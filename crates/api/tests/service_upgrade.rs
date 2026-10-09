@@ -49,7 +49,7 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
     cfg.db.path = path.clone();
     cfg.db.pool_size = 2;
     cfg.bot.owner_id = 123;
-    cfg.bot.control_bind = bound.to_string();
+    cfg.bot.control_target = bound.to_string();
     cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
     cfg.web.base_url = "https://api.example.test".into();
     let opts = cfg.db_open_options();

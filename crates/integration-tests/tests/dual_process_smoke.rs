@@ -89,7 +89,7 @@ async fn smoke_dual_process_config_sync() {
             .expect("control listener");
         let mut api_cfg = ApiProcessConfig::default();
         api_cfg.db.path = tmp.clone();
-        api_cfg.bot.control_bind = bound.to_string();
+        api_cfg.bot.control_target = bound.to_string();
         api_cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         assert!(api_db.is_read_only());
         let api = ApiState::new(api_cfg, api_db).expect("ApiState");

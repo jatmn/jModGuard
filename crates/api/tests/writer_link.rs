@@ -87,7 +87,7 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
         "a read-only API connection cannot begin a write"
     );
     assert_eq!(probe.immediate(), 0);
-    cfg.bot.control_bind = bound.to_string();
+    cfg.bot.control_target = bound.to_string();
     let app = ApiState::new(cfg, db).unwrap();
     let rejected = app
         .commit_actor(
@@ -157,9 +157,7 @@ async fn missing_control_secret_fails_api_writes_closed() {
         .commit(db::ControlOp::AbortUpgrade { id: "1".into() })
         .await
         .unwrap_err();
-    let text = error.to_string();
-    assert!(text.contains("JMODGUARD_CONTROL_SECRET"), "{text}");
-    assert!(!text.contains('/'), "{text}");
+    assert_eq!(error.to_string(), "control link unavailable");
     drop(app);
     cleanup(&path);
 }
@@ -205,5 +203,148 @@ async fn normal_api_routes_and_startup_do_not_open_a_writer() {
         !flag.load(Ordering::SeqCst),
         "building the normal router must not open a writer"
     );
+    cleanup(&path);
+}
+
+async fn read_serves_and_write_is_unavailable(cfg: ApiProcessConfig, path: PathBuf) {
+    let db = Db::open_with(cfg.db_open_options()).unwrap();
+    assert!(db.is_read_only());
+    let app = ApiState::new(cfg, db).unwrap();
+    assert!(app.poll_config_version().await.is_ok());
+    let error = app
+        .commit(db::ControlOp::AbortUpgrade { id: "1".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "control link unavailable");
+    drop(app);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unset_control_target_serves_a_read_and_a_write_is_unavailable() {
+    let path = temp_db("unset-bind");
+    let _writer = Db::open(&path, 2).unwrap();
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    assert!(cfg.bot.control_target.is_empty());
+    read_serves_and_write_is_unavailable(cfg, path).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_control_target_serves_a_read_and_a_write_is_unavailable() {
+    let path = temp_db("empty-bind");
+    let _writer = Db::open(&path, 2).unwrap();
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    cfg.bot.control_target = String::new();
+    cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    read_serves_and_write_is_unavailable(cfg, path).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
+    let path = temp_db("check");
+    let bot_db = Db::open(&path, 2).unwrap();
+    let mut bot_cfg = BotProcessConfig::default();
+    bot_cfg.db.path = path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    cfg.bot.control_target = bound.to_string();
+    let probe = Arc::new(db::StartupProbe::default());
+    let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let db = Db::open_with(cfg.db_open_options()).unwrap();
+    let app = Arc::new(ApiState::new(cfg, db).unwrap());
+    let state = db::component_update(&app.db, "bot").await.unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let candidate = db::ComponentRelease {
+        component: "bot".into(),
+        channel: state.channel.clone(),
+        release_id: "test".into(),
+        source_sha: "a".repeat(40),
+        published_at: "2026-10-01T00:00:00Z".into(),
+        image: "ghcr.io/jatmn/jmodguard-bot".into(),
+        digest: format!("sha256:{}", "c".repeat(64)),
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        result_schema: db::CORE_SCHEMA_VERSION,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: None,
+        base_abi: "debian-bookworm-amd64".into(),
+        upgrade: None,
+    };
+    let reply = app
+        .commit(db::ControlOp::RecordUpdateCheck {
+            component: "bot".into(),
+            channel: state.channel.clone(),
+            candidate: Some(candidate),
+            error: None,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(reply, db::ControlReply::Saved { .. }), "{reply:?}");
+    let stored = db::component_update(&bot.db, "bot").await.unwrap();
+    assert_eq!(
+        stored.candidate.unwrap().digest,
+        format!("sha256:{}", "c".repeat(64))
+    );
+    assert!(
+        !jmodguard_api::web::updates::release_check_is_stale(stored.checked_at, now),
+        "an install immediately after Check must not be stale"
+    );
+    let before = probe.immediate();
+    jmodguard_api::web::updates::poll_releases(&app, async |_component, _channel| {
+        Ok::<_, anyhow::Error>("sha256:dddd".to_owned())
+    })
+    .await;
+    assert_eq!(
+        probe.immediate(),
+        before,
+        "the hourly API timer writes nothing"
+    );
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_without_a_control_target_is_control_link_unavailable() {
+    let path = temp_db("check-down");
+    let _writer = Db::open(&path, 2).unwrap();
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    let db = Db::open_with(cfg.db_open_options()).unwrap();
+    let app = Arc::new(ApiState::new(cfg, db).unwrap());
+    let error = jmodguard_api::web::updates::check_one(&app, "bot")
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "control link unavailable");
+    drop(app);
     cleanup(&path);
 }

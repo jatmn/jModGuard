@@ -21,23 +21,46 @@ fn write_probe_marker(dir: &Path, name: &str, contents: &str) -> Result<()> {
 
 pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
     let opts = cfg.db_open_options();
+    let remote = !opts.url.trim().is_empty();
     let budget = db::startup_open_retry(&opts);
-    Db::open_with_budget(opts, budget).await
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let opts = opts.clone();
+        let probe = db::current_startup_probe();
+        let opened = tokio::task::spawn_blocking(move || {
+            let _probe = db::enter_startup_probe(probe);
+            Db::open_with(opts)
+        })
+        .await
+        .context("database open worker stopped before returning")?;
+        match opened {
+            Ok(db) => return Ok(db),
+            Err(error) if db::is_startup_retryable(&error, remote) => {
+                tracing::warn!(
+                    attempt,
+                    "API database is not ready; retrying without migrating: {error:#}"
+                );
+                tokio::time::sleep(db::startup_backoff(
+                    attempt,
+                    budget.initial_backoff,
+                    budget.max_backoff,
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
-/// Prime API state with the same retry budget as opening the database.
-/// A retry does not write terminal defaults.
+/// Prime API state. An older schema or a retryable read waits with a capped
+/// delay. The API does not migrate. An incompatible schema still returns.
 pub async fn build_state(cfg: ApiProcessConfig, db: Db) -> Result<Arc<ApiState>> {
     let budget = db::startup_open_retry(&cfg.db_open_options());
     let remote = !cfg.db.url.trim().is_empty();
     let started = Instant::now();
-    let deadline = started + budget.budget;
     let mut attempt = 0_u32;
-    let mut last = None;
     loop {
-        if attempt > 0 && Instant::now() >= deadline {
-            break;
-        }
         attempt += 1;
         let cfg = cfg.clone();
         let db = db.clone();
@@ -60,31 +83,21 @@ pub async fn build_state(cfg: ApiProcessConfig, db: Db) -> Result<Arc<ApiState>>
                 return Ok(state);
             }
             Ok(Err(error)) if db::is_startup_retryable(&error, remote) => {
-                last = Some(error);
+                tracing::warn!(
+                    attempt,
+                    "API starting-state read is not ready; retrying: {error:#}"
+                );
             }
             Ok(Err(error)) => return Err(error),
             Err(error) => return Err(error),
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let sleep_for =
-            db::startup_backoff(attempt, budget.initial_backoff, budget.max_backoff).min(remaining);
-        if sleep_for.is_zero() {
-            break;
-        }
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        tracing::info!(
+        tokio::time::sleep(db::startup_backoff(
             attempt,
-            elapsed_ms,
-            "starting-state read not ready; retrying: {:#}",
-            last.as_ref().expect("retry stores the error")
-        );
-        tokio::time::sleep(sleep_for).await;
+            budget.initial_backoff,
+            budget.max_backoff,
+        ))
+        .await;
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("starting-state read failed")))
-        .context("timed out retrying the starting-state read")
 }
 
 /// Open the shared database without migrating, then commit one prefix change.
@@ -100,7 +113,7 @@ pub async fn write_shared_config(cfg: ApiProcessConfig) -> Result<()> {
     let port = std::fs::read_to_string(dir.join("writer-port")).context("writer-port")?;
     let scope_id = std::fs::read_to_string(dir.join("writer-scope")).context("writer-scope")?;
     let mut cfg = cfg;
-    cfg.bot.control_bind = format!("127.0.0.1:{}", port.trim());
+    cfg.bot.control_target = format!("127.0.0.1:{}", port.trim());
     let db = open_database(&cfg).await?;
     let app = ApiState::new(cfg, db)?;
     let reply = app
@@ -300,5 +313,112 @@ mod tests {
         );
         drop(app);
         cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn older_schema_stays_live_then_becomes_ready_without_exiting() {
+        jmodguard::set_process_ready(false);
+        let path = temp_db("older");
+        let prepared = prepare_bot(&path);
+        drop(prepared);
+        db::set_user_version_unfenced(&path, db::CORE_SCHEMA_VERSION - 1).unwrap();
+        let cfg = api_config(&path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = Arc::new(db::StartupProbe::default());
+        let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        db::arm_writer_open_tripwire(Arc::clone(&tripped));
+        let cfg_wait = cfg.clone();
+        let opened = tokio::spawn(async move {
+            crate::health::serve_while(&listener, async move {
+                let db = open_database(&cfg_wait).await?;
+                jmodguard::set_process_ready(true);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok::<_, anyhow::Error>(db)
+            })
+            .await
+        });
+        assert_eq!(
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200
+        );
+        assert_eq!(
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            503
+        );
+        assert_eq!(
+            http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            503
+        );
+        assert!(
+            !opened.is_finished(),
+            "startup must not exit on an older schema"
+        );
+        let path_upgrade = path.clone();
+        std::thread::spawn(move || {
+            db::set_user_version_unfenced(&path_upgrade, db::CORE_SCHEMA_VERSION).unwrap();
+        })
+        .join()
+        .unwrap();
+        let mut ready = 0;
+        for _ in 0..40 {
+            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            if ready == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            ready, 200,
+            "the API becomes ready after the schema is upgraded"
+        );
+        let db = opened.await.unwrap().unwrap();
+        assert!(db.is_read_only());
+        assert_eq!(probe.immediate(), 0);
+        assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
+        jmodguard::set_process_ready(false);
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn newer_schema_exits_instead_of_waiting() {
+        let path = temp_db("newer");
+        let prepared = prepare_bot(&path);
+        drop(prepared);
+        db::set_user_version_unfenced(&path, db::CORE_SCHEMA_VERSION + 1).unwrap();
+        let cfg = api_config(&path);
+        let opened = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
+        assert!(opened.unwrap().is_err(), "a newer schema must exit");
+        cleanup(&path);
+    }
+
+    async fn wait_status(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let mut seen = 0;
+        for _ in 0..40 {
+            seen = http_status(addr, request).await;
+            if seen == want {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    async fn http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+            return 0;
+        };
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        let text = String::from_utf8_lossy(&buf[..n]);
+        text.split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0)
     }
 }

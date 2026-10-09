@@ -573,6 +573,7 @@ pub async fn execute_pending(
                             None,
                             &format!("[automod:{}] {}", pending.rule_id, reason),
                             None,
+                            db::BanRecord::Retry,
                         )
                         .await
                         .ok()
@@ -637,6 +638,7 @@ pub async fn execute_pending(
                                             None,
                                             &format!("[automod:{}] {}", pending.rule_id, reason),
                                             None,
+                                            db::BanRecord::Fresh,
                                         )
                                         .await
                                         .ok()

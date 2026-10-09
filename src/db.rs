@@ -36,6 +36,7 @@ mod member_sync_pace;
 pub use member_sync_pace::*;
 mod bootstrap;
 pub use bootstrap::*;
+pub use bootstrap::{meta_string_conn, write_meta_string_conn};
 mod enrollments;
 pub use enrollments::*;
 mod configuration;
@@ -82,6 +83,15 @@ const MIGRATIONS: &[&str] = &[
 
 /// Completed core schema required by service startup and release observations.
 pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Set `PRAGMA user_version` on a local file without an application pool.
+/// Startup tests use this so the writer-open tripwire stays quiet.
+/// The busy timeout waits out a concurrent read-only open.
+pub fn set_user_version_unfenced(path: &Path, version: i64) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000")?;
+    conn.pragma_update(None, "user_version", version)
+}
 
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
@@ -407,6 +417,8 @@ pub struct DbOpenOptions {
 type BeforeFinalLeaseHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 type BeforeFinalLeaseReread = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
+#[cfg(test)]
+type DuringLeasedGuildCommit = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
 
 #[derive(Clone)]
 pub struct Db {
@@ -427,10 +439,20 @@ pub struct Db {
     /// Empty means commits are not fenced. Claiming the writer lease arms this
     /// and leaves it armed. Control apply restores the previous value.
     lease_owner: Arc<Mutex<Option<String>>>,
+    /// Bot launcher instance. Empty means update-control commits are not fenced
+    /// by the launcher lease. This is not the application writer lease.
+    launcher_fence: Arc<Mutex<Option<String>>>,
+    /// In-flight guild commits for the current lease owner. Renewal of that
+    /// owner does not wait. Release and a different claimant do.
+    guild_commits: Arc<(Mutex<GuildCommitFence>, std::sync::Condvar)>,
     /// Moves the core lease after the early guild-commit probe and before the
-    /// final re-read that shares the core writer lock with `COMMIT`.
+    /// final re-read. The re-read does not hold the writer lock across COMMIT.
     #[cfg(test)]
     before_final_lease_reread: BeforeFinalLeaseReread,
+    #[cfg(test)]
+    during_leased_guild_commit: DuringLeasedGuildCommit,
+    #[cfg(test)]
+    fail_lease_cleanup: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -481,8 +503,26 @@ impl Db {
         self.read_only
     }
 
-    pub(crate) fn arm_lease_owner(&self, owner: &str) {
+    /// Treat later commits from this pool as belonging to `owner`. A commit is
+    /// rejected when that instance does not hold the active-bot lease.
+    pub fn arm_lease_owner(&self, owner: &str) {
         self.restore_lease_owner(Some(owner.to_owned()));
+    }
+
+    /// Short fence for bot-launcher update-control writes. It does not use the
+    /// application writer lease, so it still works while the bot process is stopped.
+    pub fn arm_launcher_fence(&self, instance: &str) {
+        *self
+            .launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(instance.to_owned());
+    }
+
+    pub fn launcher_instance(&self) -> Option<String> {
+        self.launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     #[cfg(test)]
@@ -527,6 +567,112 @@ impl Db {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
     }
+
+    #[cfg(test)]
+    pub(crate) fn arm_during_leased_guild_commit(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .during_leased_guild_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn take_during_leased_guild_commit(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.during_leased_guild_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_lease_cleanup_failure(&self) {
+        self.fail_lease_cleanup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_lease_cleanup_failure(&self) -> bool {
+        self.fail_lease_cleanup
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn begin_guild_commit(&self, owner: &str) {
+        let mut fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.inflight = fence.inflight.saturating_add(1);
+        if fence.owner.is_none() {
+            fence.owner = Some(owner.to_owned());
+        }
+    }
+
+    pub(crate) fn end_guild_commit(&self) {
+        let mut fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.inflight = fence.inflight.saturating_sub(1);
+        if fence.inflight == 0 {
+            fence.owner = None;
+        }
+        self.guild_commits.1.notify_all();
+    }
+
+    pub(crate) fn guild_commit_blocks_claim(&self, instance: &str) -> bool {
+        let fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.inflight > 0 && fence.owner.as_deref() != Some(instance)
+    }
+
+    pub(crate) fn guild_commit_blocks_release(&self, instance: &str) -> bool {
+        let fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fence.inflight > 0 && fence.owner.as_deref() == Some(instance)
+    }
+
+    pub(crate) fn wait_for_guild_commit_claim(&self, instance: &str) {
+        let mut fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while fence.inflight > 0 && fence.owner.as_deref() != Some(instance) {
+            fence = self
+                .guild_commits
+                .1
+                .wait(fence)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn wait_for_guild_commit_release(&self, instance: &str) {
+        let mut fence = self
+            .guild_commits
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while fence.inflight > 0 && fence.owner.as_deref() == Some(instance) {
+            fence = self
+                .guild_commits
+                .1
+                .wait(fence)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+struct GuildCommitFence {
+    inflight: usize,
+    owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -544,6 +690,7 @@ struct ConnectionPool {
     read_only: bool,
     busy_timeout_ms: u32,
     lease_owner: Arc<Mutex<Option<String>>>,
+    launcher_fence: Arc<Mutex<Option<String>>>,
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
 }
 
@@ -589,6 +736,12 @@ impl ConnectionLease {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         connection.set_expected_lease_owner(owner);
+        let launcher = pool
+            .launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        connection.set_expected_launcher(launcher);
         let probe = pool
             .commit_lease_probe
             .lock()
@@ -862,6 +1015,7 @@ impl Db {
             ready(bootstrap)?;
 
             let lease_owner = Arc::new(Mutex::new(None));
+            let launcher_fence = Arc::new(Mutex::new(None));
             let commit_lease_probe = Arc::new(Mutex::new(None));
             Ok(Self {
                 path: opts.path.clone(),
@@ -878,6 +1032,7 @@ impl Db {
                     read_only: opts.read_only,
                     busy_timeout_ms,
                     lease_owner: Arc::clone(&lease_owner),
+                    launcher_fence: Arc::clone(&launcher_fence),
                     commit_lease_probe,
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
@@ -891,8 +1046,20 @@ impl Db {
                 config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
                 settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
                 lease_owner,
+                launcher_fence,
+                guild_commits: Arc::new((
+                    Mutex::new(GuildCommitFence {
+                        inflight: 0,
+                        owner: None,
+                    }),
+                    std::sync::Condvar::new(),
+                )),
                 #[cfg(test)]
                 before_final_lease_reread: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                during_leased_guild_commit: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })

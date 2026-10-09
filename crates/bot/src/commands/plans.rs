@@ -341,6 +341,7 @@ async fn run_step(
                             None,
                             "custom command",
                             None,
+                            db::BanRecord::Retry,
                         )
                         .await?;
                     }
@@ -420,6 +421,7 @@ async fn run_step(
                         None,
                         "custom command",
                         None,
+                        db::BanRecord::Fresh,
                     )
                     .await?;
                 }

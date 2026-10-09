@@ -3,7 +3,6 @@
 use super::*;
 use crate::config::ApiProcessConfig;
 use crate::db::UpdateControl;
-use anyhow::Context as _;
 use axum::extract::State;
 use axum::response::Html;
 use serde::Deserialize;
@@ -14,8 +13,10 @@ pub struct RecoveryState {
     pub oauth: Arc<oauth::OAuthClient>,
     pub control: UpdateControl,
     pub apply_enabled: bool,
-    /// Normal router only. Maintenance `serve` stays on the local writable control.
+    /// Normal router sends owner actions through `api`. Maintenance `serve`
+    /// stays read-only and uses `writer` when the control target is set.
     pub api: Option<Arc<super::state::ApiState>>,
+    pub writer: Option<jmodguard::control::WriterLink>,
 }
 
 async fn control_value<T: serde::de::DeserializeOwned>(
@@ -26,8 +27,24 @@ async fn control_value<T: serde::de::DeserializeOwned>(
     if state.control.writes_locally() {
         return local.await;
     }
-    let api = state.api.as_ref().context("waiting")?;
-    let (_, body) = api.commit_json(op).await?;
+    if let Some(api) = state.api.as_ref() {
+        let (_, body) = api.commit_json(op).await?;
+        return Ok(serde_json::from_value(body)?);
+    }
+    let Some(writer) = state.writer.clone() else {
+        anyhow::bail!("{}", jmodguard::control::CONTROL_LINK_UNAVAILABLE);
+    };
+    let reply = writer.submit(op, 0).await?;
+    let body = match reply {
+        crate::db::ControlReply::Saved { body } | crate::db::ControlReply::Unchanged { body } => {
+            body
+        }
+        crate::db::ControlReply::Failed { message } => anyhow::bail!(message),
+        crate::db::ControlReply::Waiting => anyhow::bail!(jmodguard::control::NOT_THE_WRITER),
+        crate::db::ControlReply::Busy | crate::db::ControlReply::StillWaiting => {
+            anyhow::bail!(jmodguard::control::CONTROL_LINK_UNAVAILABLE)
+        }
+    };
     Ok(serde_json::from_value(body)?)
 }
 
@@ -252,8 +269,7 @@ async fn maintenance_callback(
 pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
     crate::set_shutdown_context("temporary maintenance API; the application has not started");
     let listener = crate::health::bind(&cfg.web.bind).await?;
-    let mut opts = cfg.db_open_options();
-    opts.read_only = false;
+    let opts = cfg.db_open_options();
     let control = crate::health::serve_while(&listener, async {
         loop {
             let opts = opts.clone();
@@ -263,9 +279,7 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
                     tracing::warn!("maintenance update control is not ready: database is empty")
                 }
                 Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "maintenance update control could not be opened writable: {error:#}"
-                    ));
+                    tracing::warn!("maintenance update control is not ready: {error:#}");
                 }
             }
             tokio::select! {
@@ -285,12 +299,22 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
         return Ok(());
     };
     let oauth = Arc::new(oauth::OAuthClient::from_config(&cfg)?);
+    let writer = jmodguard::control::try_writer_link(
+        cfg.bot.control_target.as_str(),
+        cfg.bot.control_secret.as_str(),
+    )
+    .ok()
+    .flatten();
+    if writer.is_none() {
+        tracing::warn!("control link unavailable");
+    }
     let state = Arc::new(RecoveryState {
         cfg: Arc::new(cfg),
         oauth,
         control,
         apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
         api: None,
+        writer,
     });
     let app = maintenance_router(state, MemoryStore::default());
     axum::serve(listener, app)
@@ -428,6 +452,7 @@ mod tests {
             control: control.clone(),
             apply_enabled: true,
             api: None,
+            writer: None,
         });
         let store = MemoryStore::default();
         let owner_cookie = cookie(&store, 123).await;

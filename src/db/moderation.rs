@@ -498,13 +498,24 @@ pub async fn add_enrolled_warn(
     .await
 }
 
+/// How a ban row relates to a previous active mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BanRecord {
+    /// Discord already shows this ban. A matching active row is the same dispatch.
+    Retry,
+    /// Discord showed the user was not banned. Replace a stale active mirror.
+    Fresh,
+}
+
 /// Insert an active ban row for this dispatch.
 ///
-/// The same guild, user, reason, and moderator, while a row is still active, returns
-/// `None` and writes nothing even when `occurred_at` is `None`. `created_at` stays the
-/// timestamp of the insert and is not the dispatch identity. A different reason replaces
-/// the stale active row. An ended row does not block the insert. `Some` means a row was
-/// inserted and the caller may publish. `None` means do not publish.
+/// [`BanRecord::Retry`] returns `None` and writes nothing when an active row already has
+/// the same guild, user, reason, and moderator, even when `occurred_at` is `None`.
+/// [`BanRecord::Fresh`] replaces that stale active mirror and inserts a new row.
+/// `created_at` stays the timestamp of the insert and is not the dispatch identity. A
+/// different reason replaces the stale active row. An ended row does not block the
+/// insert. `Some` means a row was inserted and the caller may publish. `None` means do
+/// not publish.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_enrolled_ban_if_absent(
     db: &Db,
@@ -516,6 +527,7 @@ pub async fn record_enrolled_ban_if_absent(
     moderator_name: Option<&str>,
     reason: &str,
     occurred_at: Option<&str>,
+    kind: BanRecord,
 ) -> Result<Option<i64>> {
     let (now, reason) = (
         occurred_at.map(str::to_owned).unwrap_or_else(now_str),
@@ -540,7 +552,7 @@ pub async fn record_enrolled_ban_if_absent(
                 |row| Ok(row.get(0)?),
             )
             .optional()?;
-        if same_dispatch.is_some() {
+        if kind == BanRecord::Retry && same_dispatch.is_some() {
             tx.finish_read()?;
             return Ok(None);
         }

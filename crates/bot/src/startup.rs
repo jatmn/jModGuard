@@ -55,10 +55,11 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
             permissions: 1 << 5,
         })
     });
-    let Some(bound) = crate::control_server::spawn(Arc::clone(&app))? else {
-        bail!("{}", jmodguard::control::ControlSecretError);
-    };
-    write_probe_marker(&dir, "writer-port", &bound.port().to_string())?;
+    if let Some(bound) = crate::control_server::spawn(Arc::clone(&app))? {
+        write_probe_marker(&dir, "writer-port", &bound.port().to_string())?;
+    } else {
+        tracing::error!("control listener is off; the probe continues without a writer port");
+    }
     let enrolled = db::enroll_guild(&app.db, guild_id as i64, 1)
         .await?
         .context("probe guild was not enrolled")?;

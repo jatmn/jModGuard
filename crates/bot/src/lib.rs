@@ -20,6 +20,7 @@ pub mod logging;
 pub mod member_directory;
 pub mod member_sync;
 pub mod nickname_worker;
+pub mod recovery;
 pub mod snapshot_capture;
 pub mod spam_actions;
 pub mod startup;

@@ -173,7 +173,9 @@ async fn main() -> Result<()> {
     let _renewal =
         jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
     if jmodguard_bot::control_server::spawn(Arc::clone(&app))?.is_none() {
-        anyhow::bail!("{}", jmodguard::control::ControlSecretError);
+        tracing::error!(
+            "control listener is off; moderation continues and API writes are unavailable"
+        );
     }
 
     // --- Discord client (needed for slash re-sync after config polls) --------
@@ -515,7 +517,7 @@ async fn main() -> Result<()> {
     if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
         tracing::info!("shutdown before gateway identify");
         activation.begin_shutdown();
-        activation.cut_off();
+        activation.note_lease_lost();
         jmodguard::set_process_ready(false);
         if let Err(error) = db::release_active_bot(&app.db, activation.instance()).await {
             tracing::warn!("active-bot lease release failed: {error:#}");

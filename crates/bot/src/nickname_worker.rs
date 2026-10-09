@@ -146,30 +146,24 @@ async fn apply_nickname_edit<R, E, RF, EF>(
             return;
         }
     }
+    let now = chrono::Utc::now().timestamp();
+    if let Err(error) = db::mark_nickname_outcome_unknown(&app.db, job, now).await {
+        tracing::error!(
+            guild_id = job.guild_id,
+            "failed to persist nickname reconciliation outcome: {error:#}"
+        );
+        return;
+    }
+    if !app.activation.may_record() {
+        return;
+    }
     let edit = tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         crate::discord::race_discord_call(&app.activation, edit_member()),
     )
     .await;
     let edit = match edit {
-        Ok(crate::discord::DiscordCall::Cancelled) => {
-            let now = chrono::Utc::now().timestamp();
-            if let Err(error) = db::schedule_nickname_reconcile_retry(
-                &app.db,
-                job,
-                now,
-                "outcome_unknown",
-                "Discord nickname outcome is unknown",
-            )
-            .await
-            {
-                tracing::error!(
-                    guild_id = job.guild_id,
-                    "failed to persist nickname reconciliation outcome: {error:#}"
-                );
-            }
-            return;
-        }
+        Ok(crate::discord::DiscordCall::Cancelled) => return,
         Ok(crate::discord::DiscordCall::Finished(result)) => Ok(result),
         Err(elapsed) => Err(elapsed),
     };

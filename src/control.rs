@@ -20,9 +20,17 @@ use crate::db::{ControlOp, ControlReply};
 const BODY_LIMIT: usize = 256 * 1024;
 const MAC_HEX: usize = 64;
 const MIN_SECRET_LEN: usize = 32;
-const MAX_AGE_MS: i64 = 60_000;
+pub const MAX_AGE_MS: i64 = 60_000;
 const SKEW_MS: i64 = 5_000;
 const SEEN_LIMIT: usize = 4096;
+const REQUEST_ID_HEX: usize = 64;
+
+/// Exact status when the API cannot reach the bot writer.
+pub const CONTROL_LINK_UNAVAILABLE: &str = "control link unavailable";
+/// Exact status when this process does not hold the writer lease.
+pub const NOT_THE_WRITER: &str = "not the writer";
+/// Exact status while the bot is still applying maintenance recovery.
+pub const RECOVERY_IN_PROGRESS: &str = "recovery in progress";
 
 #[derive(Debug)]
 pub struct WriterLinkNotReady;
@@ -42,7 +50,7 @@ pub struct ControlSecretError;
 impl std::fmt::Display for ControlSecretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "JMODGUARD_CONTROL_SECRET is required on the bot and the API, must be the same value, and must be at least 32 bytes. It is separate from both database tokens.",
+            "JMODGUARD_CONTROL_SECRET must be the same value on the bot and the API and at least 32 bytes. It is separate from both database tokens. Without it the control link stays off.",
         )
     }
 }
@@ -69,11 +77,36 @@ impl WriterLink {
     }
 
     pub async fn submit(&self, op: ControlOp, actor_user_id: i64) -> Result<ControlReply> {
+        let request_id = random_request_id()?;
+        self.submit_request(op, actor_user_id, request_id).await
+    }
+
+    /// One dashboard attempt keeps `request_id` for its retry. A later attempt
+    /// calls [`Self::submit`] and gets a new id.
+    pub async fn submit_request(
+        &self,
+        op: ControlOp,
+        actor_user_id: i64,
+        request_id: String,
+    ) -> Result<ControlReply> {
         let addr = self.addr;
         let key = self.key.clone();
-        tokio::task::spawn_blocking(move || submit_blocking(addr, &key, &op, actor_user_id))
-            .await
-            .context("write failed")?
+        let op_retry = op.clone();
+        let id_retry = request_id.clone();
+        let key_retry = key.clone();
+        let first = tokio::task::spawn_blocking(move || {
+            submit_blocking(addr, &key, &op, actor_user_id, &request_id)
+        })
+        .await
+        .context("write failed")??;
+        if !matches!(first, ControlReply::StillWaiting) {
+            return Ok(first);
+        }
+        tokio::task::spawn_blocking(move || {
+            submit_blocking(addr, &key_retry, &op_retry, actor_user_id, &id_retry)
+        })
+        .await
+        .context("write failed")?
     }
 }
 
@@ -172,6 +205,7 @@ fn submit_blocking(
     key: &[u8],
     op: &ControlOp,
     actor_user_id: i64,
+    request_id: &str,
 ) -> Result<ControlReply> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| anyhow::anyhow!("waiting"))?;
@@ -181,7 +215,13 @@ fn submit_blocking(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| anyhow::anyhow!("write failed"))?;
-    let frame = seal(key, op, actor_user_id)?;
+    let frame = seal_with_request(
+        key,
+        op,
+        actor_user_id,
+        now_ms().saturating_add(MAX_AGE_MS),
+        request_id,
+    )?;
     stream
         .write_all(&frame)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
@@ -191,6 +231,7 @@ fn submit_blocking(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn seal(key: &[u8], op: &ControlOp, actor_user_id: i64) -> Result<Vec<u8>> {
     seal_with_expiry(key, op, actor_user_id, now_ms().saturating_add(MAX_AGE_MS))
 }
@@ -201,8 +242,20 @@ pub fn seal_with_expiry(
     actor_user_id: i64,
     expires_ms: i64,
 ) -> Result<Vec<u8>> {
+    seal_with_request(key, op, actor_user_id, expires_ms, &random_request_id()?)
+}
+
+pub fn seal_with_request(
+    key: &[u8],
+    op: &ControlOp,
+    actor_user_id: i64,
+    expires_ms: i64,
+    request_id: &str,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(valid_request_id(request_id), "write failed");
     let wire = Wire {
         nonce: random_nonce()?,
+        request_id: request_id.to_owned(),
         expires_ms,
         actor_user_id,
         op: op.clone(),
@@ -224,7 +277,7 @@ pub fn open_frame(
     key: &[u8],
     body: &[u8],
     nonces: &Mutex<NonceWindow>,
-) -> Result<(ControlOp, i64, i64)> {
+) -> Result<(ControlOp, i64, i64, String)> {
     if body.len() < MAC_HEX || body.len() > BODY_LIMIT {
         anyhow::bail!("write failed");
     }
@@ -234,13 +287,21 @@ pub fn open_frame(
         anyhow::bail!("write failed");
     }
     let wire: Wire = serde_json::from_slice(json).map_err(|_| anyhow::anyhow!("write failed"))?;
+    if !valid_request_id(&wire.request_id) {
+        anyhow::bail!("write failed");
+    }
     let mut guard = nonces
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !guard.accept(&wire.nonce, wire.expires_ms, now_ms()) {
         anyhow::bail!("write failed");
     }
-    Ok((wire.op, wire.actor_user_id, wire.expires_ms))
+    Ok((
+        wire.op,
+        wire.actor_user_id,
+        wire.expires_ms,
+        wire.request_id,
+    ))
 }
 
 pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
@@ -270,6 +331,19 @@ pub fn write_frame(stream: &mut impl Write, reply: &ControlReply) -> Result<()> 
         .write_all(&json)
         .map_err(|_| anyhow::anyhow!("write failed"))?;
     Ok(())
+}
+
+/// A new id for one API attempt. Retries of that attempt reuse it.
+pub fn random_request_id() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("write failed"))?;
+    Ok(to_hex(&bytes))
+}
+
+fn valid_request_id(request_id: &str) -> bool {
+    request_id.len() == REQUEST_ID_HEX && request_id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn random_nonce() -> Result<String> {
@@ -340,6 +414,7 @@ fn is_unique_local(v6: Ipv6Addr) -> bool {
 #[derive(Serialize, Deserialize)]
 struct Wire {
     nonce: String,
+    request_id: String,
     expires_ms: i64,
     actor_user_id: i64,
     op: ControlOp,
@@ -351,10 +426,11 @@ mod tests {
 
     #[test]
     fn private_bind_rejects_public_addresses() {
-        assert!(parse_private_bind("127.0.0.1:8791").is_ok());
+        assert!(parse_private_bind("127.0.0.1:9").is_ok());
         assert!(parse_private_bind("10.1.2.3:1").is_ok());
         assert!(parse_private_bind("[::1]:9").is_ok());
-        assert!(parse_private_bind("0.0.0.0:8791").is_err());
+        assert!(parse_private_bind("0.0.0.0:9").is_err());
+        assert!(parse_private_bind("[::]:9").is_err());
         assert!(parse_private_bind("8.8.8.8:53").is_err());
         assert!(parse_private_bind("192.0.2.1:1").is_err());
     }
@@ -422,9 +498,27 @@ mod tests {
     fn matching_control_secret_seals_and_opens() {
         let key = load_writer_key(&fixture_secret()).unwrap();
         let frame = seal(&key, &sample_op(), 4).unwrap();
-        let (op, actor, _) =
+        let again = seal(&key, &sample_op(), 4).unwrap();
+        let (op, actor, _, request_id) =
             open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        let (_, _, _, other) =
+            open_frame(&key, &again[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 4);
+        assert_ne!(
+            request_id, other,
+            "two attempts must not share a request id"
+        );
+        let reused = seal_with_request(
+            &key,
+            &sample_op(),
+            4,
+            now_ms().saturating_add(60_000),
+            &request_id,
+        )
+        .unwrap();
+        let (_, _, _, replay) =
+            open_frame(&key, &reused[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        assert_eq!(replay, request_id);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
     }
 
@@ -450,7 +544,7 @@ mod tests {
         assert_ne!(left.as_slice(), token_a.as_bytes());
         assert_ne!(right.as_slice(), token_b.as_bytes());
         let frame = seal(&left, &sample_op(), 0).unwrap();
-        let (op, actor, _) =
+        let (op, actor, _, _) =
             open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 0);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { .. }));

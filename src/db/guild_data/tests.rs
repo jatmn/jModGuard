@@ -576,6 +576,89 @@ async fn guild_commit_does_not_land_when_the_lease_moves_before_the_final_reread
     ));
 }
 
+#[tokio::test]
+async fn slow_guild_commit_still_lets_the_same_owner_renew() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let placement = f.placement(&reg, 22).await;
+    let owner = "ab".repeat(16);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            started,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    f.catalog.arm_during_leased_guild_commit(move || {
+        let _ = ready_tx.send(());
+        // Longer than the 5s renewal interval and shorter than the 20s TTL.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+    });
+    let catalog = f.catalog.clone();
+    let renewal = tokio::spawn(async move {
+        ready_rx.await.unwrap();
+        let began = std::time::Instant::now();
+        let renewed = claim_active_bot(
+            &catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        (renewed, began.elapsed())
+    });
+    store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    let (renewed, elapsed) = renewal.await.unwrap();
+    assert!(renewed);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "renewal waited {elapsed:?} for the guild commit"
+    );
+    store.verify_placement(placement).await.unwrap();
+}
+
+#[tokio::test]
+async fn guild_commit_stays_ok_when_only_core_cleanup_fails() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let placement = f.placement(&reg, 23).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    f.catalog.arm_lease_cleanup_failure();
+    store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    store.verify_placement(placement).await.unwrap();
+}
+
 fn lease_rejected(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause

@@ -469,62 +469,91 @@ pub async fn claim_active_bot(
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
     let armed = instance.clone();
-    let claimed = db
-        .with_conn(move |conn| {
-            // This transaction writes the lease row. It must commit even when a
-            // previous owner is still armed on the pool.
-            conn.set_expected_lease_owner(None);
-            let mut tx = conn.transaction_primary_read()?;
-            if refuse.load(std::sync::atomic::Ordering::Acquire) {
-                tx.finish_read()?;
-                return Ok(false);
+    loop {
+        let instance = instance.clone();
+        let refuse = std::sync::Arc::clone(&refuse);
+        let gate = db.clone();
+        let claimed = db
+            .with_conn(move |conn| {
+                // Wait outside the writer transaction. The same owner's renewal
+                // does not wait, so a slow guild COMMIT cannot miss the TTL.
+                gate.wait_for_guild_commit_claim(&instance);
+                // This transaction writes the lease row. It must commit even when a
+                // previous owner is still armed on the pool.
+                conn.set_expected_lease_owner(None);
+                let mut tx = conn.transaction_primary_read()?;
+                if gate.guild_commit_blocks_claim(&instance) {
+                    tx.finish_read()?;
+                    return Ok(None);
+                }
+                if refuse.load(std::sync::atomic::Ordering::Acquire) {
+                    tx.finish_read()?;
+                    return Ok(Some(false));
+                }
+                let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+                if lease_blocks(current.as_deref(), &instance, now_ms) {
+                    tx.finish_read()?;
+                    return Ok(Some(false));
+                }
+                let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+                tx.ensure_mutation_receipt()?;
+                write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
+                tx.commit()?;
+                Ok(Some(true))
+            })
+            .await?;
+        if let Some(claimed) = claimed {
+            if claimed {
+                db.arm_lease_owner(&armed);
             }
-            let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
-            if lease_blocks(current.as_deref(), &instance, now_ms) {
-                tx.finish_read()?;
-                return Ok(false);
-            }
-            let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
-            tx.ensure_mutation_receipt()?;
-            write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await?;
-    if claimed {
-        db.arm_lease_owner(&armed);
+            return Ok(claimed);
+        }
     }
-    Ok(claimed)
 }
 
 /// Drop the lease only when this instance still owns the row.
 pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
-    db.with_conn(move |conn| {
-        // The delete removes the row this commit would re-read. Ownership is
-        // checked below; the pool stays armed so later commits fail.
-        conn.set_expected_lease_owner(None);
-        let mut tx = conn.transaction_primary_read()?;
-        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
-        let owned = current
-            .as_deref()
-            .is_some_and(|value| value.starts_with(&format!("{instance} ")));
-        if !owned {
-            tx.finish_read()?;
+    loop {
+        let instance = instance.clone();
+        let gate = db.clone();
+        let released = db
+            .with_conn(move |conn| {
+                // An in-flight guild COMMIT of this owner must become visible
+                // before the token changes.
+                gate.wait_for_guild_commit_release(&instance);
+                // The delete removes the row this commit would re-read. Ownership is
+                // checked below; the pool stays armed so later commits fail.
+                conn.set_expected_lease_owner(None);
+                let mut tx = conn.transaction_primary_read()?;
+                if gate.guild_commit_blocks_release(&instance) {
+                    tx.finish_read()?;
+                    return Ok(false);
+                }
+                let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+                let owned = current
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with(&format!("{instance} ")));
+                if !owned {
+                    tx.finish_read()?;
+                    return Ok(true);
+                }
+                tx.ensure_mutation_receipt()?;
+                let owner_prefix = format!("{instance} ");
+                tx.execute_rows(
+                    "DELETE FROM meta WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
+                    params![ACTIVE_BOT_LEASE, owner_prefix],
+                    1,
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        if released {
             return Ok(());
         }
-        tx.ensure_mutation_receipt()?;
-        let owner_prefix = format!("{instance} ");
-        tx.execute_rows(
-            "DELETE FROM meta WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
-            params![ACTIVE_BOT_LEASE, owner_prefix],
-            1,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .await
+    }
 }
 
 pub(super) const META_TERMINAL_DEFAULTS: &str = "settings_terminal_defaults";
@@ -536,7 +565,7 @@ pub(super) const SETTINGS_HEAL_GENERATION: &str = "3";
 pub(super) const META_SETTINGS_HEAL_GENERATION: &str = "settings_heal_generation";
 pub(super) const META_SETTINGS_HEAL_CHECKSUM: &str = "settings_heal_checksum";
 
-pub(super) fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Option<String>> {
+pub fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
         Ok(r.get(0)?)
     })
@@ -544,11 +573,7 @@ pub(super) fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Opt
     .context("meta lookup failed")
 }
 
-pub(super) fn write_meta_string_conn(
-    conn: &impl SqlExecutor,
-    key: &str,
-    value: &str,
-) -> Result<()> {
+pub fn write_meta_string_conn(conn: &impl SqlExecutor, key: &str, value: &str) -> Result<()> {
     conn.execute_rows(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

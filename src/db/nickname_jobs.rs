@@ -194,6 +194,42 @@ fn nickname_retry_delay_secs(job: &NicknameReconcileJob) -> i64 {
     base + (seed % jitter_window as u64) as i64
 }
 
+/// Record that a nickname edit is about to leave this process. Does not change
+/// `attempt_count`, so a later acknowledgement of the same job still matches.
+pub async fn mark_nickname_outcome_unknown(
+    db: &Db,
+    job: &NicknameReconcileJob,
+    now: i64,
+) -> Result<()> {
+    let job = job.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        if !nickname_job_matches_conn(&tx, &job)? {
+            tx.finish_read()?;
+            return Ok(());
+        }
+        tx.execute_rows(
+            "UPDATE nickname_reconcile SET
+                 last_error_code = 'outcome_unknown',
+                 last_error = ?1,
+                 last_error_at = ?2
+             WHERE guild_id = ?3 AND generation = ?4 AND state = 'pending'
+               AND attempt_count = ?5",
+            params![
+                "Discord nickname outcome is unknown",
+                now,
+                job.guild_id,
+                job.generation,
+                i64::from(job.attempt_count)
+            ],
+            1,
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 pub async fn schedule_nickname_reconcile_retry(
     db: &Db,
     job: &NicknameReconcileJob,

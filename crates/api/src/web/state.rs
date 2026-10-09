@@ -20,7 +20,6 @@ pub struct ApiState {
     pub cfg: Arc<ApiProcessConfig>,
     pub oauth: Arc<OAuthClient>,
     writer: Option<jmodguard::control::WriterLink>,
-    writer_error: Option<String>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -29,6 +28,15 @@ pub struct ApiState {
     config_observation: tokio::sync::Mutex<(u64, String)>,
     /// Replaces the in-memory session store for one `web::router` build.
     session_store: std::sync::Mutex<Option<tower_sessions::MemoryStore>>,
+}
+
+fn open_writer_link(cfg: &ApiProcessConfig) -> Option<jmodguard::control::WriterLink> {
+    if cfg.bot.control_target.is_empty() {
+        return None;
+    }
+    jmodguard::control::try_writer_link(&cfg.bot.control_target, cfg.bot.control_secret.as_str())
+        .ok()
+        .flatten()
 }
 
 impl ApiState {
@@ -41,27 +49,10 @@ impl ApiState {
             }
         }
         oauth.attach_retry_store(db.clone());
-        let (writer, writer_error) = if db.is_read_only() {
-            match jmodguard::control::load_writer_key(cfg.bot.control_secret.as_str()) {
-                Err(error) => (None, Some(error.to_string())),
-                Ok(_) => {
-                    match jmodguard::control::try_writer_link(
-                        &cfg.bot.control_bind,
-                        cfg.bot.control_secret.as_str(),
-                    )? {
-                        Some(link) => {
-                            oauth.attach_writer(link.clone());
-                            (Some(link), None)
-                        }
-                        None => (
-                            None,
-                            Some(jmodguard::control::ControlSecretError.to_string()),
-                        ),
-                    }
-                }
-            }
+        let writer = if db.is_read_only() {
+            open_writer_link(&cfg).inspect(|link| oauth.attach_writer(link.clone()))
         } else {
-            (None, None)
+            None
         };
         let oauth = Arc::new(oauth);
         let primed =
@@ -75,7 +66,6 @@ impl ApiState {
             cfg: Arc::new(cfg),
             oauth,
             writer,
-            writer_error,
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
@@ -146,19 +136,8 @@ impl ApiState {
         op: db::ControlOp,
     ) -> Result<db::ControlReply> {
         if self.db.is_read_only() {
-            if let Some(message) = &self.writer_error {
-                anyhow::bail!("{message}");
-            }
-            let writer = if let Some(link) = &self.writer {
-                link.clone()
-            } else {
-                let link = jmodguard::control::try_writer_link(
-                    &self.cfg.bot.control_bind,
-                    self.cfg.bot.control_secret.as_str(),
-                )?
-                .ok_or_else(|| anyhow::anyhow!("{}", jmodguard::control::ControlSecretError))?;
-                self.oauth.attach_writer(link.clone());
-                link
+            let Some(writer) = self.writer.clone() else {
+                anyhow::bail!("{}", jmodguard::control::CONTROL_LINK_UNAVAILABLE);
             };
             writer.submit(op, actor_user_id).await
         } else {

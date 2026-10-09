@@ -431,6 +431,7 @@ async fn enforce(
                         None,
                         &format!("[automod:{rule}] {}", found.reason),
                         None,
+                        crate::db::BanRecord::Retry,
                     )
                     .await
                     .ok()
@@ -501,6 +502,7 @@ async fn enforce(
                                         None,
                                         &format!("[automod:{rule}] {}", found.reason),
                                         None,
+                                        crate::db::BanRecord::Fresh,
                                     )
                                     .await;
                                 }

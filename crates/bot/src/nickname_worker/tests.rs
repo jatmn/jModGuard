@@ -295,6 +295,16 @@ async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_ed
     let f = Fixture::new();
     let job = f.job().await;
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    assert!(
+        db::claim_active_bot(
+            &f.db,
+            app.activation.instance(),
+            chrono::Utc::now().timestamp_millis(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
     app.activation.mark_lock_held(true);
     let edits = Arc::new(AtomicUsize::new(0));
     let polled = Arc::new(AtomicBool::new(false));
@@ -326,6 +336,9 @@ async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_ed
         _ = &mut notified => {}
     }
     assert!(polled.load(Ordering::SeqCst));
+    db::release_active_bot(&f.db, app.activation.instance())
+        .await
+        .unwrap();
     app.activation.cut_off();
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
@@ -344,6 +357,16 @@ async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_ed
         .unwrap()
         .remove(0);
     let next = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    assert!(
+        db::claim_active_bot(
+            &f.db,
+            next.activation.instance(),
+            chrono::Utc::now().timestamp_millis(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
     next.activation.mark_lock_held(true);
     let again = Arc::new(AtomicUsize::new(0));
     let again_task = Arc::clone(&again);

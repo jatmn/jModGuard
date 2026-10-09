@@ -1211,6 +1211,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             control: recovery_control(&app),
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
             api: Some(Arc::clone(&app)),
+            writer: None,
         })))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(
@@ -1670,30 +1671,26 @@ mod tests {
             base_abi: "debian-bookworm-amd64".into(),
             upgrade: None,
         };
+        let before = control.component("api").await.unwrap();
         control.observe_launcher("api", 1).await.unwrap();
         control.baked_launcher("api", "hash", 1).await.unwrap();
         control
             .launcher_running("api", &release, "hash", 1)
             .await
             .unwrap();
-        let launcher_failed = control
+        control
             .launcher_failed("api", &release.digest, "err")
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(launcher_failed.contains("read-only"), "{launcher_failed}");
-        let failed = control
-            .failed("api", &release, "err")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(failed.contains("read-only"), "{failed}");
-        let upgrade_error = control
-            .upgrade_error("missing", "err")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(upgrade_error.contains("read-only"), "{upgrade_error}");
+            .unwrap();
+        control.failed("api", &release, "err").await.unwrap();
+        control.upgrade_error("missing", "err").await.unwrap();
+        let after = control.component("api").await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&after).unwrap(),
+            "an API launcher must not record launcher lifecycle"
+        );
+        assert!(control.upgrade().await.unwrap().is_none());
         assert_eq!(probe.immediate(), 0);
         assert!(!flag.load(Ordering::SeqCst));
         drop(app);

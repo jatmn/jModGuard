@@ -707,6 +707,8 @@ pub struct Connection {
     read_only: bool,
     /// Copied from the pool at checkout. `None` leaves commits unchanged.
     expected_lease_owner: Option<String>,
+    /// Bot-launcher fence. Independent of the application writer lease.
+    expected_launcher: Option<String>,
     /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
     commit_lease_probe: Option<CommitLeaseProbe>,
 }
@@ -736,8 +738,9 @@ pub(crate) fn reject_active_bot_lease(value: Option<&str>, expected: &str) -> Re
     Ok(())
 }
 
-/// Guild commits pass the remainder of `COMMIT` so the core re-read can hold
-/// its writer lock until that continuation returns.
+/// Guild commits pass the remainder of `COMMIT`. The probe checks the core
+/// lease under a short writer lock, then runs this continuation after that
+/// lock is released.
 pub(crate) type CommitLeaseProbe =
     std::sync::Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
 
@@ -1079,6 +1082,7 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            expected_launcher: None,
             commit_lease_probe: None,
         })
     }
@@ -1093,12 +1097,17 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            expected_launcher: None,
             commit_lease_probe: None,
         })
     }
 
     pub(crate) fn set_expected_lease_owner(&mut self, owner: Option<String>) {
         self.expected_lease_owner = owner;
+    }
+
+    pub(crate) fn set_expected_launcher(&mut self, instance: Option<String>) {
+        self.expected_launcher = instance;
     }
 
     pub(crate) fn set_commit_lease_probe(&mut self, probe: Option<CommitLeaseProbe>) {
@@ -1268,6 +1277,7 @@ impl Connection {
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
             expected_lease_owner: self.expected_lease_owner.clone(),
+            expected_launcher: self.expected_launcher.clone(),
             commit_lease_probe: self.commit_lease_probe.clone(),
         }
     }
@@ -1473,6 +1483,7 @@ pub struct Transaction {
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
     expected_lease_owner: Option<String>,
+    expected_launcher: Option<String>,
     commit_lease_probe: Option<CommitLeaseProbe>,
 }
 
@@ -1833,6 +1844,36 @@ impl Transaction {
         self.inner().last_insert_rowid()
     }
 
+    fn renew_launcher_fence(&self, instance: &str) -> Result<()> {
+        const KEY: &str = "launcher_lease";
+        const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
+        let now = crate::control::now_ms();
+        let current: Option<String> = self
+            .query_row("SELECT value FROM meta WHERE key=?1", params![KEY], |row| {
+                Ok(row.get(0)?)
+            })
+            .optional()?;
+        if let Some(value) = current.as_deref() {
+            let mut parts = value.split_whitespace();
+            let owner = parts.next().unwrap_or("");
+            let expires = parts
+                .next()
+                .and_then(|text| text.parse::<i64>().ok())
+                .unwrap_or(0);
+            if owner != instance && expires > now {
+                anyhow::bail!("launcher fence held");
+            }
+        }
+        let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
+        self.execute_bounded(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![KEY, next],
+            4096,
+        )?;
+        Ok(())
+    }
+
     fn reject_unless_active_lease(&self, expected: &str) -> Result<()> {
         let value: Option<String> = self
             .query_row(
@@ -1867,6 +1908,11 @@ impl Transaction {
         }
         if let Some(expected) = self.expected_lease_owner.as_deref() {
             self.reject_unless_active_lease(expected)?;
+        }
+        if self.allows_write
+            && let Some(instance) = self.expected_launcher.clone()
+        {
+            self.renew_launcher_fence(&instance)?;
         }
         if let Some(probe) = self.commit_lease_probe.clone() {
             return probe(&mut || self.commit_after_lease_probe());

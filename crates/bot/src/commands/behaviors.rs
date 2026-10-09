@@ -51,8 +51,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
                 crate::member_directory::BanContinuation::AlreadyFinished => {}
                 crate::member_directory::BanContinuation::RecordOnly => {
-                    if record_ban_once(env, enrollment.clone(), target, &target_user, &reason)
-                        .await?
+                    if record_ban_once(
+                        env,
+                        enrollment.clone(),
+                        target,
+                        &target_user,
+                        &reason,
+                        db::BanRecord::Retry,
+                    )
+                    .await?
                     {
                         log_mod(
                             env,
@@ -135,6 +142,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                     target,
                                     &target_user,
                                     &reason,
+                                    db::BanRecord::Fresh,
                                 )
                                 .await?
                             {
@@ -919,6 +927,7 @@ async fn record_ban_once(
     target: serenity::model::id::UserId,
     target_user: &UserInfo,
     reason: &str,
+    kind: db::BanRecord,
 ) -> Result<bool> {
     if !env.app.activation.may_record() {
         return Ok(false);
@@ -933,6 +942,7 @@ async fn record_ban_once(
         Some(&env.actor_member.user.name),
         reason,
         None,
+        kind,
     )
     .await?
     .is_some())

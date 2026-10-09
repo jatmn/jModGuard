@@ -29,6 +29,22 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match control.renew_launcher_fence().await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
+                Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
+            }
+        }
+    })
+}
+
 fn role() -> Result<String> {
     let value = std::env::var("JMODGUARD_ROLE").context("JMODGUARD_ROLE is required")?;
     ensure!(
@@ -1014,7 +1030,9 @@ async fn main() -> Result<()> {
         }
         let open_opts = opts.clone();
         match tokio::task::spawn_blocking(move || UpdateControl::open(&open_opts)).await? {
-            Ok(Some(control)) => break control,
+            Ok(Some(control)) => {
+                break control;
+            }
             Ok(None) if role == "bot" && initial.is_none() => {
                 if let Some(task) = boot_health.take() {
                     task.abort();
@@ -1047,6 +1065,33 @@ async fn main() -> Result<()> {
             },
             _ = tokio::time::sleep(POLL) => {},
         }
+    };
+    let instance = format!("{:032x}", rand::random::<u128>());
+    let fence_renewal = if role == "bot" {
+        control.arm_launcher_fence(&instance);
+        let acquired = control
+            .wait_for_launcher_fence(async || {
+                tokio::select! {
+                    _ = jmodguard::shutdown_signal() => true,
+                    _ = tokio::time::sleep(POLL) => false,
+                }
+            })
+            .await;
+        if !acquired {
+            if let Some(child) = initial.as_mut() {
+                stop(child).await?;
+            }
+            if let Some(task) = boot_health {
+                task.abort();
+                let _ = task.await;
+                tracing::info!("launcher released health listener");
+            }
+            jmodguard::log_shutdown_finished("launcher");
+            return Ok(());
+        }
+        Some(spawn_launcher_fence_renewal(control.clone()))
+    } else {
+        None
     };
     let handoff_digest = std::env::var("JMODGUARD_LAUNCHER_RELEASE").ok();
     let baked_controller = handoff_digest.is_none();
@@ -1092,7 +1137,7 @@ async fn main() -> Result<()> {
         baked_compatibility,
         registry: Registry::ghcr()?,
         control,
-        instance: format!("{:032x}", rand::random::<u128>()),
+        instance,
         running: initial,
         maintenance,
         health: boot_health,
@@ -1114,6 +1159,9 @@ async fn main() -> Result<()> {
             },
         }
         tokio::select! { _ = jmodguard::shutdown_signal() => break, _ = tokio::time::sleep(POLL) => {} }
+    }
+    if let Some(task) = fence_renewal {
+        task.abort();
     }
     supervisor.stop_application().await?;
     supervisor.end_idle().await?;

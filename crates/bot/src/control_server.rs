@@ -3,19 +3,104 @@
 use crate::state::BotState;
 use jmodguard::control::{self, NonceWindow};
 use jmodguard::db::{self, ControlReply};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const QUEUE: usize = 8;
+const RESULT_CAP: usize = 4096;
 
 struct Job {
+    request_id: String,
     op: db::ControlOp,
     actor_user_id: i64,
     expires_ms: i64,
     reply: std::sync::mpsc::Sender<ControlReply>,
+}
+
+enum ReplyState {
+    Pending,
+    Ready(ControlReply),
+}
+
+struct StoredReply {
+    at: Instant,
+    state: ReplyState,
+}
+
+type Results = Arc<Mutex<HashMap<String, StoredReply>>>;
+
+fn result_ttl() -> Duration {
+    Duration::from_millis(
+        u64::try_from(control::MAX_AGE_MS)
+            .unwrap_or(60_000)
+            .saturating_mul(2),
+    )
+}
+
+/// Drop results a replay can no longer present, then keep the map inside
+/// [`RESULT_CAP`] by discarding the oldest finished results. A result that is
+/// still in flight stays until it finishes or ages out.
+fn evict_results(guard: &mut HashMap<String, StoredReply>, now: Instant) {
+    let ttl = result_ttl();
+    guard.retain(|_, entry| now.saturating_duration_since(entry.at) <= ttl);
+    while guard.len() > RESULT_CAP {
+        let oldest_ready = guard
+            .iter()
+            .filter(|(_, entry)| matches!(entry.state, ReplyState::Ready(_)))
+            .min_by_key(|(_, entry)| entry.at)
+            .map(|(key, _)| key.clone());
+        let Some(key) = oldest_ready else {
+            break;
+        };
+        guard.remove(&key);
+    }
+}
+
+fn evict_and_insert(
+    guard: &mut HashMap<String, StoredReply>,
+    request_id: String,
+    state: ReplyState,
+) {
+    let now = Instant::now();
+    evict_results(guard, now);
+    guard.insert(request_id, StoredReply { at: now, state });
+    evict_results(guard, now);
+}
+
+fn not_the_writer() -> ControlReply {
+    ControlReply::Failed {
+        message: control::NOT_THE_WRITER.into(),
+    }
+}
+
+fn is_not_the_writer(reply: &ControlReply) -> bool {
+    matches!(reply, ControlReply::Failed { message } if message == control::NOT_THE_WRITER || message == control::RECOVERY_IN_PROGRESS)
+}
+
+fn remember(results: &Results, request_id: &str, reply: &ControlReply) {
+    let mut guard = results
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if is_not_the_writer(reply) {
+        guard.remove(request_id);
+        return;
+    }
+    evict_and_insert(
+        &mut guard,
+        request_id.to_owned(),
+        ReplyState::Ready(reply.clone()),
+    );
+}
+
+fn forget(results: &Results, request_id: &str) {
+    results
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(request_id);
 }
 
 pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>> {
@@ -26,21 +111,38 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
             return Ok(None);
         }
     };
-    let bind = control::parse_private_bind(&app.cfg.bot.control_bind)?;
-    let listener =
-        TcpListener::bind(bind).map_err(|_| anyhow::anyhow!("control bind is not private"))?;
-    let bound = listener
-        .local_addr()
-        .map_err(|_| anyhow::anyhow!("control bind is not private"))?;
+    let bind = match control::parse_private_bind(&app.cfg.bot.control_bind) {
+        Ok(bind) => bind,
+        Err(error) => {
+            tracing::error!("control listener disabled: {error:#}");
+            return Ok(None);
+        }
+    };
+    let listener = match TcpListener::bind(bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!("control listener disabled: {error}");
+            return Ok(None);
+        }
+    };
+    let bound = match listener.local_addr() {
+        Ok(bound) => bound,
+        Err(error) => {
+            tracing::error!("control listener disabled: {error}");
+            return Ok(None);
+        }
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(QUEUE);
+    let results: Results = Arc::new(Mutex::new(HashMap::new()));
     let worker = Arc::clone(&app);
+    let worker_results = Arc::clone(&results);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             while worker.activation.moderation_depth() > 0 && worker.activation.may_record() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let reply = if !worker.activation.may_record() {
-                ControlReply::Waiting
+                not_the_writer()
             } else if control::now_ms() > job.expires_ms {
                 ControlReply::Failed {
                     message: "request expired".into(),
@@ -50,7 +152,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     .authorize_control_actor(&job.op, job.actor_user_id)
                     .await;
                 if !worker.activation.may_record() {
-                    ControlReply::Waiting
+                    not_the_writer()
                 } else if control::now_ms() > job.expires_ms {
                     ControlReply::Failed {
                         message: "request expired".into(),
@@ -66,6 +168,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     )
                     .await
                     {
+                        Ok(ControlReply::Waiting) => not_the_writer(),
                         Ok(reply) => reply,
                         Err(error) => ControlReply::Failed {
                             message: control::public_error(&error),
@@ -73,6 +176,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     }
                 }
             };
+            remember(&worker_results, &job.request_id, &reply);
             let _ = job.reply.send(reply);
         }
     });
@@ -81,7 +185,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
     let activation = Arc::clone(&app.activation);
     std::thread::Builder::new()
         .name("writer-link".into())
-        .spawn(move || accept_loop(listener, key, tx, nonces, inflight, activation))
+        .spawn(move || accept_loop(listener, key, tx, nonces, inflight, activation, results))
         .map_err(|_| anyhow::anyhow!("control bind is not private"))?;
     Ok(Some(bound))
 }
@@ -103,6 +207,7 @@ fn accept_loop(
     nonces: Arc<Mutex<NonceWindow>>,
     inflight: Arc<AtomicUsize>,
     activation: Arc<crate::activation::Activation>,
+    results: Results,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept() else {
@@ -118,10 +223,11 @@ fn accept_loop(
         let nonces = Arc::clone(&nonces);
         let inflight_conn = Arc::clone(&inflight);
         let activation = Arc::clone(&activation);
+        let results = Arc::clone(&results);
         if std::thread::Builder::new()
             .name("writer-link-conn".into())
             .spawn(move || {
-                handle(stream, &key, &tx, &nonces, &activation);
+                handle(stream, &key, &tx, &nonces, &activation, &results);
                 inflight_conn.fetch_sub(1, Ordering::Relaxed);
             })
             .is_err()
@@ -137,6 +243,7 @@ fn handle(
     tx: &tokio::sync::mpsc::Sender<Job>,
     nonces: &Mutex<NonceWindow>,
     activation: &Arc<crate::activation::Activation>,
+    results: &Results,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -144,7 +251,17 @@ fn handle(
         Ok(body) => body,
         Err(_) => return,
     };
-    let (op, actor_user_id, expires_ms) = match control::open_frame(key, &body, nonces) {
+    if activation.recovery_in_progress() {
+        let _ = reply(
+            stream,
+            &ControlReply::Failed {
+                message: control::RECOVERY_IN_PROGRESS.into(),
+            },
+        );
+        return;
+    }
+    let (op, actor_user_id, expires_ms, request_id) = match control::open_frame(key, &body, nonces)
+    {
         Ok(opened) => opened,
         Err(error) => {
             let _ = reply(
@@ -156,13 +273,43 @@ fn handle(
             return;
         }
     };
+    enum Replay {
+        Ready(ControlReply),
+        Pending,
+        New,
+    }
+    {
+        let mut guard = results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = match guard.get(&request_id).map(|entry| &entry.state) {
+            Some(ReplyState::Ready(done)) => Replay::Ready(done.clone()),
+            Some(ReplyState::Pending) => Replay::Pending,
+            None => Replay::New,
+        };
+        match cached {
+            Replay::Ready(done) => {
+                drop(guard);
+                let _ = reply(stream, &done);
+                return;
+            }
+            Replay::Pending => {
+                drop(guard);
+                let _ = reply(stream, &ControlReply::StillWaiting);
+                return;
+            }
+            Replay::New => evict_and_insert(&mut guard, request_id.clone(), ReplyState::Pending),
+        }
+    }
     let Some(_hold) = activation.hold_control() else {
-        let _ = reply(stream, &ControlReply::Waiting);
+        forget(results, &request_id);
+        let _ = reply(stream, &not_the_writer());
         return;
     };
     let (send, recv) = std::sync::mpsc::channel();
     if tx
         .try_send(Job {
+            request_id: request_id.clone(),
             op,
             actor_user_id,
             expires_ms,
@@ -170,6 +317,7 @@ fn handle(
         })
         .is_err()
     {
+        forget(results, &request_id);
         let _ = reply(stream, &ControlReply::Busy);
         return;
     }
@@ -218,6 +366,89 @@ mod tests {
         };
         assert!(applied);
         assert!(matches!(reply, ControlReply::Saved { .. }));
+    }
+
+    #[test]
+    fn old_ready_result_is_evicted_and_a_pending_entry_is_kept() {
+        let results = Arc::new(Mutex::new(HashMap::new()));
+        let now = Instant::now();
+        {
+            let mut guard = results.lock().unwrap();
+            guard.insert(
+                "old-ready".into(),
+                StoredReply {
+                    at: now
+                        .checked_sub(result_ttl() + Duration::from_secs(1))
+                        .unwrap_or(now),
+                    state: ReplyState::Ready(ControlReply::Saved {
+                        body: serde_json::Value::Null,
+                    }),
+                },
+            );
+            guard.insert(
+                "pending".into(),
+                StoredReply {
+                    at: now,
+                    state: ReplyState::Pending,
+                },
+            );
+        }
+        remember(
+            &results,
+            "new",
+            &ControlReply::Unchanged {
+                body: serde_json::Value::Null,
+            },
+        );
+        let guard = results.lock().unwrap();
+        assert!(
+            !guard.contains_key("old-ready"),
+            "a finished result older than two frame lifetimes is evicted"
+        );
+        assert!(matches!(
+            guard.get("pending").map(|entry| &entry.state),
+            Some(ReplyState::Pending)
+        ));
+        assert!(matches!(
+            guard.get("new").map(|entry| &entry.state),
+            Some(ReplyState::Ready(_))
+        ));
+        drop(guard);
+
+        let mut guard = results.lock().unwrap();
+        guard.clear();
+        let now = Instant::now();
+        for index in 0..RESULT_CAP - 1 {
+            guard.insert(
+                format!("pending-{index}"),
+                StoredReply {
+                    at: now,
+                    state: ReplyState::Pending,
+                },
+            );
+        }
+        guard.insert(
+            "oldest-ready".into(),
+            StoredReply {
+                at: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
+                state: ReplyState::Ready(ControlReply::Waiting),
+            },
+        );
+        evict_and_insert(
+            &mut guard,
+            "newest-ready".into(),
+            ReplyState::Ready(ControlReply::Busy),
+        );
+        assert_eq!(guard.len(), RESULT_CAP);
+        assert!(!guard.contains_key("oldest-ready"));
+        assert!(guard.contains_key("newest-ready"));
+        assert_eq!(
+            guard
+                .values()
+                .filter(|entry| matches!(entry.state, ReplyState::Pending))
+                .count(),
+            RESULT_CAP - 1
+        );
     }
 
     use crate::config::BotProcessConfig;
@@ -295,6 +526,17 @@ mod tests {
     fn seal(op: &db::ControlOp, actor: i64) -> Vec<u8> {
         control::seal_with_expiry(&key(), op, actor, control::now_ms().saturating_add(60_000))
             .unwrap()
+    }
+
+    fn seal_request(op: &db::ControlOp, actor: i64, request_id: &str) -> Vec<u8> {
+        control::seal_with_request(
+            &key(),
+            op,
+            actor,
+            control::now_ms().saturating_add(60_000),
+            request_id,
+        )
+        .unwrap()
     }
 
     fn failure_message(reply: &ControlReply) -> &str {
@@ -561,6 +803,277 @@ mod tests {
         let reply = pending.await.unwrap();
         assert_eq!(failure_message(&reply), "request expired");
         assert_ne!(db::get_settings(&bot.db, 10).await.unwrap().prefix, "!late");
+        drop(bot);
+        cleanup(&path);
+    }
+
+    fn allow_actor(bot: &BotState) {
+        bot.install_control_actor_lookup(|actor, _| {
+            (actor == 7).then_some(db::CachedGuildActor {
+                guild_owner_id: 0,
+                permissions: 1 << 5,
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bot_without_the_lease_refuses_a_control_job() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        bot.activation.note_lease_lost();
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let reply = submit(bound, seal(&patch(&enrollment, "!taken"), 7));
+        assert_eq!(failure_message(&reply), "not the writer");
+        assert_ne!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!taken"
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_control_job_is_not_applied_after_the_lease_is_lost() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let hold = bot.activation.hold_rule();
+        let frame = seal(&patch(&enrollment, "!queued"), 7);
+        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        bot.activation.note_lease_lost();
+        drop(hold);
+        let reply = pending.await.unwrap();
+        assert_eq!(failure_message(&reply), "not the writer");
+        assert_ne!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!queued"
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_control_result_is_retrievable_and_replay_does_not_apply_twice() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let hold = bot.activation.hold_rule();
+        let scope = scope(&enrollment);
+        let op = db::ControlOp::AddBadword {
+            request: scope.clone(),
+            target: scope,
+            pattern: "spam".into(),
+            note: None,
+        };
+        let request_id = control::random_request_id().unwrap();
+        let frame = seal_request(&op, 7, &request_id);
+        let timed_out = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect(bound).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&frame).unwrap();
+            control::read_frame(&mut stream).is_err()
+        });
+        assert!(timed_out.await.unwrap(), "the first wait must time out");
+        drop(hold);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .len();
+            if count == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accepted control operation did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let replay = submit(bound, seal_request(&op, 7, &request_id));
+        assert!(matches!(replay, ControlReply::Saved { .. }), "{replay:?}");
+        assert_eq!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a replay must not insert a second badwords row"
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_identical_requests_both_apply() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let scope = scope(&enrollment);
+        let op = db::ControlOp::AddBadword {
+            request: scope.clone(),
+            target: scope,
+            pattern: "spam".into(),
+            note: None,
+        };
+        let first = submit(bound, seal(&op, 7));
+        let second = submit(bound, seal(&op, 7));
+        assert!(matches!(first, ControlReply::Saved { .. }), "{first:?}");
+        assert!(matches!(second, ControlReply::Saved { .. }), "{second:?}");
+        assert_eq!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_in_progress_refuses_a_control_job() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        bot.activation.set_recovery_in_progress(true);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let scope = scope(&enrollment);
+        let op = db::ControlOp::AddBadword {
+            request: scope.clone(),
+            target: scope,
+            pattern: "spam".into(),
+            note: None,
+        };
+        let refused = submit(bound, seal(&op, 7));
+        assert_eq!(failure_message(&refused), "recovery in progress");
+        assert!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        bot.activation.set_recovery_in_progress(false);
+        let saved = submit(bound, seal(&op, 7));
+        assert!(matches!(saved, ControlReply::Saved { .. }), "{saved:?}");
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_control_bind_disables_the_link_and_the_bot_still_bans() {
+        let path =
+            std::env::temp_dir().join(format!("control_bind_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.bot.control_bind = "0.0.0.0:9".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let bot = BotState::new(cfg, database).unwrap();
+        assert!(spawn(Arc::clone(&bot)).unwrap().is_none());
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.bot.control_bind = held.local_addr().unwrap().to_string();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let database = db::Db::open(&path, 2).unwrap();
+        let bot = BotState::new(cfg, database).unwrap();
+        assert!(spawn(Arc::clone(&bot)).unwrap().is_none());
+        bot.activation.mark_lock_held(true);
+        assert!(
+            db::claim_active_bot(
+                &bot.db,
+                bot.activation.instance(),
+                control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        let id = db::record_enrolled_ban_if_absent(
+            &bot.db,
+            Some(enrollment),
+            55,
+            None,
+            None,
+            Some(1),
+            None,
+            "spam",
+            None,
+            db::BanRecord::Fresh,
+        )
+        .await
+        .unwrap();
+        assert!(id.is_some());
+        drop(held);
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_job_during_the_first_recovery_read_is_recovery_in_progress() {
+        let _lock = crate::recovery::recovery_test_lock().lock().await;
+        let path = std::env::temp_dir().join(format!(
+            "control_recovery_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let database = db::Db::open(&path, 2).unwrap();
+        crate::recovery::queue(&database, &["mark-api"])
+            .await
+            .unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.bot.control_bind = "127.0.0.1:0".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let bot = BotState::new(cfg, database).unwrap();
+        crate::recovery::arm_pending_pause();
+        assert!(
+            crate::activation::claim_writer_lease(&"x".repeat(32), &bot.db, &bot.activation)
+                .await
+                .unwrap()
+        );
+        let started = std::time::Instant::now();
+        while !crate::recovery::pending_pause_entered() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "recovery did not reach its first read"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let scope = scope(&enrollment);
+        let op = db::ControlOp::AddBadword {
+            request: scope.clone(),
+            target: scope,
+            pattern: "spam".into(),
+            note: None,
+        };
+        let refused = submit(bound, seal(&op, 7));
+        assert_eq!(failure_message(&refused), "recovery in progress");
+        crate::recovery::release_pending_pause();
+        let finished = std::time::Instant::now();
+        while !crate::recovery::step_done(&bot.db, "mark-api")
+            .await
+            .unwrap()
+        {
+            assert!(
+                finished.elapsed() < Duration::from_secs(2),
+                "recovery did not finish after the read was released"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         drop(bot);
         cleanup(&path);
     }

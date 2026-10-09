@@ -1,7 +1,7 @@
 //! Stable, restricted update control. Application schema checks stay in `Db`.
 //! Future application migrations must retain the v1 control tables and keys.
 use super::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
 /// Monotonic updater capability, independent of source SHA and shell protocol.
@@ -16,6 +16,23 @@ const UPGRADE_KEY: &str = "component_upgrade_v1";
 #[derive(Debug, thiserror::Error)]
 #[error("upgrade progress changed; retry from current state")]
 pub struct UpgradeProgressChanged;
+
+fn launcher_fence_held(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("launcher fence held"))
+}
+
+fn warn_api_launcher_cannot_record_upgrade() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        "API launcher cannot record paired-upgrade progress; the upgrade will not advance"
+    );
+}
 
 fn require_progress(current: bool) -> Result<()> {
     if !current {
@@ -136,7 +153,8 @@ impl ServiceUpgrade {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UpgradeAcknowledgement {
     Prepared,
     Stopped,
@@ -250,6 +268,57 @@ impl UpdateControl {
         Self { db: db.clone() }
     }
 
+    /// Bot-launcher fence. The API launcher never calls this and never writes.
+    pub fn arm_launcher_fence(&self, instance: &str) {
+        self.db.arm_launcher_fence(instance);
+    }
+
+    /// Extend this process's launcher fence. The transaction writes that fence
+    /// only. `Ok(false)` means another live launcher holds it. This does not
+    /// read or write the active-bot lease.
+    pub async fn renew_launcher_fence(&self) -> Result<bool> {
+        if !self.writes_locally() || self.db.launcher_instance().is_none() {
+            return Ok(false);
+        }
+        match self
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_immediate()?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error) if launcher_fence_held(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retry `renew_launcher_fence` until this launcher owns the fence.
+    /// `pause` returns true to stop without taking it (shutdown). Another
+    /// live holder is logged once; other errors are logged and retried.
+    pub async fn wait_for_launcher_fence(&self, mut pause: impl AsyncFnMut() -> bool) -> bool {
+        let mut warned = false;
+        loop {
+            match self.renew_launcher_fence().await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    if !warned {
+                        tracing::warn!(
+                            "another bot launcher still holds the fence and this launcher is waiting"
+                        );
+                        warned = true;
+                    }
+                }
+                Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
+            }
+            if pause().await {
+                return false;
+            }
+        }
+    }
+
     pub fn writes_locally(&self) -> bool {
         !self.db.is_read_only()
     }
@@ -278,6 +347,9 @@ impl UpdateControl {
     }
 
     pub async fn set_channel(&self, role: &str, channel: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         set_update_policy(&self.db, role, channel, "off", false)
             .await
             .map(|_| ())
@@ -291,6 +363,9 @@ impl UpdateControl {
         error: Option<String>,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         record_update_check(&self.db, component, channel, candidate, error, now)
             .await
             .map(|_| ())
@@ -299,6 +374,9 @@ impl UpdateControl {
     /// Hold both service check leases before registry work. A failure to take
     /// the second lease releases the first so Administration discovery is not stuck.
     pub async fn acquire_pair_check(&self, now: i64) -> Result<String> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot acquire an update lease");
+        }
         let owner = format!("{:032x}", rand::random::<u128>());
         if !claim_update_lease(&self.db, "bot", &owner, now, 240).await? {
             anyhow::bail!("another update operation is running");
@@ -317,6 +395,9 @@ impl UpdateControl {
     }
 
     pub async fn release_pair_check(&self, owner: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         release_update_lease(&self.db, "bot", owner).await?;
         release_update_lease(&self.db, "api", owner).await?;
         Ok(())
@@ -332,6 +413,9 @@ impl UpdateControl {
         api: ComponentRelease,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         anyhow::ensure!(
             matches!(channel, "latest" | "stable" | "nightly"),
             "invalid channel"
@@ -389,6 +473,9 @@ impl UpdateControl {
         observation: ComponentObservation,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         record_component_running(&self.db, role, release, observation, now).await
     }
 
@@ -398,12 +485,15 @@ impl UpdateControl {
         observation: ComponentObservation,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         record_baked_component_running(&self.db, role, observation, now).await
     }
 
     pub async fn failed(&self, role: &str, release: &ComponentRelease, error: &str) -> Result<()> {
-        if self.db.is_read_only() {
-            anyhow::bail!("read-only database cannot record a component failure");
+        if !self.writes_locally() {
+            return Ok(());
         }
         record_component_failure(&self.db, role, release, error).await
     }
@@ -417,6 +507,9 @@ impl UpdateControl {
         error: &str,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         record_component_rollback(&self.db, role, failed, previous, observation, error, now).await
     }
 
@@ -501,6 +594,9 @@ impl UpdateControl {
         role: &str,
         release: &ComponentRelease,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         let (role, release) = (role.to_owned(), serde_json::to_string(release)?);
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -519,6 +615,9 @@ impl UpdateControl {
         release: &ComponentRelease,
     ) -> Result<()> {
         anyhow::ensure!(release.launcher.is_none(), "launcher contract is present");
+        if !self.writes_locally() {
+            return Ok(());
+        }
         let (role, release) = (role.to_owned(), release.clone());
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -563,8 +662,8 @@ impl UpdateControl {
     }
 
     pub async fn launcher_failed(&self, role: &str, digest: &str, error: &str) -> Result<()> {
-        if self.db.is_read_only() {
-            anyhow::bail!("read-only database cannot record a launcher failure");
+        if !self.writes_locally() {
+            return Ok(());
         }
         record_launcher_failure(&self.db, role, digest, error).await
     }
@@ -578,6 +677,9 @@ impl UpdateControl {
         recover: bool,
         now: i64,
     ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot request an upgrade");
+        }
         let (bot_digest, api_digest) = (bot_digest.to_owned(), api_digest.to_owned());
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -666,6 +768,9 @@ impl UpdateControl {
         release: &ComponentRelease,
         operation: Option<&str>,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         release.validate()?;
         let release = release.clone();
         let operation = operation.map(str::to_owned);
@@ -688,6 +793,9 @@ impl UpdateControl {
     }
 
     pub async fn abort_upgrade(&self, id: &str) -> Result<()> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot abort an upgrade");
+        }
         let id = id.to_owned();
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -708,6 +816,10 @@ impl UpdateControl {
         role: &str,
         instance: &str,
     ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            warn_api_launcher_cannot_record_upgrade();
+            return self.upgrade().await?.context("no coordinated upgrade");
+        }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
             .with_conn(move |conn| {
@@ -744,6 +856,10 @@ impl UpdateControl {
         instance: &str,
         action: UpgradeAcknowledgement,
     ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            warn_api_launcher_cannot_record_upgrade();
+            return self.upgrade().await?.context("no coordinated upgrade");
+        }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
             .with_conn(move |conn| {
@@ -824,8 +940,8 @@ impl UpdateControl {
     }
 
     pub async fn upgrade_error(&self, id: &str, error: &str) -> Result<()> {
-        if self.db.is_read_only() {
-            anyhow::bail!("read-only database cannot record an upgrade error");
+        if !self.writes_locally() {
+            return Ok(());
         }
         let (id, error) = (id.to_owned(), error.chars().take(300).collect::<String>());
         self.db
@@ -1303,5 +1419,316 @@ mod tests {
         empty.path = f.path.with_extension("empty");
         assert!(UpdateControl::open(&empty).unwrap().is_none());
         let _ = std::fs::remove_file(empty.path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_launcher_never_writes() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+        let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+        let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        arm_writer_open_tripwire(std::sync::Arc::clone(&tripped));
+        let mut opts = f.opts.clone();
+        opts.read_only = true;
+        let reader = UpdateControl::open(&opts).unwrap().unwrap();
+        assert!(!reader.writes_locally());
+        let observed = f.control.component("api").await.unwrap().observed.unwrap();
+        reader
+            .running("api", None, observed.clone(), 300)
+            .await
+            .unwrap();
+        reader
+            .baked_running("api", observed.clone(), 300)
+            .await
+            .unwrap();
+        reader
+            .join_upgrade(&upgrade.id, "api", "api")
+            .await
+            .unwrap();
+        reader
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Prepared)
+            .await
+            .unwrap();
+        reader.upgrade_error(&upgrade.id, "api-role").await.unwrap();
+        reader.observe_launcher("api", 1).await.unwrap();
+        reader
+            .launcher_failed("api", "sha256:aa", "dropped")
+            .await
+            .unwrap();
+        assert_eq!(probe.immediate(), 0);
+        assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            reader.upgrade().await.unwrap().unwrap().error.is_none(),
+            "an API launcher must not record an upgrade error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn old_and_new_bot_launchers_race_and_only_the_fenced_write_lands() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let old = UpdateControl::open(&opts).unwrap().unwrap();
+        let new = UpdateControl::open(&opts).unwrap().unwrap();
+        let old_id = "aa".repeat(16);
+        let new_id = "bb".repeat(16);
+        old.arm_launcher_fence(&old_id);
+        new.arm_launcher_fence(&new_id);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let old_task = {
+            let start = std::sync::Arc::clone(&start);
+            let old = old.clone();
+            tokio::spawn(async move {
+                start.wait();
+                old.observe_launcher("bot", 11).await
+            })
+        };
+        let new_task = {
+            let start = std::sync::Arc::clone(&start);
+            let new = new.clone();
+            tokio::spawn(async move {
+                start.wait();
+                new.observe_launcher("bot", 22).await
+            })
+        };
+        let (left, right) = tokio::join!(old_task, new_task);
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert!(
+            left.is_ok() ^ right.is_ok(),
+            "exactly one launcher write lands: {left:?} {right:?}"
+        );
+        let revision = f
+            .control
+            .component("bot")
+            .await
+            .unwrap()
+            .observed
+            .unwrap()
+            .launcher_revision;
+        let owner: String = f
+            .control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value: String = tx.query_row(
+                    "SELECT value FROM meta WHERE key='launcher_lease'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap();
+        let holder = owner.split_whitespace().next().unwrap();
+        if left.is_ok() {
+            assert_eq!(revision, 11);
+            assert_eq!(holder, old_id);
+        } else {
+            assert_eq!(revision, 22);
+            assert_eq!(holder, new_id);
+        }
+    }
+
+    async fn rewrite_launcher_expiry(control: &UpdateControl, owner: &str, expires: i64) {
+        let value = format!("{owner} {expires}");
+        control
+            .db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                crate::db::write_meta_string_conn(&tx, "launcher_lease", &value)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn active_bot_lease(control: &UpdateControl) -> Option<String> {
+        control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key='active_bot_lease'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewed_launcher_fence_blocks_a_second_writer_past_the_original_window() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let other = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let other_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        other.arm_launcher_fence(&other_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
+        assert!(
+            holder.renew_launcher_fence().await.unwrap(),
+            "the holder renews after the original window"
+        );
+        let blocked = other.observe_launcher("bot", 22).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "a renewed fence still blocks the other launcher: {blocked:#}"
+        );
+        assert!(active_bot_lease(&holder).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_launcher_takes_the_fence_after_the_holder_expires() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let waiting = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let waiting_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        waiting.arm_launcher_fence(&waiting_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        assert!(
+            !waiting.wait_for_launcher_fence(async || true).await,
+            "shutdown leaves the fence with the holder"
+        );
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        let pauses = std::sync::atomic::AtomicUsize::new(0);
+        let acquired = waiting
+            .wait_for_launcher_fence(async || {
+                if pauses.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                    return true;
+                }
+                rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000)
+                    .await;
+                false
+            })
+            .await;
+        assert!(
+            acquired,
+            "the waiting launcher takes the fence after expiry"
+        );
+        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "the old launcher's next write fails: {blocked:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_launcher_fence_lets_the_new_launcher_take_over() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let other = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let other_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        other.arm_launcher_fence(&other_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
+        other.observe_launcher("bot", 22).await.unwrap();
+        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "the old launcher's next write fails: {blocked:#}"
+        );
+        assert!(!holder.renew_launcher_fence().await.unwrap());
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .observed
+                .unwrap()
+                .launcher_revision,
+            22
+        );
+    }
+
+    /// Bot-launcher writes land with no `active_bot_lease` (the bot process is
+    /// stopped). The read-only API launcher does not record these steps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_completes_while_the_bot_process_is_stopped() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let launcher = "cc".repeat(16);
+        f.control.arm_launcher_fence(&launcher);
+        let upgrade = f.queue(false, 200).await.unwrap();
+        for role in ["bot", "api"] {
+            f.control
+                .join_upgrade(&upgrade.id, role, role)
+                .await
+                .unwrap();
+            f.control
+                .acknowledge(&upgrade.id, role, role, UpgradeAcknowledgement::Prepared)
+                .await
+                .unwrap();
+        }
+        f.control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        let stopped = f
+            .control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        assert!(stopped.bot.stopped, "the bot process is stopped");
+        assert!(matches!(stopped.phase, UpgradePhase::StartingBot));
+        let lease: Option<String> = f
+            .control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key='active_bot_lease'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap();
+        assert!(
+            lease.is_none(),
+            "the bot process is not holding the writer lease"
+        );
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Starting)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Ready)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Starting)
+            .await
+            .unwrap();
+        let done = f
+            .control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Ready)
+            .await
+            .unwrap();
+        assert_eq!(done.phase, UpgradePhase::Complete);
+        assert!(done.error.is_none());
     }
 }

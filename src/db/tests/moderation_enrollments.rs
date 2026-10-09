@@ -378,6 +378,7 @@ async fn stale_active_ban_is_replaced_and_the_same_dispatch_is_not_inserted_twic
         None,
         "new reason",
         Some(occurred),
+        BanRecord::Retry,
     )
     .await
     .unwrap();
@@ -402,6 +403,7 @@ async fn stale_active_ban_is_replaced_and_the_same_dispatch_is_not_inserted_twic
         None,
         "new reason",
         Some(occurred),
+        BanRecord::Retry,
     )
     .await
     .unwrap();
@@ -431,6 +433,7 @@ async fn same_dispatch_without_occurred_at_inserts_once() {
         None,
         "handoff",
         None,
+        BanRecord::Retry,
     )
     .await
     .unwrap();
@@ -445,6 +448,7 @@ async fn same_dispatch_without_occurred_at_inserts_once() {
         None,
         "handoff",
         None,
+        BanRecord::Retry,
     )
     .await
     .unwrap();
@@ -487,6 +491,7 @@ async fn ended_ban_does_not_block_a_new_insert() {
         None,
         "fresh",
         Some("2024-03-03T00:00:00+00:00"),
+        BanRecord::Retry,
     )
     .await
     .unwrap();
@@ -501,5 +506,183 @@ async fn ended_ban_does_not_block_a_new_insert() {
             .reason
             .as_deref(),
         Some("fresh")
+    );
+}
+
+#[tokio::test]
+async fn fresh_ban_replaces_a_matching_active_row() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(first.is_some());
+    let replacement = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(replacement.is_some());
+    assert_ne!(replacement, first);
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, replacement.unwrap());
+    assert_eq!(rows.iter().filter(|row| !row.active).count(), 1);
+}
+
+#[tokio::test]
+async fn missed_unban_then_the_same_automod_reban_inserts_a_new_active_row() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let reason = "[automod:invite] posted a link";
+    let first = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        None,
+        None,
+        reason,
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(first.is_some());
+    let replacement = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        None,
+        None,
+        reason,
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(replacement.is_some());
+    assert_ne!(replacement, first);
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, replacement.unwrap());
+    assert_eq!(active[0].reason.as_deref(), Some(reason));
+    assert_eq!(active[0].moderator_id, None);
+    assert_eq!(rows.iter().filter(|row| !row.active).count(), 1);
+}
+
+#[tokio::test]
+async fn unban_then_reban_with_the_same_reason_and_moderator_inserts() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(first.is_some());
+    mark_enrolled_unbanned(&f.db, Some(scope.clone()), 55)
+        .await
+        .unwrap();
+    let again = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Fresh,
+    )
+    .await
+    .unwrap();
+    assert!(again.is_some());
+    assert_ne!(again, first);
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, again.unwrap());
+    assert_eq!(active[0].reason.as_deref(), Some("spam"));
+    assert_eq!(active[0].moderator_id, Some(9));
+}
+
+#[tokio::test]
+async fn retry_of_the_same_ban_dispatch_inserts_once() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Retry,
+    )
+    .await
+    .unwrap();
+    let again = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "spam",
+        None,
+        BanRecord::Retry,
+    )
+    .await
+    .unwrap();
+    assert!(first.is_some());
+    assert_eq!(again, None);
+    assert_eq!(
+        list_enrolled_bans(&f.db, scope, 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.active)
+            .count(),
+        1
     );
 }

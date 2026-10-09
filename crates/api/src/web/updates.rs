@@ -19,6 +19,24 @@ fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error":message})))
 }
 
+fn check_failure(err: &anyhow::Error) -> (StatusCode, Json<Value>) {
+    let unavailable = err
+        .chain()
+        .any(|cause| cause.to_string() == jmodguard::control::CONTROL_LINK_UNAVAILABLE);
+    if unavailable {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            jmodguard::control::CONTROL_LINK_UNAVAILABLE,
+        )
+    } else {
+        error(StatusCode::SERVICE_UNAVAILABLE, "release check failed")
+    }
+}
+
+pub fn release_check_is_stale(checked_at: Option<i64>, now: i64) -> bool {
+    checked_at.is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+}
+
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 macro_rules! via_bot {
@@ -261,7 +279,7 @@ pub async fn check(
     }
     let written = check_one(&app, &input.component)
         .await
-        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "release check failed"))?;
+        .map_err(|error| check_failure(&error))?;
     status_response(&app, Some(written)).await
 }
 
@@ -738,10 +756,7 @@ pub async fn install(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    if record
-        .checked_at
-        .is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
-    {
+    if release_check_is_stale(record.checked_at, now) {
         return Err(error(
             StatusCode::CONFLICT,
             "release check is stale; check again",
