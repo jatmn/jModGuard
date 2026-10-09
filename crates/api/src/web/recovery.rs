@@ -289,7 +289,9 @@ fn maintenance_router(state: Arc<RecoveryState>, store: MemoryStore) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{self, ComponentObservation, ComponentRelease, Db, UpgradeCompatibility};
+    use crate::db::{
+        self, ComponentObservation, ComponentRelease, Db, SqlExecutor, UpgradeCompatibility,
+    };
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
