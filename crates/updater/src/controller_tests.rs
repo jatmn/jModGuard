@@ -165,6 +165,7 @@ fn controller(
         standby: None,
         rollback: None,
         pending_failure: None,
+        pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,
         reported: false,
@@ -181,6 +182,7 @@ async fn restart(service: &mut Supervisor) {
     service.standby = None;
     service.rollback = None;
     service.pending_failure = None;
+    service.pending_startup.clear();
     service.receipt_attempt = 0;
     service.receipt_not_before = None;
 }
@@ -1565,5 +1567,329 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     assert!(!root.join("jmodguard-launcher-next").exists());
     server.abort();
     drop(service);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn revision_two_controller_keeps_a_revision_three_launcher_selection() {
+    let root = std::env::temp_dir().join(format!(
+        "launcher-rev2-keeps-rev3-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let mut objects = HashMap::new();
+    let mut release = image(&mut objects, "bot", b"\x7fELFfixture");
+    release.launcher = Some(db::LauncherCompatibility {
+        revision: 3,
+        min_revision: 3,
+    });
+    store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let mut bot = controller(
+        "bot",
+        root.join("baked-bot"),
+        registry,
+        control.clone(),
+        &root,
+    );
+    bot.launcher_revision = 2;
+    let selected = bot
+        .launcher(&control.component("bot").await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(selected, ControlStep::Reexec));
+    let desired = control
+        .component("bot")
+        .await
+        .unwrap()
+        .desired_launcher
+        .unwrap();
+    assert_eq!(desired.digest, release.digest);
+    assert_eq!(desired.launcher.unwrap().revision, 3);
+    let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+        .await
+        .unwrap();
+    assert!(handoff.ends_with(&format!("{}\n", release.digest)));
+    server.abort();
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+async fn http_application(root: &Path) -> PathBuf {
+    let path = root.join("http-api");
+    let source = root.join("http_api.rs");
+    let code = r#"
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+static STOP: AtomicBool = AtomicBool::new(false);
+extern "C" fn stop(_: i32) { STOP.store(true, Ordering::SeqCst); }
+unsafe extern "C" { fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }
+fn main() {
+    unsafe { signal(15, stop); }
+    let maintenance = std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1");
+    let ready = std::path::PathBuf::from(std::env::var("JMODGUARD_READY_FILE").unwrap());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::fs::write(ready.with_extension("port"), port.to_string()).unwrap();
+    std::fs::write(ready.with_extension("mode"), if maintenance { "1" } else { "0" }).unwrap();
+    std::fs::write(&ready, "ready").unwrap();
+    while !STOP.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if line.starts_with("GET /health") {
+                    ("200 OK", "ok")
+                } else if line.starts_with("GET /api/me") && !maintenance {
+                    ("200 OK", "{\"ok\":true}")
+                } else {
+                    ("404 Not Found", "missing")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+}
+"#;
+    tokio::fs::write(&source, code).await.unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
+        .arg(&path)
+        .arg(&source)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    path
+}
+
+fn read_only_options(path: &Path) -> DbOpenOptions {
+    DbOpenOptions {
+        read_only: true,
+        path: path.to_owned(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    }
+}
+
+async fn application_route(port_file: &Path) -> String {
+    let started = Instant::now();
+    let port = loop {
+        if let Ok(text) = tokio::fs::read_to_string(port_file).await
+            && let Ok(port) = text.trim().parse::<u16>()
+        {
+            break port;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "application did not publish its port"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let started = Instant::now();
+    loop {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream
+                .write_all(b"GET /api/me HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut body = String::new();
+            let _ = stream.read_to_string(&mut body).await;
+            if body.contains("200") {
+                return body;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "application route was not served"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn api_without_a_writer(binary: &Path, root: &Path, db_path: &Path) {
+    let control = UpdateControl::open(&read_only_options(db_path))
+        .unwrap()
+        .unwrap();
+    assert!(!control.writes_locally());
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        planned.first(),
+        Some(StartupReceipt::BakedLauncher { .. })
+    ));
+    assert!(matches!(
+        planned.get(1),
+        Some(StartupReceipt::ObserveLauncher)
+    ));
+    let mut service = controller(
+        "api",
+        binary.to_owned(),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        root,
+    );
+    service.enabled = false;
+    service.pending_startup = planned;
+    let started = service.tick().await;
+    assert!(started.is_ok(), "{started:?}");
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let mode = tokio::fs::read_to_string(ready.with_extension("mode"))
+        .await
+        .unwrap();
+    assert_eq!(mode.trim(), "0");
+    assert_eq!(service.pending_startup.len(), 2);
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .launcher_sha256
+            .is_none()
+    );
+    service.stop_application().await.unwrap();
+}
+
+#[tokio::test]
+async fn api_role_serves_the_application_when_startup_receipts_cannot_be_saved() {
+    let root = std::env::temp_dir().join(format!(
+        "api-startup-nowriter-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let _db = Db::open(&db_path, 2).unwrap();
+    assert!(api_writer_link("", &"x".repeat(32)).is_none());
+    assert!(api_writer_link("", "").is_none());
+    assert!(api_writer_link("127.0.0.1:9", "short").is_none());
+    for name in ["unset", "empty", "secret"] {
+        api_without_a_writer(&binary, &root.join(name), &db_path).await;
+    }
+    drop(_db);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is_writer() {
+    let root = std::env::temp_dir().join(format!(
+        "api-startup-writer-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let bot_db = Db::open(&db_path, 2).unwrap();
+    let secret = "x".repeat(32);
+    let mut bot_cfg = jmodguard::config::BotProcessConfig::default();
+    bot_cfg.db.path = db_path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = jmodguard::config::ControlSecret::new(secret.clone());
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let link = jmodguard::control::try_writer_link(&bound.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    service.enabled = false;
+    service.pending_startup = planned;
+    assert!(!service.tick().await.unwrap());
+    let ready = service.running.as_ref().unwrap().ready_file.clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    assert_eq!(service.pending_startup.len(), 2);
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .launcher_sha256
+            .is_none()
+    );
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    assert!(service.pending_startup.is_empty());
+    assert_eq!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .launcher_sha256
+            .as_deref(),
+        Some(hash.as_str())
+    );
+    service.stop_application().await.unwrap();
+    drop(bot);
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
