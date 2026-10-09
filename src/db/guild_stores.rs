@@ -62,6 +62,11 @@ impl StoreRegistration {
     pub(crate) fn from_parts(id: StoreId, policy: StorePolicy) -> Self {
         Self { id, policy }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(id: StoreId, policy: StorePolicy) -> Self {
+        Self::from_parts(id, policy)
+    }
 }
 
 /// Initial placement identity. A revision is not a distributed writer lease.

@@ -394,6 +394,151 @@ mod tests {
         cleanup(&path);
     }
 
+    fn guild_path(core: &Path) -> PathBuf {
+        let mut store = core.as_os_str().to_owned();
+        store.push(".guild.db");
+        PathBuf::from(store)
+    }
+
+    fn guild_options(path: PathBuf, read_only: bool) -> db::guild_data::GuildStoreOptions {
+        db::guild_data::GuildStoreOptions {
+            path,
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            read_only,
+        }
+    }
+
+    fn shared_registration() -> db::guild_stores::StoreRegistration {
+        db::guild_stores::StoreRegistration::for_test(
+            db::guild_stores::StoreId::new(),
+            db::guild_stores::StorePolicy::Shared,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn older_guild_store_stays_live_then_becomes_ready_after_bot_migration() {
+        jmodguard::set_process_ready(false);
+        let path = temp_db("guild14");
+        let core = Db::open(&path, 2).unwrap();
+        assert_eq!(
+            db::core_schema_version(&core).await.unwrap(),
+            db::CORE_SCHEMA_VERSION
+        );
+        drop(core);
+        let guild = guild_path(&path);
+        let registration = shared_registration();
+        db::guild_data::GuildDataStore::create_historical_store(
+            guild_options(guild.clone(), false),
+            registration.clone(),
+            14,
+        )
+        .unwrap();
+        let cfg = api_config(&path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = Arc::new(db::StartupProbe::default());
+        let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let cfg_wait = cfg.clone();
+        let serving = tokio::spawn(async move {
+            let router = crate::health::serve_while(&listener, async move {
+                let db = open_database(&cfg_wait).await?;
+                let state = build_state(cfg_wait, db).await?;
+                jmodguard::set_process_ready(true);
+                Ok::<_, anyhow::Error>(crate::web::router(state))
+            })
+            .await?;
+            axum::serve(listener, router)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))
+        });
+        assert_eq!(
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200
+        );
+        assert_eq!(
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            503
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            200
+        );
+        assert_eq!(
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            503
+        );
+        assert!(
+            !serving.is_finished(),
+            "startup must not exit while the guild store is older than 15"
+        );
+        std::thread::spawn(move || {
+            db::guild_data::GuildDataStore::initialize(guild_options(guild, false), registration)
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        let mut ready = 0;
+        let mut app_route = 0;
+        for _ in 0..80 {
+            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            app_route =
+                http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            if ready == 200 && app_route != 503 && app_route != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            ready, 200,
+            "the API becomes ready after the bot migrates the guild store"
+        );
+        assert_ne!(
+            app_route, 503,
+            "an application route must leave the startup page"
+        );
+        assert_ne!(app_route, 0);
+        assert_eq!(
+            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            200
+        );
+        assert!(
+            !serving.is_finished(),
+            "the API keeps serving after it is ready"
+        );
+        assert_eq!(probe.immediate(), 0);
+        serving.abort();
+        jmodguard::set_process_ready(false);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn newer_guild_store_exits_instead_of_waiting() {
+        let path = temp_db("guild16");
+        let core = Db::open(&path, 2).unwrap();
+        drop(core);
+        let guild = guild_path(&path);
+        let registration = shared_registration();
+        let store = db::guild_data::GuildDataStore::initialize(
+            guild_options(guild.clone(), false),
+            registration,
+        )
+        .unwrap();
+        drop(store);
+        db::set_user_version_unfenced(&guild, db::guild_data::SCHEMA_VERSION + 1).unwrap();
+        let cfg = api_config(&path);
+        let db = open_database(&cfg).await.unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(3), build_state(cfg, db)).await;
+        let built = opened.expect("a newer guild schema must not wait");
+        let Err(error) = built else {
+            panic!("a newer guild schema must exit");
+        };
+        assert!(!db::is_startup_retryable(&error, false), "{error:#}");
+        cleanup(&path);
+    }
+
     async fn wait_status(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
         let mut seen = 0;
         for _ in 0..40 {

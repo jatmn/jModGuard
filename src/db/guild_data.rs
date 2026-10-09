@@ -280,6 +280,14 @@ fn initialize_store(
         let needs_write =
             create && ((1..VERSION).contains(&version) || (version == 0 && objects == 0));
         if !needs_write {
+            if !create && (1..VERSION).contains(&version) {
+                verify_identity_version(&tx, expected, version)?;
+                tx.finish_read()?;
+                return Err(SchemaNotReady(format!(
+                    "guild store schema {version} is older than {VERSION}; waiting for the bot to migrate it"
+                ))
+                .into());
+            }
             verify_identity(&tx, expected)?;
             tx.finish_read()?;
             return Ok(());
@@ -405,6 +413,69 @@ impl GuildDataStore {
     /// Verify an existing store without creating its schema or bindings.
     pub fn open(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {
         Self::connect(options, expected, false)
+    }
+
+    /// Build a store with the real guild migrations through `version` and stop there.
+    /// The writable initializer is what advances it later.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_historical_store(
+        options: GuildStoreOptions,
+        expected: StoreRegistration,
+        version: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (1..VERSION).contains(&version),
+            "historical guild schema is outside 1..{VERSION}"
+        );
+        let opts = DbOpenOptions {
+            path: options.path,
+            url: options.url,
+            token: options.token,
+            pool_size: options.pool_size,
+            migrate: false,
+            read_only: false,
+            default_prefix: String::new(),
+            retention_days: 0,
+        };
+        Db::open_with_bootstrap(
+            &opts,
+            |conn| {
+                let mut tx = conn.transaction_immediate()?;
+                let batches: &[(&str, i64)] = &[
+                    (SCHEMA, 1),
+                    (TENANT_SCHEMA, 2),
+                    (CASE_SCHEMA, 3),
+                    (HISTORY_SCHEMA, 4),
+                    (SOURCE_SCHEMA, 5),
+                    (EVIDENCE_SCHEMA, 6),
+                    (BUNNY_SCHEMA, 7),
+                    (ERASURE_SCHEMA, 8),
+                    (SNAPSHOT_SCHEMA, 9),
+                    (MEMBER_SCHEMA, 10),
+                    (MEMBER_STATUS_SCHEMA, 11),
+                    (MEMBER_PROGRESS_SCHEMA, 12),
+                    (MEMBER_UNRESOLVED_AUDITS_SCHEMA, 13),
+                    (MEMBER_CASE_RETAIN_REVISION_SCHEMA, 14),
+                    (LOCAL_WRITE_FENCE_SCHEMA, 15),
+                ];
+                for (sql, at) in batches {
+                    if *at <= version {
+                        tx.execute_batch_bounded(sql, 32_000_000)?;
+                    }
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_rows(
+                    "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
+                    params![FAMILY, expected.id().as_str(), owner(&expected)],
+                    1,
+                )?;
+                tx.pragma_update(None, "user_version", version)?;
+                tx.commit()?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok(())
     }
 
     /// Read a stamped installation identity without creating or upgrading schema.
