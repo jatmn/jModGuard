@@ -119,6 +119,12 @@ pub struct NonceWindow {
     order: VecDeque<(String, i64)>,
 }
 
+impl Default for NonceWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NonceWindow {
     pub fn new() -> Self {
         Self {
@@ -223,7 +229,7 @@ pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
         .read_exact(&mut len_buf)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > BODY_LIMIT || len < MAC_HEX {
+    if !(MAC_HEX..=BODY_LIMIT).contains(&len) {
         anyhow::bail!("write failed");
     }
     let mut body = vec![0u8; len];
@@ -312,7 +318,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(text: &str) -> Result<Vec<u8>> {
-    anyhow::ensure!(text.len() % 2 == 0, "write failed");
+    anyhow::ensure!(text.len().is_multiple_of(2), "write failed");
     let mut out = Vec::with_capacity(text.len() / 2);
     let bytes = text.as_bytes();
     let mut index = 0;
