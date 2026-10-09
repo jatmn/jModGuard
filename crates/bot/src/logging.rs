@@ -862,13 +862,7 @@ async fn emit_to_observed_with_audit(
             .map(String::as_str)
             .unwrap_or_else(|| default_template(event));
         templates::format_log_timestamps(&mut vars);
-        if template == default_template(event) {
-            bound_default_message_vars(event, &mut vars);
-            if event == "automod" {
-                bound_automod_content_var(template, &mut vars, 2000);
-            }
-        }
-        let rendered = templates::render_bounded(template, &vars, 2000);
+        let rendered = render_log_template(event, template, &mut vars);
         sink.send(channel_id, log_message(&rendered)).await?;
         Ok::<_, anyhow::Error>(Delivery::Sent)
     })
@@ -1148,6 +1142,73 @@ fn split_automod_proving_content(content: &str) -> (Option<String>, String) {
     (None, content.to_string())
 }
 
+/// Discord log body after the same bounds delivery applies.
+/// Automod `{content}` is bounded for every template, including a guild override.
+pub(crate) fn render_log_template(
+    event: &str,
+    template: &str,
+    vars: &mut BTreeMap<String, String>,
+) -> String {
+    if template == default_template(event) {
+        bound_default_message_vars(event, vars);
+    }
+    if event == "automod" {
+        bound_automod_content_var(template, vars, 2000);
+    }
+    templates::render_bounded(template, vars, 2000)
+}
+
+fn substituted_key_count(template: &str, key: &str) -> usize {
+    template
+        .split_inclusive('}')
+        .filter(|chunk| {
+            chunk.ends_with('}')
+                && chunk
+                    .rfind('{')
+                    .is_some_and(|start| &chunk[start + 1..chunk.len() - 1] == key)
+        })
+        .count()
+}
+
+fn is_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Keep a prefix of complete digests. When some are omitted, say how many.
+/// A budget that cannot hold one digest still reports the full omitted count
+/// when that phrase fits, and never returns a cut digest.
+fn bound_proving_hash_list(hashes: &str, budget: usize) -> String {
+    if hashes.encode_utf16().count() <= budget {
+        return hashes.to_string();
+    }
+    let Some(body) = hashes.strip_prefix(AUTOMOD_SHA256_PREFIX) else {
+        return String::new();
+    };
+    if body.is_empty() {
+        return String::new();
+    }
+    let digests: Vec<&str> = body.split(',').collect();
+    if !digests.iter().copied().all(is_sha256_digest) {
+        return String::new();
+    }
+    let total = digests.len();
+    for shown in (0..total).rev() {
+        let omitted = total - shown;
+        let text = if shown == 0 {
+            format!("and {omitted} more")
+        } else {
+            format!(
+                "{AUTOMOD_SHA256_PREFIX}{} and {omitted} more",
+                digests[..shown].join(",")
+            )
+        };
+        if text.encode_utf16().count() <= budget {
+            return text;
+        }
+    }
+    String::new()
+}
+
 pub(crate) fn bound_automod_content_var(
     template: &str,
     vars: &mut BTreeMap<String, String>,
@@ -1160,15 +1221,14 @@ pub(crate) fn bound_automod_content_var(
         vars.insert("content".into(), content);
         return;
     }
-    let budget = templates::substitution_budget(template, vars, "content", max_units);
+    let copies = substituted_key_count(template, "content");
+    if copies == 0 {
+        vars.insert("content".into(), content);
+        return;
+    }
+    let budget = templates::substitution_budget(template, vars, "content", max_units) / copies;
     let bounded = match split_automod_proving_content(&content) {
-        (Some(hashes), tail) if tail.is_empty() => {
-            if hashes.encode_utf16().count() <= budget {
-                hashes
-            } else {
-                clip(&hashes, budget)
-            }
-        }
+        (Some(hashes), tail) if tail.is_empty() => bound_proving_hash_list(&hashes, budget),
         (Some(hashes), tail) => {
             let hash_units = hashes.encode_utf16().count();
             let marker = " [display clipped]";
@@ -1176,11 +1236,7 @@ pub(crate) fn bound_automod_content_var(
             let sep = "; ";
             let sep_units = sep.encode_utf16().count();
             if hash_units.saturating_add(sep_units) >= budget {
-                if hash_units <= budget {
-                    hashes
-                } else {
-                    clip(&hashes, budget)
-                }
+                bound_proving_hash_list(&hashes, budget)
             } else if tail.encode_utf16().count() <= budget.saturating_sub(hash_units + sep_units) {
                 format!("{hashes}{sep}{tail}")
             } else {

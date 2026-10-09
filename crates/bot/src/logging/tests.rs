@@ -2132,12 +2132,114 @@ fn automod_default_template_preserves_proving_hashes_under_discord_budget() {
         ("time".into(), "2026-10-09T00:00:00+00:00".into()),
     ]);
     let template = default_template("automod");
-    bound_default_message_vars("automod", &mut vars);
-    bound_automod_content_var(template, &mut vars, 2000);
-    let rendered = templates::render_bounded(template, &vars, 2000);
+    let rendered = render_log_template("automod", template, &mut vars);
     assert!(
         rendered.contains(&hash_hex),
         "expected full proving digest: {rendered}"
     );
     assert!(rendered.encode_utf16().count() <= 2000);
+}
+
+fn proving_digests(count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("{n:064x}")).collect()
+}
+
+/// Independent of `bound_proving_hash_list`: same phrase, measured in UTF-16 units.
+fn whole_hash_notice(digests: &[String], budget: usize) -> String {
+    let total = digests.len();
+    for shown in (0..total).rev() {
+        let omitted = total - shown;
+        let text = if shown == 0 {
+            format!("and {omitted} more")
+        } else {
+            format!("sha256 {} and {omitted} more", digests[..shown].join(","))
+        };
+        if text.encode_utf16().count() <= budget {
+            return text;
+        }
+    }
+    String::new()
+}
+
+#[test]
+fn oversized_hash_set_renders_whole_hashes_and_omitted_count() {
+    let digests = proving_digests(40);
+    let expected = format!("sha256 {} and 10 more", digests[..30].join(","));
+    assert_eq!(expected.encode_utf16().count(), 1968);
+    assert!(expected.encode_utf16().count() <= 2000);
+    assert!(
+        format!("sha256 {} and 9 more", digests[..31].join(","))
+            .encode_utf16()
+            .count()
+            > 2000
+    );
+    assert_eq!(whole_hash_notice(&digests, 2000), expected);
+    for content in [
+        format!("sha256 {}", digests.join(",")),
+        format!("sha256 {}; channel 9, message 8", digests.join(",")),
+    ] {
+        let mut vars = BTreeMap::from([("content".into(), content)]);
+        let rendered = render_log_template("automod", "{content}", &mut vars);
+        assert_eq!(rendered, expected);
+        assert!(rendered.encode_utf16().count() <= 2000);
+        assert!(!rendered.contains('…'));
+        assert!(!rendered.contains("channel"));
+        let shown = rendered
+            .strip_prefix("sha256 ")
+            .unwrap()
+            .split(" and ")
+            .next()
+            .unwrap();
+        assert!(shown.split(',').all(|digest| digest.len() == 64));
+    }
+}
+
+#[test]
+fn custom_automod_template_keeps_large_match_hashes_within_budget() {
+    let template = "**Rule:** {rule}\n**Evidence:** {content}\n**Action:** {action}";
+    assert_ne!(template, default_template("automod"));
+    let digests = proving_digests(40);
+    let locations = (0..16)
+        .map(|i| format!("channel {i}, message {}", i + 100))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let content = format!("sha256 {}; {locations}", digests.join(","));
+    let mut vars = BTreeMap::from([
+        ("rule".into(), "Exact image spam".into()),
+        ("action".into(), "log only".into()),
+        ("content".into(), content),
+    ]);
+    let budget = templates::substitution_budget(template, &vars, "content", 2000);
+    let expected_content = whole_hash_notice(&digests, budget);
+    assert!(expected_content.starts_with("sha256 "));
+    assert!(expected_content.contains(" and "));
+    assert!(!expected_content.contains("channel"));
+    let mut expected_vars = vars.clone();
+    expected_vars.insert("content".into(), expected_content);
+    let expected = templates::render(template, &expected_vars);
+    let rendered = render_log_template("automod", template, &mut vars);
+    assert_eq!(rendered, expected);
+    assert!(rendered.encode_utf16().count() <= 2000);
+    assert!(!rendered.contains('…'));
+    assert!(rendered.contains("**Action:** log only"));
+    assert!(rendered.contains(&format!("{:064x}", 0)));
+    assert!(!rendered.contains("channel 0"));
+}
+
+#[test]
+fn repeated_content_token_keeps_each_hash_copy_whole() {
+    let template = "{content}\n{content}";
+    let digests = proving_digests(40);
+    let content = format!("sha256 {}", digests.join(","));
+    let mut vars = BTreeMap::from([("content".into(), content)]);
+    let budget = templates::substitution_budget(template, &vars, "content", 2000) / 2;
+    let expected_content = whole_hash_notice(&digests, budget);
+    let expected = format!("{expected_content}\n{expected_content}");
+    let rendered = render_log_template("automod", template, &mut vars);
+    assert_eq!(rendered, expected);
+    assert!(rendered.encode_utf16().count() <= 2000);
+    assert!(!rendered.contains('…'));
+    let mut lines = rendered.lines();
+    assert_eq!(lines.next(), lines.next());
+    assert!(lines.next().is_none());
 }

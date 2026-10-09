@@ -2298,8 +2298,7 @@ mod tests {
             .map(|(_, template)| template)
             .expect("automod template");
         let mut vars = vars.clone();
-        crate::logging::bound_automod_content_var(template, &mut vars, 2000);
-        crate::templates::render_bounded(template, &vars, 2000)
+        crate::logging::render_log_template("automod", template, &mut vars)
     }
 
     #[test]
