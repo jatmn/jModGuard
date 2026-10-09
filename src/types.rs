@@ -36,6 +36,28 @@ pub const EVENT_TYPES: [&str; 14] = [
     "system",
 ];
 
+/// Opt-in Discord activity logs. They use the same per-guild log channel and
+/// ignore list as [`EVENT_TYPES`], but they are not guild-store event types:
+/// `guild_log_channels` keeps its existing check constraint, and these names
+/// are not inserted as new global template rows on startup.
+pub const ACTIVITY_LOG_EVENTS: [&str; 10] = [
+    "member_role_update",
+    "role_change",
+    "voice_join",
+    "voice_leave",
+    "voice_move",
+    "nickname_change",
+    "username_change",
+    "thread_create",
+    "thread_update",
+    "thread_delete",
+];
+
+/// True for a log event the core log-channel settings can route.
+pub fn is_log_event(event: &str) -> bool {
+    EVENT_TYPES.contains(&event) || ACTIVITY_LOG_EVENTS.contains(&event)
+}
+
 /// Effective (fully resolved) guild settings used at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -394,5 +416,27 @@ mod tests {
         let set: PatchBody = serde_json::from_str(r#"{"prefix":"!x","retention_days":0}"#).unwrap();
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.retention_days, Some(Some(0)));
+    }
+
+    #[test]
+    fn activity_templates_cover_activity_events_without_joining_store_events() {
+        let templates = crate::defaults::activity_log_templates();
+        assert_eq!(templates.len(), ACTIVITY_LOG_EVENTS.len());
+        for event in ACTIVITY_LOG_EVENTS {
+            assert!(
+                templates
+                    .iter()
+                    .any(|(name, body)| *name == event && !body.is_empty()),
+                "{event}"
+            );
+            assert!(!EVENT_TYPES.contains(&event), "{event}");
+            assert!(is_log_event(event));
+        }
+        for (event, _) in crate::defaults::default_templates() {
+            assert!(!ACTIVITY_LOG_EVENTS.contains(&event));
+            assert!(EVENT_TYPES.contains(&event));
+        }
+        assert!(!is_log_event("not_a_log_event"));
+        assert!(is_log_event("member_join"));
     }
 }

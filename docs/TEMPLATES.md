@@ -38,6 +38,8 @@ preview) or via `!template`.
 
 Unknown variables are left untouched so template mistakes are visible.
 
+Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{role_name}`, `{detail}`, `{before_global}`, `{after_global}`, `{thread}`, `{thread_id}`, `{thread_name}`, `{archived}`, `{locked}`, `{auto_archive}`, and `{invitable}` when that event has them. They do not supply message text.
+
 ## Default templates (all editable)
 
 - **member_join** — joined the server, account created/age
@@ -53,6 +55,15 @@ Unknown variables are left untouched so template mistakes are visible.
 - **plan_executed** — custom command runs
 - **system** — general notices, including one start notice per process and a
   graceful-shutdown notice with compact uptime
+- **member_role_update** — roles added and removed, only when the previous member was cached
+- **role_change** — role created, updated, or deleted. Detail names the change, including colour, emoji, and icon, without permission bits or image hashes
+- **voice_join** / **voice_leave** / **voice_move** — voice channel only. Mute and deaf changes are not reports. A move ignore matches either channel
+- **nickname_change** / **username_change** — guild nickname, or username and display name. No message text
+- **thread_create** / **thread_update** / **thread_delete** — thread name, parent, and owner when known. Updates also include archive, lock, auto-archive, and whether others can be invited. The starter message is not included
+
+These activity events follow the same opt-in rule: no log channel means no post.
+Their default wording lives in the bot until an operator saves a template. They
+are not new guild-store event types.
 
 ## Log channel routing
 

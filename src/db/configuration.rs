@@ -48,10 +48,7 @@ pub async fn put_enrolled_log_filter(
     event: &str,
     filter: LogFilter,
 ) -> Result<LogFilter> {
-    anyhow::ensure!(
-        crate::types::EVENT_TYPES.contains(&event),
-        "unknown log event type"
-    );
+    anyhow::ensure!(crate::types::is_log_event(event), "unknown log event type");
     anyhow::ensure!(scope.guild_id() > 0, "log filters are guild-only");
     let filter = filter.normalized()?;
     let keys = vec![scope.guild_id().into(), event.to_owned().into()];

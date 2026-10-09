@@ -135,7 +135,7 @@ pub async fn guild_config(
     }
 
     let mut templates = Vec::new();
-    for (event, def) in crate::defaults::default_templates() {
+    for (event, def) in crate::defaults::rendered_log_templates() {
         let guild_row = snapshot.guild_templates.get(event).cloned();
         let global_row = snapshot.global_templates.get(event).cloned();
         templates.push(serde_json::json!({
@@ -147,7 +147,10 @@ pub async fn guild_config(
     }
 
     let mut log_channels = Vec::new();
-    for event in crate::types::EVENT_TYPES {
+    for event in crate::types::EVENT_TYPES
+        .into_iter()
+        .chain(crate::types::ACTIVITY_LOG_EVENTS)
+    {
         let guild_row = snapshot.guild_log_channels.get(event).copied();
         let effective = guild_row.unwrap_or(0);
         // Strings so JS never coerces snowflakes through IEEE-754 Number.
@@ -662,7 +665,7 @@ pub async fn get_template(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::get_enrolled_template(&app.db, scope, &event).await?;
     let (guild_override, global) = (layers.guild, layers.global);
-    let def = crate::defaults::default_templates()
+    let def = crate::defaults::rendered_log_templates()
         .into_iter()
         .find(|(e, _)| *e == event)
         .map(|(_, t)| t.to_string());
@@ -684,7 +687,7 @@ pub async fn put_template(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    if !crate::types::EVENT_TYPES.contains(&event.as_str()) {
+    if !crate::types::is_log_event(&event) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
     db::upsert_enrolled_template(
@@ -825,7 +828,7 @@ pub async fn put_logchannel(
             "log channels must be configured per guild"
         )));
     }
-    if !crate::types::EVENT_TYPES.contains(&event.as_str()) {
+    if !crate::types::is_log_event(&event) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
     enqueue_action(

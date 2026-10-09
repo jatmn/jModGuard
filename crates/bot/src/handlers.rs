@@ -4,12 +4,13 @@
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::gateway::ActivityData;
-use serenity::model::channel::Message;
+use serenity::model::channel::{GuildChannel, Message, PartialGuildChannel};
 use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent, ResumedEvent};
 use serenity::model::gateway::Ready;
-use serenity::model::guild::{Guild, Member, UnavailableGuild};
-use serenity::model::id::{GuildId, MessageId};
+use serenity::model::guild::{Guild, Member, Role, UnavailableGuild};
+use serenity::model::id::{GuildId, MessageId, RoleId};
 use serenity::model::prelude::{ChannelId, User};
+use serenity::model::voice::VoiceState;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -27,6 +28,20 @@ pub struct Handler {
 impl Handler {
     fn app(&self) -> &Arc<BotState> {
         &self.app
+    }
+}
+
+async fn emit_activity(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    guild_id: GuildId,
+    reports: Vec<crate::activity_log::ActivityReport>,
+) {
+    if guild_id.get() == 0 {
+        return;
+    }
+    for report in reports {
+        logging::emit(app, ctx, guild_id, report.event, report.vars).await;
     }
 }
 
@@ -961,7 +976,9 @@ impl EventHandler for Handler {
         .await;
         let Some(new) = new_if_available else { return };
         let guild_id = new.guild_id;
-        let old_to = old_if_available.and_then(|o| o.communication_disabled_until);
+        let old_to = old_if_available
+            .as_ref()
+            .and_then(|member| member.communication_disabled_until);
         let new_to = new.communication_disabled_until;
         if old_to != new_to {
             let enrollment = crate::cases::capture(&app, guild_id.get()).await;
@@ -993,6 +1010,139 @@ impl EventHandler for Handler {
                 )
                 .await;
             }
+        }
+        if let Some(old) = old_if_available {
+            // Diff only. These reports do not write a row and do not wait
+            // behind moderation: delivery uses the existing non-blocking slot.
+            let reports = crate::activity_log::member_activity_reports(
+                &crate::activity_log::MemberView::from_member(&old),
+                &crate::activity_log::MemberView::from_member(&new),
+            );
+            emit_activity(&app, &ctx, guild_id, reports).await;
+        }
+    }
+
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let Some(guild_id) = new.guild_id else {
+            return;
+        };
+        let member = crate::activity_log::MemberView::from_voice(&new);
+        let old_channel = old
+            .as_ref()
+            .and_then(|state| state.channel_id.map(|id| id.get()));
+        let new_channel = new.channel_id.map(|id| id.get());
+        if let Some(report) = crate::activity_log::voice_report(&member, old_channel, new_channel) {
+            emit_activity(&self.app, &ctx, guild_id, vec![report]).await;
+        }
+    }
+
+    async fn guild_role_create(&self, ctx: Context, new: Role) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let view = crate::activity_log::RoleView::from_role(&new);
+        if let Some(report) = crate::activity_log::role_change_report(
+            crate::activity_log::RoleAction::Created,
+            None,
+            Some(&view),
+        ) {
+            emit_activity(&self.app, &ctx, new.guild_id, vec![report]).await;
+        }
+    }
+
+    async fn guild_role_delete(
+        &self,
+        ctx: Context,
+        guild_id: GuildId,
+        removed_role_id: RoleId,
+        removed_role_data_if_available: Option<Role>,
+    ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let view = removed_role_data_if_available
+            .as_ref()
+            .map(crate::activity_log::RoleView::from_role)
+            .unwrap_or_else(|| {
+                crate::activity_log::RoleView::unknown(removed_role_id.get(), guild_id.get())
+            });
+        if let Some(report) = crate::activity_log::role_change_report(
+            crate::activity_log::RoleAction::Deleted,
+            Some(&view),
+            None,
+        ) {
+            emit_activity(&self.app, &ctx, guild_id, vec![report]).await;
+        }
+    }
+
+    async fn guild_role_update(
+        &self,
+        ctx: Context,
+        old_data_if_available: Option<Role>,
+        new: Role,
+    ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let new_view = crate::activity_log::RoleView::from_role(&new);
+        let old_view = old_data_if_available
+            .as_ref()
+            .map(crate::activity_log::RoleView::from_role);
+        if let Some(report) = crate::activity_log::role_change_report(
+            crate::activity_log::RoleAction::Updated,
+            old_view.as_ref(),
+            Some(&new_view),
+        ) {
+            emit_activity(&self.app, &ctx, new.guild_id, vec![report]).await;
+        }
+    }
+
+    async fn thread_create(&self, ctx: Context, thread: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let Some(view) = crate::activity_log::ThreadView::from_guild(&thread) else {
+            return;
+        };
+        if let Some(report) = crate::activity_log::thread_created(&view) {
+            emit_activity(&self.app, &ctx, thread.guild_id, vec![report]).await;
+        }
+    }
+
+    async fn thread_update(&self, ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let Some(new_view) = crate::activity_log::ThreadView::from_guild(&new) else {
+            return;
+        };
+        let old_view = old
+            .as_ref()
+            .and_then(crate::activity_log::ThreadView::from_guild);
+        if let Some(report) = crate::activity_log::thread_updated(old_view.as_ref(), &new_view) {
+            emit_activity(&self.app, &ctx, new.guild_id, vec![report]).await;
+        }
+    }
+
+    async fn thread_delete(
+        &self,
+        ctx: Context,
+        thread: PartialGuildChannel,
+        full_thread_data: Option<GuildChannel>,
+    ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        let Some(view) =
+            crate::activity_log::ThreadView::from_deleted(&thread, full_thread_data.as_ref())
+        else {
+            return;
+        };
+        if let Some(report) = crate::activity_log::thread_deleted(&view) {
+            emit_activity(&self.app, &ctx, thread.guild_id, vec![report]).await;
         }
     }
 

@@ -246,7 +246,11 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
    reports only Discord-identified edits (`edited_timestamp`), not GIF/link
    unfurls, chat replies, or the bot's own log posts. For each event, optionally save ignored
    user or bot IDs and source channel IDs to avoid duplicate bot reports or
-   exclude staff channels.
+   exclude staff channels. Role, voice, nickname, username, and thread events use
+   that same per-event channel and stay off until you set one. Voice join, leave,
+   and move need the Guild Voice States intent. It is not a privileged intent.
+   Nickname, username, and member role logs use the Server Members intent already
+   required above. These reports are Discord messages only.
 3. Add your **badwords** (Badwords tab) and test them with the live tester.
 4. Change the prefix / bot nickname if you like (Settings tab).
 5. Point the slash commands at your mods and try `/ban`, `/kick`, `/warn`.

@@ -92,6 +92,15 @@ Joining, leaving and talking still do not maintain a general activity archive.
   that same row. Without a reliable match, a new row says "Reason unavailable";
   older rows keep their recorded text. Rows without a known name or reliable
   moderator show the ID or unavailable moderator in the WebUI.
+- Role, voice, nickname, username, and thread reports use the same per-event log
+  channel and ignore list. They stay off until that event has a channel. They are
+  Discord messages only: no SQL event row, no case, and no message text. A member
+  role, nickname, or username line is sent only when this process already cached
+  the previous member. Voice join, leave, and move need the Guild Voice States
+  gateway intent, which is not a privileged intent. Nickname, username, and member
+  role logs use the existing Server Members intent. Thread logs use the existing
+  Guilds intent. A voice move ignore matches either the channel left or the channel
+  joined. These names are not guild-store log-channel types.
 - Startup, routine command-plan execution and test/log-only automod reports use Discord
   channels, without a generic SQL event copy. Delete-only automod reports are transient.
   Plans containing timeout/kick/ban steps retain their existing SQL execution summary;
