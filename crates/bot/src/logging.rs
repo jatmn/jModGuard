@@ -955,10 +955,14 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
                 .and_then(|value| value.strip_prefix("<#")?.strip_suffix('>'))
         });
     user_match
-        || source
-            .and_then(|source| source.parse::<u64>().ok())
-            .filter(|id| *id != 0)
-            .is_some_and(|source| filter.channels.iter().any(|id| id == &source.to_string()))
+        || channel_id_excluded(filter, source)
+        || channel_id_excluded(filter, vars.get("before_channel_id").map(String::as_str))
+}
+
+fn channel_id_excluded(filter: &db::LogFilter, raw: Option<&str>) -> bool {
+    raw.and_then(|source| source.parse::<u64>().ok())
+        .filter(|id| *id != 0)
+        .is_some_and(|source| filter.channels.iter().any(|id| id == &source.to_string()))
 }
 
 pub(crate) fn record_delivery_failure(app: &BotState) {
@@ -1787,7 +1791,7 @@ fn verified_member_departure_vars(
 }
 
 fn default_template(event: &str) -> &'static str {
-    crate::defaults::default_templates()
+    crate::defaults::rendered_log_templates()
         .into_iter()
         .find(|(e, _)| *e == event)
         .map(|(_, t)| t)

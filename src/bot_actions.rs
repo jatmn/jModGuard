@@ -47,10 +47,7 @@ impl Action {
                 );
             }
             Self::SetLogChannel { event, channel_id } => {
-                anyhow::ensure!(
-                    crate::types::EVENT_TYPES.contains(&event.as_str()),
-                    "unknown log event"
-                );
+                anyhow::ensure!(crate::types::is_log_event(event), "unknown log event");
                 anyhow::ensure!(
                     channel_id.is_none_or(|id| id > 0),
                     "channel_id must be positive"

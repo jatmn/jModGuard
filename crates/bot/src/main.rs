@@ -166,11 +166,15 @@ async fn main() -> Result<()> {
         jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
 
     // --- Discord client (needed for slash re-sync after config polls) --------
+    // Guild voice states is not a privileged intent. Voice join, leave, and
+    // move logs need it. Nickname, username, and member-role logs use the
+    // existing server members intent. Thread logs use the existing guilds intent.
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILD_MODERATION;
+        | GatewayIntents::GUILD_MODERATION
+        | GatewayIntents::GUILD_VOICE_STATES;
 
     let mut cache_settings = CacheSettings::default();
     cache_settings.max_messages = 0; // no general message history in RAM or SQL

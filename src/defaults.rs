@@ -466,6 +466,64 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
+///
+/// These stay out of [`default_templates`] so startup does not insert new
+/// global template rows. Delivery falls back to this wording until an operator
+/// saves an override.
+pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "member_role_update",
+            "**:label: {user} roles updated**\n\n**User:** {mention} (`{user_id}`)\n**Added:** {added}\n**Removed:** {removed}\n**Time:** `{time}`",
+        ),
+        (
+            "role_change",
+            "**:label: Role {action}**\n\n**Role:** {role} (`{role_id}`)\n**Name:** {role_name}\n**Detail:** {detail}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_join",
+            "**:loud_sound: {user} joined voice**\n\n**User:** {mention} (`{user_id}`)\n**Channel:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_leave",
+            "**:mute: {user} left voice**\n\n**User:** {mention} (`{user_id}`)\n**Channel:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_move",
+            "**:arrow_right: {user} moved voice channels**\n\n**User:** {mention} (`{user_id}`)\n**From:** {before}\n**To:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "nickname_change",
+            "**:label: {user} nickname changed**\n\n**User:** {mention} (`{user_id}`)\n**Before:** {before}\n**After:** {after}\n**Time:** `{time}`",
+        ),
+        (
+            "username_change",
+            "**:label: {user} username changed**\n\n**User:** {mention} (`{user_id}`)\n**Username:** `{before}` → `{after}`\n**Display name:** `{before_global}` → `{after_global}`\n**Time:** `{time}`",
+        ),
+        (
+            "thread_create",
+            "**:thread: Thread {notice}**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Owner:** {mention}\n**Time:** `{time}`",
+        ),
+        (
+            "thread_update",
+            "**:thread: Thread updated**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Before name:** {before}\n**Parent:** {channel}\n**Archived:** {archived}\n**Locked:** {locked}\n**Auto-archive:** {auto_archive}\n**Invitable:** {invitable}\n**Time:** `{time}`",
+        ),
+        (
+            "thread_delete",
+            "**:thread: Thread deleted**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Time:** `{time}`",
+        ),
+    ]
+}
+
+/// Shipped templates plus activity-log defaults. Startup seeding stays on
+/// [`default_templates`] alone.
+pub fn rendered_log_templates() -> Vec<(&'static str, &'static str)> {
+    let mut templates = default_templates();
+    templates.extend(activity_log_templates());
+    templates
+}
+
 /// Exact shipped delete template before attachment details were added.
 pub(crate) const PRE_ATTACHMENT_DELETE_TEMPLATE: &str = "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}";
 

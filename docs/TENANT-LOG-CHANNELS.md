@@ -48,7 +48,9 @@ can leave the caller with a stale token: refresh and resolve the conflict, never
 substitute a new revision and resend the old edit. This is not a request-id replay protocol.
 
 Only the existing `EVENT_TYPES` are accepted, with one mapping per event (currently14), and
-channel IDs must be positive integers. That bounds row count and read memory without an
+channel IDs must be positive integers. Member role, role, voice, nickname, username, and
+thread logs are separate opt-in names on the core log-channel table. They are not
+guild-store event types, so this check constraint stays unchanged. That bounds row count and read memory without an
 arbitrary configurable history quota. No event payload is stored. Future event additions
 must update the schema constraint and shared event types together. Actor permissions and
 Discord channel ownership/availability must be checked before runtime mutation; positive

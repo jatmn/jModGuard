@@ -1067,6 +1067,9 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
         }
         "set" => {
             let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+            if !crate::types::is_log_event(&event) {
+                return Err(anyhow!("unknown log event `{event}`"));
+            }
             let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
             let channel = parse_channel_mention(&token)
                 .or_else(|| token.parse::<u64>().ok().map(Into::into))
