@@ -456,11 +456,18 @@ pub(crate) async fn execute_pending_with(
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
     let resolved = loaded.as_ref().ok().and_then(|cfg| {
-        cfg.rules
-            .get(&pending.rule_id)
-            .map(|r| (r.dry_run, r.log_automod, r.open_case, r.skip_moderators))
+        cfg.rules.get(&pending.rule_id).map(|r| {
+            (
+                r.dry_run,
+                r.log_automod,
+                r.open_case,
+                r.skip_moderators,
+                !r.whitelist_roles.is_empty(),
+            )
+        })
     });
-    let (dry, log_automod, open_case, skip_moderators) =
+    let config_unknown = resolved.is_none();
+    let (dry, log_automod, open_case, skip_moderators, skips_roles) =
         if jmodguard::custom_rules::is_custom_id(&pending.rule_id) {
             let Some(values) = resolved else {
                 tracing::warn!(
@@ -473,7 +480,7 @@ pub(crate) async fn execute_pending_with(
             };
             values
         } else {
-            resolved.unwrap_or((false, true, true, false))
+            resolved.unwrap_or((false, true, true, false, false))
         };
 
     if dry {
@@ -493,6 +500,35 @@ pub(crate) async fn execute_pending_with(
         return;
     }
 
+    // A missing member is not a known member with no roles. Gateway members
+    // may have no user field, but their supplied role list is still useful.
+    let role_ids: Option<Vec<u64>> = provided_member
+        .as_ref()
+        .map(|member| member.roles.iter().map(|role| role.get()).collect())
+        .or_else(|| {
+            cache.guild(guild_id).and_then(|guild| {
+                guild
+                    .members
+                    .get(&target.id)
+                    .map(|member| member.roles.iter().map(|role| role.get()).collect())
+            })
+        });
+    let moderator_unknown = role_ids.as_deref().is_none_or(|roles| {
+        crate::commands::cached_moderator_status(app, cache, guild_id, target.id.get(), roles)
+            == crate::commands::ModeratorStatus::Unknown
+    });
+    let warning = if config_unknown {
+        Some("rule configuration unavailable; deleting the message and skipping kick or ban")
+    } else if role_ids.is_none() && (skip_moderators || skips_roles) {
+        Some(jmodguard::custom_rules::UNKNOWN_MEMBERSHIP_WARNING)
+    } else if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown) {
+        Some(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING)
+    } else if pending.mention_permission_unknown {
+        Some(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING)
+    } else {
+        None
+    };
+
     if matches!(rule.action.as_str(), "delete" | "timeout" | "kick" | "ban")
         && db::guild_stores::guild_is_write_fenced(&app.db, guild_id.get() as i64)
             .await
@@ -506,33 +542,14 @@ pub(crate) async fn execute_pending_with(
         return;
     }
 
-    let role_ids: Vec<u64> = provided_member
-        .as_ref()
-        .map(|member| member.roles.iter().map(|role| role.get()).collect())
-        .or_else(|| {
-            cache.guild(guild_id).and_then(|guild| {
-                guild.members.get(&target.id).map(|member| {
-                    member
-                        .roles
-                        .iter()
-                        .map(|role| role.get())
-                        .collect::<Vec<_>>()
-                })
-            })
-        })
-        .unwrap_or_default();
-    let moderator_unknown =
-        crate::commands::cached_moderator_status(app, cache, guild_id, target.id.get(), &role_ids)
-            == crate::commands::ModeratorStatus::Unknown;
-    if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown)
+    if let Some(warning) = warning
         && matches!(rule.action.as_str(), "kick" | "ban")
     {
         tracing::warn!(
             guild_id = guild_id.get(),
             user_id = target.id.get(),
             rule_id = pending.rule_id.as_str(),
-            "{}",
-            jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
+            "{warning}"
         );
         if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
             if !app.activation.may_record() {
@@ -544,54 +561,10 @@ pub(crate) async fn execute_pending_with(
             )
             .await;
         }
+        // This return precedes the ban handoff and operation identity creation.
         if log_automod {
             let mut v = vars;
-            v.insert(
-                "action".into(),
-                format!(
-                    "delete; {}",
-                    jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
-                ),
-            );
-            v.insert(
-                "content".into(),
-                pending.evidence["content"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            logging::emit_to(app, http, guild_id, "automod", v).await;
-        }
-        return;
-    }
-
-    if pending.mention_permission_unknown && matches!(rule.action.as_str(), "kick" | "ban") {
-        tracing::warn!(
-            guild_id = guild_id.get(),
-            user_id = target.id.get(),
-            rule_id = pending.rule_id.as_str(),
-            "{}",
-            jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING
-        );
-        if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-            if !app.activation.may_record() {
-                return;
-            }
-            let _ = crate::discord::race_discord_call(
-                &app.activation,
-                http.delete_message(ch.into(), id.into(), None),
-            )
-            .await;
-        }
-        if log_automod {
-            let mut v = vars;
-            v.insert(
-                "action".into(),
-                format!(
-                    "delete; {}",
-                    jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING
-                ),
-            );
+            v.insert("action".into(), format!("delete; {warning}"));
             v.insert(
                 "content".into(),
                 pending.evidence["content"]
@@ -1193,11 +1166,14 @@ mod tests {
             ),
         );
         let cfg = test_cfg(&rules, &HashMap::new());
-        assert!(
-            engine
-                .evaluate(&cfg, &msg(1, "scam", 0, false, false))
-                .is_some()
-        );
+        for content in ["scam", "scam!", "scam.", "(scam)"] {
+            assert!(
+                engine
+                    .evaluate(&cfg, &msg(1, content, 0, false, false))
+                    .is_some(),
+                "{content}"
+            );
+        }
         assert!(
             engine
                 .evaluate(&cfg, &msg(1, "scamper", 0, false, false))
@@ -2156,6 +2132,384 @@ mod tests {
                 stop,
                 server: Some(server),
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConfigLookup {
+        Available,
+        MissingCustom,
+        UnreadableBuiltin,
+    }
+
+    // Exercises the real matcher and executor with SQLite and a local Discord HTTP stub.
+    async fn lookup_fallback_case(
+        action: &str,
+        skip_moderators: bool,
+        skipped_roles: Vec<u64>,
+        member_roles: Option<Vec<u64>>,
+        missing_role: bool,
+        expect_withheld: bool,
+        config_lookup: ConfigLookup,
+    ) {
+        use serenity::all::{Guild, GuildCreateEvent, GuildId, Member, Role, RoleId, User, UserId};
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let id = if matches!(config_lookup, ConfigLookup::UnreadableBuiltin) || action == "log" {
+            "velocity"
+        } else {
+            "custom:0123456789abcdef"
+        };
+        let path = std::env::temp_dir().join(format!(
+            "lookup_fallback_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false))
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        rule.actions[0].action = action.into();
+        rule.actions[0].duration_minutes = 5;
+        rule.skip_moderators = skip_moderators;
+        rule.whitelist_roles = skipped_roles;
+        if id == "velocity" {
+            rule.params = serde_json::json!({ "max_messages": 0, "window_secs": 10 });
+        }
+        crate::db::upsert_rule(&app.db, 10, id, &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let roles = member_roles.clone().unwrap_or_default();
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&roles))
+            .expect("word match");
+        match config_lookup {
+            ConfigLookup::Available => {}
+            ConfigLookup::MissingCustom => {
+                crate::db::delete_rule(&app.db, 10, id).await.unwrap();
+                app.configs.invalidate();
+            }
+            ConfigLookup::UnreadableBuiltin => {
+                app.db
+                    .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE rules", 65_536))
+                    .await
+                    .unwrap();
+                app.configs.invalidate();
+            }
+        }
+
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(10);
+        guild.roles.insert(everyone.id, everyone);
+        let member = member_roles.map(|roles| {
+            let mut member = Member::default();
+            member.guild_id = guild.id;
+            member.user = user.clone();
+            member.roles = roles.into_iter().map(RoleId::new).collect();
+            if !missing_role {
+                for id in &member.roles {
+                    let mut role = Role::default();
+                    role.id = *id;
+                    guild.roles.insert(*id, role);
+                }
+            }
+            member
+        });
+        let stub = DiscordStub::start();
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            member,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let seen = stub.finish();
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let deletes = seen
+            .iter()
+            .filter(|line| line.starts_with("DELETE ") && line.contains("/messages/42"))
+            .count();
+        if matches!(config_lookup, ConfigLookup::MissingCustom) {
+            assert!(
+                seen.is_empty(),
+                "missing custom config must not call Discord: {seen:?}"
+            );
+            assert!(
+                crate::db::list_warns(&app.db, 10, 99)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                output.contains("WARN")
+                    && output.contains(jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING),
+                "{output}"
+            );
+        } else if expect_withheld || action == "delete" {
+            assert_eq!(deletes, 1, "delete must run exactly once: {seen:?}");
+        } else {
+            assert_eq!(
+                deletes, 0,
+                "normal {action} must not gain a fallback delete: {seen:?}"
+            );
+        }
+        if expect_withheld {
+            assert!(
+                seen.iter().all(|line| !(line.contains("/bans/")
+                    || line.starts_with("DELETE ") && line.contains("/members/"))),
+                "no ban handoff, ban, or kick: {seen:?}"
+            );
+            assert!(
+                output.contains("WARN") && output.contains("skipping kick or ban"),
+                "{output}"
+            );
+            assert!(app.gateway_ban_echo_operation(10, 99).is_none());
+            let scope = app.tenant.scope(enrollment).await.unwrap();
+            let store = app.tenant.store(&scope).await.unwrap();
+            assert!(
+                store
+                    .next_member_pending_ban_verification(scope, i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no ban operation may start"
+            );
+        } else if !matches!(config_lookup, ConfigLookup::MissingCustom) {
+            match action {
+                "ban" => assert!(
+                    seen.iter()
+                        .any(|line| line.starts_with("PUT ") && line.contains("/bans/99")),
+                    "normal ban: {seen:?}"
+                ),
+                "timeout" => assert!(
+                    seen.iter()
+                        .any(|line| line.starts_with("PATCH ") && line.contains("/members/99")),
+                    "timeout still runs: {seen:?}"
+                ),
+                "warn" => assert_eq!(
+                    crate::db::list_warns(&app.db, 10, 99).await.unwrap().len(),
+                    1
+                ),
+                "delete" | "log" => {}
+                _ => panic!("unexpected test action"),
+            }
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn unknown_roles_withhold_only_dependent_kick_and_ban() {
+        for action in ["ban", "kick"] {
+            lookup_fallback_case(
+                action,
+                true,
+                vec![],
+                None,
+                false,
+                true,
+                ConfigLookup::Available,
+            )
+            .await;
+            lookup_fallback_case(
+                action,
+                false,
+                vec![55],
+                None,
+                false,
+                true,
+                ConfigLookup::Available,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn known_empty_roles_and_no_role_dependency_still_enforce() {
+        lookup_fallback_case(
+            "ban",
+            true,
+            vec![],
+            Some(vec![]),
+            false,
+            false,
+            ConfigLookup::Available,
+        )
+        .await;
+        lookup_fallback_case(
+            "ban",
+            false,
+            vec![],
+            None,
+            false,
+            false,
+            ConfigLookup::Available,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_role_definition_withholds_dependent_ban() {
+        lookup_fallback_case(
+            "ban",
+            true,
+            vec![],
+            Some(vec![55]),
+            true,
+            true,
+            ConfigLookup::Available,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_role_definitions_preserve_timeout_and_warn() {
+        for action in ["delete", "timeout", "warn", "log"] {
+            lookup_fallback_case(
+                action,
+                true,
+                vec![],
+                Some(vec![55]),
+                true,
+                false,
+                ConfigLookup::Available,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_custom_rule_config_stops_all_actions() {
+        for action in ["delete", "ban", "kick", "timeout", "warn"] {
+            lookup_fallback_case(
+                action,
+                false,
+                vec![],
+                Some(vec![]),
+                false,
+                false,
+                ConfigLookup::MissingCustom,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_builtin_config_withholds_only_kick_and_ban() {
+        for action in ["delete", "ban", "kick", "timeout", "warn", "log"] {
+            lookup_fallback_case(
+                action,
+                false,
+                vec![],
+                Some(vec![]),
+                false,
+                matches!(action, "ban" | "kick"),
+                ConfigLookup::UnreadableBuiltin,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_roles_do_not_add_delete_to_log_action() {
+        for config in [ConfigLookup::Available, ConfigLookup::UnreadableBuiltin] {
+            lookup_fallback_case("log", true, vec![], None, false, false, config).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_mention_role_definitions_delete_without_ban() {
+        use serenity::all::{
+            ChannelId, Guild, GuildChannel, GuildId, PartialMember, Role, RoleId, UserId,
+        };
+        for missing_everyone in [false, true] {
+            let mut guild = Guild::default();
+            guild.id = GuildId::new(10);
+            guild.owner_id = UserId::new(1);
+            let mut channel = GuildChannel::default();
+            channel.id = ChannelId::new(70);
+            channel.guild_id = guild.id;
+            guild.channels.insert(channel.id, channel);
+            if !missing_everyone {
+                let mut role = Role::default();
+                role.id = RoleId::new(10);
+                guild.roles.insert(role.id, role);
+            }
+            let partial: PartialMember = serde_json::from_value(serde_json::json!({
+                "deaf": false, "joined_at": null, "mute": false, "nick": null,
+                "roles": if missing_everyone { vec![] } else { vec!["55"] },
+                "pending": false, "premium_since": null, "guild_id": "10", "user": null,
+                "permissions": null, "unusual_dm_activity_until": null,
+                "avatar": null, "banner": null, "avatar_decoration_data": null,
+            }))
+            .unwrap();
+            let scope = crate::commands::author_message_scope(
+                0,
+                Some(&guild),
+                ChannelId::new(70),
+                UserId::new(99),
+                Some(&partial),
+            );
+            assert_eq!(scope.mention, crate::commands::MentionPermission::Unknown);
+            let (seen, output) = execute_scoped_everyone_ban(scope).await;
+            assert_deleted_without_kick_or_ban(&seen, &output);
         }
     }
 

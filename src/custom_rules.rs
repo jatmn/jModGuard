@@ -220,11 +220,16 @@ pub fn custom_words(rule: &RuleDef) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Literal token match on normalized text (case-insensitive).
+/// Whole-word match on literal or normalized text (case-insensitive).
 pub fn word_rule_matches(content: &str, words: &[String]) -> bool {
     if words.is_empty() {
         return false;
     }
+    let literal = content.to_lowercase();
+    let literal_tokens: std::collections::HashSet<&str> = literal
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
     let normalized = normalize::normalize_lenient(content);
     let tokens: std::collections::HashSet<&str> = normalized
         .split(|c: char| !c.is_alphanumeric())
@@ -232,7 +237,8 @@ pub fn word_rule_matches(content: &str, words: &[String]) -> bool {
         .collect();
     words.iter().any(|w| {
         let token = normalize::normalize_lenient(w);
-        !token.is_empty() && tokens.contains(token.as_str())
+        (!token.is_empty() && tokens.contains(token.as_str()))
+            || literal_tokens.contains(w.to_lowercase().as_str())
     })
 }
 
@@ -288,6 +294,10 @@ pub const UNKNOWN_MENTION_PERMISSION_WARNING: &str =
 /// Logged when a pending `custom:` rule is gone or its config cannot be read.
 /// No Discord action runs. Built-in rules do not use this stop.
 pub const CUSTOM_RULE_UNAVAILABLE_WARNING: &str = "custom rule unavailable; skipping the action";
+
+/// Missing membership cannot rule out a moderator or a skipped role.
+pub const UNKNOWN_MEMBERSHIP_WARNING: &str =
+    "member roles unknown; deleting the message and skipping kick or ban";
 
 /// A channel id travels with the message, so only the moderator lookup can fail.
 /// Unknown status must not be treated as permission to kick or ban.
@@ -432,6 +442,40 @@ mod tests {
     fn word_token_not_substring() {
         assert!(word_rule_matches("buy scam now", &["scam".into()]));
         assert!(!word_rule_matches("scamper", &["scam".into()]));
+    }
+
+    #[test]
+    fn word_literal_punctuation_boundaries() {
+        for content in [
+            "scam!",
+            "scam.",
+            "(scam)",
+            "scam$",
+            "scam@",
+            "SCAM!",
+            "buy scam! now",
+        ] {
+            assert!(word_rule_matches(content, &["scam".into()]), "{content}");
+        }
+        assert!(!word_rule_matches("scamper!", &["scam".into()]));
+    }
+
+    #[test]
+    fn punctuated_rule_word_keeps_normalized_behavior() {
+        for (content, expected) in [
+            ("sc@m", true),
+            ("scam", true),
+            ("sc@m!", false),
+            ("sc@m.", true),
+            ("scam!", false),
+            ("scamper", false),
+        ] {
+            assert_eq!(
+                word_rule_matches(content, &["sc@m".into()]),
+                expected,
+                "{content}"
+            );
+        }
     }
 
     #[test]

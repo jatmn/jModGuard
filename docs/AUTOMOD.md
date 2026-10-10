@@ -91,8 +91,9 @@ or `ban` with `delete_days` 0–7). Types:
 
 - **pattern** — `params.pattern` compiled with the same linear-time regex engine
   as badwords (length cap 512; look-around and backreferences rejected).
-- **word** — 1–32 literal tokens matched case-insensitively on normalized text
-  (whole tokens, not substrings).
+- **word** — 1–32 whole words matched case-insensitively on literal and
+  normalized text. `scam!`, `scam.`, and `(scam)` match `scam`; `scamper` does
+  not. A configured word containing punctuation retains its normalized matching.
 - **channel_content** — `params.links` and/or `params.attachments` (at least one
   true): URL/invite detection or `attachment_count > 0`.
 - **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
@@ -120,14 +121,22 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 channels). `skip_moderators` skips members at mod permission level or higher.
 Exact-image and repeated-text rules honor both settings on admission and again
 before enforcement. The message carries its channel, so the channel list cannot
-fail open or closed. If the guild cache cannot show whether the author is a
-moderator, matched messages are still deleted and a warning is logged, but the
-bot does not kick or ban. Custom rules that skip moderators use that same limit.
+fail open or closed. For a pending kick or ban, unknown moderator status with
+`skip_moderators` on replaces the penalty with message deletion and a warning.
+Missing membership is distinct from a known empty role list: pending kicks or
+bans from rules that skip moderators or roles use that same fallback when member
+roles are unavailable. Rules without those role dependencies enforce normally.
 An everyone-attempt whose channel permission cannot be resolved uses the same
-delete-and-warn limit, including when skip moderators is off. If a custom rule
-is deleted, or its configuration cannot be read, before the pending action
-runs, the bot logs a warning and does not act. A failed configuration read
-does not stop a built-in rule.
+fallback for kick and ban, including when skip moderators is off. Missing role
+definitions also make that permission unknown. Delete, timeout, warn, and log
+keep their normal paths without an extra message delete. A delete action runs
+once; timeout and warn do not gain a deletion, and log never deletes.
+If a custom rule is deleted, or its configuration cannot be read, before a
+pending action runs, the bot logs a warning and takes no Discord action, including
+delete, timeout, or warn. The pending action does not carry its match-time dry-run
+state, so unavailable custom configuration cannot authorize enforcement. A failed
+configuration read for a built-in rule uses the fallback only for kick or ban;
+its other actions keep their normal paths. Known dry-run rules remain log-only.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 

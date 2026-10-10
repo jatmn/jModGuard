@@ -138,7 +138,7 @@ pub fn permission_level(
 pub enum ModeratorStatus {
     Moderator,
     Member,
-    /// The guild is not in the cache, so the member cannot be ruled out.
+    /// The guild or a required role is not cached, so status cannot be resolved.
     Unknown,
 }
 
@@ -153,6 +153,12 @@ pub fn cached_moderator_status(
     let Some(guild) = cache.guild(guild_id) else {
         return ModeratorStatus::Unknown;
     };
+    if role_ids
+        .iter()
+        .any(|id| !guild.roles.contains_key(&RoleId::new(*id)))
+    {
+        return ModeratorStatus::Unknown;
+    }
     if permission_level(
         app.cfg.bot.owner_id,
         &guild.roles,
@@ -265,8 +271,13 @@ pub(crate) fn mention_permission_in(
     let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
         return MentionPermission::Unknown;
     };
+    if !guild.roles.contains_key(&RoleId::new(guild.id.get()))
+        || role_ids.iter().any(|id| !guild.roles.contains_key(id))
+    {
+        return MentionPermission::Unknown;
+    }
     let Some(partial) = partial_member(guild.id, role_ids) else {
-        return MentionPermission::Denied;
+        return MentionPermission::Unknown;
     };
     let perms = guild.partial_member_permissions_in(channel, user_id, &partial);
     if perms.contains(Permissions::MENTION_EVERYONE) {
@@ -1430,6 +1441,23 @@ mod tests {
             ),
             super::MentionPermission::Unknown,
             "a channel missing from the guild cache is unknown"
+        );
+        guild.roles.remove(&RoleId::new(ROLE));
+        assert_eq!(
+            super::mention_permission_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(MEMBER),
+                &[RoleId::new(ROLE)]
+            ),
+            super::MentionPermission::Unknown,
+            "missing member role is not a cached deny"
+        );
+        guild.roles.remove(&RoleId::new(GUILD));
+        assert_eq!(
+            super::mention_permission_in(&guild, ChannelId::new(CHANNEL), UserId::new(MEMBER), &[]),
+            super::MentionPermission::Unknown,
+            "missing everyone role is not a cached deny"
         );
     }
 
