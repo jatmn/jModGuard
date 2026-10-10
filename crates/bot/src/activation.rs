@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const RENEW_EVERY: Duration = Duration::from_secs(5);
+const RENEW_START_MARGIN: Duration = Duration::from_millis(100);
 /// Host clocks can disagree. The local deadline ends this far before the lease row.
 const LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 /// In-flight rule work must finish inside the observed shutdown grace.
@@ -29,6 +30,9 @@ pub struct Activation {
     recovery: AtomicBool,
     /// `None` until a claim succeeds. Callers that only mark the flag stay open.
     authority_deadline: Mutex<Option<Instant>>,
+    exit_hook: fn(i32),
+    #[cfg(test)]
+    startup_delay: Mutex<Duration>,
     #[cfg(test)]
     renewal_fault: AtomicBool,
     #[cfg(test)]
@@ -82,6 +86,12 @@ impl Activation {
             moderation_depth: std::sync::atomic::AtomicUsize::new(0),
             recovery: AtomicBool::new(false),
             authority_deadline: Mutex::new(None),
+            #[cfg(not(test))]
+            exit_hook: |code| std::process::exit(code),
+            #[cfg(test)]
+            exit_hook: |_| {},
+            #[cfg(test)]
+            startup_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             renewal_fault: AtomicBool::new(false),
             #[cfg(test)]
@@ -130,7 +140,10 @@ impl Activation {
     }
 
     pub fn allows_discord_connect(&self) -> bool {
-        self.lock_held.load(Ordering::Acquire) && !self.is_shutting_down()
+        self.lock_held.load(Ordering::Acquire)
+            && !self.is_shutting_down()
+            && !self.cut_off.load(Ordering::Acquire)
+            && self.authority_current()
     }
 
     pub fn allows_started_notice(&self) -> bool {
@@ -292,31 +305,15 @@ impl Activation {
 }
 
 /// One attempt of the production wait. Does not sleep.
-pub async fn poll_writer_lock(
-    db: &Db,
-    activation: &Activation,
-    tenant: Option<&crate::tenant::TenantRuntime>,
-) -> anyhow::Result<WriterLockPoll> {
+pub async fn poll_writer_lock(db: &Db, activation: &Activation) -> anyhow::Result<WriterLockPoll> {
     if activation.is_shutting_down() {
         activation.mark_lock_held(false);
         return Ok(WriterLockPoll::Waiting);
     }
     let requested_at = Instant::now();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let previous = db.leased_generation();
     if db::claim_active_bot(db, activation.instance(), now_ms, activation.refuse_flag()).await? {
         activation.note_authority(requested_at);
-        if db.leased_generation() != previous
-            && let Some(tenant) = tenant
-            && let Err(error) = tenant.raise_held_writer_epoch().await
-        {
-            activation.mark_lock_held(false);
-            if writer_lease_lost(&error) {
-                let _ = db::release_active_bot(db, activation.instance()).await;
-                return Err(error);
-            }
-            return Err(error);
-        }
         activation.mark_lock_held(true);
         Ok(WriterLockPoll::Ready)
     } else {
@@ -336,11 +333,7 @@ fn writer_lease_lost(error: &anyhow::Error) -> bool {
 /// Returns `Ok(false)` when shutdown wins. Returns `Ok(true)` as soon as the
 /// lease is free, without sleeping. The sleep is only the startup backoff
 /// while another instance still holds the lease.
-pub async fn wait_for_writer_lock(
-    db: &Db,
-    activation: &Arc<Activation>,
-    tenant: Option<&crate::tenant::TenantRuntime>,
-) -> anyhow::Result<bool> {
+pub async fn wait_for_writer_lock(db: &Db, activation: &Arc<Activation>) -> anyhow::Result<bool> {
     let budget = db::startup_retry_budget(db.is_remote());
     let started = Instant::now();
     let deadline = started + budget.budget;
@@ -350,7 +343,7 @@ pub async fn wait_for_writer_lock(
             return Ok(false);
         }
         attempt += 1;
-        match poll_writer_lock(db, activation, tenant).await {
+        match poll_writer_lock(db, activation).await {
             Ok(WriterLockPoll::Ready) => {
                 let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 tracing::info!(
@@ -383,12 +376,12 @@ pub async fn wait_for_writer_lock(
     }
 }
 
-pub fn spawn_renewal(
+fn spawn_renewal(
     db: Db,
     activation: Arc<Activation>,
-    tenant: crate::tenant::TenantRuntime,
+    tenant: Option<crate::tenant::TenantRuntime>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_renewal_every(db, activation, Some(tenant), RENEW_EVERY)
+    spawn_renewal_every(db, activation, tenant, RENEW_EVERY)
 }
 
 fn spawn_renewal_every(
@@ -403,7 +396,7 @@ fn spawn_renewal_every(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
-            let lost_at_deadline = wait_for_renewal_tick(&activation, &mut interval).await;
+            let lost_at_deadline = wait_for_renewal_tick(&activation, &mut interval, every).await;
             if lost_at_deadline {
                 // Shutdown notices still record until the notice drain cuts off.
                 if !activation.is_shutting_down() {
@@ -458,6 +451,12 @@ fn spawn_renewal_every(
                 claim.await
             };
             if matches!(result, Ok(true)) {
+                if !activation.authority_current() {
+                    if !activation.is_shutting_down() {
+                        lose_lease(&activation, "active-bot lease renewal completed too late");
+                    }
+                    break;
+                }
                 activation.note_authority(requested_at);
                 let generation = db.leased_generation();
                 if generation != armed {
@@ -480,6 +479,14 @@ fn spawn_renewal_every(
                 break;
             }
         }
+        if !activation.is_shutting_down() {
+            // Cut off Discord work before exiting, even if the task ended after
+            // an already-observed cutoff. A running, unleased bot is unhealthy.
+            activation.note_lease_lost();
+            set_process_ready(false);
+            tracing::error!("active-bot lease lost outside shutdown; exiting for restart");
+            (activation.exit_hook)(1);
+        }
     })
 }
 
@@ -487,6 +494,7 @@ fn spawn_renewal_every(
 async fn wait_for_renewal_tick(
     activation: &Activation,
     interval: &mut tokio::time::Interval,
+    every: Duration,
 ) -> bool {
     let tick = interval.tick();
     tokio::pin!(tick);
@@ -494,9 +502,15 @@ async fn wait_for_renewal_tick(
         tick.await;
         return false;
     };
+    // A slow claim (or startup work) may leave less than one normal tick.
+    // Wake early enough to start a renewal while confirmed authority remains.
+    let renew_at = deadline
+        .checked_sub(every.saturating_add(RENEW_START_MARGIN))
+        .unwrap_or(deadline);
     tokio::select! {
         biased;
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => true,
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at)) => false,
         _ = &mut tick => false,
     }
 }
@@ -552,7 +566,8 @@ pub async fn claim_writer_lease(
     // listener starts only after this function, and recovery's first read is
     // still ahead of it.
     activation.set_recovery_in_progress(true);
-    let claimed = match wait_for_writer_lock(db, activation, tenant).await {
+    let previous = db.leased_generation();
+    let claimed = match wait_for_writer_lock(db, activation).await {
         Ok(claimed) => claimed,
         Err(error) => {
             activation.set_recovery_in_progress(false);
@@ -563,6 +578,29 @@ pub async fn claim_writer_lease(
         activation.set_recovery_in_progress(false);
         return Ok(false);
     }
+    // Renew before any guild-store startup work can consume this claim's
+    // authority window. Dropping the handle leaves renewal running.
+    let _renewal = spawn_renewal(db.clone(), Arc::clone(activation), tenant.cloned());
+    #[cfg(test)]
+    {
+        let delay = *activation.startup_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+    }
+    if db.leased_generation() != previous
+        && let Some(tenant) = tenant
+        && let Err(error) = tenant.raise_held_writer_epoch().await
+    {
+        activation.mark_lock_held(false);
+        if writer_lease_lost(&error) {
+            let _ = db::release_active_bot(db, activation.instance()).await;
+        }
+        activation.set_recovery_in_progress(false);
+        return Err(error);
+    }
+    anyhow::ensure!(
+        activation.may_record(),
+        "active-bot lease expired during startup"
+    );
     let db = db.clone();
     let activation = Arc::clone(activation);
     tokio::spawn(async move {
@@ -647,7 +685,7 @@ mod tests {
         let (path, db) = temp_db("overlap");
         let holder = Activation::new();
         let started = Instant::now();
-        assert!(wait_for_writer_lock(&db, &holder, None).await.unwrap());
+        assert!(wait_for_writer_lock(&db, &holder).await.unwrap());
         assert!(
             started.elapsed() < Duration::from_millis(800),
             "a free lease must return without the retry sleep"
@@ -658,7 +696,7 @@ mod tests {
 
         let challenger = Activation::new();
         assert_eq!(
-            poll_writer_lock(&db, &challenger, None).await.unwrap(),
+            poll_writer_lock(&db, &challenger).await.unwrap(),
             WriterLockPoll::Waiting
         );
         assert!(!challenger.allows_discord_connect());
@@ -676,7 +714,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            poll_writer_lock(&db, &challenger, None).await.unwrap(),
+            poll_writer_lock(&db, &challenger).await.unwrap(),
             WriterLockPoll::Ready
         );
         assert!(challenger.allows_discord_connect());
@@ -796,7 +834,7 @@ mod tests {
     async fn failed_renewal_cancels_an_inflight_discord_call() {
         let (path, db) = temp_db("renew-err");
         let activation = Activation::new();
-        assert!(wait_for_writer_lock(&db, &activation, None).await.unwrap());
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         activation.fail_next_renewal();
@@ -854,7 +892,7 @@ mod tests {
     async fn takeover_cancels_an_inflight_discord_call() {
         let (path, db) = temp_db("renew-takeover");
         let activation = Activation::new();
-        assert!(wait_for_writer_lock(&db, &activation, None).await.unwrap());
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         db::release_active_bot(&db, activation.instance())
@@ -886,9 +924,13 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_cancellation_cancels_an_inflight_discord_call_after_notices() {
+        static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
         let (path, db) = temp_db("renew-shutdown");
-        let activation = Activation::new();
-        assert!(wait_for_writer_lock(&db, &activation, None).await.unwrap());
+        let mut activation = Activation::new();
+        Arc::get_mut(&mut activation).unwrap().exit_hook = |code| {
+            EXIT_CODE.store(code, Ordering::Release);
+        };
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         activation.begin_shutdown();
@@ -898,7 +940,11 @@ mod tests {
             None,
             Duration::from_millis(20),
         );
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::timeout(Duration::from_secs(2), renewal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(EXIT_CODE.load(Ordering::Acquire), 0);
         assert!(
             activation.may_record(),
             "shutdown notices must still be allowed before the cutoff path"
@@ -914,7 +960,6 @@ mod tests {
         assert!(saw_notice.load(Ordering::SeqCst));
         assert_cancelled(task).await;
         assert!(!activation.may_record());
-        renewal.abort();
         drop(db);
         cleanup(&path);
     }
@@ -923,16 +968,16 @@ mod tests {
     async fn release_cannot_clear_another_owners_lease() {
         let (path, db) = temp_db("release");
         let holder = Activation::new();
-        assert!(wait_for_writer_lock(&db, &holder, None).await.unwrap());
+        assert!(wait_for_writer_lock(&db, &holder).await.unwrap());
         let other = Activation::new();
         db::release_active_bot(&db, other.instance()).await.unwrap();
         assert!(
             holder.may_record()
-                || poll_writer_lock(&db, &holder, None).await.unwrap() == WriterLockPoll::Ready,
+                || poll_writer_lock(&db, &holder).await.unwrap() == WriterLockPoll::Ready,
             "a different instance must not clear the held lease"
         );
         assert_eq!(
-            poll_writer_lock(&db, &other, None).await.unwrap(),
+            poll_writer_lock(&db, &other).await.unwrap(),
             WriterLockPoll::Waiting
         );
         assert!(!other.may_record());
@@ -942,7 +987,7 @@ mod tests {
         holder.note_lease_lost();
         assert!(!holder.may_record());
         assert_eq!(
-            poll_writer_lock(&db, &other, None).await.unwrap(),
+            poll_writer_lock(&db, &other).await.unwrap(),
             WriterLockPoll::Ready
         );
         assert!(other.may_record());
@@ -1005,6 +1050,95 @@ mod tests {
         cleanup(&path);
     }
 
+    #[tokio::test]
+    async fn slow_startup_epoch_raise_keeps_the_lease_held_and_renewing() {
+        let _recovery = crate::recovery::recovery_test_lock().lock().await;
+        let (path, db) = temp_db("slow-startup");
+        let cfg = crate::config::DbConfig {
+            path: path.clone(),
+            ..Default::default()
+        };
+        let tenant =
+            crate::tenant::TenantRuntime::open(&db, &cfg, &Default::default(), &Default::default())
+                .unwrap();
+        let activation = Activation::new();
+        // Startup work outlasts the production 15s authority window. Keep the
+        // real cadence/window so concurrent DB tests cannot exhaust a tiny TTL.
+        *activation.startup_delay.lock().unwrap() = Duration::from_secs(16);
+        let started = Instant::now();
+        assert!(
+            claim_writer_lease("", &db, &activation, Some(&tenant))
+                .await
+                .unwrap()
+        );
+        assert!(started.elapsed() > Duration::from_secs(15));
+        assert!(
+            activation.may_record(),
+            "startup work outlasting the original authority window must finish with a renewed lease"
+        );
+        let deadline = activation.authority_deadline().unwrap();
+        tokio::time::sleep(RENEW_EVERY + Duration::from_millis(100)).await;
+        assert!(activation.authority_deadline().unwrap() > deadline);
+        assert!(!activation.cut_off.load(Ordering::Acquire));
+        activation.begin_shutdown();
+        drop(tenant);
+        drop(db);
+        crate::tenant::remove_sidecars(&path);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn slow_core_claim_renews_before_remaining_authority_expires() {
+        let (path, db) = temp_db("slow-claim");
+        let activation = Activation::new();
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        // Model a confirmed claim that spent 12s of its 15s window.
+        activation.note_authority(Instant::now() - Duration::from_secs(12));
+        let deadline = activation.authority_deadline().unwrap();
+        let renewal = spawn_renewal_every(db.clone(), Arc::clone(&activation), None, RENEW_EVERY);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            activation.may_record(),
+            "a slow claim must renew before its remaining authority expires"
+        );
+        assert!(activation.authority_deadline().unwrap() > deadline);
+        assert!(!activation.cut_off.load(Ordering::Acquire));
+        activation.begin_shutdown();
+        renewal.abort();
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn unexpected_lease_loss_calls_the_nonzero_exit_hook() {
+        static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        let (path, db) = temp_db("lease-exit");
+        let mut activation = Activation::new();
+        Arc::get_mut(&mut activation).unwrap().exit_hook = |code| {
+            EXIT_CODE.store(code, Ordering::Release);
+        };
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        activation.fail_next_renewal();
+        let renewal = spawn_renewal_every(
+            db.clone(),
+            Arc::clone(&activation),
+            None,
+            Duration::from_millis(30),
+        );
+        tokio::time::timeout(Duration::from_secs(2), renewal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(activation.cut_off.load(Ordering::Acquire));
+        assert!(!activation.may_record());
+        assert!(
+            EXIT_CODE.load(Ordering::Acquire) != 0,
+            "unexpected lease loss must call the exit hook with a non-zero code"
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
     #[test]
     fn control_hold_does_not_raise_moderation_depth() {
         let activation = Activation::new();
@@ -1027,7 +1161,7 @@ mod tests {
         let (path, db) = temp_db("renew-stall");
         let activation = Activation::new();
         activation.set_lease_window(Duration::from_millis(500), Duration::from_millis(40));
-        assert!(wait_for_writer_lock(&db, &activation, None).await.unwrap());
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         assert!(activation.may_record());
         let horizon = activation
             .authority_deadline()

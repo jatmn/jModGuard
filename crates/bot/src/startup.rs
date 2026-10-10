@@ -49,11 +49,6 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     {
         bail!("bot probe stopped before it held the writer lease");
     }
-    let _renewal = crate::activation::spawn_renewal(
-        app.db.clone(),
-        Arc::clone(&app.activation),
-        app.tenant.clone(),
-    );
     app.install_control_actor_lookup(|_actor, _op| {
         Some(db::CachedGuildActor {
             guild_owner_id: 0,
