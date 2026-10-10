@@ -8,7 +8,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 3;
+pub const LAUNCHER_REVISION: u32 = 4;
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
@@ -269,6 +269,9 @@ pub async fn record_clear_superseded_launcher(
 
 /// Compare the parsed release, then swap on the original stored text.
 /// Rows saved before launcher labels omit fields this serializer writes.
+/// An absent or different selection is already settled, including a clear the
+/// bot saved before its reply was lost. Succeed without writing so a queued
+/// receipt can retire; database and JSON failures still surface.
 pub async fn record_clear_uncontracted_launcher(
     db: &Db,
     role: &str,
@@ -283,12 +286,15 @@ pub async fn record_clear_uncontracted_launcher(
             params![role.clone()],
             |row| Ok(row.get(0)?),
         )?;
-        let stored = stored.context("desired launcher is already clear")?;
+        let Some(stored) = stored else {
+            tx.commit()?;
+            return Ok(());
+        };
         let parsed: ComponentRelease = serde_json::from_str(&stored)?;
-        anyhow::ensure!(
-            parsed.launcher.is_none() && parsed == release,
-            "desired launcher changed before clear"
-        );
+        if parsed.launcher.is_some() || parsed != release {
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute_rows(
             "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
             params![role, stored],
