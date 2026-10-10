@@ -2514,3 +2514,157 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
     drop(bot);
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
+
+/// Reconstruct the historical schema, rather than only lowering user_version
+/// on an otherwise current DB. The child is the existing ELF fixture; application
+/// migrations below use the real bot-owned Db::open path after launcher admission.
+#[tokio::test]
+async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early() {
+    for stale_meta in [false, true] {
+        let root =
+            std::env::temp_dir().join(format!("queued-core16-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let baked = executable(&root, "baked-bot").await;
+        let path = root.join("core.db");
+        let db = Db::open(&path, 2).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
+        db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
+                 DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
+                 DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
+                 PRAGMA user_version=16;",
+                1024 * 1024,
+            )?;
+            for row in fixture["component_updates"].as_array().unwrap() {
+                // Column names are from this committed synthetic fixture only.
+                for (column, value) in row.as_object().unwrap() {
+                    if column == "component" {
+                        continue;
+                    }
+                    let sql =
+                        format!("UPDATE component_updates SET {column}=?1 WHERE component=?2");
+                    let value = match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(value) => Some(value.clone()),
+                        value => Some(value.to_string()),
+                    };
+                    tx.execute_bounded(
+                        &sql,
+                        params![value, row["component"].as_str().unwrap()],
+                        64 * 1024,
+                    )?;
+                }
+            }
+            for (key, value) in fixture["meta"].as_object().unwrap() {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                db::write_meta_string_conn(&tx, key, &value)?;
+            }
+            if stale_meta {
+                for role in ["bot", "api"] {
+                    // Failed newer baked boot, followed by rollback to the old app.
+                    let value = json!({"source_sha": "f".repeat(40), "core": 18, "guild": 15});
+                    db::write_meta_string_conn(
+                        &tx,
+                        &format!("component_baked_compatibility_{role}_v1"),
+                        &value.to_string(),
+                    )?;
+                }
+            }
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        drop(db);
+        let opts = DbOpenOptions {
+            path: path.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            read_only: false,
+            default_prefix: "!".into(),
+            retention_days: 1,
+        };
+        let control = UpdateControl::open(&opts).unwrap().unwrap();
+        assert_eq!(control.schema_version().await.unwrap(), 16);
+        assert!(control.upgrade().await.unwrap().is_none());
+        let before = control.component("bot").await.unwrap();
+        assert_eq!(before.observed.as_ref().unwrap().update_protocol, 3);
+        assert!(before.installed.is_none() && before.previous.is_none());
+        let mut bot = controller(
+            "bot",
+            baked.clone(),
+            Registry::ghcr().unwrap(),
+            control.clone(),
+            &root,
+        );
+        // Match real baked startup: bot writes both records; read-only baked API
+        // uses its compiled contract, independent of old or stale meta.
+        for role in ["bot", "api"] {
+            let contract = control
+                .baked_compatibility(role, &bot.base_sha, true)
+                .await
+                .unwrap();
+            assert_eq!(contract.core, 18);
+            assert_eq!(contract.source_sha, bot.base_sha);
+            if role == "bot" {
+                bot.baked_compatibility = contract;
+            }
+        }
+        let mut api = controller(
+            "api",
+            baked,
+            Registry::ghcr().unwrap(),
+            control.clone(),
+            &root,
+        );
+        let error = api.tick().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("baked application cannot open database")
+        );
+        assert!(api.running.is_none());
+        tokio::fs::write(root.join("hold-baked-bot-ready"), "")
+            .await
+            .unwrap();
+        bot.tick().await.unwrap();
+        assert!(
+            bot.running.is_some(),
+            "baked migrator must start from core16"
+        );
+        assert!(bot.running.as_ref().unwrap().release.is_none());
+        // Real application bootstrap applies migrations 17-18 and the readiness
+        // marker. The ELF child itself deliberately does no DB/application work.
+        let migrated = Db::open(&path, 2).unwrap();
+        assert_eq!(control.schema_version().await.unwrap(), 18);
+        tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bot.reported {
+            assert!(Instant::now() < deadline);
+            bot.report_ready().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after = control.component("bot").await.unwrap();
+        assert_eq!(after.desired, before.desired);
+        assert_eq!(after.candidate, before.candidate);
+        assert!(after.installed.is_none() && after.previous.is_none());
+        assert_eq!(after.state, "queued");
+        assert_eq!(after.observed.unwrap().min_schema, 18);
+        api.restore(&control.component("api").await.unwrap())
+            .await
+            .unwrap();
+        assert!(api.running.is_some());
+        api.stop_application().await.unwrap();
+        bot.stop_application().await.unwrap();
+        drop((api, bot, control, migrated));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}

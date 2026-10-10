@@ -773,8 +773,22 @@ impl Supervisor {
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
         } else {
+            // A baked bot owns migrations. A protocol-aware observation alone
+            // does not make an uninstalled, queued release a managed baseline.
+            // Keep that queue intact, but never replace managed history or a
+            // durable paired operation. Published baked migration origins start
+            // at core15; the API still requires its exact runtime schema.
+            let baked_migration = self.role == "bot"
+                && (15..=self.baked_compatibility.core).contains(&schema)
+                && state.previous.is_none()
+                && (state.desired.is_none() || state.state == "queued")
+                && state
+                    .observed
+                    .as_ref()
+                    .is_none_or(|seen| seen.max_schema <= self.baked_compatibility.core)
+                && self.control.upgrade().await?.is_none();
             ensure!(
-                self.control.schema_version().await? == self.baked_compatibility.core,
+                schema == self.baked_compatibility.core || baked_migration,
                 "baked application cannot open database; use owner recovery"
             );
             let path = self.baked.clone();
