@@ -1248,11 +1248,13 @@ pub struct CachedGuildConfig {
     pub log_channels: HashMap<String, ChannelId>,
     pub log_filters: HashMap<String, db::LogFilter>,
     pub regexes: Vec<Regex>,
+    pub custom_patterns: HashMap<String, Regex>,
 }
 
 impl CachedGuildConfig {
     fn from_parts(version: u64, durable_version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
+        let mut custom_patterns = HashMap::new();
         for pattern in &parts.badwords {
             // Same compile limits as WebUI / add_badword — legacy DB rows that
             // exceed the budget are skipped so cache load cannot DoS the bot.
@@ -1260,6 +1262,27 @@ impl CachedGuildConfig {
                 Ok(re) => regexes.push(re),
                 Err(e) => {
                     tracing::warn!("badword pattern `{pattern}` failed to compile: {e}");
+                }
+            }
+        }
+        for (rule_id, rule) in &parts.rules {
+            if !jmodguard::custom_rules::is_custom_id(rule_id) {
+                continue;
+            }
+            if rule.params.get("kind").and_then(|v| v.as_str()) != Some("pattern") {
+                continue;
+            }
+            let pattern = rule
+                .params
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match crate::normalize::compile_user_regex(pattern) {
+                Ok(re) => {
+                    custom_patterns.insert(rule_id.clone(), re);
+                }
+                Err(e) => {
+                    tracing::warn!("custom pattern `{rule_id}` failed to compile: {e}");
                 }
             }
         }
@@ -1288,6 +1311,7 @@ impl CachedGuildConfig {
                 .collect(),
             log_filters: parts.log_filters,
             regexes,
+            custom_patterns,
         }
     }
 

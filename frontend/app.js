@@ -462,6 +462,10 @@ function closeOverlay() {
   ui.set({ editor: null, dirty: false });
 }
 function editRule(record) {
+  if (isCustomRuleId(record.rule_id)) {
+    ui.set({ editor: h(CustomRuleEditor, { record, creating: false }) });
+    return;
+  }
   ui.set({ editor: h(RuleEditor, { record }) });
 }
 function editCommand(record) {
@@ -1251,7 +1255,24 @@ function applyConfigPatch(res) {
   state.loading = false;
   state.error = null;
   if (patch.kind === "rule") {
-    const row = config.rules?.find((rule) => rule.rule_id === patch.id);
+    const custom = isCustomRuleId(patch.id);
+    if (custom && patch.value == null) {
+      config.rules = (config.rules || []).filter((rule) => rule.rule_id !== patch.id);
+      return true;
+    }
+    let row = config.rules?.find((rule) => rule.rule_id === patch.id);
+    if (!row && custom && patch.value) {
+      config.rules ||= [];
+      config.rules.push({
+        rule_id: patch.id,
+        name: patch.value.name,
+        description: patch.value.description || "",
+        effective: patch.value,
+        guild_override: patch.value,
+        global: null,
+      });
+      return true;
+    }
     if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
     if (patch.scope === "global") {
       row.global = patch.value;
@@ -1517,12 +1538,55 @@ function stat(label, value) {
   );
 }
 
+function isCustomRuleId(id) {
+  const rest = String(id || "").slice("custom:".length);
+  return id?.startsWith("custom:") && rest.length >= 8 && rest.length <= 32 && /^[0-9a-f]+$/.test(rest);
+}
+
+function newCustomRuleDraft() {
+  const hex = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  return {
+    rule_id: `custom:${hex}`,
+    name: "Custom rule",
+    description: "",
+    effective: {
+      name: "Custom rule",
+      description: "",
+      enabled: true,
+      dry_run: true,
+      params: { kind: "pattern", pattern: "" },
+      actions: [{ at: 1, action: "delete", duration_minutes: 0, delete_days: 0, reason: "" }],
+      whitelist_roles: [],
+      whitelist_channels: [],
+      whitelist_users: [],
+      skip_moderators: false,
+      include_channels: [],
+      log_automod: true,
+      open_case: true,
+    },
+    guild_override: null,
+    global: null,
+  };
+}
+
 function tabRules() {
   const rules = state.config.rules;
   return h(
     "div",
     {},
     h("h2", {}, "Automod rules"),
+    h(
+      "div",
+      { className: "row", style: { marginBottom: "12px" } },
+      h(
+        ActionButton,
+        {
+          className: "btn btn-primary btn-sm",
+          onClick: () => ui.set({ editor: h(CustomRuleEditor, { record: newCustomRuleDraft(), creating: true }) }),
+        },
+        "Add custom rule",
+      ),
+    ),
     h(
       "p",
       { className: "muted", style: { marginBottom: "14px" } },
@@ -1537,7 +1601,7 @@ function tabRules() {
 
 function ruleCard(r) {
   const rule = r.effective;
-  const spam = spamRule(r.rule_id);
+  const spam = !isCustomRuleId(r.rule_id) && spamRule(r.rule_id);
   const supported = !spam || spamConfigured(r.rule_id, rule);
   const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
   const label = !rule.enabled
@@ -1645,6 +1709,178 @@ function spamThresholds(p, id) {
   return ranges.every(([n, min, max]) => Number.isInteger(n) && n >= min && n <= max);
 }
 
+function buildCustomRuleSaveBody(rule, creating) {
+  const body = JSON.parse(JSON.stringify(rule));
+  if (creating) body.dry_run = true;
+  return body;
+}
+
+function CustomRuleEditor({ record: r, creating }) {
+  const [rule] = useState(() => JSON.parse(JSON.stringify(r.effective)));
+  const [, bumpForm] = useState(0);
+  const kind = rule.params?.kind || "pattern";
+  return h(
+    DialogPanel,
+    { className: "modal-box rule-editor", onInput: trackDraft },
+    h("h3", { className: "card-title" }, creating ? "Add custom rule" : `Edit custom rule: ${r.name || r.rule_id}`),
+    field("Name", h(Input, { type: "text", defaultValue: rule.name, className: "input", onInput: (e) => (rule.name = e.target.value) })),
+    field(
+      "Type",
+      h(
+        Select,
+        {
+          className: "select",
+          defaultValue: kind,
+          onChange: (e) => {
+            const next = e.target.value;
+            const prev = rule.params || {};
+            rule.params = { kind: next };
+            if (next === "pattern") rule.params.pattern = prev.pattern || "";
+            if (next === "word") rule.params.words = Array.isArray(prev.words) ? prev.words : [];
+            if (next === "channel_content") {
+              rule.params.links = prev.links !== false;
+              rule.params.attachments = prev.attachments === true;
+            }
+            if (next === "honeypot_role") {
+              rule.params.role_id = prev.role_id || "";
+              const current = rule.actions?.[0]?.action;
+              if (!current || current === "delete") {
+                rule.actions = [{
+                  at: 1,
+                  action: "kick",
+                  duration_minutes: 0,
+                  delete_days: 0,
+                  reason: rule.actions?.[0]?.reason || "",
+                }];
+              }
+            }
+            markDirty();
+            bumpForm((n) => n + 1);
+          },
+        },
+        h("option", { value: "pattern" }, "Pattern (regex)"),
+        h("option", { value: "word" }, "Word list"),
+        h("option", { value: "channel_content" }, "Channel content"),
+        h("option", { value: "everyone_attempt" }, "@everyone / @here attempt"),
+        h("option", { value: "honeypot_role" }, "Honeypot role"),
+      ),
+    ),
+    kind === "pattern"
+      ? field("Pattern", h(Input, { type: "text", className: "input mono", defaultValue: rule.params.pattern || "", onInput: (e) => (rule.params.pattern = e.target.value) }))
+      : null,
+    kind === "word"
+      ? field("Words (comma-separated)", h(Input, { type: "text", className: "input", defaultValue: (rule.params.words || []).join(","), onInput: (e) => (rule.params.words = e.target.value.split(",").map((w) => w.trim()).filter(Boolean)) }))
+      : null,
+    kind === "channel_content"
+      ? h(
+          "div",
+          { className: "row checkbox-group" },
+          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.links, onChange: (e) => (rule.params.links = e.target.checked) }), "Links"),
+          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.attachments, onChange: (e) => (rule.params.attachments = e.target.checked) }), "Attachments"),
+        )
+      : null,
+    kind === "honeypot_role"
+      ? h(
+          "p",
+          { className: "muted" },
+          "Default action is kick. For a hidden case, turn on Open a case and turn off Post to automod log. Role id is a snowflake string.",
+          field("Role id", h(Input, { type: "text", className: "input mono", defaultValue: String(rule.params.role_id || ""), onInput: (e) => (rule.params.role_id = e.target.value.trim()) })),
+        )
+      : null,
+    field(
+      "Action",
+      h(
+        Select,
+        {
+          key: `action-${rule.actions?.[0]?.action || "delete"}`,
+          className: "select",
+          value: rule.actions?.[0]?.action || "delete",
+          onChange: (e) => {
+            const action = e.target.value;
+            const prev = rule.actions?.[0] || {};
+            let duration = prev.duration_minutes || 0;
+            if (action === "timeout" && !duration) duration = 60;
+            rule.actions = [{
+              at: 1,
+              action,
+              duration_minutes: duration,
+              delete_days: action === "ban" ? prev.delete_days || 0 : 0,
+              reason: prev.reason || "",
+            }];
+            markDirty();
+            bumpForm((n) => n + 1);
+          },
+        },
+        ["delete", "warn", "timeout", "kick", "ban"].map((a) => h("option", { key: a, value: a }, a)),
+      ),
+    ),
+    rule.actions?.[0]?.action === "timeout"
+      ? field("Timeout (minutes)", h(Input, { type: "number", className: "input", defaultValue: rule.actions[0].duration_minutes || 60, onInput: (e) => (rule.actions[0].duration_minutes = Number(e.target.value)) }))
+      : null,
+    rule.actions?.[0]?.action === "ban"
+      ? field("Delete history (days)", h(Input, { type: "number", min: 0, max: 7, className: "input", defaultValue: rule.actions[0].delete_days || 0, onInput: (e) => (rule.actions[0].delete_days = Number(e.target.value)) }))
+      : null,
+    field("Reason template", h(Input, { type: "text", className: "input", defaultValue: rule.actions?.[0]?.reason || "", onInput: (e) => (rule.actions[0].reason = e.target.value) })),
+    h(
+      "div",
+      { className: "row checkbox-group" },
+      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.enabled, onChange: (e) => (rule.enabled = e.target.checked) }), "Enabled"),
+      h(
+        "label",
+        { className: "checkbox-label" },
+        h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.dry_run, disabled: creating, onChange: (e) => (rule.dry_run = e.target.checked) }),
+        "Dry-run (log only)",
+      ),
+      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.log_automod, onChange: (e) => (rule.log_automod = e.target.checked) }), "Post to automod log"),
+      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.open_case, onChange: (e) => (rule.open_case = e.target.checked) }), "Open a case"),
+      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.skip_moderators, onChange: (e) => (rule.skip_moderators = e.target.checked) }), "Skip moderators"),
+    ),
+    field("Only these channels (empty means all)", h(Input, { type: "text", className: "input", defaultValue: (rule.include_channels || []).join(","), onInput: (e) => (rule.include_channels = splitIds(e.target.value)) })),
+    h(
+      "div",
+      { className: "row form-row" },
+      field("Skip roles (ids, comma)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_roles || []).join(","), onInput: (e) => (rule.whitelist_roles = splitIds(e.target.value)) })),
+      field("Skip channels (ids)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_channels || []).join(","), onInput: (e) => (rule.whitelist_channels = splitIds(e.target.value)) })),
+      field("Skip users (ids)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_users || []).join(","), onInput: (e) => (rule.whitelist_users = splitIds(e.target.value)) })),
+    ),
+    h(
+      "div",
+      { className: "modal-action" },
+      h(
+        ActionButton,
+        {
+          className: "btn btn-primary",
+          onClick: async () => {
+            const data = buildCustomRuleSaveBody(rule, creating);
+            const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope: "guild", data });
+            if (!applyConfigPatch(saved) && !(await loadConfig())) return;
+            toast("Rule saved", "success");
+            closeOverlay();
+            renderTab();
+          },
+        },
+        "Save",
+      ),
+      !creating
+        ? h(
+            ActionButton,
+            {
+              className: "btn btn-error",
+              onClick: async () => {
+                await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" }), () => {
+                  toast("Rule deleted", "success");
+                  closeOverlay();
+                });
+              },
+            },
+            "Delete",
+          )
+        : null,
+      h(ActionButton, { className: "btn btn-outline", onClick: () => canLeave() && closeOverlay() }, "Cancel"),
+    ),
+  );
+}
+
 function RuleEditor({ record: r }) {
   const [rule] = useState(() => JSON.parse(JSON.stringify(r.effective)));
   const [, setActionsRevision] = useState(0);
@@ -1725,6 +1961,21 @@ function RuleEditor({ record: r }) {
     ref: usersTextRef,
     type: "text",
     defaultValue: (rule.whitelist_users || []).join(","),
+    className: "input",
+  });
+  const skipModRef = useRef(null);
+  const skipMod = h(Input, {
+    ref: skipModRef,
+    type: "checkbox",
+    defaultChecked: rule.skip_moderators,
+    onChange: (e) => (rule.skip_moderators = e.target.checked),
+    className: "checkbox",
+  });
+  const includeChannelsRef = useRef(null);
+  const includeChannels = h(Input, {
+    ref: includeChannelsRef,
+    type: "text",
+    defaultValue: (rule.include_channels || []).join(","),
     className: "input",
   });
   const scopeSelRef = useRef(null);
@@ -1836,6 +2087,12 @@ function RuleEditor({ record: r }) {
     ),
     h(
       "div",
+      { className: "row checkbox-group" },
+      h("label", { className: "checkbox-label" }, skipMod, "Skip moderators"),
+      field("Only these channels (empty means all)", includeChannels),
+    ),
+    h(
+      "div",
       { className: "modal-action" },
       field("Applies to", scopeSel),
       h(
@@ -1890,6 +2147,8 @@ function RuleEditor({ record: r }) {
             rule.whitelist_roles = splitIds(whitelistTextRef.current.value);
             rule.whitelist_channels = splitIds(channelsTextRef.current.value);
             rule.whitelist_users = splitIds(usersTextRef.current.value);
+            rule.skip_moderators = skipModRef.current?.checked ?? rule.skip_moderators;
+            rule.include_channels = splitIds(includeChannelsRef.current?.value || "");
             const scope = scopeSelRef.current.value;
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", {
               scope,

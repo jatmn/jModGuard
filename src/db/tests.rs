@@ -2987,6 +2987,7 @@ mod action_enrollments;
 mod nickname_enrollments;
 
 mod configuration_enrollments;
+mod custom_rules;
 
 mod moderation_enrollments;
 

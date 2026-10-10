@@ -704,6 +704,60 @@ fn prepare_badword_replacement(
     Ok((valid, skipped))
 }
 
+/// Validates a rules copy before the destination is cleared.
+///
+/// Custom rows use the same create admission as an upsert: global scope is
+/// rejected, the per-guild cap applies to the replacement set, and each new
+/// custom rule is stored dry-run.
+fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(String, RuleDef)>> {
+    let mut replacement = Vec::with_capacity(rows.len());
+    let mut custom = 0usize;
+    for (id, rule) in rows {
+        crate::image_spam::validate_rule(&id, &rule)?;
+        if crate::custom_rules::is_custom_id(&id) {
+            custom += 1;
+            replacement.push((
+                id.clone(),
+                crate::custom_rules::custom_rule_for_create(dst, &id, rule)?,
+            ));
+        } else {
+            replacement.push((id, rule));
+        }
+    }
+    crate::custom_rules::ensure_room_for_new_custom_rules(0, custom)?;
+    Ok(replacement)
+}
+
+// The caller keeps validation, deletion and these budgeted inserts in one transaction.
+pub(super) fn insert_copied_rules(
+    dst: i64,
+    replacement: &[(String, RuleDef)],
+    mut execute: impl FnMut(&str, Vec<Value>, u64) -> Result<usize>,
+) -> Result<()> {
+    // Match the badword-copy batch size to bound parameters and remote requests.
+    for chunk in replacement.chunks(100) {
+        let values = (0..chunk.len())
+            .map(|i| {
+                let n = i * 3 + 1;
+                format!("(?{n}, ?{}, ?{})", n + 1, n + 2)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (id, rule) in chunk {
+            args.push(Value::Integer(dst));
+            args.push(Value::Text(id.clone()));
+            args.push(Value::Text(serde_json::to_string(rule)?));
+        }
+        execute(
+            &format!("INSERT INTO rules (guild_id, rule_id, data) VALUES {values}"),
+            args,
+            chunk.len() as u64,
+        )?;
+    }
+    Ok(())
+}
+
 fn section_wanted(sections: &[String], name: &str) -> bool {
     sections.iter().any(|s| s == name || s == "all")
 }
@@ -809,20 +863,17 @@ async fn copy_guild_config_inner(
         }
 
         if wants("rules") {
-            for (id, rule) in load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)? {
-                crate::image_spam::validate_rule(&id, &rule)?;
-            }
+            let rows = load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)?;
             if src != dst {
+                let replacement = prepare_copied_rules(dst, rows)?;
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
-                tx.execute_copy(
-                    "INSERT INTO rules (guild_id, rule_id, data)
-                     SELECT ?1, rule_id, data FROM rules WHERE guild_id = ?2",
-                    dst,
-                    src,
-                    "rules",
-                    "rule_id",
-                    "data",
-                )?;
+                insert_copied_rules(dst, &replacement, |sql, args, rows| {
+                    tx.execute_rows(sql, params_from_iter(args), rows)
+                })?;
+            } else {
+                for (id, rule) in &rows {
+                    crate::image_spam::validate_rule(id, rule)?;
+                }
             }
             result.copied.push("rules");
         }
@@ -1218,6 +1269,16 @@ impl ConfigurationSnapshotRows {
                 ),
             );
         }
+        if guild_id != GLOBAL_SCOPE {
+            for (id, row) in &self.guild_rules {
+                if !crate::custom_rules::is_custom_id(id) {
+                    continue;
+                }
+                if crate::custom_rules::validate_custom_rule_shape(guild_id, id, row).is_ok() {
+                    rules.insert(id.clone(), row.clone());
+                }
+            }
+        }
         let mut commands = self.global_commands.clone();
         for (name, def) in self.guild_commands {
             commands.insert(name, def);
@@ -1403,6 +1464,9 @@ pub async fn upsert_enrolled_rule(
     rule: &RuleDef,
 ) -> Result<()> {
     crate::image_spam::validate_rule(id, rule)?;
+    if crate::custom_rules::is_custom_id(id) {
+        return upsert_enrolled_custom_rule(db, scope, id, rule).await;
+    }
     upsert_row(
         db,
         "rules",
@@ -1412,6 +1476,46 @@ pub async fn upsert_enrolled_rule(
         false,
         Some(scope),
     )
+    .await
+}
+
+async fn upsert_enrolled_custom_rule(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    let guild_id = scope.guild_id();
+    let json = serde_json::to_string(rule)?;
+    let id_owned = id.to_owned();
+    let rule = rule.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, Some(&scope), guild_id)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rules WHERE guild_id = ?1 AND rule_id = ?2)",
+            params![guild_id, id_owned.as_str()],
+            |r| Ok(r.get(0)?),
+        )?;
+        crate::custom_rules::validate_custom_rule_for_write(guild_id, &id_owned, &rule, !exists)?;
+        if !exists {
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM rules WHERE guild_id = ?1 AND rule_id LIKE 'custom:%'",
+                params![guild_id],
+                |r| Ok(r.get(0)?),
+            )?;
+            crate::custom_rules::ensure_room_for_new_custom_rules(count as usize, 1)?;
+        }
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![guild_id, id_owned.as_str(), json],
+            1,
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
     .await
 }
 pub async fn delete_enrolled_rule(db: &Db, scope: ConfigurationWriteScope, id: &str) -> Result<()> {

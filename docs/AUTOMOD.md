@@ -77,12 +77,71 @@ wins (ban > kick > timeout > warn > delete > log). Exact-image and repeated-text
 matches never use that generic executor; they log or delete-and-ban through their
 own path.
 
+## Custom rules (per server)
+
+Operators can add up to **32** guild-scoped rules with ids `custom:` plus 8–32
+lowercase hex characters. New rules are stored **dry-run**; a later edit can turn
+them live. Copying rules onto another server uses that same create check: each
+custom rule arrives in dry-run, the 32-rule cap applies, and custom rules are
+refused for the global scope. Saves go through the bot `UpsertRule` control
+operation (the API does not write the row directly).
+
+Each custom rule has exactly **one** action (`delete`, `warn`, `timeout`, `kick`,
+or `ban` with `delete_days` 0–7). Types:
+
+- **pattern** — `params.pattern` compiled with the same linear-time regex engine
+  as badwords (length cap 512; look-around and backreferences rejected).
+- **word** — 1–32 whole words matched case-insensitively on literal and
+  normalized text. `scam!`, `scam.`, and `(scam)` match `scam`; `scamper` does
+  not. A configured word containing punctuation retains its normalized matching.
+- **channel_content** — `params.links` and/or `params.attachments` (at least one
+  true): URL/invite detection or `attachment_count > 0`.
+- **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
+  flag) when the member lacks Mention Everyone in that channel, including role
+  and member overwrites and the parent channel of a thread. Active threads are
+  read from the guild thread list, then their parent channel. Owning the bot
+  application is not a permission. If the channel is not in the guild channel
+  list or the active thread list, or a thread's parent channel is not cached,
+  the permission is unknown: the message is deleted, a warning is logged, and
+  the bot does not kick or ban. A missing guild cache entry or a message with
+  no member is unknown in the same way. A cached deny still kicks or bans.
+- **honeypot_role** — `params.role_id`; fires when that role is **added** (default
+  action kick). Channel include lists do not apply.
+
+Built-in and custom rules share skip lists plus **skip moderators** and optional
+**include channels** (empty = all channels except skipped). Custom rules also
+expose **post to automod log** and **open a case** switches (built-in rules keep
+today’s log/case behavior).
+
 ## Whitelists
 
 Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
-`whitelist_users` (user IDs). Matches skip the rule entirely. Whitelist your
-announcement channels and your mod/admin roles so @everyone pings in them
-never trigger.
+`whitelist_users` (user IDs). Matches skip the rule entirely. Optional
+`include_channels` limits a rule to listed channels (empty means all non-skipped
+channels). `skip_moderators` skips members at mod permission level or higher.
+Pending actions recheck moderator and skipped-role exemptions using supplied
+member roles or, when those are absent, the author's cached guild roles. A known
+exempt author is skipped before deletion, warning records, timeout, kick, or ban.
+Exact-image and repeated-text rules honor both settings on admission and again
+before enforcement. The message carries its channel, so the channel list cannot
+fail open or closed. For a pending kick or ban, unknown moderator status with
+`skip_moderators` on replaces the penalty with message deletion and a warning.
+Missing membership is distinct from a known empty role list: pending kicks or
+bans from rules that skip moderators or roles use that same fallback when member
+roles are unavailable. Rules without those role dependencies enforce normally.
+An everyone-attempt whose channel permission cannot be resolved uses the same
+fallback for kick and ban, including when skip moderators is off. Missing role
+definitions also make that permission unknown. Delete, timeout, warn, and log
+keep their normal paths without an extra message delete. A delete action runs
+once; timeout and warn do not gain a deletion, and log never deletes.
+If a custom rule is deleted, or its configuration cannot be read, before a
+pending action runs, the bot logs a warning and takes no Discord action, including
+delete, timeout, or warn. The pending action does not carry its match-time dry-run
+state, so unavailable custom configuration cannot authorize enforcement. A failed
+configuration read for a built-in rule uses the fallback only for kick or ban;
+its other actions keep their normal paths. Known dry-run rules remain log-only.
+Whitelist your announcement channels and your mod/admin roles so @everyone pings
+in them never trigger.
 
 ## Dry-run mode
 

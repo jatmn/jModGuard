@@ -834,6 +834,10 @@ mod tests {
                 whitelist_roles: Vec::new(),
                 whitelist_channels: Vec::new(),
                 whitelist_users: Vec::new(),
+                skip_moderators: false,
+                include_channels: Vec::new(),
+                log_automod: true,
+                open_case: true,
             },
         };
         let frame = seal(&op, 7);

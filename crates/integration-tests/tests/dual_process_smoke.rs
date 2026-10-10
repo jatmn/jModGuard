@@ -121,7 +121,7 @@ async fn smoke_dual_process_config_sync() {
                     scope: db::ScopeWire {
                         global: false,
                         guild_id: guild_id as i64,
-                        enrollment_id: enrollment.id,
+                        enrollment_id: enrollment.id.clone(),
                         joined_at_ns: 1,
                     },
                     prefix: db::FieldPatch::Set("!from-api".into()),
@@ -145,6 +145,57 @@ async fn smoke_dual_process_config_sync() {
             "bot cache must reload after cross-process write"
         );
 
+        let custom_id = "custom:0123456789abcdef".to_string();
+        let custom_rule = jmodguard::types::RuleDef {
+            name: "pattern test".into(),
+            description: String::new(),
+            enabled: true,
+            dry_run: true,
+            params: serde_json::json!({ "kind": "pattern", "pattern": "scam" }),
+            actions: vec![jmodguard::types::ActionDef {
+                at: 1,
+                action: "delete".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "match".into(),
+            }],
+            whitelist_roles: vec![],
+            whitelist_channels: vec![],
+            whitelist_users: vec![],
+            skip_moderators: false,
+            include_channels: vec![],
+            log_automod: true,
+            open_case: true,
+        };
+        let version_before_custom = db::get_config_version(&bot.db).await.unwrap();
+        let scope = db::ScopeWire {
+            global: false,
+            guild_id: guild_id as i64,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
+        let reply = api
+            .commit_actor(
+                1,
+                db::ControlOp::UpsertRule {
+                    request: scope.clone(),
+                    target: scope,
+                    id: custom_id.clone(),
+                    rule: custom_rule,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reply, db::ControlReply::Saved { .. }));
+        let stored = db::get_rule(&bot.db, guild_id as i64, &custom_id)
+            .await
+            .unwrap()
+            .expect("bot must persist custom rule");
+        assert!(stored.dry_run);
+        assert!(
+            db::get_config_version(&bot.db).await.unwrap() > version_before_custom,
+            "custom rule upsert must bump config_version"
+        );
         // --- check 3: bot command write visible to API (guild_config reads DB)
         db::patch_settings(
             &bot.db,
@@ -163,7 +214,7 @@ async fn smoke_dual_process_config_sync() {
             "API must read bot-side config write from shared DB"
         );
 
-        assert_eq!(db::get_config_version(&api.db).await.unwrap(), baseline + 2);
+        assert_eq!(db::get_config_version(&api.db).await.unwrap(), baseline + 3);
         assert!(
             api.poll_config_version().await.unwrap(),
             "API must detect bot config_version bump"

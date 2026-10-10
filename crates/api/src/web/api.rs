@@ -82,6 +82,22 @@ pub async fn guild_config(
             "global": global_row.unwrap_or(def),
         }));
     }
+    for (id, row) in &snapshot.guild_rules {
+        if !jmodguard::custom_rules::is_custom_id(id) {
+            continue;
+        }
+        if jmodguard::custom_rules::validate_custom_rule_shape(guild_id as i64, id, row).is_err() {
+            continue;
+        }
+        rules.push(serde_json::json!({
+            "rule_id": id,
+            "name": row.name,
+            "description": row.description,
+            "effective": row,
+            "guild_override": row,
+            "global": serde_json::Value::Null,
+        }));
+    }
 
     // Runtime enforcement combines global and guild badwords. Return that
     // same set so global rows created in this UI remain inspectable and
@@ -287,8 +303,19 @@ pub async fn get_rule(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
-    if !crate::types::RULE_IDS.contains(&rule_id.as_str()) {
+    if !jmodguard::custom_rules::known_rule_id(&rule_id) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
+    }
+    if jmodguard::custom_rules::is_custom_id(&rule_id) {
+        let layers = db::get_enrolled_rule(&app.db, scope, &rule_id).await?;
+        let Some(effective) = layers.guild else {
+            return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
+        };
+        return Ok(Json(serde_json::json!({
+            "effective": effective,
+            "guild_override": effective,
+            "global": null,
+        })));
     }
     let idx = crate::types::RULE_IDS
         .iter()
@@ -314,10 +341,19 @@ pub async fn put_rule(
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
-    if !crate::types::RULE_IDS.contains(&rule_id.as_str()) {
+    if !jmodguard::custom_rules::known_rule_id(&rule_id) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
     }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
+    if jmodguard::custom_rules::is_custom_id(&rule_id) {
+        if scope == GLOBAL_SCOPE {
+            return Err(ApiError(anyhow::anyhow!(
+                "custom rules cannot use global scope"
+            )));
+        }
+        jmodguard::custom_rules::validate_custom_rule_shape(scope, &rule_id, &body.data)
+            .map_err(ApiError)?;
+    }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -355,7 +391,15 @@ pub async fn delete_rule(
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
+    if !jmodguard::custom_rules::known_rule_id(&rule_id) {
+        return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
+    }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
+    if jmodguard::custom_rules::is_custom_id(&rule_id) && scope == GLOBAL_SCOPE {
+        return Err(ApiError(anyhow::anyhow!(
+            "custom rules cannot use global scope"
+        )));
+    }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(

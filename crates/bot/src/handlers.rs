@@ -767,9 +767,10 @@ impl EventHandler for Handler {
 
         // automod
         let member: Option<Member> = msg.member.clone().map(|m| Member::from(*m));
-        let member_roles: Vec<u64> = member
-            .as_ref()
-            .map(|m| m.roles.iter().map(|r| r.get()).collect())
+        let member_roles: Vec<u64> = msg
+            .member
+            .as_deref()
+            .map(|partial| partial.roles.iter().map(|role| role.get()).collect())
             .unwrap_or_default();
         let joined_secs_ago = app
             .automod
@@ -779,6 +780,22 @@ impl EventHandler for Handler {
             let created = msg.author.created_at();
             let now = chrono::Utc::now().timestamp();
             (now - created.unix_timestamp()).max(0) as u64 / 86400
+        };
+
+        let (is_moderator, can_mention_everyone, mention_permission_unknown) = {
+            let guild = ctx.cache.guild(guild_id);
+            let scope = crate::commands::author_message_scope(
+                app.cfg.bot.owner_id,
+                guild.as_deref(),
+                msg.channel_id,
+                msg.author.id,
+                msg.member.as_deref(),
+            );
+            (
+                scope.is_moderator,
+                scope.mention == crate::commands::MentionPermission::Allowed,
+                scope.mention == crate::commands::MentionPermission::Unknown,
+            )
         };
 
         let msg_ctx = MsgCtx {
@@ -794,6 +811,9 @@ impl EventHandler for Handler {
             joined_secs_ago,
             account_age_days: Some(account_age_days),
             member_roles: &member_roles,
+            is_moderator,
+            can_mention_everyone,
+            mention_permission_unknown,
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
@@ -1053,6 +1073,59 @@ impl EventHandler for Handler {
                 &crate::activity_log::MemberView::from_member(&new),
             );
             emit_activity(&app, &ctx, guild_id, reports).await;
+
+            let old_roles: std::collections::HashSet<u64> =
+                old.roles.iter().map(|r| r.get()).collect();
+            let added: Vec<u64> = new
+                .roles
+                .iter()
+                .map(|r| r.get())
+                .filter(|id| !old_roles.contains(id))
+                .collect();
+            if !added.is_empty() {
+                let cfg = match app.configs.get(&app.db, guild_id.get()).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let member_roles: Vec<u64> = new.roles.iter().map(|r| r.get()).collect();
+                let (is_moderator, _) = ctx.cache.guild(guild_id).map_or((false, false), |g| {
+                    let level = crate::commands::perm_level(&app, &g.roles, &new);
+                    (level >= crate::commands::PermLevel::Mod, false)
+                });
+                if let Some((rule_id, action)) = jmodguard::custom_rules::honeypot_role_added(
+                    &cfg.rules,
+                    &added,
+                    new.user.id.get(),
+                    &member_roles,
+                    is_moderator,
+                ) {
+                    let rule_name = cfg
+                        .rules
+                        .get(&rule_id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| rule_id.clone());
+                    let pending = crate::automod::PendingAction {
+                        rule_id,
+                        rule_name,
+                        action,
+                        strikes: 1,
+                        evidence: serde_json::json!({}),
+                        mention_permission_unknown: false,
+                    };
+                    execute_pending(
+                        &app,
+                        &ctx,
+                        guild_id,
+                        &new.user,
+                        Some(new.clone()),
+                        new.display_name(),
+                        None,
+                        None,
+                        &pending,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
