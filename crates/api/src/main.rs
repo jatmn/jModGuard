@@ -40,6 +40,8 @@ async fn main() -> Result<()> {
         return web::recovery::serve(cfg).await;
     }
 
+    jmodguard::cgroup::spawn_container_usage_sampler();
+
     if offline_write {
         jmodguard_api::startup::write_shared_config(cfg).await?;
         tracing::info!("API process stopped");

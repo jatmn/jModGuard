@@ -9,5 +9,6 @@ description = "Small shared process lifecycle, health, and cgroup usage utilitie
 
 [dependencies]
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync", "net", "io-util"] }
 tracing = "0.1"

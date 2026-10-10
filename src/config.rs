@@ -70,6 +70,8 @@ pub struct BotConfig {
     pub control_bind: String,
     /// API dial target for the control link. No default. Empty disables writes.
     pub control_target: String,
+    /// Bot dial target for private API container-use readings. Empty disables them.
+    pub read_target: String,
     /// Shared HMAC secret for the private writer link. Not a database token.
     pub control_secret: ControlSecret,
 }
@@ -306,6 +308,7 @@ impl Default for BotConfig {
             message_capture_enabled: true,
             control_bind: "127.0.0.1:8082".into(),
             control_target: String::new(),
+            read_target: String::new(),
             control_secret: ControlSecret::default(),
         }
     }
@@ -796,6 +799,9 @@ impl Config {
         }
         if let Ok(value) = env::var("JMODGUARD_CONTROL_TARGET") {
             self.bot.control_target = value;
+        }
+        if let Ok(value) = env::var("JMODGUARD_READ_TARGET") {
+            self.bot.read_target = value;
         }
         if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
             let v = v.trim();
