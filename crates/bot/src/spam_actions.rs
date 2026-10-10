@@ -266,69 +266,6 @@ async fn enforce(
     if app.tenant.live(enrollment.clone()).await.is_err() {
         return ReportDisposition::Consumed;
     }
-    let member = tokio::time::timeout(
-        Duration::from_secs(10),
-        ctx.http
-            .get_member(GuildId::new(found.guild), UserId::new(found.author)),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok);
-    if member.is_none() {
-        let vars = BTreeMap::from([
-            ("rule".into(), name.into()),
-            ("mention".into(), format!("<@{}>", found.author)),
-            ("user_id".into(), found.author.to_string()),
-            ("source_channel_id".into(), found.channel.to_string()),
-            ("channel".into(), format!("<#{}>", found.channel)),
-            (
-                "action".into(),
-                "enforce skipped; membership could not be confirmed".into(),
-            ),
-            ("reason".into(), found.reason),
-            ("content".into(), "member lookup failed or timed out".into()),
-        ]);
-        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return ReportDisposition::Consumed;
-    }
-    let roles: Vec<u64> = member
-        .as_ref()
-        .map(|m| m.roles.iter().map(|r| r.get()).collect())
-        .unwrap_or_default();
-    // A missing guild cache cannot prove moderator status, so enforcement continues.
-    let is_moderator = crate::commands::cached_is_moderator(
-        app,
-        ctx,
-        GuildId::new(found.guild),
-        found.author,
-        &roles,
-    );
-    if scope_blocks_enforcement(
-        rule_def,
-        found.author,
-        found.messages.iter().map(|(channel, _)| *channel),
-        &roles,
-        is_moderator,
-    ) {
-        let vars = BTreeMap::from([
-            ("rule".into(), name.into()),
-            ("mention".into(), format!("<@{}>", found.author)),
-            ("user_id".into(), found.author.to_string()),
-            ("source_channel_id".into(), found.channel.to_string()),
-            ("channel".into(), format!("<#{}>", found.channel)),
-            (
-                "action".into(),
-                "enforce skipped; exemption recheck failed".into(),
-            ),
-            ("reason".into(), found.reason),
-            (
-                "content".into(),
-                "matched channel/user/role is whitelisted".into(),
-            ),
-        ]);
-        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return ReportDisposition::Consumed;
-    }
     let now = Instant::now();
     let token = (cfg.version, cfg.durable_version);
     if token != found.token {
@@ -360,7 +297,97 @@ async fn enforce(
     {
         return ReportDisposition::Retryable;
     }
-    let http = ctx.http.as_ref();
+    punish_proven_match(
+        app,
+        ctx.http.as_ref(),
+        ctx.cache.as_ref(),
+        found,
+        rule,
+        name,
+        rule_def,
+        enrollment,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn punish_proven_match(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    found: Match,
+    rule: &str,
+    name: &str,
+    rule_def: &jmodguard::types::RuleDef,
+    enrollment: crate::db::GuildEnrollment,
+) -> ReportDisposition {
+    let member = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.get_member(GuildId::new(found.guild), UserId::new(found.author)),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    if member.is_none() {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; membership could not be confirmed".into(),
+            ),
+            ("reason".into(), found.reason),
+            ("content".into(), "member lookup failed or timed out".into()),
+        ]);
+        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        return ReportDisposition::Consumed;
+    }
+    let roles: Vec<u64> = member
+        .as_ref()
+        .map(|m| m.roles.iter().map(|r| r.get()).collect())
+        .unwrap_or_default();
+    let status = crate::commands::cached_moderator_status(
+        app,
+        cache,
+        GuildId::new(found.guild),
+        found.author,
+        &roles,
+    );
+    let is_moderator = status == crate::commands::ModeratorStatus::Moderator;
+    let withhold_ban = jmodguard::custom_rules::withhold_member_penalty(
+        rule_def.skip_moderators,
+        status == crate::commands::ModeratorStatus::Unknown,
+    );
+    if scope_blocks_enforcement(
+        rule_def,
+        found.author,
+        found.messages.iter().map(|(channel, _)| *channel),
+        &roles,
+        is_moderator,
+    ) {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; exemption recheck failed".into(),
+            ),
+            ("reason".into(), found.reason),
+            (
+                "content".into(),
+                "matched channel/user/role is whitelisted".into(),
+            ),
+        ]);
+        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        return ReportDisposition::Consumed;
+    }
+    let now = Instant::now();
     let mut delete_notes = Vec::new();
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
@@ -416,7 +443,15 @@ async fn enforce(
         .await;
     }
     let mut ban_outcome = None;
-    if app.spam_gate.claim_ban(found.guild, found.author, now) {
+    if withhold_ban {
+        tracing::warn!(
+            guild_id = found.guild,
+            user_id = found.author,
+            rule,
+            "{}",
+            jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
+        );
+    } else if app.spam_gate.claim_ban(found.guild, found.author, now) {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
             http,
@@ -498,9 +533,16 @@ async fn enforce(
             }
         }
     }
-    let action = match ban_outcome {
-        None => "delete remaining; ban already applied this window".into(),
-        Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
+    let action = if withhold_ban {
+        format!(
+            "delete matched messages; {}",
+            jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
+        )
+    } else {
+        match ban_outcome {
+            None => "delete remaining; ban already applied this window".into(),
+            Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
+        }
     };
     let notes = delete_notes.join("; ");
     let content = if found.kind == Kind::Image {
@@ -525,7 +567,7 @@ async fn enforce(
         ("reason".into(), found.reason),
         ("content".into(), content),
     ]);
-    crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+    crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
     ReportDisposition::Consumed
 }
 
@@ -1114,5 +1156,238 @@ mod tests {
         assert!(!blocks(&[(11, 1)], false));
         assert!(blocks(&[(11, 1)], true));
         assert!(blocks(&[(11, 1), (12, 2)], false));
+    }
+
+    const MEMBER_JSON: &str = r#"{
+        "user": {
+            "id": "99",
+            "username": "member",
+            "global_name": null,
+            "avatar": null,
+            "banner": null,
+            "accent_color": null,
+            "locale": null,
+            "verified": null,
+            "email": null,
+            "public_flags": null,
+            "member": null,
+            "primary_guild": null,
+            "avatar_decoration_data": null,
+            "collectibles": null
+        },
+        "nick": null,
+        "avatar": null,
+        "banner": null,
+        "roles": [],
+        "joined_at": null,
+        "premium_since": null,
+        "deaf": false,
+        "mute": false,
+        "flags": 0,
+        "permissions": null,
+        "communication_disabled_until": null,
+        "unusual_dm_activity_until": null,
+        "avatar_decoration_data": null
+    }"#;
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => return None,
+            }
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
+                break;
+            }
+        }
+        let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+        let header = String::from_utf8_lossy(&buf[..header_end]);
+        let mut parts = header.lines().next()?.split_whitespace();
+        let method = parts.next()?.to_string();
+        let path = parts.next()?.to_string();
+        Some((method, path))
+    }
+
+    fn serve_discord_stub(
+        listener: std::net::TcpListener,
+        lines: Arc<Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::io::Write;
+        listener.set_nonblocking(true).unwrap();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let Some((method, path)) = read_http_request(&mut stream) else {
+                        continue;
+                    };
+                    lines.lock().push(format!("{method} {path}"));
+                    let body = if method == "GET" && path.contains("/members/") {
+                        MEMBER_JSON
+                    } else {
+                        ""
+                    };
+                    let status = if body.is_empty() {
+                        "204 No Content"
+                    } else {
+                        "200 OK"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_moderator_deletes_spam_message_without_kick_or_ban() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop_guard = Stop(Arc::clone(&stop));
+        let server_lines = Arc::clone(&lines);
+        let server_stop = Arc::clone(&stop);
+        let server =
+            std::thread::spawn(move || serve_discord_stub(listener, server_lines, server_stop));
+
+        let path = std::env::temp_dir().join(format!(
+            "spam_unknown_mod_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let mut rule = crate::defaults::default_rules().remove(2);
+        rule.enabled = true;
+        rule.skip_moderators = true;
+        let found = Match {
+            kind: Kind::Text,
+            guild: 10,
+            author: 99,
+            channel: 11,
+            policy: MatchPolicy::Text(jmodguard::text_spam::Policy {
+                mode: "exact_text".into(),
+                window_secs: 60,
+                min_channels: 3,
+                min_length: 20,
+                enforce: true,
+            }),
+            token: (0, 0),
+            messages: vec![(11, 42)],
+            excerpts: Vec::new(),
+            attachments: Vec::new(),
+            reason: "repeated text".into(),
+        };
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let log = CapturedLog(Arc::new(Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let disposition = punish_proven_match(
+            &app,
+            &http,
+            &cache,
+            found,
+            "repeat_text",
+            "Repeated text",
+            &rule,
+            enrollment,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        drop(stop_guard);
+        let _ = server.join();
+        assert_eq!(disposition, ReportDisposition::Consumed);
+        let seen = lines.lock().clone();
+        assert!(
+            seen.iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
+            "the matched message must be deleted: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "unknown moderator status must not ban: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/members/"))),
+            "unknown moderator status must not kick: {seen:?}"
+        );
+        let output = String::from_utf8(log.0.lock().clone()).unwrap();
+        assert!(
+            output.contains("WARN")
+                && output.contains(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING),
+            "{output}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 }

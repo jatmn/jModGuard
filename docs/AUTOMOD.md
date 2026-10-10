@@ -114,8 +114,10 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 `include_channels` limits a rule to listed channels (empty means all non-skipped
 channels). `skip_moderators` skips members at mod permission level or higher.
 Exact-image and repeated-text rules honor both settings on admission and again
-before enforcement. If the guild cache cannot show whether the author is a
-moderator, the message is still moderated.
+before enforcement. The message carries its channel, so the channel list cannot
+fail open or closed. If the guild cache cannot show whether the author is a
+moderator, matched messages are still deleted and a warning is logged, but the
+bot does not kick or ban. Custom rules that skip moderators use that same limit.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 

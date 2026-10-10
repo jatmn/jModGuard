@@ -134,7 +134,41 @@ pub fn permission_level(
     PermLevel::Everyone
 }
 
-/// Cache miss is not a moderator. Callers must keep moderating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeratorStatus {
+    Moderator,
+    Member,
+    /// The guild is not in the cache, so the member cannot be ruled out.
+    Unknown,
+}
+
+/// Guild-cache lookup. A miss is [`ModeratorStatus::Unknown`], not a member.
+pub fn cached_moderator_status(
+    app: &BotState,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    user_id: u64,
+    role_ids: &[u64],
+) -> ModeratorStatus {
+    let Some(guild) = cache.guild(guild_id) else {
+        return ModeratorStatus::Unknown;
+    };
+    if permission_level(
+        app.cfg.bot.owner_id,
+        &guild.roles,
+        user_id,
+        role_ids.iter().copied(),
+    ) >= PermLevel::Mod
+    {
+        ModeratorStatus::Moderator
+    } else {
+        ModeratorStatus::Member
+    }
+}
+
+/// `true` only when the cache shows moderator or higher. Unknown is `false`,
+/// so admission still sees the message; kick and ban must consult
+/// [`cached_moderator_status`] before punishing the member.
 pub fn cached_is_moderator(
     app: &BotState,
     ctx: &Context,
@@ -142,15 +176,8 @@ pub fn cached_is_moderator(
     user_id: u64,
     role_ids: &[u64],
 ) -> bool {
-    let Some(guild) = ctx.cache.guild(guild_id) else {
-        return false;
-    };
-    permission_level(
-        app.cfg.bot.owner_id,
-        &guild.roles,
-        user_id,
-        role_ids.iter().copied(),
-    ) >= PermLevel::Mod
+    cached_moderator_status(app, &ctx.cache, guild_id, user_id, role_ids)
+        == ModeratorStatus::Moderator
 }
 
 /// Mention Everyone in this channel, including overwrites and thread parents.

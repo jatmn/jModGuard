@@ -416,7 +416,7 @@ pub async fn execute_pending(
     let reason = crate::templates::render(&rule.reason, &vars);
     vars.insert("reason".into(), reason.clone());
 
-    let (dry, log_automod, open_case) = app
+    let (dry, log_automod, open_case, skip_moderators) = app
         .configs
         .get(&app.db, guild_id.get())
         .await
@@ -424,9 +424,9 @@ pub async fn execute_pending(
         .and_then(|c| {
             c.rules
                 .get(&pending.rule_id)
-                .map(|r| (r.dry_run, r.log_automod, r.open_case))
+                .map(|r| (r.dry_run, r.log_automod, r.open_case, r.skip_moderators))
         })
-        .unwrap_or((false, true, true));
+        .unwrap_or((false, true, true, false));
 
     if dry {
         let mut v = vars.clone();
@@ -455,6 +455,69 @@ pub async fn execute_pending(
             action = rule.action,
             "automod Discord mutation skipped because the guild is write-fenced"
         );
+        return;
+    }
+
+    let role_ids: Vec<u64> = provided_member
+        .as_ref()
+        .map(|member| member.roles.iter().map(|role| role.get()).collect())
+        .or_else(|| {
+            ctx.cache.guild(guild_id).and_then(|guild| {
+                guild.members.get(&target.id).map(|member| {
+                    member
+                        .roles
+                        .iter()
+                        .map(|role| role.get())
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+        .unwrap_or_default();
+    let moderator_unknown = crate::commands::cached_moderator_status(
+        app,
+        &ctx.cache,
+        guild_id,
+        target.id.get(),
+        &role_ids,
+    ) == crate::commands::ModeratorStatus::Unknown;
+    if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown)
+        && matches!(rule.action.as_str(), "kick" | "ban")
+    {
+        tracing::warn!(
+            guild_id = guild_id.get(),
+            user_id = target.id.get(),
+            rule_id = pending.rule_id.as_str(),
+            "{}",
+            jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
+        );
+        if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
+            if !app.activation.may_record() {
+                return;
+            }
+            let _ = crate::discord::race_discord_call(
+                &app.activation,
+                ctx.http.delete_message(ch.into(), id.into(), None),
+            )
+            .await;
+        }
+        if log_automod {
+            let mut v = vars;
+            v.insert(
+                "action".into(),
+                format!(
+                    "delete; {}",
+                    jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
+                ),
+            );
+            v.insert(
+                "content".into(),
+                pending.evidence["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            logging::emit(app, ctx, guild_id, "automod", v).await;
+        }
         return;
     }
 

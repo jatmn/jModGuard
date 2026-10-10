@@ -275,9 +275,20 @@ pub fn rule_scope_skips(
     false
 }
 
+/// Logged when `skip_moderators` is on and the guild cache cannot show whether
+/// the author is a moderator. The message is still deleted. Kick and ban are not.
+pub const UNKNOWN_MODERATOR_WARNING: &str =
+    "moderator status unknown; deleting the message and skipping kick or ban";
+
+/// A channel id travels with the message, so only the moderator lookup can fail.
+/// Unknown status must not be treated as permission to kick or ban.
+pub fn withhold_member_penalty(skip_moderators: bool, moderator_unknown: bool) -> bool {
+    skip_moderators && moderator_unknown
+}
+
 /// Spam admission. Unknown role lists still refuse when the rule has role
-/// skips. A failed moderator lookup is `is_moderator == false`, so moderation
-/// continues instead of treating the member as exempt.
+/// skips. Unknown moderator status is not an exemption, so the message can
+/// still be deleted; kick and ban are withheld later.
 pub fn spam_scope_admits(
     rule: &RuleDef,
     author_id: u64,
@@ -422,6 +433,13 @@ mod tests {
         assert!(validate_custom_rule_shape(1, "custom:0123456789abcdef", &rule).is_err());
         let rule = sample_rule("pattern", json!({ "pattern": r"(\w)\1" }));
         assert!(validate_custom_rule_shape(1, "custom:0123456789abcdef", &rule).is_err());
+    }
+
+    #[test]
+    fn unknown_moderator_withholds_kick_and_ban_only_when_skip_is_on() {
+        assert!(withhold_member_penalty(true, true));
+        assert!(!withhold_member_penalty(false, true));
+        assert!(!withhold_member_penalty(true, false));
     }
 
     #[test]
