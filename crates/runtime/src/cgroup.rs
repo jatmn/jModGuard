@@ -6,6 +6,7 @@
 //! `/proc/self/mountinfo`. Host-wide memory and processor totals
 //! are not consulted. Nothing here writes a database or calls a provider.
 
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
@@ -19,7 +20,7 @@ const V1_UNLIMITED_BYTES: u64 = 1 << 62;
 static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
 
 /// Real program memory: `memory.current` minus `inactive_file`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryUse {
     pub program_bytes: u64,
     pub limit: MemoryLimit,
@@ -27,7 +28,7 @@ pub struct MemoryUse {
 
 /// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes,
 /// mean the cgroup has no limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryLimit {
     Bytes(u64),
     Unlimited,
@@ -48,7 +49,7 @@ pub struct CgroupReading {
 
 /// Cached container use. CPU is in tenths of a percent (`124` is 12.4%) and
 /// stays `None` until two background samples exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSample {
     pub memory: Option<MemoryUse>,
     pub cpu_tenths: Option<u32>,

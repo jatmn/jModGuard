@@ -114,9 +114,12 @@ release row is `❓` and has no SHA or age. Container use is this bot
 process's own cgroup. Memory is real program use (`memory.current` minus
 `inactive_file`) shown against `memory.max` (`max` means no limit). CPU is the
 latest background sample. `!status` does not wait for one; until a sample
-exists that row is `unavailable`. The API CPU and memory rows stay
-`unavailable` until a private reading is supplied. A missing reading is
-`unavailable`, never `0`.
+exists that row is `unavailable`. When `JMODGUARD_READ_TARGET` points at the
+API loopback read listener (for example `127.0.0.1:8083`) and
+`JMODGUARD_CONTROL_SECRET` matches, the bot fetches
+the API container sample in parallel with the rest of the reply (short
+timeout). The label names whichever API copy answered; it is not an aggregate.
+A missing or slow reading is `unavailable`, never `0`.
 
 Prefix `!status`
 uses the same stats command, permissions and response; the slash name remains
