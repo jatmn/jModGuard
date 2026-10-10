@@ -129,139 +129,177 @@ fn verify_identity_version(
     expected: &StoreRegistration,
     wanted: i64,
 ) -> Result<()> {
-    // Inspect version and catalog in one request while preserving the base's
-    // required-object checks inside the caller's data transaction.
-    let (version, objects): (i64, String) = conn.query_row(
-        "SELECT (SELECT user_version FROM pragma_user_version), json_group_array(json_array(type,name)) FROM sqlite_master",
-        (), |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    anyhow::ensure!(version == wanted, StoreCheckError::Schema);
-    let objects: std::collections::HashSet<(String, String)> = serde_json::from_str(&objects)?;
-    let has = |kind: &str, name: &str| objects.contains(&(kind.to_owned(), name.to_owned()));
-    let required: &[(i64, &str, &str)] = &[
-        (
-            1,
-            "table",
-            "store_identity guild_bindings mutation_receipts",
-        ),
-        (
-            1,
-            "trigger",
-            "store_identity_no_replace store_identity_no_update store_identity_no_delete guild_binding_owner guild_binding_no_replace guild_binding_no_update",
-        ),
-        (2, "table", "guild_memberships guild_log_channels"),
-        (
-            2,
-            "trigger",
-            "guild_membership_binding guild_membership_no_replace guild_membership_update guild_log_channel_insert guild_log_channel_update",
-        ),
-        (3, "table", "guild_cases"),
-        (
-            3,
-            "trigger",
-            "guild_case_insert guild_case_update guild_case_delete",
-        ),
-        (3, "index", "guild_cases_visible"),
-        (4, "table", "guild_case_history"),
-        (
-            4,
-            "trigger",
-            "guild_case_history_insert guild_case_history_update guild_case_history_delete guild_case_remove_history guild_case_purge_history",
-        ),
-        (5, "table", "guild_case_sources"),
-        (
-            5,
-            "trigger",
-            "guild_case_source_insert guild_case_source_update guild_case_source_delete guild_case_original_source guild_case_purge_sources",
-        ),
-        (6, "table", "guild_case_evidence"),
-        (
-            6,
-            "index",
-            "guild_evidence_parent guild_evidence_work guild_evidence_cancel",
-        ),
-        (
-            6,
-            "trigger",
-            "guild_evidence_insert guild_evidence_update guild_evidence_delete guild_case_cancel_evidence guild_case_purge_evidence",
-        ),
-        (7, "table", "guild_bunny_evidence"),
-        (7, "index", "guild_bunny_resource"),
-        (
-            7,
-            "trigger",
-            "guild_bunny_insert guild_bunny_update guild_bunny_delete guild_bunny_settlement guild_bunny_purge guild_bunny_forget",
-        ),
-        (8, "table", "guild_tenant_settings"),
-        (
-            8,
-            "trigger",
-            "guild_binding_delete guild_tenant_settings_insert guild_tenant_settings_no_replace guild_tenant_settings_update",
-        ),
-        (9, "table", "guild_message_snapshots guild_snapshot_health"),
-        (9, "index", "guild_snapshot_expiry"),
-        (
-            9,
-            "trigger",
-            "guild_snapshot_insert guild_snapshot_update guild_snapshot_account_insert guild_snapshot_account_update guild_snapshot_account_delete guild_membership_delete",
-        ),
-        (
-            10,
-            "table",
-            "guild_member_feature guild_member_seed guild_member_sync guild_member_directory guild_member_stays guild_member_case_index guild_member_pending_bans guild_member_state_observations guild_member_target_checks guild_member_audit_recovery",
-        ),
-        (13, "table", "guild_member_unresolved_audits"),
-        (13, "index", "guild_member_unresolved_audits_user"),
-        (
-            13,
-            "trigger",
-            "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
-        ),
-        (15, "table", "guild_local_write_fence guild_writer_epoch"),
-        (15, "trigger", "guild_case_settle_retain"),
-    ];
-    for (version, kind, names) in required {
-        if wanted >= *version {
-            anyhow::ensure!(
-                names.split_whitespace().all(|name| has(kind, name)),
-                StoreCheckError::Schema
-            );
-        }
+    const PROBE_SQL: &str = "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)";
+    const CATALOG_SQL: &str = "SELECT (SELECT user_version FROM pragma_user_version), (SELECT schema_version FROM pragma_schema_version), json_group_array(json_array(type,name)) FROM sqlite_master";
+
+    let (probe_schema_version, probe_user_version): (i64, i64) =
+        conn.query_row(PROBE_SQL, (), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let slot = conn.schema_verification_slot();
+    let cached = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let expected_store_id = expected.id().as_str();
+    let expected_dedicated = owner(expected);
+    if let Some(memo) = cached
+        && memo.schema_version == probe_schema_version
+        && memo.user_version == probe_user_version
+        && memo.user_version == wanted
+        && memo.store_id == expected_store_id
+        && memo.dedicated_guild_id == expected_dedicated
+    {
+        return Ok(());
     }
-    anyhow::ensure!(
-        has(
-            "trigger",
-            if wanted >= 8 {
-                "guild_binding_delete"
-            } else {
-                "guild_binding_no_delete"
+
+    let full = (|| -> Result<()> {
+        let (version, schema_version, objects): (i64, i64, String) =
+            conn.query_row(CATALOG_SQL, (), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        anyhow::ensure!(version == wanted, StoreCheckError::Schema);
+        let objects: std::collections::HashSet<(String, String)> = serde_json::from_str(&objects)?;
+        let has = |kind: &str, name: &str| objects.contains(&(kind.to_owned(), name.to_owned()));
+        let required: &[(i64, &str, &str)] = &[
+            (
+                1,
+                "table",
+                "store_identity guild_bindings mutation_receipts",
+            ),
+            (
+                1,
+                "trigger",
+                "store_identity_no_replace store_identity_no_update store_identity_no_delete guild_binding_owner guild_binding_no_replace guild_binding_no_update",
+            ),
+            (2, "table", "guild_memberships guild_log_channels"),
+            (
+                2,
+                "trigger",
+                "guild_membership_binding guild_membership_no_replace guild_membership_update guild_log_channel_insert guild_log_channel_update",
+            ),
+            (3, "table", "guild_cases"),
+            (
+                3,
+                "trigger",
+                "guild_case_insert guild_case_update guild_case_delete",
+            ),
+            (3, "index", "guild_cases_visible"),
+            (4, "table", "guild_case_history"),
+            (
+                4,
+                "trigger",
+                "guild_case_history_insert guild_case_history_update guild_case_history_delete guild_case_remove_history guild_case_purge_history",
+            ),
+            (5, "table", "guild_case_sources"),
+            (
+                5,
+                "trigger",
+                "guild_case_source_insert guild_case_source_update guild_case_source_delete guild_case_original_source guild_case_purge_sources",
+            ),
+            (6, "table", "guild_case_evidence"),
+            (
+                6,
+                "index",
+                "guild_evidence_parent guild_evidence_work guild_evidence_cancel",
+            ),
+            (
+                6,
+                "trigger",
+                "guild_evidence_insert guild_evidence_update guild_evidence_delete guild_case_cancel_evidence guild_case_purge_evidence",
+            ),
+            (7, "table", "guild_bunny_evidence"),
+            (7, "index", "guild_bunny_resource"),
+            (
+                7,
+                "trigger",
+                "guild_bunny_insert guild_bunny_update guild_bunny_delete guild_bunny_settlement guild_bunny_purge guild_bunny_forget",
+            ),
+            (8, "table", "guild_tenant_settings"),
+            (
+                8,
+                "trigger",
+                "guild_binding_delete guild_tenant_settings_insert guild_tenant_settings_no_replace guild_tenant_settings_update",
+            ),
+            (9, "table", "guild_message_snapshots guild_snapshot_health"),
+            (9, "index", "guild_snapshot_expiry"),
+            (
+                9,
+                "trigger",
+                "guild_snapshot_insert guild_snapshot_update guild_snapshot_account_insert guild_snapshot_account_update guild_snapshot_account_delete guild_membership_delete",
+            ),
+            (
+                10,
+                "table",
+                "guild_member_feature guild_member_seed guild_member_sync guild_member_directory guild_member_stays guild_member_case_index guild_member_pending_bans guild_member_state_observations guild_member_target_checks guild_member_audit_recovery",
+            ),
+            (13, "table", "guild_member_unresolved_audits"),
+            (13, "index", "guild_member_unresolved_audits_user"),
+            (
+                13,
+                "trigger",
+                "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
+            ),
+            (15, "table", "guild_local_write_fence guild_writer_epoch"),
+            (15, "trigger", "guild_case_settle_retain"),
+        ];
+        for (version, kind, names) in required {
+            if wanted >= *version {
+                anyhow::ensure!(
+                    names.split_whitespace().all(|name| has(kind, name)),
+                    StoreCheckError::Schema
+                );
             }
-        ),
-        StoreCheckError::Schema
-    );
-    if wanted >= 2 {
+        }
         anyhow::ensure!(
             has(
                 "trigger",
                 if wanted >= 8 {
-                    "guild_membership_delete"
+                    "guild_binding_delete"
                 } else {
-                    "guild_membership_no_delete"
+                    "guild_binding_no_delete"
                 }
             ),
             StoreCheckError::Schema
         );
+        if wanted >= 2 {
+            anyhow::ensure!(
+                has(
+                    "trigger",
+                    if wanted >= 8 {
+                        "guild_membership_delete"
+                    } else {
+                        "guild_membership_no_delete"
+                    }
+                ),
+                StoreCheckError::Schema
+            );
+        }
+        let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
+        let Some((family, id, dedicated)) = identity else {
+            return Err(StoreCheckError::Schema.into());
+        };
+        anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+        anyhow::ensure!(
+            id == expected_store_id && dedicated == expected_dedicated,
+            StoreCheckError::Identity
+        );
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(crate::db_compat::SchemaVerification {
+                schema_version,
+                user_version: wanted,
+                store_id: expected_store_id.to_owned(),
+                dedicated_guild_id: expected_dedicated,
+            });
+        Ok(())
+    })();
+    if full.is_err() {
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(
+            guard.as_ref(),
+            Some(memo) if memo.schema_version == probe_schema_version
+                && memo.user_version == probe_user_version
+        ) {
+            *guard = None;
+        }
     }
-    let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
-    let Some((family, id, dedicated)) = identity else {
-        return Err(StoreCheckError::Schema.into());
-    };
-    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
-    anyhow::ensure!(
-        id == expected.id().as_str() && dedicated == owner(expected),
-        StoreCheckError::Identity
-    );
-    Ok(())
+    full
 }
 
 fn initialize_store(
