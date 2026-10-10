@@ -40,7 +40,9 @@ pub use bootstrap::{meta_string_conn, write_meta_string_conn};
 mod enrollments;
 pub use enrollments::*;
 mod configuration;
+mod known_bad_images;
 pub use configuration::*;
+pub use known_bad_images::*;
 mod nickname_jobs;
 pub use nickname_jobs::*;
 mod moderation;
@@ -80,6 +82,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0016_member_sync_pacing.sql"),
     include_str!("../migrations/0017_hot_query_indexes.sql"),
     include_str!("../migrations/0018_one_active_ban.sql"),
+    include_str!("../migrations/0019_known_bad_images.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

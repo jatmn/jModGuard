@@ -189,6 +189,7 @@ pub async fn guild_config(
         "nickname_reconcile": snapshot.nickname_reconcile,
         "rules": rules,
         "badwords": badwords,
+        "known_bad_images": snapshot.known_bad_images,
         "commands": commands,
         "templates": templates,
         "log_channels": log_channels,
@@ -1344,4 +1345,62 @@ mod tests {
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownBadImageBody {
+    hash: String,
+    note: Option<String>,
+}
+
+pub async fn add_known_bad_image(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<KnownBadImageBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = authorize_manage_guild(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let hash = db::canonical_image_hash(&body.hash)?;
+    let note = db::safe_image_note(body.note)?;
+    let (_, result) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::AddKnownBadImage {
+                scope: scope.to_wire(),
+                hash,
+                note,
+            },
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "changed": result["changed"]}),
+    ))
+}
+
+pub async fn remove_known_bad_image(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, hash)): Path<(u64, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = authorize_manage_guild(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let hash = db::canonical_image_hash(&hash)?;
+    let (_, result) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::RemoveKnownBadImage {
+                scope: scope.to_wire(),
+                hash,
+            },
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "changed": result["changed"]}),
+    ))
 }

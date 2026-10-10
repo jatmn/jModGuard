@@ -153,6 +153,7 @@ pub(super) fn wipe_directory_guild_data_conn(
         "DELETE FROM log_channels WHERE guild_id=?1",
         "DELETE FROM log_filters WHERE guild_id=?1",
         "DELETE FROM badwords WHERE guild_id=?1",
+        "DELETE FROM known_bad_images WHERE guild_id=?1",
         "DELETE FROM guild_settings WHERE guild_id=?1",
         "DELETE FROM events WHERE guild_id=?1",
         "DELETE FROM warns WHERE guild_id=?1",
@@ -164,9 +165,9 @@ pub(super) fn wipe_directory_guild_data_conn(
     .enumerate()
     {
         let changed = tx.execute_reclaim(sql, params![guild])? > 0;
-        config_changed |= index < 7 && changed;
+        config_changed |= index < 8 && changed;
         commands_changed |= index == 1 && changed;
-        settings_changed |= index == 6 && changed;
+        settings_changed |= index == 7 && changed;
     }
     if config_changed {
         if reclaim {

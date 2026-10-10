@@ -1700,6 +1700,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),

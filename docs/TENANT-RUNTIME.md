@@ -110,9 +110,8 @@ Public installation is documented in [INSTALL.md](INSTALL.md). Owner-selected
 image updates use the existing WebUI/API; see [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
 Live provider checks remain deferred.
 Image and text spam enforcement is implemented separately; see
-[IMAGE-SPAM.md](IMAGE-SPAM.md). The bot captures proving Discord attachments for
-selected image-spam enforcement through tenant runtime; the API serves authorized
-journal-available objects and does not perform that Discord re-fetch. See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
+[IMAGE-SPAM.md](IMAGE-SPAM.md). Exact-image spam retains hash-only evidence; the API continues serving authorized
+journal-available objects. See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
 [evidence](CASE-EVIDENCE.md) and [enrollments](ENROLLMENTS.md).
 
 ## Continuation and retry boundaries

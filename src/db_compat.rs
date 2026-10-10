@@ -995,6 +995,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_enrollments"
                     | "guild_store_catalog"
                     | "log_filters"
+                    | "known_bad_images"
                     | "guild_case_evidence"
                     | "guild_case_history"
                     | "guild_case_sources"

@@ -4291,3 +4291,154 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
         );
     }
 }
+
+#[tokio::test]
+async fn known_bad_image_routes_require_current_page_and_live_permission() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body = serde_json::json!({"hash": hash, "note": null}).to_string();
+    let old = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let (status, _) = f
+        .request_token("POST", "/api/guilds/10/known-bad-images", &body, None)
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    f.discord.guilds.lock().unwrap().clear();
+    assert_ne!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_ne!(
+        f.request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            ""
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    f.discord.guilds.lock().unwrap().push(managed_guild(10));
+    db::retire_guild_enrollment(&f.app.db, 10, 100)
+        .await
+        .unwrap();
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    let (status, error) = f
+        .request_token(
+            "POST",
+            "/api/guilds/10/known-bad-images",
+            &body,
+            Some(&old.id),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(error["code"], "guild_enrollment_changed");
+    assert!(
+        db::load_config_parts(&f.app.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
+    );
+    assert_ne!(
+        f.request("POST", "/api/guilds/0/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body =
+        serde_json::json!({"hash": hash.to_uppercase(), "note": "confirmed spam"}).to_string();
+    let (status, saved) = f
+        .request("POST", "/api/guilds/10/known-bad-images", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["changed"], true);
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = config["known_bad_images"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["hash"], hash);
+    assert_eq!(rows[0]["actor"], "unknown");
+    assert_eq!(rows[0]["added_via"], "webui");
+    assert_eq!(rows[0].as_object().unwrap().len(), 5);
+    for invalid in [
+        serde_json::json!({"hash": "unknown"}),
+        serde_json::json!({"note": "missing digest"}),
+        serde_json::json!({"hash": hash, "payload": "unsupported"}),
+    ] {
+        assert_ne!(
+            f.request(
+                "POST",
+                "/api/guilds/10/known-bad-images",
+                &invalid.to_string()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .1["changed"],
+        false
+    );
+    assert_eq!(
+        f.request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            ""
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        f.request("POST", "/api/guilds/10/config", "").await.1["known_bad_images"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_delete_rate_limit_leaves_row_intact() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body = serde_json::json!({"hash": hash, "note": null}).to_string();
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f
+        .request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(
+        db::load_config_parts(&f.app.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .len(),
+        1
+    );
+}

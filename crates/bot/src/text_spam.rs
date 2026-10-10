@@ -835,6 +835,7 @@ fn consider(
                     token,
                     messages,
                     excerpts,
+                    proving_hashes: Vec::new(),
                     attachments: Vec::new(),
                     reason: format!(
                         "Exact trimmed text across {} channels in {} (minimum {} scalars)",
@@ -1416,6 +1417,7 @@ mod tests {
             token,
             messages,
             excerpts: Vec::new(),
+            proving_hashes: Vec::new(),
             attachments: Vec::new(),
             reason: "repeated text".into(),
         };

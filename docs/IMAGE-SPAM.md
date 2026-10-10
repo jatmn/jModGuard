@@ -80,20 +80,37 @@ and is not a spam hit. It does not use the dry-run success action. Hashes alread
 stored for those posts still count, and an in-flight result that proves the match
 is reported as that match.
 
-After a ban case is recorded for an image match, the bot re-fetches proving
-attachments through the same Hasher CDN contract (no arbitrary URLs, redirects,
-credentials or retries) into a temporary file, then streams that file into the
-configured evidence backend. Capture uses a stable evidence ID derived from the
-channel/message/attachment origin so the same attachment retries the same identity.
-Existing reservations are not re-uploaded. Failures are logged and do not undo the
-delete or ban. A `none` backend skips capture. Capture admission uses the same
-per-case `EvidenceLimits` as the guild evidence journal (currently eight items,
-eight mebibytes per file, and thirty-two mebibytes total per case on the bot
-path); proving files that cannot be admitted are skipped with a warning rather
-than attempted. Process image budgets stay in `[image_spam]`; the capture batch
-shares the existing download timeout. Live Discord
-CDN and Bunny zone privacy remain separate provider checks. Authorized dashboard
-serving of available objects is unchanged.
+Exact-image matches retain only hashes and case text metadata. They never capture,
+cache, or re-share attachment bytes through the evidence backend. Attachment hashing
+streams bytes through SHA-256 in memory and discards each chunk. Other evidence
+backend functions remain available for their separately authorized uses.
+
+## Known-bad image management
+
+Select a server, then **Known-bad images** in the WebUI. Operators with Manage
+Server permission can list/search digests and safe notes, add a confirmed 64-character
+SHA-256 from a notice, and remove an entry. A duplicate add preserves the original
+metadata and performs no configuration write. Removal of an absent digest is also
+a no-op. Changes use the authenticated bot writer link and the page's loaded bot
+membership; the API stays read-only. The bot must be online to save.
+
+The list is guild-local, capped at 1024 digests, and independent of configuration
+copy/global defaults. It survives restarts. Metadata holds the added time, WebUI
+source, an explicitly unknown actor (no retained operator identifier), and an
+optional short label without links, mentions, or identifiers. No images or
+attachment addresses are accepted by this management API. Invalid/missing hashes
+are rejected; restored invalid rows cannot establish a match.
+
+A listed digest matches a single admitted incoming image without waiting for
+repetition across channels. The exact-image rule must be enabled; dry-run logs
+only and normal mode retains its delete-and-ban behavior. Existing exclusions,
+member verification, replay/invalidation and process budgets still apply.
+An empty list retains ordinary common-image thresholds. Adds/removals advance the
+existing configuration version so in-flight results from older configuration
+cannot punish. Normal cross-process configuration polling delay still applies.
+
+Learning is explicit: confirm a digest, then add it in the WebUI. A dry-run match
+never adds a digest automatically.
 
 ## Resource controls
 

@@ -321,7 +321,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch_bounded("DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
+        conn.execute_batch_bounded("DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -1411,6 +1411,133 @@ fn completed_core_opens_for_inspection_and_reclaim_above_scaled_growth_stop() {
             let after = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
             assert_eq!(after.config, before.config + 1);
             assert_eq!(after.slash, before.slash + 1);
+        },
+    );
+    cleanup_db(&path);
+}
+
+#[test]
+fn known_bad_image_removal_uses_reclaim_above_scaled_growth_stop() {
+    let path = tmp_db_path("known_bad_pressure");
+    let bot_options = DbOpenOptions {
+        read_only: false,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    };
+    let initialized = Db::open_with(bot_options.clone()).unwrap();
+    let hash = "ab".repeat(32);
+    let other_hash = "cd".repeat(32);
+    let absent_hash = "ef".repeat(32);
+    tokio_test_block_on(async {
+        let enrollment = enroll_guild(&initialized, 42, 100).await.unwrap().unwrap();
+        let scope = ConfigurationScope::Guild(enrollment);
+        let write =
+            ConfigurationWriteScope::new(scope.clone(), scope).expect("configuration write scope");
+        add_enrolled_known_bad_image(&initialized, write.clone(), &hash, None)
+            .await
+            .unwrap();
+        initialized
+            .with_conn(|conn| {
+                conn.execute_rows(
+                    "INSERT INTO known_bad_images (guild_id, hash, added_at, added_via, actor, note)
+                     VALUES (99, ?1, '2026-01-01T00:00:00Z', 'webui', 'unknown', NULL)",
+                    params![other_hash],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    let allocation = initialized
+        .with_conn_sync(|conn| crate::capacity::allocated_bytes(conn))
+        .unwrap();
+    drop(initialized);
+
+    crate::db_compat::with_test_default_capacity_limits(
+        allocation - 4096,
+        allocation + 80 * 1024 * 1024,
+        || {
+            let bot = Db::open_with(bot_options.clone()).expect("known-bad pressure reconnect");
+            assert!(bot.capacity_runtime_status().startup_deferred);
+            let ordinary = bot.with_conn_sync(|conn| {
+                conn.execute_rows(
+                    "INSERT INTO warns(guild_id,user_id,moderator_id,created_at) VALUES(42,10,3,'2026-01-01')",
+                    (),
+                    1,
+                )?;
+                Ok(())
+            });
+            assert!(
+                ordinary
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity budget exhausted")
+            );
+            let enrollment = tokio_test_block_on(guild_enrollment(&bot, 42))
+                .unwrap()
+                .unwrap();
+            let scope = ConfigurationScope::Guild(enrollment);
+            let write =
+                ConfigurationWriteScope::new(scope.clone(), scope).expect("configuration write scope");
+            assert!(
+                tokio_test_block_on(add_enrolled_known_bad_image(
+                    &bot,
+                    write.clone(),
+                    &absent_hash,
+                    None,
+                ))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity budget exhausted")
+            );
+            let before = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert!(
+                tokio_test_block_on(remove_enrolled_known_bad_image(&bot, write.clone(), &hash))
+                    .unwrap()
+            );
+            assert!(
+                tokio_test_block_on(load_config_parts(&bot, 42))
+                    .unwrap()
+                    .known_bad_images
+                    .is_empty()
+            );
+            let after_remove = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after_remove.config, before.config + 1);
+            assert!(
+                !tokio_test_block_on(remove_enrolled_known_bad_image(&bot, write.clone(), &hash))
+                    .unwrap()
+            );
+            let after_repeat = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after_repeat.config, after_remove.config);
+            assert!(
+                !tokio_test_block_on(remove_enrolled_known_bad_image(&bot, write.clone(), &absent_hash))
+                    .unwrap()
+            );
+            let after_absent = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after_absent.config, after_repeat.config);
+            assert!(
+                tokio_test_block_on(remove_enrolled_known_bad_image(&bot, write, "not-a-digest"))
+                    .is_err()
+            );
+            let after_invalid = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after_invalid.config, after_absent.config);
+            assert!(tokio_test_block_on(wipe_departed_directory_guild_data(&bot, 99)).unwrap());
+            let rows_on_inactive = tokio_test_block_on(bot.with_conn(|conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT count(*) FROM known_bad_images WHERE guild_id=99",
+                    (),
+                    |r| Ok(r.get(0)?),
+                )?;
+                Ok(count)
+            }))
+            .unwrap();
+            assert_eq!(rows_on_inactive, 0);
         },
     );
     cleanup_db(&path);

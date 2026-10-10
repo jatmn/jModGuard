@@ -244,8 +244,7 @@ fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
 fn one_active_ban_migration_collapses_existing_duplicates() {
     let path = tmp_db_path("one_active_ban_migration");
     let mut conn = Connection::open(&path).unwrap();
-    let prior = MIGRATIONS.len() - 1;
-    assert_eq!(prior, 17, "0018 is the migration under test");
+    let prior = 17; // Test 0018 even after later migrations are added.
     for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
         let tx = conn.transaction_primary_read().unwrap();
         tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();

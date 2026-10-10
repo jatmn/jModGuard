@@ -152,8 +152,7 @@ Reserve before object writes, preserve stable identity/byte admission, and never
 capture settlement while a write can still arrive. Removal cancels/hides metadata immediately;
 closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jobs are snapshots,
 not leases or provider proof. Authorized serving of available objects is now
-implemented; the bot captures proving Discord attachments for selected image-spam
-enforcement through tenant runtime. The API serves authorized journal-available objects
+implemented; exact-image spam retains hash-only evidence. The API serves authorized journal-available objects
 and does not perform that Discord re-fetch.
 Private evidence and operator-managed backup resources must remain separate.
 
@@ -164,15 +163,14 @@ keys or retry an existing reservation's source. Keep the evidence root private/d
 only verified file absence can acknowledge cleanup. Local advisory locks require cooperating
 writers and trusted parents; they do not establish remote PUT completion or restore fencing.
 Bot and API open this backend through tenant runtime for authorized serving of available
-objects. The bot captures proving Discord attachments for selected image-spam enforcement
-through tenant runtime; the API does not perform that Discord re-fetch.
+objects. Exact-image spam retains hash-only evidence; the API does not perform that Discord re-fetch.
 
 The opt-in Bunny evidence adapter uses guild schema7 single-use attempts and durable201
 acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve immutable scoped
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; operator checks, provider resolution and runtime authority
-remain before activation. Core is at migration 0018. Local HTTP/SQL fixtures
+remain before activation. Core is at migration 0019. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and
@@ -183,10 +181,9 @@ channels, preserve original observation time and invalidation/replay guards, and
 keep work/metadata bounds with no background task queue. Test reports are Discord
 logs only, with no SQL cases. Enforcement rechecks membership/exemptions, deletes
 matched messages and bans with truthful separate outcomes, and records selected
-case text (hashes/message IDs/trimmed excerpts). The bot captures proving Discord
-attachments after a recorded image-spam ban case using the Hasher CDN contract and the
-configured evidence backend; the API does not perform that Discord re-fetch. Test mode
-and `none` skip it. Failures do not undo delete or ban. Process image budgets belong
+case text (hashes/message IDs/trimmed excerpts). Exact-image spam retains hashes and safe case metadata only, with no attachment
+byte capture. Operator-managed guild-local known-bad digests use the existing
+configuration version and bot writer control path. Process image budgets belong
 only to bot config.
 Owner-selected image updates use the existing WebUI/API; see `docs/BUNNY-UPDATES.md`.
 Core or guild schema changes require the durable bot/API paired protocol. Preserve
@@ -505,7 +502,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves built dist/frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless bundled at build time, not git)
-migrations/             0001_init through 0018_one_active_ban
+migrations/             0001_init through 0019_known_bad_images
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```
