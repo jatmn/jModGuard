@@ -93,6 +93,10 @@ fn rule(id: &str) -> RuleDef {
         whitelist_roles: vec![],
         whitelist_channels: vec![],
         whitelist_users: vec![],
+        skip_moderators: false,
+        include_channels: vec![],
+        log_automod: true,
+        open_case: true,
     }
 }
 

@@ -781,6 +781,21 @@ impl EventHandler for Handler {
             (now - created.unix_timestamp()).max(0) as u64 / 86400
         };
 
+        let (is_moderator, can_mention_everyone) = {
+            let guild = ctx.cache.guild(guild_id);
+            if let (Some(guild), Some(member)) = (guild.as_ref(), member.as_ref()) {
+                let level = crate::commands::perm_level(&app, &guild.roles, member);
+                let is_mod = level >= crate::commands::PermLevel::Mod;
+                let perms = crate::commands::guild_permissions(&guild.roles, member);
+                let can_mention = member.user.id.get() == app.cfg.bot.owner_id
+                    || perms.contains(serenity::model::prelude::Permissions::ADMINISTRATOR)
+                    || perms.contains(serenity::model::prelude::Permissions::MENTION_EVERYONE);
+                (is_mod, can_mention)
+            } else {
+                (false, false)
+            }
+        };
+
         let msg_ctx = MsgCtx {
             guild_id: guild_id.get(),
             message_id: msg.id.get(),
@@ -794,6 +809,8 @@ impl EventHandler for Handler {
             joined_secs_ago,
             account_age_days: Some(account_age_days),
             member_roles: &member_roles,
+            is_moderator,
+            can_mention_everyone,
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
@@ -1053,6 +1070,58 @@ impl EventHandler for Handler {
                 &crate::activity_log::MemberView::from_member(&new),
             );
             emit_activity(&app, &ctx, guild_id, reports).await;
+
+            let old_roles: std::collections::HashSet<u64> =
+                old.roles.iter().map(|r| r.get()).collect();
+            let added: Vec<u64> = new
+                .roles
+                .iter()
+                .map(|r| r.get())
+                .filter(|id| !old_roles.contains(id))
+                .collect();
+            if !added.is_empty() {
+                let cfg = match app.configs.get(&app.db, guild_id.get()).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let member_roles: Vec<u64> = new.roles.iter().map(|r| r.get()).collect();
+                let (is_moderator, _) = ctx.cache.guild(guild_id).map_or((false, false), |g| {
+                    let level = crate::commands::perm_level(&app, &g.roles, &new);
+                    (level >= crate::commands::PermLevel::Mod, false)
+                });
+                if let Some((rule_id, action)) = jmodguard::custom_rules::honeypot_role_added(
+                    &cfg.rules,
+                    &added,
+                    new.user.id.get(),
+                    &member_roles,
+                    is_moderator,
+                ) {
+                    let rule_name = cfg
+                        .rules
+                        .get(&rule_id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| rule_id.clone());
+                    let pending = crate::automod::PendingAction {
+                        rule_id,
+                        rule_name,
+                        action,
+                        strikes: 1,
+                        evidence: serde_json::json!({}),
+                    };
+                    execute_pending(
+                        &app,
+                        &ctx,
+                        guild_id,
+                        &new.user,
+                        Some(new.clone()),
+                        new.display_name(),
+                        None,
+                        None,
+                        &pending,
+                    )
+                    .await;
+                }
+            }
         }
     }
 

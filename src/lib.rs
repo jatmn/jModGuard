@@ -7,6 +7,7 @@ pub mod bunny_evidence;
 pub mod capacity;
 pub mod config;
 pub mod control;
+pub mod custom_rules;
 pub mod db;
 mod db_compat;
 pub mod defaults;

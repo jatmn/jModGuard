@@ -1218,6 +1218,16 @@ impl ConfigurationSnapshotRows {
                 ),
             );
         }
+        if guild_id != GLOBAL_SCOPE {
+            for (id, row) in &self.guild_rules {
+                if !crate::custom_rules::is_custom_id(id) {
+                    continue;
+                }
+                if crate::custom_rules::validate_custom_rule_shape(guild_id, id, row).is_ok() {
+                    rules.insert(id.clone(), row.clone());
+                }
+            }
+        }
         let mut commands = self.global_commands.clone();
         for (name, def) in self.guild_commands {
             commands.insert(name, def);
@@ -1403,6 +1413,9 @@ pub async fn upsert_enrolled_rule(
     rule: &RuleDef,
 ) -> Result<()> {
     crate::image_spam::validate_rule(id, rule)?;
+    if crate::custom_rules::is_custom_id(id) {
+        return upsert_enrolled_custom_rule(db, scope, id, rule).await;
+    }
     upsert_row(
         db,
         "rules",
@@ -1412,6 +1425,51 @@ pub async fn upsert_enrolled_rule(
         false,
         Some(scope),
     )
+    .await
+}
+
+async fn upsert_enrolled_custom_rule(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    let guild_id = scope.guild_id();
+    let json = serde_json::to_string(rule)?;
+    let id_owned = id.to_owned();
+    let rule = rule.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, Some(&scope), guild_id)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rules WHERE guild_id = ?1 AND rule_id = ?2)",
+            params![guild_id, id_owned.as_str()],
+            |r| Ok(r.get(0)?),
+        )?;
+        crate::custom_rules::validate_custom_rule_for_write(guild_id, &id_owned, &rule, !exists)?;
+        if !exists {
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM rules WHERE guild_id = ?1 AND rule_id LIKE 'custom:%'",
+                params![guild_id],
+                |r| Ok(r.get(0)?),
+            )?;
+            if count as usize >= crate::custom_rules::MAX_CUSTOM_RULES_PER_GUILD {
+                anyhow::bail!(
+                    "at most {} custom rules per guild",
+                    crate::custom_rules::MAX_CUSTOM_RULES_PER_GUILD
+                );
+            }
+        }
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![guild_id, id_owned.as_str(), json],
+            1,
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
     .await
 }
 pub async fn delete_enrolled_rule(db: &Db, scope: ConfigurationWriteScope, id: &str) -> Result<()> {

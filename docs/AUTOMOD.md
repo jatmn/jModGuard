@@ -77,12 +77,40 @@ wins (ban > kick > timeout > warn > delete > log). Exact-image and repeated-text
 matches never use that generic executor; they log or delete-and-ban through their
 own path.
 
+## Custom rules (per server)
+
+Operators can add up to **32** guild-scoped rules with ids `custom:` plus 8–32
+lowercase hex characters. New rules are stored **dry-run**; a later edit can turn
+them live. Saves go through the bot `UpsertRule` control operation (the API does
+not write the row directly).
+
+Each custom rule has exactly **one** action (`delete`, `warn`, `timeout`, `kick`,
+or `ban` with `delete_days` 0–7). Types:
+
+- **pattern** — `params.pattern` compiled with the same linear-time regex engine
+  as badwords (length cap 512; look-around and backreferences rejected).
+- **word** — 1–32 literal tokens matched case-insensitively on normalized text
+  (whole tokens, not substrings).
+- **channel_content** — `params.links` and/or `params.attachments` (at least one
+  true): URL/invite detection or `attachment_count > 0`.
+- **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
+  flag) when the member lacks Mention Everyone.
+- **honeypot_role** — `params.role_id`; fires when that role is **added** (default
+  action kick). Channel include lists do not apply.
+
+Built-in and custom rules share skip lists plus **skip moderators** and optional
+**include channels** (empty = all channels except skipped). Custom rules also
+expose **post to automod log** and **open a case** switches (built-in rules keep
+today’s log/case behavior).
+
 ## Whitelists
 
 Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
-`whitelist_users` (user IDs). Matches skip the rule entirely. Whitelist your
-announcement channels and your mod/admin roles so @everyone pings in them
-never trigger.
+`whitelist_users` (user IDs). Matches skip the rule entirely. Optional
+`include_channels` limits a rule to listed channels (empty means all non-skipped
+channels). `skip_moderators` skips members at mod permission level or higher.
+Whitelist your announcement channels and your mod/admin roles so @everyone pings
+in them never trigger.
 
 ## Dry-run mode
 

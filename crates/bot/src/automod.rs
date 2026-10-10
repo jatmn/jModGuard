@@ -56,11 +56,13 @@ pub struct MsgCtx<'a> {
     pub joined_secs_ago: Option<u64>,
     pub account_age_days: Option<u64>,
     pub member_roles: &'a [u64],
+    pub is_moderator: bool,
+    pub can_mention_everyone: bool,
 }
 
 /// A rule fired and an action decided (highest severity across rules wins).
 pub struct PendingAction {
-    pub rule_id: &'static str,
+    pub rule_id: String,
     pub rule_name: String,
     pub action: ActionDef,
     pub strikes: u32,
@@ -155,13 +157,14 @@ impl AutomodEngine {
             if !rule.enabled {
                 continue;
             }
-            if rule.whitelist_users.contains(&ctx.author_id)
-                || rule.whitelist_channels.contains(&ctx.channel_id)
-                || rule
-                    .whitelist_roles
-                    .iter()
-                    .any(|r| ctx.member_roles.contains(r))
-            {
+            if jmodguard::custom_rules::rule_scope_skips(
+                rule,
+                ctx.author_id,
+                ctx.channel_id,
+                ctx.member_roles,
+                ctx.is_moderator,
+                true,
+            ) {
                 continue;
             }
 
@@ -211,7 +214,7 @@ impl AutomodEngine {
             state.fired.insert(action.at);
 
             let pending = PendingAction {
-                rule_id,
+                rule_id: rule_id.to_string(),
                 rule_name: rule.name.clone(),
                 action: action.clone(),
                 strikes,
@@ -221,6 +224,74 @@ impl AutomodEngine {
                     "message_id": ctx.message_id,
                     "attachments": ctx.attachment_count,
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
+                }),
+            };
+            if is_more_severe(&pending, &best) {
+                best = Some(pending);
+            }
+        }
+
+        for (rule_id, rule) in &cfg.rules {
+            if !jmodguard::custom_rules::is_custom_id(rule_id) || !rule.enabled {
+                continue;
+            }
+            if jmodguard::custom_rules::rule_scope_skips(
+                rule,
+                ctx.author_id,
+                ctx.channel_id,
+                ctx.member_roles,
+                ctx.is_moderator,
+                true,
+            ) {
+                continue;
+            }
+            let kind = rule
+                .params
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let triggered = match kind {
+                "pattern" => cfg
+                    .custom_patterns
+                    .get(rule_id)
+                    .map(|re| normalize::matches_badword(ctx.content, &normalized, re))
+                    .unwrap_or(false),
+                "word" => {
+                    let words = jmodguard::custom_rules::custom_words(rule);
+                    jmodguard::custom_rules::word_rule_matches(ctx.content, &words)
+                }
+                "channel_content" => {
+                    let links = rule.params.get("links").and_then(|v| v.as_bool()) == Some(true);
+                    let attachments =
+                        rule.params.get("attachments").and_then(|v| v.as_bool()) == Some(true);
+                    (links && has_url) || (attachments && ctx.attachment_count > 0)
+                }
+                "everyone_attempt" => {
+                    !ctx.can_mention_everyone
+                        && jmodguard::custom_rules::everyone_attempt_matches(
+                            ctx.content,
+                            ctx.everyone_mentions > 0,
+                        )
+                }
+                "honeypot_role" => false,
+                _ => false,
+            };
+            if !triggered {
+                continue;
+            }
+            let Some(action) = jmodguard::custom_rules::custom_rule_action(rule) else {
+                continue;
+            };
+            let pending = PendingAction {
+                rule_id: rule_id.clone(),
+                rule_name: rule.name.clone(),
+                action,
+                strikes: 1,
+                evidence: serde_json::json!({
+                    "content": truncate(ctx.content, 2000),
+                    "channel_id": ctx.channel_id,
+                    "message_id": ctx.message_id,
+                    "attachments": ctx.attachment_count,
                 }),
             };
             if is_more_severe(&pending, &best) {
@@ -345,13 +416,17 @@ pub async fn execute_pending(
     let reason = crate::templates::render(&rule.reason, &vars);
     vars.insert("reason".into(), reason.clone());
 
-    let dry = app
+    let (dry, log_automod, open_case) = app
         .configs
         .get(&app.db, guild_id.get())
         .await
         .ok()
-        .and_then(|c| c.rules.get(pending.rule_id).map(|r| r.dry_run))
-        .unwrap_or(false);
+        .and_then(|c| {
+            c.rules
+                .get(&pending.rule_id)
+                .map(|r| (r.dry_run, r.log_automod, r.open_case))
+        })
+        .unwrap_or((false, true, true));
 
     if dry {
         let mut v = vars.clone();
@@ -414,23 +489,25 @@ pub async fn execute_pending(
                 return;
             }
             let outcome = crate::cases::classify_db_commit(&warn_result);
-            crate::cases::record(
-                app,
-                enrollment.clone(),
-                crate::db::guild_data::CaseAction::Warning,
-                outcome,
-                target.id.get(),
-                None,
-                Some(reason.clone()),
-                crate::cases::text_excerpt(
-                    msg_channel.unwrap_or(0),
-                    msg_id.unwrap_or(0),
+            if open_case {
+                crate::cases::record(
+                    app,
+                    enrollment.clone(),
+                    crate::db::guild_data::CaseAction::Warning,
+                    outcome,
                     target.id.get(),
-                    pending.evidence["content"].as_str().unwrap_or(""),
-                ),
-                crate::cases::application_source(),
-            )
-            .await;
+                    None,
+                    Some(reason.clone()),
+                    crate::cases::text_excerpt(
+                        msg_channel.unwrap_or(0),
+                        msg_id.unwrap_or(0),
+                        target.id.get(),
+                        pending.evidence["content"].as_str().unwrap_or(""),
+                    ),
+                    crate::cases::application_source(),
+                )
+                .await;
+            }
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
@@ -473,8 +550,9 @@ pub async fn execute_pending(
             if !app.activation.may_record() {
                 return;
             }
-            if let Some(outcome) =
-                crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
+            if open_case
+                && let Some(outcome) =
+                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
                 crate::cases::record(
                     app,
@@ -526,8 +604,9 @@ pub async fn execute_pending(
             if !app.activation.may_record() {
                 return;
             }
-            if let Some(outcome) =
-                crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
+            if open_case
+                && let Some(outcome) =
+                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
                 crate::cases::record_application(
                     app,
@@ -561,25 +640,29 @@ pub async fn execute_pending(
                     publish_report = false;
                 }
                 crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
-                    crate::cases::settle_present_application_ban(
-                        app,
-                        enrollment.clone(),
-                        target.id.get(),
-                        reason.as_deref(),
-                    )
-                    .await;
+                    if open_case {
+                        crate::cases::settle_present_application_ban(
+                            app,
+                            enrollment.clone(),
+                            target.id.get(),
+                            reason.as_deref(),
+                        )
+                        .await;
+                    }
                     publish_report = false;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
                 } => {
-                    crate::cases::settle_present_application_ban(
-                        app,
-                        enrollment.clone(),
-                        target.id.get(),
-                        discord_reason.as_deref(),
-                    )
-                    .await;
+                    if open_case {
+                        crate::cases::settle_present_application_ban(
+                            app,
+                            enrollment.clone(),
+                            target.id.get(),
+                            discord_reason.as_deref(),
+                        )
+                        .await;
+                    }
                     publish_report = app.activation.may_record()
                         && db::record_enrolled_ban_if_absent(
                             &app.db,
@@ -612,28 +695,32 @@ pub async fn execute_pending(
                         if !app.activation.may_record() {
                             publish_report = false;
                         } else {
-                            let attempted = match crate::db::guild_data::CaseId::try_from(
-                                pending_ban.operation_id().to_owned(),
-                            ) {
-                                Ok(operation_id) => {
-                                    crate::cases::begin_application_attempt(
-                                        app,
-                                        enrollment.clone(),
-                                        crate::db::guild_data::CaseAction::Ban,
-                                        target.id.get(),
-                                        None,
-                                        Some(reason.clone()),
-                                        crate::cases::text_excerpt(
-                                            msg_channel.unwrap_or(0),
-                                            msg_id.unwrap_or(0),
+                            let attempted = if open_case {
+                                match crate::db::guild_data::CaseId::try_from(
+                                    pending_ban.operation_id().to_owned(),
+                                ) {
+                                    Ok(operation_id) => {
+                                        crate::cases::begin_application_attempt(
+                                            app,
+                                            enrollment.clone(),
+                                            crate::db::guild_data::CaseAction::Ban,
                                             target.id.get(),
-                                            pending.evidence["content"].as_str().unwrap_or(""),
-                                        ),
-                                        operation_id,
-                                    )
-                                    .await
+                                            None,
+                                            Some(reason.clone()),
+                                            crate::cases::text_excerpt(
+                                                msg_channel.unwrap_or(0),
+                                                msg_id.unwrap_or(0),
+                                                target.id.get(),
+                                                pending.evidence["content"].as_str().unwrap_or(""),
+                                            ),
+                                            operation_id,
+                                        )
+                                        .await
+                                    }
+                                    Err(_) => None,
                                 }
-                                Err(_) => None,
+                            } else {
+                                None
                             };
                             let operation_id = pending_ban.operation_id().to_owned();
                             let suppression = app.suppress_next_gateway_case(
@@ -713,7 +800,7 @@ pub async fn execute_pending(
     }
     // Log-only/delete-only observations are routine Discord reports. Retain
     // selected moderation records until the typed case model replaces this table.
-    if matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
+    if open_case && matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
         if !app.activation.may_record() {
             return;
         }
@@ -732,6 +819,9 @@ pub async fn execute_pending(
         .await;
     }
 
+    if !log_automod {
+        return;
+    }
     let mut v = vars;
     v.insert(
         "content".into(),
@@ -796,6 +886,10 @@ mod tests {
                 whitelist_roles: Vec::new(),
                 whitelist_channels: Vec::new(),
                 whitelist_users: Vec::new(),
+                skip_moderators: false,
+                include_channels: vec![],
+                log_automod: true,
+                open_case: true,
             },
         );
         let cfg = CachedGuildConfig {
@@ -809,6 +903,7 @@ mod tests {
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
         };
         let roles = [];
         let message = MsgCtx {
@@ -824,13 +919,352 @@ mod tests {
             joined_secs_ago: None,
             account_age_days: Some(30),
             member_roles: &roles,
+            is_moderator: false,
+            can_mention_everyone: false,
         };
         let first = engine.evaluate(&cfg, &message).expect("first ban");
         assert_eq!(first.action.action, "ban");
         assert!(engine.evaluate(&cfg, &message).is_none());
-        engine.release_fired(1, 2, first.rule_id, first.action.at);
+        engine.release_fired(1, 2, &first.rule_id, first.action.at);
         let retry = engine.evaluate(&cfg, &message).expect("retried ban");
         assert_eq!(retry.action.action, "ban");
         assert_eq!(retry.action.at, 1);
+    }
+
+    fn test_cfg(
+        rules: &HashMap<String, RuleDef>,
+        patterns: &HashMap<String, regex::Regex>,
+    ) -> CachedGuildConfig {
+        CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules: rules.clone(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: patterns.clone(),
+        }
+    }
+
+    fn custom_rule(params: serde_json::Value, action: &str) -> RuleDef {
+        RuleDef {
+            name: "custom".into(),
+            description: String::new(),
+            enabled: true,
+            dry_run: true,
+            params,
+            actions: vec![ActionDef {
+                at: 1,
+                action: action.into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "r".into(),
+            }],
+            whitelist_roles: vec![],
+            whitelist_channels: vec![],
+            whitelist_users: vec![],
+            skip_moderators: false,
+            include_channels: vec![],
+            log_automod: true,
+            open_case: true,
+        }
+    }
+
+    fn msg(
+        channel: u64,
+        content: &str,
+        attachments: usize,
+        is_mod: bool,
+        can_everyone: bool,
+    ) -> MsgCtx<'_> {
+        MsgCtx {
+            guild_id: 1,
+            message_id: 1,
+            channel_id: channel,
+            author_id: 42,
+            content,
+            attachment_count: attachments,
+            everyone_mentions: 0,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: &[],
+            is_moderator: is_mod,
+            can_mention_everyone: can_everyone,
+        }
+    }
+
+    #[test]
+    fn custom_create_helper_starts_dry_run() {
+        let rule = custom_rule(
+            serde_json::json!({ "kind": "pattern", "pattern": "x" }),
+            "delete",
+        );
+        assert!(rule.dry_run);
+    }
+
+    #[test]
+    fn custom_pattern_and_word_rules() {
+        let id = "custom:0123456789abcdef".to_string();
+        let mut rules = HashMap::new();
+        rules.insert(
+            id.clone(),
+            custom_rule(
+                serde_json::json!({ "kind": "pattern", "pattern": "scam" }),
+                "delete",
+            ),
+        );
+        let patterns = HashMap::from([(
+            id.clone(),
+            jmodguard::normalize::compile_user_regex("scam").unwrap(),
+        )]);
+        let engine = AutomodEngine::new();
+        let cfg = test_cfg(&rules, &patterns);
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "this is a scam", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "safe text", 0, false, false))
+                .is_none()
+        );
+
+        rules.clear();
+        rules.insert(
+            id.clone(),
+            custom_rule(
+                serde_json::json!({ "kind": "word", "words": ["scam"] }),
+                "delete",
+            ),
+        );
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "scam", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "scamper", 0, false, false))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn custom_scope_include_and_skip_lists() {
+        let id = "custom:0123456789abcdef".to_string();
+        let mut rule = custom_rule(
+            serde_json::json!({ "kind": "word", "words": ["hit"] }),
+            "delete",
+        );
+        let engine = AutomodEngine::new();
+
+        let mut rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(5, "hit", 0, false, false))
+                .is_some()
+        );
+
+        rule.include_channels = vec![10, 20];
+        rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(10, "hit", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(20, "hit", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(30, "hit", 0, false, false))
+                .is_none()
+        );
+
+        rule.whitelist_channels = vec![20];
+        rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(10, "hit", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(20, "hit", 0, false, false))
+                .is_none()
+        );
+
+        rule.whitelist_users = vec![42];
+        rule.whitelist_channels = vec![];
+        rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(10, "hit", 0, false, false))
+                .is_none()
+        );
+
+        rule.whitelist_users = vec![];
+        rule.whitelist_roles = vec![7];
+        rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        let roles = [7u64];
+        let mut skipped = msg(10, "hit", 0, false, false);
+        skipped.member_roles = &roles;
+        assert!(engine.evaluate(&cfg, &skipped).is_none());
+        rule.whitelist_roles = vec![];
+
+        rule.whitelist_users = vec![];
+        rule.skip_moderators = true;
+        rules = HashMap::from([(id.clone(), rule.clone())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(10, "hit", 0, true, false))
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(10, "hit", 0, false, false))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn custom_channel_content_and_everyone() {
+        let id = "custom:0123456789abcdef".to_string();
+        let engine = AutomodEngine::new();
+        let mut rules = HashMap::new();
+        rules.insert(
+            id.clone(),
+            custom_rule(
+                serde_json::json!({ "kind": "channel_content", "links": true, "attachments": false }),
+                "delete",
+            ),
+        );
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "see https://example.com", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "no link", 0, false, false))
+                .is_none()
+        );
+
+        rules.clear();
+        rules.insert(
+            id.clone(),
+            custom_rule(
+                serde_json::json!({ "kind": "channel_content", "links": false, "attachments": true }),
+                "delete",
+            ),
+        );
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "file", 1, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "file", 0, false, false))
+                .is_none()
+        );
+
+        rules.clear();
+        rules.insert(
+            id.clone(),
+            custom_rule(
+                serde_json::json!({ "kind": "channel_content", "links": true, "attachments": true }),
+                "delete",
+            ),
+        );
+        let cfg = test_cfg(&rules, &HashMap::new());
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "see https://example.com", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "discord.gg/spam", 0, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "file", 2, false, false))
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "plain", 0, false, false))
+                .is_none()
+        );
+
+        rules.clear();
+        rules.insert(
+            id.clone(),
+            custom_rule(serde_json::json!({ "kind": "everyone_attempt" }), "delete"),
+        );
+        let cfg = test_cfg(&rules, &HashMap::new());
+        let mut m = msg(1, "hello @everyone", 0, false, false);
+        assert!(engine.evaluate(&cfg, &m).is_some());
+        m.content = "HELLO @EVERYONE";
+        assert!(engine.evaluate(&cfg, &m).is_some());
+        m.content = "one @here attempt";
+        assert!(engine.evaluate(&cfg, &m).is_some());
+        m.can_mention_everyone = true;
+        assert!(engine.evaluate(&cfg, &m).is_none());
+    }
+
+    #[test]
+    fn honeypot_role_added_helper() {
+        let id = "custom:0123456789abcdef".to_string();
+        let mut rules = HashMap::new();
+        let mut honeypot = custom_rule(
+            serde_json::json!({ "kind": "honeypot_role", "role_id": "99" }),
+            "kick",
+        );
+        honeypot.dry_run = false;
+        rules.insert(id.clone(), honeypot);
+        let hit = jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], false);
+        assert_eq!(
+            hit.as_ref()
+                .map(|(rid, a)| (rid.as_str(), a.action.as_str())),
+            Some((id.as_str(), "kick"))
+        );
+        assert!(
+            jmodguard::custom_rules::honeypot_role_added(&rules, &[], 42, &[], false).is_none()
+        );
+        rules.get_mut(&id).unwrap().whitelist_users = vec![42];
+        assert!(
+            jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], false).is_none()
+        );
+        rules.get_mut(&id).unwrap().whitelist_users.clear();
+        rules.get_mut(&id).unwrap().dry_run = true;
+        assert!(
+            jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], false).is_some()
+        );
+        rules.get_mut(&id).unwrap().dry_run = false;
+        rules.get_mut(&id).unwrap().skip_moderators = true;
+        assert!(
+            jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], true).is_none()
+        );
     }
 }

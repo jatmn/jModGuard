@@ -88,7 +88,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -2788,4 +2788,21 @@ test('appearance retains the session choice across startup and workspace when st
   assert.equal(picker.isConnected, false);
   assert.equal(h.document.querySelector('select[aria-label="Appearance"]').value, 'dark');
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
+});
+
+test('custom pattern draft save uses dry_run and custom id', () => {
+  const h = harness();
+  const draft = h.app.buildCustomRuleSaveBody(
+    {
+      name: 'x',
+      dry_run: false,
+      params: { kind: 'pattern', pattern: 'scam' },
+      actions: [{ at: 1, action: 'delete', reason: '', duration_minutes: 0, delete_days: 0 }],
+    },
+    true,
+  );
+  assert.equal(draft.dry_run, true);
+  assert.equal(draft.params.kind, 'pattern');
+  const record = h.app.newCustomRuleDraft();
+  assert.match(record.rule_id, /^custom:[0-9a-f]{16}$/);
 });

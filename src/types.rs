@@ -214,6 +214,18 @@ pub struct RuleDef {
         serialize_with = "crate::ids::ser_u64_vec_str"
     )]
     pub whitelist_users: Vec<u64>,
+    #[serde(default)]
+    pub skip_moderators: bool,
+    #[serde(
+        default,
+        deserialize_with = "crate::ids::de_u64_vec",
+        serialize_with = "crate::ids::ser_u64_vec_str"
+    )]
+    pub include_channels: Vec<u64>,
+    #[serde(default = "default_true")]
+    pub log_automod: bool,
+    #[serde(default = "default_true")]
+    pub open_case: bool,
 }
 
 impl RuleDef {
