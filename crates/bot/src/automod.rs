@@ -2128,7 +2128,11 @@ mod tests {
                                 .lock()
                                 .unwrap()
                                 .push(format!("{method} {path}"));
-                            let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let response = if method == "GET" {
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            } else {
+                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            };
                             let _ = stream.write_all(response.as_bytes());
                             let _ = stream.flush();
                             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -2439,6 +2443,153 @@ mod tests {
             seen.iter()
                 .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
             "a built-in rule still deletes when the config read fails: {seen:?}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn custom_rule_ban_echo_leaves_one_active_row() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+
+        const ID: &str = "custom:0123456789abcdef";
+        let path = std::env::temp_dir().join(format!(
+            "custom_ban_echo_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10_i64, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        crate::db::upsert_rule(&app.db, 10, ID, &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let roles = [];
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&roles))
+            .expect("custom ban rule matches");
+        assert_eq!(pending.action.action, "ban");
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let stub = DiscordStub::start();
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        let seen = stub.finish();
+        assert!(
+            seen.iter().any(|line| line.contains("/bans/")),
+            "the custom-rule ban must be sent: {seen:?}"
+        );
+
+        let (row_id, operation_id, reason) = app
+            .db
+            .with_conn(|conn| {
+                use crate::db::SqlExecutor;
+                let (count, row_id, operation_id, reason): (i64, i64, String, String) = conn
+                    .query_row(
+                        "SELECT COUNT(*), id, operation_id, reason FROM bans
+                         WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                        crate::db::params![10_i64, 99_i64],
+                        |row| {
+                            Ok((
+                                row.get(0).map_err(|error| anyhow::anyhow!("{error}"))?,
+                                row.get(1).map_err(|error| anyhow::anyhow!("{error}"))?,
+                                row.get(2).map_err(|error| anyhow::anyhow!("{error}"))?,
+                                row.get(3).map_err(|error| anyhow::anyhow!("{error}"))?,
+                            ))
+                        },
+                    )?;
+                anyhow::ensure!(count == 1, "expected one active ban before the echo");
+                Ok((row_id, operation_id, reason))
+            })
+            .await
+            .unwrap();
+        assert!(
+            !operation_id.is_empty(),
+            "the ban row must carry operation_id"
+        );
+        assert!(
+            reason.contains(ID),
+            "the bot reason must be stored before the echo: {reason}"
+        );
+
+        let suppressed =
+            app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Ban, 10, 99);
+        let echo_operation = app.gateway_ban_echo_operation(10, 99);
+        let owned_echo = suppressed || echo_operation.is_some();
+        let echoed_operation = echo_operation.flatten();
+        assert!(owned_echo, "the custom-rule ban must own its gateway echo");
+        assert_eq!(echoed_operation.as_deref(), Some(operation_id.as_str()));
+        let write = crate::db::record_gateway_ban(
+            &app.db,
+            Some(enrollment),
+            99,
+            Some("member"),
+            None,
+            None,
+            owned_echo,
+            echoed_operation.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(write, crate::db::GatewayBanWrite::Existing { row_id });
+        let (active, total) = app
+            .db
+            .with_conn(|conn| {
+                use crate::db::SqlExecutor;
+                let active: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                    crate::db::params![10_i64, 99_i64],
+                    |row| row.get(0).map_err(|error| anyhow::anyhow!("{error}")),
+                )?;
+                let total: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM bans WHERE guild_id=?1 AND user_id=?2",
+                    crate::db::params![10_i64, 99_i64],
+                    |row| row.get(0).map_err(|error| anyhow::anyhow!("{error}")),
+                )?;
+                Ok((active, total))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (active, total),
+            (1, 1),
+            "the echo must not add or replace the active ban"
         );
         drop(app);
         let _ = std::fs::remove_file(&path);
