@@ -1182,6 +1182,7 @@ mod tests {
             "new reason",
             Some(occurred),
             db::BanRecord::Retry,
+            None,
         )
         .await
         .unwrap();
@@ -1208,6 +1209,7 @@ mod tests {
             "new reason",
             Some(occurred),
             db::BanRecord::Retry,
+            None,
         )
         .await
         .unwrap();
@@ -1347,6 +1349,7 @@ mod tests {
             "handoff",
             None,
             db::BanRecord::Retry,
+            None,
         )
         .await
         .unwrap();
@@ -1372,6 +1375,7 @@ mod tests {
             "handoff",
             None,
             db::BanRecord::Retry,
+            None,
         )
         .await
         .unwrap();

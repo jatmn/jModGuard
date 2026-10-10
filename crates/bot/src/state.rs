@@ -48,10 +48,22 @@ const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GatewayCaseSuppression(u128);
 
+struct GatewayCaseEntry {
+    action: GatewayCaseAction,
+    guild: u64,
+    user: u64,
+    operation_id: Option<String>,
+    expires: Instant,
+}
+
 #[derive(Default)]
 struct GatewayCaseSuppressions {
     next_token: u128,
-    entries: HashMap<GatewayCaseSuppression, ((GatewayCaseAction, u64, u64), Instant)>,
+    entries: HashMap<GatewayCaseSuppression, GatewayCaseEntry>,
+    /// Ban tokens already consumed. A second delivery of the same bot echo
+    /// has no token left, but it is still the bot's ban until this expires
+    /// or an unban clears it. The string is that attempt's operation id.
+    recent_ban_echo: HashMap<(u64, u64), (Instant, Option<String>)>,
 }
 
 /// A write failure cannot be recorded in the same unavailable guild store.
@@ -124,7 +136,9 @@ impl PendingMemberGaps {
 
 impl GatewayCaseSuppressions {
     fn prune(&mut self, now: Instant) {
-        self.entries.retain(|_, (_, expires)| *expires > now);
+        self.entries.retain(|_, entry| entry.expires > now);
+        self.recent_ban_echo
+            .retain(|_, (expires, _)| *expires > now);
     }
 
     fn insert(
@@ -132,6 +146,7 @@ impl GatewayCaseSuppressions {
         action: GatewayCaseAction,
         guild: u64,
         user: u64,
+        operation_id: Option<String>,
     ) -> GatewayCaseSuppression {
         let now = Instant::now();
         self.prune(now);
@@ -139,7 +154,7 @@ impl GatewayCaseSuppressions {
             && let Some(oldest) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, expires))| *expires)
+                .min_by_key(|(_, entry)| entry.expires)
                 .map(|(key, _)| *key)
         {
             self.entries.remove(&oldest);
@@ -148,7 +163,13 @@ impl GatewayCaseSuppressions {
         let token = GatewayCaseSuppression(self.next_token);
         self.entries.insert(
             token,
-            ((action, guild, user), now + GATEWAY_CASE_SUPPRESSION_TTL),
+            GatewayCaseEntry {
+                action,
+                guild,
+                user,
+                operation_id,
+                expires: now + GATEWAY_CASE_SUPPRESSION_TTL,
+            },
         );
         token
     }
@@ -163,10 +184,38 @@ impl GatewayCaseSuppressions {
         let token = self
             .entries
             .iter()
-            .filter(|(_, (key, _))| *key == (action, guild, user))
-            .min_by_key(|(_, (_, expires))| *expires)
+            .filter(|(_, entry)| {
+                entry.action == action && entry.guild == guild && entry.user == user
+            })
+            .min_by_key(|(_, entry)| entry.expires)
             .map(|(token, _)| *token);
-        token.is_some_and(|token| self.entries.remove(&token).is_some())
+        let Some(entry) = token.and_then(|token| self.entries.remove(&token)) else {
+            return false;
+        };
+        if entry.action == GatewayCaseAction::Ban {
+            self.recent_ban_echo.insert(
+                (entry.guild, entry.user),
+                (
+                    Instant::now() + GATEWAY_CASE_SUPPRESSION_TTL,
+                    entry.operation_id,
+                ),
+            );
+        }
+        true
+    }
+
+    /// `Some` when a consumed bot ban echo is still remembered.
+    /// The string is that attempt's operation id, when the dispatch saved one.
+    fn ban_echo_operation(&mut self, guild: u64, user: u64) -> Option<Option<String>> {
+        let now = Instant::now();
+        self.prune(now);
+        self.recent_ban_echo
+            .get(&(guild, user))
+            .map(|(_, operation_id)| operation_id.clone())
+    }
+
+    fn clear_ban_echo(&mut self, guild: u64, user: u64) {
+        self.recent_ban_echo.remove(&(guild, user));
     }
 }
 
@@ -776,10 +825,14 @@ impl BotState {
         action: GatewayCaseAction,
         guild: u64,
         user: u64,
+        operation_id: Option<&str>,
     ) -> GatewayCaseSuppression {
-        self.gateway_case_suppressions
-            .lock()
-            .insert(action, guild, user)
+        self.gateway_case_suppressions.lock().insert(
+            action,
+            guild,
+            user,
+            operation_id.filter(|id| !id.is_empty()).map(str::to_owned),
+        )
     }
 
     pub(crate) fn release_gateway_case_suppression(&self, token: GatewayCaseSuppression) {
@@ -795,6 +848,24 @@ impl BotState {
         self.gateway_case_suppressions
             .lock()
             .remove(action, guild, user)
+    }
+
+    /// Operation id saved with a consumed bot ban echo, when one is still remembered.
+    pub(crate) fn gateway_ban_echo_operation(
+        &self,
+        guild: u64,
+        user: u64,
+    ) -> Option<Option<String>> {
+        self.gateway_case_suppressions
+            .lock()
+            .ban_echo_operation(guild, user)
+    }
+
+    /// An unban ends the bot echo. A later ban is a new row.
+    pub(crate) fn clear_gateway_ban_echo(&self, guild: u64, user: u64) {
+        self.gateway_case_suppressions
+            .lock()
+            .clear_ban_echo(guild, user);
     }
 
     pub(crate) fn remember_member_gap(
@@ -1433,48 +1504,69 @@ mod tests {
     #[test]
     fn gateway_case_suppressions_are_scoped_consumed_and_bounded() {
         let mut suppressions = GatewayCaseSuppressions::default();
-        suppressions.insert(GatewayCaseAction::Ban, 10, 20);
+        suppressions.insert(GatewayCaseAction::Ban, 10, 20, None);
         assert!(!suppressions.remove(GatewayCaseAction::Unban, 10, 20));
         assert!(suppressions.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(!suppressions.remove(GatewayCaseAction::Ban, 10, 20));
 
         suppressions.entries.insert(
             GatewayCaseSuppression(0),
-            (
-                (GatewayCaseAction::Ban, 30, 40),
-                Instant::now() - Duration::from_secs(1),
-            ),
+            GatewayCaseEntry {
+                action: GatewayCaseAction::Ban,
+                guild: 30,
+                user: 40,
+                operation_id: None,
+                expires: Instant::now() - Duration::from_secs(1),
+            },
         );
-        suppressions.insert(GatewayCaseAction::Unban, 30, 40);
+        suppressions.insert(GatewayCaseAction::Unban, 30, 40, None);
         assert!(!suppressions.remove(GatewayCaseAction::Ban, 30, 40));
         assert!(suppressions.remove(GatewayCaseAction::Unban, 30, 40));
 
         for user in 1..=(MAX_GATEWAY_CASE_SUPPRESSIONS as u64 + 1) {
-            suppressions.insert(GatewayCaseAction::Ban, 50, user);
+            suppressions.insert(GatewayCaseAction::Ban, 50, user, None);
         }
         assert_eq!(suppressions.entries.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
     }
 
     #[test]
+    fn consumed_ban_echo_stays_owned_until_cleared() {
+        let mut suppressions = GatewayCaseSuppressions::default();
+        suppressions.insert(GatewayCaseAction::Ban, 10, 20, Some("attempt-a".into()));
+        assert!(suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+        assert_eq!(
+            suppressions.ban_echo_operation(10, 20),
+            Some(Some("attempt-a".into()))
+        );
+        assert!(suppressions.ban_echo_operation(10, 20).is_some());
+        assert!(suppressions.ban_echo_operation(10, 21).is_none());
+        suppressions.insert(GatewayCaseAction::Unban, 10, 21, None);
+        assert!(suppressions.remove(GatewayCaseAction::Unban, 10, 21));
+        assert!(suppressions.ban_echo_operation(10, 21).is_none());
+        suppressions.clear_ban_echo(10, 20);
+        assert!(suppressions.ban_echo_operation(10, 20).is_none());
+    }
+
+    #[test]
     fn overlapping_gateway_dispatches_keep_individual_ownership() {
         let mut s = GatewayCaseSuppressions::default();
-        let a = s.insert(GatewayCaseAction::Ban, 10, 20);
-        let b = s.insert(GatewayCaseAction::Ban, 10, 20);
+        let a = s.insert(GatewayCaseAction::Ban, 10, 20, None);
+        let b = s.insert(GatewayCaseAction::Ban, 10, 20, None);
         s.release(b);
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
         s.release(a); // Already consumed; cannot release a future marker.
-        let a = s.insert(GatewayCaseAction::Ban, 10, 20);
-        let _b = s.insert(GatewayCaseAction::Ban, 10, 20);
+        let a = s.insert(GatewayCaseAction::Ban, 10, 20, None);
+        let _b = s.insert(GatewayCaseAction::Ban, 10, 20, None);
         s.release(a);
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
-        let a = s.insert(GatewayCaseAction::Unban, 10, 20);
+        let a = s.insert(GatewayCaseAction::Unban, 10, 20, None);
         assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
-        s.insert(GatewayCaseAction::Unban, 10, 20);
+        s.insert(GatewayCaseAction::Unban, 10, 20, None);
         s.release(a);
         assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
-        s.insert(GatewayCaseAction::Ban, 10, 20);
-        s.insert(GatewayCaseAction::Ban, 10, 20);
+        s.insert(GatewayCaseAction::Ban, 10, 20, None);
+        s.insert(GatewayCaseAction::Ban, 10, 20, None);
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));

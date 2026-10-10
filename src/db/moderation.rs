@@ -507,6 +507,21 @@ pub enum BanRecord {
     Fresh,
 }
 
+/// Reason stored on a gateway ban until an audit entry attributes it.
+/// Migration 0018 uses this same text when choosing which duplicate active row to keep.
+pub const GATEWAY_BAN_REASON: &str = "Reason unavailable";
+
+/// How a gateway ban delivery relates to the active mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayBanWrite {
+    /// The bot's echo stored the missing active row. No `member_ban` event.
+    OwnedByBot { row_id: i64 },
+    /// An active row is already this ban. Leave its actor and reason unchanged.
+    Existing { row_id: i64 },
+    /// This delivery inserted the only active row and one `member_ban` event.
+    Recorded { row_id: i64 },
+}
+
 /// Insert an active ban row for this dispatch.
 ///
 /// [`BanRecord::Retry`] returns `None` and writes nothing when an active row already has
@@ -514,8 +529,11 @@ pub enum BanRecord {
 /// [`BanRecord::Fresh`] replaces that stale active mirror and inserts a new row.
 /// `created_at` stays the timestamp of the insert and is not the dispatch identity. A
 /// different reason replaces the stale active row. An ended row does not block the
-/// insert. `Some` means a row was inserted and the caller may publish. `None` means do
-/// not publish.
+/// insert. An active row whose `operation_id` is this attempt is the gateway echo of
+/// this same ban; the command fills that row instead of inserting another. An older
+/// active row with any other id, including none, is ended and kept as history. `Some`
+/// means a row was inserted or filled and the caller may publish. `None` means do not
+/// publish.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_enrolled_ban_if_absent(
     db: &Db,
@@ -528,6 +546,7 @@ pub async fn record_enrolled_ban_if_absent(
     reason: &str,
     occurred_at: Option<&str>,
     kind: BanRecord,
+    operation_id: Option<&str>,
 ) -> Result<Option<i64>> {
     let (now, reason) = (
         occurred_at.map(str::to_owned).unwrap_or_else(now_str),
@@ -536,6 +555,7 @@ pub async fn record_enrolled_ban_if_absent(
     let user_name = user_name.map(str::to_owned);
     let user_display_name = user_display_name.map(str::to_owned);
     let moderator_name = moderator_name.map(str::to_owned);
+    let operation_id = operation_id.filter(|id| !id.is_empty()).map(str::to_owned);
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
@@ -556,15 +576,52 @@ pub async fn record_enrolled_ban_if_absent(
             tx.finish_read()?;
             return Ok(None);
         }
+        let same_attempt: Option<i64> = match operation_id.as_deref() {
+            Some(operation_id) => tx
+                .query_row(
+                    "SELECT id FROM bans
+                     WHERE guild_id=?1 AND user_id=?2 AND active=1
+                       AND operation_id = ?3
+                     ORDER BY id LIMIT 1",
+                    params![guild_id, user_id, operation_id],
+                    |row| Ok(row.get(0)?),
+                )
+                .optional()?,
+            None => None,
+        };
         tx.ensure_mutation_receipt()?;
+        if let Some(row_id) = same_attempt {
+            let updated = tx.execute_matching(
+                "UPDATE bans SET moderator_id=?1, moderator_name=?2, reason=?3,
+                    user_name=COALESCE(?4, user_name),
+                    user_display_name=COALESCE(?5, user_display_name),
+                    created_at=?6
+                 WHERE id=?7 AND guild_id=?8 AND user_id=?9 AND active=1 AND operation_id = ?10",
+                params![
+                    moderator_id,
+                    moderator_name,
+                    reason,
+                    user_name,
+                    user_display_name,
+                    now,
+                    row_id,
+                    guild_id,
+                    user_id,
+                    operation_id
+                ],
+            )?;
+            anyhow::ensure!(updated == 1, "gateway ban echo was no longer this attempt");
+            tx.commit()?;
+            return Ok(Some(row_id));
+        }
         tx.execute_matching(
             "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
             params![guild_id, user_id],
         )?;
         tx.execute_rows(
-            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
-            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name],
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name, operation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
+            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name, operation_id],
             1,
         )?;
         let row_id = tx.last_insert_rowid();
@@ -632,6 +689,154 @@ pub async fn record_enrolled_ban_with_identity(
         Ok(row_id)
     })
     .await
+}
+
+/// Record a gateway ban without creating a second active row.
+///
+/// A bot echo inserts the one active row when none exists, and does not insert a
+/// `member_ban` event. `operation_id` is saved on that row so only the same ban
+/// attempt can fill it. A manual delivery inserts one active row and one
+/// `member_ban` event in the same transaction, with no operation id. A later
+/// delivery for an active ban returns the existing row and does not change its
+/// actor or reason.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_gateway_ban(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    user_name: Option<&str>,
+    user_display_name: Option<&str>,
+    occurred_at: Option<&str>,
+    owned_by_bot: bool,
+    operation_id: Option<&str>,
+) -> Result<GatewayBanWrite> {
+    let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
+    let reason = GATEWAY_BAN_REASON.to_owned();
+    let user_name = user_name.map(str::to_owned);
+    let user_display_name = user_display_name.map(str::to_owned);
+    let operation_id = if owned_by_bot {
+        operation_id.filter(|id| !id.is_empty()).map(str::to_owned)
+    } else {
+        None
+    };
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        record_gateway_ban_conn(
+            conn,
+            &enrollment,
+            guild_id,
+            user_id,
+            user_name,
+            user_display_name,
+            reason,
+            now,
+            owned_by_bot,
+            operation_id,
+        )
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_gateway_ban_conn(
+    conn: &mut Connection,
+    enrollment: &GuildEnrollment,
+    guild_id: i64,
+    user_id: i64,
+    user_name: Option<String>,
+    user_display_name: Option<String>,
+    reason: String,
+    now: String,
+    owned_by_bot: bool,
+    operation_id: Option<String>,
+) -> Result<GatewayBanWrite> {
+    let mut tx = conn.transaction_primary_read()?;
+    super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
+    super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+    if let Some(row_id) = active_ban_id(&tx, guild_id, user_id)? {
+        tx.finish_read()?;
+        return Ok(GatewayBanWrite::Existing { row_id });
+    }
+    tx.ensure_mutation_receipt()?;
+    match tx.execute_rows(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name, operation_id)
+         VALUES (?1, ?2, NULL, ?3, ?4, 1, ?5, ?6, NULL, ?7)",
+        params![
+            guild_id,
+            user_id,
+            reason.clone(),
+            now.clone(),
+            user_name,
+            user_display_name,
+            operation_id
+        ],
+        1,
+    ) {
+        Ok(_) => {}
+        Err(error) if active_ban_conflict(&error) => {
+            drop(tx);
+            return existing_active_ban(conn, enrollment, guild_id, user_id);
+        }
+        Err(error) => return Err(error),
+    }
+    let row_id = tx.last_insert_rowid();
+    if owned_by_bot {
+        tx.commit()?;
+        return Ok(GatewayBanWrite::OwnedByBot { row_id });
+    }
+    let data = crate::ids::stringify_js_unsafe_integers(&serde_json::json!({
+        "reason": reason,
+        "source": "discord",
+        "ban_id": row_id,
+    }))
+    .to_string();
+    tx.query_row_write(
+        "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+         VALUES (?1, 'member_ban', ?2, NULL, ?3, ?4)
+         RETURNING id",
+        params![guild_id, user_id, data, now],
+        |row| Ok(row.get::<i64>(0)?),
+    )?;
+    tx.commit()?;
+    Ok(GatewayBanWrite::Recorded { row_id })
+}
+
+fn active_ban_id(conn: &impl SqlExecutor, guild_id: i64, user_id: i64) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 ORDER BY id LIMIT 1",
+        params![guild_id, user_id],
+        |row| Ok(row.get(0)?),
+    )
+    .optional()
+}
+
+fn existing_active_ban(
+    conn: &mut Connection,
+    enrollment: &GuildEnrollment,
+    guild_id: i64,
+    user_id: i64,
+) -> Result<GatewayBanWrite> {
+    let tx = conn.transaction_primary_read()?;
+    super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
+    super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+    let row_id = active_ban_id(&tx, guild_id, user_id)?.ok_or_else(|| {
+        anyhow::anyhow!("active ban conflict left no row for guild {guild_id} user {user_id}")
+    })?;
+    tx.finish_read()?;
+    Ok(GatewayBanWrite::Existing { row_id })
+}
+
+fn active_ban_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(libsql::Error::SqliteFailure(code, message)) = cause.downcast_ref() {
+            return *code == 2067
+                || message.contains("idx_bans_one_active")
+                || message.contains("UNIQUE constraint failed");
+        }
+        let text = cause.to_string();
+        text.contains("idx_bans_one_active") || text.contains("UNIQUE constraint failed")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

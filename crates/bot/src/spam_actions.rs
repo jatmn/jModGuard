@@ -546,6 +546,7 @@ pub(crate) async fn continue_present_spam_ban(
             &format!("[automod:{rule}] {reason}"),
             None,
             crate::db::BanRecord::Retry,
+            None,
         )
         .await
         .ok()
@@ -655,10 +656,12 @@ async fn dispatch_spam_ban<B>(
 where
     B: std::future::Future<Output = Result<(), serenity::Error>>,
 {
+    let operation_id = pending_ban.operation_id().to_owned();
     let suppression = app.suppress_next_gateway_case(
         crate::state::GatewayCaseAction::Ban,
         found.guild,
         found.author,
+        Some(&operation_id),
     );
     let discord = tokio::time::timeout(
         Duration::from_secs(10),
@@ -708,6 +711,7 @@ where
             &format!("[automod:{rule}] {}", found.reason),
             None,
             crate::db::BanRecord::Fresh,
+            Some(&operation_id),
         )
         .await;
     }

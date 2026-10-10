@@ -87,11 +87,18 @@ Joining, leaving and talking still do not maintain a general activity archive.
   Latest-observation records are process-only, capped at 4096 and kept for 30 seconds.
   If an observation cannot be tracked at capacity, enrichment pauses for that interval;
   report delivery continues with unavailable fields. No past reports are retried.
-  On a Gateway ban, the supplied banned-user name is saved before the bounded
-  audit lookup. A matching entry adds the moderator ID and actual reason to
-  that same row. Without a reliable match, a new row says "Reason unavailable";
-  older rows keep their recorded text. Rows without a known name or reliable
-  moderator show the ID or unavailable moderator in the WebUI.
+  On a Gateway ban that is not the bot's own echo, and that does not already
+  have an active row, the supplied banned-user name is saved with one
+  `member_ban` event before the bounded audit lookup. A matching entry adds
+  the moderator ID and actual reason to that same row. Without a reliable
+  match, that new row says "Reason unavailable"; older rows keep their recorded
+  text. A bot echo that finds no active row stores that one row, marked with
+  the operation id of that ban attempt, and does not add a `member_ban` event.
+  The command for that same attempt fills the marked row. A later ban with a
+  different operation id ends the older active row and inserts a new one.
+  A delivery of a ban the bot already recorded does not insert another row
+  and does not replace that row's actor or reason. Rows without a known name
+  or reliable moderator show the ID or unavailable moderator in the WebUI.
 - Role, voice, nickname, username, and thread reports use the same per-event log
   channel and ignore list. They stay off until that event has a channel. They are
   Discord messages only: no SQL event row, no case, and no message text. A member

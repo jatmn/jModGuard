@@ -357,6 +357,7 @@ async fn run_step(
                             "custom command",
                             None,
                             db::BanRecord::Retry,
+                            None,
                         )
                         .await?;
                     }
@@ -392,10 +393,12 @@ async fn run_step(
                         }
                         Err(_) => None,
                     };
+                    let operation_id = pending_ban.operation_id().to_owned();
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
                         target.get(),
+                        Some(&operation_id),
                     );
                     let result = match crate::discord::race_discord_call(
                         &env.app.activation,
@@ -454,6 +457,7 @@ async fn run_step(
                         "custom command",
                         None,
                         db::BanRecord::Fresh,
+                        Some(&operation_id),
                     )
                     .await?;
                 }
