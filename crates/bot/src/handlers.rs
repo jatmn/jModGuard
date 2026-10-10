@@ -784,22 +784,18 @@ impl EventHandler for Handler {
 
         let (is_moderator, can_mention_everyone, mention_permission_unknown) = {
             let guild = ctx.cache.guild(guild_id);
-            if let (Some(guild), Some(partial)) = (guild.as_ref(), msg.member.as_deref()) {
-                let scope = crate::commands::message_author_scope(
-                    app.cfg.bot.owner_id,
-                    guild,
-                    msg.channel_id,
-                    msg.author.id,
-                    partial,
-                );
-                (
-                    scope.is_moderator,
-                    scope.mention == crate::commands::MentionPermission::Allowed,
-                    scope.mention == crate::commands::MentionPermission::Unknown,
-                )
-            } else {
-                (false, false, false)
-            }
+            let scope = crate::commands::author_message_scope(
+                app.cfg.bot.owner_id,
+                guild.as_deref(),
+                msg.channel_id,
+                msg.author.id,
+                msg.member.as_deref(),
+            );
+            (
+                scope.is_moderator,
+                scope.mention == crate::commands::MentionPermission::Allowed,
+                scope.mention == crate::commands::MentionPermission::Unknown,
+            )
         };
 
         let msg_ctx = MsgCtx {

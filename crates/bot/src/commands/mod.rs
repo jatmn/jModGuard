@@ -183,8 +183,9 @@ pub fn cached_is_moderator(
 /// Whether this member can use Mention Everyone in the channel.
 ///
 /// `Unknown` means the channel is not in `guild.channels` or `guild.threads`,
-/// or a thread's parent channel is not cached. That is not a deny: the message
-/// can still be deleted, but kick and ban are withheld.
+/// a thread's parent channel is not cached, or the guild or member needed for
+/// that lookup is missing. That is not a deny: the message can still be
+/// deleted, but kick and ban are withheld.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MentionPermission {
     Allowed,
@@ -199,6 +200,28 @@ pub(crate) enum MentionPermission {
 pub(crate) struct MessageAuthorScope {
     pub is_moderator: bool,
     pub mention: MentionPermission,
+}
+
+/// Mention permission for one gateway message.
+///
+/// A missing guild cache entry or a message with no member is unknown, not a
+/// cached deny. The author is not treated as a moderator.
+pub(crate) fn author_message_scope(
+    owner_id: u64,
+    guild: Option<&serenity::model::guild::Guild>,
+    channel_id: ChannelId,
+    author_id: UserId,
+    partial: Option<&serenity::model::guild::PartialMember>,
+) -> MessageAuthorScope {
+    match (guild, partial) {
+        (Some(guild), Some(partial)) => {
+            message_author_scope(owner_id, guild, channel_id, author_id, partial)
+        }
+        _ => MessageAuthorScope {
+            is_moderator: false,
+            mention: MentionPermission::Unknown,
+        },
+    }
 }
 
 pub(crate) fn message_author_scope(

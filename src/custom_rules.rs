@@ -285,6 +285,10 @@ pub const UNKNOWN_MODERATOR_WARNING: &str =
 pub const UNKNOWN_MENTION_PERMISSION_WARNING: &str =
     "mention permission unknown; deleting the message and skipping kick or ban";
 
+/// Logged when a pending `custom:` rule is gone or its config cannot be read.
+/// No Discord action runs. Built-in rules do not use this stop.
+pub const CUSTOM_RULE_UNAVAILABLE_WARNING: &str = "custom rule unavailable; skipping the action";
+
 /// A channel id travels with the message, so only the moderator lookup can fail.
 /// Unknown status must not be treated as permission to kick or ban.
 pub fn withhold_member_penalty(skip_moderators: bool, moderator_unknown: bool) -> bool {

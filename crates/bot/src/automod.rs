@@ -454,17 +454,27 @@ pub(crate) async fn execute_pending_with(
     let reason = crate::templates::render(&rule.reason, &vars);
     vars.insert("reason".into(), reason.clone());
 
-    let (dry, log_automod, open_case, skip_moderators) = app
-        .configs
-        .get(&app.db, guild_id.get())
-        .await
-        .ok()
-        .and_then(|c| {
-            c.rules
-                .get(&pending.rule_id)
-                .map(|r| (r.dry_run, r.log_automod, r.open_case, r.skip_moderators))
-        })
-        .unwrap_or((false, true, true, false));
+    let loaded = app.configs.get(&app.db, guild_id.get()).await;
+    let resolved = loaded.as_ref().ok().and_then(|cfg| {
+        cfg.rules
+            .get(&pending.rule_id)
+            .map(|r| (r.dry_run, r.log_automod, r.open_case, r.skip_moderators))
+    });
+    let (dry, log_automod, open_case, skip_moderators) =
+        if jmodguard::custom_rules::is_custom_id(&pending.rule_id) {
+            let Some(values) = resolved else {
+                tracing::warn!(
+                    guild_id = guild_id.get(),
+                    rule_id = pending.rule_id.as_str(),
+                    "{}",
+                    jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING
+                );
+                return;
+            };
+            values
+        } else {
+            resolved.unwrap_or((false, true, true, false))
+        };
 
     if dry {
         let mut v = vars.clone();
@@ -986,10 +996,10 @@ mod tests {
 
     use crate::cases::discord_attempt_outcome;
     use crate::db::guild_data::CaseOutcome;
-    use crate::state::CachedGuildConfig;
+    use crate::state::{BotState, CachedGuildConfig};
     use crate::types::{ActionDef, GuildSettings, RuleDef};
 
-    use super::{AutomodEngine, MsgCtx};
+    use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
 
     #[test]
     fn selected_kick_timeout_cases_require_a_discord_attempt() {
@@ -1622,6 +1632,18 @@ mod tests {
             .unwrap()
         );
         app.activation.mark_lock_held(true);
+        crate::db::upsert_rule(
+            &app.db,
+            10,
+            "custom:0123456789abcdef",
+            cfg.rules
+                .get("custom:0123456789abcdef")
+                .expect("everyone-attempt rule"),
+        )
+        .await
+        .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
         let http = serenity::http::HttpBuilder::new("token")
             .proxy(format!("http://{addr}"))
             .ratelimiter_disabled(true)
@@ -1676,6 +1698,747 @@ mod tests {
             output.contains("WARN")
                 && output.contains(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING),
             "{output}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    fn gateway_partial(guild: u64) -> serenity::model::guild::PartialMember {
+        serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": guild.to_string(),
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap()
+    }
+
+    fn everyone_ban_rule() -> RuleDef {
+        RuleDef {
+            name: "custom".into(),
+            description: String::new(),
+            enabled: true,
+            dry_run: false,
+            params: serde_json::json!({ "kind": "everyone_attempt" }),
+            actions: vec![ActionDef {
+                at: 1,
+                action: "ban".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "r".into(),
+            }],
+            whitelist_roles: vec![],
+            whitelist_channels: vec![],
+            whitelist_users: vec![],
+            skip_moderators: false,
+            include_channels: vec![],
+            log_automod: true,
+            open_case: true,
+        }
+    }
+
+    async fn execute_scoped_everyone_ban(
+        scope: crate::commands::MessageAuthorScope,
+    ) -> (Vec<String>, String) {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing::instrument::WithSubscriber;
+
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok()?;
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => return None,
+                }
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
+                    break;
+                }
+            }
+            let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+            let header = String::from_utf8_lossy(&buf[..header_end]);
+            let mut parts = header.lines().next()?.split_whitespace();
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        }
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop_guard = Stop(Arc::clone(&stop));
+        let server_lines = Arc::clone(&lines);
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let Some((method, path)) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        server_lines
+                            .lock()
+                            .unwrap()
+                            .push(format!("{method} {path}"));
+                        let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let id = "custom:0123456789abcdef".to_string();
+        let mut rules = HashMap::new();
+        rules.insert(id, everyone_ban_rule());
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules,
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let roles = [];
+        let message = MsgCtx {
+            guild_id: 10,
+            message_id: 42,
+            channel_id: 70,
+            author_id: 99,
+            content: "@everyone",
+            attachment_count: 0,
+            everyone_mentions: 1,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: &roles,
+            is_moderator: scope.is_moderator,
+            can_mention_everyone: scope.mention == crate::commands::MentionPermission::Allowed,
+            mention_permission_unknown: scope.mention
+                == crate::commands::MentionPermission::Unknown,
+        };
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &message)
+            .expect("unknown permission still matches");
+        assert!(pending.mention_permission_unknown);
+        assert_eq!(pending.action.action, "ban");
+
+        let path = std::env::temp_dir().join(format!(
+            "mention_missing_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        crate::db::upsert_rule(&app.db, 10, "custom:0123456789abcdef", &everyone_ban_rule())
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        execute_pending_with(
+            &app,
+            &http,
+            &cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        drop(stop_guard);
+        let _ = server.join();
+        let seen = lines.lock().unwrap().clone();
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+        (seen, output)
+    }
+
+    fn assert_deleted_without_kick_or_ban(seen: &[String], output: &str) {
+        assert!(
+            seen.iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
+            "the triggering message must be deleted: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "unknown mention permission must not ban: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/members/"))),
+            "unknown mention permission must not kick: {seen:?}"
+        );
+        assert!(
+            output.contains("WARN")
+                && output.contains(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_guild_deletes_everyone_attempt_without_kick_or_ban() {
+        use serenity::model::id::{ChannelId, UserId};
+
+        let partial = gateway_partial(10);
+        let scope = crate::commands::author_message_scope(
+            0,
+            None,
+            ChannelId::new(70),
+            UserId::new(99),
+            Some(&partial),
+        );
+        assert_eq!(scope.mention, crate::commands::MentionPermission::Unknown);
+        assert!(
+            !scope.is_moderator,
+            "a missing guild is not a known moderator"
+        );
+        let (seen, output) = execute_scoped_everyone_ban(scope).await;
+        assert_deleted_without_kick_or_ban(&seen, &output);
+    }
+
+    #[tokio::test]
+    async fn missing_member_deletes_everyone_attempt_without_kick_or_ban() {
+        use serenity::model::guild::Guild;
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        guild.name = "g".into();
+        let scope = crate::commands::author_message_scope(
+            0,
+            Some(&guild),
+            ChannelId::new(70),
+            UserId::new(99),
+            None,
+        );
+        assert_eq!(scope.mention, crate::commands::MentionPermission::Unknown);
+        assert!(
+            !scope.is_moderator,
+            "a missing member is not a known moderator"
+        );
+        let (seen, output) = execute_scoped_everyone_ban(scope).await;
+        assert_deleted_without_kick_or_ban(&seen, &output);
+    }
+
+    fn dry_run_word_ban() -> RuleDef {
+        RuleDef {
+            name: "custom".into(),
+            description: String::new(),
+            enabled: true,
+            dry_run: true,
+            params: serde_json::json!({ "kind": "word", "words": ["spamword"] }),
+            actions: vec![ActionDef {
+                at: 1,
+                action: "ban".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "r".into(),
+            }],
+            whitelist_roles: vec![],
+            whitelist_channels: vec![],
+            whitelist_users: vec![],
+            skip_moderators: false,
+            include_channels: vec![],
+            log_automod: true,
+            open_case: true,
+        }
+    }
+
+    fn word_message<'a>(roles: &'a [u64]) -> MsgCtx<'a> {
+        MsgCtx {
+            guild_id: 10,
+            message_id: 42,
+            channel_id: 70,
+            author_id: 99,
+            content: "spamword",
+            attachment_count: 0,
+            everyone_mentions: 0,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: roles,
+            is_moderator: false,
+            can_mention_everyone: true,
+            mention_permission_unknown: false,
+        }
+    }
+
+    struct DiscordStub {
+        http: serenity::http::Http,
+        cache: serenity::cache::Cache,
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DiscordStub {
+        fn start() -> Self {
+            Self::bind()
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            self.lines.lock().unwrap().clone()
+        }
+    }
+
+    impl DiscordStub {
+        fn bind() -> Self {
+            use std::io::{Read, Write};
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .ok()?;
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            break;
+                        }
+                        Err(_) => return None,
+                    }
+                    if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
+                        break;
+                    }
+                }
+                let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+                let header = String::from_utf8_lossy(&buf[..header_end]);
+                let mut parts = header.lines().next()?.split_whitespace();
+                Some((parts.next()?.to_string(), parts.next()?.to_string()))
+            }
+
+            let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_lines = Arc::clone(&lines);
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                while !server_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let Some((method, path)) = read_request(&mut stream) else {
+                                continue;
+                            };
+                            server_lines
+                                .lock()
+                                .unwrap()
+                                .push(format!("{method} {path}"));
+                            let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            let http = serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build();
+            let cache = serenity::cache::Cache::new();
+            Self {
+                http,
+                cache,
+                lines,
+                stop,
+                server: Some(server),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_dry_run_custom_rule_does_not_ban() {
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use tracing::instrument::WithSubscriber;
+
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const ID: &str = "custom:0123456789abcdef";
+        let path =
+            std::env::temp_dir().join(format!("custom_deleted_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+        crate::db::upsert_rule(&app.db, 10, ID, &dry_run_word_ban())
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let roles = [];
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&roles))
+            .expect("dry-run custom rule still matches");
+        assert_eq!(pending.action.action, "ban");
+        crate::db::delete_rule(&app.db, 10, ID).await.unwrap();
+        app.configs.invalidate();
+
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let stub = DiscordStub::start();
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let seen = stub.finish();
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "a deleted dry-run custom rule must not ban: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/messages/"))),
+            "a deleted custom rule must not act: {seen:?}"
+        );
+        assert!(
+            output.contains("WARN")
+                && output.contains(jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING),
+            "{output}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn custom_rule_does_not_act_when_config_read_fails() {
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use tracing::instrument::WithSubscriber;
+
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "custom_read_fail_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let mut rules = HashMap::new();
+        rules.insert("custom:0123456789abcdef".to_string(), dry_run_word_ban());
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules,
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let roles = [];
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&roles))
+            .expect("dry-run custom rule still matches");
+        app.db
+            .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE rules", 65_536))
+            .await
+            .unwrap();
+        app.configs.invalidate();
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let stub = DiscordStub::start();
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let seen = stub.finish();
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "a failed custom-rule config read must not ban: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/messages/"))),
+            "a failed custom-rule config read must not act: {seen:?}"
+        );
+        assert!(
+            output.contains("WARN")
+                && output.contains(jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING),
+            "{output}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn builtin_rule_still_deletes_when_config_read_fails() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+
+        let path = std::env::temp_dir().join(format!(
+            "builtin_read_fail_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        app.db
+            .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE rules", 65_536))
+            .await
+            .unwrap();
+        app.configs.invalidate();
+        let pending = PendingAction {
+            rule_id: "badword".into(),
+            rule_name: "Badwords".into(),
+            action: ActionDef {
+                at: 1,
+                action: "delete".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "Banned word".into(),
+            },
+            strikes: 1,
+            evidence: serde_json::json!({
+                "content": "spamword",
+                "channel_id": 70,
+                "message_id": 42,
+            }),
+            mention_permission_unknown: false,
+        };
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let stub = DiscordStub::start();
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        let seen = stub.finish();
+        assert!(
+            seen.iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
+            "a built-in rule still deletes when the config read fails: {seen:?}"
         );
         drop(app);
         let _ = std::fs::remove_file(&path);

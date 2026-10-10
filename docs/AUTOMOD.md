@@ -102,7 +102,8 @@ or `ban` with `delete_days` 0–7). Types:
   application is not a permission. If the channel is not in the guild channel
   list or the active thread list, or a thread's parent channel is not cached,
   the permission is unknown: the message is deleted, a warning is logged, and
-  the bot does not kick or ban. A cached deny still kicks or bans.
+  the bot does not kick or ban. A missing guild cache entry or a message with
+  no member is unknown in the same way. A cached deny still kicks or bans.
 - **honeypot_role** — `params.role_id`; fires when that role is **added** (default
   action kick). Channel include lists do not apply.
 
@@ -123,7 +124,10 @@ fail open or closed. If the guild cache cannot show whether the author is a
 moderator, matched messages are still deleted and a warning is logged, but the
 bot does not kick or ban. Custom rules that skip moderators use that same limit.
 An everyone-attempt whose channel permission cannot be resolved uses the same
-delete-and-warn limit, including when skip moderators is off.
+delete-and-warn limit, including when skip moderators is off. If a custom rule
+is deleted, or its configuration cannot be read, before the pending action
+runs, the bot logs a warning and does not act. A failed configuration read
+does not stop a built-in rule.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 
