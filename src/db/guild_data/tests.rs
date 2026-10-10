@@ -425,6 +425,78 @@ mod member_directory;
 mod bunny_transfer;
 
 #[tokio::test]
+async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    let mut catalog = probe.catalog();
+    let mut imm = probe.immediate();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 1);
+    assert_eq!(probe.immediate() - imm, 0);
+    catalog = probe.catalog();
+    imm = probe.immediate();
+
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+    catalog = probe.catalog();
+    imm = probe.immediate();
+
+    conn.clear_schema_verification();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 1);
+    assert_eq!(probe.immediate() - imm, 0);
+    catalog = probe.catalog();
+    imm = probe.immediate();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+
+    conn.execute_batch_bounded("CREATE TABLE identity_cache_probe (id INTEGER)", 32_000_000)
+        .unwrap();
+    catalog = probe.catalog();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 1);
+    catalog = probe.catalog();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+
+    let pool_probe = probe.clone();
+    let pool_reg = reg.clone();
+    store
+        .db
+        .with_conn(move |conn| {
+            conn.clear_schema_verification();
+            verify_identity(conn, &pool_reg)?;
+            let cat = pool_probe.catalog();
+            let start_imm = pool_probe.immediate();
+            verify_identity(conn, &pool_reg)?;
+            assert_eq!(pool_probe.catalog() - cat, 0);
+            assert_eq!(pool_probe.immediate() - start_imm, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    conn.execute_batch_bounded("DROP TRIGGER store_identity_no_update", 32_000_000)
+        .unwrap();
+    catalog = probe.catalog();
+    assert!(verify_identity(&conn, &reg).is_err());
+    assert_eq!(probe.catalog() - catalog, 1);
+
+    drop(conn);
+    catalog = probe.catalog();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+    assert!(verify_identity(&conn, &reg).is_err());
+    assert_eq!(probe.catalog() - catalog, 1);
+}
+
+#[tokio::test]
 async fn identity_verification_uses_one_catalog_read_and_rechecks_schema() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;

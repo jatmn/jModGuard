@@ -94,7 +94,11 @@ HTTPS connector, timeouts, pool and receipt recovery. Clones share that pool; se
 opened handles allocate their own configurable pool (minimum2). Initialization reconciles
 a lost commit response by checking the committed identity/schema on primary; subsequent
 binding writes use mutation receipts. Reads and matching retries create no receipts.
-Identity/schema checks run again on every binding/check operation, including after open.
+Each binding/check compares the expected store with a memo kept on that pooled
+connection. A hit reads only schema_version and user_version. The catalog and
+identity row are read again after a new connection, a remote stream reset, or a
+change to either version, and when the expected store does not match the memo.
+A hit does not start a write transaction. This memo is not a routing cache.
 SQL guards prevent identity/binding updates, deletes and replacement, and enforce dedicated
 ownership without relying on foreign-key or recursive-trigger settings.
 

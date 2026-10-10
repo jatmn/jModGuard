@@ -152,6 +152,15 @@ impl Drop for RuntimeThread {
     }
 }
 
+/// Guild-store identity last confirmed on one pooled connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaVerification {
+    pub schema_version: i64,
+    pub user_version: i64,
+    pub store_id: String,
+    pub dedicated_guild_id: Option<i64>,
+}
+
 /// Counts write transactions and database calls for the startup that installed it.
 ///
 /// Only connections created while this probe is current increment it, so
@@ -161,6 +170,7 @@ pub struct StartupProbe {
     immediate: AtomicU64,
     transactions: AtomicU64,
     queries: AtomicU64,
+    catalog: AtomicU64,
 }
 
 impl StartupProbe {
@@ -176,12 +186,20 @@ impl StartupProbe {
         self.queries.load(Ordering::Relaxed)
     }
 
+    pub fn catalog(&self) -> u64 {
+        self.catalog.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn record_immediate(&self) {
         self.immediate.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_query(&self) {
         self.queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_catalog(&self) {
+        self.catalog.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -713,6 +731,7 @@ pub struct Connection {
     expected_launcher: Option<String>,
     /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
     commit_lease_probe: Option<CommitLeaseProbe>,
+    schema_verification: Arc<Mutex<Option<SchemaVerification>>>,
 }
 
 /// The active-bot lease row is not this instance, or it has expired.
@@ -840,6 +859,8 @@ pub trait SqlExecutor {
     fn prepare(&self, sql: &str) -> Result<Statement>;
 
     fn record_config_version(&self, version: u64);
+
+    fn schema_verification_slot(&self) -> Arc<Mutex<Option<SchemaVerification>>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1087,6 +1108,7 @@ impl Connection {
             expected_writer_generation: None,
             expected_launcher: None,
             commit_lease_probe: None,
+            schema_verification: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1103,6 +1125,7 @@ impl Connection {
             expected_writer_generation: None,
             expected_launcher: None,
             commit_lease_probe: None,
+            schema_verification: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1139,11 +1162,19 @@ impl Connection {
     /// idle. libSQL reset clears local stream state without sending SQL or
     /// replaying a failed request; explicit transactions use separate streams.
     pub(crate) fn reset_remote_stream(&self) -> Result<()> {
+        self.clear_schema_verification();
         self.runtime
             .block_on_database("reset pooled stream", async {
                 self.inner.reset().await;
                 Ok::<_, anyhow::Error>(())
             })
+    }
+
+    pub(crate) fn clear_schema_verification(&self) {
+        *self
+            .schema_verification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
@@ -1288,6 +1319,7 @@ impl Connection {
             expected_writer_generation: self.expected_writer_generation,
             expected_launcher: self.expected_launcher.clone(),
             commit_lease_probe: self.commit_lease_probe.clone(),
+            schema_verification: Arc::clone(&self.schema_verification),
         }
     }
 
@@ -1412,6 +1444,11 @@ impl SqlExecutor for Connection {
         F: FnOnce(&Row) -> Result<T> + Send,
     {
         require_read_sql(sql)?;
+        if sql.contains("sqlite_master")
+            && let Some(probe) = &self.runtime.startup_probe
+        {
+            probe.record_catalog();
+        }
         self.runtime.block_on_database("query", async {
             let mut rows = self.inner.query(sql, params).await?;
             let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
@@ -1432,6 +1469,10 @@ impl SqlExecutor for Connection {
 
     fn record_config_version(&self, version: u64) {
         self.config_version.fetch_max(version, Ordering::SeqCst);
+    }
+
+    fn schema_verification_slot(&self) -> Arc<Mutex<Option<SchemaVerification>>> {
+        Arc::clone(&self.schema_verification)
     }
 }
 
@@ -1495,6 +1536,7 @@ pub struct Transaction {
     expected_writer_generation: Option<i64>,
     expected_launcher: Option<String>,
     commit_lease_probe: Option<CommitLeaseProbe>,
+    schema_verification: Arc<Mutex<Option<SchemaVerification>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1685,6 +1727,11 @@ impl Transaction {
         P: IntoParams + Send,
         F: FnOnce(&Row) -> Result<T> + Send,
     {
+        if sql.contains("sqlite_master")
+            && let Some(probe) = &self.runtime.startup_probe
+        {
+            probe.record_catalog();
+        }
         self.map_stream(
             self.runtime
                 .block_on_database("transaction internal query", async {
@@ -2351,6 +2398,10 @@ impl SqlExecutor for Transaction {
     fn record_config_version(&self, version: u64) {
         self.pending_config_version
             .fetch_max(version, Ordering::SeqCst);
+    }
+
+    fn schema_verification_slot(&self) -> Arc<Mutex<Option<SchemaVerification>>> {
+        Arc::clone(&self.schema_verification)
     }
 }
 
