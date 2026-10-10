@@ -2375,3 +2375,142 @@ async fn lost_uncontracted_clear_reply_drains_and_restarts_a_crashed_child() {
     drop(bot);
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
+
+async fn api_waiting_on_superseded_clear(
+    label: &str,
+) -> (
+    PathBuf,
+    Arc<jmodguard_bot::state::BotState>,
+    Supervisor,
+    ComponentRelease,
+) {
+    let root = std::env::temp_dir().join(format!("{label}-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let bot_db = Db::open(&db_path, 2).unwrap();
+    let release = release_at("api", 'c', db::CORE_SCHEMA_VERSION);
+    assert_eq!(
+        release.launcher.as_ref().unwrap().revision,
+        db::LAUNCHER_REVISION
+    );
+    store_desired_launcher(&bot_db, "api", &serde_json::to_string(&release).unwrap()).await;
+    let secret = "x".repeat(32);
+    let mut bot_cfg = jmodguard::config::BotProcessConfig::default();
+    bot_cfg.db.path = db_path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = jmodguard::config::ControlSecret::new(secret.clone());
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let link = jmodguard::control::try_writer_link(&bound.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    assert!(!control.writes_locally());
+    let planned = plan_api_startup(&control, "api", &"ab".repeat(32), None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    assert!(service.enabled);
+    service.pending_startup = planned;
+    assert!(!service.tick().await.unwrap());
+    assert!(
+        service.pending_startup.iter().any(|receipt| {
+            matches!(
+                receipt,
+                StartupReceipt::ClearSuperseded { release: selected }
+                    if selected.digest == release.digest
+            )
+        }),
+        "superseded clear was not queued"
+    );
+    assert!(
+        service.running.is_some(),
+        "normal application was not started"
+    );
+    (root, bot, service, release)
+}
+
+#[tokio::test]
+async fn superseded_clear_receipt_retires_when_no_row_matches() {
+    let (root, bot, mut service, queued) =
+        api_waiting_on_superseded_clear("api-superseded-zero-rows").await;
+    let replacement = release_at("api", 'f', db::CORE_SCHEMA_VERSION);
+    assert_ne!(
+        serde_json::to_string(&replacement).unwrap(),
+        serde_json::to_string(&queued).unwrap()
+    );
+    store_desired_launcher(
+        &bot.db,
+        "api",
+        &serde_json::to_string(&replacement).unwrap(),
+    )
+    .await;
+    let crashed = crash_running_child(&mut service).await;
+    // A different stored selection makes the conditional update match zero
+    // rows. Leave self-update off so this tick does not clear or hand off
+    // that replacement while the crashed child is restarted.
+    service.enabled = false;
+    claim_writer(&bot).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let error = service.tick().await.unwrap_err();
+    assert!(
+        error.to_string().contains("application exited"),
+        "{error:#}"
+    );
+    assert!(
+        service
+            .pending_startup
+            .iter()
+            .all(|receipt| { !matches!(receipt, StartupReceipt::ClearSuperseded { .. }) }),
+        "superseded clear stayed queued after zero rows matched"
+    );
+    assert!(service.pending_startup.is_empty());
+    assert!(service.running.is_none());
+    assert_eq!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .unwrap()
+            .digest,
+        replacement.digest
+    );
+    assert!(!service.tick().await.unwrap());
+    let restarted = service
+        .running
+        .as_ref()
+        .expect("crashed child was not restarted");
+    assert_ne!(restarted.child.id(), Some(crashed));
+    let ready = restarted.ready_file.clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    assert_eq!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .unwrap()
+            .digest,
+        replacement.digest
+    );
+    assert!(service.pending_startup.is_empty());
+    service.stop_application().await.unwrap();
+    drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
