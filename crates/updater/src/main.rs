@@ -253,7 +253,7 @@ struct PendingFailure {
 
 /// Startup receipts the API cannot store until the bot is the writer.
 /// Order is activation, then observation, then a failed handoff.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum StartupReceipt {
     BakedLauncher {
         hash: String,
@@ -272,6 +272,12 @@ enum StartupReceipt {
     ComponentFailed {
         release: ComponentRelease,
         message: String,
+    },
+    ClearSuperseded {
+        release: ComponentRelease,
+    },
+    ClearUncontracted {
+        release: ComponentRelease,
     },
 }
 
@@ -415,6 +421,16 @@ impl Supervisor {
             }
             StartupReceipt::ComponentFailed { release, message } => {
                 self.control.failed(&self.role, release, message).await
+            }
+            StartupReceipt::ClearSuperseded { release } => {
+                self.control
+                    .clear_superseded_launcher(&self.role, release)
+                    .await
+            }
+            StartupReceipt::ClearUncontracted { release } => {
+                self.control
+                    .clear_uncontracted_launcher(&self.role, release)
+                    .await
             }
         }
     }
@@ -868,14 +884,23 @@ impl Supervisor {
         }
         if let Some(contract) = &release.launcher {
             if contract.revision <= self.launcher_revision {
-                let cleared = self
-                    .control
-                    .clear_superseded_launcher(&self.role, release)
-                    .await;
-                return match cleared {
-                    Ok(()) => Ok(ControlStep::Proceed),
-                    Err(error) => self.defer_unsaved(error),
+                if self.control.writes_locally() {
+                    let cleared = self
+                        .control
+                        .clear_superseded_launcher(&self.role, release)
+                        .await;
+                    return match cleared {
+                        Ok(()) => Ok(ControlStep::Proceed),
+                        Err(error) => self.defer_unsaved(error),
+                    };
+                }
+                let receipt = StartupReceipt::ClearSuperseded {
+                    release: release.clone(),
                 };
+                if !self.pending_startup.contains(&receipt) {
+                    self.pending_startup.push(receipt);
+                }
+                return Ok(ControlStep::Proceed);
             }
         } else if state.desired_launcher.is_some() {
             // An image from before launcher-revision labels has nothing to run.
@@ -885,14 +910,23 @@ impl Supervisor {
                 "stored launcher selection {} has no capability contract; clearing it and keeping the baked controller",
                 release.digest
             );
-            let cleared = self
-                .control
-                .clear_uncontracted_launcher(&self.role, release)
-                .await;
-            return match cleared {
-                Ok(()) => Ok(ControlStep::Proceed),
-                Err(error) => self.defer_unsaved(error),
+            if self.control.writes_locally() {
+                let cleared = self
+                    .control
+                    .clear_uncontracted_launcher(&self.role, release)
+                    .await;
+                return match cleared {
+                    Ok(()) => Ok(ControlStep::Proceed),
+                    Err(error) => self.defer_unsaved(error),
+                };
+            }
+            let receipt = StartupReceipt::ClearUncontracted {
+                release: release.clone(),
             };
+            if !self.pending_startup.contains(&receipt) {
+                self.pending_startup.push(receipt);
+            }
+            return Ok(ControlStep::Proceed);
         } else {
             return Ok(ControlStep::Proceed);
         }

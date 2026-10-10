@@ -1703,7 +1703,7 @@ fn read_only_options(path: &Path) -> DbOpenOptions {
     }
 }
 
-async fn application_route(port_file: &Path) -> String {
+async fn application_exchange(port_file: &Path, request_target: &str) -> String {
     let started = Instant::now();
     let port = loop {
         if let Ok(text) = tokio::fs::read_to_string(port_file).await
@@ -1721,15 +1721,30 @@ async fn application_route(port_file: &Path) -> String {
     loop {
         if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            stream
-                .write_all(b"GET /api/me HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
+            let request = format!(
+                "{request_target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
             let mut body = String::new();
             let _ = stream.read_to_string(&mut body).await;
-            if body.contains("200") {
+            if body.contains("200") || body.contains("404") {
                 return body;
             }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "application route was not served"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn application_route(port_file: &Path) -> String {
+    let started = Instant::now();
+    loop {
+        let body = application_exchange(port_file, "GET /api/me").await;
+        if body.contains("200") {
+            return body;
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -1888,6 +1903,252 @@ async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is
             .launcher_sha256
             .as_deref(),
         Some(hash.as_str())
+    );
+    service.stop_application().await.unwrap();
+    drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_role_serves_reads_while_a_superseded_launcher_clear_waits_for_the_writer() {
+    let root = std::env::temp_dir().join(format!(
+        "api-superseded-clear-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let bot_db = Db::open(&db_path, 2).unwrap();
+    let release = release_at("api", 'c', db::CORE_SCHEMA_VERSION);
+    assert_eq!(
+        release.launcher.as_ref().unwrap().revision,
+        db::LAUNCHER_REVISION
+    );
+    store_desired_launcher(&bot_db, "api", &serde_json::to_string(&release).unwrap()).await;
+    let secret = "x".repeat(32);
+    let mut bot_cfg = jmodguard::config::BotProcessConfig::default();
+    bot_cfg.db.path = db_path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = jmodguard::config::ControlSecret::new(secret.clone());
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let link = jmodguard::control::try_writer_link(&bound.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    assert!(!control.writes_locally());
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    assert!(service.enabled);
+    service.pending_startup = planned;
+    assert!(!service.tick().await.unwrap());
+    assert_eq!(
+        service
+            .pending_startup
+            .iter()
+            .filter(|receipt| {
+                matches!(
+                    receipt,
+                    StartupReceipt::ClearSuperseded { release: selected }
+                        if selected.digest == release.digest
+                )
+            })
+            .count(),
+        1
+    );
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let health = application_exchange(&ready.with_extension("port"), "GET /health").await;
+    assert!(health.contains("200"), "{health}");
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let mode = tokio::fs::read_to_string(ready.with_extension("mode"))
+        .await
+        .unwrap();
+    assert_eq!(mode.trim(), "0");
+    assert_eq!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .as_ref()
+            .map(|selected| selected.digest.as_str()),
+        Some(release.digest.as_str())
+    );
+    assert!(!root.join("jmodguard-launcher-next").exists());
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
+    );
+    assert!(!service.tick().await.unwrap());
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
+    );
+    service.stop_application().await.unwrap();
+    drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_role_serves_reads_while_an_uncontracted_launcher_clear_waits_for_the_writer() {
+    let root = std::env::temp_dir().join(format!(
+        "api-uncontracted-clear-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let bot_db = Db::open(&db_path, 2).unwrap();
+    let raw = uncontracted_selection("api", 'd', false);
+    let release: ComponentRelease = serde_json::from_str(&raw).unwrap();
+    assert!(release.launcher.is_none());
+    store_desired_launcher(&bot_db, "api", &raw).await;
+    let secret = "x".repeat(32);
+    let mut bot_cfg = jmodguard::config::BotProcessConfig::default();
+    bot_cfg.db.path = db_path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = jmodguard::config::ControlSecret::new(secret.clone());
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let link = jmodguard::control::try_writer_link(&bound.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    assert!(!control.writes_locally());
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    assert!(service.enabled);
+    service.pending_startup = planned;
+    assert!(!service.tick().await.unwrap());
+    assert_eq!(
+        service
+            .pending_startup
+            .iter()
+            .filter(|receipt| {
+                matches!(
+                    receipt,
+                    StartupReceipt::ClearUncontracted { release: selected }
+                        if selected.digest == release.digest
+                )
+            })
+            .count(),
+        1
+    );
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let health = application_exchange(&ready.with_extension("port"), "GET /health").await;
+    assert!(health.contains("200"), "{health}");
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let mode = tokio::fs::read_to_string(ready.with_extension("mode"))
+        .await
+        .unwrap();
+    assert_eq!(mode.trim(), "0");
+    assert_eq!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .as_ref()
+            .map(|selected| selected.digest.as_str()),
+        Some(release.digest.as_str())
+    );
+    assert!(!root.join("jmodguard-launcher-next").exists());
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
+    );
+    assert!(!service.tick().await.unwrap());
+    assert!(
+        service
+            .control
+            .component("api")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
     );
     service.stop_application().await.unwrap();
     drop(bot);
