@@ -887,18 +887,13 @@ async fn stats_response(
     guild_id: i64,
     uptime_seconds: u64,
 ) -> Result<String> {
-    let read = jmodguard::read_link::try_read_link(
+    let api_task = jmodguard::read_link::try_read_link(
         &app.cfg.bot.read_target,
         app.cfg.bot.control_secret.as_str(),
-    )?;
-    let api_fetch = async {
-        if let Some(link) = read {
-            link.fetch_container_use().await
-        } else {
-            None
-        }
-    };
-    let api_task = tokio::spawn(api_fetch);
+    )
+    .ok()
+    .flatten()
+    .map(|link| tokio::task::spawn_blocking(move || link.fetch_container_use_blocking()));
     // Cached by the background sampler. This does not open cgroup files or wait.
     let bot_use = jmodguard::cgroup::latest_container_sample();
     let s = db::guild_stats(&app.reads, guild_id).await?;
@@ -906,10 +901,13 @@ async fn stats_response(
         .await
         .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
         .ok();
-    let api_reading = tokio::time::timeout(jmodguard::read_link::STATS_FETCH_TIMEOUT, api_task)
-        .await
-        .ok()
-        .and_then(|joined| joined.ok().flatten());
+    let api_reading = match api_task {
+        Some(task) => tokio::time::timeout(jmodguard::read_link::STATS_FETCH_TIMEOUT, task)
+            .await
+            .ok()
+            .and_then(|joined| joined.ok().flatten()),
+        None => None,
+    };
     let (api_sample, api_copy) = api_reading
         .map(|response| (Some(response.sample), Some(response.copy)))
         .unwrap_or((None, None));
@@ -1534,6 +1532,94 @@ mod tests {
             "{unavailable}"
         );
         assert!(!unavailable.contains("0.0%"), "{unavailable}");
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stats_api_fetch_does_not_block_concurrent_async_work() {
+        let path =
+            std::env::temp_dir().join(format!("stats_parallel_{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.bot.read_target = "127.0.0.1:1".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_flag = std::sync::Arc::clone(&progress);
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            progress_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stats_response(&app, 10, 5),
+        )
+        .await;
+        watcher.await.unwrap();
+        assert!(progress.load(std::sync::atomic::Ordering::SeqCst));
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stats_invalid_read_target_still_returns_api_rows_unavailable() {
+        let path = std::env::temp_dir().join(format!(
+            "stats_bad_read_target_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.bot.read_target = "0.0.0.0:8083".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
+        let text = stats_response(&app, 10, 5).await.unwrap();
+        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**API memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stats_hanging_api_read_returns_within_fetch_timeout() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 256];
+                while stream.read(&mut buf).unwrap_or(0) > 0 {}
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "stats_hanging_api_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.bot.read_target = addr.to_string();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
+        let started = Instant::now();
+        let text = stats_response(&app, 10, 5).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed
+                < jmodguard::read_link::STATS_FETCH_TIMEOUT + std::time::Duration::from_millis(150),
+            "stats waited {elapsed:?} for a hung API read"
+        );
+        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**API memory (real program use):** `unavailable`"),
+            "{text}"
+        );
         drop(app);
         let _ = std::fs::remove_file(path);
     }

@@ -41,6 +41,10 @@ async fn main() -> Result<()> {
     }
 
     jmodguard::cgroup::spawn_container_usage_sampler();
+    jmodguard::read_link::spawn_container_read_listener(
+        &cfg.bot.read_bind,
+        cfg.bot.control_secret.as_str(),
+    );
 
     if offline_write {
         jmodguard_api::startup::write_shared_config(cfg).await?;
