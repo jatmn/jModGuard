@@ -728,6 +728,36 @@ fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(S
     Ok(replacement)
 }
 
+// The caller keeps validation, deletion and these budgeted inserts in one transaction.
+pub(super) fn insert_copied_rules(
+    dst: i64,
+    replacement: &[(String, RuleDef)],
+    mut execute: impl FnMut(&str, Vec<Value>, u64) -> Result<usize>,
+) -> Result<()> {
+    // Match the badword-copy batch size to bound parameters and remote requests.
+    for chunk in replacement.chunks(100) {
+        let values = (0..chunk.len())
+            .map(|i| {
+                let n = i * 3 + 1;
+                format!("(?{n}, ?{}, ?{})", n + 1, n + 2)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (id, rule) in chunk {
+            args.push(Value::Integer(dst));
+            args.push(Value::Text(id.clone()));
+            args.push(Value::Text(serde_json::to_string(rule)?));
+        }
+        execute(
+            &format!("INSERT INTO rules (guild_id, rule_id, data) VALUES {values}"),
+            args,
+            chunk.len() as u64,
+        )?;
+    }
+    Ok(())
+}
+
 fn section_wanted(sections: &[String], name: &str) -> bool {
     sections.iter().any(|s| s == name || s == "all")
 }
@@ -837,14 +867,9 @@ async fn copy_guild_config_inner(
             if src != dst {
                 let replacement = prepare_copied_rules(dst, rows)?;
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
-                for (id, rule) in &replacement {
-                    let json = serde_json::to_string(rule)?;
-                    tx.execute_rows(
-                        "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
-                        params![dst, id.as_str(), json],
-                        1,
-                    )?;
-                }
+                insert_copied_rules(dst, &replacement, |sql, args, rows| {
+                    tx.execute_rows(sql, params_from_iter(args), rows)
+                })?;
             } else {
                 for (id, rule) in &rows {
                     crate::image_spam::validate_rule(id, rule)?;

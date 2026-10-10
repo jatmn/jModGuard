@@ -462,12 +462,12 @@ pub(crate) async fn execute_pending_with(
                 r.log_automod,
                 r.open_case,
                 r.skip_moderators,
-                !r.whitelist_roles.is_empty(),
+                r.whitelist_roles.as_slice(),
             )
         })
     });
     let config_unknown = resolved.is_none();
-    let (dry, log_automod, open_case, skip_moderators, skips_roles) =
+    let (dry, log_automod, open_case, skip_moderators, skipped_roles) =
         if jmodguard::custom_rules::is_custom_id(&pending.rule_id) {
             let Some(values) = resolved else {
                 tracing::warn!(
@@ -480,7 +480,7 @@ pub(crate) async fn execute_pending_with(
             };
             values
         } else {
-            resolved.unwrap_or((false, true, true, false, false))
+            resolved.unwrap_or((false, true, true, false, &[]))
         };
 
     if dry {
@@ -513,13 +513,30 @@ pub(crate) async fn execute_pending_with(
                     .map(|member| member.roles.iter().map(|role| role.get()).collect())
             })
         });
-    let moderator_unknown = role_ids.as_deref().is_none_or(|roles| {
-        crate::commands::cached_moderator_status(app, cache, guild_id, target.id.get(), roles)
-            == crate::commands::ModeratorStatus::Unknown
-    });
+    let moderator_status =
+        role_ids
+            .as_deref()
+            .map_or(crate::commands::ModeratorStatus::Unknown, |roles| {
+                crate::commands::cached_moderator_status(
+                    app,
+                    cache,
+                    guild_id,
+                    target.id.get(),
+                    roles,
+                )
+            });
+    let known_skipped_role = role_ids
+        .as_deref()
+        .is_some_and(|roles| skipped_roles.iter().any(|role| roles.contains(role)));
+    if known_skipped_role
+        || skip_moderators && moderator_status == crate::commands::ModeratorStatus::Moderator
+    {
+        return;
+    }
+    let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
         Some("rule configuration unavailable; deleting the message and skipping kick or ban")
-    } else if role_ids.is_none() && (skip_moderators || skips_roles) {
+    } else if role_ids.is_none() && (skip_moderators || !skipped_roles.is_empty()) {
         Some(jmodguard::custom_rules::UNKNOWN_MEMBERSHIP_WARNING)
     } else if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown) {
         Some(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING)
@@ -1358,6 +1375,49 @@ mod tests {
     }
 
     #[test]
+    fn everyone_attempt_punctuation_boundaries_with_denied_permission() {
+        let id = "custom:0123456789abcdef".to_string();
+        let rules = HashMap::from([(
+            id,
+            custom_rule(serde_json::json!({"kind": "everyone_attempt"}), "ban"),
+        )]);
+        let cfg = test_cfg(&rules, &HashMap::new());
+        let engine = AutomodEngine::new();
+        for (content, expected) in [
+            ("@everyone", true),
+            ("@here!", true),
+            ("hello,@everyone", true),
+            ("@everyone,@here", true),
+            ("(@here);hello", true),
+            ("@everyoneX", false),
+            ("hello@everyone", false),
+            ("@hereafter", false),
+            ("@@everyone", false),
+        ] {
+            let message = msg(1, content, 0, false, false);
+            assert_eq!(message.everyone_mentions, 0);
+            assert!(!message.can_mention_everyone);
+            assert!(!message.mention_permission_unknown);
+            let hit = engine.evaluate(&cfg, &message);
+            assert_eq!(hit.is_some(), expected, "{content}");
+            if let Some(hit) = hit {
+                assert!(!hit.mention_permission_unknown);
+            }
+        }
+        let mut flagged = msg(1, "plain", 0, false, false);
+        flagged.everyone_mentions = 1;
+        assert!(
+            engine.evaluate(&cfg, &flagged).is_some(),
+            "mention flag shortcut"
+        );
+        flagged.can_mention_everyone = true;
+        assert!(
+            engine.evaluate(&cfg, &flagged).is_none(),
+            "allowed mention is exempt"
+        );
+    }
+
+    #[test]
     fn honeypot_role_added_helper() {
         let id = "custom:0123456789abcdef".to_string();
         let mut rules = HashMap::new();
@@ -2133,6 +2193,180 @@ mod tests {
                 server: Some(server),
             }
         }
+    }
+
+    // Omitted gateway membership still uses cached author roles at execution.
+    async fn cached_author_case(action: &str, moderator: bool, skipped_role: bool) {
+        use serenity::all::{
+            ChannelId, Guild, GuildCreateEvent, GuildId, Member, Permissions, Role, RoleId, User,
+            UserId,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let path =
+            std::env::temp_dir().join(format!("cached_author_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false))
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        rule.skip_moderators = true;
+        rule.whitelist_roles = if skipped_role { vec![55] } else { vec![56] };
+        rule.actions[0].action = action.into();
+        rule.actions[0].duration_minutes = 5;
+        crate::db::upsert_rule(&app.db, 10, "custom:0123456789abcdef", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        let mut role = Role::default();
+        role.id = RoleId::new(55);
+        role.permissions = if moderator {
+            Permissions::MANAGE_MESSAGES
+        } else {
+            Permissions::empty()
+        };
+        guild.roles.insert(role.id, role);
+        let mut member = Member::default();
+        member.guild_id = guild.id;
+        member.user = user.clone();
+        member.roles = vec![RoleId::new(55)];
+        guild.members.insert(user.id, member);
+        let scope = crate::commands::author_message_scope(
+            app.cfg.bot.owner_id,
+            Some(&guild),
+            ChannelId::new(70),
+            user.id,
+            None,
+        );
+        assert!(!scope.is_moderator, "admission has no partial member");
+        let mut message = word_message(&[]);
+        message.is_moderator = scope.is_moderator;
+        message.mention_permission_unknown =
+            scope.mention == crate::commands::MentionPermission::Unknown;
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &message)
+            .expect("live custom word rule matches at admission");
+        assert_eq!(pending.action.action, action);
+        assert!(
+            !pending.mention_permission_unknown,
+            "word rules do not depend on mention permission"
+        );
+        let stub = DiscordStub::start();
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        let seen = stub.finish();
+        if moderator || skipped_role {
+            assert!(
+                seen.iter().all(|line| !line.contains("/bans/")),
+                "no ban lookup or dispatch for an exempt author: {seen:?}"
+            );
+            assert!(
+                seen.is_empty(),
+                "cached exempt author must receive no Discord call for {action}: {seen:?}"
+            );
+            assert!(
+                crate::db::list_warns(&app.db, 10, 99)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                crate::db::list_bans(&app.db, 10, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(app.gateway_ban_echo_operation(10, 99).is_none());
+            let scope = app.tenant.scope(enrollment).await.unwrap();
+            let store = app.tenant.store(&scope).await.unwrap();
+            assert_eq!(
+                store
+                    .case_count(scope.clone(), Default::default())
+                    .await
+                    .unwrap(),
+                0,
+                "no moderation case"
+            );
+            assert!(
+                store
+                    .next_member_pending_ban_verification(scope, i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no ban attempt"
+            );
+        } else {
+            assert!(
+                seen.iter()
+                    .any(|line| line.starts_with("PUT ") && line.contains("/bans/99")),
+                "cached non-moderator must be banned: {seen:?}"
+            );
+            assert_eq!(
+                crate::db::list_bans(&app.db, 10, 100).await.unwrap().len(),
+                1
+            );
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn cached_moderator_without_gateway_member_skips_all_penalties() {
+        for action in ["delete", "warn", "timeout", "kick", "ban"] {
+            cached_author_case(action, true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_skipped_role_without_gateway_member_skips_all_penalties() {
+        for action in ["delete", "warn", "timeout", "kick", "ban"] {
+            cached_author_case(action, false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_non_moderator_without_gateway_member_still_bans() {
+        cached_author_case("ban", false, false).await;
     }
 
     #[derive(Clone, Copy)]

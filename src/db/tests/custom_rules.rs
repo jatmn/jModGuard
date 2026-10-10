@@ -255,3 +255,88 @@ async fn copy_custom_rules_start_dry_run_respect_cap_and_reject_global() {
     assert!(err.to_string().contains("custom rules"), "{err:#}");
     assert!(!get_rule(&f.db, 20, id).await.unwrap().unwrap().dry_run);
 }
+
+// Run the admitted maximum through captured copy and the same SQL insertion path.
+#[tokio::test]
+async fn full_custom_rule_copy_batches_inserts_and_preserves_replacement() {
+    let f = Fixture::new();
+    let source = f.scope(10).await;
+    let destination = f.scope(20).await;
+    let mut replacement = Vec::new();
+    for i in 0..MAX_CUSTOM_RULES_PER_GUILD {
+        let id = custom_id(i);
+        let mut rule = custom_rule(true, &format!("scam{i}"));
+        upsert_enrolled_rule(&f.db, write_scope(&source), &id, &rule)
+            .await
+            .unwrap();
+        rule.dry_run = false;
+        upsert_enrolled_rule(&f.db, write_scope(&source), &id, &rule)
+            .await
+            .unwrap();
+        rule.dry_run = true;
+        replacement.push((id, rule));
+    }
+    for (id, mut rule) in crate::types::RULE_IDS
+        .iter()
+        .zip(crate::defaults::default_rules())
+    {
+        rule.description = format!("source override {id}");
+        upsert_enrolled_rule(&f.db, write_scope(&source), id, &rule)
+            .await
+            .unwrap();
+        replacement.push((id.to_string(), rule));
+    }
+    let stale_id = "custom:ffffffffffffffff";
+    upsert_enrolled_rule(
+        &f.db,
+        write_scope(&destination),
+        stale_id,
+        &custom_rule(true, "old"),
+    )
+    .await
+    .unwrap();
+    let before = get_primary_versions(&f.db).await.unwrap();
+    copy_enrolled_guild_config(&f.db, source, destination, vec!["rules".into()])
+        .await
+        .unwrap();
+    let after = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(after.config, before.config + 1, "one atomic version bump");
+    assert!(get_rule(&f.db, 20, stale_id).await.unwrap().is_none());
+    let copied = list_rules(&f.db, 20).await.unwrap();
+    assert_eq!(copied.len(), replacement.len());
+    for (id, expected) in &replacement {
+        let actual = get_rule(&f.db, 20, id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "{id}"
+        );
+    }
+    // Count emitted INSERT statements while executing them with real row budgets.
+    let count =
+        f.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            let mut inserts = 0;
+            super::super::configuration::insert_copied_rules(
+                30,
+                &replacement,
+                |sql, args, rows| {
+                    inserts += 1;
+                    tx.execute_rows(sql, params_from_iter(args), rows)
+                },
+            )?;
+            let stored: i64 =
+                tx.query_row("SELECT COUNT(*) FROM rules WHERE guild_id=30", (), |row| {
+                    Ok(row.get(0)?)
+                })?;
+            assert_eq!(stored as usize, replacement.len());
+            tx.commit()?;
+            Ok(inserts)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "32 custom rules plus built-in overrides fit one insert batch"
+    );
+}

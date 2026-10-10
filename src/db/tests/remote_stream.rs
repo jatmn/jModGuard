@@ -36,6 +36,10 @@ struct HranaState {
     begin_hung: bool,
     rollback_started: bool,
     progress: Arc<Notify>,
+    // Optional real SQLite backing for configuration transaction/transport tests.
+    backing: Option<(DbRuntime, libsql::Connection)>,
+    requests: usize,
+    statements: Vec<String>,
 }
 
 impl HranaState {
@@ -66,6 +70,9 @@ impl HranaState {
             begin_hung: false,
             rollback_started: false,
             progress: Arc::new(Notify::new()),
+            backing: None,
+            requests: 0,
+            statements: Vec::new(),
         }
     }
 }
@@ -354,6 +361,7 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
     }
     let supplied_baton = input["baton"].as_str();
     let mut state = state.lock().unwrap();
+    state.requests += 1;
     if supplied_baton.is_some_and(|baton| state.expired.contains(baton)) {
         state.expired_requests += 1;
         return body(
@@ -430,6 +438,18 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
                 );
             }
             assert_eq!(input["batch"]["steps"].as_array().unwrap().len(), 1);
+            if state.backing.is_some() {
+                let result = backed_statement_result(&input, &mut state);
+                let mut lines = vec![
+                    json!({"baton": baton}).to_string(),
+                    json!({"type": "step_begin", "step": 0, "cols": result["cols"]}).to_string(),
+                ];
+                for row in result["rows"].as_array().unwrap() {
+                    lines.push(json!({"type": "row", "row": row}).to_string());
+                }
+                lines.push(json!({"type": "step_end", "step": 0, "affected_row_count": result["affected_row_count"]}).to_string());
+                return body(StatusCode::OK, format!("{}\n", lines.join("\n")));
+            }
             let lines = [
                 json!({"baton": baton}).to_string(),
                 json!({"type": "step_begin", "step": 0, "cols": [{"name": "value", "decltype": "INTEGER"}]}).to_string(),
@@ -498,18 +518,146 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
         state.in_transaction = false;
         state.write_locked = false;
     }
+    let result = if state.backing.is_some() {
+        backed_statement_result(request, state)
+    } else {
+        json!({"cols": [], "rows": [], "affected_row_count": 0, "last_insert_rowid": null})
+    };
     json!({
         "type": "batch",
-        "result": {
-            "step_results": [{
-                "cols": [],
-                "rows": [],
-                "affected_row_count": 0,
-                "last_insert_rowid": null
-            }],
-            "step_errors": [null]
-        }
+        "result": { "step_results": [result], "step_errors": [null] }
     })
+}
+
+// Use actual SQL for copy tests while retaining synthetic lifecycle fault fixtures.
+fn backed_statement_result(request: &Json, state: &mut HranaState) -> Json {
+    let stmt = request["batch"]["steps"]
+        .as_array()
+        .and_then(|steps| steps.first())
+        .map(|step| &step["stmt"])
+        .unwrap_or(&request["stmt"]);
+    let sql = stmt["sql"].as_str().unwrap();
+    state.statements.push(sql.to_owned());
+    let args = stmt["args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .map(|arg| match arg["type"].as_str().unwrap() {
+                    "integer" => {
+                        libsql::Value::Integer(arg["value"].as_str().unwrap().parse().unwrap())
+                    }
+                    "text" => libsql::Value::Text(arg["value"].as_str().unwrap().to_owned()),
+                    "null" => libsql::Value::Null,
+                    other => panic!("unsupported copy fixture parameter: {other}"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (runtime, conn) = state.backing.as_ref().unwrap();
+    runtime.block_on(async {
+        let prepared = conn.prepare(sql).await.unwrap();
+        let cols = prepared.columns().into_iter().map(|col| json!({"name": col.name(), "decltype": col.decl_type()})).collect::<Vec<_>>();
+        let mut values = Vec::new();
+        let affected = if prepared.column_count() > 0 {
+            let mut rows = prepared.query(args).await.unwrap();
+            while let Some(row) = rows.next().await.unwrap() {
+                values.push((0..row.column_count()).map(|i| match row.get_value(i).unwrap() {
+                    libsql::Value::Integer(n) => json!({"type": "integer", "value": n.to_string()}),
+                    libsql::Value::Text(value) => json!({"type": "text", "value": value}),
+                    libsql::Value::Null => json!({"type": "null"}),
+                    other => panic!("unsupported copy fixture value: {other:?}"),
+                }).collect::<Vec<_>>());
+            }
+            0
+        } else {
+            prepared.execute(args).await.unwrap()
+        };
+        json!({"cols": cols, "rows": values, "affected_row_count": affected, "last_insert_rowid": null})
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_custom_rule_copy_uses_one_hrana_insert_request() {
+    let path = super::tmp_db_path("remote_custom_copy");
+    let local = Db::open(&path, 2).unwrap();
+    let source = ConfigurationScope::Guild(enroll_guild(&local, 10, 100).await.unwrap().unwrap());
+    let destination =
+        ConfigurationScope::Guild(enroll_guild(&local, 20, 100).await.unwrap().unwrap());
+    let mut expected = Vec::new();
+    for n in 0..crate::custom_rules::MAX_CUSTOM_RULES_PER_GUILD {
+        let id = format!("custom:{n:016x}");
+        let mut rule = crate::defaults::default_rules()[0].clone();
+        rule.params = json!({"kind": "word", "words": [format!("word{n}")]});
+        rule.dry_run = false;
+        upsert_rule(&local, 10, &id, &rule).await.unwrap();
+        rule.dry_run = true;
+        expected.push((id, rule));
+    }
+    for (id, rule) in crate::types::RULE_IDS
+        .iter()
+        .zip(crate::defaults::default_rules())
+    {
+        upsert_rule(&local, 10, id, &rule).await.unwrap();
+        expected.push((id.to_string(), rule));
+    }
+    let mut stale = crate::defaults::default_rules()[0].clone();
+    stale.description = "destination only".into();
+    upsert_rule(&local, 20, "old", &stale).await.unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let remote = fixture.db();
+    copy_enrolled_guild_config(&remote, source, destination, vec!["rules".into()])
+        .await
+        .unwrap();
+    {
+        let state = fixture.state.lock().unwrap();
+        let inserts = state
+            .statements
+            .iter()
+            .filter(|sql| sql.starts_with("INSERT INTO rules "))
+            .count();
+        assert_eq!(inserts, 1, "full copy must send one rules INSERT request");
+        assert!(
+            state.requests <= 30,
+            "copy HTTP requests must stay bounded: {}",
+            state.requests
+        );
+        assert!(
+            state
+                .statements
+                .iter()
+                .any(|sql| sql.starts_with("BEGIN IMMEDIATE"))
+        );
+        assert!(state.statements.iter().any(|sql| sql.starts_with("COMMIT")));
+        eprintln!(
+            "full copy: {inserts} rules INSERT request; {} total HTTP requests",
+            state.requests
+        );
+    }
+    let copied = list_rules(&local, 20).await.unwrap();
+    assert_eq!(copied.len(), expected.len());
+    assert!(get_rule(&local, 20, "old").await.unwrap().is_none());
+    for (id, rule) in expected {
+        let actual = get_rule(&local, 20, &id).await.unwrap().unwrap();
+        if crate::custom_rules::is_custom_id(&id) {
+            assert!(actual.dry_run, "copied {id} must be dry-run");
+        }
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(rule).unwrap(),
+            "{id}"
+        );
+    }
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 fn read_one(conn: &mut Connection) -> Result<i64> {

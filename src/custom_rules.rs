@@ -246,10 +246,9 @@ pub fn everyone_attempt_matches(content: &str, mention_everyone_flag: bool) -> b
     if mention_everyone_flag {
         return true;
     }
-    content.split_whitespace().any(|raw| {
-        let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '@');
-        token.eq_ignore_ascii_case("@everyone") || token.eq_ignore_ascii_case("@here")
-    })
+    content
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '@')
+        .any(|token| token.eq_ignore_ascii_case("@everyone") || token.eq_ignore_ascii_case("@here"))
 }
 
 pub fn rule_scope_skips(

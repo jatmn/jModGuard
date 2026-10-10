@@ -119,6 +119,9 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 `whitelist_users` (user IDs). Matches skip the rule entirely. Optional
 `include_channels` limits a rule to listed channels (empty means all non-skipped
 channels). `skip_moderators` skips members at mod permission level or higher.
+Pending actions recheck moderator and skipped-role exemptions using supplied
+member roles or, when those are absent, the author's cached guild roles. A known
+exempt author is skipped before deletion, warning records, timeout, kick, or ban.
 Exact-image and repeated-text rules honor both settings on admission and again
 before enforcement. The message carries its channel, so the channel list cannot
 fail open or closed. For a pending kick or ban, unknown moderator status with
