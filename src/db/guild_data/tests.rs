@@ -494,6 +494,168 @@ async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
 }
 
 #[tokio::test]
+async fn identity_memo_rereads_store_row_and_rejects_swapped_identity() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let other = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    verify_identity(&conn, &reg).unwrap();
+
+    let (schema_before, user_before): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)",
+            (),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // Disable triggers only on a separate connection so the warmed connection's
+    // memo stays eligible: no schema objects or version cookies change.
+    {
+        struct SwapConnection(*mut libsql::ffi::sqlite3);
+        impl Drop for SwapConnection {
+            fn drop(&mut self) {
+                // SAFETY: this scope owns the handle and leaves no statements open.
+                unsafe { libsql::ffi::sqlite3_close_v2(self.0) };
+            }
+        }
+        let path = std::ffi::CString::new(f.store_path.to_str().unwrap()).unwrap();
+        let mut swap = SwapConnection(std::ptr::null_mut());
+        let update = std::ffi::CString::new(format!(
+            "UPDATE store_identity SET store_id='{}' WHERE singleton=1",
+            other.id().as_str()
+        ))
+        .unwrap();
+        // SAFETY: all C strings live through their calls; the handle is owned by
+        // swap, used on this thread only, and closed before verification resumes.
+        unsafe {
+            assert_eq!(
+                libsql::ffi::sqlite3_open_v2(
+                    path.as_ptr(),
+                    &mut swap.0,
+                    libsql::ffi::SQLITE_OPEN_READWRITE,
+                    std::ptr::null(),
+                ),
+                libsql::ffi::SQLITE_OK
+            );
+            assert_eq!(
+                libsql::ffi::sqlite3_db_config(
+                    swap.0,
+                    libsql::ffi::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                    0_i32,
+                    std::ptr::null_mut::<std::ffi::c_int>(),
+                ),
+                libsql::ffi::SQLITE_OK
+            );
+            assert_eq!(
+                libsql::ffi::sqlite3_exec(
+                    swap.0,
+                    update.as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                libsql::ffi::SQLITE_OK
+            );
+        }
+    }
+    let (schema_after, user_after): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)",
+            (),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(schema_after, schema_before);
+    assert_eq!(user_after, user_before);
+
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+    let error = verify_identity(&conn, &reg).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Identity)
+    ));
+    assert_eq!(
+        probe.catalog() - catalog,
+        0,
+        "memo hit must re-read store_identity without scanning sqlite_master"
+    );
+    assert_eq!(probe.immediate() - imm, 0);
+
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+    let error = verify_identity(&conn, &reg).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Identity)
+    ));
+    assert_eq!(probe.catalog() - catalog, 1);
+    assert_eq!(probe.immediate() - imm, 0);
+}
+
+#[tokio::test]
+async fn identity_memo_hit_still_avoids_catalog_reads() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+}
+
+#[tokio::test]
+async fn identity_memo_miss_for_different_expected_registration_rescans_catalog() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let other = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    let catalog = probe.catalog();
+    assert!(verify_identity(&conn, &other).is_err());
+    assert_eq!(probe.catalog() - catalog, 1);
+}
+
+#[tokio::test]
+async fn identity_memo_survives_pooled_checkout_reset() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let mut store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    crate::db::test_mark_connection_pool_remote(&mut store.db);
+
+    store
+        .db
+        .with_conn_sync(|conn| verify_identity(conn, &reg))
+        .unwrap();
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+
+    store
+        .db
+        .with_conn_sync(|conn| verify_identity(conn, &reg))
+        .unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+}
+
+#[tokio::test]
 async fn identity_verification_uses_one_catalog_read_and_rechecks_schema() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
