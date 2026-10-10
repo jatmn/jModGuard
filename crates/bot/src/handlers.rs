@@ -433,8 +433,9 @@ impl EventHandler for Handler {
         // Consume the one-shot token before the write, and remember that
         // consumption so a second delivery of the same echo stays owned.
         // If Discord applied the ban but the command never stored a row, that
-        // owned echo still inserts the one active row and does not add a
-        // member_ban event. A manual delivery inserts one row and one
+        // owned echo still inserts the one active row, marked with this
+        // attempt's operation id, and does not add a member_ban event. A
+        // manual delivery inserts one row and one
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. A later delivery does not insert
         // and does not replace the actor or reason already stored.
@@ -443,8 +444,9 @@ impl EventHandler for Handler {
             guild_id.get(),
             banned_user.id.get(),
         );
-        let owned_echo =
-            suppressed || app.gateway_ban_echo_was_consumed(guild_id.get(), banned_user.id.get());
+        let echo_operation = app.gateway_ban_echo_operation(guild_id.get(), banned_user.id.get());
+        let owned_echo = suppressed || echo_operation.is_some();
+        let operation_id = echo_operation.flatten();
         let ban_write = db::record_gateway_ban(
             &app.db,
             enrollment.clone(),
@@ -453,6 +455,7 @@ impl EventHandler for Handler {
             banned_user.global_name.as_deref(),
             Some(&observed_at),
             owned_echo,
+            operation_id.as_deref(),
         )
         .await
         .ok();

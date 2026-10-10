@@ -1010,7 +1010,7 @@ mod tests {
     async fn uncertain_ban_keeps_gateway_suppression_and_links_audit() {
         let (app, enrollment, path) = app_with_guild(10).await;
         let _suppression =
-            app.suppress_next_gateway_case(crate::state::GatewayCaseAction::Ban, 10, 99);
+            app.suppress_next_gateway_case(crate::state::GatewayCaseAction::Ban, 10, 99, None);
         let case_id = record_application(
             &app,
             Some(enrollment.clone()),
@@ -1487,6 +1487,7 @@ mod tests {
                 "[automod:attachment_flood] spam wave",
                 None,
                 db::BanRecord::Fresh,
+                None,
             )
             .await
             .unwrap()

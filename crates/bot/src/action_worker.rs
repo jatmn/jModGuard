@@ -393,6 +393,7 @@ async fn execute_inner(
                         crate::state::GatewayCaseAction::Unban,
                         job.guild_id as u64,
                         *user_id as u64,
+                        None,
                     )
                 });
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);

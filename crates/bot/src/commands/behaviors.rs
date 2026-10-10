@@ -116,10 +116,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         }
                         Err(_) => None,
                     };
+                    let operation_id = pending_ban.operation_id().to_owned();
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
                         target.get(),
+                        Some(&operation_id),
                     );
                     let raced = if let Some(m) = member {
                         crate::discord::race_discord_call(
@@ -166,6 +168,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                     &target_user,
                                     &reason,
                                     db::BanRecord::Fresh,
+                                    Some(&operation_id),
                                 )
                                 .await?
                             {
@@ -212,6 +215,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::state::GatewayCaseAction::Unban,
                 env.guild_id.get(),
                 target.get(),
+                None,
             );
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
@@ -973,6 +977,7 @@ pub(crate) async fn continue_present_command_ban(
         reason,
         None,
         db::BanRecord::Retry,
+        None,
     )
     .await?
     .is_some())
@@ -985,6 +990,7 @@ async fn record_ban_once(
     target_user: &UserInfo,
     reason: &str,
     kind: db::BanRecord,
+    operation_id: Option<&str>,
 ) -> Result<bool> {
     if !env.app.activation.may_record() {
         return Ok(false);
@@ -1000,6 +1006,7 @@ async fn record_ban_once(
         reason,
         None,
         kind,
+        operation_id,
     )
     .await?
     .is_some())

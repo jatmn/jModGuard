@@ -592,6 +592,7 @@ pub async fn execute_pending(
                             &format!("[automod:{}] {}", pending.rule_id, reason),
                             None,
                             db::BanRecord::Retry,
+                            None,
                         )
                         .await
                         .ok()
@@ -634,10 +635,12 @@ pub async fn execute_pending(
                                 }
                                 Err(_) => None,
                             };
+                            let operation_id = pending_ban.operation_id().to_owned();
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
                                 guild_id.get(),
                                 target.id.get(),
+                                Some(&operation_id),
                             );
                             let raced = crate::discord::race_discord_call(
                                 &app.activation,
@@ -686,6 +689,7 @@ pub async fn execute_pending(
                                             &format!("[automod:{}] {}", pending.rule_id, reason),
                                             None,
                                             db::BanRecord::Fresh,
+                                            Some(&operation_id),
                                         )
                                         .await
                                         .ok()

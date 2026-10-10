@@ -1081,6 +1081,7 @@ mod tests {
             "spam",
             None,
             db::BanRecord::Fresh,
+            None,
         )
         .await
         .unwrap();

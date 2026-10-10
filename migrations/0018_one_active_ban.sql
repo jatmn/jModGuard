@@ -26,3 +26,8 @@ WHERE active = 1
   );
 
 CREATE UNIQUE INDEX idx_bans_one_active ON bans(guild_id, user_id) WHERE active = 1;
+
+-- The bot attempt that owns a gateway echo. A later command fills that row
+-- only when this id is the same attempt. Null is not an attempt. The keeper
+-- score above does not use this column.
+ALTER TABLE bans ADD COLUMN operation_id TEXT;
