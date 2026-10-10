@@ -79,6 +79,15 @@ fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bo
     !suppressed_by_owned_action
 }
 
+/// Audit attribution belongs only to the row this delivery inserted.
+/// An existing bot row keeps the actor and reason the command already stored.
+fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
+    match write {
+        db::GatewayBanWrite::Recorded { row_id } => Some(row_id),
+        db::GatewayBanWrite::OwnedByBot | db::GatewayBanWrite::Existing { .. } => None,
+    }
+}
+
 fn departure_joined_at_ms(
     decision: Option<&crate::db::guild_data::MemberDepartureDecision>,
     payload_joined_at_ms: Option<i64>,
@@ -420,28 +429,32 @@ impl EventHandler for Handler {
         )
         .await;
         let observed_at = observed.to_rfc3339();
-        // Record the supplied identity before any audit HTTP wait. An unban
-        // observed during that wait must be able to mark this row inactive.
-        let ban_row_id = db::record_enrolled_ban_with_identity(
-            &app.db,
-            enrollment.clone(),
-            banned_user.id.get() as i64,
-            Some(&banned_user.name),
-            banned_user.global_name.as_deref(),
-            None,
-            None,
-            "Reason unavailable",
-            Some(&observed_at),
-        )
-        .await
-        .ok();
-        // Decide whether this Gateway event is the bot's own echo before the
-        // best-effort audit lookup can outlive its bounded suppression token.
+        // A bot echo is not a second ban and not a manual moderation record.
+        // Consume the one-shot token before the write, and remember that
+        // consumption so a second delivery of the same echo stays owned.
+        // A manual delivery inserts one row and one member_ban event before
+        // the audit wait, so an unban during that wait can mark the row
+        // inactive. A later delivery does not insert and does not replace
+        // the actor or reason already stored.
         let suppressed = app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Ban,
             guild_id.get(),
             banned_user.id.get(),
         );
+        let owned_echo =
+            suppressed || app.gateway_ban_echo_was_consumed(guild_id.get(), banned_user.id.get());
+        let ban_write = db::record_gateway_ban(
+            &app.db,
+            enrollment.clone(),
+            banned_user.id.get() as i64,
+            Some(&banned_user.name),
+            banned_user.global_name.as_deref(),
+            Some(&observed_at),
+            owned_echo,
+        )
+        .await
+        .ok();
+        let ban_row_id = ban_write.and_then(gateway_ban_row_to_attribute);
         // Every unsuppressed delivery is a distinct unresolved observation.
         // A matching saved status is not an action identity: an opposite event
         // may have been missed while Gateway coverage was unavailable.
@@ -539,6 +552,9 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        // A ban after this unban is a new ban, even inside the echo window.
+        self.app
+            .clear_gateway_ban_echo(guild_id.get(), unbanned_user.id.get());
         let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
@@ -1233,8 +1249,8 @@ mod tests {
     }
 
     use super::{
-        audit_case_action, departure_joined_at_ms, log_message_diagnostic,
-        record_unresolved_gateway_observation, select_update_authors,
+        audit_case_action, departure_joined_at_ms, gateway_ban_row_to_attribute,
+        log_message_diagnostic, record_unresolved_gateway_observation, select_update_authors,
     };
     use crate::{db::Db, logging, state::BotState};
     use serenity::model::channel::Message;
@@ -1246,6 +1262,22 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[test]
+    fn only_a_newly_recorded_manual_ban_is_attributed() {
+        assert_eq!(
+            gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::Recorded { row_id: 4 }),
+            Some(4)
+        );
+        assert_eq!(
+            gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::Existing { row_id: 4 }),
+            None
+        );
+        assert_eq!(
+            gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::OwnedByBot),
+            None
+        );
     }
 
     #[tokio::test]

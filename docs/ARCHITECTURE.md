@@ -183,7 +183,7 @@ serves authorized journal-available objects and does not perform that Discord re
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0017. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0018. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
@@ -194,7 +194,8 @@ log exclusions. Migration 0014 stores known ban display names. Migration 0015
 stores component-update coordination. Migration 0016 adds the per-bot shared
 [member-sync request gate](MEMBERS.md), preserving minimum request intervals and
 rate-limit delays across guilds and worker restarts. Migration 0017 adds indexes for
-ordered guild event/ban pages and expiring bot actions. Bot/API startup
+ordered guild event/ban pages and expiring bot actions. Migration 0018 keeps
+one active ban row per guild and user. Bot/API startup
 opens [tenant runtime](TENANT-RUNTIME.md) against that catalog. Unban/log-channel WebUI
 operations now use API admission and bot dispatch.
 
@@ -232,7 +233,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness and /ready readiness (in-memory; bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless bundled at build time, not vendored)
-migrations/                0001_init through 0017_hot_query_indexes
+migrations/                0001_init through 0018_one_active_ban
 Dockerfile.bot
 Dockerfile.api
 ```

@@ -52,6 +52,10 @@ pub(crate) struct GatewayCaseSuppression(u128);
 struct GatewayCaseSuppressions {
     next_token: u128,
     entries: HashMap<GatewayCaseSuppression, ((GatewayCaseAction, u64, u64), Instant)>,
+    /// Ban tokens already consumed. A second delivery of the same bot echo
+    /// has no token left, but it is still the bot's ban until this expires
+    /// or an unban clears it.
+    recent_ban_echo: HashMap<(u64, u64), Instant>,
 }
 
 /// A write failure cannot be recorded in the same unavailable guild store.
@@ -125,6 +129,7 @@ impl PendingMemberGaps {
 impl GatewayCaseSuppressions {
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, (_, expires)| *expires > now);
+        self.recent_ban_echo.retain(|_, expires| *expires > now);
     }
 
     fn insert(
@@ -166,7 +171,22 @@ impl GatewayCaseSuppressions {
             .filter(|(_, (key, _))| *key == (action, guild, user))
             .min_by_key(|(_, (_, expires))| *expires)
             .map(|(token, _)| *token);
-        token.is_some_and(|token| self.entries.remove(&token).is_some())
+        let removed = token.is_some_and(|token| self.entries.remove(&token).is_some());
+        if removed && action == GatewayCaseAction::Ban {
+            self.recent_ban_echo
+                .insert((guild, user), Instant::now() + GATEWAY_CASE_SUPPRESSION_TTL);
+        }
+        removed
+    }
+
+    fn ban_echo_was_consumed(&mut self, guild: u64, user: u64) -> bool {
+        let now = Instant::now();
+        self.prune(now);
+        self.recent_ban_echo.contains_key(&(guild, user))
+    }
+
+    fn clear_ban_echo(&mut self, guild: u64, user: u64) {
+        self.recent_ban_echo.remove(&(guild, user));
     }
 }
 
@@ -795,6 +815,20 @@ impl BotState {
         self.gateway_case_suppressions
             .lock()
             .remove(action, guild, user)
+    }
+
+    /// True when this process already consumed the bot's ban echo for this user.
+    pub(crate) fn gateway_ban_echo_was_consumed(&self, guild: u64, user: u64) -> bool {
+        self.gateway_case_suppressions
+            .lock()
+            .ban_echo_was_consumed(guild, user)
+    }
+
+    /// An unban ends the bot echo. A later ban is a new row.
+    pub(crate) fn clear_gateway_ban_echo(&self, guild: u64, user: u64) {
+        self.gateway_case_suppressions
+            .lock()
+            .clear_ban_echo(guild, user);
     }
 
     pub(crate) fn remember_member_gap(
@@ -1453,6 +1487,20 @@ mod tests {
             suppressions.insert(GatewayCaseAction::Ban, 50, user);
         }
         assert_eq!(suppressions.entries.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
+    }
+
+    #[test]
+    fn consumed_ban_echo_stays_owned_until_cleared() {
+        let mut suppressions = GatewayCaseSuppressions::default();
+        suppressions.insert(GatewayCaseAction::Ban, 10, 20);
+        assert!(suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(suppressions.ban_echo_was_consumed(10, 20));
+        assert!(!suppressions.ban_echo_was_consumed(10, 21));
+        suppressions.insert(GatewayCaseAction::Unban, 10, 21);
+        assert!(suppressions.remove(GatewayCaseAction::Unban, 10, 21));
+        assert!(!suppressions.ban_echo_was_consumed(10, 21));
+        suppressions.clear_ban_echo(10, 20);
+        assert!(!suppressions.ban_echo_was_consumed(10, 20));
     }
 
     #[test]

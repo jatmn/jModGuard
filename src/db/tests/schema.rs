@@ -239,3 +239,70 @@ fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     drop(api);
     cleanup_db(&path);
 }
+
+#[test]
+fn one_active_ban_migration_collapses_existing_duplicates() {
+    let path = tmp_db_path("one_active_ban_migration");
+    let mut conn = Connection::open(&path).unwrap();
+    let prior = MIGRATIONS.len() - 1;
+    assert_eq!(prior, 17, "0018 is the migration under test");
+    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
+        let tx = conn.transaction_primary_read().unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute_batch_bounded(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) VALUES
+            (10, 55, 9, 'spam', '2024-01-01T00:00:00Z', 1),
+            (10, 55, NULL, 'Reason unavailable', '2024-01-01T00:00:01Z', 1),
+            (10, 56, NULL, 'Reason unavailable', '2024-01-02T00:00:00Z', 1),
+            (10, 56, NULL, 'Reason unavailable', '2024-01-02T00:00:01Z', 1),
+            (10, 57, 3, 'ended', '2024-01-03T00:00:00Z', 0),
+            (10, 57, 4, 'fresh', '2024-01-04T00:00:00Z', 1);",
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    migrate_conn(&mut conn).unwrap();
+    let row = |sql: &str| -> (Option<i64>, i64) {
+        conn.query_row(sql, (), |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    };
+    assert_eq!(
+        row("SELECT moderator_id, active FROM bans WHERE user_id=55 AND reason='spam'"),
+        (Some(9), 1)
+    );
+    assert_eq!(
+        row(
+            "SELECT moderator_id, active FROM bans WHERE user_id=56 AND reason='Reason unavailable'"
+        ),
+        (None, 1)
+    );
+    assert_eq!(
+        row("SELECT moderator_id, active FROM bans WHERE user_id=57 AND reason='ended'"),
+        (Some(3), 0)
+    );
+    assert_eq!(
+        row("SELECT moderator_id, active FROM bans WHERE user_id=57 AND reason='fresh'"),
+        (Some(4), 1)
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM bans", (), |r| Ok(r.get::<i64>(0)?))
+            .unwrap(),
+        4
+    );
+    let error = conn
+        .execute_batch_bounded(
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) VALUES (10, 55, 1, 'second', '2024-05-01T00:00:00Z', 1);",
+            64 * 1024 * 1024,
+        )
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("UNIQUE constraint failed") || text.contains("idx_bans_one_active"),
+        "{text}"
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
