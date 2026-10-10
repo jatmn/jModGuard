@@ -103,3 +103,39 @@ async fn loopback_listener_rejects_oversized_content_length_without_buffering_bo
     assert!(text.contains("HTTP/1.1 413"), "{text}");
     set_process_ready(false);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_container_use_accepts_a_delayed_body() {
+    let secret = "d".repeat(32);
+    let addr = spawn_container_read_listener("127.0.0.1:0", &secret).expect("listener");
+    let _ready_guard = PROCESS_READY_TESTS.lock().unwrap();
+    set_process_ready(true);
+    let body = seal_read(secret.as_bytes()).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let headers = format!(
+        "POST {CONTAINER_READ_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    // Read even if the peer has closed, so failure reports the missing HTTP 200.
+    let body_write = stream.write_all(&body);
+    let mut response = Vec::new();
+    let response_read = stream.read_to_end(&mut response);
+    set_process_ready(false);
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "expected HTTP 200 for delayed body: {text:?}; write: {body_write:?}; read: {response_read:?}"
+    );
+    body_write.unwrap();
+    response_read.unwrap();
+    let (_, json) = text.split_once("\r\n\r\n").expect("http body");
+    let _: jmodguard::read_link::ContainerReadResponse = serde_json::from_str(json).unwrap();
+}

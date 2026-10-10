@@ -294,8 +294,8 @@ pub fn seal_with_request(
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(valid_request_id(request_id), "write failed");
     let wire = Wire {
-        direction: CONTROL_LINK_DIRECTION.to_owned(),
-        route: CONTROL_LINK_ROUTE.to_owned(),
+        direction: Some(CONTROL_LINK_DIRECTION.to_owned()),
+        route: Some(CONTROL_LINK_ROUTE.to_owned()),
         nonce: random_nonce()?,
         request_id: request_id.to_owned(),
         expires_ms,
@@ -329,11 +329,14 @@ pub fn open_frame(
         anyhow::bail!("write failed");
     }
     let wire: Wire = serde_json::from_slice(json).map_err(|_| anyhow::anyhow!("write failed"))?;
-    if wire.direction != CONTROL_LINK_DIRECTION {
-        anyhow::bail!("write failed: direction binding");
-    }
-    if wire.route != CONTROL_LINK_ROUTE {
-        anyhow::bail!("write failed: route binding");
+    // Previous APIs omit both bindings. A present binding requires the full pair.
+    if wire.direction.is_some() || wire.route.is_some() {
+        if wire.direction.as_deref() != Some(CONTROL_LINK_DIRECTION) {
+            anyhow::bail!("write failed: direction binding");
+        }
+        if wire.route.as_deref() != Some(CONTROL_LINK_ROUTE) {
+            anyhow::bail!("write failed: route binding");
+        }
     }
     let now = now_ms();
     if wire.expires_ms < now.saturating_sub(SKEW_MS) {
@@ -463,10 +466,20 @@ fn is_unique_local(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
+// Only an absent field is legacy: an explicit null must not skip binding checks.
+fn deserialize_control_binding<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Wire {
-    direction: String,
-    route: String,
+    #[serde(default, deserialize_with = "deserialize_control_binding")]
+    direction: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_control_binding")]
+    route: Option<String>,
     nonce: String,
     request_id: String,
     expires_ms: i64,
@@ -574,6 +587,88 @@ mod tests {
             open_frame(&key, &reused[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(replay, request_id);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
+    }
+
+    fn resign_control_body(key: &[u8], wire: &serde_json::Value) -> Vec<u8> {
+        let json = serde_json::to_vec(wire).unwrap();
+        let mut body = mac_hex(key, &json).into_bytes();
+        body.extend_from_slice(&json);
+        body
+    }
+
+    #[test]
+    fn previous_format_control_frame_is_accepted() {
+        let key = load_writer_key(&fixture_secret()).unwrap();
+        let frame = seal(&key, &sample_op(), 7).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_slice(&frame[4 + MAC_HEX..]).unwrap();
+        let expected_request_id = wire["request_id"].as_str().unwrap().to_owned();
+        let expected_expiry = wire["expires_ms"].as_i64().unwrap();
+        let fields = wire.as_object_mut().unwrap();
+        fields.remove("direction");
+        fields.remove("route");
+        let body = resign_control_body(&key, &wire);
+        assert!(
+            crate::read_link::open_read(&key, &body, &Mutex::new(NonceWindow::new())).is_err(),
+            "legacy control bodies must not open on the read link"
+        );
+        let nonces = Mutex::new(NonceWindow::new());
+        let (op, actor, expiry, request_id) = open_frame(&key, &body, &nonces).unwrap();
+        assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
+        assert_eq!(actor, 7);
+        assert_eq!(expiry, expected_expiry);
+        assert_eq!(request_id, expected_request_id);
+        assert!(
+            open_frame(&key, &body, &nonces).is_err(),
+            "legacy nonce replay"
+        );
+    }
+
+    #[test]
+    fn control_frame_rejects_partial_or_wrong_bindings() {
+        let key = load_writer_key(&fixture_secret()).unwrap();
+        let frame = seal(&key, &sample_op(), 7).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&frame[4 + MAC_HEX..]).unwrap();
+        for (field, value, expected_error) in [
+            ("direction", None, "write failed: direction binding"),
+            ("route", None, "write failed: route binding"),
+            (
+                "direction",
+                Some("api-container-read"),
+                "write failed: direction binding",
+            ),
+            (
+                "route",
+                Some("/private/container-use"),
+                "write failed: route binding",
+            ),
+            ("direction", Some(""), "write failed: direction binding"),
+            ("route", Some(""), "write failed: route binding"),
+        ] {
+            let mut wire = original.clone();
+            if let Some(value) = value {
+                wire[field] = value.into();
+            } else {
+                wire.as_object_mut().unwrap().remove(field);
+            }
+            let body = resign_control_body(&key, &wire);
+            let error = open_frame(&key, &body, &Mutex::new(NonceWindow::new())).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                expected_error,
+                "field {field}, value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_frame_rejects_null_bindings() {
+        let key = load_writer_key(&fixture_secret()).unwrap();
+        let frame = seal(&key, &sample_op(), 7).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_slice(&frame[4 + MAC_HEX..]).unwrap();
+        wire["direction"] = serde_json::Value::Null;
+        wire["route"] = serde_json::Value::Null;
+        let body = resign_control_body(&key, &wire);
+        assert!(open_frame(&key, &body, &Mutex::new(NonceWindow::new())).is_err());
     }
 
     #[test]

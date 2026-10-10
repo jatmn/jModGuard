@@ -154,6 +154,8 @@ pub fn spawn_container_read_listener(bind: &str, secret: &str) -> Option<SocketA
 const HEADER_READ_LIMIT: usize = 8192;
 
 fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<()> {
+    // Tokio's into_std retains nonblocking mode; synchronous I/O needs blocking timeouts.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Vec::new();

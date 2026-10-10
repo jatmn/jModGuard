@@ -73,6 +73,13 @@ An owner install request requires a successful release check for the currently s
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
 
+The private API-to-bot control link supports either update order for these compatible
+switches. An updated bot accepts correctly signed previous API frames that omit
+both direction and route; frames that include either field must include both with
+the control-link values. An updated API continues to send frames that a previous
+bot can read, because that bot ignores the added fields after verifying the signed
+payload. Container-read requests remain separate from control requests.
+
 For a core or guild schema change, use **Update bot and API together / recovery** in Administration. Paired bot and API upgrades are refused until signed, launcher-routed upgrades land (issue 188). Single-container installs still work. Schema changes ship in new images. This opens `/api/service-upgrade/recovery` through the existing `/api*` proxy on the public WebUI host and uses the existing Discord owner login. Check a matching pair, inspect its source SHA and two pinned image digests, and confirm the interruption. Changes to either service publish both service images so an API-only or bot-only forward fix has a matching pair. The API resolves the counterpart from the same full source-SHA tag. The channel and checked candidate for both services are stored in one step, and that check holds both update leases so it cannot overlap Administration discovery. If either image is missing, neither selection changes and nothing is stopped.
 
 The durable operation first hands off any required launcher before that role acknowledges preparation, then prepares and verifies both application executables, stops and reaps the old API, stops and reaps the old bot, records an irreversible migration boundary, starts the new bot, then starts the matching API only after bot readiness. Completion requires both readiness markers. Closing the browser does not cancel it. A restarted controller invalidates its local staging/stop acknowledgements and resumes the operation; heartbeat expiry is never evidence of shutdown. Run **one container per role** against the shared core and guild stores; overlapping replicas or other writers are not supported by this protocol.
