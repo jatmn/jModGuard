@@ -906,12 +906,33 @@ impl Fixture {
         let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = 1;
         cfg.log.discord_timeout_secs = timeout_secs;
-        Self {
-            app: BotState::new(cfg, db).unwrap(),
-            path,
-        }
+        let app = BotState::new(cfg, db).unwrap();
+        app.activation.mark_lock_held(true);
+        Self { app, path }
     }
 }
+#[tokio::test]
+async fn cutoff_drops_configured_log_delivery() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 456)
+        .await
+        .unwrap();
+    f.app.activation.cut_off();
+    let sink = Sink::default();
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_edit",
+            BTreeMap::new()
+        )
+        .await,
+        Delivery::Dropped
+    );
+    assert!(sink.messages.lock().unwrap().is_empty());
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         for suffix in ["", "-wal", "-shm"] {
@@ -1038,6 +1059,54 @@ async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
         "Bot shutting down (v{}). Uptime: 1h 1m 1s",
         env!("CARGO_PKG_VERSION")
     )));
+}
+
+#[tokio::test]
+async fn graceful_shutdown_emits_notices_before_cutoff() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Arc::new(Sink::default());
+    let app = Arc::clone(&f.app);
+    let delivery = Arc::clone(&sink);
+    assert!(f.app.activation.may_record());
+    crate::activation::drain_for_shutdown_notices(&f.app.activation, async move {
+        assert!(app.activation.may_record());
+        let sent = emit_shutdown_notices_to(
+            &app,
+            delivery,
+            vec![GuildId::new(789)],
+            shutdown_notice_content(1),
+            SHUTDOWN_NOTICE_PHASE,
+        )
+        .await;
+        assert_eq!(sent, 1);
+    })
+    .await;
+    assert!(!f.app.activation.may_record());
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lease_loss_cutoff_emits_no_shutdown_notices() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    f.app.activation.note_lease_lost();
+    let sink = Arc::new(Sink::default());
+    let sent = emit_shutdown_notices_to(
+        &f.app,
+        sink.clone(),
+        vec![GuildId::new(789)],
+        shutdown_notice_content(1),
+        SHUTDOWN_NOTICE_PHASE,
+    )
+    .await;
+    assert_eq!(sent, 0);
+    assert!(sink.messages.lock().unwrap().is_empty());
+    assert!(!f.app.activation.may_record());
 }
 
 #[tokio::test]

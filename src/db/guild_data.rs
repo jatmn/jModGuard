@@ -25,6 +25,8 @@ const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
     include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
 const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
     include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
+const LOCAL_WRITE_FENCE_SCHEMA: &str =
+    include_str!("../../migrations/guild/0015_local_write_fence.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -54,6 +56,8 @@ pub struct GuildStoreOptions {
     pub url: String,
     pub token: String,
     pub pool_size: u32,
+    /// Readers never take the writer lock. The API sets this when its core pool is read-only.
+    pub read_only: bool,
 }
 
 /// Keeps the raw pool private so core schema operations cannot accidentally target it.
@@ -213,6 +217,8 @@ fn verify_identity_version(
             "trigger",
             "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
         ),
+        (15, "table", "guild_local_write_fence guild_writer_epoch"),
+        (15, "trigger", "guild_case_settle_retain"),
     ];
     for (version, kind, names) in required {
         if wanted >= *version {
@@ -274,6 +280,14 @@ fn initialize_store(
         let needs_write =
             create && ((1..VERSION).contains(&version) || (version == 0 && objects == 0));
         if !needs_write {
+            if !create && (1..VERSION).contains(&version) {
+                verify_identity_version(&tx, expected, version)?;
+                tx.finish_read()?;
+                return Err(SchemaNotReady(format!(
+                    "guild store schema {version} is older than {VERSION}; waiting for the bot to migrate it"
+                ))
+                .into());
+            }
             verify_identity(&tx, expected)?;
             tx.finish_read()?;
             return Ok(());
@@ -333,6 +347,9 @@ fn initialize_store(
         if version < 14 {
             tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
         }
+        if version < 15 {
+            tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -355,6 +372,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -397,6 +415,69 @@ impl GuildDataStore {
         Self::connect(options, expected, false)
     }
 
+    /// Build a store with the real guild migrations through `version` and stop there.
+    /// The writable initializer is what advances it later.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_historical_store(
+        options: GuildStoreOptions,
+        expected: StoreRegistration,
+        version: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (1..VERSION).contains(&version),
+            "historical guild schema is outside 1..{VERSION}"
+        );
+        let opts = DbOpenOptions {
+            path: options.path,
+            url: options.url,
+            token: options.token,
+            pool_size: options.pool_size,
+            migrate: false,
+            read_only: false,
+            default_prefix: String::new(),
+            retention_days: 0,
+        };
+        Db::open_with_bootstrap(
+            &opts,
+            |conn| {
+                let mut tx = conn.transaction_immediate()?;
+                let batches: &[(&str, i64)] = &[
+                    (SCHEMA, 1),
+                    (TENANT_SCHEMA, 2),
+                    (CASE_SCHEMA, 3),
+                    (HISTORY_SCHEMA, 4),
+                    (SOURCE_SCHEMA, 5),
+                    (EVIDENCE_SCHEMA, 6),
+                    (BUNNY_SCHEMA, 7),
+                    (ERASURE_SCHEMA, 8),
+                    (SNAPSHOT_SCHEMA, 9),
+                    (MEMBER_SCHEMA, 10),
+                    (MEMBER_STATUS_SCHEMA, 11),
+                    (MEMBER_PROGRESS_SCHEMA, 12),
+                    (MEMBER_UNRESOLVED_AUDITS_SCHEMA, 13),
+                    (MEMBER_CASE_RETAIN_REVISION_SCHEMA, 14),
+                    (LOCAL_WRITE_FENCE_SCHEMA, 15),
+                ];
+                for (sql, at) in batches {
+                    if *at <= version {
+                        tx.execute_batch_bounded(sql, 32_000_000)?;
+                    }
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_rows(
+                    "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
+                    params![FAMILY, expected.id().as_str(), owner(&expected)],
+                    1,
+                )?;
+                tx.pragma_update(None, "user_version", version)?;
+                tx.commit()?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
     /// Read a stamped installation identity without creating or upgrading schema.
     /// Missing local files and empty databases return `None`.
     pub fn existing_registration(options: GuildStoreOptions) -> Result<Option<StoreRegistration>> {
@@ -410,6 +491,7 @@ impl GuildDataStore {
             token: options.token,
             pool_size: options.pool_size,
             migrate: false,
+            read_only: options.read_only,
             default_prefix: String::new(),
             retention_days: 0,
         };
@@ -435,6 +517,7 @@ impl GuildDataStore {
             pool_size: options.pool_size,
             // Not consumed by this schema's bootstrap. No core defaults are seeded.
             migrate: false,
+            read_only: options.read_only,
             default_prefix: String::new(),
             retention_days: 0,
         };
@@ -452,11 +535,207 @@ impl GuildDataStore {
 
     /// Bot/API tenant runtimes attach the core database so persisted write fences fail closed on
     /// guild-store mutations, not only at `TenantRuntime::live` handle acquisition.
+    ///
+    /// When the core pool has an armed writer, every guild mutation commit re-reads the core
+    /// `active_bot_lease` row under a short writer lock, then commits after that lock is
+    /// released. The guild transaction also requires `guild_writer_epoch` to equal the
+    /// generation snapshotted for that commit. An empty owner slot does not query and does
+    /// not change commits.
     pub fn with_core_write_fence(self, core: Db) -> Self {
+        self.db.follow_writer_generation(&core);
+        let probe_core = core.clone();
+        self.db
+            .install_commit_lease_probe(std::sync::Arc::new(move |commit| {
+                Self::confirm_core_writer_lease(&probe_core, commit)
+            }));
         Self {
             core: Some(core),
             ..self
         }
+    }
+
+    /// Raise this store's epoch to `generation` when the stored value is absent or lower.
+    /// A higher stored value is left unchanged and reported as a lost lease.
+    pub async fn raise_writer_epoch(&self, generation: i64) -> Result<()> {
+        anyhow::ensure!(generation > 0, "active bot generation is corrupt");
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_read()?;
+                let stored: Option<i64> = tx
+                    .query_row(
+                        "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                if stored == Some(generation) {
+                    tx.finish_read()?;
+                    return Ok(());
+                }
+                if stored.is_some_and(|value| value > generation) {
+                    tx.finish_read()?;
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_rows(
+                    "INSERT INTO guild_writer_epoch(singleton, generation) VALUES(1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
+                     WHERE guild_writer_epoch.generation < excluded.generation",
+                    params![generation],
+                    1,
+                )?;
+                let raised: Option<i64> = tx
+                    .query_row(
+                        "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                if raised != Some(generation) {
+                    tx.finish_read()?;
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Re-read the core lease, then release that writer lock before the guild `COMMIT`.
+    /// An empty owner slot does not query. The guild epoch check inside the guild
+    /// transaction is what rejects a stale holder. Renewal of the same owner does not
+    /// take a new generation and does not wait on the guild commit.
+    fn confirm_core_writer_lease(core: &Db, commit: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let Some(expected) = core.leased_owner() else {
+            return commit();
+        };
+        Self::read_core_lease(core, &expected)?;
+        #[cfg(test)]
+        if let Some(hook) = core.take_before_final_lease_reread() {
+            hook();
+        }
+        core.with_conn_sync(|conn| {
+            let tx = conn.transaction_primary_read()?;
+            let value = Self::lease_row(&tx)?;
+            if let Err(error) =
+                crate::db_compat::reject_active_bot_lease(value.as_deref(), &expected)
+            {
+                let _ = tx.finish_read();
+                return Err(error);
+            }
+            tx.finish_read()
+        })?;
+        core.with_conn_sync(|conn| {
+            // Deferred snapshot: it does not reserve the writer lock, so renewal
+            // can commit while the remote guild COMMIT is still in flight.
+            let tx = conn.transaction_primary_snapshot()?;
+            #[cfg(test)]
+            if let Some(hook) = core.take_during_leased_guild_commit() {
+                hook();
+            }
+            let committed = commit();
+            let finished = tx.finish_read();
+            #[cfg(test)]
+            let finished = if core.take_lease_cleanup_failure() {
+                Err(anyhow::anyhow!("injected core read cleanup failure"))
+            } else {
+                finished
+            };
+            match committed {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    if let Err(error) = finished {
+                        tracing::warn!(
+                            "core lease read cleanup failed after guild commit: {error:#}"
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn read_core_lease(core: &Db, expected: &str) -> Result<()> {
+        core.with_conn_sync(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let value = Self::lease_row(&tx)?;
+            tx.finish_read()?;
+            crate::db_compat::reject_active_bot_lease(value.as_deref(), expected)
+        })
+    }
+
+    fn lease_row(tx: &crate::db_compat::Transaction) -> Result<Option<String>> {
+        tx.query_row(
+            "SELECT value FROM meta WHERE key='active_bot_lease'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+        .optional()
+    }
+
+    pub(super) fn confirm_captured_enrollment(
+        core: &Option<Db>,
+        scope: &GuildDataScope,
+    ) -> Result<()> {
+        let Some(core) = core else {
+            return Ok(());
+        };
+        core.with_conn_sync(|conn| {
+            super::enrollments::verify_enrollment_conn(conn, scope.enrollment())
+        })
+    }
+
+    pub async fn confirm_active_enrollment(&self, scope: GuildDataScope) -> Result<()> {
+        let core = self.core.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
+                    tx.finish_read()?;
+                    return Err(error);
+                }
+                tx.finish_read()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Record the guild-local fence first, then the core fence row.
+    pub async fn publish_guild_write_fence(
+        &self,
+        guild: i64,
+        fenced_at_ms: i64,
+        generation: &str,
+        destination_store_id: &str,
+        destination_revision: &str,
+    ) -> Result<()> {
+        self.record_local_write_fence(guild, fenced_at_ms).await?;
+        let Some(core) = self.core.clone() else {
+            anyhow::bail!("guild write fence requires the core database");
+        };
+        let generation = generation.to_owned();
+        let destination_store_id = destination_store_id.to_owned();
+        let destination_revision = destination_revision.to_owned();
+        core.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id, generation, phase, destination_store_id, destination_revision, created_at
+                 ) VALUES(?1, ?2, 'freeze', ?3, ?4, ?5)",
+                params![
+                    guild,
+                    generation,
+                    destination_store_id,
+                    destination_revision,
+                    fenced_at_ms
+                ],
+                8192,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     pub(super) async fn refuse_fenced_guild_write(&self, guild: i64) -> Result<()> {

@@ -12,6 +12,20 @@ async fn main() -> Result<()> {
     let offline_write =
         std::env::var("JMODGUARD_PROCESS_PROBE").ok().as_deref() == Some("api-write");
 
+    init_tracing(&cfg.log, "api");
+    jmodguard::set_shutdown_context("api");
+    if let Some(message) = jmodguard::launcher_child::refusal_message() {
+        tracing::error!("{message}");
+        let listener = tokio::net::TcpListener::bind(&cfg.web.bind)
+            .await
+            .with_context(|| format!("failed to bind API on {}", cfg.web.bind))?;
+        let bound = listener.local_addr()?;
+        tracing::info!("health listener (api) on http://{bound}/health");
+        health::serve_while(&listener, shutdown_signal()).await;
+        jmodguard::log_shutdown_finished("api");
+        tracing::info!("API process stopped");
+        return Ok(());
+    }
     if !offline_write
         && (cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty())
     {
@@ -22,9 +36,6 @@ async fn main() -> Result<()> {
              JMODGUARD_OAUTH_CLIENT_SECRET."
         );
     }
-
-    init_tracing(&cfg.log, "api");
-    jmodguard::set_shutdown_context("api");
     if std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1") {
         return web::recovery::serve(cfg).await;
     }

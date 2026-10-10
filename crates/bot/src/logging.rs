@@ -863,7 +863,18 @@ async fn emit_to_observed_with_audit(
             .unwrap_or_else(|| default_template(event));
         templates::format_log_timestamps(&mut vars);
         let rendered = render_log_template(event, template, &mut vars);
-        sink.send(channel_id, log_message(&rendered)).await?;
+        if !app.activation.may_record() {
+            return Ok(Delivery::Dropped);
+        }
+        match crate::discord::race_discord_call(
+            &app.activation,
+            sink.send(channel_id, log_message(&rendered)),
+        )
+        .await
+        {
+            crate::discord::DiscordCall::Cancelled => return Ok(Delivery::Dropped),
+            crate::discord::DiscordCall::Finished(result) => result?,
+        }
         Ok::<_, anyhow::Error>(Delivery::Sent)
     })
     .await;
@@ -1589,10 +1600,13 @@ pub(crate) async fn emit_retained_bulk(
             || !matches!(
                 tokio::time::timeout(
                     left,
-                    destination.send_message(&ctx.http, log_message(&rendered))
+                    crate::discord::race_discord_call(
+                        &app.activation,
+                        destination.send_message(&ctx.http, log_message(&rendered)),
+                    ),
                 )
                 .await,
-                Ok(Ok(_))
+                Ok(crate::discord::DiscordCall::Finished(Ok(_)))
             )
         {
             record_delivery_failure(app);
@@ -1612,12 +1626,15 @@ pub(crate) async fn emit_retained_bulk(
         log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
     match tokio::time::timeout(
         deadline.saturating_sub(started.elapsed()),
-        destination.send_message(&ctx.http, message),
+        crate::discord::race_discord_call(
+            &app.activation,
+            destination.send_message(&ctx.http, message),
+        ),
     )
     .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(serenity::Error::Http(error)))
+        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {}
+        Ok(crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(error))))
             if error
                 .status_code()
                 .is_some_and(|status| status.as_u16() == 403) =>
@@ -1631,10 +1648,13 @@ pub(crate) async fn emit_retained_bulk(
                     || !matches!(
                         tokio::time::timeout(
                             left,
-                            destination.send_message(&ctx.http, log_message(&details))
+                            crate::discord::race_discord_call(
+                                &app.activation,
+                                destination.send_message(&ctx.http, log_message(&details)),
+                            ),
                         )
                         .await,
-                        Ok(Ok(_))
+                        Ok(crate::discord::DiscordCall::Finished(Ok(_)))
                     )
                 {
                     record_delivery_failure(app);
@@ -1759,6 +1779,9 @@ pub async fn emit_mod_action(
     source_channel_id: u64,
     reason: &str,
 ) {
+    if !app.activation.may_record() {
+        return;
+    }
     let mut vars = templates::user_vars(target_id, target_name, target_display);
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());

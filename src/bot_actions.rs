@@ -67,7 +67,7 @@ impl Action {
 }
 
 /// Storage limits loaded by bot/API; keep matching admission/retention values.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
     pub pending_per_guild: u32,

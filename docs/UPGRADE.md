@@ -25,7 +25,7 @@ core. Before rollout, configure both services with the shared-store URL/token pa
 and an explicit evidence backend from [the Bunny runbook](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).
 Local installs use `{core-path}.guild.db` and, on Unix, `{core-path}.evidence` by default.
 Keep these stores and evidence resources with their core catalog during recovery;
-a missing owned guild database fails closed. Guild schema version 14 requires matching
+a missing owned guild database fails closed. Guild schema version 15 requires matching
 binaries; rollback needs the corresponding pre-upgrade stores, not just the core file.
 The completed initial member import marker is preserved by compatible upgrades;
 upgrading does not trigger another full roster or current-ban scan. See [MEMBERS.md](MEMBERS.md).
@@ -89,6 +89,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 With the launcher-aware coordinated-update baseline installed, supported in-container upgrades
 use **Administration → Updates → Update bot and API together / recovery**.
+Paired bot and API upgrades are refused until signed, launcher-routed upgrades land (issue 188).
+Single-container installs still work. Schema changes ship in new images.
 That flow enforces the stop/migrate/start ordering below and persists restart
 recovery. See [Bunny updates](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
 Normal Update installs a required launcher before its application; the update page
@@ -147,9 +149,11 @@ database backup unless a release note says otherwise.
 
 ## Bunny / dual-container notes
 
-Same order: migrate with the bot app, then roll the API app. Both must keep
-using the same Bunny Database. Upload matching `frontend/` to Storage and purge
-the Pull Zone when the page needs the new API. CSS-only UI updates do not
+Both containers ship together in one app update. The bot container migrates,
+and the API container keeps `/health` at 200 and `/ready` at 503 until the
+schema matches. Both must keep using the same Bunny Database. Upload
+matching `frontend/` to Storage and purge the Pull Zone when the page needs
+the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **Override Origin URL** (`OriginUrl`), not OriginMagicContainers.
 

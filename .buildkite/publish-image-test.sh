@@ -234,21 +234,21 @@ for component in bot api webui; do
 done
 
 # Migration origins are distinct from exact application runtime ranges.
-for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=14; do
+for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=15; do
   contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
 done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" .)
-for field in launcher-revision=2 min-launcher-revision=1; do
+for field in launcher-revision=3 min-launcher-revision=3; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 2;$/pub const LAUNCHER_REVISION: u32 = 7;/' \
-    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 4;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 3;$/pub const LAUNCHER_REVISION: u32 = 7;/' \
+    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 4;/' \
     src/db/update_control.rs > "$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source")
 for field in launcher-revision=7 min-launcher-revision=4; do

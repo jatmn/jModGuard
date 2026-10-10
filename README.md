@@ -62,10 +62,12 @@ cp config.example.toml config.toml     # add your token + OAuth ids
 ```
 
 Start the bot once before the API so schema creation/migrations and default-data
-bootstrap are complete. The API waits about 30 seconds locally, or about six
-minutes against a remote database. Both
-processes use the same local SQLite file (`db.path`) or remote libSQL database
-(`db.url` and `db.token`).
+bootstrap are complete. The API does not migrate. It keeps retrying with a
+capped delay. `/health` stays 200. `/ready` and app routes stay 503 until it
+is ready. It exits on a newer unsupported schema, rejected remote credentials
+and other non-retryable open errors, and bad config such as an empty OAuth
+client id or secret. Both processes use the same local SQLite file (`db.path`)
+or remote libSQL database (`db.url` and `db.token`).
 
 Full walkthrough (Discord developer portal, intents, invite URL, systemd):
 **[docs/SETUP.md](docs/SETUP.md)**.

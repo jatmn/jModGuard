@@ -68,10 +68,11 @@ Environment-only (not in `config.toml`):
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0017_hot_query_indexes.sql`) and is applied by
-`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
-locally, or about six minutes on a remote database, for the bot to finish
-bootstrap or for a transient connect/lock to clear, then serves HTTP; it
-exits if that wait expires).
+`jmodguard-bot` on startup. The API opens with `migrate=false` and does not
+migrate. It keeps retrying with a capped delay. `/health` stays 200. `/ready`
+and app routes stay 503 until it is ready. It exits on a newer unsupported
+schema, rejected remote credentials and other non-retryable open errors, and
+bad config such as an empty OAuth client id or secret.
 
 | Table | Holds |
 |---|---|

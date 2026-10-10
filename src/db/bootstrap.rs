@@ -4,14 +4,23 @@ pub(super) fn configure_connection(
     connection: &Connection,
     remote: bool,
     busy_timeout_ms: u32,
+    read_only: bool,
 ) -> Result<()> {
     if remote {
         // Hrana opens a new stream for each transaction, so a connection-level
         // foreign_keys pragma would not carry into transactional writes. The
         // current schema has no FOREIGN KEY clauses; add per-transaction stream
         // setup if a future migration introduces them. Remote busy timeout is
-        // not honored; the client operation deadline is the bound.
+        // not honored; the client operation deadline is the bound. A read-only
+        // client refuses writer-lock transactions before any BEGIN is sent.
+        let _ = read_only;
         Ok(())
+    } else if read_only {
+        connection.execute_batch(&format!(
+            "PRAGMA busy_timeout={busy_timeout_ms};
+             PRAGMA foreign_keys=ON;
+             PRAGMA query_only=ON;"
+        ))
     } else {
         connection.execute_batch(&format!(
             "PRAGMA busy_timeout={busy_timeout_ms};
@@ -428,7 +437,8 @@ fn take_starting_state_failure(path: &std::path::Path) -> bool {
 }
 
 const ACTIVE_BOT_LEASE: &str = "active_bot_lease";
-const ACTIVE_BOT_LEASE_TTL_MS: i64 = 20_000;
+const ACTIVE_BOT_GENERATION: &str = "active_bot_generation";
+pub const ACTIVE_BOT_LEASE_TTL_MS: i64 = 20_000;
 
 fn valid_bot_instance(instance: &str) -> bool {
     instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -447,10 +457,38 @@ fn lease_blocks(current: Option<&str>, instance: &str, now_ms: i64) -> bool {
     owner != instance && expires > now_ms
 }
 
+/// The current owner still holds an unexpired row. Expired and foreign rows are fresh claims.
+fn lease_is_renewal(current: Option<&str>, instance: &str, now_ms: i64) -> bool {
+    let Some(value) = current else {
+        return false;
+    };
+    let Some((owner, expires)) = value.rsplit_once(' ') else {
+        return false;
+    };
+    let Ok(expires) = expires.parse::<i64>() else {
+        return false;
+    };
+    owner == instance && expires > now_ms
+}
+
+fn generation_value(raw: Option<&str>) -> Result<i64> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let value = raw
+        .parse::<i64>()
+        .context("active bot generation is corrupt")?;
+    anyhow::ensure!(value >= 0, "active bot generation is corrupt");
+    Ok(value)
+}
+
 /// Take or renew the active-bot lease under the writer lock.
 ///
-/// `refuse` is checked after the lock is held. When it is set, this does not
-/// write, so a shutdown that already started cannot reclaim the lease.
+/// A fresh lease (row absent, expired, or owned by someone else) increments
+/// `active_bot_generation` in the same transaction. A renewal by the current
+/// owner keeps that generation. `refuse` is checked after the lock is held.
+/// When it is set, this does not write, so a shutdown that already started
+/// cannot reclaim the lease.
 pub async fn claim_active_bot(
     db: &Db,
     instance: &str,
@@ -459,31 +497,59 @@ pub async fn claim_active_bot(
 ) -> Result<bool> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        if refuse.load(std::sync::atomic::Ordering::Acquire) {
-            tx.finish_read()?;
-            return Ok(false);
-        }
-        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
-        if lease_blocks(current.as_deref(), &instance, now_ms) {
-            tx.finish_read()?;
-            return Ok(false);
-        }
-        let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
-        tx.ensure_mutation_receipt()?;
-        write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
-        tx.commit()?;
-        Ok(true)
-    })
-    .await
+    let armed = instance.clone();
+    let generation = db
+        .with_conn(move |conn| {
+            // This transaction writes the lease row. It must commit even when a
+            // previous owner is still armed on the pool.
+            conn.set_expected_lease_owner(None);
+            let mut tx = conn.transaction_primary_read()?;
+            if refuse.load(std::sync::atomic::Ordering::Acquire) {
+                tx.finish_read()?;
+                return Ok(None);
+            }
+            let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+            if lease_blocks(current.as_deref(), &instance, now_ms) {
+                tx.finish_read()?;
+                return Ok(None);
+            }
+            let renewal = lease_is_renewal(current.as_deref(), &instance, now_ms);
+            let stored =
+                generation_value(meta_string_conn(&tx, ACTIVE_BOT_GENERATION)?.as_deref())?;
+            let generation = if renewal {
+                if stored > 0 { stored } else { 1 }
+            } else {
+                stored
+                    .checked_add(1)
+                    .context("active bot generation overflow")?
+            };
+            let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+            tx.ensure_mutation_receipt()?;
+            write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
+            if !renewal || stored == 0 {
+                write_meta_string_conn(&tx, ACTIVE_BOT_GENERATION, &generation.to_string())?;
+            }
+            tx.commit()?;
+            Ok(Some(generation))
+        })
+        .await?;
+    let Some(generation) = generation else {
+        return Ok(false);
+    };
+    db.arm_writer_term(&armed, generation);
+    Ok(true)
 }
 
 /// Drop the lease only when this instance still owns the row.
+///
+/// The generation is left in place. The next fresh claim increments it.
 pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
     db.with_conn(move |conn| {
+        // The delete removes the row this commit would re-read. Ownership is
+        // checked below; the pool stays armed so later commits fail.
+        conn.set_expected_lease_owner(None);
         let mut tx = conn.transaction_primary_read()?;
         let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
         let owned = current
@@ -494,9 +560,10 @@ pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
             return Ok(());
         }
         tx.ensure_mutation_receipt()?;
+        let owner_prefix = format!("{instance} ");
         tx.execute_rows(
-            "DELETE FROM meta WHERE key = ?1",
-            params![ACTIVE_BOT_LEASE],
+            "DELETE FROM meta WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
+            params![ACTIVE_BOT_LEASE, owner_prefix],
             1,
         )?;
         tx.commit()?;
@@ -514,7 +581,7 @@ pub(super) const SETTINGS_HEAL_GENERATION: &str = "3";
 pub(super) const META_SETTINGS_HEAL_GENERATION: &str = "settings_heal_generation";
 pub(super) const META_SETTINGS_HEAL_CHECKSUM: &str = "settings_heal_checksum";
 
-pub(super) fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Option<String>> {
+pub fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
         Ok(r.get(0)?)
     })
@@ -522,11 +589,7 @@ pub(super) fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Opt
     .context("meta lookup failed")
 }
 
-pub(super) fn write_meta_string_conn(
-    conn: &impl SqlExecutor,
-    key: &str,
-    value: &str,
-) -> Result<()> {
+pub fn write_meta_string_conn(conn: &impl SqlExecutor, key: &str, value: &str) -> Result<()> {
     conn.execute_rows(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

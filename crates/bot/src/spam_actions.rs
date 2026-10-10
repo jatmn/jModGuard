@@ -353,6 +353,9 @@ async fn enforce(
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();
     for (channel, message) in &found.messages {
+        if !app.activation.may_record() {
+            break;
+        }
         if !app
             .spam_gate
             .claim_delete(found.guild, found.author, *channel, *message, now)
@@ -362,17 +365,20 @@ async fn enforce(
         }
         let outcome = match tokio::time::timeout(
             Duration::from_secs(10),
-            http.delete_message(
-                ChannelId::new(*channel),
-                MessageId::new(*message),
-                Some("spam match"),
+            crate::discord::race_discord_call(
+                &app.activation,
+                http.delete_message(
+                    ChannelId::new(*channel),
+                    MessageId::new(*message),
+                    Some("spam match"),
+                ),
             ),
         )
         .await
         {
-            Ok(Ok(())) => CaseOutcome::Succeeded,
-            Ok(Err(error)) => delete_outcome(&error),
-            Err(_) => CaseOutcome::Uncertain,
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
         app.spam_gate.finish_delete(
             found.guild,
@@ -383,6 +389,9 @@ async fn enforce(
             matches!(outcome, CaseOutcome::Succeeded),
         );
         delete_notes.push(format!("{channel}/{message} {outcome:?}"));
+        if !app.activation.may_record() {
+            break;
+        }
         crate::cases::record(
             app,
             Some(enrollment.clone()),
@@ -397,67 +406,87 @@ async fn enforce(
         .await;
     }
     let mut ban_outcome = None;
-    let mut ban_case = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
-        let pending_ban =
-            crate::member_directory::begin_ban_attempt(app, found.guild, found.author).await;
-        let suppression = app.suppress_next_gateway_case(
-            crate::state::GatewayCaseAction::Ban,
-            found.guild,
-            found.author,
-        );
-        let discord = tokio::time::timeout(
-            Duration::from_secs(10),
-            GuildId::new(found.guild).ban_with_reason(
-                http,
-                UserId::new(found.author),
-                0,
-                &found.reason,
-            ),
-        )
-        .await;
-        let outcome = match discord {
-            Ok(Ok(())) => CaseOutcome::Succeeded,
-            Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
-            Err(_) => CaseOutcome::Uncertain,
-        };
-        app.spam_gate.finish_ban(
-            found.guild,
-            found.author,
-            now,
-            matches!(outcome, CaseOutcome::Succeeded),
-        );
-        if release_gateway_ban_suppression(&outcome) {
-            app.release_gateway_case_suppression(suppression);
-        }
-        if matches!(outcome, CaseOutcome::Succeeded) {
-            let _ = crate::db::record_enrolled_ban(
-                &app.db,
-                Some(enrollment.clone()),
-                found.author as i64,
-                None,
-                &format!("[automod:{rule}] {}", found.reason),
-            )
-            .await;
-        }
-        ban_outcome = Some(outcome.clone());
-        ban_case = crate::cases::record_application(
+        let decision = crate::member_directory::observe_ban_handoff(
             app,
-            Some(enrollment.clone()),
-            CaseAction::Ban,
-            outcome.clone(),
+            http,
+            found.guild,
             found.author,
-            None,
-            Some(found.reason.clone()),
-            evidence(found.excerpts.clone()),
+            crate::member_directory::MarkerSave::Missing,
         )
         .await;
-        pending_ban.finish(app, outcome).await;
-    }
-    if found.kind == Kind::Image
-        && let Some(case_id) = ban_case
-    {
-        capture_attachments(app, enrollment, case_id, &found.attachments).await;
+        match decision {
+            crate::member_directory::BanContinuation::Stop => {}
+            crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                crate::cases::settle_present_application_ban(
+                    app,
+                    Some(enrollment.clone()),
+                    found.author,
+                    reason.as_deref(),
+                )
+                .await;
+            }
+            crate::member_directory::BanContinuation::RecordOnly { reason } => {
+                if continue_present_spam_ban(
+                    app,
+                    enrollment.clone(),
+                    found.author,
+                    rule,
+                    &found.reason,
+                    reason.as_deref(),
+                )
+                .await
+                {
+                    ban_outcome = Some(CaseOutcome::Succeeded);
+                }
+            }
+            crate::member_directory::BanContinuation::BanThenRecord => {
+                if app.activation.may_record() {
+                    let pending_ban =
+                        crate::member_directory::begin_ban_attempt(app, found.guild, found.author)
+                            .await;
+                    if app.activation.may_record() {
+                        let attempted = match crate::db::guild_data::CaseId::try_from(
+                            pending_ban.operation_id().to_owned(),
+                        ) {
+                            Ok(operation_id) => {
+                                crate::cases::begin_application_attempt(
+                                    app,
+                                    Some(enrollment.clone()),
+                                    CaseAction::Ban,
+                                    found.author,
+                                    None,
+                                    Some(found.reason.clone()),
+                                    evidence(found.excerpts.clone()),
+                                    operation_id,
+                                )
+                                .await
+                            }
+                            Err(_) => None,
+                        };
+                        if let Some(outcome) = dispatch_spam_ban(
+                            app,
+                            enrollment.clone(),
+                            &found,
+                            rule,
+                            now,
+                            pending_ban,
+                            attempted,
+                            GuildId::new(found.guild).ban_with_reason(
+                                http,
+                                UserId::new(found.author),
+                                0,
+                                &found.reason,
+                            ),
+                        )
+                        .await
+                        {
+                            ban_outcome = Some(outcome);
+                        }
+                    }
+                }
+            }
+        }
     }
     let action = match ban_outcome {
         None => "delete remaining; ban already applied this window".into(),
@@ -488,6 +517,40 @@ async fn enforce(
     ]);
     crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
     ReportDisposition::Consumed
+}
+
+pub(crate) async fn continue_present_spam_ban(
+    app: &BotState,
+    enrollment: crate::db::GuildEnrollment,
+    author: u64,
+    rule: &str,
+    reason: &str,
+    discord_reason: Option<&str>,
+) -> bool {
+    crate::cases::settle_present_application_ban(
+        app,
+        Some(enrollment.clone()),
+        author,
+        discord_reason,
+    )
+    .await;
+    app.activation.may_record()
+        && crate::db::record_enrolled_ban_if_absent(
+            &app.db,
+            Some(enrollment),
+            author as i64,
+            None,
+            None,
+            None,
+            None,
+            &format!("[automod:{rule}] {reason}"),
+            None,
+            crate::db::BanRecord::Retry,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
@@ -571,12 +634,105 @@ impl Drop for RemoveCapture {
     }
 }
 
+#[cfg(test)]
+static HOLD_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static SPAM_PHASES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Discord ban, then the case and the core mirror. Capture is last so a slow
+/// download cannot delay or drop the mirror.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_spam_ban<B>(
+    app: &Arc<BotState>,
+    enrollment: crate::db::GuildEnrollment,
+    found: &Match,
+    rule: &str,
+    now: Instant,
+    pending_ban: crate::member_directory::PendingBan,
+    attempted: Option<crate::cases::ApplicationAttempt>,
+    ban: B,
+) -> Option<CaseOutcome>
+where
+    B: std::future::Future<Output = Result<(), serenity::Error>>,
+{
+    let suppression = app.suppress_next_gateway_case(
+        crate::state::GatewayCaseAction::Ban,
+        found.guild,
+        found.author,
+    );
+    let discord = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::discord::race_discord_call(&app.activation, ban),
+    )
+    .await;
+    if matches!(discord, Ok(crate::discord::DiscordCall::Cancelled)) {
+        app.spam_gate
+            .finish_ban(found.guild, found.author, now, false);
+        pending_ban.finish(app, CaseOutcome::Uncertain).await;
+        return None;
+    }
+    let outcome = match discord {
+        Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
+        Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+            crate::cases::classify_discord(Some(&error))
+        }
+        Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
+    };
+    app.spam_gate.finish_ban(
+        found.guild,
+        found.author,
+        now,
+        matches!(outcome, CaseOutcome::Succeeded),
+    );
+    if release_gateway_ban_suppression(&outcome) {
+        app.release_gateway_case_suppression(suppression);
+    }
+    if !app.activation.may_record() {
+        return None;
+    }
+    let case_id = if let Some(attempt) = attempted {
+        attempt.finish(app, outcome.clone()).await
+    } else {
+        None
+    };
+    pending_ban.finish(app, outcome.clone()).await;
+    if matches!(outcome, CaseOutcome::Succeeded) {
+        let _ = crate::db::record_enrolled_ban_if_absent(
+            &app.db,
+            Some(enrollment.clone()),
+            found.author as i64,
+            None,
+            None,
+            None,
+            None,
+            &format!("[automod:{rule}] {}", found.reason),
+            None,
+            crate::db::BanRecord::Fresh,
+        )
+        .await;
+    }
+    if app.activation.may_record()
+        && found.kind == Kind::Image
+        && let Some(case_id) = case_id
+    {
+        capture_attachments(app, enrollment, case_id, &found.attachments).await;
+    }
+    Some(outcome)
+}
+
 async fn capture_attachments(
     app: &BotState,
     enrollment: crate::db::GuildEnrollment,
     case_id: crate::db::guild_data::CaseId,
     attachments: &[ProvingAttachment],
 ) {
+    #[cfg(test)]
+    {
+        SPAM_PHASES.lock().push("capture-start");
+        while HOLD_CAPTURE.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
     if !app.tenant.evidence_enabled() {
         return;
     }
@@ -772,5 +928,145 @@ mod tests {
         assert!(!release_gateway_ban_suppression(&CaseOutcome::Succeeded));
         assert!(!release_gateway_ban_suppression(&CaseOutcome::Uncertain));
         assert!(release_gateway_ban_suppression(&CaseOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn image_ban_future_finishes_before_capture_starts() {
+        use std::sync::atomic::Ordering;
+        struct ReleaseHold;
+        impl Drop for ReleaseHold {
+            fn drop(&mut self) {
+                HOLD_CAPTURE.store(false, Ordering::SeqCst);
+                SPAM_PHASES.lock().clear();
+            }
+        }
+        let _release = ReleaseHold;
+        HOLD_CAPTURE.store(true, Ordering::SeqCst);
+        SPAM_PHASES.lock().clear();
+        let path =
+            std::env::temp_dir().join(format!("spam_order_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let app_ban = std::sync::Arc::clone(&app);
+        let enrollment_ban = enrollment.clone();
+        let task = tokio::spawn(async move {
+            let pending = crate::member_directory::begin_ban_attempt(&app_ban, 10, 99).await;
+            let operation =
+                crate::db::guild_data::CaseId::try_from(pending.operation_id().to_owned()).unwrap();
+            let attempted = crate::cases::begin_application_attempt(
+                &app_ban,
+                Some(enrollment_ban.clone()),
+                CaseAction::Ban,
+                99,
+                None,
+                Some("image spam".into()),
+                CaseEvidence::Unavailable,
+                operation,
+            )
+            .await;
+            let found = Match {
+                kind: Kind::Image,
+                guild: 10,
+                author: 99,
+                channel: 5,
+                policy: MatchPolicy::Image(jmodguard::image_spam::Policy {
+                    mode: "exact_image_test".into(),
+                    window_secs: 60,
+                    min_channels: 3,
+                    min_attachments: 2,
+                    enforce: true,
+                }),
+                token: (0, 0),
+                messages: Vec::new(),
+                excerpts: Vec::new(),
+                attachments: Vec::new(),
+                reason: "image spam".into(),
+            };
+            dispatch_spam_ban(
+                &app_ban,
+                enrollment_ban,
+                &found,
+                "attachment_flood",
+                Instant::now(),
+                pending,
+                attempted,
+                async {
+                    SPAM_PHASES.lock().push("ban-enter");
+                    SPAM_PHASES.lock().push("ban-complete");
+                    Ok(())
+                },
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if SPAM_PHASES.lock().contains(&"capture-start") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture did not start: {:?}",
+                SPAM_PHASES.lock().clone()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            SPAM_PHASES.lock().clone(),
+            vec!["ban-enter", "ban-complete", "capture-start"]
+        );
+        let mirrored: i64 = app
+            .db
+            .with_conn(|conn| {
+                use crate::db::SqlExecutor;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                    crate::db::params![10_i64, 99_i64],
+                    |row| {
+                        let count: i64 = row.get(0).map_err(|error| anyhow::anyhow!("{error}"))?;
+                        Ok(count)
+                    },
+                )?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            mirrored, 1,
+            "the ban mirror must exist before capture starts"
+        );
+        HOLD_CAPTURE.store(false, Ordering::SeqCst);
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome, Some(CaseOutcome::Succeeded));
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 20, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let stored = store
+            .case(scope, ids[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.outcome, CaseOutcome::Succeeded);
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 }

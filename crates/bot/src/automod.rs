@@ -383,14 +383,25 @@ pub async fn execute_pending(
         return;
     }
 
+    let mut publish_report = true;
     match rule.action.as_str() {
         "log" => {}
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-                let _ = ctx.http.delete_message(ch.into(), id.into(), None).await;
+                if !app.activation.may_record() {
+                    return;
+                }
+                let _ = crate::discord::race_discord_call(
+                    &app.activation,
+                    ctx.http.delete_message(ch.into(), id.into(), None),
+                )
+                .await;
             }
         }
         "warn" => {
+            if !app.activation.may_record() {
+                return;
+            }
             let warn_result = db::add_enrolled_warn(
                 &app.db,
                 enrollment.clone(),
@@ -399,6 +410,9 @@ pub async fn execute_pending(
                 &format!("[automod:{}] {}", pending.rule_id, reason),
             )
             .await;
+            if !app.activation.may_record() {
+                return;
+            }
             let outcome = crate::cases::classify_db_commit(&warn_result);
             crate::cases::record(
                 app,
@@ -433,16 +447,31 @@ pub async fn execute_pending(
                 if let Ok(until) =
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
                 {
-                    discord_err = member
-                        .disable_communication_until_datetime(&ctx.http, until)
-                        .await
-                        .err();
+                    if !app.activation.may_record() {
+                        return;
+                    }
+                    match crate::discord::race_discord_call(
+                        &app.activation,
+                        member.disable_communication_until_datetime(&ctx.http, until),
+                    )
+                    .await
+                    {
+                        crate::discord::DiscordCall::Cancelled => {
+                            discord_err = Some(crate::discord::cutoff_discord_error());
+                        }
+                        crate::discord::DiscordCall::Finished(result) => {
+                            discord_err = result.err();
+                        }
+                    }
                     called = true;
                 } else {
                     tracing::warn!("automod timeout: could not build Discord timeout timestamp");
                 }
             } else {
                 tracing::warn!("automod timeout: no guild member for {}", target.id);
+            }
+            if !app.activation.may_record() {
+                return;
             }
             if let Some(outcome) =
                 crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
@@ -475,14 +504,28 @@ pub async fn execute_pending(
                 target.id,
             );
             let (called, discord_err) = if let Some(member) = member {
-                (
-                    true,
-                    member.kick_with_reason(&ctx.http, &reason).await.err(),
+                if !app.activation.may_record() {
+                    return;
+                }
+                let discord_err = match crate::discord::race_discord_call(
+                    &app.activation,
+                    member.kick_with_reason(&ctx.http, &reason),
                 )
+                .await
+                {
+                    crate::discord::DiscordCall::Cancelled => {
+                        Some(crate::discord::cutoff_discord_error())
+                    }
+                    crate::discord::DiscordCall::Finished(result) => result.err(),
+                };
+                (true, discord_err)
             } else {
                 tracing::warn!("automod kick: no guild member for {}", target.id);
                 (false, None)
             };
+            if !app.activation.may_record() {
+                return;
+            }
             if let Some(outcome) =
                 crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
@@ -505,61 +548,171 @@ pub async fn execute_pending(
             }
         }
         "ban" => {
-            let pending_ban =
-                crate::member_directory::begin_ban_attempt(app, guild_id.get(), target.id.get())
-                    .await;
-            let suppression = app.suppress_next_gateway_case(
-                crate::state::GatewayCaseAction::Ban,
+            let decision = crate::member_directory::observe_ban_handoff(
+                app,
+                ctx.http.as_ref(),
                 guild_id.get(),
                 target.id.get(),
-            );
-            let discord = guild_id
-                .ban_with_reason(&ctx.http, target.id, rule.delete_days, &reason)
-                .await;
-            let outcome = crate::cases::classify_discord(discord.err().as_ref());
-            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
-                app.release_gateway_case_suppression(suppression);
-            }
-            if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
-                let _ = db::record_enrolled_ban_with_identity(
-                    &app.db,
-                    enrollment.clone(),
-                    target.id.get() as i64,
-                    Some(&target.name),
-                    target.global_name.as_deref(),
-                    None,
-                    None,
-                    &format!("[automod:{}] {}", pending.rule_id, reason),
-                    None,
-                )
-                .await;
-            }
-            crate::cases::record_application(
-                app,
-                enrollment.clone(),
-                crate::db::guild_data::CaseAction::Ban,
-                outcome.clone(),
-                target.id.get(),
-                None,
-                Some(reason.clone()),
-                crate::cases::text_excerpt(
-                    msg_channel.unwrap_or(0),
-                    msg_id.unwrap_or(0),
-                    target.id.get(),
-                    pending.evidence["content"].as_str().unwrap_or(""),
-                ),
+                crate::member_directory::MarkerSave::Missing,
             )
             .await;
-            pending_ban.finish(app, outcome).await;
+            match decision {
+                crate::member_directory::BanContinuation::Stop => {
+                    publish_report = false;
+                }
+                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                    crate::cases::settle_present_application_ban(
+                        app,
+                        enrollment.clone(),
+                        target.id.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                    publish_report = false;
+                }
+                crate::member_directory::BanContinuation::RecordOnly {
+                    reason: discord_reason,
+                } => {
+                    crate::cases::settle_present_application_ban(
+                        app,
+                        enrollment.clone(),
+                        target.id.get(),
+                        discord_reason.as_deref(),
+                    )
+                    .await;
+                    publish_report = app.activation.may_record()
+                        && db::record_enrolled_ban_if_absent(
+                            &app.db,
+                            enrollment.clone(),
+                            target.id.get() as i64,
+                            Some(&target.name),
+                            target.global_name.as_deref(),
+                            None,
+                            None,
+                            &format!("[automod:{}] {}", pending.rule_id, reason),
+                            None,
+                            db::BanRecord::Retry,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                }
+                crate::member_directory::BanContinuation::BanThenRecord => {
+                    if !app.activation.may_record() {
+                        publish_report = false;
+                    } else {
+                        let pending_ban = crate::member_directory::begin_ban_attempt(
+                            app,
+                            guild_id.get(),
+                            target.id.get(),
+                        )
+                        .await;
+                        if !app.activation.may_record() {
+                            publish_report = false;
+                        } else {
+                            let attempted = match crate::db::guild_data::CaseId::try_from(
+                                pending_ban.operation_id().to_owned(),
+                            ) {
+                                Ok(operation_id) => {
+                                    crate::cases::begin_application_attempt(
+                                        app,
+                                        enrollment.clone(),
+                                        crate::db::guild_data::CaseAction::Ban,
+                                        target.id.get(),
+                                        None,
+                                        Some(reason.clone()),
+                                        crate::cases::text_excerpt(
+                                            msg_channel.unwrap_or(0),
+                                            msg_id.unwrap_or(0),
+                                            target.id.get(),
+                                            pending.evidence["content"].as_str().unwrap_or(""),
+                                        ),
+                                        operation_id,
+                                    )
+                                    .await
+                                }
+                                Err(_) => None,
+                            };
+                            let suppression = app.suppress_next_gateway_case(
+                                crate::state::GatewayCaseAction::Ban,
+                                guild_id.get(),
+                                target.id.get(),
+                            );
+                            let raced = crate::discord::race_discord_call(
+                                &app.activation,
+                                guild_id.ban_with_reason(
+                                    &ctx.http,
+                                    target.id,
+                                    rule.delete_days,
+                                    &reason,
+                                ),
+                            )
+                            .await;
+                            match raced {
+                                crate::discord::DiscordCall::Cancelled => {
+                                    pending_ban
+                                        .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
+                                        .await;
+                                    publish_report = false;
+                                }
+                                crate::discord::DiscordCall::Finished(discord) => {
+                                    let outcome =
+                                        crate::cases::classify_discord(discord.err().as_ref());
+                                    if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed)
+                                    {
+                                        app.release_gateway_case_suppression(suppression);
+                                    }
+                                    if app.activation.may_record() {
+                                        if let Some(attempt) = attempted {
+                                            attempt.finish(app, outcome.clone()).await;
+                                        }
+                                        pending_ban.finish(app, outcome.clone()).await;
+                                    }
+                                    if !app.activation.may_record() {
+                                        publish_report = false;
+                                    } else if matches!(
+                                        outcome,
+                                        crate::db::guild_data::CaseOutcome::Succeeded
+                                    ) {
+                                        publish_report = db::record_enrolled_ban_if_absent(
+                                            &app.db,
+                                            enrollment.clone(),
+                                            target.id.get() as i64,
+                                            Some(&target.name),
+                                            target.global_name.as_deref(),
+                                            None,
+                                            None,
+                                            &format!("[automod:{}] {}", pending.rule_id, reason),
+                                            None,
+                                            db::BanRecord::Fresh,
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .is_some();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         other => {
             tracing::warn!("unknown automod action `{other}`");
         }
     }
 
+    if !publish_report {
+        return;
+    }
     // Log-only/delete-only observations are routine Discord reports. Retain
     // selected moderation records until the typed case model replaces this table.
     if matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
+        if !app.activation.may_record() {
+            return;
+        }
         let evidence = serde_json::json!({
             "rule": pending.rule_id, "action": rule.action,
             "reason": reason, "evidence": pending.evidence,

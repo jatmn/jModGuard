@@ -6,11 +6,13 @@ pub mod bot_actions;
 pub mod bunny_evidence;
 pub mod capacity;
 pub mod config;
+pub mod control;
 pub mod db;
 mod db_compat;
 pub mod defaults;
 #[cfg(unix)]
 pub mod evidence_transfer;
+pub mod launcher_child;
 pub use jmodguard_runtime::cgroup;
 pub use jmodguard_runtime::health;
 pub use jmodguard_runtime::log_shutdown_finished;

@@ -179,8 +179,13 @@ impl GuildDataStore {
             CaseError::Limit
         );
         let expected = self.expected.clone();
+        let core = self.core.clone();
         self.db.with_conn(move |conn| {
             let mut tx=conn.transaction_primary_read()?;
+            if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
+                tx.finish_read()?;
+                return Err(error);
+            }
             verify_scope(&tx,&expected,&scope,true)?;
             anyhow::ensure!(live_parent(&tx,&scope,&case)?, CaseError::Conflict);
             if note_intent {

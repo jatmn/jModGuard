@@ -1,13 +1,15 @@
 //! Stable, restricted update control. Application schema checks stay in `Db`.
 //! Future application migrations must retain the v1 control tables and keys.
 use super::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
+pub const PAIRED_UPGRADES_DISABLED: &str =
+    "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 2;
-pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;
+pub const LAUNCHER_REVISION: u32 = 3;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
 /// A controller restarted, or an owner replaced/cancelled the operation while
@@ -16,6 +18,55 @@ const UPGRADE_KEY: &str = "component_upgrade_v1";
 #[derive(Debug, thiserror::Error)]
 #[error("upgrade progress changed; retry from current state")]
 pub struct UpgradeProgressChanged;
+
+/// The bot did not confirm this launcher receipt. Callers retry; they must not
+/// treat the step as durable or as a failed child.
+#[derive(Debug, thiserror::Error)]
+#[error("launcher receipt was not saved ({status})")]
+pub struct ReceiptNotSaved {
+    pub status: String,
+}
+
+fn launcher_fence_held(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("launcher fence held"))
+}
+
+fn warn_api_launcher_cannot_record_upgrade() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        "API launcher cannot record paired-upgrade progress; the upgrade will not advance"
+    );
+}
+
+fn warn_api_launcher_observation_not_forwarded() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!("API launcher has no control link; component observations are not recorded");
+}
+
+fn transient_receipt(message: &str) -> bool {
+    message == crate::control::NOT_THE_WRITER
+        || message == crate::control::RECOVERY_IN_PROGRESS
+        || message == crate::control::CONTROL_LINK_UNAVAILABLE
+        || message == crate::control::OUTCOME_UNKNOWN
+        || message == "request expired"
+}
+
+fn receipt_not_saved(status: impl Into<String>) -> anyhow::Error {
+    ReceiptNotSaved {
+        status: status.into(),
+    }
+    .into()
+}
 
 fn require_progress(current: bool) -> Result<()> {
     if !current {
@@ -29,6 +80,7 @@ fn require_progress(current: bool) -> Result<()> {
 #[derive(Clone)]
 pub struct UpdateControl {
     db: Db,
+    writer: Option<crate::control::WriterLink>,
 }
 
 /// Immutable application compatibility of this container's baked image. A
@@ -48,6 +100,21 @@ impl BakedCompatibility {
             guild: guild_data::SCHEMA_VERSION,
         }
     }
+}
+
+fn read_baked_compatibility(
+    conn: &impl SqlExecutor,
+    key: &str,
+    base_sha: &str,
+) -> Result<BakedCompatibility> {
+    let raw = meta_string_conn(conn, key)?
+        .context("baked compatibility missing; restart the container's baked controller")?;
+    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
+    anyhow::ensure!(
+        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
+        "baked compatibility does not match this base image"
+    );
+    Ok(baked)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,7 +188,8 @@ impl ServiceUpgrade {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UpgradeAcknowledgement {
     Prepared,
     Stopped,
@@ -152,11 +220,135 @@ pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
+pub async fn record_launcher_observation(db: &Db, role: &str, revision: u32) -> Result<()> {
+    anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+    let role = role.to_owned();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let raw: Option<String> = tx.query_row(
+            "SELECT observed FROM component_updates WHERE component=?1",
+            params![role.clone()],
+            |row| Ok(row.get(0)?),
+        )?;
+        if let Some(raw) = raw {
+            let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
+            seen.launcher_revision = revision;
+            // Preserve pre-protocol baseline adoption until the baked app
+            // reports readiness; a legacy schema15 row may describe DB16.
+            if seen.update_protocol != 0 {
+                seen.update_protocol = UPDATE_CONTROL_PROTOCOL;
+            }
+            tx.execute_rows(
+                "UPDATE component_updates SET observed=?2 WHERE component=?1",
+                params![role, serde_json::to_string(&seen)?],
+                1,
+            )?;
+        }
+        tx.commit()
+    })
+    .await
+}
+
+pub async fn record_clear_superseded_launcher(
+    db: &Db,
+    role: &str,
+    release: &ComponentRelease,
+) -> Result<()> {
+    let (role, release) = (role.to_owned(), serde_json::to_string(release)?);
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute_rows(
+            "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
+            params![role, release],
+            1,
+        )?;
+        tx.commit()
+    })
+    .await
+}
+
+/// Compare the parsed release, then swap on the original stored text.
+/// Rows saved before launcher labels omit fields this serializer writes.
+pub async fn record_clear_uncontracted_launcher(
+    db: &Db,
+    role: &str,
+    release: &ComponentRelease,
+) -> Result<()> {
+    anyhow::ensure!(release.launcher.is_none(), "launcher contract is present");
+    let (role, release) = (role.to_owned(), release.clone());
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let stored: Option<String> = tx.query_row(
+            "SELECT desired_launcher FROM component_updates WHERE component=?1",
+            params![role.clone()],
+            |row| Ok(row.get(0)?),
+        )?;
+        let stored = stored.context("desired launcher is already clear")?;
+        let parsed: ComponentRelease = serde_json::from_str(&stored)?;
+        anyhow::ensure!(
+            parsed.launcher.is_none() && parsed == release,
+            "desired launcher changed before clear"
+        );
+        tx.execute_rows(
+            "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
+            params![role, stored],
+            1,
+        )?;
+        tx.commit()
+    })
+    .await
+}
+
+pub async fn record_required_launcher(
+    db: &Db,
+    release: &ComponentRelease,
+    operation: Option<String>,
+) -> Result<()> {
+    release.validate()?;
+    let release = release.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        if let Some(id) = operation {
+            let op = read_upgrade(&tx)?.context("upgrade missing")?;
+            require_progress(
+                op.id == id
+                    && op.phase == UpgradePhase::Preparing
+                    && op.error.is_none()
+                    && op.service(&release.component)?.release == release,
+            )?;
+        } else {
+            ensure_no_service_upgrade(&tx)?;
+            let row = tx.query_row(
+                &format!(
+                    "SELECT {} FROM component_updates WHERE component=?1",
+                    updates::COLS
+                ),
+                params![release.component.clone()],
+                updates::row_update,
+            )?;
+            anyhow::ensure!(
+                row.desired.as_ref() == Some(&release) || row.installed.as_ref() == Some(&release),
+                "application selection changed before launcher handoff"
+            );
+        }
+        tx.execute_rows(
+            "UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
+            params![release.component.clone(), serde_json::to_string(&release)?],
+            1,
+        )?;
+        tx.commit()
+    })
+    .await
+}
+
 impl UpdateControl {
     /// None means verified empty or an interrupted initial bootstrap without
     /// any managed selections, where the baked bot may finish initialization.
     /// An error never authorizes fallback to a baked application.
     pub fn open(opts: &DbOpenOptions) -> Result<Option<Self>> {
+        if !opts.read_only {
+            super::note_writable_open();
+        }
         let empty = std::cell::Cell::new(false);
         let db = Db::open_with_bootstrap(
             opts,
@@ -225,11 +417,74 @@ impl UpdateControl {
             },
             |_| Ok(()),
         )?;
-        Ok((!empty.get()).then_some(Self { db }))
+        Ok((!empty.get()).then_some(Self { db, writer: None }))
     }
 
     pub fn from_application(db: &Db) -> Self {
-        Self { db: db.clone() }
+        Self {
+            db: db.clone(),
+            writer: None,
+        }
+    }
+
+    pub fn with_writer_link(mut self, link: crate::control::WriterLink) -> Self {
+        self.writer = Some(link);
+        self
+    }
+
+    /// Bot-launcher fence. The API launcher never calls this and never writes.
+    pub fn arm_launcher_fence(&self, instance: &str) {
+        self.db.arm_launcher_fence(instance);
+    }
+
+    /// Extend this process's launcher fence. The transaction writes that fence
+    /// only. `Ok(false)` means another live launcher holds it. This does not
+    /// read or write the active-bot lease.
+    pub async fn renew_launcher_fence(&self) -> Result<bool> {
+        if !self.writes_locally() || self.db.launcher_instance().is_none() {
+            return Ok(false);
+        }
+        match self
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_immediate()?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error) if launcher_fence_held(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retry `renew_launcher_fence` until this launcher owns the fence.
+    /// `pause` returns true to stop without taking it (shutdown). Another
+    /// live holder is logged once; other errors are logged and retried.
+    pub async fn wait_for_launcher_fence(&self, mut pause: impl AsyncFnMut() -> bool) -> bool {
+        let mut warned = false;
+        loop {
+            match self.renew_launcher_fence().await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    if !warned {
+                        tracing::warn!(
+                            "another bot launcher still holds the fence and this launcher is waiting"
+                        );
+                        warned = true;
+                    }
+                }
+                Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
+            }
+            if pause().await {
+                return false;
+            }
+        }
+    }
+
+    pub fn writes_locally(&self) -> bool {
+        !self.db.is_read_only()
     }
 
     pub async fn schema_version(&self) -> Result<i64> {
@@ -256,7 +511,12 @@ impl UpdateControl {
     }
 
     pub async fn set_channel(&self, role: &str, channel: &str) -> Result<()> {
-        set_update_policy(&self.db, role, channel, "off", false).await
+        if !self.writes_locally() {
+            return Ok(());
+        }
+        set_update_policy(&self.db, role, channel, "off", false)
+            .await
+            .map(|_| ())
     }
 
     pub async fn checked(
@@ -267,12 +527,20 @@ impl UpdateControl {
         error: Option<String>,
         now: i64,
     ) -> Result<()> {
-        record_update_check(&self.db, component, channel, candidate, error, now).await
+        if !self.writes_locally() {
+            return Ok(());
+        }
+        record_update_check(&self.db, component, channel, candidate, error, now)
+            .await
+            .map(|_| ())
     }
 
     /// Hold both service check leases before registry work. A failure to take
     /// the second lease releases the first so Administration discovery is not stuck.
     pub async fn acquire_pair_check(&self, now: i64) -> Result<String> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot acquire an update lease");
+        }
         let owner = format!("{:032x}", rand::random::<u128>());
         if !claim_update_lease(&self.db, "bot", &owner, now, 240).await? {
             anyhow::bail!("another update operation is running");
@@ -291,6 +559,9 @@ impl UpdateControl {
     }
 
     pub async fn release_pair_check(&self, owner: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         release_update_lease(&self.db, "bot", owner).await?;
         release_update_lease(&self.db, "api", owner).await?;
         Ok(())
@@ -306,6 +577,9 @@ impl UpdateControl {
         api: ComponentRelease,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         anyhow::ensure!(
             matches!(channel, "latest" | "stable" | "nightly"),
             "invalid channel"
@@ -363,6 +637,16 @@ impl UpdateControl {
         observation: ComponentObservation,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordComponentRunning {
+                    component: role.to_owned(),
+                    release,
+                    observation,
+                    now,
+                })
+                .await;
+        }
         record_component_running(&self.db, role, release, observation, now).await
     }
 
@@ -372,10 +656,56 @@ impl UpdateControl {
         observation: ComponentObservation,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordBakedComponentRunning {
+                    component: role.to_owned(),
+                    observation,
+                    now,
+                })
+                .await;
+        }
         record_baked_component_running(&self.db, role, observation, now).await
     }
 
+    /// Saved or Unchanged is the only durable reply. A missing link, a refused
+    /// writer, or an in-progress recovery is [`ReceiptNotSaved`]. A compare
+    /// failure stays a normal error so the caller does not retry a changed selection.
+    async fn forward_process(&self, op: ControlOp) -> Result<()> {
+        let Some(link) = &self.writer else {
+            warn_api_launcher_observation_not_forwarded();
+            return Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE));
+        };
+        match link.submit(op, 0).await {
+            Ok(ControlReply::Saved { .. } | ControlReply::Unchanged { .. }) => Ok(()),
+            Ok(ControlReply::Waiting) => Err(receipt_not_saved("waiting")),
+            Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
+            Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
+            Ok(ControlReply::Failed { message }) if transient_receipt(&message) => {
+                tracing::warn!("API launcher receipt was not recorded: {message}");
+                Err(receipt_not_saved(message))
+            }
+            Ok(ControlReply::Failed { message }) => {
+                tracing::warn!("API launcher receipt was not recorded: {message}");
+                anyhow::bail!("{message}")
+            }
+            Err(error) => {
+                tracing::warn!("API launcher receipt was not recorded: {error:#}");
+                Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE))
+            }
+        }
+    }
+
     pub async fn failed(&self, role: &str, release: &ComponentRelease, error: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordComponentFailure {
+                    component: role.to_owned(),
+                    failed: release.clone(),
+                    error: error.to_owned(),
+                })
+                .await;
+        }
         record_component_failure(&self.db, role, release, error).await
     }
 
@@ -388,10 +718,24 @@ impl UpdateControl {
         error: &str,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordComponentRollback {
+                    component: role.to_owned(),
+                    failed: failed.clone(),
+                    previous,
+                    observation,
+                    error: error.to_owned(),
+                    now,
+                })
+                .await;
+        }
         record_component_rollback(&self.db, role, failed, previous, observation, error, now).await
     }
 
     /// Only the baked controller can establish the baked application's schema.
+    /// A read-only process returns the compiled value or verifies it with a
+    /// snapshot. The bot launcher is the process that persists it.
     pub async fn baked_compatibility(
         &self,
         role: &str,
@@ -401,6 +745,20 @@ impl UpdateControl {
         anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
         let key = format!("component_baked_compatibility_{role}_v1");
         let base_sha = base_sha.to_owned();
+        if self.db.is_read_only() {
+            if baked_controller {
+                return Ok(BakedCompatibility::compiled(&base_sha));
+            }
+            return self
+                .db
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let baked = read_baked_compatibility(&tx, &key, &base_sha)?;
+                    tx.finish_read()?;
+                    Ok(baked)
+                })
+                .await;
+        }
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_immediate()?;
@@ -409,15 +767,7 @@ impl UpdateControl {
                     write_meta_string_conn(&tx, &key, &serde_json::to_string(&baked)?)?;
                     baked
                 } else {
-                    let raw = meta_string_conn(&tx, &key)?.context(
-                        "baked compatibility missing; restart the container's baked controller",
-                    )?;
-                    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
-                    anyhow::ensure!(
-                        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
-                        "baked compatibility does not match this base image"
-                    );
-                    baked
+                    read_baked_compatibility(&tx, &key, &base_sha)?
                 };
                 tx.commit()?;
                 Ok(result)
@@ -427,33 +777,15 @@ impl UpdateControl {
 
     /// Refresh actual controller capability without an application heartbeat.
     pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
-        anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
-        let role = role.to_owned();
-        self.db
-            .with_conn(move |conn| {
-                let tx = conn.transaction_immediate()?;
-                let raw: Option<String> = tx.query_row(
-                    "SELECT observed FROM component_updates WHERE component=?1",
-                    params![role.clone()],
-                    |row| Ok(row.get(0)?),
-                )?;
-                if let Some(raw) = raw {
-                    let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
-                    seen.launcher_revision = revision;
-                    // Preserve pre-protocol baseline adoption until the baked app
-                    // reports readiness; a legacy schema15 row may describe DB16.
-                    if seen.update_protocol != 0 {
-                        seen.update_protocol = UPDATE_CONTROL_PROTOCOL;
-                    }
-                    tx.execute_rows(
-                        "UPDATE component_updates SET observed=?2 WHERE component=?1",
-                        params![role, serde_json::to_string(&seen)?],
-                        1,
-                    )?;
-                }
-                tx.commit()
-            })
-            .await
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::ObserveLauncher {
+                    component: role.to_owned(),
+                    revision,
+                })
+                .await;
+        }
+        record_launcher_observation(&self.db, role, revision).await
     }
 
     pub async fn clear_superseded_launcher(
@@ -461,45 +793,32 @@ impl UpdateControl {
         role: &str,
         release: &ComponentRelease,
     ) -> Result<()> {
-        let (role, release) = (role.to_owned(), serde_json::to_string(release)?);
-        self.db.with_conn(move |conn| {
-            let tx = conn.transaction_immediate()?;
-            tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
-                params![role, release], 1)?;
-            tx.commit()
-        }).await
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::ClearSupersededLauncher {
+                    component: role.to_owned(),
+                    release: release.clone(),
+                })
+                .await;
+        }
+        record_clear_superseded_launcher(&self.db, role, release).await
     }
 
     /// Clear a stored launcher selection that has no capability contract.
-    /// Compare the parsed release, then swap on the original stored text.
-    /// Rows saved before launcher labels omit fields this serializer writes.
     pub async fn clear_uncontracted_launcher(
         &self,
         role: &str,
         release: &ComponentRelease,
     ) -> Result<()> {
-        anyhow::ensure!(release.launcher.is_none(), "launcher contract is present");
-        let (role, release) = (role.to_owned(), release.clone());
-        self.db.with_conn(move |conn| {
-            let tx = conn.transaction_immediate()?;
-            let stored: Option<String> = tx.query_row(
-                "SELECT desired_launcher FROM component_updates WHERE component=?1",
-                params![role.clone()],
-                |row| Ok(row.get(0)?),
-            )?;
-            let stored = stored.context("desired launcher is already clear")?;
-            let parsed: ComponentRelease = serde_json::from_str(&stored)?;
-            anyhow::ensure!(
-                parsed.launcher.is_none() && parsed == release,
-                "desired launcher changed before clear"
-            );
-            tx.execute_rows(
-                "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
-                params![role, stored],
-                1,
-            )?;
-            tx.commit()
-        }).await
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::ClearUncontractedLauncher {
+                    component: role.to_owned(),
+                    release: release.clone(),
+                })
+                .await;
+        }
+        record_clear_uncontracted_launcher(&self.db, role, release).await
     }
 
     pub async fn launcher_running(
@@ -509,19 +828,46 @@ impl UpdateControl {
         hash: &str,
         now: i64,
     ) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordLauncherRunning {
+                    component: role.to_owned(),
+                    release: release.clone(),
+                    hash: hash.to_owned(),
+                    now,
+                })
+                .await;
+        }
         record_launcher_running(&self.db, role, release, hash, now).await
     }
 
     pub async fn baked_launcher(&self, role: &str, hash: &str, now: i64) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordBakedLauncher {
+                    component: role.to_owned(),
+                    hash: hash.to_owned(),
+                    now,
+                })
+                .await;
+        }
         record_baked_launcher(&self.db, role, hash, now).await
     }
 
     pub async fn launcher_failed(&self, role: &str, digest: &str, error: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordLauncherFailure {
+                    component: role.to_owned(),
+                    digest: digest.to_owned(),
+                    error: error.to_owned(),
+                })
+                .await;
+        }
         record_launcher_failure(&self.db, role, digest, error).await
     }
 
-    /// Pin both checked targets atomically before either service is interrupted.
-    /// Recovery is an explicit owner action and may only move forwards.
+    /// Paired upgrades stay refused until signed, launcher-routed upgrades land.
     pub async fn request_upgrade(
         &self,
         bot_digest: &str,
@@ -529,6 +875,24 @@ impl UpdateControl {
         recover: bool,
         now: i64,
     ) -> Result<ServiceUpgrade> {
+        let _ = (bot_digest, api_digest, recover, now);
+        anyhow::bail!("{PAIRED_UPGRADES_DISABLED}");
+    }
+
+    /// Pin both checked targets atomically before either service is interrupted.
+    /// Recovery is an explicit owner action and may only move forwards.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn queue_paired_upgrade_for_tests(
+        &self,
+        bot_digest: &str,
+        api_digest: &str,
+        recover: bool,
+        now: i64,
+    ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot request an upgrade");
+        }
         let (bot_digest, api_digest) = (bot_digest.to_owned(), api_digest.to_owned());
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -617,28 +981,21 @@ impl UpdateControl {
         release: &ComponentRelease,
         operation: Option<&str>,
     ) -> Result<()> {
-        release.validate()?;
-        let release = release.clone();
-        let operation = operation.map(str::to_owned);
-        self.db.with_conn(move |conn| {
-            let tx = conn.transaction_immediate()?;
-            if let Some(id) = operation {
-                let op = read_upgrade(&tx)?.context("upgrade missing")?;
-                require_progress(op.id == id && op.phase == UpgradePhase::Preparing && op.error.is_none()
-                    && op.service(&release.component)?.release == release)?;
-            } else {
-                ensure_no_service_upgrade(&tx)?;
-                let row = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component=?1", updates::COLS), params![release.component.clone()], updates::row_update)?;
-                anyhow::ensure!(row.desired.as_ref() == Some(&release) || row.installed.as_ref() == Some(&release),
-                    "application selection changed before launcher handoff");
-            }
-            tx.execute_rows("UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
-                params![release.component.clone(),serde_json::to_string(&release)?], 1)?;
-            tx.commit()
-        }).await
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::SelectRequiredLauncher {
+                    release: release.clone(),
+                    operation: operation.map(str::to_owned),
+                })
+                .await;
+        }
+        record_required_launcher(&self.db, release, operation.map(str::to_owned)).await
     }
 
     pub async fn abort_upgrade(&self, id: &str) -> Result<()> {
+        if !self.writes_locally() {
+            anyhow::bail!("read-only database cannot abort an upgrade");
+        }
         let id = id.to_owned();
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
@@ -659,6 +1016,10 @@ impl UpdateControl {
         role: &str,
         instance: &str,
     ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            warn_api_launcher_cannot_record_upgrade();
+            return self.upgrade().await?.context("no coordinated upgrade");
+        }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
             .with_conn(move |conn| {
@@ -695,6 +1056,10 @@ impl UpdateControl {
         instance: &str,
         action: UpgradeAcknowledgement,
     ) -> Result<ServiceUpgrade> {
+        if !self.writes_locally() {
+            warn_api_launcher_cannot_record_upgrade();
+            return self.upgrade().await?.context("no coordinated upgrade");
+        }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
             .with_conn(move |conn| {
@@ -775,6 +1140,9 @@ impl UpdateControl {
     }
 
     pub async fn upgrade_error(&self, id: &str, error: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return Ok(());
+        }
         let (id, error) = (id.to_owned(), error.chars().take(300).collect::<String>());
         self.db
             .with_conn(move |conn| {
@@ -810,6 +1178,7 @@ mod tests {
                 .join(format!("paired-control-{:032x}.db", rand::random::<u128>()));
             let db = Db::open(&path, 2).unwrap();
             let opts = DbOpenOptions {
+                read_only: false,
                 path: path.clone(),
                 url: String::new(),
                 token: String::new(),
@@ -883,7 +1252,7 @@ mod tests {
         }
         async fn queue(&self, recover: bool, now: i64) -> Result<ServiceUpgrade> {
             self.control
-                .request_upgrade(
+                .queue_paired_upgrade_for_tests(
                     &format!("sha256:{}", "a".repeat(64)),
                     &format!("sha256:{}", "b".repeat(64)),
                     recover,
@@ -1196,6 +1565,7 @@ mod tests {
                 rand::random::<u128>()
             ));
             let opts = DbOpenOptions {
+                read_only: false,
                 path: path.clone(),
                 url: String::new(),
                 token: String::new(),
@@ -1249,5 +1619,402 @@ mod tests {
         empty.path = f.path.with_extension("empty");
         assert!(UpdateControl::open(&empty).unwrap().is_none());
         let _ = std::fs::remove_file(empty.path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_launcher_never_writes() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+        let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+        let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        arm_writer_open_tripwire(std::sync::Arc::clone(&tripped));
+        let mut opts = f.opts.clone();
+        opts.read_only = true;
+        let reader = UpdateControl::open(&opts).unwrap().unwrap();
+        assert!(!reader.writes_locally());
+        let observed = f.control.component("api").await.unwrap().observed.unwrap();
+        for result in [
+            reader
+                .running("api", None, observed.clone(), 300)
+                .await
+                .map(|_| ()),
+            reader.baked_running("api", observed.clone(), 300).await,
+            reader.observe_launcher("api", 1).await,
+            reader.launcher_failed("api", "sha256:aa", "dropped").await,
+            reader
+                .failed("api", &upgrade.api.release, "compatibility: dropped")
+                .await,
+            reader
+                .rolled_back(
+                    "api",
+                    &upgrade.api.release,
+                    None,
+                    observed.clone(),
+                    "spawn: dropped",
+                    300,
+                )
+                .await,
+            reader
+                .launcher_running("api", &upgrade.api.release, &"a".repeat(64), 300)
+                .await,
+            reader.baked_launcher("api", &"b".repeat(64), 300).await,
+            reader
+                .select_required_launcher(&upgrade.api.release, None)
+                .await,
+            reader
+                .clear_superseded_launcher("api", &upgrade.api.release)
+                .await,
+            reader
+                .clear_uncontracted_launcher("api", &upgrade.api.release)
+                .await,
+        ] {
+            let error =
+                result.expect_err("a read-only launcher must not pretend a receipt was saved");
+            assert!(
+                error.is::<ReceiptNotSaved>(),
+                "missing link is not durable: {error:#}"
+            );
+        }
+        reader
+            .join_upgrade(&upgrade.id, "api", "api")
+            .await
+            .unwrap();
+        reader
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Prepared)
+            .await
+            .unwrap();
+        reader.upgrade_error(&upgrade.id, "api-role").await.unwrap();
+        assert_eq!(probe.immediate(), 0);
+        assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            reader.upgrade().await.unwrap().unwrap().error.is_none(),
+            "an API launcher must not record an upgrade error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn old_and_new_bot_launchers_race_and_only_the_fenced_write_lands() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let old = UpdateControl::open(&opts).unwrap().unwrap();
+        let new = UpdateControl::open(&opts).unwrap().unwrap();
+        let old_id = "aa".repeat(16);
+        let new_id = "bb".repeat(16);
+        old.arm_launcher_fence(&old_id);
+        new.arm_launcher_fence(&new_id);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let old_task = {
+            let start = std::sync::Arc::clone(&start);
+            let old = old.clone();
+            tokio::spawn(async move {
+                start.wait();
+                old.observe_launcher("bot", 11).await
+            })
+        };
+        let new_task = {
+            let start = std::sync::Arc::clone(&start);
+            let new = new.clone();
+            tokio::spawn(async move {
+                start.wait();
+                new.observe_launcher("bot", 22).await
+            })
+        };
+        let (left, right) = tokio::join!(old_task, new_task);
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert!(
+            left.is_ok() ^ right.is_ok(),
+            "exactly one launcher write lands: {left:?} {right:?}"
+        );
+        let revision = f
+            .control
+            .component("bot")
+            .await
+            .unwrap()
+            .observed
+            .unwrap()
+            .launcher_revision;
+        let owner: String = f
+            .control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value: String = tx.query_row(
+                    "SELECT value FROM meta WHERE key='launcher_lease'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap();
+        let holder = owner.split_whitespace().next().unwrap();
+        if left.is_ok() {
+            assert_eq!(revision, 11);
+            assert_eq!(holder, old_id);
+        } else {
+            assert_eq!(revision, 22);
+            assert_eq!(holder, new_id);
+        }
+    }
+
+    async fn rewrite_launcher_expiry(control: &UpdateControl, owner: &str, expires: i64) {
+        let value = format!("{owner} {expires}");
+        control
+            .db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                crate::db::write_meta_string_conn(&tx, "launcher_lease", &value)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn active_bot_lease(control: &UpdateControl) -> Option<String> {
+        control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key='active_bot_lease'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewed_launcher_fence_blocks_a_second_writer_past_the_original_window() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let other = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let other_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        other.arm_launcher_fence(&other_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
+        assert!(
+            holder.renew_launcher_fence().await.unwrap(),
+            "the holder renews after the original window"
+        );
+        let blocked = other.observe_launcher("bot", 22).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "a renewed fence still blocks the other launcher: {blocked:#}"
+        );
+        assert!(active_bot_lease(&holder).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_launcher_takes_the_fence_after_the_holder_expires() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let waiting = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let waiting_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        waiting.arm_launcher_fence(&waiting_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        assert!(
+            !waiting.wait_for_launcher_fence(async || true).await,
+            "shutdown leaves the fence with the holder"
+        );
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        let pauses = std::sync::atomic::AtomicUsize::new(0);
+        let acquired = waiting
+            .wait_for_launcher_fence(async || {
+                if pauses.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                    return true;
+                }
+                rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000)
+                    .await;
+                false
+            })
+            .await;
+        assert!(
+            acquired,
+            "the waiting launcher takes the fence after expiry"
+        );
+        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "the old launcher's next write fails: {blocked:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_launcher_fence_lets_the_new_launcher_take_over() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut opts = f.opts.clone();
+        opts.pool_size = 2;
+        let holder = UpdateControl::open(&opts).unwrap().unwrap();
+        let other = UpdateControl::open(&opts).unwrap().unwrap();
+        let holder_id = "aa".repeat(16);
+        let other_id = "bb".repeat(16);
+        holder.arm_launcher_fence(&holder_id);
+        other.arm_launcher_fence(&other_id);
+        assert!(holder.renew_launcher_fence().await.unwrap());
+        rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
+        other.observe_launcher("bot", 22).await.unwrap();
+        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        assert!(
+            launcher_fence_held(&blocked),
+            "the old launcher's next write fails: {blocked:#}"
+        );
+        assert!(!holder.renew_launcher_fence().await.unwrap());
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .observed
+                .unwrap()
+                .launcher_revision,
+            22
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_request_is_refused_until_issue_188() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let bot = format!("sha256:{}", "a".repeat(64));
+        let api = format!("sha256:{}", "b".repeat(64));
+        for recover in [false, true] {
+            let error = f
+                .control
+                .request_upgrade(&bot, &api, recover, 100)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), PAIRED_UPGRADES_DISABLED);
+            let applied = crate::db::apply_control(
+                &f.control.db,
+                None,
+                crate::db::ControlOp::RequestUpgrade {
+                    bot_digest: bot.clone(),
+                    api_digest: api.clone(),
+                    recover,
+                    now: 100,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(applied.to_string(), PAIRED_UPGRADES_DISABLED);
+            assert_eq!(
+                crate::control::public_error(&applied),
+                PAIRED_UPGRADES_DISABLED
+            );
+        }
+        assert!(f.control.upgrade().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatible_single_container_install_still_queues() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let reply = crate::db::apply_control(
+            &f.control.db,
+            None,
+            crate::db::ControlOp::RequestComponentInstall {
+                component: "bot".into(),
+                digest: digest.clone(),
+                now: 100,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
+        let row = f.control.component("bot").await.unwrap();
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.desired.unwrap().digest, digest);
+        assert!(f.control.upgrade().await.unwrap().is_none());
+    }
+
+    /// Bot-launcher writes land with no `active_bot_lease` (the bot process is
+    /// stopped). The read-only API launcher does not record these steps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_completes_while_the_bot_process_is_stopped() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let launcher = "cc".repeat(16);
+        f.control.arm_launcher_fence(&launcher);
+        let upgrade = f.queue(false, 200).await.unwrap();
+        for role in ["bot", "api"] {
+            f.control
+                .join_upgrade(&upgrade.id, role, role)
+                .await
+                .unwrap();
+            f.control
+                .acknowledge(&upgrade.id, role, role, UpgradeAcknowledgement::Prepared)
+                .await
+                .unwrap();
+        }
+        f.control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        let stopped = f
+            .control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        assert!(stopped.bot.stopped, "the bot process is stopped");
+        assert!(matches!(stopped.phase, UpgradePhase::StartingBot));
+        let lease: Option<String> = f
+            .control
+            .db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key='active_bot_lease'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .unwrap();
+        assert!(
+            lease.is_none(),
+            "the bot process is not holding the writer lease"
+        );
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Starting)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Ready)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Starting)
+            .await
+            .unwrap();
+        let done = f
+            .control
+            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Ready)
+            .await
+            .unwrap();
+        assert_eq!(done.phase, UpgradePhase::Complete);
+        assert!(done.error.is_none());
     }
 }

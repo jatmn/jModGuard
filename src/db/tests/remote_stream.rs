@@ -120,9 +120,15 @@ impl HranaFixture {
         let connections = (0..2)
             .map(|_| Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap())
             .collect();
+        let lease_state = Arc::new(Mutex::new(crate::db::ActiveLease {
+            owner: None,
+            generation: None,
+        }));
+        let launcher_fence = Arc::new(Mutex::new(None));
         Db {
             path: PathBuf::new(),
             remote: true,
+            read_only: false,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
             startup_deferred: false,
@@ -131,7 +137,12 @@ impl HranaFixture {
                 database,
                 runtime,
                 remote: true,
+                read_only: false,
                 busy_timeout_ms: 5_000,
+                lease_state: Arc::clone(&lease_state),
+                generation_source: Mutex::new(None),
+                launcher_fence: Arc::clone(&launcher_fence),
+                commit_lease_probe: Arc::new(Mutex::new(None)),
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),
@@ -139,6 +150,14 @@ impl HranaFixture {
             config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
             settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lease_state,
+            launcher_fence,
+            #[cfg(test)]
+            before_final_lease_reread: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            during_leased_guild_commit: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }

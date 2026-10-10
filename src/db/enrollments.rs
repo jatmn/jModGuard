@@ -1,12 +1,19 @@
 //! Bot membership observations only. These identifiers do not authorize dashboard access.
 use super::*;
+use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuildEnrollment {
-    #[serde(serialize_with = "crate::ids::ser_i64_str")]
+    #[serde(
+        serialize_with = "crate::ids::ser_i64_str",
+        deserialize_with = "crate::ids::de_i64"
+    )]
     pub guild_id: i64,
     pub id: String,
-    #[serde(serialize_with = "crate::ids::ser_i64_str")]
+    #[serde(
+        serialize_with = "crate::ids::ser_i64_str",
+        deserialize_with = "crate::ids::de_i64"
+    )]
     pub joined_at_ns: i64,
 }
 
@@ -216,11 +223,35 @@ pub enum ConfigurationScope {
     Global,
     Guild(GuildEnrollment),
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeWire {
+    pub global: bool,
+    pub guild_id: i64,
+    pub enrollment_id: String,
+    pub joined_at_ns: i64,
+}
+
 impl ConfigurationScope {
     pub fn guild_id(&self) -> i64 {
         match self {
             Self::Global => GLOBAL_SCOPE,
             Self::Guild(enrollment) => enrollment.guild_id,
+        }
+    }
+    pub fn to_wire(&self) -> ScopeWire {
+        match self {
+            Self::Global => ScopeWire {
+                global: true,
+                guild_id: GLOBAL_SCOPE,
+                enrollment_id: String::new(),
+                joined_at_ns: 0,
+            },
+            Self::Guild(enrollment) => ScopeWire {
+                global: false,
+                guild_id: enrollment.guild_id,
+                enrollment_id: enrollment.id.clone(),
+                joined_at_ns: enrollment.joined_at_ns,
+            },
         }
     }
     pub(super) fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
@@ -240,6 +271,9 @@ pub struct ConfigurationWriteScope {
     target: ConfigurationScope,
 }
 impl ConfigurationWriteScope {
+    pub fn to_wires(&self) -> (ScopeWire, ScopeWire) {
+        (self.request.to_wire(), self.target.to_wire())
+    }
     pub fn new(request: ConfigurationScope, target: ConfigurationScope) -> Result<Self> {
         if target != request && target != ConfigurationScope::Global {
             return Err(EnrollmentChanged.into());

@@ -19,6 +19,9 @@ license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 autobins = false
 rust-version = "1.96"
 
+[features]
+test-support = []
+
 [dependencies]
 http = "1"
 url = "2"

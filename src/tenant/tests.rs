@@ -1845,3 +1845,120 @@ async fn link_selected_source_binds_the_supplied_identity() {
     assert_eq!(found.id, case_id);
     assert!(!found.removed);
 }
+
+#[tokio::test]
+async fn case_control_rejects_replaced_enrollment() {
+    let f = Fixture::new();
+    let first = enroll(&f, 10, 100).await;
+    let op = db::ControlOp::CleanupEvidence {
+        scope: db::ScopeWire {
+            global: false,
+            guild_id: first.guild_id,
+            enrollment_id: first.id.clone(),
+            joined_at_ns: first.joined_at_ns,
+        },
+    };
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.tenant.schedule_erasure(first).await.unwrap();
+    f.tenant.drive_erasure().await.unwrap();
+    let next = enroll(&f, 10, 101).await;
+    f.tenant
+        .record_selected_case(next.clone(), case_data(3))
+        .await
+        .unwrap()
+        .unwrap();
+    let before = {
+        let (store, scope) = f.tenant.live(next.clone()).await.unwrap();
+        store.case_count(scope, case_limits()).await.unwrap()
+    };
+    assert!(before >= 1);
+    let error = db::apply_control(&f.db, Some(&f.tenant), op, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<db::EnrollmentChanged>().is_some(),
+        "{error:#}"
+    );
+    let (store, scope) = f.tenant.live(next).await.unwrap();
+    assert_eq!(
+        store.case_count(scope, case_limits()).await.unwrap(),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_evidence_retries_until_storage_id_appears() {
+    set_evidence_retry_cap_for_test(20);
+    struct RestoreCap;
+    impl Drop for RestoreCap {
+        fn drop(&mut self) {
+            set_evidence_retry_cap_for_test(60_000);
+        }
+    }
+    let _restore_cap = RestoreCap;
+    let path = std::env::temp_dir().join(format!(
+        "jmodguard_evidence_retry_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let writer = Db::open(&path, 2).unwrap();
+    let db_cfg = DbConfig {
+        path: path.clone(),
+        pool_size: 2,
+        ..DbConfig::default()
+    };
+    let prepared = TenantRuntime::open(
+        &writer,
+        &db_cfg,
+        &GuildStoresConfig::default(),
+        &EvidenceConfig {
+            backend: "none".into(),
+            ..EvidenceConfig::default()
+        },
+    )
+    .unwrap();
+    drop(prepared);
+    let read_opts = crate::db::DbOpenOptions {
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        read_only: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    };
+    let reader = Db::open_with(read_opts).unwrap();
+    assert!(reader.is_read_only());
+    let reader_tenant = TenantRuntime::open(
+        &reader,
+        &db_cfg,
+        &GuildStoresConfig::default(),
+        &EvidenceConfig {
+            backend: "local".into(),
+            ..EvidenceConfig::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !reader_tenant.evidence_enabled(),
+        "evidence stays closed until the storage id exists"
+    );
+    let id = CaseId::try_from(db::evidence_storage_id(&writer, "").await.unwrap()).unwrap();
+    let mut root = path.as_os_str().to_owned();
+    root.push(".evidence");
+    crate::evidence_transfer::LocalEvidenceStore::initialize(PathBuf::from(root), id, 65536)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !reader_tenant.evidence_enabled() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert!(reader_tenant.evidence_enabled());
+    drop(reader_tenant);
+    drop(reader);
+    drop(writer);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    remove_sidecars(&path);
+}

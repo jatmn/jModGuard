@@ -704,7 +704,55 @@ pub struct Connection {
     tainted: Arc<AtomicBool>,
     config_version: Arc<std::sync::atomic::AtomicU64>,
     capacity_limits: CapacityLimits,
+    read_only: bool,
+    /// Copied from the pool at checkout. `None` leaves commits unchanged.
+    expected_lease_owner: Option<String>,
+    /// Guild-store writer generation snapshotted at checkout. `None` skips the epoch check.
+    expected_writer_generation: Option<i64>,
+    /// Bot-launcher fence. Independent of the application writer lease.
+    expected_launcher: Option<String>,
+    /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
+    commit_lease_probe: Option<CommitLeaseProbe>,
 }
+
+/// The active-bot lease row is not this instance, or it has expired.
+#[derive(Debug)]
+pub struct ActiveBotLeaseRejected;
+
+/// Re-read of `meta.active_bot_lease`. Missing, foreign, and expired rows fail.
+pub(crate) fn reject_active_bot_lease(value: Option<&str>, expected: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Err(ActiveBotLeaseRejected.into());
+    };
+    let mut parts = value.split_whitespace();
+    let owner = parts.next().unwrap_or("");
+    let expires = parts
+        .next()
+        .and_then(|text| text.parse::<i64>().ok())
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    if owner != expected || expires <= now_ms {
+        return Err(ActiveBotLeaseRejected.into());
+    }
+    Ok(())
+}
+
+/// Guild commits pass the remainder of `COMMIT`. The probe checks the core
+/// lease under a short writer lock, then runs this continuation after that
+/// lock is released.
+pub(crate) type CommitLeaseProbe =
+    std::sync::Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
+
+impl std::fmt::Display for ActiveBotLeaseRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("active bot lease is not held")
+    }
+}
+
+impl std::error::Error for ActiveBotLeaseRejected {}
 
 #[derive(Clone, Copy)]
 struct CapacityLimits {
@@ -1034,6 +1082,11 @@ impl Connection {
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
+            read_only: false,
+            expected_lease_owner: None,
+            expected_writer_generation: None,
+            expected_launcher: None,
+            commit_lease_probe: None,
         })
     }
 
@@ -1045,7 +1098,40 @@ impl Connection {
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
+            read_only: false,
+            expected_lease_owner: None,
+            expected_writer_generation: None,
+            expected_launcher: None,
+            commit_lease_probe: None,
         })
+    }
+
+    pub(crate) fn set_expected_lease_owner(&mut self, owner: Option<String>) {
+        self.expected_lease_owner = owner;
+    }
+
+    pub(crate) fn set_expected_writer_generation(&mut self, generation: Option<i64>) {
+        self.expected_writer_generation = generation;
+    }
+
+    pub(crate) fn set_expected_launcher(&mut self, instance: Option<String>) {
+        self.expected_launcher = instance;
+    }
+
+    pub(crate) fn set_commit_lease_probe(&mut self, probe: Option<CommitLeaseProbe>) {
+        self.commit_lease_probe = probe;
+    }
+
+    pub(crate) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    fn refuse_writer_lock(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only,
+            "read-only connection cannot start a write transaction"
+        );
+        Ok(())
     }
 
     /// Start a pooled remote operation without the previous operation's
@@ -1106,6 +1192,7 @@ impl Connection {
     }
 
     pub fn transaction_immediate(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
@@ -1136,6 +1223,7 @@ impl Connection {
     /// writer can invalidate promotion; the capture owner must restart the
     /// entire operation on a proven busy error, never reuse the read results.
     pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin capture transaction",
             libsql::TransactionBehavior::Deferred,
@@ -1166,6 +1254,7 @@ impl Connection {
     /// a mutation receipt. Before non-migration writes, enable a mutation receipt
     /// on the returned transaction so lost COMMIT responses remain recoverable.
     pub fn transaction_primary_read(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin primary read transaction",
             libsql::TransactionBehavior::Immediate,
@@ -1195,6 +1284,10 @@ impl Connection {
             client_deadline: AtomicBool::new(false),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
+            expected_lease_owner: self.expected_lease_owner.clone(),
+            expected_writer_generation: self.expected_writer_generation,
+            expected_launcher: self.expected_launcher.clone(),
+            commit_lease_probe: self.commit_lease_probe.clone(),
         }
     }
 
@@ -1398,6 +1491,10 @@ pub struct Transaction {
     client_deadline: AtomicBool,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
+    expected_lease_owner: Option<String>,
+    expected_writer_generation: Option<i64>,
+    expected_launcher: Option<String>,
+    commit_lease_probe: Option<CommitLeaseProbe>,
 }
 
 #[derive(Clone, Copy)]
@@ -1757,6 +1854,62 @@ impl Transaction {
         self.inner().last_insert_rowid()
     }
 
+    fn renew_launcher_fence(&self, instance: &str) -> Result<()> {
+        const KEY: &str = "launcher_lease";
+        const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
+        let now = crate::control::now_ms();
+        let current: Option<String> = self
+            .query_row("SELECT value FROM meta WHERE key=?1", params![KEY], |row| {
+                Ok(row.get(0)?)
+            })
+            .optional()?;
+        if let Some(value) = current.as_deref() {
+            let mut parts = value.split_whitespace();
+            let owner = parts.next().unwrap_or("");
+            let expires = parts
+                .next()
+                .and_then(|text| text.parse::<i64>().ok())
+                .unwrap_or(0);
+            if owner != instance && expires > now {
+                anyhow::bail!("launcher fence held");
+            }
+        }
+        let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
+        self.execute_bounded(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![KEY, next],
+            4096,
+        )?;
+        Ok(())
+    }
+
+    fn reject_unless_active_lease(&self, expected: &str) -> Result<()> {
+        let value: Option<String> = self
+            .query_row(
+                "SELECT value FROM meta WHERE key='active_bot_lease'",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        reject_active_bot_lease(value.as_deref(), expected)
+    }
+
+    /// The guild transaction already holds its write lock. A mismatch rolls back.
+    fn reject_unless_writer_epoch(&self, generation: i64) -> Result<()> {
+        let stored: Option<i64> = self
+            .query_row(
+                "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        if stored != Some(generation) {
+            return Err(ActiveBotLeaseRejected.into());
+        }
+        Ok(())
+    }
+
     pub fn commit(mut self) -> Result<()> {
         anyhow::ensure!(
             !self.capacity_poisoned.load(Ordering::Acquire),
@@ -1778,8 +1931,28 @@ impl Transaction {
             )?;
             self.capacity_dirty.store(true, Ordering::Release);
         }
+        if let Some(expected) = self.expected_lease_owner.as_deref() {
+            self.reject_unless_active_lease(expected)?;
+        }
+        if self.allows_write
+            && let Some(instance) = self.expected_launcher.clone()
+        {
+            self.renew_launcher_fence(&instance)?;
+        }
+        if let Some(probe) = self.commit_lease_probe.clone() {
+            return probe(&mut || self.commit_after_lease_probe());
+        }
+        self.commit_after_lease_probe()
+    }
+
+    /// Capacity check and `COMMIT`. A guild lease probe calls this after the
+    /// short core lease re-read has released the core writer lock.
+    fn commit_after_lease_probe(&mut self) -> Result<()> {
+        if let Some(generation) = self.expected_writer_generation {
+            self.reject_unless_writer_epoch(generation)?;
+        }
         if self.capacity_dirty.load(Ordering::Acquire) {
-            let actual = crate::capacity::sample(&self)?;
+            let actual = crate::capacity::sample(&*self)?;
             let expected = self
                 .capacity_reservation
                 .lock()

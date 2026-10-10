@@ -169,10 +169,11 @@ First boot (bot):
 - syncs slash commands into every server it is in.
 
 The API process serves the WebUI on `127.0.0.1:8080`. It **requires** Discord
-OAuth client id/secret (it exits immediately if they are empty). If the bot is
-still migrating, the API waits about 30 seconds locally (about six minutes
-against a remote database), then serves HTTP. If that wait expires, the API
-exits.
+OAuth client id/secret (it exits immediately if they are empty). If the
+database is not ready, the API keeps retrying with a capped delay and does
+not migrate. `/health` stays 200. `/ready` and app routes stay 503 until it
+is ready. It also exits on a newer unsupported schema, and on rejected
+remote credentials and other non-retryable open errors.
 
 ### Linux (systemd)
 
@@ -213,10 +214,11 @@ WantedBy=multi-user.target
 ```
 
 `After=jmodguard-bot.service` only waits for the bot **process** to exist, not
-for bootstrap to finish. The API retries incomplete-bootstrap, transient
-SQLite-lock, and (on remote databases) connect/timeout errors so a first-boot
-race does not crash-loop. Local SQLite waits about 30 seconds; remote waits
-about six minutes.
+for bootstrap to finish. The API keeps retrying with a capped delay and does
+not migrate, so a first-boot race does not make it exit. `/health` stays 200.
+`/ready` and app routes stay 503 until it is ready. It still exits on a newer
+unsupported schema, rejected remote credentials and other non-retryable open
+errors, and bad config such as an empty OAuth client id or secret.
 
 ```bash
 sudo systemctl daemon-reload

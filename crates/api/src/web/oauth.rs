@@ -15,6 +15,7 @@ pub struct OAuthClient {
     /// Core database used to keep Retry-After across process restarts. Empty in tests
     /// that do not open a database.
     retry_db: std::sync::Mutex<Option<crate::db::Db>>,
+    writer: std::sync::Mutex<Option<jmodguard::control::WriterLink>>,
     #[cfg(test)]
     pub guilds_endpoint: Option<String>,
     #[cfg(test)]
@@ -687,6 +688,13 @@ impl OAuthClient {
         }
     }
 
+    pub(crate) fn attach_writer(&self, link: jmodguard::control::WriterLink) {
+        *self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(link);
+    }
+
     pub(crate) fn attach_retry_store(&self, db: crate::db::Db) {
         *self
             .retry_db
@@ -719,9 +727,40 @@ impl OAuthClient {
                 tracing::warn!("discord retry deadline record is too large to store");
                 return;
             }
-            if let Err(error) = super::discord_retry::store_deadlines(&db, json).await {
-                tracing::warn!("failed to persist discord retry deadline: {error:#}");
-                return;
+            let stored = if db.is_read_only() {
+                let link = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let Some(link) = link else {
+                    tracing::warn!("discord retry deadline is waiting for the bot writer");
+                    return;
+                };
+                link.submit(crate::db::ControlOp::StoreRetryDeadlines { json }, 0)
+                    .await
+                    .map(|reply| {
+                        matches!(
+                            reply,
+                            crate::db::ControlReply::Saved { .. }
+                                | crate::db::ControlReply::Unchanged { .. }
+                        )
+                    })
+            } else {
+                super::discord_retry::store_deadlines(&db, json)
+                    .await
+                    .map(|_| true)
+            };
+            match stored {
+                Err(error) => {
+                    tracing::warn!("failed to persist discord retry deadline: {error:#}");
+                    return;
+                }
+                Ok(false) => {
+                    tracing::warn!("discord retry deadline is waiting for the bot writer");
+                    return;
+                }
+                Ok(true) => {}
             }
             let current = self
                 .guild_list
@@ -926,6 +965,7 @@ impl OAuthClient {
                 std::collections::HashMap::new(),
             )),
             retry_db: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
             #[cfg(test)]
             guilds_endpoint: None,
             #[cfg(test)]
@@ -1032,6 +1072,7 @@ mod tests {
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
@@ -1080,6 +1121,7 @@ mod tests {
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
@@ -1136,6 +1178,7 @@ mod tests {
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
@@ -1169,6 +1212,7 @@ mod tests {
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
             guilds_endpoint,
             token_endpoint,
             me_endpoint,

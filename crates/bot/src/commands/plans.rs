@@ -172,6 +172,37 @@ async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::mod
         .map_err(|e| anyhow!("target is not available in this server: {e}"))
 }
 
+async fn require_plan_writer(activation: &crate::activation::Activation) -> Result<()> {
+    #[cfg(test)]
+    plan_effect_pause::checkpoint().await;
+    if !activation.may_record() {
+        anyhow::bail!("writer lease is not held");
+    }
+    Ok(())
+}
+
+async fn run_guarded_case_step(
+    app: &crate::state::BotState,
+    actor: UserId,
+    enrollment: Option<db::GuildEnrollment>,
+    action: crate::db::guild_data::CaseAction,
+    target: UserId,
+    discord: impl std::future::Future<Output = serenity::Result<()>>,
+) -> Result<()> {
+    require_plan_writer(&app.activation).await?;
+    let result = match crate::discord::race_discord_call(&app.activation, discord).await {
+        crate::discord::DiscordCall::Cancelled => {
+            let cancelled = Err(crate::discord::cutoff_discord_error());
+            record_step_outcome(app, actor, enrollment, action, target, &cancelled).await;
+            anyhow::bail!("writer lease is not held");
+        }
+        crate::discord::DiscordCall::Finished(result) => result,
+    };
+    require_plan_writer(&app.activation).await?;
+    record_step_outcome(app, actor, enrollment, action, target, &result).await;
+    result.map_err(|error| anyhow!("{error}"))
+}
+
 async fn run_step(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
@@ -190,32 +221,65 @@ async fn run_step(
             refuse_fenced_discord_mutation(env).await?;
             let text = crate::templates::render(template, vars);
             let user_id = target.unwrap_or(env.actor);
-            let channel = env
-                .ctx
-                .http
-                .create_private_channel(&serde_json::json!({"recipient_id": user_id.get()}))
-                .await?;
-            let _ = channel.say(&env.ctx.http, &text).await;
+            require_plan_writer(&env.app.activation).await?;
+            let channel = match crate::discord::race_discord_call(
+                &env.app.activation,
+                env.ctx
+                    .http
+                    .create_private_channel(&serde_json::json!({"recipient_id": user_id.get()})),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(channel) => channel?,
+            };
+            require_plan_writer(&env.app.activation).await?;
+            let _ = crate::discord::race_discord_call(
+                &env.app.activation,
+                channel.say(&env.ctx.http, &text),
+            )
+            .await;
         }
         PlanStep::Log { event, template } => {
             let text = crate::templates::render(template, vars);
             let mut v = vars.clone();
             v.insert("content".into(), text);
+            require_plan_writer(&env.app.activation).await?;
             logging::emit(env.app, env.ctx, guild_id, event, v).await;
         }
         PlanStep::AddRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
             refuse_fenced_discord_mutation(env).await?;
-            member
-                .add_role(&env.ctx.http, RoleId::new(*role_id))
-                .await?;
+            require_plan_writer(&env.app.activation).await?;
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                member.add_role(&env.ctx.http, RoleId::new(*role_id)),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(result) => result?,
+            }
         }
         PlanStep::RemoveRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
             refuse_fenced_discord_mutation(env).await?;
-            member
-                .remove_role(&env.ctx.http, RoleId::new(*role_id))
-                .await?;
+            require_plan_writer(&env.app.activation).await?;
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                member.remove_role(&env.ctx.http, RoleId::new(*role_id)),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(result) => result?,
+            }
         }
         PlanStep::Timeout { minutes } => {
             let target = target.expect("target-required plan steps are validated before execution");
@@ -225,103 +289,198 @@ async fn run_step(
             )
             .map_err(|e| anyhow!("invalid timeout: {e}"))?;
             refuse_fenced_discord_mutation(env).await?;
-            let result = member
-                .disable_communication_until_datetime(&env.ctx.http, until)
-                .await;
-            record_step_outcome(
+            run_guarded_case_step(
                 env.app,
                 env.actor,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Timeout,
                 target,
-                &result,
+                member.disable_communication_until_datetime(&env.ctx.http, until),
             )
-            .await;
-            result?;
+            .await?;
         }
         PlanStep::Kick => {
             let target = target.expect("target-required plan steps are validated before execution");
             let member = target_member(env, target).await?;
             refuse_fenced_discord_mutation(env).await?;
-            let result = member
-                .kick_with_reason(&env.ctx.http, "custom command")
-                .await;
-            record_step_outcome(
+            run_guarded_case_step(
                 env.app,
                 env.actor,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
                 target,
-                &result,
+                member.kick_with_reason(&env.ctx.http, "custom command"),
             )
-            .await;
-            result?;
+            .await?;
         }
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
             refuse_fenced_discord_mutation(env).await?;
-            let pending_ban = crate::member_directory::begin_ban_attempt(
+            let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
+                env.ctx.http.as_ref(),
                 env.guild_id.get(),
                 target.get(),
+                crate::member_directory::MarkerSave::Missing,
             )
             .await;
-            let suppression = env.app.suppress_next_gateway_case(
-                crate::state::GatewayCaseAction::Ban,
-                env.guild_id.get(),
-                target.get(),
-            );
-            let result = env
-                .guild_id
-                .ban_with_reason(&env.ctx.http, target, *delete_days, "custom command")
-                .await;
-            if matches!(
-                crate::cases::classify_discord(result.as_ref().err()),
-                crate::db::guild_data::CaseOutcome::Failed
-            ) {
-                env.app.release_gateway_case_suppression(suppression);
+            match decision {
+                crate::member_directory::BanContinuation::Stop => {
+                    anyhow::bail!("writer lease is not held");
+                }
+                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                    crate::cases::settle_present_application_ban(
+                        env.app,
+                        enrollment.clone(),
+                        target.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                }
+                crate::member_directory::BanContinuation::RecordOnly { reason } => {
+                    crate::cases::settle_present_application_ban(
+                        env.app,
+                        enrollment.clone(),
+                        target.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                    if env.app.activation.may_record() {
+                        db::record_enrolled_ban_if_absent(
+                            &env.app.db,
+                            enrollment.clone(),
+                            target.get() as i64,
+                            None,
+                            None,
+                            Some(env.actor.get() as i64),
+                            None,
+                            "custom command",
+                            None,
+                            db::BanRecord::Retry,
+                        )
+                        .await?;
+                    }
+                }
+                crate::member_directory::BanContinuation::BanThenRecord => {
+                    if !env.app.activation.may_record() {
+                        anyhow::bail!("writer lease is not held");
+                    }
+                    let pending_ban = crate::member_directory::begin_ban_attempt(
+                        env.app,
+                        env.guild_id.get(),
+                        target.get(),
+                    )
+                    .await;
+                    if !env.app.activation.may_record() {
+                        anyhow::bail!("writer lease is not held");
+                    }
+                    let attempted = match crate::db::guild_data::CaseId::try_from(
+                        pending_ban.operation_id().to_owned(),
+                    ) {
+                        Ok(operation_id) => {
+                            crate::cases::begin_application_attempt(
+                                env.app,
+                                enrollment.clone(),
+                                crate::db::guild_data::CaseAction::Ban,
+                                target.get(),
+                                Some(env.actor.get()),
+                                Some("custom command".into()),
+                                crate::db::guild_data::CaseEvidence::Unavailable,
+                                operation_id,
+                            )
+                            .await
+                        }
+                        Err(_) => None,
+                    };
+                    let suppression = env.app.suppress_next_gateway_case(
+                        crate::state::GatewayCaseAction::Ban,
+                        env.guild_id.get(),
+                        target.get(),
+                    );
+                    let result = match crate::discord::race_discord_call(
+                        &env.app.activation,
+                        env.guild_id.ban_with_reason(
+                            &env.ctx.http,
+                            target,
+                            *delete_days,
+                            "custom command",
+                        ),
+                    )
+                    .await
+                    {
+                        crate::discord::DiscordCall::Cancelled => {
+                            pending_ban
+                                .finish(env.app, crate::db::guild_data::CaseOutcome::Uncertain)
+                                .await;
+                            anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                        }
+                        crate::discord::DiscordCall::Finished(result) => result,
+                    };
+                    if matches!(
+                        crate::cases::classify_discord(result.as_ref().err()),
+                        crate::db::guild_data::CaseOutcome::Failed
+                    ) {
+                        env.app.release_gateway_case_suppression(suppression);
+                    }
+                    if !env.app.activation.may_record() {
+                        anyhow::bail!("writer lease is not held");
+                    }
+                    if let Some(attempt) = attempted {
+                        attempt
+                            .finish(
+                                env.app,
+                                crate::cases::classify_discord(result.as_ref().err()),
+                            )
+                            .await;
+                    }
+                    pending_ban
+                        .finish(
+                            env.app,
+                            crate::cases::classify_discord(result.as_ref().err()),
+                        )
+                        .await;
+                    if !env.app.activation.may_record() {
+                        anyhow::bail!("writer lease is not held");
+                    }
+                    result?;
+                    db::record_enrolled_ban_if_absent(
+                        &env.app.db,
+                        enrollment.clone(),
+                        target.get() as i64,
+                        None,
+                        None,
+                        Some(env.actor.get() as i64),
+                        None,
+                        "custom command",
+                        None,
+                        db::BanRecord::Fresh,
+                    )
+                    .await?;
+                }
             }
-            record_step_outcome(
-                env.app,
-                env.actor,
-                enrollment.clone(),
-                crate::db::guild_data::CaseAction::Ban,
-                target,
-                &result,
-            )
-            .await;
-            pending_ban
-                .finish(
-                    env.app,
-                    crate::cases::classify_discord(result.as_ref().err()),
-                )
-                .await;
-            result?;
-            db::record_enrolled_ban(
-                &env.app.db,
-                enrollment.clone(),
-                target.get() as i64,
-                Some(env.actor.get() as i64),
-                "custom command",
-            )
-            .await?;
         }
         PlanStep::DeleteCommandMessage => {
             if let Some(id) = env.source_message {
-                let _ = env.channel_id.delete_message(&env.ctx.http, id).await;
+                require_plan_writer(&env.app.activation).await?;
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.channel_id.delete_message(&env.ctx.http, id),
+                )
+                .await;
             }
         }
         PlanStep::React { emoji } => {
             if let Some(id) = env.source_message {
-                let _ = env
-                    .ctx
-                    .http
-                    .create_reaction(
+                require_plan_writer(&env.app.activation).await?;
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.ctx.http.create_reaction(
                         env.channel_id,
                         id,
                         &serenity::model::channel::ReactionType::Unicode(emoji.clone()),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
             }
         }
         PlanStep::Wait { secs } => {
@@ -369,6 +528,45 @@ async fn record_step_outcome(
         crate::cases::application_source(),
     )
     .await;
+}
+
+#[cfg(test)]
+mod plan_effect_pause {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    fn parked() -> &'static Notify {
+        static PARKED: OnceLock<Notify> = OnceLock::new();
+        PARKED.get_or_init(Notify::new)
+    }
+
+    fn release() -> &'static Notify {
+        static RELEASE: OnceLock<Notify> = OnceLock::new();
+        RELEASE.get_or_init(Notify::new)
+    }
+
+    pub(super) fn arm() {
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) async fn wait_parked() {
+        parked().notified().await;
+    }
+
+    pub(super) fn resume() {
+        ARMED.store(false, Ordering::SeqCst);
+        release().notify_one();
+    }
+
+    pub(super) async fn checkpoint() {
+        if ARMED.load(Ordering::SeqCst) {
+            parked().notify_one();
+            release().notified().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +740,73 @@ mod tests {
         assert!(plan_requires_target(&[PlanStep::Timeout { minutes: 5 }]));
         assert!(plan_requires_target(&[PlanStep::Kick]));
         assert!(plan_requires_target(&[PlanStep::Ban { delete_days: 0 }]));
+    }
+
+    #[tokio::test]
+    async fn cutoff_stops_timeout_discord_and_case_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path =
+            std::env::temp_dir().join(format!("plan_cutoff_{:032x}.db", rand::random::<u128>()));
+        let app = crate::state::BotState::new(Default::default(), db::Db::open(&path, 2).unwrap())
+            .unwrap();
+        app.activation.mark_lock_held(true);
+        assert!(
+            db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_task = std::sync::Arc::clone(&calls);
+        super::plan_effect_pause::arm();
+        let worker = std::sync::Arc::clone(&app);
+        let enrolled = enrollment.clone();
+        let task = tokio::spawn(async move {
+            run_guarded_case_step(
+                &worker,
+                UserId::new(42),
+                Some(enrolled),
+                crate::db::guild_data::CaseAction::Timeout,
+                UserId::new(99),
+                async move {
+                    calls_task.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        super::plan_effect_pause::wait_parked().await;
+        app.activation.cut_off();
+        db::release_active_bot(&app.db, app.activation.instance())
+            .await
+            .unwrap();
+        super::plan_effect_pause::resume();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("writer lease is not held"),
+            "{error:#}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        assert_eq!(
+            store
+                .case_count(scope, crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            0
+        );
+        drop(store);
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

@@ -399,6 +399,9 @@ pub async fn sync_slash_commands_versioned_http(
         );
         return false;
     }
+    if !app.activation.may_record() {
+        return false;
+    }
     set_slash_commands(http, guild_id, &commands).await
 }
 

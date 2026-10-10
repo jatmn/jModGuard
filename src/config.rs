@@ -66,6 +66,33 @@ pub struct BotConfig {
     pub config_poll_secs: u64,
     /// Automatically retain eligible guild messages unless explicitly disabled.
     pub message_capture_enabled: bool,
+    /// Bot control listener. Not the public health or web bind.
+    pub control_bind: String,
+    /// API dial target for the control link. No default. Empty disables writes.
+    pub control_target: String,
+    /// Shared HMAC secret for the private writer link. Not a database token.
+    pub control_secret: ControlSecret,
+}
+
+/// Dedicated writer-link secret. Debug output never includes the value.
+#[derive(Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ControlSecret(String);
+
+impl std::fmt::Debug for ControlSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ControlSecret(<redacted>)")
+    }
+}
+
+impl ControlSecret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +304,9 @@ impl Default for BotConfig {
             status: "moderating".into(),
             config_poll_secs: 5,
             message_capture_enabled: true,
+            control_bind: "127.0.0.1:8082".into(),
+            control_target: String::new(),
+            control_secret: ControlSecret::default(),
         }
     }
 }
@@ -494,6 +524,7 @@ impl DbConfig {
             token: self.token.clone(),
             pool_size: self.pool_size,
             migrate,
+            read_only: !migrate,
             default_prefix: bot.default_prefix.clone(),
             retention_days: bot.retention_days,
         }
@@ -756,6 +787,15 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+        }
+        if let Ok(value) = env::var("JMODGUARD_CONTROL_SECRET") {
+            self.bot.control_secret = ControlSecret(value);
+        }
+        if let Ok(value) = env::var("JMODGUARD_CONTROL_BIND") {
+            self.bot.control_bind = value;
+        }
+        if let Ok(value) = env::var("JMODGUARD_CONTROL_TARGET") {
+            self.bot.control_target = value;
         }
         if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
             let v = v.trim();
@@ -1122,6 +1162,93 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn control_bind_defaults_to_loopback_and_target_defaults_empty() {
+        let cfg = Config::default();
+        assert_eq!(cfg.bot.control_bind, "127.0.0.1:8082");
+        assert!(cfg.bot.control_target.is_empty());
+        assert_eq!(cfg.web.bind, "127.0.0.1:8080");
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_CONTROL_BIND", "JMODGUARD_CONTROL_TARGET"]);
+        unsafe { std::env::set_var("JMODGUARD_CONTROL_BIND", "127.0.0.1:9") };
+        unsafe { std::env::set_var("JMODGUARD_CONTROL_TARGET", "") };
+        let mut cfg = Config::default();
+        cfg.apply_env_for(false).unwrap();
+        assert_eq!(cfg.bot.control_bind, "127.0.0.1:9");
+        assert!(cfg.bot.control_target.is_empty());
+        unsafe { std::env::set_var("JMODGUARD_CONTROL_TARGET", "127.0.0.1:9") };
+        cfg.apply_env_for(true).unwrap();
+        assert_eq!(cfg.bot.control_target, "127.0.0.1:9");
+    }
+
+    #[test]
+    fn listener_defaults_are_distinct() {
+        let bot_image = include_str!("../Dockerfile.bot");
+        let api_image = include_str!("../Dockerfile.api");
+        let bot_health = env_port(bot_image, "JMODGUARD_HEALTH_BIND");
+        let bot_expose = expose_port(bot_image);
+        let api_bind = env_port(api_image, "JMODGUARD_WEB_BIND");
+        let api_expose = expose_port(api_image);
+        let cfg = Config::default();
+        let control = port_of(&cfg.bot.control_bind);
+        let web = port_of(&cfg.web.bind);
+        assert_eq!(bot_health, 8081);
+        assert_eq!(bot_expose, 8081);
+        assert_eq!(api_bind, 8080);
+        assert_eq!(api_expose, 8080);
+        assert_eq!(web, 8080);
+        assert_eq!(control, 8082);
+        let mut ports = [bot_health, api_bind, control];
+        ports.sort_unstable();
+        assert!(
+            ports.windows(2).all(|pair| pair[0] != pair[1]),
+            "listener defaults must be distinct: {ports:?}"
+        );
+    }
+
+    fn env_port(dockerfile: &str, key: &str) -> u16 {
+        let line = dockerfile
+            .lines()
+            .find(|line| line.contains(&format!("ENV {key}=")))
+            .unwrap_or_else(|| panic!("missing {key}"));
+        port_of(line.rsplit('=').next().unwrap())
+    }
+
+    fn expose_port(dockerfile: &str) -> u16 {
+        let line = dockerfile
+            .lines()
+            .find(|line| line.starts_with("EXPOSE "))
+            .expect("missing EXPOSE");
+        line.trim_start_matches("EXPOSE ").trim().parse().unwrap()
+    }
+
+    fn port_of(address: &str) -> u16 {
+        address
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("port in {address}"))
+    }
+
+    #[test]
+    fn control_secret_loads_for_bot_and_api() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_CONTROL_SECRET"]);
+        let secret = "x".repeat(32);
+        unsafe { std::env::set_var("JMODGUARD_CONTROL_SECRET", &secret) };
+        let mut bot = Config::default();
+        bot.apply_env_for(false).unwrap();
+        let mut api = Config::default();
+        api.apply_env_for(true).unwrap();
+        assert_eq!(bot.bot.control_secret.as_str(), secret);
+        assert_eq!(api.bot.control_secret.as_str(), secret);
+        let rendered = format!("{:?}", bot.bot.control_secret);
+        assert!(!rendered.contains(&secret));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]

@@ -19,6 +19,10 @@ use crate::bot_actions::Action;
 use crate::db;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
 
+fn dashboard_actor(auth: &AuthCtx) -> i64 {
+    i64::try_from(auth.discord_user_id()).unwrap_or(0)
+}
+
 /// Authorizes an endpoint that operates on a real Discord guild. Global
 /// configuration (`guild_id = 0`) is intentionally handled by configuration
 /// routes, but it must never reach Discord REST or guild-local audit tables.
@@ -230,17 +234,22 @@ pub async fn update_settings(
     let bot_name_present = body.bot_name.is_some();
     let prefix_patch = body.prefix.clone();
     let bot_name_patch = body.bot_name.clone();
-    let settings = db::patch_enrolled_settings(
-        &app.db,
-        super::configuration_scope(&app, &auth, guild_id)?,
-        body.prefix,
-        body.bot_name,
-        body.sync_nickname,
-    )
-    .await?;
+    let (unchanged, settings_body) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::PatchSettings {
+                scope: super::configuration_scope(&app, &auth, guild_id)?.to_wire(),
+                prefix: db::FieldPatch::from_settings(body.prefix),
+                bot_name: db::FieldPatch::from_settings(body.bot_name),
+                reconcile: body.sync_nickname,
+            },
+        )
+        .await?;
+    let settings: crate::types::GuildSettings = serde_json::from_value(settings_body)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
+        "unchanged": unchanged,
         "settings": settings_wire(&settings),
         "nickname_applied": null,
         "nickname_queued": nickname_queued,
@@ -309,11 +318,16 @@ pub async fn put_rule(
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
     }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::upsert_enrolled_rule(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &rule_id,
-        &body.data,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::UpsertRule {
+            request,
+            target,
+            id: rule_id.clone(),
+            rule: body.data.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -342,10 +356,15 @@ pub async fn delete_rule(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_enrolled_rule(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &rule_id,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::DeleteRule {
+            request,
+            target,
+            id: rule_id.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -410,13 +429,20 @@ pub async fn add_badword(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    let id = db::add_enrolled_badword(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &body.pattern,
-        body.note.as_deref(),
-    )
-    .await?;
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    let (_, id_body) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::AddBadword {
+                request,
+                target,
+                pattern: body.pattern.clone(),
+                note: body.note.clone(),
+            },
+        )
+        .await?;
+    let id: i64 = serde_json::from_value(id_body)?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "id": id,
@@ -458,14 +484,20 @@ pub async fn delete_badword(
     }
     // Post-auth miss (TOCTOU race / already deleted) must stay uniform — do not
     // surface guild-scoped DB wording if the layer ever diverges again.
-    match db::delete_enrolled_badword(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, word.guild_id)?,
-        word_id,
-    )
-    .await
+    let write = super::configuration_write_scope(&app, &auth, guild_id, word.guild_id)?;
+    let (request, target) = write.to_wires();
+    match app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::DeleteBadword {
+                request,
+                target,
+                id: word_id,
+            },
+        )
+        .await
     {
-        Ok(()) => Ok(Json(serde_json::json!({
+        Ok((_, _)) => Ok(Json(serde_json::json!({
             "ok": true,
             "config_patch": {
                 "kind": "badword",
@@ -560,11 +592,16 @@ pub async fn put_command(
     let mut data = body.data;
     data.name = name.clone();
     validate_command_descriptor(&data)?;
-    db::upsert_enrolled_command(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &name,
-        &data,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::UpsertCommand {
+            request,
+            target,
+            name: name.clone(),
+            command: data.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -592,11 +629,16 @@ pub async fn create_command(
     let mut data = body.data;
     data.name = name.clone();
     validate_command_descriptor(&data)?;
-    db::upsert_enrolled_command(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &name,
-        &data,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::UpsertCommand {
+            request,
+            target,
+            name: name.clone(),
+            command: data.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -621,10 +663,15 @@ pub async fn delete_command(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_enrolled_command(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &name.to_lowercase(),
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::DeleteCommand {
+            request,
+            target,
+            name: name.to_lowercase(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -690,11 +737,16 @@ pub async fn put_template(
     if !crate::types::is_log_event(&event) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
-    db::upsert_enrolled_template(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &event,
-        &body.template,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::UpsertTemplate {
+            request,
+            target,
+            event: event.clone(),
+            template: body.template.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -718,10 +770,15 @@ pub async fn delete_template(
     let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_enrolled_template(
-        &app.db,
-        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
-        &event,
+    let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::DeleteTemplate {
+            request,
+            target,
+            event: event.clone(),
+        },
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -749,7 +806,19 @@ pub async fn put_log_filter(
     let auth = real_guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_write_scope(&app, &auth, guild_id, guild_id as i64)?;
-    let filter = db::put_enrolled_log_filter(&app.db, scope, &event, filter).await?;
+    let (request, target) = scope.to_wires();
+    let (_, body) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::PutLogFilter {
+                request,
+                target,
+                event: event.clone(),
+                filter,
+            },
+        )
+        .await?;
+    let filter: db::LogFilter = serde_json::from_value(body)?;
     Ok(Json(serde_json::json!({ "ignore": filter })))
 }
 
@@ -925,13 +994,17 @@ pub async fn copy_config(
     // Settings copy atomically commits the desired nickname and outbox row;
     // the bot applies Discord from that durable state.
     let nickname_queued = wants_settings && guild_id != 0;
-    let result = db::copy_enrolled_guild_config(
-        &app.db,
-        super::configuration_scope(&app, &source, body.from_guild_id)?,
-        super::configuration_scope(&app, &dest, guild_id)?,
-        body.sections,
-    )
-    .await?;
+    let (_, copied) = app
+        .commit_json_actor(
+            dashboard_actor(&dest),
+            db::ControlOp::CopyGuildConfig {
+                source: super::configuration_scope(&app, &source, body.from_guild_id)?.to_wire(),
+                destination: super::configuration_scope(&app, &dest, guild_id)?.to_wire(),
+                sections: body.sections,
+            },
+        )
+        .await?;
+    let result: db::CopyAck = serde_json::from_value(copied)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1090,30 +1163,34 @@ pub(super) async fn enqueue_action(
     let enrollment = super::authorized_enrollment(auth, guild)?;
     let actor = i64::try_from(auth.discord_user_id())
         .map_err(|_| ApiError(anyhow::anyhow!("invalid actor id")))?;
-    let job = db::enqueue_enrolled_bot_action(
-        &app.db,
-        &enrollment,
-        actor,
-        request,
-        action,
-        chrono::Utc::now().timestamp(),
-        app.cfg.actions.clone(),
-    )
-    .await
-    .map_err(|error| {
-        if error.is::<db::EnrollmentChanged>() {
-            return ApiError(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
-        }
-        if error.is::<db::EnrollmentUnverified>()
-            || error.is::<crate::bot_actions::RequestKeyError>()
-        {
-            return ApiError(error);
-        }
-        tracing::warn!("bot action admission failed: {error:#}");
-        ApiError(anyhow::anyhow!(
-            "Could not queue action. Check pending actions and retry using the same request ID."
-        ))
-    })?;
+    let (_, job_body) = app
+        .commit_json(db::ControlOp::EnqueueBotAction {
+            enrollment,
+            actor,
+            request: request.to_owned(),
+            action,
+            now: chrono::Utc::now().timestamp(),
+            limits: app.cfg.actions.clone(),
+        })
+        .await
+        .map_err(|error| {
+            if error.is::<db::EnrollmentChanged>()
+                || error.to_string().contains("Server membership changed")
+            {
+                return ApiError(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
+            }
+            if error.is::<db::EnrollmentUnverified>()
+                || error.is::<crate::bot_actions::RequestKeyError>()
+                || error.to_string().contains("could not be verified")
+            {
+                return ApiError(error);
+            }
+            tracing::warn!("bot action admission failed: {error:#}");
+            ApiError(anyhow::anyhow!(
+                "Could not queue action. Check pending actions and retry using the same request ID."
+            ))
+        })?;
+    let job: db::BotAction = serde_json::from_value(job_body)?;
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
@@ -1162,7 +1239,13 @@ pub async fn cancel_action(
     if !can_access_action(&auth, guild, &job.action) {
         return Err(ApiError(anyhow::anyhow!("action not available")));
     }
-    if !db::cancel_enrolled_bot_action(&app.db, &enrollment, &id).await? {
+    let (_, cancelled) = app
+        .commit_json(db::ControlOp::CancelBotAction {
+            enrollment,
+            id: id.clone(),
+        })
+        .await?;
+    if !serde_json::from_value::<bool>(cancelled)? {
         return Err(ApiError(anyhow::anyhow!(
             "only unstarted work can be cancelled; log-channel work can also be cleared while running or unknown"
         )));

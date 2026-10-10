@@ -1011,10 +1011,15 @@ where
         ))
 }
 
+fn recovery_control(app: &ApiState) -> crate::db::UpdateControl {
+    crate::db::UpdateControl::from_application(&app.db)
+}
+
 pub fn router(app: Arc<ApiState>) -> Router {
     // In-memory sessions are intentional for a single API replica.
     // Sessions are lost on API restart; multi-replica needs a shared store.
-    router_with_store(app, MemoryStore::default())
+    let store = app.take_session_store().unwrap_or_default();
+    router_with_store(app, store)
 }
 
 fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
@@ -1203,8 +1208,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .merge(recovery::routes(Arc::new(recovery::RecoveryState {
             cfg: Arc::clone(&app.cfg),
             oauth: Arc::clone(&app.oauth),
-            control: crate::db::UpdateControl::from_application(&app.db),
+            control: recovery_control(&app),
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+            api: Some(Arc::clone(&app)),
+            writer: None,
         })))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(
@@ -1569,6 +1576,131 @@ mod tests {
         super::assert_uncacheable_headers(res.headers());
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_api_serves_health_and_launcher_startup_does_not_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path =
+            std::env::temp_dir().join(format!("api-health-{:032x}.db", rand::random::<u128>()));
+        let writer = crate::db::Db::open(&path, 2).unwrap();
+        let seeded = crate::db::UpdateControl::from_application(&writer);
+        assert!(seeded.writes_locally());
+        // The baked bot controller stores its own row and the API row.
+        seeded
+            .baked_compatibility("bot", "base-sha", true)
+            .await
+            .unwrap();
+        seeded
+            .baked_compatibility("api", "base-sha", true)
+            .await
+            .unwrap();
+        drop(seeded);
+        drop(writer);
+
+        let mut cfg = crate::config::ApiProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 2;
+        let opts = cfg.db_open_options();
+        assert!(opts.read_only, "production API options stay read-only");
+        assert!(!opts.migrate);
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        crate::db::arm_writer_open_tripwire(std::sync::Arc::clone(&flag));
+        let probe = std::sync::Arc::new(crate::db::StartupProbe::default());
+        let _guard = crate::db::enter_startup_probe(Some(std::sync::Arc::clone(&probe)));
+        let db = crate::startup::open_database(&cfg).await.unwrap();
+        assert!(db.is_read_only());
+        let app = ApiState::new(cfg, db).unwrap();
+        let response = router(std::sync::Arc::clone(&app))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let served = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert_eq!(&served[..], b"ok");
+
+        let control = crate::db::UpdateControl::from_application(&app.db);
+        assert!(!control.writes_locally());
+        let verified = control
+            .baked_compatibility("api", "base-sha", false)
+            .await
+            .unwrap();
+        assert_eq!(verified.source_sha, "base-sha");
+        let compiled = control
+            .baked_compatibility("api", "other-sha", true)
+            .await
+            .unwrap();
+        assert_eq!(compiled.source_sha, "other-sha");
+        assert_eq!(
+            control
+                .baked_compatibility("api", "base-sha", false)
+                .await
+                .unwrap()
+                .source_sha,
+            "base-sha",
+            "a read-only controller must not overwrite baked compatibility"
+        );
+        let mismatch = control
+            .baked_compatibility("api", "wrong-sha", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("does not match"), "{mismatch}");
+        let release = crate::db::ComponentRelease {
+            component: "api".into(),
+            channel: "stable".into(),
+            release_id: "test".into(),
+            source_sha: "a".repeat(40),
+            published_at: "2026-10-01T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-api".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            launcher: None,
+            base_abi: "debian-bookworm-amd64".into(),
+            upgrade: None,
+        };
+        let before = control.component("api").await.unwrap();
+        for result in [
+            control.observe_launcher("api", 1).await,
+            control.baked_launcher("api", "hash", 1).await,
+            control.launcher_running("api", &release, "hash", 1).await,
+            control.launcher_failed("api", &release.digest, "err").await,
+            control.failed("api", &release, "err").await,
+        ] {
+            let error =
+                result.expect_err("a read-only launcher must not pretend a receipt was saved");
+            assert!(
+                error.downcast_ref::<crate::db::ReceiptNotSaved>().is_some(),
+                "{error:#}"
+            );
+        }
+        control.upgrade_error("missing", "err").await.unwrap();
+        let after = control.component("api").await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&after).unwrap(),
+            "an API launcher must not record launcher lifecycle"
+        );
+        assert!(control.upgrade().await.unwrap().is_none());
+        assert_eq!(probe.immediate(), 0);
+        assert!(!flag.load(Ordering::SeqCst));
+        drop(app);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        crate::tenant::remove_sidecars(&path);
     }
 
     async fn assert_unauthenticated(app: Router, method: &str, uri: &str, body: &str) {

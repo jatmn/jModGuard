@@ -307,17 +307,16 @@ async fn patch_settings_inner(
         } else if guild_id > 0 {
             super::guild_stores::refuse_fenced_write(&tx, guild_id)?;
         }
+        let defaults = terminal_defaults_conn(&tx)?;
         if !settings_changed && !reconcile_nickname {
-            let defaults = terminal_defaults_conn(&tx)?;
             let settings = effective_settings_conn(&tx, guild_id, &defaults)?;
             tx.finish_read()?;
             return Ok(settings);
         }
 
-        tx.ensure_mutation_receipt()?;
-        let defaults = terminal_defaults_conn(&tx)?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
-        let mut ov = read_settings_override_conn(&tx, guild_id)?.unwrap_or_default();
+        let current = read_settings_override_conn(&tx, guild_id)?.unwrap_or_default();
+        let mut ov = current.clone();
 
         // Apply provided fields, then normalize the *whole* override against
         // parent. Normalizing only patched fields would leave legacy
@@ -334,7 +333,13 @@ async fn patch_settings_inner(
             ov.retention_days = r;
         }
         let ov = normalize_settings_override_against_parent(&ov, &parent);
+        if ov == current && !nickname_changed {
+            let effective = effective_settings_conn(&tx, guild_id, &defaults)?;
+            tx.finish_read()?;
+            return Ok(effective);
+        }
 
+        tx.ensure_mutation_receipt()?;
         if settings_changed {
             write_settings_override_conn(&tx, guild_id, &ov)?;
         }

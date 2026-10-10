@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const JOINED_AT_NS: i64 = 1_000_000_100;
@@ -266,4 +267,218 @@ async fn departure_or_settings_change_during_http_blocks_dispatch() {
         };
         assert!(!dispatch_ready(&f.db, &job, &source).await.unwrap());
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_edit() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    struct Stuck {
+        polled: Arc<AtomicBool>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Future for Stuck {
+        type Output = serenity::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polled.store(true, Ordering::SeqCst);
+            self.started.notify_waiters();
+            Poll::Pending
+        }
+    }
+
+    let f = Fixture::new();
+    let job = f.job().await;
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    assert!(
+        db::claim_active_bot(
+            &f.db,
+            app.activation.instance(),
+            chrono::Utc::now().timestamp_millis(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    app.activation.mark_lock_held(true);
+    let edits = Arc::new(AtomicUsize::new(0));
+    let polled = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notified = started.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let task = {
+        let app = Arc::clone(&app);
+        let job = job.clone();
+        let edits = Arc::clone(&edits);
+        let polled = Arc::clone(&polled);
+        let started = Arc::clone(&started);
+        tokio::spawn(async move {
+            apply_nickname_edit(
+                &app,
+                &job,
+                || async { panic!("the first edit has no unknown outcome") },
+                || {
+                    edits.fetch_add(1, Ordering::SeqCst);
+                    Stuck { polled, started }
+                },
+            )
+            .await
+        })
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("edit was not polled"),
+        _ = &mut notified => {}
+    }
+    assert!(polled.load(Ordering::SeqCst));
+    db::release_active_bot(&f.db, app.activation.instance())
+        .await
+        .unwrap();
+    app.activation.cut_off();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cutoff must finish the nickname edit")
+        .unwrap();
+    assert_eq!(edits.load(Ordering::SeqCst), 1);
+    let status = db::nickname_reconcile_status(&f.db, 10)
+        .await
+        .unwrap()
+        .expect("a cancelled edit must not acknowledge the job");
+    assert_eq!(status.state, "pending");
+    assert_eq!(status.last_error_code.as_deref(), Some("outcome_unknown"));
+
+    let next_job = db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let next = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    assert!(
+        db::claim_active_bot(
+            &f.db,
+            next.activation.instance(),
+            chrono::Utc::now().timestamp_millis(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    next.activation.mark_lock_held(true);
+    let again = Arc::new(AtomicUsize::new(0));
+    let again_task = Arc::clone(&again);
+    let wanted = next_job.nickname.clone();
+    apply_nickname_edit(
+        &next,
+        &next_job,
+        || async move { Ok(Some(wanted)) },
+        || {
+            again_task.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        },
+    )
+    .await;
+    assert_eq!(
+        again.load(Ordering::SeqCst),
+        0,
+        "an already-applied nickname must not call edit_member"
+    );
+    assert!(
+        db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stale_nickname_job_is_not_sent_after_a_newer_generation() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    assert!(
+        db::claim_active_bot(
+            &f.db,
+            app.activation.instance(),
+            chrono::Utc::now().timestamp_millis(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    app.activation.mark_lock_held(true);
+    assert!(
+        db::mark_nickname_outcome_unknown(&f.db, &job, 10)
+            .await
+            .unwrap(),
+        "the captured job is still current"
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let edits = Arc::new(AtomicUsize::new(0));
+    let waiting = entered.notified();
+    tokio::pin!(waiting);
+    waiting.as_mut().enable();
+    let task = {
+        let app = Arc::clone(&app);
+        let job = job.clone();
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let edits = Arc::clone(&edits);
+        tokio::spawn(async move {
+            apply_nickname_edit(
+                &app,
+                &job,
+                move || {
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let waiting = release.notified();
+                        tokio::pin!(waiting);
+                        waiting.as_mut().enable();
+                        entered.notify_waiters();
+                        waiting.await;
+                        Ok(Some("not the saved nickname".into()))
+                    }
+                },
+                || {
+                    edits.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("the confirmation read must pause");
+    db::patch_settings(
+        &f.db,
+        10,
+        None,
+        Some(Some("superseding nickname".into())),
+        None,
+    )
+    .await
+    .unwrap();
+    let fresh = db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_ne!(fresh.generation, job.generation);
+    assert_eq!(fresh.nickname, "superseding nickname");
+    release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("the stale job must finish without sending")
+        .unwrap();
+    assert_eq!(edits.load(Ordering::SeqCst), 0);
+    let after = db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(after, fresh);
 }

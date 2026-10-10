@@ -55,6 +55,7 @@ pub trait DiscordActions: Send + Sync {
 pub struct LiveDiscord<'a> {
     pub http: &'a serenity::http::Http,
     pub bot_user_id: UserId,
+    pub activation: &'a crate::activation::Activation,
 }
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
@@ -101,20 +102,24 @@ impl DiscordActions for LiveDiscord<'_> {
         )
     }
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome {
-        match self
-            .http
-            .remove_ban(
+        match crate::discord::race_discord_call(
+            self.activation,
+            self.http.remove_ban(
                 GuildId::new(guild as u64),
                 UserId::new(user as u64),
                 Some(reason),
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(()) => Outcome::succeeded("unbanned"),
-            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r))) => {
-                classify_unban_response(r.status_code.as_u16(), r.error.code)
+            crate::discord::DiscordCall::Cancelled => Outcome::uncertain("discord_outcome_unknown"),
+            crate::discord::DiscordCall::Finished(Ok(())) => Outcome::succeeded("unbanned"),
+            crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(r),
+            ))) => classify_unban_response(r.status_code.as_u16(), r.error.code),
+            crate::discord::DiscordCall::Finished(Err(_)) => {
+                Outcome::uncertain("discord_outcome_unknown")
             }
-            Err(_) => Outcome::uncertain("discord_outcome_unknown"),
         }
     }
 }
@@ -315,6 +320,9 @@ async fn execute_inner(
                         crate::db::guild_data::MemberSyncAction::Reconcile
                     }
                 };
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 let Some(bot_id) = discord.bot_user_id() else {
                     return Outcome::failed("bot_identity_unavailable");
@@ -377,6 +385,9 @@ async fn execute_inner(
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
                 }
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
                 let suppression = app.map(|app| {
                     app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Unban,
@@ -419,6 +430,9 @@ async fn execute_inner(
                 Outcome::failed("validation_timed_out")
             }
         });
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Err(anyhow::anyhow!("writer lease is not held"));
+    }
     if mutation_started.load(std::sync::atomic::Ordering::Relaxed)
         && let Some(tenant) = tenant
         && let Action::Unban { user_id, reason } = &job.action
@@ -489,6 +503,9 @@ async fn execute_inner(
                 "selected unban case not recorded: invalid captured action identity"
             );
         }
+    }
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Err(anyhow::anyhow!("writer lease is not held"));
     }
     if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
         tracing::warn!(

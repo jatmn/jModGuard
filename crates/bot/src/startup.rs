@@ -9,6 +9,7 @@ use crate::db::{self, Db};
 use crate::state::BotState;
 use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn write_probe_marker(dir: &Path, name: &str, contents: &str) -> Result<()> {
@@ -38,6 +39,36 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     write_probe_marker(&dir, "bot-migrate", if migrate { "true" } else { "false" })?;
     let db = open_database(&cfg).await?;
     let app = BotState::new(cfg, db)?;
+    if !crate::activation::claim_writer_lease(
+        app.cfg.bot.control_secret.as_str(),
+        &app.db,
+        &app.activation,
+        Some(&app.tenant),
+    )
+    .await?
+    {
+        bail!("bot probe stopped before it held the writer lease");
+    }
+    let _renewal = crate::activation::spawn_renewal(
+        app.db.clone(),
+        Arc::clone(&app.activation),
+        app.tenant.clone(),
+    );
+    app.install_control_actor_lookup(|_actor, _op| {
+        Some(db::CachedGuildActor {
+            guild_owner_id: 0,
+            permissions: 1 << 5,
+        })
+    });
+    if let Some(bound) = crate::control_server::spawn(Arc::clone(&app))? {
+        write_probe_marker(&dir, "writer-port", &bound.port().to_string())?;
+    } else {
+        tracing::error!("control listener is off; the probe continues without a writer port");
+    }
+    let enrolled = db::enroll_guild(&app.db, guild_id as i64, 1)
+        .await?
+        .context("probe guild was not enrolled")?;
+    write_probe_marker(&dir, "writer-scope", &enrolled.id)?;
     let before = app.configs.get(&app.db, guild_id).await?;
     write_probe_marker(&dir, "bot-ready", &before.settings.prefix)?;
     let deadline = Instant::now() + Duration::from_secs(60);

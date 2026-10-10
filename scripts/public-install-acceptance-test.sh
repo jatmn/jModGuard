@@ -132,7 +132,7 @@ if (JSON.stringify(names) !== JSON.stringify(expected)) {
 const bunny = fs.readFileSync(path.join(root, "docs/DEPLOY-BUNNY.md"), "utf8");
 const idx = bunny.indexOf("**General:**");
 const idx2 = bunny.indexOf("**Text:**", idx);
-const idx3 = bunny.indexOf("## 7. Acceptance test", idx2);
+const idx3 = bunny.indexOf("## 6. Acceptance test", idx2);
 if (Math.min(idx, idx2, idx3) < 0) {
   process.stderr.write("docs/DEPLOY-BUNNY.md missing Discord URL Generator permission lists\n");
   process.exit(1);

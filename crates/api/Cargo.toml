@@ -28,6 +28,7 @@ tower-sessions = { version = "0.15", features = ["memory-store"] }
 tracing = "0.1"
 
 [dev-dependencies]
+jmodguard = { path = "../..", features = ["test-support"] }
 tower = "0.5.3"
 async-trait = "0.1"
 jmodguard-bot = { path = "../bot" } # HTTP-to-worker regression fixtures only

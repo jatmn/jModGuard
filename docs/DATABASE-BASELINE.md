@@ -112,7 +112,7 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 ## Separate guild-store family
 
 The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version14,
-using `migrations/guild/0001_identity.sql` through `0014_member_case_retain_revision.sql`. This separate
+using `migrations/guild/0001_identity.sql` through `0015_local_write_fence.sql`. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
@@ -145,4 +145,4 @@ matching pre-upgrade backup and binaries. See [application database budgets](DAT
 Core migration 0017 adds ordered guild event/ban page indexes and a state/expiry
 index for the bot-action poll. Upgrade the bot and API together through the
 existing paired schema protocol; their exact core runtime schema is now 17.
-The guild schema remains 14: its member-cleanup index already exists.
+The guild schema is 15. Migration 0015 adds `guild_local_write_fence` so a member-sync status read can see a fence inside the guild transaction, and `guild_writer_epoch` so a leased guild commit must match the holder's generation before it lands. Core fences remain in the other database. A newer holder raises that epoch in the guild store before it acts. The core writer lock is not held across the guild commit.

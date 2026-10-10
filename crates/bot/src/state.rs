@@ -7,6 +7,7 @@ use regex::Regex;
 use serenity::model::id::ChannelId;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -354,6 +355,23 @@ pub enum SlashResyncPlan {
     Sync { guilds: Vec<u64>, invalidate: bool },
 }
 
+type ControlActorLookup = dyn Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync;
+
+pub(crate) enum ControlMemberFetch {
+    Found(Box<serenity::model::guild::Member>),
+    Absent,
+    Unavailable,
+}
+
+type MemberLookup =
+    dyn Fn(u64, u64) -> Pin<Box<dyn Future<Output = ControlMemberFetch> + Send>> + Send + Sync;
+
+enum GuildActorCache {
+    Known(db::CachedGuildActor),
+    MemberMissing,
+    GuildMissing,
+}
+
 /// Discord runtime state has no dashboard OAuth client.
 /// ```compile_fail
 /// fn dashboard(state: &jmodguard_bot::state::BotState) {
@@ -362,6 +380,8 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
+    /// Pure reads. Rule writes stay on [`Self::db`].
+    pub reads: Db,
     pub activation: Arc<crate::activation::Activation>,
     pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<BotProcessConfig>,
@@ -412,6 +432,10 @@ pub struct BotState {
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
+    /// Test seam. Production reads [`Self::discord_cache`] instead.
+    control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
+    member_lookup: Mutex<Option<Arc<MemberLookup>>>,
+    discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
 }
 
 impl BotState {
@@ -439,8 +463,18 @@ impl BotState {
         let primed = db::get_primary_versions_sync(&db)
             .context("failed to read primary version baselines while building BotState")?;
         db.require_config_version(primed.config);
+        let mut read_opts = cfg.db_open_options();
+        if !db.is_remote() {
+            read_opts.path = db.path().to_path_buf();
+            read_opts.url.clear();
+            read_opts.token.clear();
+        }
+        read_opts.read_only = true;
+        read_opts.migrate = false;
+        let reads = Db::open_with(read_opts).context("failed to open the read-only database")?;
         Ok(Arc::new(Self {
             db,
+            reads,
             activation: crate::activation::Activation::new(),
             tenant,
             cfg: Arc::new(cfg),
@@ -475,9 +509,243 @@ impl BotState {
             member_sync_wake: tokio::sync::Notify::new(),
             ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
+            control_actor_lookup: Mutex::new(None),
+            member_lookup: Mutex::new(None),
+            discord_cache: Mutex::new(None),
         }))
     }
 
+    pub fn install_discord_cache(&self, cache: Arc<serenity::cache::Cache>) {
+        *self.discord_cache.lock() = Some(cache);
+    }
+
+    /// Process probes and tests supply a cache view without a live Discord gateway.
+    pub fn install_control_actor_lookup(
+        &self,
+        lookup: impl Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync + 'static,
+    ) {
+        *self.control_actor_lookup.lock() = Some(Arc::new(lookup));
+    }
+
+    pub(crate) fn install_member_lookup<F, Fut>(&self, lookup: F)
+    where
+        F: Fn(u64, u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ControlMemberFetch> + Send + 'static,
+    {
+        *self.member_lookup.lock() = Some(Arc::new(move |guild_id, user_id| {
+            Box::pin(lookup(guild_id, user_id))
+        }));
+    }
+
+    pub fn install_http_member_lookup(&self, http: Arc<serenity::http::Http>) {
+        self.install_member_lookup(move |guild_id, user_id| {
+            let http = Arc::clone(&http);
+            async move {
+                match http
+                    .get_member(
+                        serenity::model::id::GuildId::new(guild_id),
+                        serenity::model::id::UserId::new(user_id),
+                    )
+                    .await
+                {
+                    Ok(member) => ControlMemberFetch::Found(Box::new(member)),
+                    Err(error) if member_lookup_absent(&error) => ControlMemberFetch::Absent,
+                    Err(_) => ControlMemberFetch::Unavailable,
+                }
+            }
+        });
+    }
+
+    pub async fn authorize_control_actor(
+        &self,
+        op: &db::ControlOp,
+        actor_user_id: i64,
+    ) -> Result<(), &'static str> {
+        if self.control_actor_lookup.lock().is_some() {
+            let cached = self.cached_control_actor(actor_user_id, op);
+            for need in db::control_actor_needs(op) {
+                db::decide_control_actor(need, actor_user_id, self.cfg.bot.owner_id, cached)?;
+            }
+            return Ok(());
+        }
+        for need in db::control_actor_needs(op) {
+            self.authorize_control_need(need, actor_user_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_control_need(
+        &self,
+        need: db::ControlActorNeed,
+        actor_user_id: i64,
+    ) -> Result<(), &'static str> {
+        let guild_id = match need {
+            db::ControlActorNeed::Process | db::ControlActorNeed::Owner => {
+                return db::decide_control_actor(need, actor_user_id, self.cfg.bot.owner_id, None);
+            }
+            db::ControlActorNeed::ManageGuild(id) | db::ControlActorNeed::GuildAdmin(id) => id,
+        };
+        match self.cached_guild_actor(guild_id, actor_user_id) {
+            GuildActorCache::Known(cached) => {
+                db::decide_control_actor(need, actor_user_id, self.cfg.bot.owner_id, Some(cached))
+            }
+            GuildActorCache::GuildMissing => Err("actor permission could not be confirmed"),
+            GuildActorCache::MemberMissing => {
+                self.lookup_guild_actor(need, guild_id, actor_user_id).await
+            }
+        }
+    }
+
+    fn cached_guild_actor(&self, guild_id: i64, actor_user_id: i64) -> GuildActorCache {
+        if guild_id <= 0 || actor_user_id <= 0 {
+            return GuildActorCache::MemberMissing;
+        }
+        let Some(cache) = self.discord_cache.lock().clone() else {
+            return GuildActorCache::GuildMissing;
+        };
+        let Some(guild) = cache.guild(serenity::model::id::GuildId::new(guild_id as u64)) else {
+            return GuildActorCache::GuildMissing;
+        };
+        let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
+        if owner == actor_user_id {
+            return GuildActorCache::Known(db::CachedGuildActor {
+                guild_owner_id: owner,
+                permissions: 0,
+            });
+        }
+        let Some(member) = guild
+            .members
+            .get(&serenity::model::id::UserId::new(actor_user_id as u64))
+        else {
+            return GuildActorCache::MemberMissing;
+        };
+        GuildActorCache::Known(db::CachedGuildActor {
+            guild_owner_id: owner,
+            permissions: permission_bits(guild.member_permissions(member)),
+        })
+    }
+
+    async fn lookup_guild_actor(
+        &self,
+        need: db::ControlActorNeed,
+        guild_id: i64,
+        actor_user_id: i64,
+    ) -> Result<(), &'static str> {
+        let Some(lookup) = self.member_lookup.lock().clone() else {
+            return Err("actor permission could not be confirmed");
+        };
+        if guild_id <= 0 || actor_user_id <= 0 {
+            return Err("actor is not allowed");
+        }
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(2),
+            lookup(guild_id as u64, actor_user_id as u64),
+        )
+        .await;
+        match fetched {
+            Ok(ControlMemberFetch::Absent) => Err("actor is not allowed"),
+            Ok(ControlMemberFetch::Unavailable) | Err(_) => {
+                Err("actor permission could not be confirmed")
+            }
+            Ok(ControlMemberFetch::Found(member)) => {
+                let Some(cache) = self.discord_cache.lock().clone() else {
+                    return Err("actor permission could not be confirmed");
+                };
+                let Some(guild) = cache.guild(serenity::model::id::GuildId::new(guild_id as u64))
+                else {
+                    return Err("actor permission could not be confirmed");
+                };
+                let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
+                db::decide_control_actor(
+                    need,
+                    actor_user_id,
+                    self.cfg.bot.owner_id,
+                    Some(db::CachedGuildActor {
+                        guild_owner_id: owner,
+                        permissions: permission_bits(guild.member_permissions(&member)),
+                    }),
+                )
+            }
+        }
+    }
+
+    fn cached_control_actor(
+        &self,
+        actor_user_id: i64,
+        op: &db::ControlOp,
+    ) -> Option<db::CachedGuildActor> {
+        if let Some(lookup) = self.control_actor_lookup.lock().clone() {
+            return lookup(actor_user_id, op);
+        }
+        let cache = self.discord_cache.lock().clone()?;
+        cached_actor_from_discord(&cache, actor_user_id, op)
+    }
+}
+
+fn cached_actor_from_discord(
+    cache: &serenity::cache::Cache,
+    actor_user_id: i64,
+    op: &db::ControlOp,
+) -> Option<db::CachedGuildActor> {
+    let guild_id = match db::control_actor_need(op) {
+        db::ControlActorNeed::ManageGuild(id) | db::ControlActorNeed::GuildAdmin(id) if id > 0 => {
+            id as u64
+        }
+        _ => return None,
+    };
+    if actor_user_id <= 0 {
+        return None;
+    }
+    let guild = cache.guild(serenity::model::id::GuildId::new(guild_id))?;
+    let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
+    if owner == actor_user_id {
+        return Some(db::CachedGuildActor {
+            guild_owner_id: owner,
+            permissions: 0,
+        });
+    }
+    let member = guild
+        .members
+        .get(&serenity::model::id::UserId::new(actor_user_id as u64))?;
+    let permissions = guild.member_permissions(member);
+    let mut bits = 0u64;
+    if permissions.administrator() {
+        bits |= 1 << 3;
+    }
+    if permissions.manage_guild() {
+        bits |= 1 << 5;
+    }
+    Some(db::CachedGuildActor {
+        guild_owner_id: owner,
+        permissions: bits,
+    })
+}
+
+fn permission_bits(permissions: serenity::model::permissions::Permissions) -> u64 {
+    let mut bits = 0u64;
+    if permissions.administrator() {
+        bits |= 1 << 3;
+    }
+    if permissions.manage_guild() {
+        bits |= 1 << 5;
+    }
+    bits
+}
+
+fn member_lookup_absent(error: &serenity::Error) -> bool {
+    let serenity::Error::Http(http) = error else {
+        return false;
+    };
+    if http.status_code().is_some_and(|code| code.as_u16() == 404) {
+        return true;
+    }
+    match http {
+        serenity::http::HttpError::UnsuccessfulRequest(response) => response.error.code == 10007,
+        _ => false,
+    }
+}
+
+impl BotState {
     /// Register Ready work only while this process can still send start notices.
     pub async fn spawn_startup_notice_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut startup = self.startup_notice_task.lock().await;
@@ -1113,6 +1381,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1333,6 +1602,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1343,6 +1613,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1383,6 +1654,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1393,6 +1665,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1444,6 +1717,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1454,6 +1728,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1521,6 +1796,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1561,6 +1837,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1627,6 +1904,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1685,6 +1963,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),

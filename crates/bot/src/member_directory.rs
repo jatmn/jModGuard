@@ -221,7 +221,7 @@ pub struct PendingBan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MarkerSave {
+pub(crate) enum MarkerSave {
     /// The insert committed before the ban.
     Saved,
     /// The insert failed and will not commit.
@@ -267,6 +267,82 @@ pub async fn begin_ban_attempt(app: &BotState, guild_id: u64, user_id: u64) -> P
             .into_inner()
             .unwrap_or_else(|error| error.into_inner()),
         save,
+    }
+}
+
+impl PendingBan {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DiscordBanView {
+    Absent,
+    Present { reason: Option<String> },
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BanContinuation {
+    Stop,
+    AlreadyFinished { reason: Option<String> },
+    RecordOnly { reason: Option<String> },
+    BanThenRecord,
+}
+
+/// Lease loss stops the attempt, including a marker that may still commit.
+/// A ban Discord already shows is recorded once and never sent again.
+pub(crate) async fn observe_ban_handoff(
+    app: &BotState,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    user_id: u64,
+    save: MarkerSave,
+) -> BanContinuation {
+    if !app.activation.may_record() {
+        return BanContinuation::Stop;
+    }
+    let view = discord_ban_view(http, guild_id, user_id).await;
+    let row_exists = db::active_ban_recorded(&app.reads, guild_id as i64, user_id as i64)
+        .await
+        .unwrap_or(true);
+    ban_continuation(app.activation.may_record(), save, view, row_exists)
+}
+
+async fn discord_ban_view(
+    http: &serenity::http::Http,
+    guild_id: u64,
+    user_id: u64,
+) -> DiscordBanView {
+    let guild = serenity::model::id::GuildId::new(guild_id);
+    let user = serenity::model::id::UserId::new(user_id);
+    match tokio::time::timeout(Duration::from_secs(5), http.get_ban(guild, user)).await {
+        Ok(Ok(Some(ban))) => DiscordBanView::Present { reason: ban.reason },
+        Ok(Ok(_)) => DiscordBanView::Absent,
+        Ok(Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+            response,
+        )))) if response.status_code.as_u16() == 404 => DiscordBanView::Absent,
+        _ => DiscordBanView::Unknown,
+    }
+}
+
+pub(crate) fn ban_continuation(
+    may_record: bool,
+    _save: MarkerSave,
+    view: DiscordBanView,
+    row_exists: bool,
+) -> BanContinuation {
+    if !may_record {
+        return BanContinuation::Stop;
+    }
+    match view {
+        DiscordBanView::Unknown => BanContinuation::Stop,
+        DiscordBanView::Present { reason } if row_exists => {
+            BanContinuation::AlreadyFinished { reason }
+        }
+        DiscordBanView::Present { reason } => BanContinuation::RecordOnly { reason },
+        DiscordBanView::Absent => BanContinuation::BanThenRecord,
     }
 }
 
@@ -638,8 +714,55 @@ mod tests {
     use crate::{db, tenant};
 
     use super::{
-        BAN_MARKER_SAVE_DEADLINE, MarkerSave, PendingBan, begin_ban_attempt, reserve_ban_marker,
+        BAN_MARKER_SAVE_DEADLINE, BanContinuation, DiscordBanView, MarkerSave, PendingBan,
+        ban_continuation, begin_ban_attempt, reserve_ban_marker,
     };
+
+    #[test]
+    fn expired_lease_ignores_a_late_marker_and_cutoff_does_not_double_ban() {
+        assert_eq!(
+            ban_continuation(false, MarkerSave::MaybeLate, DiscordBanView::Absent, false),
+            BanContinuation::Stop,
+            "a late marker after lease loss must not authorize a ban or a log"
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::MaybeLate, DiscordBanView::Absent, false),
+            BanContinuation::BanThenRecord
+        );
+        assert_eq!(
+            ban_continuation(
+                false,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
+            BanContinuation::Stop
+        );
+        assert_eq!(
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
+            BanContinuation::RecordOnly { reason: None },
+            "a successor records the missing row and does not ban again"
+        );
+        assert_eq!(
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                true
+            ),
+            BanContinuation::AlreadyFinished { reason: None },
+            "a recorded ban is not logged a second time"
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Unknown, false),
+            BanContinuation::Stop
+        );
+    }
 
     const GUILD: i64 = 10;
     const USER: i64 = 91;
@@ -1022,5 +1145,239 @@ mod tests {
         let helper = include_str!("member_directory.rs");
         assert!(helper.contains("reserve_ban_marker(save)"));
         assert!(helper.contains("BAN_MARKER_SAVE_DEADLINE"));
+    }
+
+    #[tokio::test]
+    async fn stale_active_ban_is_replaced_when_discord_has_no_ban() {
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Missing, DiscordBanView::Absent, true),
+            BanContinuation::BanThenRecord
+        );
+        let path =
+            std::env::temp_dir().join(format!("stale_ban_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let enrollment = db::enroll_guild(&database, 10, 100).await.unwrap().unwrap();
+        db::record_enrolled_ban_with_identity(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(1),
+            None,
+            "old reason",
+            Some("2020-01-01T00:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        let occurred = "2024-02-02T00:00:00+00:00";
+        let id = db::record_enrolled_ban_if_absent(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(9),
+            None,
+            "new reason",
+            Some(occurred),
+            db::BanRecord::Retry,
+        )
+        .await
+        .unwrap();
+        assert!(id.is_some(), "a new ban must not be suppressed");
+        let rows = db::list_enrolled_bans(&database, enrollment.clone(), 10)
+            .await
+            .unwrap();
+        let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason.as_deref(), Some("new reason"));
+        assert_eq!(active[0].moderator_id, Some(9));
+        assert!(
+            rows.iter()
+                .any(|row| !row.active && row.moderator_id == Some(1))
+        );
+        let again = db::record_enrolled_ban_if_absent(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(9),
+            None,
+            "new reason",
+            Some(occurred),
+            db::BanRecord::Retry,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, None);
+        assert_eq!(
+            db::list_enrolled_bans(&database, enrollment, 10)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row.active)
+                .count(),
+            1
+        );
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A Discord call already inside its rate-limit wait is cancelled by cutoff.
+    /// The ban settles as uncertain: no bans row and no report. The next holder
+    /// records that ban once from Discord's view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cutoff_during_discord_wait_cancels_the_ban_and_the_next_holder_records_once() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        struct Stuck {
+            polled: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            started: Arc<tokio::sync::Notify>,
+        }
+
+        impl Future for Stuck {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                self.polled.store(true, Ordering::SeqCst);
+                self.started.notify_waiters();
+                Poll::Pending
+            }
+        }
+
+        impl Drop for Stuck {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let activation = crate::activation::Activation::new();
+        activation.mark_lock_held(true);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notified = started.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let task = tokio::spawn({
+            let activation = Arc::clone(&activation);
+            let polled = Arc::clone(&polled);
+            let dropped = Arc::clone(&dropped);
+            let started = Arc::clone(&started);
+            async move {
+                crate::discord::race_discord_call(
+                    &activation,
+                    Stuck {
+                        polled,
+                        dropped,
+                        started,
+                    },
+                )
+                .await
+            }
+        });
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                panic!("the discord future must be polled while it is still pending");
+            }
+            _ = &mut notified => {}
+        }
+        assert!(polled.load(Ordering::SeqCst));
+        assert!(!dropped.load(Ordering::SeqCst));
+        activation.cut_off();
+        let raced = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cutoff must cancel the discord future")
+            .unwrap();
+        assert!(matches!(raced, crate::discord::DiscordCall::Cancelled));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the future is the cancellation"
+        );
+
+        let (_tmp, app, enrollment) = open_bot().await;
+        let (store, scope) = ready_directory(&app, &enrollment).await;
+        let pending = begin_ban_attempt(&app, GUILD as u64, USER as u64).await;
+        assert_eq!(pending.save, MarkerSave::Saved);
+        pending.finish(&app, CaseOutcome::Uncertain).await;
+        let settled = recorded(&app, &store, &scope).await;
+        assert_eq!(
+            settled.bans, 0,
+            "a cancelled ban must not insert a bans row"
+        );
+        assert_eq!(
+            settled.mod_logs, 0,
+            "a cancelled ban must not publish a report"
+        );
+        assert_eq!(settled.cases, 0);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        assert!(
+            store
+                .next_member_pending_ban_verification(scope.clone(), now_ms.saturating_add(400_000))
+                .await
+                .unwrap()
+                .is_some(),
+            "uncertain settlement leaves the pending marker"
+        );
+        assert_eq!(
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
+            BanContinuation::RecordOnly { reason: None }
+        );
+        let inserted = db::record_enrolled_ban_if_absent(
+            &app.db,
+            Some(enrollment.clone()),
+            USER,
+            None,
+            None,
+            Some(7),
+            None,
+            "handoff",
+            None,
+            db::BanRecord::Retry,
+        )
+        .await
+        .unwrap();
+        assert!(inserted.is_some());
+        db::insert_enrolled_event(
+            &app.db,
+            Some(enrollment.clone()),
+            "mod_action",
+            Some(USER),
+            Some(7),
+            &serde_json::json!({"action": "ban"}),
+        )
+        .await
+        .unwrap();
+        let again = db::record_enrolled_ban_if_absent(
+            &app.db,
+            Some(enrollment.clone()),
+            USER,
+            None,
+            None,
+            Some(7),
+            None,
+            "handoff",
+            None,
+            db::BanRecord::Retry,
+        )
+        .await
+        .unwrap();
+        assert!(again.is_none(), "the same dispatch must not publish again");
+        let reconciled = recorded(&app, &store, &scope).await;
+        assert_eq!(reconciled.bans, 1);
+        assert_eq!(reconciled.mod_logs, 1);
     }
 }

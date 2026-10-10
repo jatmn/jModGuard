@@ -19,7 +19,20 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochRaise {
+    Current,
+    Deferred,
+}
+
+fn writer_lease_rejected(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("active bot lease"))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TenantError {
@@ -49,9 +62,10 @@ struct Inner {
     max_handles: usize,
     handles: Mutex<HandleCache>,
     handle_open_locks: parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    evidence: EvidenceBackend,
+    evidence: Arc<parking_lot::RwLock<EvidenceBackend>>,
     erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    epoch_retry: AtomicI64,
 }
 
 struct HandleCache {
@@ -64,6 +78,7 @@ struct ResolvedStore {
     options: GuildStoreOptions,
 }
 
+#[derive(Clone)]
 enum EvidenceBackend {
     None,
     #[cfg(unix)]
@@ -305,17 +320,36 @@ impl TenantRuntime {
         }
         let mut default_shared = None;
         for store in &credentials {
-            let registered = register_store(
-                core,
-                store.registration.id().clone(),
-                store.registration.policy(),
-            )
-            .await?;
-            anyhow::ensure!(
-                registered == store.registration,
-                "configured guild store ownership conflicts with the catalog"
-            );
-            open_runtime_store(core, store).await?;
+            if core.is_read_only() {
+                if let Some(existing) =
+                    crate::db::guild_stores::store_registration(core, store.registration.id())
+                        .await?
+                {
+                    anyhow::ensure!(
+                        existing == store.registration,
+                        "configured guild store ownership conflicts with the catalog"
+                    );
+                }
+            } else {
+                let registered = register_store(
+                    core,
+                    store.registration.id().clone(),
+                    store.registration.policy(),
+                )
+                .await?;
+                anyhow::ensure!(
+                    registered == store.registration,
+                    "configured guild store ownership conflicts with the catalog"
+                );
+            }
+            if let Err(error) = open_runtime_store(core, store).await {
+                let unpublished = core.is_read_only()
+                    && crate::db::is_schema_not_ready(&error)
+                    && error.to_string().contains("guild store is not ready");
+                if !unpublished {
+                    return Err(error);
+                }
+            }
             if matches!(store.registration.policy(), StorePolicy::Shared) {
                 default_shared.get_or_insert_with(|| store.registration.id().clone());
             }
@@ -333,9 +367,21 @@ impl TenantRuntime {
                     map: HashMap::new(),
                 }),
                 handle_open_locks: parking_lot::Mutex::new(HashMap::new()),
-                evidence: open_evidence(core, evidence).await?,
+                evidence: {
+                    let opened = open_evidence(core, evidence).await?;
+                    let slot = Arc::new(parking_lot::RwLock::new(opened));
+                    #[cfg(unix)]
+                    if evidence.backend == "local"
+                        && core.is_read_only()
+                        && matches!(*slot.read(), EvidenceBackend::None)
+                    {
+                        start_evidence_id_retry(core.clone(), evidence.clone(), Arc::clone(&slot));
+                    }
+                    slot
+                },
                 erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
+                epoch_retry: AtomicI64::new(0),
             }),
         })
     }
@@ -434,6 +480,170 @@ impl TenantRuntime {
         }
     }
 
+    pub async fn settle_selected_case(
+        &self,
+        enrollment: GuildEnrollment,
+        case_id: CaseId,
+        outcome: crate::db::guild_data::CaseOutcome,
+    ) -> Result<Option<crate::db::guild_data::CaseData>> {
+        let (store, scope) = self.live(enrollment).await?;
+        store
+            .settle_case_outcome(scope, case_id, outcome, case_limits())
+            .await
+    }
+
+    pub async fn settle_pending_application_ban(
+        &self,
+        enrollment: GuildEnrollment,
+        subject: u64,
+        discord_reason: &str,
+    ) -> Result<Vec<(CaseId, crate::db::guild_data::CaseData)>> {
+        let subject = i64::try_from(subject).map_err(|_| anyhow!("invalid ban subject"))?;
+        let (store, scope) = self.live(enrollment).await?;
+        store
+            .settle_matching_application_ban(scope, subject, discord_reason, case_limits())
+            .await
+    }
+
+    /// Raise the writer epoch in every catalog store this process can open.
+    /// A higher stored epoch is a lost lease. A store that cannot be reached is
+    /// retried later; leased writes to it fail until the raise lands.
+    pub async fn raise_held_writer_epoch(&self) -> Result<()> {
+        let Some(generation) = self.core.leased_generation() else {
+            return Ok(());
+        };
+        if !matches!(
+            self.raise_writer_epochs(generation).await?,
+            EpochRaise::Deferred
+        ) {
+            return Ok(());
+        }
+        self.schedule_epoch_retry(generation);
+        Ok(())
+    }
+
+    async fn ensure_writer_epoch(&self, handle: &GuildDataStore) -> Result<()> {
+        if self.core.is_read_only() {
+            return Ok(());
+        }
+        let Some(generation) = self.core.leased_generation() else {
+            return Ok(());
+        };
+        match handle.raise_writer_epoch(generation).await {
+            Ok(()) => Ok(()),
+            Err(error) if writer_lease_rejected(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!("guild writer epoch raise deferred: {error:#}");
+                self.schedule_epoch_retry(generation);
+                Ok(())
+            }
+        }
+    }
+
+    async fn raise_writer_epochs(&self, generation: i64) -> Result<EpochRaise> {
+        if self.core.is_read_only() || self.core.leased_generation() != Some(generation) {
+            return Ok(EpochRaise::Current);
+        }
+        let catalog = self.usage_catalog().await?;
+        let mut pending = false;
+        let mut seen = Vec::new();
+        for registration in catalog {
+            seen.push(registration.id().clone());
+            if self.raise_one_store(registration.id(), generation).await? == EpochRaise::Deferred {
+                pending = true;
+            }
+        }
+        for store in &self.inner.credentials {
+            if seen.iter().any(|id| id == store.registration.id()) {
+                continue;
+            }
+            if self
+                .raise_one_store(store.registration.id(), generation)
+                .await?
+                == EpochRaise::Deferred
+            {
+                pending = true;
+            }
+        }
+        Ok(if pending {
+            EpochRaise::Deferred
+        } else {
+            EpochRaise::Current
+        })
+    }
+
+    async fn raise_one_store(&self, id: &StoreId, generation: i64) -> Result<EpochRaise> {
+        let Some(resolved) = self
+            .inner
+            .credentials
+            .iter()
+            .find(|store| store.registration.id() == id)
+        else {
+            tracing::warn!(
+                store_id = %id.as_str(),
+                "guild writer epoch not raised; this process cannot open the store"
+            );
+            return Ok(EpochRaise::Current);
+        };
+        let handle = match open_runtime_store(&self.core, resolved).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(
+                    store_id = %id.as_str(),
+                    "guild writer epoch raise deferred: {error:#}"
+                );
+                return Ok(EpochRaise::Deferred);
+            }
+        };
+        match handle.raise_writer_epoch(generation).await {
+            Ok(()) => Ok(EpochRaise::Current),
+            Err(error) if writer_lease_rejected(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    store_id = %id.as_str(),
+                    "guild writer epoch raise deferred: {error:#}"
+                );
+                Ok(EpochRaise::Deferred)
+            }
+        }
+    }
+
+    fn schedule_epoch_retry(&self, generation: i64) {
+        if self.inner.epoch_retry.swap(generation, Ordering::AcqRel) == generation {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0_u32;
+            loop {
+                if runtime.core.leased_generation() != Some(generation) {
+                    return;
+                }
+                attempt = attempt.saturating_add(1);
+                let delay = crate::db::startup_backoff(
+                    attempt,
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(30),
+                );
+                tokio::time::sleep(delay).await;
+                if runtime.core.leased_generation() != Some(generation) {
+                    return;
+                }
+                match runtime.raise_writer_epochs(generation).await {
+                    Ok(EpochRaise::Current) => return,
+                    Ok(EpochRaise::Deferred) => {}
+                    Err(error) if writer_lease_rejected(&error) => {
+                        tracing::warn!("guild writer epoch is newer; active bot lease is not held");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!("guild writer epoch raise deferred: {error:#}");
+                    }
+                }
+            }
+        });
+    }
+
     /// Bind a Discord audit entry to an already-recorded application case.
     /// Callers must supply the dispatch's own source identity; this does not
     /// search cases by subject or time.
@@ -473,7 +683,7 @@ impl TenantRuntime {
         store: GuildDataStore,
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<EvidenceState> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => backend.reconcile(store, target).await,
             EvidenceBackend::Bunny(backend) => backend.reconcile(store, target).await,
@@ -486,7 +696,7 @@ impl TenantRuntime {
         store: GuildDataStore,
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<()> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => {
                 backend.cleanup(store, target).await?;
@@ -575,7 +785,7 @@ impl TenantRuntime {
         }
         #[cfg(unix)]
         {
-            if matches!(self.inner.evidence, EvidenceBackend::None) {
+            if matches!(self.evidence_backend(), EvidenceBackend::None) {
                 return Ok(None);
             }
             let guild_id = enrollment.guild_id;
@@ -612,7 +822,7 @@ impl TenantRuntime {
                 request,
                 limits: evidence_limits(),
             };
-            let state = match &self.inner.evidence {
+            let state = match self.evidence_backend() {
                 EvidenceBackend::None => return Ok(None),
                 EvidenceBackend::Local(backend) => {
                     let file = std::fs::File::open(&source)
@@ -632,7 +842,7 @@ impl TenantRuntime {
 
     #[cfg(unix)]
     fn evidence_storage_id(&self) -> Option<CaseId> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => None,
             EvidenceBackend::Local(store) => Some(store.storage_id().clone()),
             EvidenceBackend::Bunny(store) => Some(store.storage_id().clone()),
@@ -736,7 +946,7 @@ impl TenantRuntime {
                 break;
             }
             for job in &jobs {
-                match &self.inner.evidence {
+                match self.evidence_backend() {
                     EvidenceBackend::None => {
                         anyhow::bail!("private evidence cleanup requires its configured backend");
                     }
@@ -816,6 +1026,7 @@ impl TenantRuntime {
             .find(|store| store.registration.id() == id)
             .ok_or(TenantError::Offline)?;
         let handle = open_runtime_store(&self.core, resolved).await?;
+        self.ensure_writer_epoch(&handle).await?;
         let mut cache = self.inner.handles.lock().await;
         if let Some(existing) = cache.map.get(id.as_str()).cloned() {
             return Ok(existing);
@@ -841,21 +1052,25 @@ impl TenantRuntime {
     }
 
     pub fn evidence_enabled(&self) -> bool {
-        !matches!(self.inner.evidence, EvidenceBackend::None)
+        !matches!(self.evidence_backend(), EvidenceBackend::None)
+    }
+
+    fn evidence_backend(&self) -> EvidenceBackend {
+        self.inner.evidence.read().clone()
     }
 
     #[cfg(unix)]
-    pub fn local_evidence(&self) -> Option<&crate::evidence_transfer::LocalEvidenceStore> {
-        match &self.inner.evidence {
+    pub fn local_evidence(&self) -> Option<crate::evidence_transfer::LocalEvidenceStore> {
+        match self.evidence_backend() {
             EvidenceBackend::Local(store) => Some(store),
             _ => None,
         }
     }
 
     #[cfg(unix)]
-    pub fn bunny_evidence(&self) -> Option<&crate::bunny_evidence::BunnyEvidenceStore> {
-        match &self.inner.evidence {
-            EvidenceBackend::Bunny(store) => Some(store.as_ref()),
+    pub fn bunny_evidence(&self) -> Option<crate::bunny_evidence::BunnyEvidenceStore> {
+        match self.evidence_backend() {
+            EvidenceBackend::Bunny(store) => Some(*store),
             _ => None,
         }
     }
@@ -876,7 +1091,7 @@ impl TenantRuntime {
         let Some(available) = store.available_case_evidence(scope, case, evidence).await? else {
             return Ok(None);
         };
-        let bytes = match &self.inner.evidence {
+        let bytes = match self.evidence_backend() {
             EvidenceBackend::None => {
                 anyhow::bail!("evidence backend is not configured")
             }
@@ -899,7 +1114,8 @@ impl TenantRuntime {
 }
 
 async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDataStore> {
-    if GuildDataStore::existing_registration(store.options.clone())?.is_none() {
+    let stamped = GuildDataStore::existing_registration(store.options.clone())?;
+    if stamped.is_none() {
         use crate::db::SqlExecutor;
         let id = store.registration.id().as_str().to_owned();
         let owned: bool = core.with_conn(move |conn| {
@@ -916,10 +1132,28 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
             "owned guild store is missing or empty; restore its original database before retrying"
         );
     }
-    Ok(
-        GuildDataStore::initialize(store.options.clone(), store.registration.clone())?
-            .with_core_write_fence(core.clone()),
-    )
+    let expected = if store.options.read_only {
+        let Some(stamped) = stamped else {
+            return Err(crate::db::SchemaNotReady(
+                "guild store is not ready. Start the bot so it can create the store, then start the API."
+                    .into(),
+            )
+            .into());
+        };
+        anyhow::ensure!(
+            stamped.policy() == store.registration.policy(),
+            "configured guild store ownership conflicts with the store identity"
+        );
+        stamped
+    } else {
+        store.registration.clone()
+    };
+    let opened = if store.options.read_only {
+        GuildDataStore::open(store.options.clone(), expected)?
+    } else {
+        GuildDataStore::initialize(store.options.clone(), expected)?
+    };
+    Ok(opened.with_core_write_fence(core.clone()))
 }
 
 async fn resolve_configured(
@@ -944,6 +1178,7 @@ async fn resolve_configured(
         url: configured.url.clone(),
         token: configured.token.clone(),
         pool_size: pool,
+        read_only: core.is_read_only(),
     };
     let id = if configured.id.is_empty() {
         discover_store_id(core, &options, policy).await?
@@ -978,6 +1213,7 @@ async fn default_shared(
         url: String::new(),
         token: String::new(),
         pool_size: pool,
+        read_only: core.is_read_only(),
     };
     let id = discover_store_id(core, &options, StorePolicy::Shared).await?;
     Ok(ResolvedStore {
@@ -1044,6 +1280,13 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
             #[cfg(unix)]
             {
                 let root = evidence_root(core, evidence)?;
+                if core.is_read_only()
+                    && db::existing_evidence_storage_id(core, &evidence.storage_id)
+                        .await?
+                        .is_none()
+                {
+                    return Ok(EvidenceBackend::None);
+                }
                 let first_install = db::existing_evidence_storage_id(core, &evidence.storage_id)
                     .await?
                     .is_none();
@@ -1103,6 +1346,71 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
         }
         _ => bail!("unsupported evidence backend"),
     }
+}
+
+#[cfg(test)]
+static EVIDENCE_RETRY_CAP_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(60_000);
+
+#[cfg(test)]
+pub fn set_evidence_retry_cap_for_test(ms: u64) {
+    EVIDENCE_RETRY_CAP_MS.store(ms.min(60_000), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn evidence_retry_cap() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = EVIDENCE_RETRY_CAP_MS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(1, 60_000);
+        std::time::Duration::from_millis(ms)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+#[cfg(unix)]
+fn start_evidence_id_retry(
+    core: Db,
+    evidence: EvidenceConfig,
+    slot: Arc<parking_lot::RwLock<EvidenceBackend>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("evidence-id-retry".into())
+        .spawn(move || {
+            let mut delay = std::time::Duration::from_millis(20);
+            let cap = evidence_retry_cap();
+            loop {
+                let found = core.with_conn_sync(|conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let existing = tx
+                        .query_row(
+                            "SELECT value FROM meta WHERE key='evidence_storage_id'",
+                            (),
+                            |row| Ok(row.get::<String>(0)?),
+                        )
+                        .optional()?;
+                    tx.finish_read()?;
+                    Ok(existing)
+                });
+                if let Ok(Some(raw)) = found
+                    && let Ok(id) = CaseId::try_from(raw)
+                    && let Ok(root) = evidence_root(&core, &evidence)
+                    && let Ok(store) = crate::evidence_transfer::LocalEvidenceStore::open(
+                        root,
+                        id,
+                        evidence.buffer_bytes,
+                    )
+                {
+                    *slot.write() = EvidenceBackend::Local(store);
+                    return;
+                }
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(cap);
+            }
+        });
 }
 
 #[cfg(test)]

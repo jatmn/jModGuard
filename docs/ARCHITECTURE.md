@@ -7,13 +7,13 @@ jModGuard runs as **two processes** that share one database:
 | `jmodguard-bot` | Discord gateway, automod, commands, migrations (`migrate=true`) |
 | `jmodguard-api` | OAuth WebUI + JSON API (`migrate=false`; requires feature `web`) |
 
-Neither process calls the other. The **database is the source of truth**.
+Steady state, the API is read-only and sends mutations to the bot over the private control link. The bot writes application data only while it holds the writer lease.
 
 ```
-jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jmodguard-api
-       │                           │                           │
-       └──── polls config_version ─┴── both processes poll ────┘
+jmodguard-api  ──control link──►  jmodguard-bot  ──writes──►  SQLite / libSQL
 ```
+
+One Bunny Magic Containers app runs the bot and API containers in one pod over localhost, one copy. Only the copy whose bot holds the writer lease applies changes. Platform checks are liveness `/health` only on both containers (API port 8080, bot port 8081). The API listens on port 8080. Bot health listens on port 8081. The bot control listener defaults to `127.0.0.1:8082`, is loopback-only, and is never behind a public or CDN endpoint. The API dials `JMODGUARD_CONTROL_TARGET` (`127.0.0.1:<control-port>`), which has no default. The bot runs maintenance recovery only after it holds the writer lease. The bot launcher writes update-control under its own short fence, including while the bot process is stopped. Schema and base changes ship in new images. Self-update stays off by default and is owner-triggered only; signing is tracked in issue 188.
 
 For a single-host install, both processes open the same local SQLite file. For
 distributed deployment, both connect to one remote libSQL database. Bunny
@@ -121,8 +121,11 @@ Non-reusable revision tokens also distinguish counters that
 return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers. Web, API,
 and status reads use the deferred snapshot or a read-only transaction instead, so they
-cannot take that lock. API writes keep a short busy and operation timeout and fail
-retriably rather than waiting out a bot write.
+cannot take that lock. The API process opens its database read-only. Settings and
+other dashboard changes are sent to the bot over a private authenticated link.
+The bot applies them only while it holds the writer lease, and settings wait
+behind in-flight rule actions. A full queue or a lost lease returns a clear
+error to the API. The API never starts a write transaction.
 
 Nickname changes commit a durable outbox row in the settings transaction, capturing the
 nickname, random request ID and active membership. The bot drains primary-routed due work,
@@ -134,9 +137,10 @@ Only a confirmed matching membership can resume its own dormant request. New joi
 migrated unbound jobs require a fresh save or Re-sync; no automatic initial nickname edit
 is issued. See [nickname reconciliation](ENROLLMENTS.md#nickname-reconciliation).
 
-These checks cannot recall an already-sent Discord edit or provide exclusive bot-replica
-ownership. Configuration API scope is implemented below; writer coordination remains
-separate work. Use one bot worker for this implementation.
+These checks cannot recall an already-sent Discord edit. One bot process holds
+the writer lease. A replacement waits until that lease expires or the owner
+releases it, and a release cannot clear another owner's row. Use one bot
+worker for this implementation.
 
 Captured configuration data operations now retain the original guild membership through
 the primary write transaction, including both sides of a copy and the guild context of a
@@ -197,11 +201,13 @@ operations now use API admission and bot dispatch.
 - Bot applies migrations, atomically seeds globals plus their config/command
   versions, heals settings, then publishes a
   bootstrap-complete marker.
-- API opens with `migrate=false`. Until the schema, terminal-defaults meta, and
-  bootstrap-complete marker exist—or while SQLite is transiently locked by bot
-  startup—it retries for about 30 seconds locally. On a remote database it also
-  retries transient connect/timeout errors for about six minutes. Credential
-  and other non-retryable open failures still fail immediately.
+- API opens with `migrate=false` and does not migrate. It keeps retrying an
+  incomplete bootstrap, an older schema, a transient SQLite lock, and (on a
+  remote database) transient connect/timeout errors. The delay is capped.
+  `/health` stays 200. `/ready` and app routes stay 503 until it is ready.
+  It exits on a newer unsupported schema, rejected remote credentials and
+  other non-retryable open errors, and bad config such as an empty OAuth
+  client id or secret.
 - Always start (or migrate with) the bot before the API on a new or upgraded DB.
 
 ## WebUI auth (summary)

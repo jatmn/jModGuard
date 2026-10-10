@@ -29,6 +29,46 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn api_writer_link(target: &str, secret: &str) -> Option<jmodguard::control::WriterLink> {
+    if target.is_empty() {
+        tracing::warn!(
+            "API launcher control target is unset; component observations will not be recorded"
+        );
+        return None;
+    }
+    match jmodguard::control::try_writer_link(target, secret) {
+        Ok(Some(link)) => Some(link),
+        Ok(None) => {
+            tracing::warn!(
+                "API launcher control secret is missing or too short; component observations will not be recorded"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                "API launcher control link is unusable; component observations will not be recorded: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match control.renew_launcher_fence().await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
+                Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
+            }
+        }
+    })
+}
+
 fn role() -> Result<String> {
     let value = std::env::var("JMODGUARD_ROLE").context("JMODGUARD_ROLE is required")?;
     ensure!(
@@ -72,6 +112,10 @@ async fn launch_mode(
         .env(
             "JMODGUARD_UPDATE_MAINTENANCE",
             if maintenance { "1" } else { "0" },
+        )
+        .env(
+            "JMODGUARD_LAUNCHER_REVISION",
+            db::LAUNCHER_REVISION.to_string(),
         )
         .kill_on_drop(true)
         .spawn()
@@ -196,6 +240,41 @@ fn deployment_observation(
     seen
 }
 
+enum ControlStep {
+    Reexec,
+    Proceed,
+    Defer,
+}
+
+struct PendingFailure {
+    component: Option<(ComponentRelease, String)>,
+    launcher: Option<(String, String)>,
+}
+
+/// Startup receipts the API cannot store until the bot is the writer.
+/// Order is activation, then observation, then a failed handoff.
+#[derive(Clone)]
+enum StartupReceipt {
+    BakedLauncher {
+        hash: String,
+        now: i64,
+    },
+    LauncherRunning {
+        release: ComponentRelease,
+        hash: String,
+        now: i64,
+    },
+    ObserveLauncher,
+    LauncherFailed {
+        digest: String,
+        message: String,
+    },
+    ComponentFailed {
+        release: ComponentRelease,
+        message: String,
+    },
+}
+
 /// Local process ownership plus the durable paired operation. One container per
 /// role is required; an expired heartbeat never stands in for a reaped child.
 struct Supervisor {
@@ -218,11 +297,167 @@ struct Supervisor {
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
+    pending_failure: Option<PendingFailure>,
+    pending_startup: Vec<StartupReceipt>,
+    receipt_attempt: u32,
+    receipt_not_before: Option<Instant>,
     reported: bool,
     last_observed: Option<Instant>,
 }
 
 impl Supervisor {
+    fn receipt_not_saved(error: &anyhow::Error) -> bool {
+        error.is::<db::ReceiptNotSaved>()
+    }
+
+    fn note_receipt_delay(&mut self) {
+        let delay =
+            Duration::from_secs(1_u64 << self.receipt_attempt.min(6)).min(Duration::from_secs(60));
+        self.receipt_attempt = self.receipt_attempt.saturating_add(1);
+        self.receipt_not_before = Some(Instant::now() + delay);
+    }
+
+    fn reset_receipt_backoff(&mut self) {
+        self.receipt_attempt = 0;
+        self.receipt_not_before = None;
+    }
+
+    fn receipt_wait_elapsed(&self) -> bool {
+        self.receipt_not_before
+            .is_none_or(|at| Instant::now() >= at)
+    }
+
+    fn remember_pending(&mut self, pending: PendingFailure) {
+        tracing::warn!("launcher receipt was not saved; retrying before any new candidate");
+        self.pending_failure = Some(pending);
+        self.note_receipt_delay();
+    }
+
+    async fn flush_pending_failure(&mut self) -> Result<bool> {
+        if self.pending_failure.is_none() {
+            return Ok(false);
+        }
+        if !self.receipt_wait_elapsed() {
+            return Ok(true);
+        }
+        if let Some((digest, message)) = self
+            .pending_failure
+            .as_ref()
+            .and_then(|pending| pending.launcher.clone())
+        {
+            match self
+                .control
+                .launcher_failed(&self.role, &digest, &message)
+                .await
+            {
+                Ok(()) => {
+                    if let Some(pending) = self.pending_failure.as_mut() {
+                        pending.launcher = None;
+                    }
+                }
+                Err(error) if Self::receipt_not_saved(&error) => {
+                    tracing::warn!("launcher failure receipt was not saved: {error:#}");
+                    self.note_receipt_delay();
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some((release, message)) = self
+            .pending_failure
+            .as_ref()
+            .and_then(|pending| pending.component.clone())
+        {
+            match self.control.failed(&self.role, &release, &message).await {
+                Ok(()) => {
+                    if let Some(pending) = self.pending_failure.as_mut() {
+                        pending.component = None;
+                    }
+                }
+                Err(error) if Self::receipt_not_saved(&error) => {
+                    tracing::warn!("component failure receipt was not saved: {error:#}");
+                    self.note_receipt_delay();
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self
+            .pending_failure
+            .as_ref()
+            .is_some_and(|pending| pending.component.is_none() && pending.launcher.is_none())
+        {
+            self.pending_failure = None;
+            self.reset_receipt_backoff();
+        }
+        Ok(false)
+    }
+
+    async fn apply_startup_receipt(&self, receipt: &StartupReceipt) -> Result<()> {
+        match receipt {
+            StartupReceipt::BakedLauncher { hash, now } => {
+                self.control.baked_launcher(&self.role, hash, *now).await
+            }
+            StartupReceipt::LauncherRunning { release, hash, now } => {
+                self.control
+                    .launcher_running(&self.role, release, hash, *now)
+                    .await
+            }
+            StartupReceipt::ObserveLauncher => {
+                self.control
+                    .observe_launcher(&self.role, db::LAUNCHER_REVISION)
+                    .await
+            }
+            StartupReceipt::LauncherFailed { digest, message } => {
+                self.control
+                    .launcher_failed(&self.role, digest, message)
+                    .await
+            }
+            StartupReceipt::ComponentFailed { release, message } => {
+                self.control.failed(&self.role, release, message).await
+            }
+        }
+    }
+
+    /// Send the head of the startup queue. A missing writer waits on the same
+    /// capped backoff as other receipts and does not skip the application start.
+    async fn flush_startup_receipts(&mut self) -> Result<()> {
+        while !self.pending_startup.is_empty() && self.receipt_wait_elapsed() {
+            let receipt = self.pending_startup[0].clone();
+            match self.apply_startup_receipt(&receipt).await {
+                Ok(()) => {
+                    self.pending_startup.remove(0);
+                    self.reset_receipt_backoff();
+                }
+                Err(error) if Self::receipt_not_saved(&error) => {
+                    tracing::warn!("launcher startup receipt was not saved: {error:#}");
+                    self.note_receipt_delay();
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_component_failure(
+        &mut self,
+        release: ComponentRelease,
+        message: String,
+    ) -> Result<()> {
+        match self.control.failed(&self.role, &release, &message).await {
+            Ok(()) => self.reset_receipt_backoff(),
+            Err(error) if Self::receipt_not_saved(&error) => {
+                self.remember_pending(PendingFailure {
+                    component: Some((release, message)),
+                    launcher: None,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
     async fn idle(&mut self) -> Result<()> {
         if self.running.is_some() {
             return Ok(());
@@ -291,100 +526,90 @@ impl Supervisor {
     }
 
     async fn report_ready(&mut self) -> Result<bool> {
-        let Some(child) = self.running.as_mut() else {
-            return Ok(false);
+        let (release, seen) = {
+            let Some(child) = self.running.as_mut() else {
+                return Ok(false);
+            };
+            if let Some(status) = child.child.try_wait()? {
+                bail!("application exited: {status}");
+            }
+            if tokio::fs::metadata(&child.ready_file).await.is_err() {
+                ensure!(
+                    self.rollback.is_some()
+                        || child.release.is_none()
+                        || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
+                    "replacement child readiness timed out"
+                );
+                return Ok(false);
+            }
+            (
+                child.release.clone(),
+                deployment_observation(
+                    child,
+                    &self.base_sha,
+                    &self.base_abi,
+                    self.enabled,
+                    &self.baked_compatibility,
+                ),
+            )
         };
-        if let Some(status) = child.child.try_wait()? {
-            bail!("application exited: {status}");
-        }
-        if tokio::fs::metadata(&child.ready_file).await.is_err() {
-            ensure!(
-                self.rollback.is_some()
-                    || child.release.is_none()
-                    || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
-                "replacement child readiness timed out"
-            );
-            return Ok(false);
-        }
         if self.reported {
             if self
                 .last_observed
                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
             {
-                match self
-                    .control
-                    .running(
-                        &self.role,
-                        None,
-                        deployment_observation(
-                            child,
-                            &self.base_sha,
-                            &self.base_abi,
-                            self.enabled,
-                            &self.baked_compatibility,
-                        ),
-                        now(),
-                    )
-                    .await
-                {
+                match self.control.running(&self.role, None, seen, now()).await {
                     Ok(()) => self.last_observed = Some(Instant::now()),
-                    Err(error) => tracing::warn!("release heartbeat failed: {error:#}"),
+                    Err(error) => {
+                        tracing::warn!("release heartbeat failed: {error:#}");
+                        self.last_observed = Some(Instant::now());
+                    }
                 }
             }
-        } else if let Some((failed, error)) = self.rollback.clone() {
-            self.control
-                .rolled_back(
-                    &self.role,
-                    &failed,
-                    child.release.clone(),
-                    deployment_observation(
-                        child,
-                        &self.base_sha,
-                        &self.base_abi,
-                        self.enabled,
-                        &self.baked_compatibility,
-                    ),
-                    &error,
-                    now(),
-                )
-                .await?;
-            self.rollback = None;
-            self.standby = None;
-            self.reported = true;
-            self.last_observed = Some(Instant::now());
-        } else {
-            if child.release.is_none() {
-                self.control
-                    .baked_running(
-                        &self.role,
-                        deployment_observation(
-                            child,
-                            &self.base_sha,
-                            &self.base_abi,
-                            self.enabled,
-                            &self.baked_compatibility,
-                        ),
-                        now(),
-                    )
-                    .await?;
-            } else {
-                self.control
-                    .running(
-                        &self.role,
-                        child.release.clone(),
-                        deployment_observation(
-                            child,
-                            &self.base_sha,
-                            &self.base_abi,
-                            self.enabled,
-                            &self.baked_compatibility,
-                        ),
-                        now(),
-                    )
-                    .await?;
+            return Ok(true);
+        }
+        if !self.receipt_wait_elapsed() {
+            return Ok(false);
+        }
+        if let Some((failed, error)) = self.rollback.clone() {
+            match self
+                .control
+                .rolled_back(&self.role, &failed, release.clone(), seen, &error, now())
+                .await
+            {
+                Ok(()) => {
+                    self.rollback = None;
+                    self.standby = None;
+                    self.reported = true;
+                    self.last_observed = Some(Instant::now());
+                    self.reset_receipt_backoff();
+                }
+                Err(error) if Self::receipt_not_saved(&error) => {
+                    tracing::warn!("rollback receipt was not saved: {error:#}");
+                    self.note_receipt_delay();
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
             }
-            self.reported = true;
-            self.last_observed = Some(Instant::now());
+        } else {
+            let saved = if release.is_none() {
+                self.control.baked_running(&self.role, seen, now()).await
+            } else {
+                self.control.running(&self.role, release, seen, now()).await
+            };
+            match saved {
+                Ok(()) => {
+                    self.reported = true;
+                    self.last_observed = Some(Instant::now());
+                    self.reset_receipt_backoff();
+                }
+                Err(error) if Self::receipt_not_saved(&error) => {
+                    tracing::warn!("activation receipt was not saved: {error:#}");
+                    self.note_receipt_delay();
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(true)
     }
@@ -416,8 +641,10 @@ impl Supervisor {
             target.base_abi == self.base_abi,
             "paired release requires a different base ABI"
         );
-        if self.required_launcher(&target, Some(id)).await? {
-            return Ok(true);
+        match self.required_launcher(&target, Some(id)).await? {
+            ControlStep::Reexec => return Ok(true),
+            ControlStep::Proceed => {}
+            ControlStep::Defer => return Ok(false),
         }
         if self
             .prepared
@@ -546,7 +773,10 @@ impl Supervisor {
         release: &ComponentRelease,
         operation: Option<&str>,
         required: bool,
-    ) -> Result<bool> {
+    ) -> Result<ControlStep> {
+        if !self.control.writes_locally() && !self.receipt_wait_elapsed() {
+            return Ok(ControlStep::Defer);
+        }
         ensure!(
             self.enabled,
             "launcher update requires self-update to be enabled"
@@ -558,10 +788,20 @@ impl Supervisor {
         jmodguard_updater::launcher_compatible(release, &self.base_abi)?;
         let path = stage(&self.registry, release, "jmodguard-launcher", &self.staging).await?;
         let hash = sha256_hex(&tokio::fs::read(&path).await?);
-        if required {
-            self.control
+        if required
+            && let Err(error) = self
+                .control
                 .select_required_launcher(release, operation)
-                .await?;
+                .await
+        {
+            if !self.control.writes_locally() {
+                tracing::warn!(
+                    "required launcher selection was not saved; handoff deferred: {error:#}"
+                );
+                self.note_receipt_delay();
+                return Ok(ControlStep::Defer);
+            }
+            return Err(error);
         }
         // Production staging is /tmp/jmodguard-updates and PID1 uses its sibling.
         let control_file = self
@@ -576,17 +816,17 @@ impl Supervisor {
         .await?;
         self.stop_application().await?;
         self.end_idle().await?;
-        Ok(true)
+        Ok(ControlStep::Reexec)
     }
 
     async fn required_launcher(
         &mut self,
         release: &ComponentRelease,
         operation: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<ControlStep> {
         release.validate()?;
         if self.launcher_revision >= release.required_launcher() {
-            return Ok(false);
+            return Ok(ControlStep::Proceed);
         }
         if operation.is_none()
             && std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
@@ -602,26 +842,40 @@ impl Supervisor {
         self.handoff(release, operation, true).await
     }
 
-    async fn launcher(&mut self, state: &db::ComponentUpdate) -> Result<bool> {
+    fn defer_unsaved(&mut self, error: anyhow::Error) -> Result<ControlStep> {
+        if Self::receipt_not_saved(&error) {
+            tracing::warn!("launcher clear was not saved: {error:#}");
+            self.note_receipt_delay();
+            Ok(ControlStep::Defer)
+        } else {
+            Err(error)
+        }
+    }
+
+    async fn launcher(&mut self, state: &db::ComponentUpdate) -> Result<ControlStep> {
         let Some(release) = state
             .desired_launcher
             .as_ref()
             .or(state.installed_launcher.as_ref())
         else {
-            return Ok(false);
+            return Ok(ControlStep::Proceed);
         };
         if std::env::var("JMODGUARD_LAUNCHER_RELEASE").as_deref() == Ok(&release.digest)
             || (std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
                 && state.desired_launcher.is_none())
         {
-            return Ok(false);
+            return Ok(ControlStep::Proceed);
         }
         if let Some(contract) = &release.launcher {
             if contract.revision <= self.launcher_revision {
-                self.control
+                let cleared = self
+                    .control
                     .clear_superseded_launcher(&self.role, release)
-                    .await?;
-                return Ok(false);
+                    .await;
+                return match cleared {
+                    Ok(()) => Ok(ControlStep::Proceed),
+                    Err(error) => self.defer_unsaved(error),
+                };
             }
         } else if state.desired_launcher.is_some() {
             // An image from before launcher-revision labels has nothing to run.
@@ -631,12 +885,16 @@ impl Supervisor {
                 "stored launcher selection {} has no capability contract; clearing it and keeping the baked controller",
                 release.digest
             );
-            self.control
+            let cleared = self
+                .control
                 .clear_uncontracted_launcher(&self.role, release)
-                .await?;
-            return Ok(false);
+                .await;
+            return match cleared {
+                Ok(()) => Ok(ControlStep::Proceed),
+                Err(error) => self.defer_unsaved(error),
+            };
         } else {
-            return Ok(false);
+            return Ok(ControlStep::Proceed);
         }
         self.handoff(release, None, false).await
     }
@@ -645,8 +903,9 @@ impl Supervisor {
         let state = self.control.component(&self.role).await?;
         if self.enabled && (state.desired_launcher.is_some() || self.running.is_none()) {
             match self.launcher(&state).await {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
+                Ok(ControlStep::Reexec) => return Ok(true),
+                Ok(ControlStep::Proceed) => {}
+                Ok(ControlStep::Defer) => return Ok(false),
                 Err(error) => {
                     tracing::warn!(
                         "launcher update failed; retaining stable controller: {error:#}"
@@ -656,27 +915,43 @@ impl Supervisor {
                         .as_ref()
                         .or(state.installed_launcher.as_ref())
                     {
-                        self.control
-                            .launcher_failed(&self.role, &release.digest, &format!("{error:#}"))
-                            .await?;
+                        let message = format!("{error:#}");
+                        match self
+                            .control
+                            .launcher_failed(&self.role, &release.digest, &message)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(save) if Self::receipt_not_saved(&save) => {
+                                self.remember_pending(PendingFailure {
+                                    component: None,
+                                    launcher: Some((release.digest.clone(), message)),
+                                });
+                                return Ok(false);
+                            }
+                            Err(save) => return Err(save),
+                        }
                     }
                 }
             }
         }
         if self.running.is_none() {
             let restored = async {
-                if let Some(installed) = &state.installed
-                    && self.required_launcher(installed, None).await?
-                {
-                    return Ok(true);
+                if let Some(installed) = &state.installed {
+                    match self.required_launcher(installed, None).await? {
+                        ControlStep::Reexec => return Ok(ControlStep::Reexec),
+                        ControlStep::Proceed => {}
+                        ControlStep::Defer => return Ok(ControlStep::Defer),
+                    }
                 }
                 self.restore(&state).await?;
-                Ok::<_, anyhow::Error>(false)
+                Ok::<_, anyhow::Error>(ControlStep::Proceed)
             }
             .await;
             match restored {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
+                Ok(ControlStep::Reexec) => return Ok(true),
+                Ok(ControlStep::Defer) => return Ok(false),
+                Ok(ControlStep::Proceed) => {}
                 Err(error) => {
                     if let Some(op) = self.control.upgrade().await?.filter(|op| {
                         self.rollback.is_none()
@@ -746,7 +1021,9 @@ impl Supervisor {
                 self.stop_application().await?;
                 self.start(&path, &sha, previous.clone()).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
-                self.control
+                let message = format!("{error:#}");
+                match self
+                    .control
                     .rolled_back(
                         &self.role,
                         &failed,
@@ -758,10 +1035,20 @@ impl Supervisor {
                             self.enabled,
                             &self.baked_compatibility,
                         ),
-                        &format!("{error:#}"),
+                        &message,
                         now(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(save) if Self::receipt_not_saved(&save) => {
+                        tracing::warn!("rollback receipt was not saved: {save:#}");
+                        self.rollback = Some((failed, message));
+                        self.note_receipt_delay();
+                        return Ok(false);
+                    }
+                    Err(save) => return Err(save),
+                }
             } else {
                 self.stop_application().await?;
                 return Err(error);
@@ -786,31 +1073,50 @@ impl Supervisor {
         {
             return Ok(false);
         }
+        if !self.pending_startup.is_empty()
+            || self.pending_failure.as_ref().is_some_and(|pending| {
+                pending
+                    .component
+                    .as_ref()
+                    .is_some_and(|(release, _)| release.digest == candidate.digest)
+                    || pending
+                        .launcher
+                        .as_ref()
+                        .is_some_and(|(digest, _)| digest == &candidate.digest)
+            })
+        {
+            return Ok(false);
+        }
         if let Err(error) = compatible_control(&self.control, &candidate, now()).await {
-            self.control
-                .failed(&self.role, &candidate, &format!("compatibility: {error:#}"))
+            self.record_component_failure(candidate, format!("compatibility: {error:#}"))
                 .await?;
             return Ok(false);
         }
         match self.required_launcher(&candidate, None).await {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
+            Ok(ControlStep::Reexec) => return Ok(true),
+            Ok(ControlStep::Proceed) => {}
+            Ok(ControlStep::Defer) => return Ok(false),
             Err(error) => {
-                self.control
-                    .launcher_failed(
-                        &self.role,
-                        &candidate.digest,
-                        &format!("required launcher failed: {error:#}"),
-                    )
-                    .await?;
-                self.control
-                    .failed(
-                        &self.role,
-                        &candidate,
-                        &format!(
-                            "required launcher failed: {error:#}; application was not updated"
-                        ),
-                    )
+                let launcher_message = format!("required launcher failed: {error:#}");
+                let app_message =
+                    format!("required launcher failed: {error:#}; application was not updated");
+                match self
+                    .control
+                    .launcher_failed(&self.role, &candidate.digest, &launcher_message)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(save) if Self::receipt_not_saved(&save) => {
+                        let digest = candidate.digest.clone();
+                        self.remember_pending(PendingFailure {
+                            component: Some((candidate, app_message)),
+                            launcher: Some((digest, launcher_message)),
+                        });
+                        return Ok(false);
+                    }
+                    Err(save) => return Err(save),
+                }
+                self.record_component_failure(candidate, app_message)
                     .await?;
                 return Ok(false);
             }
@@ -825,8 +1131,7 @@ impl Supervisor {
         {
             Ok(path) => path,
             Err(error) => {
-                self.control
-                    .failed(&self.role, &candidate, &format!("download: {error:#}"))
+                self.record_component_failure(candidate, format!("download: {error:#}"))
                     .await?;
                 return Ok(false);
             }
@@ -900,6 +1205,10 @@ impl Supervisor {
     }
 
     async fn tick(&mut self) -> Result<bool> {
+        self.flush_startup_receipts().await?;
+        if self.flush_pending_failure().await? {
+            return Ok(false);
+        }
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
@@ -935,6 +1244,68 @@ async fn activate_launcher(
     control.launcher_running(role, release, hash, now()).await
 }
 
+/// Read-only startup checks for the API launcher. Receipts are returned in the
+/// order they must be stored: baked or handoff activation, then the observation,
+/// then a failed handoff. Nothing here writes.
+async fn plan_api_startup(
+    control: &UpdateControl,
+    role: &str,
+    hash: &str,
+    handoff_digest: Option<&str>,
+    launcher_failed: Option<&str>,
+) -> Result<Vec<StartupReceipt>> {
+    let state = control.component(role).await?;
+    let mut receipts = Vec::new();
+    if let Some(digest) = handoff_digest {
+        let release = state
+            .desired_launcher
+            .clone()
+            .or(state.installed_launcher.clone())
+            .context("launcher selection missing")?;
+        ensure!(
+            release.digest == digest,
+            "launcher selection changed before handoff"
+        );
+        ensure!(
+            release
+                .launcher
+                .as_ref()
+                .is_some_and(|contract| contract.revision == db::LAUNCHER_REVISION),
+            "launcher binary capability does not match its release metadata"
+        );
+        receipts.push(StartupReceipt::LauncherRunning {
+            release,
+            hash: hash.to_owned(),
+            now: now(),
+        });
+    } else if state
+        .installed_launcher
+        .as_ref()
+        .is_none_or(|release| release.upgrade.is_none())
+    {
+        receipts.push(StartupReceipt::BakedLauncher {
+            hash: hash.to_owned(),
+            now: now(),
+        });
+    }
+    receipts.push(StartupReceipt::ObserveLauncher);
+    if let Some(digest) = launcher_failed {
+        receipts.push(StartupReceipt::LauncherFailed {
+            digest: digest.to_owned(),
+            message: "updated launcher failed; stable baked controller is recovering the selected application".into(),
+        });
+        if let Some(pending) = state.desired.filter(|release| {
+            release.digest == digest && release.required_launcher() > db::LAUNCHER_REVISION
+        }) {
+            receipts.push(StartupReceipt::ComponentFailed {
+                release: pending,
+                message: "required launcher failed; application was not updated; retry from Administration".into(),
+            });
+        }
+    }
+    Ok(receipts)
+}
+
 /// Verify a replacement (or record the baked controller), then publish compiled
 /// capability. Observation is the owner-visible "running launcher"; it must not
 /// precede a failed activation.
@@ -968,10 +1339,69 @@ async fn establish_launcher(
     control.observe_launcher(role, db::LAUNCHER_REVISION).await
 }
 
+async fn stop_pre_supervisor(
+    initial: &mut Option<Running>,
+    maintenance: &mut Option<Running>,
+    boot_health: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    fence_renewal: &Option<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    if let Some(task) = fence_renewal {
+        task.abort();
+    }
+    if let Some(child) = initial.as_mut() {
+        stop(child).await?;
+    }
+    if let Some(child) = maintenance.as_mut() {
+        tracing::info!("stopping temporary maintenance API before the application starts");
+        stop(child).await?;
+    }
+    if let Some(task) = boot_health.take() {
+        task.abort();
+        let _ = task.await;
+        tracing::info!("launcher released health listener");
+    }
+    jmodguard::log_shutdown_finished("launcher");
+    Ok(())
+}
+
+fn startup_receipt_missing(error: &anyhow::Error) -> bool {
+    error.is::<db::ReceiptNotSaved>()
+}
+
+/// `Ok(false)` is shutdown. A compare failure is still returned.
+async fn retry_startup_receipt<F, Fut>(label: &str, mut op: F) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(()) => return Ok(true),
+            Err(error) if startup_receipt_missing(&error) => {
+                let status = error
+                    .downcast_ref::<db::ReceiptNotSaved>()
+                    .map(|saved| saved.status.as_str())
+                    .unwrap_or("not saved");
+                tracing::warn!("{label} was not saved ({status}); retrying");
+                let delay =
+                    Duration::from_secs(1_u64 << attempt.min(6)).min(Duration::from_secs(60));
+                attempt = attempt.saturating_add(1);
+                tokio::select! {
+                    _ = jmodguard::shutdown_signal() => return Ok(false),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let role = role()?;
     let base_sha = std::env::var("JMODGUARD_BASE_SHA").unwrap_or_else(|_| "unknown".into());
+    let mut api_control: Option<(String, String)> = None;
     let (opts, health_bind) = if role == "bot" {
         let cfg = BotProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
@@ -981,6 +1411,10 @@ async fn main() -> Result<()> {
         let cfg = ApiProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
         jmodguard::set_shutdown_context("launcher");
+        api_control = Some((
+            cfg.bot.control_target.clone(),
+            cfg.bot.control_secret.as_str().to_owned(),
+        ));
         (cfg.db_open_options(), None)
     };
     let baked = binary_path(&role);
@@ -1014,7 +1448,9 @@ async fn main() -> Result<()> {
         }
         let open_opts = opts.clone();
         match tokio::task::spawn_blocking(move || UpdateControl::open(&open_opts)).await? {
-            Ok(Some(control)) => break control,
+            Ok(Some(control)) => {
+                break control;
+            }
             Ok(None) if role == "bot" && initial.is_none() => {
                 if let Some(task) = boot_health.take() {
                     task.abort();
@@ -1048,26 +1484,67 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(POLL) => {},
         }
     };
-    let handoff_digest = std::env::var("JMODGUARD_LAUNCHER_RELEASE").ok();
-    let baked_compatibility = control
-        .baked_compatibility(&role, &base_sha, handoff_digest.is_none())
-        .await?;
-    let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
-    // Capability is published only after the pinned release is verified.
-    // A rejected handoff must not leave Administration treating this binary as active.
-    establish_launcher(&control, &role, &hash, handoff_digest.as_deref()).await?;
-    if let Ok(failed) = std::env::var("JMODGUARD_LAUNCHER_FAILED") {
-        control.launcher_failed(&role, &failed, "updated launcher failed; stable baked controller is recovering the selected application").await?;
-        if let Some(pending) = control
-            .component(&role)
-            .await?
-            .desired
-            .filter(|r| r.digest == failed && r.required_launcher() > db::LAUNCHER_REVISION)
-        {
-            control.failed(&role, &pending, "required launcher failed; application was not updated; retry from Administration").await?;
+    let control = if let Some((target, secret)) = api_control.as_ref() {
+        match api_writer_link(target, secret) {
+            Some(link) => control.with_writer_link(link),
+            None => control,
         }
-        if let Some(op) = control.upgrade().await?.filter(|op| op.phase.active())
-            && op.service(&role)?.release.digest == failed
+    } else {
+        control
+    };
+    let instance = format!("{:032x}", rand::random::<u128>());
+    let fence_renewal = if role == "bot" {
+        control.arm_launcher_fence(&instance);
+        let acquired = control
+            .wait_for_launcher_fence(async || {
+                tokio::select! {
+                    _ = jmodguard::shutdown_signal() => true,
+                    _ = tokio::time::sleep(POLL) => false,
+                }
+            })
+            .await;
+        if !acquired {
+            if let Some(child) = initial.as_mut() {
+                stop(child).await?;
+            }
+            if let Some(task) = boot_health {
+                task.abort();
+                let _ = task.await;
+                tracing::info!("launcher released health listener");
+            }
+            jmodguard::log_shutdown_finished("launcher");
+            return Ok(());
+        }
+        Some(spawn_launcher_fence_renewal(control.clone()))
+    } else {
+        None
+    };
+    let handoff_digest = std::env::var("JMODGUARD_LAUNCHER_RELEASE").ok();
+    let baked_controller = handoff_digest.is_none();
+    let baked_compatibility = control
+        .baked_compatibility(&role, &base_sha, baked_controller)
+        .await?;
+    // The API process is read-only, so the baked bot controller stores both rows.
+    if role == "bot" && baked_controller {
+        control.baked_compatibility("api", &base_sha, true).await?;
+    }
+    let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
+    // Capability is checked before the application starts. The API queues the
+    // receipts and serves immediately; the bot still waits until they are saved.
+    // A rejected handoff must not leave Administration treating this binary as active.
+    let pending_startup = if role == "api" {
+        let failed = std::env::var("JMODGUARD_LAUNCHER_FAILED").ok();
+        let planned = plan_api_startup(
+            &control,
+            &role,
+            &hash,
+            handoff_digest.as_deref(),
+            failed.as_deref(),
+        )
+        .await?;
+        if let Some(digest) = failed.as_deref()
+            && let Some(op) = control.upgrade().await?.filter(|op| op.phase.active())
+            && op.service(&role)?.release.digest == digest
         {
             control
                 .upgrade_error(
@@ -1076,7 +1553,70 @@ async fn main() -> Result<()> {
                 )
                 .await?;
         }
-    }
+        planned
+    } else {
+        if !retry_startup_receipt("launcher startup", || {
+            establish_launcher(&control, &role, &hash, handoff_digest.as_deref())
+        })
+        .await?
+        {
+            return stop_pre_supervisor(
+                &mut initial,
+                &mut maintenance,
+                &mut boot_health,
+                &fence_renewal,
+            )
+            .await;
+        }
+        if let Ok(failed) = std::env::var("JMODGUARD_LAUNCHER_FAILED") {
+            let launcher_note = "updated launcher failed; stable baked controller is recovering the selected application";
+            if !retry_startup_receipt("launcher failure", || {
+                control.launcher_failed(&role, &failed, launcher_note)
+            })
+            .await?
+            {
+                return stop_pre_supervisor(
+                    &mut initial,
+                    &mut maintenance,
+                    &mut boot_health,
+                    &fence_renewal,
+                )
+                .await;
+            }
+            if let Some(pending) = control
+                .component(&role)
+                .await?
+                .desired
+                .filter(|r| r.digest == failed && r.required_launcher() > db::LAUNCHER_REVISION)
+            {
+                let note = "required launcher failed; application was not updated; retry from Administration";
+                if !retry_startup_receipt("application failure", || {
+                    control.failed(&role, &pending, note)
+                })
+                .await?
+                {
+                    return stop_pre_supervisor(
+                        &mut initial,
+                        &mut maintenance,
+                        &mut boot_health,
+                        &fence_renewal,
+                    )
+                    .await;
+                }
+            }
+            if let Some(op) = control.upgrade().await?.filter(|op| op.phase.active())
+                && op.service(&role)?.release.digest == failed
+            {
+                control
+                    .upgrade_error(
+                        &op.id,
+                        "required launcher failed; retry the selected pair from recovery",
+                    )
+                    .await?;
+            }
+        }
+        Vec::new()
+    };
     let mut supervisor = Supervisor {
         role,
         base_sha,
@@ -1087,7 +1627,7 @@ async fn main() -> Result<()> {
         baked_compatibility,
         registry: Registry::ghcr()?,
         control,
-        instance: format!("{:032x}", rand::random::<u128>()),
+        instance,
         running: initial,
         maintenance,
         health: boot_health,
@@ -1096,6 +1636,10 @@ async fn main() -> Result<()> {
         prepared: None,
         standby: None,
         rollback: None,
+        pending_failure: None,
+        pending_startup,
+        receipt_attempt: 0,
+        receipt_not_before: None,
         reported: false,
         last_observed: None,
     };
@@ -1109,6 +1653,9 @@ async fn main() -> Result<()> {
             },
         }
         tokio::select! { _ = jmodguard::shutdown_signal() => break, _ = tokio::time::sleep(POLL) => {} }
+    }
+    if let Some(task) = fence_renewal {
+        task.abort();
     }
     supervisor.stop_application().await?;
     supervisor.end_idle().await?;

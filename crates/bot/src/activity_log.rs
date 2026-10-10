@@ -956,6 +956,7 @@ mod tests {
     #[tokio::test]
     async fn each_activity_event_follows_channel_and_ignore_toggles() {
         let f = Fixture::new();
+        f.app.activation.mark_lock_held(true);
         let sink = Sink::default();
         let guild = GuildId::new(789);
         for event in ACTIVITY_LOG_EVENTS {

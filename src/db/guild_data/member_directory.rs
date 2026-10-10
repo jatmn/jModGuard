@@ -1094,13 +1094,41 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         anyhow::ensure!(bot_id > 0, MemberSyncError::Invalid);
         let expected = self.expected.clone();
+        let guild = scope.guild_id();
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
+                let fenced: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM guild_local_write_fence WHERE guild_id=?1)",
+                    params![guild],
+                    |row| Ok(row.get(0)?),
+                )?;
+                if fenced == 1 {
+                    tx.finish_read()?;
+                    return Err(crate::db::guild_stores::GuildWriteFenced.into());
+                }
                 verify_scope(&tx, &expected, &scope, true)?;
                 let out = status(&tx, &scope, bot_id, now_ms, false)?;
                 tx.finish_read()?;
                 Ok(out)
+            })
+            .await
+    }
+
+    /// Record the guild-local fence before any core fence row.
+    pub async fn record_local_write_fence(&self, guild: i64, fenced_at_ms: i64) -> Result<()> {
+        anyhow::ensure!(guild > 0 && fenced_at_ms > 0, MemberSyncError::Invalid);
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_read()?;
+                tx.ensure_mutation_receipt()?;
+                tx.execute_rows(
+                    "INSERT INTO guild_local_write_fence(guild_id, fenced_at_ms) VALUES(?1, ?2)
+                     ON CONFLICT(guild_id) DO NOTHING",
+                    params![guild, fenced_at_ms],
+                    1,
+                )?;
+                tx.commit()
             })
             .await
     }

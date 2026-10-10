@@ -425,8 +425,9 @@ authorize live provider calls or require a Codex skill to contribute.
   no-op receipt behavior. Retirement/replacement invalidates jobs atomically; missing
   Gateway context must not mutate jobs through a separate guild-only lifecycle helper.
   No initial nickname edit is created on join. Nicknames remain guild-only. Final
-  DB checks cannot recall a Discord request already sent or coordinate multiple bot
-  replicas; writer leases remain later work.
+  DB checks cannot recall a Discord request already sent. One bot process holds
+  the writer lease; the API opens the database read-only and sends changes to
+  that process. A replacement does not act until it holds the lease.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.

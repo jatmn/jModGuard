@@ -36,6 +36,7 @@ mod member_sync_pace;
 pub use member_sync_pace::*;
 mod bootstrap;
 pub use bootstrap::*;
+pub use bootstrap::{meta_string_conn, write_meta_string_conn};
 mod enrollments;
 pub use enrollments::*;
 mod configuration;
@@ -50,6 +51,8 @@ mod tenant_lifecycle;
 pub use tenant_lifecycle::*;
 mod settings;
 pub use settings::*;
+mod control_apply;
+pub use control_apply::*;
 mod updates;
 pub use updates::*;
 mod update_control;
@@ -80,6 +83,15 @@ const MIGRATIONS: &[&str] = &[
 
 /// Completed core schema required by service startup and release observations.
 pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Set `PRAGMA user_version` on a local file without an application pool.
+/// Startup tests use this so the writer-open tripwire stays quiet.
+/// The busy timeout waits out a concurrent read-only open.
+pub fn set_user_version_unfenced(path: &Path, version: i64) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000")?;
+    conn.pragma_update(None, "user_version", version)
+}
 
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
@@ -124,8 +136,7 @@ impl std::fmt::Display for RemoteTokenCannotWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "remote database token cannot write. The API needs a full-access token \
-             (Bunny Database Access → full access, not read-only). Original error: {}",
+            "database connection cannot write. Original error: {}",
             self.0
         )
     }
@@ -315,7 +326,13 @@ pub fn startup_retry_kind(err: &anyhow::Error, remote: bool) -> Option<StartupRe
     {
         return None;
     }
-    if is_schema_not_ready(err) {
+    if is_schema_not_ready(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::control::WriterLinkNotReady>()
+                .is_some()
+        })
+    {
         return Some(StartupRetryKind::Schema);
     }
     if is_sqlite_startup_lock(err) {
@@ -388,16 +405,26 @@ pub struct DbOpenOptions {
     pub pool_size: u32,
     /// When true, apply migrations + seed globals. Bot uses true; API uses false.
     pub migrate: bool,
+    /// Readers never take the writer lock. The API and pure bot reads set this.
+    pub read_only: bool,
     /// Seeded into the global settings row on first boot (`bot.default_prefix`).
     pub default_prefix: String,
     /// Seeded into the global settings row on first boot (`bot.retention_days`).
     pub retention_days: u32,
 }
 
+#[cfg(test)]
+type BeforeFinalLeaseHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+type BeforeFinalLeaseReread = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
+#[cfg(test)]
+type DuringLeasedGuildCommit = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
+
 #[derive(Clone)]
 pub struct Db {
     path: PathBuf,
     remote: bool,
+    read_only: bool,
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
     startup_deferred: bool,
@@ -408,6 +435,22 @@ pub struct Db {
     config_write_generation: Arc<std::sync::atomic::AtomicU64>,
     config_floor_lock: Arc<parking_lot::Mutex<()>>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Expected active-bot instance and generation copied onto this pool's
+    /// connections at checkout. An empty owner means commits are not fenced.
+    /// Claiming the writer lease arms this and leaves it armed. Control apply
+    /// restores the previous owner and leaves the generation in place.
+    lease_state: Arc<Mutex<ActiveLease>>,
+    /// Bot launcher instance. Empty means update-control commits are not fenced
+    /// by the launcher lease. This is not the application writer lease.
+    launcher_fence: Arc<Mutex<Option<String>>>,
+    /// Moves the core lease after the early guild-commit probe and before the
+    /// final re-read. The re-read does not hold the writer lock across COMMIT.
+    #[cfg(test)]
+    before_final_lease_reread: BeforeFinalLeaseReread,
+    #[cfg(test)]
+    during_leased_guild_commit: DuringLeasedGuildCommit,
+    #[cfg(test)]
+    fail_lease_cleanup: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -447,9 +490,147 @@ impl Db {
     pub fn sqlite_path(&self) -> Option<&Path> {
         (!self.remote).then_some(self.path.as_path())
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn is_remote(&self) -> bool {
         self.remote
     }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Treat later commits from this pool as belonging to `owner`. A commit is
+    /// rejected when that instance does not hold the active-bot lease.
+    pub fn arm_lease_owner(&self, owner: &str) {
+        self.restore_lease_owner(Some(owner.to_owned()));
+    }
+
+    /// Record the owner and generation taken by `claim_active_bot`.
+    pub(super) fn arm_writer_term(&self, owner: &str, generation: i64) {
+        let mut state = self
+            .lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.owner = Some(owner.to_owned());
+        state.generation = Some(generation);
+    }
+
+    /// Generation armed by the latest claim on this pool. `None` until a claim.
+    pub fn leased_generation(&self) -> Option<i64> {
+        self.lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    /// Guild pools snapshot this core pool's generation at checkout.
+    pub(super) fn follow_writer_generation(&self, core: &Db) {
+        *self
+            .connections
+            .generation_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&core.lease_state));
+    }
+
+    /// Short fence for bot-launcher update-control writes. It does not use the
+    /// application writer lease, so it still works while the bot process is stopped.
+    pub fn arm_launcher_fence(&self, instance: &str) {
+        *self
+            .launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(instance.to_owned());
+    }
+
+    pub fn launcher_instance(&self) -> Option<String> {
+        self.launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_lease_owner(&self) {
+        let mut state = self
+            .lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.owner = None;
+        state.generation = None;
+    }
+
+    pub(crate) fn leased_owner(&self) -> Option<String> {
+        self.lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .owner
+            .clone()
+    }
+
+    pub(crate) fn restore_lease_owner(&self, owner: Option<String>) {
+        self.lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .owner = owner;
+    }
+
+    pub(crate) fn install_commit_lease_probe(&self, probe: crate::db_compat::CommitLeaseProbe) {
+        *self
+            .connections
+            .commit_lease_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_final_lease_reread(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_final_lease_reread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_before_final_lease_reread(&self) -> Option<BeforeFinalLeaseHook> {
+        self.before_final_lease_reread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_during_leased_guild_commit(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .during_leased_guild_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn take_during_leased_guild_commit(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.during_leased_guild_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_lease_cleanup_failure(&self) {
+        self.fail_lease_cleanup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_lease_cleanup_failure(&self) -> bool {
+        self.fail_lease_cleanup
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct ActiveLease {
+    owner: Option<String>,
+    generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -464,7 +645,13 @@ struct ConnectionPool {
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
     remote: bool,
+    read_only: bool,
     busy_timeout_ms: u32,
+    lease_state: Arc<Mutex<ActiveLease>>,
+    /// Guild pools snapshot the core writer's generation. Core pools leave this empty.
+    generation_source: Mutex<Option<Arc<Mutex<ActiveLease>>>>,
+    launcher_fence: Arc<Mutex<Option<String>>>,
+    commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
 }
 
 struct ConnectionLease {
@@ -480,13 +667,19 @@ impl ConnectionLease {
             .lock()
             .map_err(|_| anyhow::anyhow!("database connection pool lock poisoned"))?
             .pop();
-        let connection = match connection {
+        let mut connection = match connection {
             Some(connection) => connection,
             None => {
-                let connection =
+                let mut connection =
                     Connection::from_database(Arc::clone(&pool.database), pool.runtime.clone())
                         .context("failed to replace discarded database connection")?;
-                configure_connection(&connection, pool.remote, pool.busy_timeout_ms)?;
+                connection.set_read_only(pool.read_only);
+                configure_connection(
+                    &connection,
+                    pool.remote,
+                    pool.busy_timeout_ms,
+                    pool.read_only,
+                )?;
                 connection
             }
         };
@@ -497,6 +690,37 @@ impl ConnectionLease {
             // it may contain writes whose outcome cannot safely be replayed.
             connection.reset_remote_stream()?;
         }
+        let owner = pool
+            .lease_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .owner
+            .clone();
+        connection.set_expected_lease_owner(owner);
+        let source = pool
+            .generation_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let generation = source.and_then(|state| {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation
+        });
+        connection.set_expected_writer_generation(generation);
+        let launcher = pool
+            .launcher_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        connection.set_expected_launcher(launcher);
+        let probe = pool
+            .commit_lease_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        connection.set_commit_lease_probe(probe);
         Ok(Self {
             connection: Some(connection),
             pool,
@@ -571,6 +795,7 @@ impl Db {
             token: String::new(),
             pool_size,
             migrate: true,
+            read_only: false,
             default_prefix: GuildSettings::default().prefix,
             retention_days: GuildSettings::default().retention_days,
         })
@@ -582,6 +807,9 @@ impl Db {
     }
 
     pub fn open_with(opts: DbOpenOptions) -> Result<Self> {
+        if !opts.read_only {
+            note_writable_open();
+        }
         let startup_deferred = std::cell::Cell::new(false);
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
@@ -674,7 +902,11 @@ impl Db {
                     .build(),
             )?
         } else {
-            runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?
+            let mut builder = libsql::Builder::new_local(opts.path.clone());
+            if opts.read_only {
+                builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY);
+            }
+            runtime.block_on(builder.build())?
         };
         let database = Arc::new(database);
         let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -684,10 +916,13 @@ impl Db {
         // on the database runtime, including the error path.
         {
             let mut held = CloseBootstrap {
-                connection: Some(
-                    Connection::from_database(Arc::clone(&database), runtime.clone())
-                        .context("failed to connect to database")?,
-                ),
+                connection: Some({
+                    let mut connection =
+                        Connection::from_database(Arc::clone(&database), runtime.clone())
+                            .context("failed to connect to database")?;
+                    connection.set_read_only(opts.read_only);
+                    connection
+                }),
                 runtime: runtime.clone(),
             };
             let bootstrap = held
@@ -696,12 +931,20 @@ impl Db {
                 .expect("bootstrap connection is installed");
             let step_started = Instant::now();
             if !remote {
-                bootstrap.execute_batch(
-                    "PRAGMA busy_timeout=5000;
-                     PRAGMA journal_mode=WAL;
-                     PRAGMA synchronous=NORMAL;
-                     PRAGMA foreign_keys=ON;",
-                )?;
+                if opts.read_only {
+                    bootstrap.execute_batch(
+                        "PRAGMA busy_timeout=5000;
+                         PRAGMA foreign_keys=ON;
+                         PRAGMA query_only=ON;",
+                    )?;
+                } else {
+                    bootstrap.execute_batch(
+                        "PRAGMA busy_timeout=5000;
+                         PRAGMA journal_mode=WAL;
+                         PRAGMA synchronous=NORMAL;
+                         PRAGMA foreign_keys=ON;",
+                    )?;
+                }
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
@@ -730,10 +973,11 @@ impl Db {
             };
             let mut connections = Vec::with_capacity(pool_size);
             for _ in 0..pool_size {
-                let connection =
+                let mut connection =
                     Connection::from_database(Arc::clone(&database), pool_runtime.clone())
                         .context("failed to create pooled database connection")?;
-                configure_connection(&connection, remote, busy_timeout_ms)?;
+                connection.set_read_only(opts.read_only);
+                configure_connection(&connection, remote, busy_timeout_ms, opts.read_only)?;
                 connections.push(connection);
             }
 
@@ -743,9 +987,16 @@ impl Db {
             // API that already passed the gate is serving.
             ready(bootstrap)?;
 
+            let lease_state = Arc::new(Mutex::new(ActiveLease {
+                owner: None,
+                generation: None,
+            }));
+            let launcher_fence = Arc::new(Mutex::new(None));
+            let commit_lease_probe = Arc::new(Mutex::new(None));
             Ok(Self {
                 path: opts.path.clone(),
                 remote,
+                read_only: opts.read_only,
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
                 startup_deferred: false,
@@ -754,7 +1005,12 @@ impl Db {
                     database,
                     runtime: pool_runtime,
                     remote,
+                    read_only: opts.read_only,
                     busy_timeout_ms,
+                    lease_state: Arc::clone(&lease_state),
+                    generation_source: Mutex::new(None),
+                    launcher_fence: Arc::clone(&launcher_fence),
+                    commit_lease_probe,
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 permit_timeout: remote.then_some(if opts.migrate {
@@ -766,6 +1022,14 @@ impl Db {
                 config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
                 settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                lease_state,
+                launcher_fence,
+                #[cfg(test)]
+                before_final_lease_reread: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                during_leased_guild_commit: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })
@@ -915,6 +1179,7 @@ impl Db {
 
     async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {
         let probe = current_startup_probe();
+        let tripwire = writer_open_tripwire();
         let (send, receive) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("jmodguard-db-open".into())
@@ -922,6 +1187,9 @@ impl Db {
                 // The receiver can be dropped on shutdown. The worker still
                 // finishes the synchronous open; process exit reaps it.
                 let _probe = enter_startup_probe(probe);
+                if let Some(flag) = tripwire {
+                    arm_writer_open_tripwire(flag);
+                }
                 let _ = send.send(Self::open_with(opts));
             })
             .context("failed to start database-open worker")?;
@@ -1088,5 +1356,29 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
+
+std::thread_local! {
+    static WRITER_OPEN_FLAG: std::cell::Cell<Option<Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arms a thread-local flag that records writable `Db::open_with` and
+/// `UpdateControl::open` calls. Other tests leave it unset.
+pub fn arm_writer_open_tripwire(flag: Arc<std::sync::atomic::AtomicBool>) {
+    WRITER_OPEN_FLAG.with(|slot| slot.set(Some(flag)));
+}
+
+pub(crate) fn writer_open_tripwire() -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    WRITER_OPEN_FLAG
+        .with(|slot| slot.take())
+        .inspect(|flag| WRITER_OPEN_FLAG.with(|slot| slot.set(Some(Arc::clone(flag)))))
+}
+
+fn note_writable_open() {
+    if let Some(flag) = writer_open_tripwire() {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests;

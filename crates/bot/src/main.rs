@@ -120,6 +120,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(message) = jmodguard::launcher_child::refusal_message() {
+        tracing::error!("{message}");
+        shutdown_signal().await;
+        jmodguard::log_shutdown_finished("bot");
+        tracing::info!("bot process stopped");
+        return Ok(());
+    }
+
     jmodguard::cgroup::spawn_container_usage_sampler();
 
     let db = tokio::select! {
@@ -151,7 +159,14 @@ async fn main() -> Result<()> {
 
     let app = BotState::new(cfg.clone(), db)?;
     let activation = Arc::clone(&app.activation);
-    match jmodguard_bot::activation::wait_for_writer_lock(&app.db, &activation).await {
+    match jmodguard_bot::activation::claim_writer_lease(
+        app.cfg.bot.control_secret.as_str(),
+        &app.db,
+        &activation,
+        Some(&app.tenant),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             tracing::info!("bot stopped before it held the active-bot lease");
@@ -159,13 +174,21 @@ async fn main() -> Result<()> {
             tracing::info!("bot process stopped");
             return Ok(());
         }
-        Err(error) => return Err(error.context("active-bot lease")),
+        Err(error) => return Err(error),
     }
     if !activation.allows_discord_connect() {
         anyhow::bail!("active-bot lease was not held");
     }
-    let _renewal =
-        jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
+    let _renewal = jmodguard_bot::activation::spawn_renewal(
+        app.db.clone(),
+        Arc::clone(&activation),
+        app.tenant.clone(),
+    );
+    if jmodguard_bot::control_server::spawn(Arc::clone(&app))?.is_none() {
+        tracing::error!(
+            "control listener is off; moderation continues and API writes are unavailable"
+        );
+    }
 
     // --- Discord client (needed for slash re-sync after config polls) --------
     // Guild voice states is not a privileged intent. Voice join, leave, and
@@ -227,6 +250,8 @@ async fn main() -> Result<()> {
 
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
+    app.install_discord_cache(Arc::clone(&cache));
+    app.install_http_member_lookup(Arc::clone(&http));
 
     // One process-wide importer shares its Discord request budget across all
     // enrolled guilds. The job claim/cursor lives in the guild store.
@@ -256,6 +281,9 @@ async fn main() -> Result<()> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = shutdown_signal() => break, _ = tick.tick() => {} }
+                if !app.activation.may_record() {
+                    continue;
+                }
                 let Some(source) =
                     jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                 else {
@@ -296,6 +324,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         let Some(membership) =
                             jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                         else {
@@ -304,6 +335,7 @@ async fn main() -> Result<()> {
                         let discord = jmodguard_bot::action_worker::LiveDiscord {
                             http: &http,
                             bot_user_id: membership.bot_user_id,
+                            activation: &app.activation,
                         };
                         tokio::select! {
                             _ = shutdown_signal() => break,
@@ -313,6 +345,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ = cleanup.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await {
                             tracing::warn!("bot action history cleanup failed: {error:#}");
                         }
@@ -331,6 +366,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         jmodguard_bot::cases::retry_deferred_discord_audit_links(&app, None).await;
                     }
                 }
@@ -347,6 +385,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         loop {
                             match app.tenant.drive_erasure().await {
                                 Ok(true) => {}
@@ -374,6 +415,9 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if !app.activation.may_record() {
+                    continue;
+                }
                 drain_nickname_reconciles(&app, &http, &identity).await;
             }
         });
@@ -404,6 +448,9 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if !app.activation.may_record() {
+                    continue;
+                }
                 // Peek slash registry every tick (not gated on config_version) so a
                 // future slash-only bump cannot be missed. Do not commit the observed
                 // version until Discord re-sync has nothing left to retry — otherwise
@@ -482,6 +529,7 @@ async fn main() -> Result<()> {
     if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
         tracing::info!("shutdown before gateway identify");
         activation.begin_shutdown();
+        activation.note_lease_lost();
         jmodguard::set_process_ready(false);
         if let Err(error) = db::release_active_bot(&app.db, activation.instance()).await {
             tracing::warn!("active-bot lease release failed: {error:#}");
@@ -502,13 +550,17 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
         jmodguard::set_process_ready(false);
-        shutdown_app.stop_startup_notice_task().await;
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
         let attempted = guild_ids.len();
-        let sent =
-            logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
-        tracing::info!(sent, attempted, "shutdown notice phase complete");
+        jmodguard_bot::activation::drain_for_shutdown_notices(&shutdown_activation, async move {
+            shutdown_app.stop_startup_notice_task().await;
+            let sent =
+                logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content)
+                    .await;
+            tracing::info!(sent, attempted, "shutdown notice phase complete");
+        })
+        .await;
         if let Err(error) =
             db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
         {

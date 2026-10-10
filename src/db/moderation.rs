@@ -340,6 +340,18 @@ pub struct Stats {
 
 /// Per-guild identified moderation aggregates. Legacy unclassified plan summaries
 /// remain available through query_events, but cannot truthfully count as moderation.
+/// Autocommit existence check used before a ban handoff. No transaction.
+pub async fn active_ban_recorded(db: &Db, guild_id: i64, user_id: i64) -> Result<bool> {
+    db.with_conn(move |conn| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1)",
+            params![guild_id, user_id],
+            |row| Ok(row.get::<i64>(0)? != 0),
+        )
+    })
+    .await
+}
+
 pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| guild_stats_conn(conn, guild_id))
         .await
@@ -482,6 +494,82 @@ pub async fn add_enrolled_warn(
         )?;
         tx.commit()?;
         Ok(id)
+    })
+    .await
+}
+
+/// How a ban row relates to a previous active mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BanRecord {
+    /// Discord already shows this ban. A matching active row is the same dispatch.
+    Retry,
+    /// Discord showed the user was not banned. Replace a stale active mirror.
+    Fresh,
+}
+
+/// Insert an active ban row for this dispatch.
+///
+/// [`BanRecord::Retry`] returns `None` and writes nothing when an active row already has
+/// the same guild, user, reason, and moderator, even when `occurred_at` is `None`.
+/// [`BanRecord::Fresh`] replaces that stale active mirror and inserts a new row.
+/// `created_at` stays the timestamp of the insert and is not the dispatch identity. A
+/// different reason replaces the stale active row. An ended row does not block the
+/// insert. `Some` means a row was inserted and the caller may publish. `None` means do
+/// not publish.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_enrolled_ban_if_absent(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    user_name: Option<&str>,
+    user_display_name: Option<&str>,
+    moderator_id: Option<i64>,
+    moderator_name: Option<&str>,
+    reason: &str,
+    occurred_at: Option<&str>,
+    kind: BanRecord,
+) -> Result<Option<i64>> {
+    let (now, reason) = (
+        occurred_at.map(str::to_owned).unwrap_or_else(now_str),
+        reason.to_string(),
+    );
+    let user_name = user_name.map(str::to_owned);
+    let user_display_name = user_display_name.map(str::to_owned);
+    let moderator_name = moderator_name.map(str::to_owned);
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let same_dispatch: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM bans
+                 WHERE guild_id=?1 AND user_id=?2 AND active=1
+                   AND reason IS ?3 AND moderator_id IS ?4
+                 ORDER BY id DESC LIMIT 1",
+                params![guild_id, user_id, reason.clone(), moderator_id],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        if kind == BanRecord::Retry && same_dispatch.is_some() {
+            tx.finish_read()?;
+            return Ok(None);
+        }
+        tx.ensure_mutation_receipt()?;
+        tx.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+            params![guild_id, user_id],
+        )?;
+        tx.execute_rows(
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name],
+            1,
+        )?;
+        let row_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(row_id))
     })
     .await
 }

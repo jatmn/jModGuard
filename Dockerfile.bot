@@ -50,10 +50,10 @@ ENV JMODGUARD_LOG_DIRECTORY=""
 # Fail closed unless Bunny/portable remote credentials are present.
 ENV JMODGUARD_REQUIRE_REMOTE_DB=1
 # Process-local liveness for Magic Containers HTTP GET/HEAD /health.
-ENV JMODGUARD_HEALTH_BIND=0.0.0.0:8080
+ENV JMODGUARD_HEALTH_BIND=0.0.0.0:8081
 ENV JMODGUARD_BASE_SHA=${SOURCE_SHA}
 ENV JMODGUARD_BASE_ABI=debian-bookworm-amd64
 ENV JMODGUARD_ROLE=bot
 ENV JMODGUARD_SELF_UPDATE=0
-EXPOSE 8080
+EXPOSE 8081
 ENTRYPOINT ["/bin/sh", "/usr/local/bin/jmodguard-bootstrap"]

@@ -507,6 +507,7 @@ async fn queued_retry_and_resume_after_initial_completion_keep_the_seed_checkpoi
     let f = Fixture::new();
     let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     app.tenant
         .activate(enrollment.clone())
         .await
@@ -590,6 +591,7 @@ async fn completed_retry_requeues_stalled_audit_recovery() {
     let f = Fixture::new();
     let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     app.tenant
         .activate(enrollment.clone())
         .await
@@ -992,6 +994,7 @@ async fn later_same_second_membership_repairs_missed_rejoin_before_consuming_cla
         .enqueue(10, "repair_membership", log_channel(Some(123)))
         .await;
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     let old = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
     app.tenant.activate(old).await.unwrap();
 
@@ -1055,6 +1058,7 @@ async fn move_fence_racing_membership_repair_finishes_the_claim_without_dispatch
         .enqueue(10, "fenced_membership_repair", log_channel(Some(123)))
         .await;
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     let old = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
     app.tenant.activate(old).await.unwrap();
     let destination = db::guild_stores::StoreId::new();
@@ -1637,6 +1641,7 @@ async fn known_noop_unban_does_not_consume_a_future_external_echo() {
     ] {
         let f = Fixture::new();
         let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
         let job = f.enqueue(10, "echo", unban(99)).await;
         let e = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
         app.tenant.activate(e).await.unwrap();
@@ -1664,6 +1669,7 @@ async fn known_noop_unban_does_not_consume_a_future_external_echo() {
 async fn queued_unban_links_a_bot_audit_without_subject_search() {
     let f = Fixture::new();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     let job = f.enqueue(10, "audit", unban(99)).await;
     let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
     app.tenant.activate(enrollment.clone()).await.unwrap();
@@ -1724,6 +1730,7 @@ async fn queued_unban_links_a_bot_audit_without_subject_search() {
 async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
     let f = Fixture::new();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
     let noop_job = f.enqueue(10, "noop", unban(99)).await;
     let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
     app.tenant.activate(enrollment.clone()).await.unwrap();
