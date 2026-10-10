@@ -326,8 +326,11 @@ pub fn open_frame(
         anyhow::bail!("write failed");
     }
     let wire: Wire = serde_json::from_slice(json).map_err(|_| anyhow::anyhow!("write failed"))?;
-    if wire.direction != CONTROL_LINK_DIRECTION || wire.route != CONTROL_LINK_ROUTE {
-        anyhow::bail!("write failed");
+    if wire.direction != CONTROL_LINK_DIRECTION {
+        anyhow::bail!("write failed: direction binding");
+    }
+    if wire.route != CONTROL_LINK_ROUTE {
+        anyhow::bail!("write failed: route binding");
     }
     let now = now_ms();
     if wire.expires_ms < now.saturating_sub(SKEW_MS) {
