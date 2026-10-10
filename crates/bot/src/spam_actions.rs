@@ -295,11 +295,21 @@ async fn enforce(
         .as_ref()
         .map(|m| m.roles.iter().map(|r| r.get()).collect())
         .unwrap_or_default();
-    if found
-        .messages
-        .iter()
-        .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
-    {
+    // A missing guild cache cannot prove moderator status, so enforcement continues.
+    let is_moderator = crate::commands::cached_is_moderator(
+        app,
+        ctx,
+        GuildId::new(found.guild),
+        found.author,
+        &roles,
+    );
+    if scope_blocks_enforcement(
+        rule_def,
+        found.author,
+        found.messages.iter().map(|(channel, _)| *channel),
+        &roles,
+        is_moderator,
+    ) {
         let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
@@ -552,13 +562,6 @@ pub(crate) async fn continue_present_spam_ban(
         .ok()
         .flatten()
         .is_some()
-}
-
-fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
-    rule.enabled
-        && !rule.whitelist_users.contains(&author)
-        && !rule.whitelist_channels.contains(&channel)
-        && !rule.whitelist_roles.iter().any(|r| roles.contains(r))
 }
 
 fn delete_outcome(error: &serenity::Error) -> CaseOutcome {
@@ -833,6 +836,26 @@ async fn capture_attachments(
     }
 }
 
+/// True when any matched channel is outside the rule's current scope.
+/// Moderator status is the caller's lookup; a failed lookup is not a moderator.
+fn scope_blocks_enforcement(
+    rule: &jmodguard::types::RuleDef,
+    author: u64,
+    channels: impl IntoIterator<Item = u64>,
+    roles: &[u64],
+    is_moderator: bool,
+) -> bool {
+    channels.into_iter().any(|channel| {
+        !jmodguard::custom_rules::spam_scope_admits(
+            rule,
+            author,
+            channel,
+            Some(roles),
+            is_moderator,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1095,24 @@ mod tests {
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);
+    }
+
+    #[test]
+    fn enforcement_recheck_sees_moderator_and_channel_scope_changes() {
+        let mut rule = crate::defaults::default_rules().remove(1);
+        rule.skip_moderators = true;
+        rule.include_channels = vec![11];
+        let blocks = |channels: &[(u64, u64)], is_moderator: bool| {
+            scope_blocks_enforcement(
+                &rule,
+                5,
+                channels.iter().map(|(channel, _)| *channel),
+                &[],
+                is_moderator,
+            )
+        };
+        assert!(!blocks(&[(11, 1)], false));
+        assert!(blocks(&[(11, 1)], true));
+        assert!(blocks(&[(11, 1), (12, 2)], false));
     }
 }

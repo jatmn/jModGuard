@@ -578,14 +578,9 @@ fn may_admit(
     author: u64,
     channel: u64,
     roles: Option<&[u64]>,
+    is_moderator: bool,
 ) -> bool {
-    rule.enabled
-        && !rule.whitelist_users.contains(&author)
-        && !rule.whitelist_channels.contains(&channel)
-        && match roles {
-            Some(roles) => !rule.whitelist_roles.iter().any(|r| roles.contains(r)),
-            None => rule.whitelist_roles.is_empty(),
-        }
+    jmodguard::custom_rules::spam_scope_admits(rule, author, channel, roles, is_moderator)
 }
 
 pub fn observe(
@@ -606,6 +601,8 @@ pub fn observe(
     }
     let Some(member) = &msg.member else { return };
     let roles: Vec<_> = member.roles.iter().map(|r| r.get()).collect();
+    let is_moderator =
+        crate::commands::cached_is_moderator(app, ctx, guild, msg.author.id.get(), &roles);
     consider(
         app,
         ctx,
@@ -615,6 +612,7 @@ pub fn observe(
         msg.channel_id.get(),
         msg.id.get(),
         Some(&roles),
+        is_moderator,
         Some(msg.content.as_str()),
         msg.timestamp.timestamp_millis(),
         received,
@@ -648,6 +646,9 @@ pub(crate) fn observe_update(
     if author == ctx.cache.current_user().id.get() {
         return;
     }
+    let is_moderator = roles
+        .as_deref()
+        .is_some_and(|roles| crate::commands::cached_is_moderator(app, ctx, guild, author, roles));
     let edited_ms = event
         .edited_timestamp
         .map(|t| t.timestamp_millis())
@@ -661,6 +662,7 @@ pub(crate) fn observe_update(
         event.channel_id.get(),
         event.id.get(),
         roles.as_deref(),
+        is_moderator,
         event.content.as_deref(),
         edited_ms,
         update.received,
@@ -680,6 +682,7 @@ fn consider(
     channel: u64,
     message: u64,
     roles: Option<&[u64]>,
+    is_moderator: bool,
     content: Option<&str>,
     edited_ms: i64,
     received: Instant,
@@ -695,7 +698,7 @@ fn consider(
         drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     };
-    if !may_admit(rule, author, channel, roles) {
+    if !may_admit(rule, author, channel, roles, is_moderator) {
         drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     }
@@ -1099,17 +1102,29 @@ mod tests {
     #[test]
     fn omitted_roles_still_apply_user_and_channel_exemptions() {
         let mut rule = crate::defaults::default_rules().remove(2);
-        assert!(may_admit(&rule, 1, 2, None));
+        assert!(may_admit(&rule, 1, 2, None, false));
         rule.whitelist_users.push(1);
-        assert!(!may_admit(&rule, 1, 2, None));
+        assert!(!may_admit(&rule, 1, 2, None, false));
         rule.whitelist_users.clear();
         rule.whitelist_channels.push(2);
-        assert!(!may_admit(&rule, 1, 2, None));
+        assert!(!may_admit(&rule, 1, 2, None, false));
         rule.whitelist_channels.clear();
         rule.whitelist_roles.push(3);
-        assert!(!may_admit(&rule, 1, 2, None));
-        assert!(!may_admit(&rule, 1, 2, Some(&[3])));
-        assert!(may_admit(&rule, 1, 2, Some(&[4])));
+        assert!(!may_admit(&rule, 1, 2, None, false));
+        assert!(!may_admit(&rule, 1, 2, Some(&[3]), false));
+        assert!(may_admit(&rule, 1, 2, Some(&[4]), false));
+    }
+
+    #[test]
+    fn skip_moderators_and_include_channels_gate_text_admission() {
+        let mut rule = crate::defaults::default_rules().remove(2);
+        rule.skip_moderators = true;
+        rule.include_channels = vec![10, 11];
+        rule.whitelist_channels = vec![10];
+        assert!(!may_admit(&rule, 1, 11, Some(&[]), true));
+        assert!(may_admit(&rule, 1, 11, Some(&[]), false));
+        assert!(!may_admit(&rule, 1, 10, Some(&[]), false));
+        assert!(!may_admit(&rule, 1, 12, Some(&[]), false));
     }
 
     #[test]

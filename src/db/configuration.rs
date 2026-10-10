@@ -704,6 +704,30 @@ fn prepare_badword_replacement(
     Ok((valid, skipped))
 }
 
+/// Validates a rules copy before the destination is cleared.
+///
+/// Custom rows use the same create admission as an upsert: global scope is
+/// rejected, the per-guild cap applies to the replacement set, and each new
+/// custom rule is stored dry-run.
+fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(String, RuleDef)>> {
+    let mut replacement = Vec::with_capacity(rows.len());
+    let mut custom = 0usize;
+    for (id, rule) in rows {
+        crate::image_spam::validate_rule(&id, &rule)?;
+        if crate::custom_rules::is_custom_id(&id) {
+            custom += 1;
+            replacement.push((
+                id.clone(),
+                crate::custom_rules::custom_rule_for_create(dst, &id, rule)?,
+            ));
+        } else {
+            replacement.push((id, rule));
+        }
+    }
+    crate::custom_rules::ensure_room_for_new_custom_rules(0, custom)?;
+    Ok(replacement)
+}
+
 fn section_wanted(sections: &[String], name: &str) -> bool {
     sections.iter().any(|s| s == name || s == "all")
 }
@@ -809,20 +833,22 @@ async fn copy_guild_config_inner(
         }
 
         if wants("rules") {
-            for (id, rule) in load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)? {
-                crate::image_spam::validate_rule(&id, &rule)?;
-            }
+            let rows = load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)?;
             if src != dst {
+                let replacement = prepare_copied_rules(dst, rows)?;
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
-                tx.execute_copy(
-                    "INSERT INTO rules (guild_id, rule_id, data)
-                     SELECT ?1, rule_id, data FROM rules WHERE guild_id = ?2",
-                    dst,
-                    src,
-                    "rules",
-                    "rule_id",
-                    "data",
-                )?;
+                for (id, rule) in &replacement {
+                    let json = serde_json::to_string(rule)?;
+                    tx.execute_rows(
+                        "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+                        params![dst, id.as_str(), json],
+                        1,
+                    )?;
+                }
+            } else {
+                for (id, rule) in &rows {
+                    crate::image_spam::validate_rule(id, rule)?;
+                }
             }
             result.copied.push("rules");
         }
@@ -1453,12 +1479,7 @@ async fn upsert_enrolled_custom_rule(
                 params![guild_id],
                 |r| Ok(r.get(0)?),
             )?;
-            if count as usize >= crate::custom_rules::MAX_CUSTOM_RULES_PER_GUILD {
-                anyhow::bail!(
-                    "at most {} custom rules per guild",
-                    crate::custom_rules::MAX_CUSTOM_RULES_PER_GUILD
-                );
-            }
+            crate::custom_rules::ensure_room_for_new_custom_rules(count as usize, 1)?;
         }
         tx.execute_rows(
             "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)

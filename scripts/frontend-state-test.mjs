@@ -2790,6 +2790,40 @@ test('appearance retains the session choice across startup and workspace when st
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });
 
+test('honeypot switch shows the kick action that save submits', async () => {
+  const calls = [];
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  const modal = await h.app.editRule({
+    name: 'Live pattern',
+    rule_id: 'custom:0123456789abcdef',
+    effective: {
+      name: 'Live pattern',
+      enabled: true,
+      dry_run: false,
+      params: { kind: 'pattern', pattern: 'scam' },
+      actions: [{ at: 1, action: 'delete', duration_minutes: 0, delete_days: 0, reason: '' }],
+    },
+  });
+  const type = findNode(modal, (n) => n.localName === 'select' && [...n.options].some((option) => option.value === 'honeypot_role'));
+  type.value = 'honeypot_role';
+  await fire(type, 'change');
+  const action = findNode(modal, (n) => n.localName === 'select' && [...n.options].some((option) => option.value === 'kick') && ![...n.options].some((option) => option.value === 'honeypot_role'));
+  assert.equal(action.value, 'kick');
+  const roleField = findNode(modal, (n) => n.classList?.contains('field') && textOf(n).includes('Role id'));
+  const role = findNode(roleField, (n) => n.localName === 'input');
+  role.value = '42';
+  await fire(role, 'input');
+  await fire(findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(calls[0].data.actions[0].action, 'kick');
+  assert.equal(calls[0].data.dry_run, false);
+  assert.equal(calls[0].data.params.kind, 'honeypot_role');
+  assert.equal(calls[0].data.params.role_id, '42');
+  assert.equal(action.value, 'kick');
+});
+
 test('custom pattern draft save uses dry_run and custom id', () => {
   const h = harness();
   const draft = h.app.buildCustomRuleSaveBody(

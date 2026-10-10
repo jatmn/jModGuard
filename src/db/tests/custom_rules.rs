@@ -202,3 +202,56 @@ async fn apply_control_rejects_live_create_without_row() {
     assert!(err.to_string().contains("dry-run"));
     assert!(get_rule(&f.db, 10, &id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn copy_custom_rules_start_dry_run_respect_cap_and_reject_global() {
+    let f = Fixture::new();
+    let source = write_scope(&f.scope(10).await);
+    let destination = write_scope(&f.scope(20).await);
+    let id = "custom:0123456789abcdef";
+    upsert_enrolled_rule(&f.db, source.clone(), id, &custom_rule(true, "scam"))
+        .await
+        .unwrap();
+    upsert_enrolled_rule(&f.db, source, id, &custom_rule(false, "scam"))
+        .await
+        .unwrap();
+    assert!(!get_rule(&f.db, 10, id).await.unwrap().unwrap().dry_run);
+
+    copy_guild_config(&f.db, 10, 20, vec!["rules".into()])
+        .await
+        .unwrap();
+    assert!(
+        get_rule(&f.db, 20, id).await.unwrap().unwrap().dry_run,
+        "a copied custom rule cannot enforce until an edit clears dry-run"
+    );
+    upsert_enrolled_rule(&f.db, destination, id, &custom_rule(false, "scam"))
+        .await
+        .unwrap();
+    assert!(!get_rule(&f.db, 20, id).await.unwrap().unwrap().dry_run);
+
+    let err = copy_guild_config(&f.db, 10, 0, vec!["rules".into()])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("global"), "{err:#}");
+    assert!(get_rule(&f.db, 0, id).await.unwrap().is_none());
+
+    let json = serde_json::to_string(&custom_rule(true, "scam")).unwrap();
+    f.db.with_conn(move |conn| {
+        use crate::db::SqlExecutor;
+        for n in 0..33 {
+            conn.execute_bounded(
+                "INSERT INTO rules (guild_id, rule_id, data) VALUES (30, ?1, ?2)",
+                crate::db::params![custom_id(n), json.clone()],
+                64 * 1024 * 1024,
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let err = copy_guild_config(&f.db, 30, 20, vec!["rules".into()])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("custom rules"), "{err:#}");
+    assert!(!get_rule(&f.db, 20, id).await.unwrap().unwrap().dry_run);
+}

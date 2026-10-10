@@ -786,10 +786,12 @@ impl EventHandler for Handler {
             if let (Some(guild), Some(member)) = (guild.as_ref(), member.as_ref()) {
                 let level = crate::commands::perm_level(&app, &guild.roles, member);
                 let is_mod = level >= crate::commands::PermLevel::Mod;
-                let perms = crate::commands::guild_permissions(&guild.roles, member);
-                let can_mention = member.user.id.get() == app.cfg.bot.owner_id
-                    || perms.contains(serenity::model::prelude::Permissions::ADMINISTRATOR)
-                    || perms.contains(serenity::model::prelude::Permissions::MENTION_EVERYONE);
+                let can_mention = crate::commands::can_mention_everyone_in(
+                    guild,
+                    msg.channel_id,
+                    member.user.id,
+                    &member.roles,
+                );
                 (is_mod, can_mention)
             } else {
                 (false, false)

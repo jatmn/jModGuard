@@ -60,6 +60,28 @@ pub fn validate_custom_rule_for_write(
     validate_custom_body(id, rule, true)
 }
 
+/// A custom rule introduced at a guild (upsert create or a copy onto a server).
+/// The stored row starts in dry-run; shape, scope, and the dry-run rule are the
+/// same checks as [`validate_custom_rule_for_write`].
+pub fn custom_rule_for_create(guild_id: i64, id: &str, mut rule: RuleDef) -> Result<RuleDef> {
+    rule.dry_run = true;
+    validate_custom_rule_for_write(guild_id, id, &rule, true)?;
+    Ok(rule)
+}
+
+pub fn ensure_room_for_new_custom_rules(existing: usize, adding: usize) -> Result<()> {
+    if adding == 0 {
+        return Ok(());
+    }
+    let total = existing
+        .checked_add(adding)
+        .context("custom rule count overflow")?;
+    if total > MAX_CUSTOM_RULES_PER_GUILD {
+        bail!("at most {MAX_CUSTOM_RULES_PER_GUILD} custom rules per guild");
+    }
+    Ok(())
+}
+
 fn validate_custom_body(_id: &str, rule: &RuleDef, compile_pattern: bool) -> Result<()> {
     let name = rule.name.trim();
     ensure!(!name.is_empty(), "rule name is required");
@@ -251,6 +273,32 @@ pub fn rule_scope_skips(
         return true;
     }
     false
+}
+
+/// Spam admission. Unknown role lists still refuse when the rule has role
+/// skips. A failed moderator lookup is `is_moderator == false`, so moderation
+/// continues instead of treating the member as exempt.
+pub fn spam_scope_admits(
+    rule: &RuleDef,
+    author_id: u64,
+    channel_id: u64,
+    member_roles: Option<&[u64]>,
+    is_moderator: bool,
+) -> bool {
+    if !rule.enabled {
+        return false;
+    }
+    if member_roles.is_none() && !rule.whitelist_roles.is_empty() {
+        return false;
+    }
+    !rule_scope_skips(
+        rule,
+        author_id,
+        channel_id,
+        member_roles.unwrap_or(&[]),
+        is_moderator,
+        true,
+    )
 }
 
 pub fn custom_rule_action(rule: &RuleDef) -> Option<ActionDef> {

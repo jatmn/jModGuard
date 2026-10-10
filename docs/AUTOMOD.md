@@ -81,8 +81,10 @@ own path.
 
 Operators can add up to **32** guild-scoped rules with ids `custom:` plus 8–32
 lowercase hex characters. New rules are stored **dry-run**; a later edit can turn
-them live. Saves go through the bot `UpsertRule` control operation (the API does
-not write the row directly).
+them live. Copying rules onto another server uses that same create check: each
+custom rule arrives in dry-run, the 32-rule cap applies, and custom rules are
+refused for the global scope. Saves go through the bot `UpsertRule` control
+operation (the API does not write the row directly).
 
 Each custom rule has exactly **one** action (`delete`, `warn`, `timeout`, `kick`,
 or `ban` with `delete_days` 0–7). Types:
@@ -94,7 +96,9 @@ or `ban` with `delete_days` 0–7). Types:
 - **channel_content** — `params.links` and/or `params.attachments` (at least one
   true): URL/invite detection or `attachment_count > 0`.
 - **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
-  flag) when the member lacks Mention Everyone.
+  flag) when the member lacks Mention Everyone in that channel, including role
+  and member overwrites and the parent channel of a thread. Owning the bot
+  application is not a permission.
 - **honeypot_role** — `params.role_id`; fires when that role is **added** (default
   action kick). Channel include lists do not apply.
 
@@ -109,6 +113,9 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 `whitelist_users` (user IDs). Matches skip the rule entirely. Optional
 `include_channels` limits a rule to listed channels (empty means all non-skipped
 channels). `skip_moderators` skips members at mod permission level or higher.
+Exact-image and repeated-text rules honor both settings on admission and again
+before enforcement. If the guild cache cannot show whether the author is a
+moderator, the message is still moderated.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 

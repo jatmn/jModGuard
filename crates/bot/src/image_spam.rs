@@ -1014,8 +1014,14 @@ fn capture_attachments_for_match(
     }
     attachments
 }
-fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
-    may_admit(rule, author, channel, Some(roles))
+fn eligible(
+    rule: &crate::types::RuleDef,
+    author: u64,
+    channel: u64,
+    roles: &[u64],
+    is_moderator: bool,
+) -> bool {
+    may_admit(rule, author, channel, Some(roles), is_moderator)
 }
 
 fn may_admit(
@@ -1023,14 +1029,9 @@ fn may_admit(
     author: u64,
     channel: u64,
     roles: Option<&[u64]>,
+    is_moderator: bool,
 ) -> bool {
-    rule.enabled
-        && !rule.whitelist_users.contains(&author)
-        && !rule.whitelist_channels.contains(&channel)
-        && match roles {
-            Some(roles) => !rule.whitelist_roles.iter().any(|r| roles.contains(r)),
-            None => rule.whitelist_roles.is_empty(),
-        }
+    jmodguard::custom_rules::spam_scope_admits(rule, author, channel, roles, is_moderator)
 }
 
 /// Discord may omit image dimensions or the media type. An explicit image media
@@ -1078,7 +1079,15 @@ pub fn observe(
     };
     let Some(member) = &msg.member else { return };
     let roles: Vec<_> = member.roles.iter().map(|r| r.get()).collect();
-    if !eligible(rule, msg.author.id.get(), msg.channel_id.get(), &roles) {
+    let is_moderator =
+        crate::commands::cached_is_moderator(app, ctx, guild, msg.author.id.get(), &roles);
+    if !eligible(
+        rule,
+        msg.author.id.get(),
+        msg.channel_id.get(),
+        &roles,
+        is_moderator,
+    ) {
         return;
     }
     // A replay cannot acquire a new window. Use the Discord create time, clamped
@@ -1196,7 +1205,10 @@ pub(crate) fn observe_update(
         .as_ref()
         .and_then(|m| m.as_ref())
         .map(|m| m.roles.iter().map(|r| r.get()).collect::<Vec<_>>());
-    if !may_admit(rule, author, channel, roles.as_deref()) {
+    let is_moderator = roles
+        .as_deref()
+        .is_some_and(|roles| crate::commands::cached_is_moderator(app, ctx, guild, author, roles));
+    if !may_admit(rule, author, channel, roles.as_deref(), is_moderator) {
         app.image_spam.invalidate(guild_id, channel, message);
         return;
     }
@@ -2266,20 +2278,32 @@ mod tests {
     #[test]
     fn explicit_exemptions_apply_without_implicit_bot_or_moderator_bypass() {
         let mut rule = crate::defaults::default_rules().remove(1);
-        assert!(eligible(&rule, 1, 2, &[3]));
+        assert!(eligible(&rule, 1, 2, &[3], false));
         rule.whitelist_roles.push(3);
-        assert!(!eligible(&rule, 1, 2, &[3]));
-        assert!(eligible(&rule, 1, 2, &[]));
+        assert!(!eligible(&rule, 1, 2, &[3], false));
+        assert!(eligible(&rule, 1, 2, &[], false));
         rule.whitelist_channels.push(2);
-        assert!(!eligible(&rule, 1, 2, &[]));
+        assert!(!eligible(&rule, 1, 2, &[], false));
         rule.whitelist_channels.clear();
         rule.whitelist_users.push(1);
-        assert!(!eligible(&rule, 1, 2, &[]));
-        assert!(!may_admit(&rule, 1, 2, None));
+        assert!(!eligible(&rule, 1, 2, &[], false));
+        assert!(!may_admit(&rule, 1, 2, None, false));
         rule.whitelist_users.clear();
         rule.whitelist_roles.push(9);
-        assert!(!may_admit(&rule, 1, 2, None));
-        assert!(may_admit(&rule, 1, 2, Some(&[])));
+        assert!(!may_admit(&rule, 1, 2, None, false));
+        assert!(may_admit(&rule, 1, 2, Some(&[]), false));
+    }
+
+    #[test]
+    fn skip_moderators_and_include_channels_gate_image_admission() {
+        let mut rule = crate::defaults::default_rules().remove(1);
+        rule.skip_moderators = true;
+        rule.include_channels = vec![10, 11];
+        rule.whitelist_channels = vec![10];
+        assert!(!may_admit(&rule, 1, 11, Some(&[]), true));
+        assert!(may_admit(&rule, 1, 11, Some(&[]), false));
+        assert!(!may_admit(&rule, 1, 10, Some(&[]), false));
+        assert!(!may_admit(&rule, 1, 12, Some(&[]), false));
     }
 
     fn automod_notice(vars: &BTreeMap<String, String>) -> String {

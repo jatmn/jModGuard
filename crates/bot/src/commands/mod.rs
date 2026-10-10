@@ -95,10 +95,30 @@ pub fn perm_level(
     guild_roles: &StdHashMap<serenity::model::id::RoleId, Role>,
     member: &serenity::model::guild::Member,
 ) -> PermLevel {
-    if member.user.id.get() == app.cfg.bot.owner_id {
+    permission_level(
+        app.cfg.bot.owner_id,
+        guild_roles,
+        member.user.id.get(),
+        member.roles.iter().map(|role| role.get()),
+    )
+}
+
+pub fn permission_level(
+    owner_id: u64,
+    guild_roles: &StdHashMap<RoleId, Role>,
+    user_id: u64,
+    role_ids: impl IntoIterator<Item = u64>,
+) -> PermLevel {
+    if user_id == owner_id {
         return PermLevel::Owner;
     }
-    let perms = guild_permissions(guild_roles, member);
+    let mut bits = 0u64;
+    for role_id in role_ids {
+        if let Some(role) = guild_roles.get(&RoleId::new(role_id)) {
+            bits |= role.permissions.bits();
+        }
+    }
+    let perms = Permissions::from_bits_truncate(bits);
     if perms.contains(Permissions::ADMINISTRATOR) || perms.contains(Permissions::MANAGE_GUILD) {
         return PermLevel::Admin;
     }
@@ -112,6 +132,87 @@ pub fn perm_level(
         return PermLevel::Mod;
     }
     PermLevel::Everyone
+}
+
+/// Cache miss is not a moderator. Callers must keep moderating.
+pub fn cached_is_moderator(
+    app: &BotState,
+    ctx: &Context,
+    guild_id: GuildId,
+    user_id: u64,
+    role_ids: &[u64],
+) -> bool {
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return false;
+    };
+    permission_level(
+        app.cfg.bot.owner_id,
+        &guild.roles,
+        user_id,
+        role_ids.iter().copied(),
+    ) >= PermLevel::Mod
+}
+
+/// Mention Everyone in this channel, including overwrites and thread parents.
+///
+/// Application ownership is not a Discord permission. A missing channel or
+/// thread parent returns false so the automod rule still applies.
+pub fn can_mention_everyone_in(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+    user_id: UserId,
+    role_ids: &[RoleId],
+) -> bool {
+    let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
+        return false;
+    };
+    let Some(partial) = partial_member(guild.id, role_ids) else {
+        return false;
+    };
+    let perms = guild.partial_member_permissions_in(channel, user_id, &partial);
+    perms.contains(Permissions::MENTION_EVERYONE)
+}
+
+/// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
+fn partial_member(
+    guild_id: GuildId,
+    role_ids: &[RoleId],
+) -> Option<serenity::model::guild::PartialMember> {
+    let roles: Vec<String> = role_ids.iter().map(|id| id.get().to_string()).collect();
+    serde_json::from_value(serde_json::json!({
+        "deaf": false,
+        "joined_at": null,
+        "mute": false,
+        "nick": null,
+        "roles": roles,
+        "pending": false,
+        "premium_since": null,
+        "guild_id": guild_id.get().to_string(),
+        "user": null,
+        "permissions": null,
+        "unusual_dm_activity_until": null,
+        "avatar": null,
+        "banner": null,
+        "avatar_decoration_data": null,
+    }))
+    .ok()
+}
+
+fn channel_for_member_permissions(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+) -> Option<&serenity::model::channel::GuildChannel> {
+    let channel = guild.channels.get(&channel_id)?;
+    if matches!(
+        channel.kind,
+        serenity::model::channel::ChannelType::PublicThread
+            | serenity::model::channel::ChannelType::PrivateThread
+            | serenity::model::channel::ChannelType::NewsThread
+    ) {
+        let parent_id = channel.parent_id?;
+        return guild.channels.get(&parent_id);
+    }
+    Some(channel)
 }
 
 /// Guild-level permissions from roles (owner bypass included).
@@ -1019,6 +1120,180 @@ mod tests {
         assert_eq!(
             prefix_response_text(&say_cmd(""), &outcome(Some(""), false)),
             None
+        );
+    }
+
+    #[test]
+    fn mention_everyone_uses_channel_overwrites_not_application_ownership() {
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::guild::{Guild, Role};
+        use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+
+        const GUILD: u64 = 100;
+        const OWNER: u64 = 1;
+        const MEMBER: u64 = 2;
+        const APP_OWNER: u64 = 9;
+        const ROLE: u64 = 50;
+        const CHANNEL: u64 = 7;
+        const PARENT: u64 = 8;
+        const THREAD: u64 = 70;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.permissions = perms;
+            role.name = "r".into();
+            role
+        }
+        fn ch(
+            id: u64,
+            kind: ChannelType,
+            parent: Option<u64>,
+            overwrites: Vec<PermissionOverwrite>,
+        ) -> GuildChannel {
+            let mut channel = GuildChannel::default();
+            channel.id = ChannelId::new(id);
+            channel.guild_id = GuildId::new(GUILD);
+            channel.kind = kind;
+            channel.parent_id = parent.map(ChannelId::new);
+            channel.permission_overwrites = overwrites;
+            channel.name = "c".into();
+            channel
+        }
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(OWNER);
+        guild.name = "g".into();
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        guild
+            .roles
+            .insert(RoleId::new(ROLE), role(ROLE, Permissions::empty()));
+        guild.channels.insert(
+            ChannelId::new(CHANNEL),
+            ch(
+                CHANNEL,
+                ChannelType::Text,
+                None,
+                vec![PermissionOverwrite {
+                    allow: Permissions::MENTION_EVERYONE,
+                    deny: Permissions::empty(),
+                    kind: PermissionOverwriteType::Role(RoleId::new(ROLE)),
+                }],
+            ),
+        );
+        assert!(
+            super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(MEMBER),
+                &[RoleId::new(ROLE)],
+            ),
+            "channel-only allow"
+        );
+        assert!(
+            super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(OWNER),
+                &[],
+            ),
+            "guild owner"
+        );
+        assert!(
+            !super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(APP_OWNER),
+                &[],
+            ),
+            "application owner is not a Discord permission"
+        );
+
+        guild
+            .roles
+            .get_mut(&RoleId::new(GUILD))
+            .unwrap()
+            .permissions = Permissions::MENTION_EVERYONE;
+        guild.channels.insert(
+            ChannelId::new(CHANNEL),
+            ch(
+                CHANNEL,
+                ChannelType::Text,
+                None,
+                vec![PermissionOverwrite {
+                    allow: Permissions::empty(),
+                    deny: Permissions::MENTION_EVERYONE,
+                    kind: PermissionOverwriteType::Role(RoleId::new(GUILD)),
+                }],
+            ),
+        );
+        assert!(
+            !super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(MEMBER),
+                &[],
+            ),
+            "channel deny beats the default role"
+        );
+
+        guild.channels.insert(
+            ChannelId::new(CHANNEL),
+            ch(CHANNEL, ChannelType::Text, None, vec![]),
+        );
+        assert!(
+            super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(CHANNEL),
+                UserId::new(MEMBER),
+                &[],
+            ),
+            "default role allow"
+        );
+
+        guild
+            .roles
+            .get_mut(&RoleId::new(GUILD))
+            .unwrap()
+            .permissions = Permissions::empty();
+        guild.channels.insert(
+            ChannelId::new(PARENT),
+            ch(
+                PARENT,
+                ChannelType::Text,
+                None,
+                vec![PermissionOverwrite {
+                    allow: Permissions::MENTION_EVERYONE,
+                    deny: Permissions::empty(),
+                    kind: PermissionOverwriteType::Role(RoleId::new(ROLE)),
+                }],
+            ),
+        );
+        guild.channels.insert(
+            ChannelId::new(THREAD),
+            ch(THREAD, ChannelType::PublicThread, Some(PARENT), vec![]),
+        );
+        assert!(
+            super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(THREAD),
+                UserId::new(MEMBER),
+                &[RoleId::new(ROLE)],
+            ),
+            "thread uses the parent channel"
+        );
+        assert!(
+            !super::can_mention_everyone_in(
+                &guild,
+                ChannelId::new(404),
+                UserId::new(MEMBER),
+                &[RoleId::new(ROLE)],
+            ),
+            "missing channel fails toward moderation"
         );
     }
 

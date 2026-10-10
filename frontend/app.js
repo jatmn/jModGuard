@@ -1792,8 +1792,9 @@ function CustomRuleEditor({ record: r, creating }) {
       h(
         Select,
         {
+          key: `action-${rule.actions?.[0]?.action || "delete"}`,
           className: "select",
-          defaultValue: rule.actions?.[0]?.action || "delete",
+          value: rule.actions?.[0]?.action || "delete",
           onChange: (e) => {
             const action = e.target.value;
             const prev = rule.actions?.[0] || {};
