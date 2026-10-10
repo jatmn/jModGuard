@@ -514,8 +514,8 @@ pub const GATEWAY_BAN_REASON: &str = "Reason unavailable";
 /// How a gateway ban delivery relates to the active mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayBanWrite {
-    /// The bot's own echo. Do not insert a bans row or a manual moderation event.
-    OwnedByBot,
+    /// The bot's echo stored the missing active row. No `member_ban` event.
+    OwnedByBot { row_id: i64 },
     /// An active row is already this ban. Leave its actor and reason unchanged.
     Existing { row_id: i64 },
     /// This delivery inserted the only active row and one `member_ban` event.
@@ -529,8 +529,10 @@ pub enum GatewayBanWrite {
 /// [`BanRecord::Fresh`] replaces that stale active mirror and inserts a new row.
 /// `created_at` stays the timestamp of the insert and is not the dispatch identity. A
 /// different reason replaces the stale active row. An ended row does not block the
-/// insert. `Some` means a row was inserted and the caller may publish. `None` means do
-/// not publish.
+/// insert. An active row that still has no moderator and [`GATEWAY_BAN_REASON`] is the
+/// gateway echo of this same ban; the command fills that row instead of inserting
+/// another. `Some` means a row was inserted or filled and the caller may publish.
+/// `None` means do not publish.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_enrolled_ban_if_absent(
     db: &Db,
@@ -571,7 +573,40 @@ pub async fn record_enrolled_ban_if_absent(
             tx.finish_read()?;
             return Ok(None);
         }
+        let placeholder: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM bans
+                 WHERE guild_id=?1 AND user_id=?2 AND active=1
+                   AND moderator_id IS NULL AND reason IS ?3
+                 ORDER BY id LIMIT 1",
+                params![guild_id, user_id, GATEWAY_BAN_REASON],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
         tx.ensure_mutation_receipt()?;
+        if let Some(row_id) = placeholder {
+            let updated = tx.execute_matching(
+                "UPDATE bans SET moderator_id=?1, moderator_name=?2, reason=?3,
+                    user_name=COALESCE(?4, user_name),
+                    user_display_name=COALESCE(?5, user_display_name),
+                    created_at=?6
+                 WHERE id=?7 AND guild_id=?8 AND user_id=?9 AND active=1 AND moderator_id IS NULL",
+                params![
+                    moderator_id,
+                    moderator_name,
+                    reason,
+                    user_name,
+                    user_display_name,
+                    now,
+                    row_id,
+                    guild_id,
+                    user_id
+                ],
+            )?;
+            anyhow::ensure!(updated == 1, "gateway ban placeholder was no longer active");
+            tx.commit()?;
+            return Ok(Some(row_id));
+        }
         tx.execute_matching(
             "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
             params![guild_id, user_id],
@@ -651,9 +686,10 @@ pub async fn record_enrolled_ban_with_identity(
 
 /// Record a gateway ban without creating a second active row.
 ///
-/// A bot echo writes nothing. A manual delivery inserts one active row and one
-/// `member_ban` event in the same transaction. A later delivery for that same
-/// active ban returns the existing row and does not change its actor or reason.
+/// A bot echo inserts the one active row when none exists, and does not insert a
+/// `member_ban` event. A manual delivery inserts one active row and one
+/// `member_ban` event in the same transaction. A later delivery for an active
+/// ban returns the existing row and does not change its actor or reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_gateway_ban(
     db: &Db,
@@ -664,9 +700,6 @@ pub async fn record_gateway_ban(
     occurred_at: Option<&str>,
     owned_by_bot: bool,
 ) -> Result<GatewayBanWrite> {
-    if owned_by_bot {
-        return Ok(GatewayBanWrite::OwnedByBot);
-    }
     let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
     let reason = GATEWAY_BAN_REASON.to_owned();
     let user_name = user_name.map(str::to_owned);
@@ -683,6 +716,7 @@ pub async fn record_gateway_ban(
             user_display_name,
             reason,
             now,
+            owned_by_bot,
         )
     })
     .await
@@ -698,6 +732,7 @@ fn record_gateway_ban_conn(
     user_display_name: Option<String>,
     reason: String,
     now: String,
+    owned_by_bot: bool,
 ) -> Result<GatewayBanWrite> {
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
@@ -728,6 +763,10 @@ fn record_gateway_ban_conn(
         Err(error) => return Err(error),
     }
     let row_id = tx.last_insert_rowid();
+    if owned_by_bot {
+        tx.commit()?;
+        return Ok(GatewayBanWrite::OwnedByBot { row_id });
+    }
     let data = crate::ids::stringify_js_unsafe_integers(&serde_json::json!({
         "reason": reason,
         "source": "discord",

@@ -92,8 +92,9 @@ Joining, leaving and talking still do not maintain a general activity archive.
   `member_ban` event before the bounded audit lookup. A matching entry adds
   the moderator ID and actual reason to that same row. Without a reliable
   match, that new row says "Reason unavailable"; older rows keep their recorded
-  text. A delivery of a ban the bot already recorded does not insert another
-  row and does not replace that row's actor or reason. Rows without a known
+  text. A bot echo that finds no active row stores that one row and does not
+  add a `member_ban` event. A delivery of a ban the bot already recorded does
+  not insert another row and does not replace that row's actor or reason. Rows without a known
   name or reliable moderator show the ID or unavailable moderator in the WebUI.
 - Role, voice, nickname, username, and thread reports use the same per-event log
   channel and ignore list. They stay off until that event has a channel. They are

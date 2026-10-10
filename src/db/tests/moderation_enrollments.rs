@@ -823,17 +823,26 @@ async fn bot_ban_is_not_recorded_again_when_the_gateway_echo_arrives() {
 async fn gateway_echo_before_the_command_still_leaves_the_bot_row() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let recovered = record_gateway_ban(&f.db, Some(scope.clone()), 55, None, None, None, true)
+        .await
+        .unwrap();
+    let GatewayBanWrite::OwnedByBot { row_id } = recovered else {
+        panic!("a bot echo with no row must store the mirror, got {recovered:?}");
+    };
     assert_eq!(
-        record_gateway_ban(&f.db, Some(scope.clone()), 55, None, None, None, true)
-            .await
-            .unwrap(),
-        GatewayBanWrite::OwnedByBot
-    );
-    assert!(
         list_enrolled_bans(&f.db, scope.clone(), 10)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1
+    );
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), None, 50)
+                .await
+                .unwrap()
+        ),
+        0
     );
     let inserted = record_enrolled_ban_if_absent(
         &f.db,
@@ -849,15 +858,11 @@ async fn gateway_echo_before_the_command_still_leaves_the_bot_row() {
     )
     .await
     .unwrap();
+    assert_eq!(inserted, Some(row_id));
     let echo = record_gateway_ban(&f.db, Some(scope.clone()), 55, None, None, None, false)
         .await
         .unwrap();
-    assert_eq!(
-        echo,
-        GatewayBanWrite::Existing {
-            row_id: inserted.unwrap()
-        }
-    );
+    assert_eq!(echo, GatewayBanWrite::Existing { row_id });
     let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].reason.as_deref(), Some("spam"));
@@ -934,4 +939,129 @@ async fn database_guard_rejects_a_second_active_ban_row() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].active);
     assert_eq!(rows[0].reason.as_deref(), Some(GATEWAY_BAN_REASON));
+}
+
+#[tokio::test]
+async fn uncertain_bot_ban_echo_inserts_one_active_row() {
+    // An uncertain Discord result keeps the bot's suppression and does not
+    // insert from the command. The echo is still the bot's, and it is the
+    // only chance to store the ban Discord already applied.
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let write = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        Some("2024-04-04T00:00:00+00:00"),
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::OwnedByBot { row_id } = write else {
+        panic!("uncertain echo must store the missing row, got {write:?}");
+    };
+    let again = record_gateway_ban(&f.db, Some(scope.clone()), 55, None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(again, GatewayBanWrite::Existing { row_id });
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].active);
+    assert_eq!(rows[0].id, row_id);
+    assert_eq!(rows[0].moderator_id, None);
+    assert_eq!(rows[0].reason.as_deref(), Some(GATEWAY_BAN_REASON));
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), None, 50)
+                .await
+                .unwrap()
+        ),
+        0
+    );
+    assert_eq!(enrolled_guild_stats(&f.db, scope).await.unwrap().bans, 1);
+}
+
+#[tokio::test]
+async fn failed_bot_mirror_echo_inserts_one_active_row() {
+    // Discord accepted the ban, but the command's mirror write did not commit.
+    // The owned echo stores the one active row and does not add a member_ban
+    // event. A later command write fills that same row instead of adding one.
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let write = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::OwnedByBot { row_id } = write else {
+        panic!("echo after a failed mirror must store the row, got {write:?}");
+    };
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), None, 50)
+                .await
+                .unwrap()
+        ),
+        0
+    );
+    let filled = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        Some("bot"),
+        "spam",
+        None,
+        BanRecord::Retry,
+    )
+    .await
+    .unwrap();
+    assert_eq!(filled, Some(row_id));
+    let again = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        Some("bot"),
+        "spam",
+        None,
+        BanRecord::Retry,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, None);
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].active);
+    assert_eq!(rows[0].id, row_id);
+    assert_eq!(rows[0].reason.as_deref(), Some("spam"));
+    assert_eq!(rows[0].moderator_id, Some(9));
+    assert_eq!(rows[0].moderator_name.as_deref(), Some("bot"));
+    assert_eq!(rows[0].user_name.as_deref(), Some("member"));
+    let echo = record_gateway_ban(&f.db, Some(scope.clone()), 55, None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(echo, GatewayBanWrite::Existing { row_id });
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), None, 50)
+                .await
+                .unwrap()
+        ),
+        0
+    );
 }

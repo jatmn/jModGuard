@@ -84,7 +84,7 @@ fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bo
 fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
     match write {
         db::GatewayBanWrite::Recorded { row_id } => Some(row_id),
-        db::GatewayBanWrite::OwnedByBot | db::GatewayBanWrite::Existing { .. } => None,
+        db::GatewayBanWrite::OwnedByBot { .. } | db::GatewayBanWrite::Existing { .. } => None,
     }
 }
 
@@ -432,10 +432,12 @@ impl EventHandler for Handler {
         // A bot echo is not a second ban and not a manual moderation record.
         // Consume the one-shot token before the write, and remember that
         // consumption so a second delivery of the same echo stays owned.
-        // A manual delivery inserts one row and one member_ban event before
-        // the audit wait, so an unban during that wait can mark the row
-        // inactive. A later delivery does not insert and does not replace
-        // the actor or reason already stored.
+        // If Discord applied the ban but the command never stored a row, that
+        // owned echo still inserts the one active row and does not add a
+        // member_ban event. A manual delivery inserts one row and one
+        // member_ban event before the audit wait, so an unban during that
+        // wait can mark the row inactive. A later delivery does not insert
+        // and does not replace the actor or reason already stored.
         let suppressed = app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Ban,
             guild_id.get(),
@@ -1275,7 +1277,7 @@ mod tests {
             None
         );
         assert_eq!(
-            gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::OwnedByBot),
+            gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::OwnedByBot { row_id: 4 }),
             None
         );
     }
