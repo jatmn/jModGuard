@@ -332,6 +332,17 @@ mock_publish_helpers() {
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
   }
 
+  # The browser bundle itself is tested by package-webui-test.mjs. Here prove
+  # publication installs/builds in the selected source worktree before packaging.
+  npm() {
+    printf 'npm %s\n' "$*" >>"$TRACE_FILE"
+    if [[ "$1" == run && "$2" == build ]]; then
+      local context="${4%/tools/webui}"
+      mkdir -p "$context/dist"
+      cp -R "$root/dist/frontend" "$context/dist/frontend"
+    fi
+  }
+
   run_git() {
     printf 'git %s\n' "$*" >>"$TRACE_FILE"
     case "$1" in
@@ -347,7 +358,8 @@ mock_publish_helpers() {
             cp "$root/scripts/bootstrap-container.sh" "$root/scripts/package-webui.mjs" "$4/scripts/"
             cp "$root/crates/updater/src/main.rs" "$4/crates/updater/src/"
             cp "$root/Dockerfile.webui" "$4/"
-            cp -R "$root/frontend" "$4/frontend"
+            mkdir -p "$4/tools/webui"
+            cp "$root/tools/webui/package-lock.json" "$4/tools/webui/"
           elif [[ "$SOURCE_LAYOUT" == legacy ]]; then
             printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-bot\n' >"$4/Dockerfile.bot"
             printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-api\n' >"$4/Dockerfile.api"
@@ -824,6 +836,8 @@ Dockerfile.webui|webui
 scripts/bootstrap-container.sh|bot api
 frontend/style.css|webui
 scripts/package-webui.mjs|webui
+tools/webui/package-lock.json|webui
+tools/webui/build.mjs|webui
 .buildkite/publish-image.sh|bot api webui
 .buildkite/select-checks.sh|
 .buildkite/publish-image-test.sh|

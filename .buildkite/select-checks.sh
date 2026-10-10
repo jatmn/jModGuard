@@ -145,6 +145,10 @@ classify() {
       add fmt; add dylint; add integration; add remote-database; add supply-chain
       return
       ;;
+    tools/webui/*)
+      add frontend; add api; add publish-tests
+      return
+      ;;
     Dockerfile.webui)
       add frontend
       add publish-tests

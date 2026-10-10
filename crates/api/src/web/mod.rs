@@ -890,7 +890,7 @@ fn static_handler(content: &'static str, content_type: &'static str) -> impl Int
 #[cfg(feature = "embed-ui")]
 async fn index() -> impl IntoResponse {
     static_handler(
-        include_str!("../../../../frontend/index.html"),
+        include_str!("../../../../dist/frontend/index.html"),
         "text/html; charset=utf-8",
     )
 }
@@ -898,7 +898,7 @@ async fn index() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn administration_index() -> impl IntoResponse {
     static_handler(
-        include_str!("../../../../frontend/administration/index.html"),
+        include_str!("../../../../dist/frontend/administration/index.html"),
         "text/html; charset=utf-8",
     )
 }
@@ -906,7 +906,7 @@ async fn administration_index() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn administration_js() -> impl IntoResponse {
     static_handler(
-        include_str!("../../../../frontend/administration.js"),
+        include_str!("../../../../dist/frontend/administration.js"),
         "application/javascript; charset=utf-8",
     )
 }
@@ -926,7 +926,7 @@ async fn ready() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn app_js() -> impl IntoResponse {
     static_handler(
-        include_str!("../../../../frontend/app.js"),
+        include_str!("../../../../dist/frontend/app.js"),
         "application/javascript; charset=utf-8",
     )
 }
@@ -934,7 +934,7 @@ async fn app_js() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn style_css() -> impl IntoResponse {
     static_handler(
-        include_str!("../../../../frontend/style.css"),
+        include_str!("../../../../dist/frontend/style.css"),
         "text/css; charset=utf-8",
     )
 }
@@ -2060,7 +2060,13 @@ mod tests {
     #[cfg(feature = "embed-ui")]
     async fn static_pages_serve() {
         let app = test_app();
-        for path in ["/", "/app.js", "/style.css"] {
+        for path in [
+            "/",
+            "/app.js",
+            "/style.css",
+            "/administration/index.html",
+            "/administration.js",
+        ] {
             let res = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())

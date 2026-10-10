@@ -178,7 +178,7 @@ changed_since_publication() {
   )
   if [[ "$component" == "webui" ]]; then
     inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
-      frontend scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
+      frontend tools/webui scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0
@@ -526,6 +526,10 @@ publish_component() {
   fi
   channel="$(channel_for "$mode" "$label" || true)"
   if [[ "$component" == "webui" ]]; then
+    if [[ -f "$context/tools/webui/package-lock.json" ]]; then
+      npm ci --ignore-scripts --prefix "$context/tools/webui"
+      npm run build --prefix "$context/tools/webui"
+    fi
     node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
   fi
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout")

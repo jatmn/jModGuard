@@ -71,11 +71,13 @@ git fetch --tags
 git checkout vX.Y.Z   # or your chosen tag
 
 cargo build --release --locked -p jmodguard-bot
+npm ci --ignore-scripts --prefix tools/webui
+npm run build --prefix tools/webui
 cargo build --release --locked -p jmodguard-api
 ```
 
 Or rebuild/push container images from `Dockerfile.bot` / `Dockerfile.api` at
-that tag. On Bunny, upload `frontend/` from the **same** tag when the page
+that tag. On Bunny, upload built `dist/frontend/` from the **same** tag when the page
 needs the new API; CSS/layout-only files can publish independently. Purge
 the Pull Zone after the upload.
 
@@ -152,7 +154,7 @@ database backup unless a release note says otherwise.
 Both containers ship together in one app update. The bot container migrates,
 and the API container keeps `/health` at 200 and `/ready` at 503 until the
 schema matches. Both must keep using the same Bunny Database. Upload
-matching `frontend/` to Storage and purge the Pull Zone when the page needs
+matching built `dist/frontend/` to Storage and purge the Pull Zone when the page needs
 the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **Override Origin URL** (`OriginUrl`), not OriginMagicContainers.

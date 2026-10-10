@@ -1,0 +1,27 @@
+/* Audited component families; see docs/WEBUI.md before adding a widget. */
+@import "daisyui/theme/light.css" layer(base);
+@import "daisyui/theme/dark.css" layer(base);
+@import "daisyui/base/scrollbar.css";
+@import "daisyui/base/reset.css";
+@import "daisyui/base/rootscrolllock.css";
+@import "daisyui/base/properties.css";
+@import "daisyui/base/rootscrollgutter.css";
+@import "daisyui/base/svg.css";
+@import "daisyui/base/rootcolor.css";
+@import "daisyui/components/checkbox.css";
+@import "daisyui/components/badge.css";
+@import "daisyui/components/input.css";
+@import "daisyui/components/alert.css";
+@import "daisyui/components/toast.css";
+@import "daisyui/components/fieldset.css";
+@import "daisyui/components/textarea.css";
+@import "daisyui/components/navbar.css";
+@import "daisyui/components/stat.css";
+@import "daisyui/components/table.css";
+@import "daisyui/components/modal.css";
+@import "daisyui/components/card.css";
+@import "daisyui/components/select.css";
+@import "daisyui/components/button.css";
+@import "daisyui/components/hero.css";
+@import "daisyui/components/menu.css";
+@import "../../frontend/style.css";

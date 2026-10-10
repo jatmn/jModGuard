@@ -16,87 +16,11 @@ try {
   document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 </script>
-<script>
-window.JMODGUARD_DAISYUI_HREF = window.JMODGUARD_DAISYUI_HREF || "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css";
-window.JMODGUARD_ESM_BASE = window.JMODGUARD_ESM_BASE || "https://esm.sh";
-(function () {
-  const link = document.createElement("link");
-  link.rel = "stylesheet";
-  link.id = "jmodguard-daisyui";
-  link.href = window.JMODGUARD_DAISYUI_HREF;
-  document.head.appendChild(link);
-})();
-</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div id="preview-banner" class="preview-banner alert alert-warning hidden" role="status">Preview — changes disabled</div>
 <a class="skip-link" href="#content">Skip to workspace</a>
-<div id="app">
-  <div id="startup-view" class="hidden welcome-view">
-    <label class="theme-picker">Appearance <select class="theme-select select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
-    <div class="login-card card bg-base-100 shadow-xl">
-      <div class="card-body items-center text-center">
-        <span class="brand-mark" aria-hidden="true">jG</span>
-        <p class="eyebrow">YOUR COMMUNITY, IN GOOD HANDS</p>
-        <h1>Getting things ready.</h1>
-        <p id="startup-status" role="status">Waiting for the API to finish starting…</p>
-        <a id="preview-return-link" class="btn btn-primary hidden" href="/">Return to owner dashboard</a>
-      </div>
-    </div>
-  </div>
-  <div id="login-view" class="hidden welcome-view">
-    <label class="theme-picker">Appearance <select class="theme-select select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
-    <div class="login-card card bg-base-100 shadow-xl">
-      <div class="card-body items-center text-center">
-        <span class="brand-mark" aria-hidden="true">jG</span>
-        <p class="eyebrow">JMODGUARD / MODERATION WORKSPACE</p>
-        <h1>A calmer place<br>to keep order.</h1>
-        <p>Thoughtful protection for your Discord community.<br>Manage your rules, people, and settings in one place.</p>
-        <a id="login-link" class="btn btn-primary" href="/login">Continue with Discord <span aria-hidden="true">↗</span></a>
-        <small>For server managers and community builders.</small>
-      </div>
-    </div>
-  </div>
-  <div id="main-view" class="hidden">
-    <aside class="sidebar">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>MODERATION WORKSPACE</small></span></div>
-      <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select" class="searchable select select-bordered select-sm w-full"></select></div>
-      <nav aria-label="Workspace navigation">
-      <ul id="tabs" class="menu w-full">
-        <li class="nav-label menu-title">Workspace</li>
-        <li><button data-tab="dashboard" class="active menu-active"><span aria-hidden="true">◈</span> Dashboard</button></li>
-        <li><button data-tab="rules"><span aria-hidden="true">◇</span> Automod Rules</button></li>
-        <li><button data-tab="badwords"><span aria-hidden="true">⊘</span> Badwords</button></li>
-        <li><button data-tab="commands"><span aria-hidden="true">⌘</span> Commands</button></li>
-        <li><button data-tab="templates"><span aria-hidden="true">≡</span> Templates</button></li>
-        <li><button data-tab="logchannels"><span aria-hidden="true">#</span> Log Channels</button></li>
-        <li class="nav-label menu-title">Community</li>
-        <li><button data-tab="events"><span aria-hidden="true">≋</span> Audit Log</button></li>
-        <li><button data-tab="members"><span aria-hidden="true">♙</span> Members</button></li>
-        <li><button data-tab="bans"><span aria-hidden="true">⊖</span> Bans</button></li>
-        <li><button data-tab="actions"><span aria-hidden="true">↻</span> Bot actions</button></li>
-        <li><button data-tab="cases"><span aria-hidden="true">▣</span> Cases</button></li>
-        <li><button data-tab="settings"><span aria-hidden="true">⚙</span> Settings</button></li>
-      </ul>
-      </nav>
-      <div id="owner-tools" class="owner-tools hidden"></div>
-      <div class="sidebar-footer">
-        <label class="theme-picker">Appearance <select class="theme-select select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
-        <div class="sidebar-user"><span id="user-chip"></span><button id="logout-btn" class="btn btn-sm btn-ghost">Sign out</button></div>
-      </div>
-    </aside>
-    <div class="workspace">
-      <header class="navbar bg-base-100 workspace-header">
-        <div class="workspace-title"><span class="eyebrow">SERVER WORKSPACE</span><strong id="workspace-name">Your servers</strong></div>
-        <span id="workspace-status">Changes saved with each action</span>
-      </header>
-      <main id="content" tabindex="-1"></main>
-      <footer class="workspace-footer">jModGuard <span>Built for better communities.</span></footer>
-    </div>
-  </div>
-</div>
-<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="app"></div>
 <script src="/app.js"></script>
 </body>
 </html>

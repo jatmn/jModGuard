@@ -15,50 +15,11 @@ try {
   document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 </script>
-<script>
-window.JMODGUARD_DAISYUI_HREF = window.JMODGUARD_DAISYUI_HREF || "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css";
-(function () {
-  const link = document.createElement("link");
-  link.rel = "stylesheet";
-  link.id = "jmodguard-daisyui";
-  link.href = window.JMODGUARD_DAISYUI_HREF;
-  document.head.appendChild(link);
-})();
-</script>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body class="administration-page">
   <a class="skip-link" href="#content">Skip to updates</a>
   <main id="content" class="administration-content" tabindex="-1">
-    <header class="administration-header">
-      <div><span class="eyebrow">OWNER ADMINISTRATION</span><h1 id="admin-title">Updates</h1></div>
-      <div class="administration-tools">
-        <button id="refresh-status" type="button" class="btn btn-sm">↻ Refresh status</button>
-        <label class="theme-picker">Appearance <select id="appearance" class="select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
-        <a class="btn btn-sm" href="/">← Back to workspace</a>
-      </div>
-    </header>
-    <p id="update-status" class="administration-notice" role="status" aria-live="polite">Checking your access and release state…</p>
-    <div id="sign-in" class="hidden"><a id="sign-in-link" class="btn btn-primary" href="/login?return_to=%2Fadministration%2Findex.html">Sign in with Discord</a></div>
-    <nav class="administration-nav" aria-label="Administration pages">
-      <button id="show-updates" class="btn btn-sm" type="button" aria-current="page">Updates</button>
-      <button id="show-database-usage" class="btn btn-sm" type="button">Database Usage</button>
-    </nav>
-    <div id="updates" class="hidden">
-      <div class="administration-overview">
-        <div><h2>Component updates</h2><p class="muted">Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly.</p></div>
-      </div>
-      <p id="automatic-state" class="muted"></p>
-      <div id="browser-version" class="administration-browser"></div>
-      <div id="update-cards" class="administration-grid"></div>
-    </div>
-    <section id="database-usage" class="hidden" aria-labelledby="database-usage-title">
-      <h2 id="database-usage-title">Database Usage</h2>
-      <p>Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable.</p>
-      <p id="usage-status" class="administration-notice" role="status">Waiting to load usage…</p>
-      <button id="refresh-usage" class="btn btn-sm" type="button">Refresh usage</button>
-      <div id="usage-cards" class="administration-grid"></div>
-    </section>
   </main>
   <script src="/administration.js"></script>
 </body>

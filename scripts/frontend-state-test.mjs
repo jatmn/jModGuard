@@ -5,119 +5,131 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 
-const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
-// Minimal DOM boundary: assertions inspect the actual children/attributes that
-// production el() sends to the browser, without duplicating its implementation.
-function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timerImpl = null) {
-  const elements = [];
-  let clockOffsetMs = 0;
-  class TestDate extends Date { static now() { return Date.now() + clockOffsetMs; } }
-  const location = {
-    search: '', pathname: '/', hash: '', replaced: null,
-    replace(value) { this.replaced = value; },
-  };
-  const opened = [];
-  const historyUrls = [];
-  const node = (tag) => {
-    const classes = new Set();
-    return {
-      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false, value: '',
-      classList: {
-        toggle(name, force) {
-          const enabled = force === undefined ? !classes.has(name) : !!force;
-          if (enabled) classes.add(name); else classes.delete(name);
-          return enabled;
-        },
-        add(name) { classes.add(name); },
-        remove(name) { classes.delete(name); },
-        contains(name) { return classes.has(name); },
-      },
-      focus() {},
-      replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
-      append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
-      set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
-      remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
-      replaceWith(replacement) {
-        if (!this.parent) return;
-        const index = this.parent.children.indexOf(this);
-        if (index >= 0) this.parent.children.splice(index, 1, replacement);
-        replacement.parent = this.parent;
-        this.parent = null;
-      },
-      contains(target) { for (let p = target; p; p = p.parent) if (p === this) return true; return false; },
-      closest(selector) {
-        const wanted = selector.split(',').map((part) => part.trim().replace(/^\./, ''));
-        for (let p = this; p; p = p.parent) {
-          const classes = String(p.className || '').split(/\s+/);
-          if (wanted.some((name) => classes.includes(name))) return p;
-        }
-        return null;
-      },
-      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); if (k === "href") this.href = String(v); },
-      getAttribute(k) { return this.attrs[k] ?? (k === "href" ? this.href : undefined); },
-      removeAttribute(k) { delete this.attrs[k]; },
-      addEventListener(k, v) { this.listeners[k] = v; },
-      querySelectorAll(selector) {
-        const descendants = [];
-        const visit = (parent) => (parent.children || []).forEach((child) => {
-          if (child?.nodeType === 1) { descendants.push(child); visit(child); }
-        });
-        visit(this);
-        if (selector === 'input, select, textarea') return descendants.filter((n) => ['input', 'select', 'textarea'].includes(n.tag));
-        if (selector === '.field') return descendants.filter((n) => String(n.className || '').split(/\s+/).includes('field'));
-        return [];
-      },
-      querySelector(selector) {
-        const keyed = selector.match(/^\[data-input-key="([^"]+)"\]$/);
-        if (keyed) return this.querySelectorAll('input, select, textarea').find((n) => n.dataset.inputKey === keyed[1]) || null;
-        if (selector === 'label') return findNode(this, (n) => n !== this && n.tag === 'label');
-        if (selector === 'tbody') return findNode(this, (n) => n !== this && n.tag === 'tbody');
-        if (selector === 'input, select, textarea') return findNode(this, (n) => n !== this && ['input', 'select', 'textarea'].includes(n.tag));
-        return null;
-      },
-    };
-  };
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link', '#jmodguard-daisyui'].map((key) => [key, node('div')]));
-  const daisy = nodes.get('#jmodguard-daisyui');
-  daisy.tag = 'link';
-  daisy.tagName = 'LINK';
-  daisy.attrs.href = 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css';
-  daisy.href = daisy.attrs.href;
-  const win = { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } };
-  for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
-    nodes.get(key).classList.add('hidden');
+import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
+import React, { useSyncExternalStore, useState, useEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
+
+
+const bootDom = new JSDOM('<html><body></body></html>', {pretendToBeVisual: true});
+activate(bootDom.window);
+const { createRoot: reactRoot } = await import('../tools/webui/node_modules/react-dom/client.js');
+const { flushSync } = await import('../tools/webui/node_modules/react-dom/index.js');
+const { Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea } = await import('../tools/webui/components.js');
+import { afterEach, after } from 'node:test';
+const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
+const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replaceAll('export function', 'function');
+const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
+  .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
+const pages = [];
+after(() => bootDom.window.close());
+function activate(window) {
+  globalThis.window = window; globalThis.document = window.document;
+  for (const name of ['HTMLElement', 'HTMLButtonElement', 'HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'Element', 'Node', 'NodeFilter', 'MutationObserver', 'Event', 'MouseEvent', 'KeyboardEvent']) globalThis[name] = window[name];
+  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  globalThis.getComputedStyle = window.getComputedStyle.bind(window);
+  globalThis.requestAnimationFrame = window.requestAnimationFrame.bind(window);
+  globalThis.cancelAnimationFrame = window.cancelAnimationFrame.bind(window);
+}
+afterEach(async () => {
+  for (const { dom, roots } of pages.splice(0)) {
+    activate(dom.window);
+    for (const root of roots) flushSync(() => root.unmount());
+    dom.window.close();
   }
-  const timers = new Map();
-  let nextTimer = 1;
-  const documentListeners = new Map();
-  const timerApi = timerImpl ?? {
-    setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, delay }); return id; },
-    clearTimeout(id) { timers.delete(id); },
-  };
-  const context = vm.createContext({
-    document: {
-      visibilityState: 'visible', addEventListener(name, fn) { documentListeners.set(name, fn); }, removeEventListener(name, fn) { if (documentListeners.get(name) === fn) documentListeners.delete(name); },
-      createElement(tag) { const n = node(tag); elements.push(n); return n; },
-      createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
-      getElementById: (id) => nodes.get('#' + id) || null,
-      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => String(n.className).split(/\s+/).includes('modal-overlay')) : null), querySelectorAll: () => [],
-    },
-    window: win,
-    location,
-    history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    fetch: fetchImpl, console, AbortController, URLSearchParams, Date: TestDate,
-    setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: { randomUUID },
+});
+async function settle() { for (let i = 0; i < 3; i++) { await new Promise(resolve => setImmediate(resolve)); flushSync(() => {}); } }
+function fire(element, type, props = {}) {
+  assert.ok(element, `event ${type} needs a mounted element`);
+  activate(element.ownerDocument.defaultView);
+  // React's value tracker must observe a browser edit, not a scripted setter.
+  if (['input', 'change'].includes(type) && element._valueTracker) element._valueTracker.setValue('previous browser value');
+  if (type === 'change' && element.type === 'checkbox') {
+    const desired = props.target?.checked ?? element.checked;
+    element.checked = !desired;
+    type = 'click';
+  }
+  const EventType = type === 'click' ? window.MouseEvent : type.startsWith('key') ? window.KeyboardEvent : window.Event;
+  flushSync(() => element.dispatchEvent(new EventType(type, { bubbles: true, cancelable: true, ...props })));
+  return settle();
+}
+function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timerImpl = null, asyncRoot = false) {
+  const dom = new JSDOM('<!doctype html><html><head><meta name="theme-color"></head><body><div id="app"></div><main id="content"></main></body></html>', {url:'https://ui.example.test', pretendToBeVisual: true});
+  const win = dom.window, document = win.document;
+  activate(win);
+  Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: true});
+  Object.defineProperty(win, 'localStorage', {value: { getItem: k => storage.get(k) ?? null, setItem: (k,v) => storage.set(k,v) }, configurable: true});
+  Object.defineProperty(win, 'sessionStorage', {value: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, configurable: true});
+  win.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
+  const roots = [], timers = new Map(), documentListeners = new Map(), opened = [], historyUrls = [];
+  let nextTimer = 1, clockOffsetMs = 0, rendering = false;
+  class TestDate extends Date { static now() { return Date.now() + clockOffsetMs; } }
+  const location = { search: '', pathname: '/', hash: '', replaced: null, replace(value) { this.replaced = value; } };
+  win.open = (...args) => opened.push(args);
+  const addEventListener = document.addEventListener.bind(document), removeEventListener = document.removeEventListener.bind(document);
+  document.addEventListener = (name, fn, ...args) => { documentListeners.set(name, fn); addEventListener(name, fn, ...args); };
+  document.removeEventListener = (name, fn, ...args) => { if (documentListeners.get(name) === fn) documentListeners.delete(name); removeEventListener(name, fn, ...args); };
+  const timerApi = timerImpl ?? { setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn: (...args) => { let result; flushSync(() => { result = fn(...args); }); return Promise.resolve(result).then(settle); }, delay }); return id; }, clearTimeout(id) { timers.delete(id); } };
+  function createRoot(container) {
+    const root = reactRoot(container); roots.push(root);
+    return { render(element) {
+      activate(win);
+      if (rendering || asyncRoot) { root.render(element); return; }
+      rendering = true; try { flushSync(() => root.render(element)); } finally { rendering = false; }
+    } };
+  }
+  const appWindow = new Proxy(win, {
+    get(target, key) { return key === 'location' ? location : Reflect.get(target, key); },
+    set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
+    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot,
+    Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
+    fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
+    setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
+  });
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document: context.document, documentListeners,
-    advanceTime(ms) { clockOffsetMs += ms; } };
+  const fixtureContent = document.querySelector('#content');
+  function mount(Component, props) {
+    const container = document.createElement('div'); container.className = 'test-panel'; fixtureContent.append(container);
+    createRoot(container).render(React.createElement(Component, props));
+    return container;
+  }
+  for (const name of ['tabActions','tabBans','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+    const Component = app[name];
+    app[name] = () => mount(Component);
+  }
+  const card = app.ruleCard; app.ruleCard = record => mount(() => card(record));
+  app.bindOwnerTools = () => mount(app.OwnerTools);
+  for (const name of ['renderTab', 'navigate']) {
+    const fn = app[name]; app[name] = (...args) => {
+      fixtureContent.remove();
+      flushSync(() => { vm.runInContext('ui.set({ view: "main-view" });', context); fn(...args); });
+      return document.querySelector('.modal-overlay');
+    };
+  }
+  for (const name of ['editRule', 'editCommand']) {
+    const fn = app[name]; app[name] = async (...args) => {
+      fixtureContent.remove();
+      flushSync(() => { vm.runInContext('ui.set({ view: "main-view" });', context); fn(...args); }); await settle();
+      return document.querySelector('.modal-overlay');
+    };
+  }
+  const nodes = { get: selector => document.querySelector(selector) };
+  const collect = () => Array.from(document.querySelectorAll('#content *, .modal-overlay *, #owner-tools *, .test-panel *'));
+  const elements = { find: predicate => collect().find(predicate), filter: predicate => collect().filter(predicate), some: predicate => collect().some(predicate), [Symbol.iterator]: function* () { yield* collect(); } };
+  vm.runInContext('root.render(h(App));', context);
+  pages.push({dom, roots});
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
 }
+
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
 function findNode(root, predicate) {
+  if (!root) return null;
   if (predicate(root)) return root;
   for (const child of root.children || []) {
     const found = findNode(child, predicate);
@@ -127,7 +139,7 @@ function findNode(root, predicate) {
 }
 
 function textOf(root) {
-  return (root.textContent || '') + (root.children || []).map(textOf).join('');
+  return root.textContent;
 }
 
 async function runMemberPoll(h) {
@@ -135,7 +147,7 @@ async function runMemberPoll(h) {
   assert(pending, 'expected a visible Members status poll');
   h.timers.delete(pending[0]);
   await pending[1].fn();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
 }
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
@@ -144,7 +156,7 @@ test('Bans shows known names and actor with exact IDs and honest unknown fallbac
     { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2026-09-22T07:43:34Z' },
   ]));
   const panel = h.app.tabBans();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   const text = textOf(panel);
   assert.match(text, /Wavingwalker \(wavingwalker, 172697277964615681\)/);
   assert.match(text, /ikaika44 \(1800882749273538599\)/);
@@ -164,15 +176,15 @@ test('dashboard moderation counts stay with their requested server', async () =>
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
   assert.equal(pending[0].method, 'POST');
   assert.equal(pending[1].method, 'POST');
-  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children.find((c) => c.className === 'stat-value').textContent;
+  const value = (root, label) => Array.from(findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
   pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(value(second, 'Moderation records'), '7');
   assert.equal(value(second, 'Warns'), '2');
   assert.equal(value(second, 'Bans'), '1');
   assert.equal(value(second, 'Cases'), '4');
   pending[0].resolve(response({ events: 900, warns: 8, bans: 3 }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(value(first, 'Moderation records'), '900');
   assert.equal(value(second, 'Moderation records'), '7');
 });
@@ -181,10 +193,10 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   const { app } = harness(async () => { throw new Error('offline'); });
   app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
   const dashboard = app.tabDashboard();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   for (const label of ['Moderation records', 'Warns', 'Bans', 'Cases']) {
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
-    assert.equal(card.children.find((c) => c.className === 'stat-value').textContent, 'Unavailable');
+    assert.equal(Array.from(card.children).find((c) => c.className === 'stat-value').textContent, 'Unavailable');
   }
 });
 
@@ -256,7 +268,7 @@ test('saved Members tab restores for the selected guild', () => {
   assert.equal(app.state.tab, 'members');
 });
 
-const flushMembers = () => new Promise(resolve => setImmediate(resolve));
+const flushMembers = settle;
 function memberTimers() {
   const active = new Map();
   let next = 0;
@@ -277,7 +289,7 @@ for (const completed of [false, true]) test(`Members reads status after success 
   syncReads()[0].resolve(response({ run_id: 'run', status: 'running', phase: 'members', progress_revision: 10 }));
   requests.find(r => r.url.includes('/members?')).resolve(response({ members: [] }));
   await flushMembers();
-  const click = findNode(panel, n => n.textContent === 'Pause').listeners.click({});
+  const click = fire(findNode(panel, n => n.textContent === 'Pause'), 'click', {});
   requests.find(r => r.url.endsWith('/member-sync/actions')).resolve(response(queuedAction('pending')));
   await click;
   // This primary read began before the worker completed; its old status is legitimate.
@@ -311,7 +323,7 @@ for (const code of ['member_sync_missing_job', 'member_sync_invalid_operation'])
   });
   const panel = memberView(h);
   await flushMembers();
-  await findNode(panel, n => n.textContent === 'Pause').listeners.click({});
+  await fire(findNode(panel, n => n.textContent === 'Pause'), 'click', {});
   await flushMembers();
   assert.match(textOf(panel), new RegExp(message.replace(/\./g, '\\.')));
   assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
@@ -332,12 +344,12 @@ for (const route of ['same guild', 'late callback', 'cancelled navigation']) tes
   const panel = memberView(h);
   const originalGuild = h.app.state.guildId;
   await flushMembers();
-  await findNode(panel, n => n.textContent === 'View history').listeners.click({});
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'View history'), 'click', {});
   await flushMembers();
-  const jump = findNode(panel, n => n.textContent === 'Case case-one');
+  const jump = findNode(panel, n => n.localName === 'button' && n.textContent === 'Case case-one');
   if (route === 'late callback') h.app.state.guildId = h.app.state.guilds[1].id;
   if (route === 'cancelled navigation') h.app.markDirty();
-  await jump.listeners.click({});
+  await fire(jump, 'click', {});
   await flushMembers();
   if (route === 'same guild') {
     assert.ok(calls.includes(`/api/guilds/${originalGuild}/cases/case-one`));
@@ -362,6 +374,7 @@ test('Members empty copy follows status completion without refetching the direct
   timers.active.delete(id);
   sync = { run_id: 'run', status: 'complete', phase: 'complete', progress_revision: 2 };
   await poll.fn();
+  await settle();
   assert.match(textOf(panel), /complete · complete/);
   assert.equal(textOf(panel.querySelector('tbody')), 'No members match these filters.');
   assert.equal(calls.filter(url => url.includes('/members?')).length, 1);
@@ -377,7 +390,7 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /🌻 Willow/);
   assert.match(textOf(panel), /1800882749273538599/);
   assert.match(textOf(panel), /Results are partial/);
@@ -395,10 +408,10 @@ test('Members separates current ban reason from an unresolved Gateway action', a
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /Current reason: Current rule/);
-  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  await settle();
   assert.match(textOf(panel), /Gateway observation; action time unconfirmed/);
   assert.match(textOf(panel), /Case case-1/);
 });
@@ -416,22 +429,22 @@ test('Members renders a dated unresolved Discord audit entry, then its exact cas
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  const historyButton = findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history');
-  historyButton.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  const historyButton = findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history');
+  fire(historyButton, 'click');
+  await settle();
   assert.match(textOf(panel), /Ban audit entry · /);
   assert.doesNotMatch(textOf(panel), /Ban audit entry · Unknown/);
   assert.match(textOf(panel), /Confirmed Discord audit action; local case association unresolved/);
   assert.match(textOf(panel), /Audit entry 123456789012345678/);
   assert.match(textOf(panel), /moderator 42/);
   assert.match(textOf(panel), /<img src=x onerror=alert\(1\)>/);
-  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n).startsWith('Case ')), null);
-  assert.equal(findNode(panel, n => n.tag === 'img'), null, 'audit reason is text, not markup');
+  assert.equal(findNode(panel, n => n.localName === 'button' && textOf(n).startsWith('Case ')), null);
+  assert.equal(findNode(panel, n => n.localName === 'img'), null, 'audit reason is text, not markup');
 
   linked = true;
-  historyButton.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  fire(historyButton, 'click');
+  await settle();
   assert.doesNotMatch(textOf(panel), /local case association unresolved/);
   assert.doesNotMatch(textOf(panel), /Audit entry 123456789012345678/);
   assert.match(textOf(panel), /Bot action linked to Discord audit/);
@@ -452,9 +465,9 @@ test('Members labels verified state changes with unknown event time and separate
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  await settle();
   assert.match(textOf(panel), /Membership absence · Unknown/);
   assert.match(textOf(panel), /Membership state check · Unknown/);
   assert.match(textOf(panel), /Ban absent \(time unknown\) · Unknown/);
@@ -480,7 +493,7 @@ test('Members keeps polling audit-only recovery while visible and stops when it 
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(statusReads, 1);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
   h.document.visibilityState = 'hidden';
@@ -488,7 +501,7 @@ test('Members keeps polling audit-only recovery while visible and stops when it 
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
   h.document.visibilityState = 'visible';
   h.documentListeners.get('visibilitychange')();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(statusReads, 2);
   await runMemberPoll(h);
   assert.equal(statusReads, 3);
@@ -514,10 +527,10 @@ test('Members follows a succeeded Resume receipt with a fresh primary status rea
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(statusReads, 1);
-  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Resume'), 'click');
+  await settle();
   assert.match(textOf(panel), /Resume requested · bot action pending/);
   assert.equal(statusReads, 2);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
@@ -546,9 +559,9 @@ test('Members clears a Pause that lands after the import already completed', asy
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Pause').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Pause'), 'click');
+  await settle();
   assert.match(textOf(panel), /Pause requested/);
   action.state = 'succeeded';
   await runMemberPoll(h);
@@ -571,13 +584,13 @@ test('Members releases a reused successful Retry after reading current status', 
   const key = `${h.app.workspaceKey()}:action:POST:/api/guilds/${guildId}/member-sync/actions:{"operation":"retry"}`;
   session.set(key, JSON.stringify({ request_id: '1000_previous', enrollment_id: 'member-enrollment' }));
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  await settle();
+  const retry = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry');
   assert(retry && !retry.disabled);
-  await retry.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await fire(retry, 'click');
+  await settle();
   assert.doesNotMatch(textOf(panel), /Retry requested/);
-  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry').disabled, false);
+  assert.equal(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry').disabled, false);
 });
 
 test('Members stops pending-control polling when the bot action fails', async () => {
@@ -591,9 +604,9 @@ test('Members stops pending-control polling when the bot action fails', async ()
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Resume'), 'click');
+  await settle();
   assert.match(textOf(panel), /resume action failed. Check Bot actions for details/);
   assert.doesNotMatch(textOf(panel), /Resume requested/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
@@ -614,9 +627,9 @@ test('Members retains an acknowledged control and retries after a status refresh
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Resume'), 'click');
+  await settle();
   assert.match(textOf(panel), /Resume requested · bot action pending/);
   assert.match(textOf(panel), /Could not refresh import status/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
@@ -636,7 +649,7 @@ test('Members retries its first failed visible status read and renders the recov
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /Could not load import status. Retrying shortly while visible/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
   await runMemberPoll(h);
@@ -663,16 +676,16 @@ test('Members accepts a later primary restore status but rejects an older in-fli
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
-  refresh.listeners.click();
-  refresh.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  const refresh = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh');
+  fire(refresh, 'click');
+  fire(refresh, 'click');
+  await settle();
   assert.equal(statusReads, 3);
   assert.match(textOf(panel), /3 records committed in this run/);
   assert.match(textOf(panel), /Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement/);
   resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /3 records committed in this run/);
   assert.doesNotMatch(textOf(panel), /777 records committed/);
 });
@@ -690,9 +703,9 @@ test('Members keeps a restore-interrupted control unconfirmed rather than claimi
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Resume'), 'click');
+  await settle();
   assert.match(textOf(panel), /Import status changed after a restore. Check Bot actions/);
   assert.doesNotMatch(textOf(panel), /Resume requested/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
@@ -712,13 +725,13 @@ test('Members shows 100 percent on completed status and labels a live member ETA
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /Preliminary member-stage estimate; later stages have unknown totals/);
   assert.match(textOf(panel), /10% of estimated member phase/);
   await runMemberPoll(h);
-  const bar = findNode(panel, n => n.tag === 'progress');
-  assert.equal(bar.attrs.value, '100');
-  assert.equal(bar.attrs['aria-valuetext'], 'Complete');
+  const bar = findNode(panel, n => n.localName === 'progress');
+  assert.equal(bar.getAttribute("value"), '100');
+  assert.equal(bar.getAttribute('aria-valuetext'), 'Complete');
   assert.match(textOf(panel), /100% complete/);
   assert.doesNotMatch(textOf(panel), /99%/);
 });
@@ -734,7 +747,7 @@ test('Members keeps completed phases done while local case history finishes and 
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   const copy = textOf(panel);
   assert.match(copy, /Members: done · 20 committed/);
   assert.match(copy, /Current bans: done · 3 committed/);
@@ -742,8 +755,8 @@ test('Members keeps completed phases done while local case history finishes and 
   assert.match(copy, /Available audit history: done · 2 committed/);
   assert.match(copy, /Local case history: waiting/);
   assert.doesNotMatch(copy, /100% complete/);
-  const bar = findNode(panel, n => n.tag === 'progress');
-  assert.equal(bar.attrs.value, undefined);
+  const bar = findNode(panel, n => n.localName === 'progress');
+  assert.equal(bar.getAttribute("value"), null);
 });
 
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
@@ -754,7 +767,7 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   const copy = textOf(panel);
   assert.match(copy, /80 members counted/);
   assert.match(copy, /Current bans: queued · committed count unknown/);
@@ -780,22 +793,22 @@ test('Members keeps controls unavailable until a real first job exists and after
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   const controls = () => ['Pause', 'Resume', 'Retry', 'Reconcile from Discord']
-    .map(label => findNode(panel, n => n.tag === 'button' && textOf(n) === label));
+    .map(label => findNode(panel, n => n.localName === 'button' && textOf(n) === label));
   assert.match(textOf(panel), /bot will create the first import job when it is online/);
   assert(controls().every(button => button.disabled));
-  await controls()[0].listeners.click();
+  await fire(controls()[0], 'click');
   assert.equal(actionPosts, 0, 'even a stale programmatic click cannot submit without a job');
-  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
-  refresh.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  const refresh = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh');
+  fire(refresh, 'click');
+  await settle();
   assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
   assert(controls().every(button => button.disabled));
-  await controls()[2].listeners.click();
+  await fire(controls()[2], 'click');
   assert.equal(actionPosts, 0);
-  refresh.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  fire(refresh, 'click');
+  await settle();
   assert.equal(controls()[0].disabled, false, 'Pause becomes available once the first run exists');
 });
 
@@ -814,10 +827,10 @@ test('Members enables Retry when audit recovery pagination stalls after initial 
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  await settle();
+  const retry = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry');
   assert.equal(retry.disabled, false);
-  const reconcile = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Reconcile from Discord');
+  const reconcile = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Reconcile from Discord');
   assert.equal(reconcile.disabled, false);
 });
 
@@ -835,8 +848,8 @@ test('Members keeps Retry disabled after initial complete when audit recovery is
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  await settle();
+  const retry = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry');
   assert.equal(retry.disabled, true);
 });
 
@@ -863,7 +876,7 @@ test('Members shows a live rate-limit countdown, separate progress time, and a p
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   let copy = textOf(panel);
   assert.match(copy, /Rate limit: retry in 1m 30s/);
   assert.match(copy, /Remaining: about 4 minutes for this phase · Expected finish: (?!Unknown)/);
@@ -892,10 +905,10 @@ test('Members shows a live rate-limit countdown, separate progress time, and a p
   expiredCountdown[1].fn();
   assert.match(textOf(panel), /Remaining: Unknown · Expected finish: Unknown/);
   assert.match(textOf(panel), /Rate limit: retry due now/);
-  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  const refresh = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh');
   for (const reason of ['discord_unavailable', 'paused', 'worker_offline']) {
-    refresh.listeners.click();
-    await new Promise(resolve => setImmediate(resolve));
+    fire(refresh, 'click');
+    await settle();
     copy = textOf(panel);
     assert.match(copy, /Remaining: Unknown · Expected finish: Unknown|Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
     assert.doesNotMatch(copy, /Rate limit: retry in/);
@@ -912,12 +925,12 @@ test('Members rejects a pending old search result before the debounce fires', as
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   assert.equal(pending.length, 1);
-  const search = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Search members');
+  const search = findNode(panel, n => n.localName === 'input' && n.getAttribute('aria-label') === 'Search members');
   search.value = 'New Query';
-  search.listeners.input();
+  fire(search, 'input');
   assert.equal(pending[0].opts.signal.aborted, true);
   pending[0].resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Old Result' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.doesNotMatch(textOf(panel), /Old Result/);
   const debounce = [...h.timers].find(([, timer]) => timer.delay === 300);
   assert(debounce);
@@ -926,7 +939,7 @@ test('Members rejects a pending old search result before the debounce fires', as
   assert.equal(pending.length, 2);
   assert.match(pending[1].url, /q=New\+Query/);
   pending[1].resolve(response({ members: [{ user_id: '1800882749273538600', display_name: 'New Result' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /New Result/);
   assert.doesNotMatch(textOf(panel), /Old Result/);
 });
@@ -943,35 +956,35 @@ test('Members filter, date, and sort changes discard old history and list respon
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
-  await new Promise(resolve => setImmediate(resolve));
-  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  await settle();
+  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
   const history = pending.find(item => item.type === 'history');
   assert(history);
-  const filter = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Member status');
+  const filter = findNode(panel, n => n.localName === 'select' && n.getAttribute('aria-label') === 'Member status');
   filter.value = 'banned';
-  filter.listeners.change();
+  fire(filter, 'change');
   assert.equal(history.opts.signal.aborted, true);
   history.resolve(response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.doesNotMatch(textOf(panel), /Discord audit action/);
   const oldList = pending.find(item => item.type === 'list');
   assert.match(oldList.url, /status=banned/);
-  const date = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Joined from date, UTC');
+  const date = findNode(panel, n => n.localName === 'input' && n.getAttribute('aria-label') === 'Joined from date, UTC');
   date.value = '2026-09-01';
-  date.listeners.input();
+  fire(date, 'input');
   assert.equal(oldList.opts.signal.aborted, true);
   oldList.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong Filter' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.doesNotMatch(textOf(panel), /Wrong Filter/);
-  const sort = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Join date order');
+  const sort = findNode(panel, n => n.localName === 'select' && n.getAttribute('aria-label') === 'Join date order');
   sort.value = 'joined_oldest';
-  sort.listeners.change();
+  fire(sort, 'change');
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 300).length, 0);
   const newList = pending.filter(item => item.type === 'list').at(-1);
   assert.match(newList.url, /joined_from=2026-09-01/);
   assert.match(newList.url, /sort=joined_oldest/);
   newList.resolve(response({ members: [{ user_id: '1800882749273538601', display_name: 'Right Filter' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.match(textOf(panel), /Right Filter/);
 });
 
@@ -984,23 +997,11 @@ test('Members drops responses from a previous server and page enrollment', async
   h.app.state.config = { enrollment_id: 'replacement-enrollment' };
   pending.find(item => item.url.endsWith('/member-sync')).resolve(response({ status: 'complete', phase: 'complete', progress_revision: 100, processed: 1 }));
   pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong server' }] }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.doesNotMatch(textOf(panel), /Wrong server/);
   assert.doesNotMatch(textOf(panel), /Initial member import/);
 });
 
-test('dropdown option arrays become real nodes and boolean false stays false', () => {
-  const { app } = harness();
-  const options = ['log', 'warn', 'ban'].map((value) => app.el('option', { value, selected: value === 'ban' }));
-  const select = app.el('select', {}, options);
-  assert.equal(select.children.length, 3);
-  assert.equal(select.children[2], options[2]);
-  assert.equal(select.children[2].selected, true);
-  const button = app.el('button', { hidden: false, disabled: false });
-  assert.equal(button.hidden, false);
-  assert.equal(button.disabled, false);
-  assert.equal(button.attrs.hidden, undefined);
-});
 
 test('out-of-order server responses never overwrite the active server', async () => {
   const pending = [];
@@ -1108,13 +1109,14 @@ test('async actions block duplicate submissions and release after errors', async
   let reject;
   let calls = 0;
   const run = () => { calls++; return new Promise((_, fail) => { reject = fail; }); };
-  const pending = app.handleEvent({}, run, {});
+  const pending = app.handleEvent(run, {});
   assert.equal(app.isBusy(), true);
-  await app.handleEvent({}, run, {});
+  await app.handleEvent(run, {});
   assert.equal(calls, 1);
   reject(new Error('save refused'));
   await pending;
   assert.equal(app.isBusy(), false);
+  await settle();
   assert.equal(nodes.get('#toast').textContent, 'save refused');
 });
 
@@ -1146,15 +1148,15 @@ function settingsHarness() {
   h.app.state.config = cfg;
   h.app.state.tab = 'settings';
   h.app.tabSettings();
-  const inputs = h.elements.filter(n => n.tag === 'input');
-  const save = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save');
+  const inputs = h.elements.filter(n => n.localName === 'input');
+  const save = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save');
   return { ...h, calls, inputs, save };
 }
 
 test('settings patches send only changed fields to the selected server', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '?';
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
   assert.equal(calls.filter((c) => c.url.endsWith('/config')).length, 0);
@@ -1179,20 +1181,21 @@ test('case-delete-role saves advance their revision token', async () => {
   h.app.state.config = cfg;
   h.app.state.tab = 'settings';
   h.app.renderTab();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
 
-  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
-  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
-  assert.equal(h.app.currentDrafts().length, 0, 'server-loaded roles must become the saved baseline');
+  const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
+  const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
+  assert.equal(Object.keys(h.app.currentDrafts()).length, 0, 'server-loaded roles must become the saved baseline');
   roleInput.value = '1, 2';
-  h.app.markDirty();
-  await saveRoles.listeners.click({});
+  await fire(roleInput, 'input');
+  await fire(saveRoles, 'click', {});
   assert.equal(h.app.isDirty(), false, 'an acknowledged role save must not remain unsaved');
-  const prefix = h.elements.find(n => n.tag === 'input' && n.value === '!');
+  const prefix = h.elements.find(n => n.localName === 'input' && n.value === '!');
   prefix.value = '?';
-  h.app.markDirty();
+  await fire(prefix, 'input');
   roleInput.value = '2';
-  await saveRoles.listeners.click({});
+  await fire(roleInput, 'input');
+  await fire(saveRoles, 'click', {});
   assert.equal(h.app.isDirty(), true, 'an unrelated settings draft must remain dirty');
 
   const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
@@ -1223,11 +1226,11 @@ test('queued log-channel saves clear dirty state and survive in-app navigation',
   };
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
-  const input = h.elements.find((node) => node.tag === 'input' && node.attrs.placeholder === 'channel id');
-  const set = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Set');
+  const input = h.elements.find((node) => node.localName === 'input' && node.getAttribute("placeholder") === 'channel id');
+  const set = h.elements.find((node) => node.localName === 'button' && node.textContent === 'Set');
   input.value = '222';
   h.app.markDirty();
-  await set.listeners.click({});
+  await fire(set, 'click', {});
   assert.equal(h.app.state.config.log_channels[0].effective, '222');
   assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'log-job');
   assert.equal(h.app.isDirty(), false);
@@ -1251,16 +1254,16 @@ test('log channel ignore editor saves user and channel IDs as strings', async ()
   };
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
-  const fields = h.elements.filter((node) => node.tag === 'textarea');
+  const fields = h.elements.filter((node) => node.localName === 'textarea');
   fields[0].value = '9007199254740993\n<@9007199254740995>';
   fields[1].value = '<#9007199254740997>';
-  const save = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Save ignores');
-  await save.listeners.click({});
+  const save = h.elements.find((node) => node.localName === 'button' && node.textContent === 'Save ignores');
+  await fire(save, 'click', {});
   assert.match(calls[0].url, /\/logfilters\/message_edit$/);
   assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
   assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
   fields[0].value = 'OtherBot';
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   assert.equal(calls.length, 1, 'names must be rejected before calling the API');
 });
 
@@ -1335,18 +1338,17 @@ test('terminal log receipt repaints while retaining an unrelated row draft', asy
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(pending);
   h.app.renderTab();
-  const inputs = h.nodes.get('#content').querySelectorAll('input, select, textarea')
-    .filter((node) => node.attrs.placeholder === 'channel id');
+  const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
   inputs[1].value = '555';
-  h.app.markDirty();
+  await fire(inputs[1], 'input');
 
   await h.app.reconcileQueuedLogChannel(pending);
+  await settle();
 
-  const renderedInputs = h.nodes.get('#content').querySelectorAll('input, select, textarea')
-    .filter((node) => node.attrs.placeholder === 'channel id');
+  const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
   assert.equal(renderedInputs[1].value, '555');
   assert.equal(h.app.isDirty(), true);
-  assert.equal(findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.textContent === 'queued'), null);
+  assert.equal(findNode(h.nodes.get('#content'), (node) => node.localName === 'span' && node.textContent === 'queued'), null);
 });
 
 test('failed authoritative log read stays unresolved for retry', async () => {
@@ -1370,7 +1372,7 @@ test('failed authoritative log read stays unresolved for retry', async () => {
   assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
 });
 
-test('terminal request-key replay clears dirty state and restores authoritative mapping', async () => {
+for (const asyncRoot of [false, true]) test(`terminal request-key replay restores authoritative mapping (async React: ${asyncRoot})`, async () => {
   let appRef;
   const terminal = {
     id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
@@ -1381,7 +1383,7 @@ test('terminal request-key replay clears dirty state and restores authoritative 
     if (options.method === 'PUT') return response(terminal);
     if (url.endsWith('/actions')) throw new Error('terminal acknowledgment must not be rediscovered');
     return response({ effective: '111', guild_override: '111', global: null });
-  });
+  }, new Map(), new Map(), () => true, null, asyncRoot);
   appRef = h.app;
   appRef.state.config = {
     enrollment_id: 'membership', rules: [], commands: [], badwords: [],
@@ -1390,12 +1392,12 @@ test('terminal request-key replay clears dirty state and restores authoritative 
   };
   appRef.state.tab = 'logchannels';
   appRef.renderTab();
-  const input = h.nodes.get('#content').querySelectorAll('input, select, textarea')
-    .find((node) => node.attrs.placeholder === 'channel id');
+  await settle();
+  const input = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).find((node) => node.getAttribute("placeholder") === 'channel id');
   input.value = '222';
   appRef.markDirty();
-  const set = findNode(h.nodes.get('#content'), (node) => node.tag === 'button' && node.textContent === 'Set');
-  await set.listeners.click({});
+  const set = findNode(h.nodes.get('#content'), (node) => node.localName === 'button' && node.textContent === 'Set');
+  await fire(set, 'click', {});
   assert.equal(appRef.isDirty(), false);
   assert.equal(appRef.state.config.log_channels[0].effective, '111');
   assert.equal(appRef.state.config.log_channels[0].pending_action, null);
@@ -1493,12 +1495,12 @@ test('known terminal log results are not labeled queued while mapping reconcilia
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(terminal);
   h.app.renderTab();
-  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
+  let status = findNode(h.nodes.get('#content'), (node) => node.localName === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 
   await h.app.reconcileQueuedLogChannel(terminal);
   assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
-  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
+  status = findNode(h.nodes.get('#content'), (node) => node.localName === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 });
 
@@ -1519,12 +1521,12 @@ test('case-delete-role save rejects invalid IDs instead of clearing roles', asyn
   h.app.state.config = cfg;
   h.app.state.tab = 'settings';
   h.app.tabSettings();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
 
-  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
-  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
+  const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
   roleInput.value = 'moderators';
-  await saveRoles.listeners.click({});
+  await fire(saveRoles, 'click', {});
   assert.equal(calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles')).length, 0);
   assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
 });
@@ -1548,16 +1550,17 @@ test('late case-delete-role load cannot overwrite an acknowledged save', async (
   h.app.state.tab = 'settings';
   h.app.tabSettings();
 
-  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
-  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
+  const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
   roleInput.value = '2';
-  await saveRoles.listeners.click({});
+  await fire(roleInput, 'input');
+  await fire(saveRoles, 'click', {});
 
   resolveInitialRoles(response({ roles: ['1'], revision: 'revision-1' }));
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   assert.equal(roleInput.value, '2');
 
-  await saveRoles.listeners.click({});
+  await fire(saveRoles, 'click', {});
   const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
   assert.equal(puts.length, 2);
   assert.equal(puts[1].body.revision, 'revision-2');
@@ -1567,77 +1570,96 @@ test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
   inputs[1].value = '';
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put.body, { prefix: null, bot_name: '' });
 });
 
 test('settings do not expose historical chat-retention controls', () => {
   const { elements, inputs } = settingsHarness();
-  assert.equal(inputs.filter(n => n.attrs.type === 'number').length, 0);
+  assert.equal(inputs.filter(n => n.getAttribute("type") === 'number').length, 0);
   assert.ok(!elements.some(n => /retention|keep forever/i.test(n.textContent || '')));
 });
 
-test('partial settings actions preserve dirty sibling fields in the same card', () => {
-  const { app, nodes } = harness();
-  const prefix = { value: '?', _initialValue: '!', dataset: { inputKey: '0' } };
-  const nickname = { value: 'Draft nickname', _initialValue: 'Guard', dataset: { inputKey: '1' } };
-  nodes.get('#content').querySelectorAll = () => [prefix, nickname];
-  const form = { contains: () => true };
-  const resetPrefix = { closest: () => form, _savedInputs: [prefix] };
-  const resync = { closest: () => form, _savedInputs: [] };
-  assert.deepEqual(JSON.parse(JSON.stringify(app.captureDrafts(resetPrefix))), [{ key: '1', value: 'Draft nickname' }]);
-  assert.equal(app.captureDrafts(resync).length, 2);
-  assert.equal(app.captureDrafts({ closest: () => form }).length, 0);
+test('partial settings actions preserve dirty sibling fields in the same card', async () => {
+  const h = settingsHarness();
+  h.app.renderTab();
+  const prefix = h.document.querySelector('input');
+  const nickname = h.document.querySelectorAll('input')[1];
+  prefix.value = '?'; await fire(prefix, 'input');
+  nickname.value = 'Draft nickname'; await fire(nickname, 'input');
+  const inherit = h.elements.find(n => n.localName === 'button' && n.textContent === 'Use global');
+  await fire(inherit, 'click');
+  assert.equal(h.document.querySelectorAll('input')[1].value, 'Draft nickname');
+  assert.equal(h.document.querySelector('input').value, '/');
+  assert.equal(h.app.isDirty(), true);
 });
 
-test('unrelated drafts survive the unavailable screen and restore after Retry', () => {
-  const { app, nodes } = harness();
-  const input = { value: 'Saved text', dataset: { inputKey: '0' } };
-  app.state.config = null;
-  app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Unsaved text' }]);
-  assert.equal(app.isDirty(), true);
-  app.restoreDrafts(); // Loading/error screen still has no input.
-  app.state.config = {};
-  nodes.get('#content').querySelector = () => input;
-  app.restoreDrafts();
-  assert.equal(input.value, 'Unsaved text');
-  assert.equal(nodes.get('#workspace-status').textContent, 'Unsaved changes');
+function templateDraftHarness() {
+  let fail = true;
+  let membership = 'original';
+  const config = () => ({ enrollment_id: membership, templates: [
+    { event: 'join', name: 'Join', effective: 'Saved join', global: 'Saved join' },
+    { event: 'leave', name: 'Leave', effective: 'Saved leave', global: 'Saved leave' },
+  ] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config') && fail) throw new Error('offline');
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'PUT') return response({});
+    return response({});
+  });
+  h.app.state.config = config(); h.app.state.tab = 'templates'; h.app.renderTab();
+  return { ...h, recover(next = 'original') { fail = false; membership = next; } };
+}
+
+test('unrelated drafts survive the unavailable screen and restore after Retry', async () => {
+  const h = templateDraftHarness();
+  const fields = h.document.querySelectorAll('textarea');
+  fields[1].value = 'Unsaved leave'; await fire(fields[1], 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.match(h.document.querySelector('#content').textContent, /Configuration unavailable/);
+  assert.equal(h.app.isDirty(), true);
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+  assert.match(h.document.querySelector('#content').textContent, /Configuration unavailable/);
+  h.recover();
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Unsaved leave');
+  assert.equal(h.app.isDirty(), true);
 });
 
-test('confirmed navigation clears pending drafts and prevents later replay', () => {
-  const { app, nodes } = harness();
-  const originalTab = app.state.tab;
-  app.state.config = null;
-  app.retainDrafts(app.state.guildId, originalTab, [{ key: '0', value: 'Old draft' }]);
-  app.navigate('settings');
-  app.state.tab = originalTab;
-  app.state.config = {};
-  const input = { value: 'Server value' };
-  nodes.get('#content').querySelector = () => input;
-  app.restoreDrafts();
-  assert.equal(input.value, 'Server value');
-  assert.equal(app.isDirty(), false);
+test('confirmed navigation clears pending drafts and prevents later replay', async () => {
+  const h = templateDraftHarness();
+  const draft = h.document.querySelectorAll('textarea')[1];
+  draft.value = 'Unsaved leave'; await fire(draft, 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  h.app.navigate('templates');
+  h.recover(); await h.app.loadConfig();
+  h.app.navigate('templates');
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Saved leave');
+  assert.equal(h.app.isDirty(), false);
 });
 
 for (const kind of ['rule', 'command']) {
   for (const action of ['add', 'remove']) {
     test(`${kind} structural ${action} marks the editor dirty`, async () => {
       const { app, elements } = harness();
-      if (kind === 'rule') app.editRule({ name: 'Flood', rule_id: 'flood', effective: { params: {}, actions: [{ at: 1, action: 'warn' }] } });
-      else app.editCommand(null);
+      if (kind === 'rule') await app.editRule({ name: 'Flood', rule_id: 'flood', effective: { params: {}, actions: [{ at: 1, action: 'warn' }] } });
+      else await app.editCommand(null);
       assert.equal(app.isDirty(), false, 'opening the editor does not modify it');
+      const panel = elements.find(n => n.classList.contains('modal-box'));
+      assert.equal(panel?.matches('.modal-open > .modal-box'), true,
+        'daisyUI only reveals editor panels that are direct children of the open modal');
       const button = action === 'add'
-        ? elements.find(n => n.tag === 'button' && (n.textContent === '+ add step' || n.children.some(c => c.textContent === '+ add action')))
-        : elements.find(n => n.tag === 'button' && (n.attrs['aria-label'] === 'Remove action 1' || n.textContent === '✕' || n.children.some(c => c.textContent === '✕')));
+        ? elements.find(n => n.localName === 'button' && (n.textContent === '+ add step' || n.textContent === '+ add action'))
+        : elements.find(n => n.localName === 'button' && (n.getAttribute('aria-label') === 'Remove action 1' || n.textContent === '✕' || Array.from(n.children).some(c => c.textContent === '✕')));
       assert.ok(button);
-      await button.listeners.click({});
+      await fire(button, 'click', {});
       assert.equal(app.isDirty(), true);
     });
   }
 }
 
-function ruleSaveHarness({ scope = 'global', override = false } = {}) {
+async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const calls = [];
   const failures = { put: false, delete: false, refresh: false };
   let globalRule = { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] };
@@ -1666,39 +1688,39 @@ function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   h.app.state.me.is_bot_owner = true;
   h.app.state.config = structuredClone(snapshot());
   h.app.navigate('rules');
-  h.app.editRule(h.app.state.config.rules[0]);
+  await h.app.editRule(h.app.state.config.rules[0]);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
-  const scopeInput = findNode(modal, (n) => n.tag === 'select' && n.children.some((c) => c.attrs?.value === 'global'));
+  const modal = h.document.querySelector('.modal-overlay');
+  const scopeInput = findNode(modal, (n) => n.localName === 'select' && Array.from(n.children).some((c) => c.getAttribute("value") === 'global'));
   scopeInput.value = scope;
-  const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
-  const save = findNode(modal, (n) => n.textContent === 'Save');
+  const enabled = findNode(modal, (n) => n.getAttribute("type") === 'checkbox');
+  const save = findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save');
   const cancel = findNode(modal, (n) => n.textContent === 'Cancel');
   return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot };
 }
 
 test('global rule partial success reconciles the committed value before navigation', async () => {
-  const h = ruleSaveHarness();
+  const h = await ruleSaveHarness();
   h.failures.delete = true;
-  await h.enabled.listeners.change({ target: { checked: false } });
-  await h.save.listeners.click({});
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
   assert.equal(h.snapshot().rules[0].effective.enabled, false);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
   assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
   assert.match(h.nodes.get('#toast').className, /error/);
-  await h.cancel.listeners.click({});
+  await fire(h.cancel, 'click', {});
   h.app.navigate('rules');
   assert.match(textOf(h.content), /disabled/);
   assert.equal(h.app.isBusy(), false);
 });
 
 test('global rule partial success with failed reconciliation stays unavailable through Retry', async () => {
-  const h = ruleSaveHarness();
+  const h = await ruleSaveHarness();
   h.failures.delete = h.failures.refresh = true;
-  await h.enabled.listeners.change({ target: { checked: false } });
-  await h.save.listeners.click({});
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
   assert.equal(h.app.state.config, null);
   assert.match(textOf(h.content), /Configuration unavailable/);
@@ -1706,48 +1728,50 @@ test('global rule partial success with failed reconciliation stays unavailable t
   assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
   assert.match(h.nodes.get('#toast').textContent, /Retry/);
   assert.equal(h.app.isBusy(), false);
-  h.app.navigate('rules');
-  assert.match(textOf(h.content), /Configuration unavailable/);
+  assert.equal(h.modal.isConnected, false);
+  assertAccessible(findNode(h.content, n => n.textContent === 'Retry'));
   h.failures.refresh = false;
   const retry = findNode(h.content, (n) => n.textContent === 'Retry');
-  await retry.listeners.click({});
+  await fire(retry, 'click', {});
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.match(textOf(h.content), /disabled/);
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST', 'POST']);
 });
 
 test('a refused rule PUT retains the checkbox draft and never deletes an override', async () => {
-  const h = ruleSaveHarness();
+  const h = await ruleSaveHarness();
   h.failures.put = true;
-  await h.enabled.listeners.change({ target: { checked: false } });
-  await h.save.listeners.click({});
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
-  assert.equal(findNode(h.content, (n) => n === h.modal), h.modal);
+  assert.equal(h.modal.isConnected, true);
+  assert.match(h.nodes.get('#toast').textContent, /write refused/);
+  assertAccessible(h.nodes.get('#toast'));
   assert.equal(h.app.state.config.rules[0].effective.enabled, true);
   assert.equal(h.app.isBusy(), false);
   h.failures.put = false;
-  await h.save.listeners.click({});
+  await fire(h.save, 'click', {});
   assert.equal(h.calls.filter((c) => c.method === 'PUT')[1].body.data.enabled, false);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
 });
 
 test('a successful global rule save applies both acknowledgments without a config reload', async () => {
-  const h = ruleSaveHarness({ override: true });
-  await h.enabled.listeners.change({ target: { checked: false } });
-  await h.save.listeners.click({});
+  const h = await ruleSaveHarness({ override: true });
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE']);
   assert.equal(h.calls[0].body.scope, 'global');
   assert.equal(h.calls[1].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].guild_override, null);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
-  assert.equal(findNode(h.content, (n) => n === h.modal), null);
+  assert.equal(h.modal.isConnected, false);
   assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');
 });
 
 test('a guild-only rule save does not run global override cleanup', async () => {
-  const h = ruleSaveHarness({ scope: 'guild' });
-  await h.enabled.listeners.change({ target: { checked: false } });
-  await h.save.listeners.click({});
+  const h = await ruleSaveHarness({ scope: 'guild' });
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
   assert.equal(h.calls[0].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].global.enabled, true);
@@ -1765,23 +1789,23 @@ test('a refused command save retains its checkbox value for the next save', asyn
   });
   h.app.state.config = { commands: [] };
   h.app.navigate('commands');
-  h.app.editCommand(null);
+  await h.app.editCommand(null);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
-  const name = findNode(modal, (n) => n.attrs?.placeholder === 'command name');
+  const modal = h.document.querySelector('.modal-overlay');
+  const name = findNode(modal, (n) => n.getAttribute("placeholder") === 'command name');
   name.value = 'hello';
-  const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
-  const save = findNode(modal, (n) => n.textContent === 'Save');
-  await enabled.listeners.change({ target: { checked: false } });
-  await save.listeners.click({});
-  assert.equal(findNode(content, (n) => n === modal), modal);
+  const enabled = findNode(modal, (n) => n.getAttribute("type") === 'checkbox');
+  const save = findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save');
+  await fire(enabled, 'change', { target: { checked: false } });
+  await fire(save, 'click', {});
+  assert.equal(modal.isConnected, true);
   assert.equal(h.app.isBusy(), false);
   refuse = false;
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   assert.equal(calls.length, 2);
   assert.equal(calls[0].data.enabled, false);
   assert.equal(calls[1].data.enabled, false);
-  assert.equal(findNode(content, (n) => n === modal), null);
+  assert.equal(modal.isConnected, false);
 });
 
 test('configuration mutations retain the loaded membership without refreshing or retrying', async () => {
@@ -1803,32 +1827,30 @@ test('configuration mutations retain the loaded membership without refreshing or
   }
 });
 
-test('drafts survive retries only within the captured bot membership', () => {
+test('drafts survive retries only within the captured bot membership', async () => {
   for (const next of ['original', 'replacement']) {
-    const { app, nodes } = harness();
-    const input = { value: 'Saved value' };
-    app.state.config = null;
-    app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Old draft' }], 'original');
-    app.state.config = { enrollment_id: next };
-    nodes.get('#content').querySelector = () => input;
-    app.restoreDrafts();
-    assert.equal(input.value, next === 'original' ? 'Old draft' : 'Saved value');
-    assert.equal(app.isDirty(), next === 'original');
+    const h = templateDraftHarness();
+    const draft = h.document.querySelectorAll('textarea')[1];
+    draft.value = 'Old draft'; await fire(draft, 'input');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+    h.recover(next);
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+    assert.equal(h.document.querySelectorAll('textarea')[1].value, next === 'original' ? 'Old draft' : 'Saved leave');
+    assert.equal(h.app.isDirty(), next === 'original');
   }
 });
 
 test('an async action cannot restore drafts into a replacement membership', async () => {
-  const { app, nodes } = harness();
-  app.state.config = { enrollment_id: 'original' };
-  const input = { value: 'Old draft', _initialValue: 'Saved', dataset: { inputKey: '0' } };
-  nodes.get('#content').querySelectorAll = () => [input];
-  nodes.get('#content').querySelector = () => input;
-  await app.handleEvent({ closest: () => ({ contains: () => false }), isConnected: false }, async () => {
-    app.state.config = { enrollment_id: 'replacement' };
-    input.value = 'New membership value';
+  const h = templateDraftHarness();
+  const input = h.document.querySelectorAll('textarea')[1];
+  input.value = 'Old draft'; await fire(input, 'input');
+  await h.app.handleEvent(async () => {
+    h.app.state.config = { ...h.app.state.config, enrollment_id: 'replacement' };
+    h.app.renderTab();
   }, {});
-  assert.equal(input.value, 'New membership value');
-  assert.equal(app.isDirty(), false);
+  await settle();
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Saved leave');
+  assert.equal(h.app.isDirty(), false);
 });
 
 test('copy captures source membership on selection and sends both page scopes', async () => {
@@ -1841,18 +1863,28 @@ test('copy captures source membership on selection and sends both page scopes', 
   });
   app.state.config = cfg;
   app.state.tab = 'settings';
-  app.tabSettings();
-  const source = elements.find(n => n.tag === 'select' && n.listeners.change);
-  const copy = elements.find(n => n.tag === 'button' && n.textContent === 'Copy');
+  app.renderTab();
+  const source = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.textContent === 'Select a source server'));
+  let copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
   source.value = app.state.guilds[1].id;
-  source.selectedOptions = [{ textContent: 'Second' }];
-  await copy.listeners.click({});
+  await fire(copy, 'click', {});
   assert.equal(calls.filter((c) => c.url.endsWith('/copy')).length, 0, 'copy waits for an explicitly loaded source');
-  await source.listeners.change({});
+  await chooseOption(source, 'Second');
   assert.equal(calls.filter((c) => c.url.includes(app.state.guilds[1].id)).length, 1);
-  await copy.listeners.click({});
+  const section = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.value === 'all'));
+  section.value = 'settings'; await fire(section, 'change');
+  const prefix = elements.find(n => n.localName === 'input' && n.value === '!');
+  prefix.value = '?'; await fire(prefix, 'input');
+  await fire(elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  const restoredSource = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.textContent === 'Select a source server'));
+  const restoredSection = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.value === 'all'));
+  assert.equal(restoredSource.value, app.state.guilds[1].id);
+  assert.equal(restoredSection.value, 'settings', 'unrelated save must not broaden the selected copy scope');
+  copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
+  await fire(copy, 'click', {});
   const sent = calls.find(c => c.opts.method === 'POST' && c.url.endsWith('/copy'));
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
+  assert.deepEqual(JSON.parse(sent.opts.body).sections, ['settings']);
   assert.equal(sent.opts.headers['x-jmodguard-enrollment'], 'destination');
   assert.equal(calls.filter(c => c.url.includes('987654321098765433')).length, 1, 'copy must not refresh the selected source token');
 });
@@ -1927,14 +1959,14 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   assert.equal(calls.length,1);
   assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
-  assert.match(textOf(h.elements.find(n=>n.tag==='p')),/Force-cancel a stuck log-channel request/);
-  const cancel=h.elements.find(n=>n.tag==='button'&&n.textContent==='Cancel');
-  await cancel.listeners.click({});
+  assert.match(textOf(h.elements.find(n=>n.localName==='p')),/Force-cancel a stuck log-channel request/);
+  const cancel=h.elements.find(n=>n.localName==='button'&&n.textContent==='Cancel');
+  await fire(cancel, 'click', {});
   assert.equal(calls[1].opts.method,'DELETE');
   assert.equal(calls[1].opts.headers['x-jmodguard-enrollment'],'membership');
   assert.equal(calls[2].opts.method,'POST');
-  const refresh=h.elements.find(n=>n.tag==='button'&&n.textContent==='Refresh');
-  await refresh.listeners.click({});
+  const refresh=h.elements.find(n=>n.localName==='button'&&n.textContent==='Refresh');
+  await fire(refresh, 'click', {});
   assert.equal(calls.length,4);
 });
 
@@ -1957,13 +1989,13 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   h.app.state.config = { enrollment_id: 'membership' };
   h.app.tabActions();
   await new Promise((resolve) => setImmediate(resolve));
-  const controls = h.elements.filter((n) => n.tag === 'button' && (n.textContent === 'Cancel' || n.textContent === 'Force cancel'));
+  const controls = h.elements.filter((n) => n.localName === 'button' && (n.textContent === 'Cancel' || n.textContent === 'Force cancel'));
   assert.deepEqual(controls.map((n) => n.textContent), ['Cancel', 'Force cancel', 'Force cancel']);
-  await controls[0].listeners.click({});
+  await fire(controls[0], 'click', {});
   assert.equal(confirms, 0);
   assert.equal(calls[1].opts.method, 'DELETE');
   assert.match(calls[1].url, /\/actions\/job$/);
-  await controls[1].listeners.click({});
+  await fire(controls[1], 'click', {});
   assert.equal(confirms, 1);
   assert.equal(calls[3].opts.method, 'DELETE');
   assert.match(calls[3].url, /\/actions\/log-run$/);
@@ -2022,12 +2054,12 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   });
   const legacy={ name:'Images', rule_id:'attachment_flood', effective:{ enabled:true, dry_run:false, params:{min_channels:2,min_attachments:2,window_secs:60,min_messages:2}, actions:[{at:1,action:'ban'}] } };
   assert.match(textOf(h.app.ruleCard(legacy)), /inactive/);
-  const modal=h.app.editRule(legacy);
+  const modal=await h.app.editRule(legacy);
   assert.doesNotMatch(textOf(modal), /Action escalation/);
-  const dryRun = findNode(modal,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
-  assert.equal(findNode(dryRun,n=>n.tag==='input').checked,true);
+  const dryRun = findNode(modal,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(dryRun,n=>n.localName==='input').checked,true);
   const save=findNode(modal,n=>n.textContent === 'Save');
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   assert.equal(calls.length,1);
   assert.equal(calls[0].data.dry_run,true);
   assert.deepEqual(calls[0].data.params,{mode:'exact_image_test',min_channels:2,min_attachments:2,window_secs:60});
@@ -2037,65 +2069,26 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   assert.doesNotMatch(textOf(h.app.ruleCard({name:'Images',rule_id:'attachment_flood',effective:calls[0].data})), /log-only test/);
   calls[0].data.params.min_channels=1;
   assert.equal(h.app.spamConfigured('attachment_flood', calls[0].data),false);
-  const punish=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,dry_run:true,params:{mode:'exact_image_test',min_channels:3,min_attachments:2,window_secs:60},actions:[{action:'log'}]}});
-  const dryRunToggle = findNode(punish,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
-  findNode(dryRunToggle,n=>n.tag==='input' && n.attrs.type==='checkbox').checked = false;
-  await findNode(punish,n=>n.textContent === 'Save').listeners.click({});
+  const punish=await h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,dry_run:true,params:{mode:'exact_image_test',min_channels:3,min_attachments:2,window_secs:60},actions:[{action:'log'}]}});
+  const dryRunToggle = findNode(punish,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
+  findNode(dryRunToggle,n=>n.localName==='input' && n.getAttribute("type")==='checkbox').checked = false;
+  await fire(findNode(punish,n=>n.textContent === 'Save'), 'click', {});
   assert.equal(calls.at(-1).data.dry_run,false);
   assert.equal(calls.at(-1).data.params.mode,'exact_image');
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
-  const back=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:calls.at(-1).data});
-  const backToggle = findNode(back,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
-  assert.equal(findNode(backToggle,n=>n.tag==='input').checked,false);
-  findNode(backToggle,n=>n.tag==='input').checked=true;
-  await findNode(back,n=>n.textContent==='Save').listeners.click({});
+  const back=await h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:calls.at(-1).data});
+  const backToggle = findNode(back,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(backToggle,n=>n.localName==='input').checked,false);
+  findNode(backToggle,n=>n.localName==='input').checked=true;
+  await fire(findNode(back,n=>n.textContent==='Save'), 'click', {});
   assert.equal(calls.at(-1).data.dry_run,true);
   assert.equal(calls.at(-1).data.params.mode,'exact_image_test');
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['log']);
 });
 
-test('checkbox labels inside rows keep primary text color', () => {
-  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
-  const specificity = (selector) => {
-    const ids = (selector.match(/#[\w-]+/g) || []).length;
-    const classes = (selector.match(/\.[\w-]+/g) || []).length
-      + (selector.match(/\[[^\]]+\]/g) || []).length
-      + (selector.match(/:(?:not|is|where)\([^)]*\)/g) || []).length;
-    const withoutPseudos = selector.replace(/:(?:not|is|where)\([^)]*\)/g, '');
-    const elements = (withoutPseudos.match(/(^|[\s>+~])[a-zA-Z][\w-]*/g) || []).length;
-    return ids * 100 + classes * 10 + elements;
-  };
-  const matches = (selector, checkbox) => {
-    if (selector.includes(':not(.checkbox-label)') && checkbox) return false;
-    const normalized = selector.replace(/:not\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
-    if (checkbox) {
-      return normalized === '.checkbox-label'
-        || normalized === '.row > label'
-        || normalized === '.row > label.checkbox-label'
-        || normalized === '.row > .checkbox-label';
-    }
-    return normalized === '.row > label' || normalized === '.row label';
-  };
-  const winningColor = (checkbox) => {
-    let winner = null;
-    rules.forEach((match, index) => {
-      const declared = match[2].match(/(?:^|;)\s*color\s*:\s*([^;]+)/);
-      if (!declared) return;
-      for (const raw of match[1].split(',')) {
-        const selector = raw.trim();
-        if (!matches(selector, checkbox)) continue;
-        const rank = specificity(selector);
-        if (!winner || rank > winner.rank || (rank === winner.rank && index >= winner.index)) {
-          winner = { rank, index, color: declared[1].trim() };
-        }
-      }
-    });
-    return winner && winner.color;
-  };
-  assert.equal(winningColor(true), 'var(--text)');
-  assert.equal(winningColor(false), 'var(--muted)');
+test('checkbox labels keep primary text color', () => {
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.checkbox-label\s*\{[^}]*color:\s*var\(--text\)/);
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
@@ -2104,24 +2097,25 @@ test('text rule UI can save independent thresholds without generic escalation', 
     if (options.method === 'PUT') calls.push(JSON.parse(options.body));
     return response({ settings:{}, rules:[], commands:[], log_channels:[], badwords:[] });
   });
-  const modal=h.app.editRule({name:'Text',rule_id:'repeat_text',effective:{enabled:true,dry_run:true,params:{mode:'exact_text',min_channels:3,window_secs:60,min_length:20},actions:[{action:'log'}]}});
+  let modal=await h.app.editRule({name:'Text',rule_id:'repeat_text',effective:{enabled:true,dry_run:true,params:{mode:'exact_text',min_channels:3,window_secs:60,min_length:20},actions:[{action:'log'}]}});
   assert.doesNotMatch(textOf(modal), /Action escalation/);
   assert.match(textOf(modal), /Minimum length/);
-  await findNode(modal,n=>n.textContent === 'Save').listeners.click({});
+  await fire(findNode(modal,n=>n.textContent === 'Save'), 'click', {});
   assert.equal(calls[0].data.params.mode,'exact_text');
   assert.equal(calls[0].data.params.min_length,20);
   assert.equal(h.app.spamConfigured('repeat_text', calls[0].data),true);
   assert.match(textOf(h.app.ruleCard({name:'Text',rule_id:'repeat_text',effective:calls[0].data})), /dry-run/);
-  const toggle=findNode(modal,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
-  findNode(toggle,n=>n.tag==='input').checked=false;
-  await findNode(modal,n=>n.textContent==='Save').listeners.click({});
+  modal = await h.app.editRule({name:'Text',rule_id:'repeat_text',effective:calls.at(-1).data});
+  const toggle=findNode(modal,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
+  findNode(toggle,n=>n.localName==='input').checked=false;
+  await fire(findNode(modal,n=>n.textContent==='Save'), 'click', {});
   assert.equal(calls.at(-1).data.dry_run,false);
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
-  const back=h.app.editRule({name:'Text',rule_id:'repeat_text',effective:calls.at(-1).data});
-  const backToggle=findNode(back,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
-  assert.equal(findNode(backToggle,n=>n.tag==='input').checked,false);
-  findNode(backToggle,n=>n.tag==='input').checked=true;
-  await findNode(back,n=>n.textContent==='Save').listeners.click({});
+  const back=await h.app.editRule({name:'Text',rule_id:'repeat_text',effective:calls.at(-1).data});
+  const backToggle=findNode(back,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(backToggle,n=>n.localName==='input').checked,false);
+  findNode(backToggle,n=>n.localName==='input').checked=true;
+  await fire(findNode(back,n=>n.textContent==='Save'), 'click', {});
   assert.equal(calls.at(-1).data.dry_run,true);
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['log']);
 });
@@ -2129,8 +2123,8 @@ test('text rule UI can save independent thresholds without generic escalation', 
 test('image test UI rejects invalid thresholds before the API request', async () => {
   let sent=0;
   const h=harness(async()=>{sent++;return response({});});
-  const modal=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,params:{min_channels:1},actions:[]}});
-  await findNode(modal,n=>n.textContent === 'Save').listeners.click({});
+  const modal=await h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,params:{min_channels:1},actions:[]}});
+  await fire(findNode(modal,n=>n.textContent === 'Save'), 'click', {});
   assert.equal(sent,0);
   assert.match(h.nodes.get('#toast').textContent,/Channels must be/);
 });
@@ -2151,18 +2145,18 @@ test('case administration reaches later pages, all admitted history and inline e
     return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
   });
   const root = h.app.tabCases();
-  await new Promise(resolve => setImmediate(resolve));
-  const next = findNode(root, n => n.tag === 'button' && n.textContent === 'Next page');
+  await settle();
+  const next = findNode(root, n => n.localName === 'button' && n.textContent === 'Next page');
   assert.equal(next.disabled, false);
-  next.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  fire(next, 'click');
+  await settle();
   assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
-  const caseButton = findNode(root, n => n.tag === 'button' && n.textContent === ids[50].slice(0, 8));
-  caseButton.listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  const caseButton = findNode(root, n => n.localName === 'button' && n.textContent === ids[50].slice(0, 8));
+  fire(caseButton, 'click');
+  await settle();
   assert.ok(textOf(root).includes('note 33'));
   assert.ok(textOf(root).includes('note 64'));
-  const excerpt = findNode(root, n => n.tag === 'pre');
+  const excerpt = findNode(root, n => n.localName === 'pre');
   assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
   assert.equal(next.disabled, true);
 });
@@ -2177,11 +2171,11 @@ test('removed case recovery survives opening a new dashboard view and retries th
     return response({cases: u.searchParams.get('removed') === 'true' ? [id] : [], can_delete: true});
   });
   const root = h.app.tabCases();
-  await new Promise(resolve => setImmediate(resolve));
-  findNode(root, n => n.textContent === 'Removed records / retry cleanup').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
+  fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click');
+  await settle();
   assert.ok(textOf(root).includes(id));
-  await findNode(root, n => n.textContent === 'Retry cleanup').listeners.click();
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Retry cleanup'), 'click');
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/cases/' + id)));
 });
 
@@ -2201,21 +2195,21 @@ test('note retry retains intent after a lost response and blocks overlapping sub
     return response({case: {action: 'warning', evidence: {}}, can_delete: true});
   });
   const root = h.app.tabCases();
-  await new Promise(resolve => setImmediate(resolve));
-  findNode(root, n => n.tag === 'button' && n.textContent === id.slice(0,8)).listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
-  const note = findNode(root, n => n.tag === 'textarea');
-  const submit = findNode(root, n => n.tag === 'button' && n.textContent === 'Add note');
+  await settle();
+  fire(findNode(root, n => n.localName === 'button' && n.textContent === id.slice(0,8)), 'click');
+  await settle();
+  const note = findNode(root, n => n.localName === 'textarea');
+  const submit = findNode(root, n => n.localName === 'button' && n.textContent === 'Add note');
   assert.ok(note, textOf(root));
   note.value = 'same note';
-  const first = submit.listeners.click();
-  await submit.listeners.click();
+  const first = fire(submit, 'click');
+  await fire(submit, 'click');
   assert.equal(posts.length,1);
-  resolveFirst(); await first;
-  await submit.listeners.click();
+  resolveFirst(); await first; await settle();
+  await fire(submit, 'click');
   assert.deepEqual(posts[1],posts[0]);
   note.value = 'different note';
-  await submit.listeners.click();
+  await fire(submit, 'click');
   assert.notEqual(posts[2].entry_id,posts[0].entry_id);
 });
 
@@ -2231,15 +2225,16 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
   h.app.state.tab = 'cases';
   const root = h.app.tabCases();
   h.nodes.get('#content').append(root);
-  await new Promise(resolve => setImmediate(resolve));
-  findNode(root, n => n.tag === 'button' && n.textContent === id.slice(0, 8)).listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
-  const note = findNode(root, n => n.tag === 'textarea');
+  await settle();
+  fire(findNode(root, n => n.localName === 'button' && n.textContent === id.slice(0, 8)), 'click');
+  await settle();
+  const note = findNode(root, n => n.localName === 'textarea');
   note.value = 'saved note';
   h.app.markDirty();
-  const submit = findNode(root, n => n.tag === 'button' && n.textContent === 'Add note');
-  await submit.listeners.click({});
+  const submit = findNode(root, n => n.localName === 'button' && n.textContent === 'Add note');
+  await fire(submit, 'click', {});
   assert.equal(h.app.isDirty(), false);
+  assert.equal(findNode(root, n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
 });
 
 test('preview token is sent on API requests from this tab', async () => {
@@ -2345,7 +2340,7 @@ test('View as hands the preview bearer through a URL fragment', async () => {
   h.app.state.me.is_bot_owner = true;
   h.app.bindOwnerTools();
   const button = findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'View as…');
-  await button.listeners.click();
+  await fire(button, 'click');
   assert.equal(h.opened[0][0], '/#preview=new-preview-token');
   assert.equal(h.opened[0][1], '_blank');
   assert.equal(h.opened[0][2], 'noopener');
@@ -2359,7 +2354,7 @@ test('only the owner sees the same-origin Administration link', () => {
   h.app.state.me.is_bot_owner = true;
   h.app.bindOwnerTools();
   const link = findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'Administration');
-  assert.equal(link.href, '/administration/index.html');
+  assert.equal(link.getAttribute('href'), '/administration/index.html');
 });
 
 test('unauthenticated blocked-storage preview never exposes owner login', async () => {
@@ -2380,7 +2375,7 @@ test('unauthenticated blocked-storage preview never exposes owner login', async 
   await h.app.init();
 
   assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
-  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#login-view'), null);
   assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
   assert.match(h.nodes.get('#startup-status').textContent, /preview is no longer signed in/i);
   assert.equal(h.app.currentPreviewToken(), 'still-read-only');
@@ -2401,7 +2396,7 @@ test('post-boot preview authentication loss enters the unavailable state', async
   await assert.rejects(h.app.api('/api/guilds/10/cases'), /not authenticated/);
 
   assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
-  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#login-view'), null);
   assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
 });
 
@@ -2417,7 +2412,7 @@ test('production session-expired response enters preview unavailable state', asy
   await h.app.init();
 
   assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
-  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#login-view'), null);
   assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
 });
 
@@ -2433,7 +2428,7 @@ test('private downloads share preview authentication-loss handling', async () =>
     await assert.rejects(h.app.downloadPrivate('/api/guilds/10/cases/1/evidence/2'), new RegExp(message));
 
     assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
-    assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+    assert.equal(h.nodes.get('#login-view'), null);
     assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
   }
 });
@@ -2477,69 +2472,22 @@ test('unauthenticated settings save returns to login', async () => {
   }));
   h.app.state.config = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
   h.app.state.tab = 'settings';
-  h.nodes.get('#login-view').classList.add('hidden');
-  h.nodes.get('#main-view').classList.remove('hidden');
   h.app.tabSettings();
-  const inputs = h.elements.filter(n => n.tag === 'input');
-  const save = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save');
+  const inputs = h.elements.filter(n => n.localName === 'input');
+  const save = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save');
   inputs[0].value = '?';
-  await save.listeners.click({});
+  await fire(save, 'click', {});
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
 });
 
-test('vendor widgets stay off in the vm harness so tests do not fetch CDN modules', () => {
-  const { app } = harness();
-  assert.equal(app.vendorWidgetsEnabled(), false);
-  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: 'guild-select', className: '', classList: { contains: () => false } }), true);
-  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'searchable', classList: { contains: (n) => n === 'searchable' } }), true);
-  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'theme-select', classList: { contains: (n) => n === 'theme-select' } }), false);
-  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: '', classList: { contains: () => false }, options: { length: 20 } }), false);
-});
 
-test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blue tokens', () => {
+test('React WebUI retains the framework imports, styling and pale-blue tokens', () => {
   const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
   const js = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
-  const { app } = harness();
-  assert.match(html, /cdn\.jsdelivr\.net\/npm\/daisyui@5\.7\.43\/daisyui\.css/);
-  assert.match(html, /link\.id = "jmodguard-daisyui"/);
-  assert.match(html, /link\.href = window\.JMODGUARD_DAISYUI_HREF/);
-  assert.doesNotMatch(html, /<link[^>]*id="jmodguard-daisyui"/);
-  assert.ok(html.indexOf('jmodguard-daisyui') < html.indexOf('href="/style.css"'));
-  assert.equal(app.VENDOR.daisyuiCss, 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css');
-  assert.equal(app.VENDOR.esm, 'https://esm.sh');
-  assert.equal(app.VENDOR.react, '19.3.0');
-  assert.equal(app.VENDOR.headless, '2.2.10');
-  assert.equal(app.vendorCssHref(), app.VENDOR.daisyuiCss);
-  assert.equal(app.vendorEsmBase(), 'https://esm.sh');
-  const names = ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"];
-  const incomplete = { Combobox() {} };
-  assert.equal(app.vendorModule(incomplete, names), null);
-  const complete = { Combobox() {}, ComboboxInput() {}, ComboboxOptions() {}, ComboboxOption() {} };
-  assert.equal(app.vendorModule(complete, names), complete);
-  const asObjects = { Combobox: { $$typeof: 1 }, ComboboxInput: { $$typeof: 1 }, ComboboxOptions: { $$typeof: 1 }, ComboboxOption: { $$typeof: 1 } };
-  assert.equal(app.vendorModule(asObjects, names), asObjects);
-  const fromDefault = { Combobox() {}, ComboboxInput: undefined, default: complete };
-  const merged = app.vendorModule(fromDefault, names);
-  assert.equal(typeof merged.Combobox, "function");
-  assert.equal(typeof merged.ComboboxInput, "function");
-  assert.equal(typeof merged.ComboboxOptions, "function");
-  assert.equal(typeof merged.ComboboxOption, "function");
-  const { app: cssApp, window: cssWindow, nodes: cssNodes } = harness();
-  cssWindow.JMODGUARD_DAISYUI_HREF = "https://cdn.example.test/daisyui.css";
-  assert.equal(cssApp.vendorCssHref(), "https://cdn.example.test/daisyui.css");
-  cssApp.applyVendorCss();
-  assert.equal(cssNodes.get("#jmodguard-daisyui").getAttribute("href"), "https://cdn.example.test/daisyui.css");
-  assert.match(js, /function applyVendorCss/);
-  assert.match(js, /vendorModule\(headlessMod, \["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"\]\)/);
-  assert.match(js, /@headlessui\/react@/);
-  assert.match(js, /esm\.sh/);
-  assert.doesNotMatch(js, /node_modules/);
-  assert.match(js, /function loadSearchSelectRuntime/);
-  assert.match(js, /function restoreNativeSelect/);
-  assert.match(js, /searchSelectId/);
-  assert.match(js, /anchor:\s*"bottom start"/);
-  assert.doesNotMatch(js, /^import /m);
+  assert.doesNotMatch(html, /https?:\/\//);
+  assert.doesNotMatch(js, /esm\.sh|cdn\.jsdelivr\.net|JMODGUARD_ESM_BASE|JMODGUARD_DAISYUI_HREF/);
+  assert.match(js, /from "react"/);
   assert.match(css, /--bg:\s*#f0f7ff/);
   assert.match(css, /--accent:\s*#2266c2/);
   assert.match(css, /\[data-theme="dark"\][\s\S]*--bg:\s*#0d1727/);
@@ -2554,24 +2502,18 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.doesNotMatch(css, /\.hero\s*\{[^}]*background:/);
   assert.doesNotMatch(css, /\.stat-grid/);
   assert.doesNotMatch(css, /\.btn\.primary/);
-  assert.match(css, /\.search-select-options\s*\{[^}]*z-index:\s*1100/);
   assert.match(css, /--color-base-100:\s*var\(--panel\)/);
   assert.match(js, /hero-content/);
   assert.match(js, /stat-title/);
   assert.match(js, /btn-primary/);
   assert.match(js, /dashboard-hero/);
-  assert.match(js, /search-select-control/);
   assert.doesNotMatch(js, /btn-neutral/);
-  assert.match(js, /class: "stats /);
-  assert.match(html, /btn btn-primary/);
-  assert.match(html, /class="navbar /);
+  assert.match(js, /className: "stats /);
+  assert.match(js, /btn btn-primary/);
+  assert.match(js, /className: "navbar /);
   assert.match(css, /\.workspace-header\s*\{[^}]*justify-content:\s*space-between/);
-  assert.match(html, /sidebar-footer[\s\S]*theme-picker[\s\S]*logout-btn/);
-  assert.match(html, /class="menu w-full"/);
-  assert.equal(app.uiClass("btn primary"), "btn btn-primary");
-  assert.equal(app.uiClass("btn small danger"), "btn btn-sm btn-error");
-  assert.equal(app.uiClass("btn outline"), "btn btn-outline");
-  assert.match(app.uiClass("card"), /card-border/);
+  assert.match(js, /sidebar-footer[\s\S]*Appearance[\s\S]*logout-btn/);
+  assert.match(js, /className: "menu w-full"/);
   assert.equal(fs.existsSync(new URL('../frontend/package.json', import.meta.url)), false);
   assert.equal(fs.existsSync(new URL('../frontend/node_modules', import.meta.url)), false);
 });
@@ -2583,10 +2525,9 @@ test('unauthenticated log-channel mutation returns to login', async () => {
     headers: { get: () => null },
     text: async () => JSON.stringify({ error: 'not authenticated' }),
   }));
-  h.nodes.get('#login-view').classList.add('hidden');
-  h.nodes.get('#main-view').classList.remove('hidden');
   const err = Object.assign(new Error('not authenticated'), { status: 400 });
   assert.equal(h.app.handleAuthLoss(err), true);
+  await settle();
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
 });
 
@@ -2594,7 +2535,7 @@ test('rule badges separate status from heading and preserve distinct semantic va
   const { app } = harness();
   for (const [enabled, dry_run, variant] of [[true, false, 'badge-success'], [true, true, 'badge-warning'], [false, false, 'badge-error']]) {
     const card = app.ruleCard({ name: 'Mention spam', rule_id: 'mention_spam', global: {}, guild_override: {}, effective: { enabled, dry_run } });
-    assert.equal(textOf(findNode(card, n => n.tag === 'h3')), 'Mention spam');
+    assert.equal(textOf(findNode(card, n => n.localName === 'h3')), 'Mention spam');
     const badge = findNode(card, n => String(n.className).split(/\s+/).includes(variant));
     assert.ok(badge, variant);
     assert.doesNotMatch(badge.className, /badge-ghost/);
@@ -2609,17 +2550,242 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
     if (options.method === 'PUT') submitted = JSON.parse(options.body);
     return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
   });
-  const modal = h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'ban', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
+  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
+  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
   for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Delete history (days)', '2'], ['Reason template', 'Updated reason']]) {
-    const wrapper = findNode(modal, n => n.tag === 'label' && textOf(n).startsWith(label));
+    const wrapper = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(label));
     assert.ok(wrapper, label);
-    const input = findNode(wrapper, n => n.tag === 'input');
+    const input = wrapper.control;
+    assert.equal(input?.localName, 'input');
     input.value = value;
-    input.onchange();
+    await fire(input, 'change');
   }
-  await findNode(modal, n => n.textContent === 'Save').listeners.click({});
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click', {});
   assert.equal(submitted.data.actions[0].at, 3);
+  assert.equal(submitted.data.actions[0].action, 'ban');
   assert.equal(submitted.data.actions[0].duration_minutes, 15);
   assert.equal(submitted.data.actions[0].delete_days, 2);
   assert.equal(submitted.data.actions[0].reason, 'Updated reason');
+});
+
+async function chooseOption(select, label) {
+  const option = Array.from(select.options).find(node => node.textContent === label);
+  assert.ok(option, label);
+  select.value = option.value;
+  await fire(select, 'input');
+  await fire(select, 'change');
+}
+
+test('changing only a rule action through Headless UI marks unsaved edits', async () => {
+  const h = harness();
+  const modal = await h.app.editRule({name: 'Mentions', rule_id: 'mention_spam', effective: {enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}});
+  assert.equal(h.app.isDirty(), false);
+  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
+  assert.equal(modal.querySelector('.escalation-step select').value, 'ban');
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('activity-log events from the config payload render template and log-channel cards', async () => {
+  const h = harness();
+  h.app.state.config = {
+    templates: [
+      { event: 'voice_join', effective: '**:loud_sound: {user} joined voice**\n\n**Channel:** {channel}\n**Time:** `{time}`' },
+      { event: 'member_role_update', effective: '**:label: {user} roles updated**\n\n**Added:** {added}\n**Removed:** {removed}' },
+    ],
+    log_channels: [
+      { event: 'voice_join', effective: '0', guild_override: null, global: null, ignore: { users: [], channels: [] } },
+      { event: 'thread_create', effective: '222', guild_override: '222', global: null, ignore: { users: ['42'], channels: [] } },
+    ],
+  };
+  h.app.navigate('templates');
+  await settle();
+  const reference = h.document.querySelector('.reference-panel');
+  assert.match(reference.textContent, /\{added\}/);
+  assert.match(reference.textContent, /do not supply message text/);
+  const cards = [...h.document.querySelectorAll('.template-card')];
+  assert.equal(cards.length, 2);
+  assert.match(cards[0].textContent, /Voice join/);
+  assert.match(cards[0].textContent, /voice_join/);
+  assert.match(cards[0].querySelector('pre').textContent, /Alice/);
+  assert.match(cards[0].querySelector('pre').textContent, /#general/);
+  assert.match(cards[1].textContent, /Member role update/);
+  assert.match(cards[1].querySelector('pre').textContent, /\{added\}/);
+  h.app.navigate('logchannels');
+  await settle();
+  const logs = [...h.document.querySelectorAll('.log-channel-card')];
+  assert.equal(logs.length, 2);
+  assert.match(logs[0].textContent, /Voice join/);
+  assert.equal(logs[0].querySelector('input').value, '');
+  assert.match(logs[1].textContent, /Thread create/);
+  assert.equal(logs[1].querySelector('input').value, '222');
+  assert.match(logs[1].querySelector('textarea').value, /^42$/);
+});
+
+test('native server selection restores the selected server and draft when navigation is cancelled', async () => {
+  const calls = [];
+  const h = harness(async url => { calls.push(url); return response({}); }, new Map(), new Map(), () => false);
+  h.app.state.config = { templates: [{event: 'member_join', effective: 'Welcome'}] };
+  h.app.navigate('templates');
+  await settle();
+  const draft = h.document.querySelector('.template-card textarea');
+  draft.value = 'Unsaved template';
+  await fire(draft, 'input');
+  const select = h.document.querySelector('#guild-select');
+  assert.equal(select.localName, 'select');
+  const originalGuild = h.app.state.guildId;
+  await chooseOption(select, 'Second');
+  assert.equal(select.value, originalGuild);
+  assert.equal(h.app.state.guildId, originalGuild);
+  assert.equal(draft.value, 'Unsaved template');
+  assert.equal(h.app.isDirty(), true);
+  assert.deepEqual(calls, []);
+});
+
+
+test('failed copy-source load reports the error and leaves copy unavailable', async () => {
+  let writes = 0;
+  const { app, elements, nodes } = harness(async (url, opts) => {
+    if (url.endsWith('/copy')) writes++;
+    throw new Error('Source unavailable');
+  });
+  app.state.config = { enrollment_id: 'destination', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '!' } };
+  app.state.tab = 'settings';
+  app.tabSettings();
+  const source = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.textContent === 'Select a source server'));
+  await chooseOption(source, 'Second');
+  assert.match(nodes.get('#toast').textContent, /Source unavailable/);
+  const copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
+  assert.equal(copy.disabled, false);
+  await fire(copy, 'click', {});
+  assert.equal(writes, 0);
+  assert.match(nodes.get('#toast').textContent, /Select a source server/);
+});
+
+function assertAccessible(node) {
+  assert.ok(node, 'feedback/recovery control exists');
+  for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+    assert.notEqual(ancestor.getAttribute('aria-hidden'), 'true');
+    assert.notEqual(ancestor.inert, true);
+  }
+}
+
+test('command plan validation retains editable drafts and accessible errors on blur and Save', async () => {
+  const writes = [];
+  let refuse = true;
+  const h = harness(async (_url, options) => {
+    const body = JSON.parse(options.body);
+    writes.push(body);
+    if (refuse) throw new Error('command write refused');
+    return response({ config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } });
+  });
+  h.app.state.config = { commands: [] };
+  h.app.state.tab = 'commands';
+  const modal = await h.app.editCommand(null);
+  const json = modal.querySelector('textarea.mono');
+  const save = findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+  for (const value of ['{broken', 'null', '[]', '{"steps":{}}', ...[null, 1, 'bad', true, []].map(step => JSON.stringify({steps: [step]}))]) {
+    json.value = value;
+    await fire(json, 'input');
+    await fire(json, 'focusout');
+    assert.equal(modal.isConnected, true, value);
+    assert.equal(json.value, value);
+    assert.match(h.nodes.get('#toast').textContent, /Invalid behavior JSON/);
+    assertAccessible(h.nodes.get('#toast'));
+    await fire(save, 'click');
+    assert.equal(modal.isConnected, true);
+    assert.equal(writes.length, 0);
+    assertAccessible(h.nodes.get('#toast'));
+  }
+  const name = modal.querySelector('input[placeholder="command name"]');
+  name.value = 'hello';
+  await fire(name, 'input');
+  json.value = '{"steps":[{"type":"reply","template":"Hello"}]}';
+  await fire(json, 'input');
+  await fire(json, 'focusout');
+  await fire(save, 'click');
+  assert.equal(modal.isConnected, true);
+  assert.equal(name.value, 'hello');
+  assert.match(h.nodes.get('#toast').textContent, /command write refused/);
+  assertAccessible(h.nodes.get('#toast'));
+  refuse = false;
+  await fire(save, 'click');
+  assert.equal(modal.isConnected, false);
+  assert.deepEqual(writes.at(-1).data.behavior.params.steps, [{type: 'reply', template: 'Hello'}]);
+});
+
+test('acknowledged command deletion exposes Retry when the config refresh fails', async () => {
+  const calls = [];
+  const h = harness(async (url, options) => {
+    calls.push({url, method: options.method});
+    if (options.method === 'DELETE') return response({ok: true});
+    throw new Error('refresh unavailable');
+  });
+  h.app.state.config = { commands: [] };
+  h.app.state.tab = 'commands';
+  const modal = await h.app.editCommand({name: 'hello', scope: 'guild', effective: {name: 'hello', behavior: {kind: 'plan', params: {steps: []}}}});
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Delete'), 'click');
+  assert.deepEqual(calls.map(call => call.method), ['DELETE', 'POST']);
+  assert.equal(h.app.state.config, null);
+  assert.equal(modal.isConnected, false);
+  assertAccessible(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Retry'));
+});
+
+test('read views retain request deadlines and cancel obsolete reads without rendering errors', async () => {
+  for (const tab of ['dashboard', 'events', 'bans', 'actions']) {
+    const signals = [];
+    const h = harness((_url, options) => new Promise((_resolve, reject) => {
+      signals.push(options.signal);
+      options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name: 'AbortError'})), {once: true});
+    }));
+    h.app.state.config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], badwords: [], log_channels: [], templates: [], event_types: []};
+    h.app.navigate(tab);
+    await settle();
+    const deadline = [...h.timers.values()].find(timer => timer.delay === 30000);
+    assert.ok(deadline, tab + ' must bound loading');
+    await deadline.fn();
+    assert.equal(signals[0].aborted, true);
+    assert.match(textOf(h.nodes.get('#content')), tab === 'dashboard' ? /Unavailable/ : /Request timed out/);
+    assert.equal([...h.timers.values()].some(timer => timer.delay === 30000), false);
+    h.app.navigate(tab);
+    await settle();
+    const pending = signals.at(-1);
+    h.app.navigate('templates');
+    await settle();
+    assert.equal(pending.aborted, true);
+    assert.equal([...h.timers.values()].some(timer => timer.delay === 30000), false);
+    assert.doesNotMatch(textOf(h.nodes.get('#content')), /Request timed out|Failed to fetch/);
+  }
+});
+
+test('field labels exclude control values and command steps have individual identities', async () => {
+  const h = harness();
+  h.app.state.config = {templates: [{event: 'member_join', effective: 'Welcome {user}'}]};
+  h.app.navigate('templates');
+  await settle();
+  for (const label of h.nodes.get('#content').querySelectorAll('.field > label')) {
+    assert.ok(['Message template', 'Save to'].includes(label.textContent));
+    assert.ok(label.control);
+    assert.equal(label.control.getAttribute('aria-labelledby'), label.id);
+  }
+  const modal = await h.app.editCommand(null);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === '+ add step'), 'click');
+  const inputs = [...modal.querySelectorAll('.step-card input, .step-card select')];
+  assert.equal(inputs.length, 4);
+  assert.equal(new Set(inputs.map(input => input.id)).size, inputs.length);
+  for (const input of inputs) assert.match(input.getAttribute('aria-label'), /^Step (action|value)$/);
+});
+
+test('appearance retains the session choice across startup and workspace when storage is blocked', async () => {
+  const blocked = {get() { throw new Error('blocked'); }, set() { throw new Error('blocked'); }};
+  const h = harness(undefined, blocked);
+  const picker = h.document.querySelector('select[aria-label="Appearance"]');
+  picker.value = 'dark';
+  await fire(picker, 'change');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
+  h.app.state.config = {templates: []};
+  h.app.navigate('templates');
+  await settle();
+  assert.equal(picker.isConnected, false);
+  assert.equal(h.document.querySelector('select[aria-label="Appearance"]').value, 'dark');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });

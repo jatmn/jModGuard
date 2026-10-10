@@ -16,7 +16,7 @@ workers: they talk to Bunny Database and (outbound) to Discord. They do not
 contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
-Publish the five `frontend/` files for an initial manual setup, including the
+Build and publish the five `dist/frontend/` files for an initial manual setup, including the
 Administration page. New trusted Buildkite publications also create an independent
 WebUI GHCR package; the owner update path is described in
 [BUNNY-UPDATES.md](BUNNY-UPDATES.md). A private ops repository is not required.
@@ -43,7 +43,7 @@ link that is not published to the internet. The bot’s extra outbound is the
 Discord gateway. The API’s extra outbound is Discord OAuth, guild listing,
 and unban.
 
-Local `cargo run` still embeds `frontend/` in the API for SETUP.md. That
+Local `cargo run` embeds the built `dist/frontend/` in the API for SETUP.md. That
 is a laptop / self-host convenience. It is not the Bunny deploy.
 
 ## 1. Create the core and guild databases
@@ -95,17 +95,14 @@ private evidence resource.
 
 ## 2. Publish the admin UI to Storage + CDN
 
-The files for a first manual upload are `frontend/index.html`, `frontend/app.js`,
-`frontend/style.css`, `frontend/administration/index.html`, and
-`frontend/administration.js`. How to get them and where they
+The files for a first manual upload are `dist/frontend/index.html`, `dist/frontend/app.js`,
+`dist/frontend/style.css`, `dist/frontend/administration/index.html`, and
+`dist/frontend/administration.js`. How to get them and where they
 go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
-The browser loads daisyUI CSS and Headless UI from a CDN at runtime; do not
-upload those libraries into Storage. To serve them from your own pull zone
-instead of the public defaults, set `window.JMODGUARD_DAISYUI_HREF` and
-`window.JMODGUARD_ESM_BASE` before `app.js` (same override pattern as
-`window.JMODGUARD_API_BASE`). `app.js` writes the CSS href onto the daisyUI
-`<link>`; setting the CSS override above that link in `index.html` avoids a
-second stylesheet request.
+Run `npm ci --ignore-scripts --prefix tools/webui` and
+`npm run build --prefix tools/webui` first. The generated `app.js` and
+`style.css` include the locked UI dependencies; no external module/CDN override
+is needed. Do not upload unbuilt source files.
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
 When creating the Storage Zone, select a **primary region and at least one replication region**.
@@ -135,8 +132,7 @@ API image to the **root** so they are `/` (or `/index.html`),
 SHA is sufficient; no Stable or Nightly release tag is required. After that,
 CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
-the page needs new API endpoints. daisyUI and Headless UI stay on the runtime
-CDN; they are not a fourth Storage object.
+the page needs new API endpoints. daisyUI and Headless UI are bundled into the existing CSS/JS assets.
 
 **Later updates.** The owner Administration page can install a WebUI package
 from GHCR using the Storage Zone password after the rollout gates in
@@ -477,7 +473,7 @@ On the Pull Zone from step 2 (Storage origin for the files):
    fields you are changing — posting the full GET body back fails
    (`model.invalid` on `id`).
 5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
-   Headless UI are fetched by the browser from the configured CDN, not Storage.
+   Headless UI are included in those built CSS/JS files.
 
 After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
 the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you

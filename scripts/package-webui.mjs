@@ -9,7 +9,7 @@ export function packageWebui(root, sha) {
 if (!root || !/^[0-9a-f]{40}$/.test(sha)) {
   throw new Error("usage: node scripts/package-webui.mjs SOURCE_ROOT FULL_SOURCE_SHA");
 }
-const frontend = path.join(root, "frontend");
+const frontend = path.join(root, "dist", "frontend");
 const out = path.join(root, "dist", "webui");
 const prefix = `/assets/releases/${sha}`;
 const required = ["index.html", "app.js", "style.css", "administration/index.html", "administration.js"];

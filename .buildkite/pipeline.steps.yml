@@ -128,6 +128,8 @@ steps:
       set -euo pipefail
       bash .buildkite/with-cargo-auth.sh bash -s <<'REMOTE'
       set -euo pipefail
+      npm ci --ignore-scripts --prefix tools/webui
+      npm run build --prefix tools/webui
       cargo fetch --locked
       for TEST_TARGET in remote_database_smoke guild_store_smoke bunny_evidence; do
         NAME="libsql-ci-$${BUILDKITE_JOB_ID}-$${TEST_TARGET}"

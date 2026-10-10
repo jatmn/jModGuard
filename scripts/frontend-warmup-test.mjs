@@ -7,29 +7,16 @@ import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const src = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
+// Exercise the production API controller without mounting the UI. Component
+// behavior is covered separately with real React/DOM and browser checks.
+const appSource = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
+const src = appSource.slice(appSource.indexOf("let state ="))
+  .replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, "\n");
 
 function loadFrontend(fetchImpl, clock, timers) {
-  const document = {
-    getElementById() {
-      return null;
-    },
-    querySelector() {
-      return {
-        classList: { toggle() {} },
-        textContent: "",
-        className: "",
-        addEventListener() {},
-      };
-    },
-    querySelectorAll() {
-      return [];
-    },
-  };
   const now = clock || { ms: 0 };
   const context = vm.createContext({
-    fetch: fetchImpl,
-    document,
+    fetch: fetchImpl, showView() {}, setStartupStatus() {}, showPreviewUnavailable() {},
     window: { JMODGUARD_API_BASE: "" },
     Date: { now: () => now.ms },
     Number,

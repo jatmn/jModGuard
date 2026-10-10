@@ -1,0 +1,22 @@
+{
+  "name": "jmodguard-webui-build",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
+  "dependencies": {
+    "@headlessui/react": "2.2.10",
+    "daisyui": "5.7.43",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "es-module-lexer": "3.0.3",
+    "esbuild": "0.28.2",
+    "jsdom": "27.4.0"
+  }
+}

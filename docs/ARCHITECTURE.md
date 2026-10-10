@@ -30,7 +30,7 @@ by processes on different hosts.
 - `jmodguard-bot` owns Discord Gateway/REST, caches, moderation, commands and workers.
   Build it with `cargo build --locked -p jmodguard-bot`.
 - `jmodguard-api` owns HTTP/OAuth, sessions and dashboard state. Its production graph
-  contains no Serenity or WebSocket stack. Default `embed-ui` embeds root `frontend/`;
+  contains no Serenity or WebSocket stack. Default `embed-ui` embeds built `dist/frontend/`;
   Bunny builds `cargo build --locked -p jmodguard-api --no-default-features` for JSON/OAuth.
 - Runtime retains its independent dependency graph. Integration tests explicitly
   join service libraries; the API's dev-only bot dependency retains HTTP-to-worker tests.
@@ -231,7 +231,7 @@ crates/bot/src/state.rs               BotState, compiled config cache and slash-
 crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness and /ready readiness (in-memory; bot listener; API bind until axum)
-frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless loaded at runtime, not vendored)
+frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless bundled at build time, not vendored)
 migrations/                0001_init through 0017_hot_query_indexes
 Dockerfile.bot
 Dockerfile.api
