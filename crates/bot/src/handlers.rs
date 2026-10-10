@@ -767,9 +767,10 @@ impl EventHandler for Handler {
 
         // automod
         let member: Option<Member> = msg.member.clone().map(|m| Member::from(*m));
-        let member_roles: Vec<u64> = member
-            .as_ref()
-            .map(|m| m.roles.iter().map(|r| r.get()).collect())
+        let member_roles: Vec<u64> = msg
+            .member
+            .as_deref()
+            .map(|partial| partial.roles.iter().map(|role| role.get()).collect())
             .unwrap_or_default();
         let joined_secs_ago = app
             .automod
@@ -781,20 +782,23 @@ impl EventHandler for Handler {
             (now - created.unix_timestamp()).max(0) as u64 / 86400
         };
 
-        let (is_moderator, can_mention_everyone) = {
+        let (is_moderator, can_mention_everyone, mention_permission_unknown) = {
             let guild = ctx.cache.guild(guild_id);
-            if let (Some(guild), Some(member)) = (guild.as_ref(), member.as_ref()) {
-                let level = crate::commands::perm_level(&app, &guild.roles, member);
-                let is_mod = level >= crate::commands::PermLevel::Mod;
-                let can_mention = crate::commands::can_mention_everyone_in(
+            if let (Some(guild), Some(partial)) = (guild.as_ref(), msg.member.as_deref()) {
+                let scope = crate::commands::message_author_scope(
+                    app.cfg.bot.owner_id,
                     guild,
                     msg.channel_id,
-                    member.user.id,
-                    &member.roles,
+                    msg.author.id,
+                    partial,
                 );
-                (is_mod, can_mention)
+                (
+                    scope.is_moderator,
+                    scope.mention == crate::commands::MentionPermission::Allowed,
+                    scope.mention == crate::commands::MentionPermission::Unknown,
+                )
             } else {
-                (false, false)
+                (false, false, false)
             }
         };
 
@@ -813,6 +817,7 @@ impl EventHandler for Handler {
             member_roles: &member_roles,
             is_moderator,
             can_mention_everyone,
+            mention_permission_unknown,
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
@@ -1109,6 +1114,7 @@ impl EventHandler for Handler {
                         action,
                         strikes: 1,
                         evidence: serde_json::json!({}),
+                        mention_permission_unknown: false,
                     };
                     execute_pending(
                         &app,

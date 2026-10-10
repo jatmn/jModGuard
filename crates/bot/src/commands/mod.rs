@@ -180,24 +180,77 @@ pub fn cached_is_moderator(
         == ModeratorStatus::Moderator
 }
 
+/// Whether this member can use Mention Everyone in the channel.
+///
+/// `Unknown` means the channel is not in `guild.channels` or `guild.threads`,
+/// or a thread's parent channel is not cached. That is not a deny: the message
+/// can still be deleted, but kick and ban are withheld.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MentionPermission {
+    Allowed,
+    Denied,
+    Unknown,
+}
+
+/// Moderator bit and mention permission for one gateway message.
+///
+/// The author id is the message author. `PartialMember::user` is often null,
+/// and `Member::from` then fills a default user id that must not be used here.
+pub(crate) struct MessageAuthorScope {
+    pub is_moderator: bool,
+    pub mention: MentionPermission,
+}
+
+pub(crate) fn message_author_scope(
+    owner_id: u64,
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+    author_id: UserId,
+    partial: &serenity::model::guild::PartialMember,
+) -> MessageAuthorScope {
+    let is_moderator = permission_level(
+        owner_id,
+        &guild.roles,
+        author_id.get(),
+        partial.roles.iter().map(|role| role.get()),
+    ) >= PermLevel::Mod;
+    MessageAuthorScope {
+        is_moderator,
+        mention: mention_permission_in(guild, channel_id, author_id, &partial.roles),
+    }
+}
+
 /// Mention Everyone in this channel, including overwrites and thread parents.
 ///
-/// Application ownership is not a Discord permission. A missing channel or
-/// thread parent returns false so the automod rule still applies.
+/// Application ownership is not a Discord permission. True only when the
+/// channel permission is [`MentionPermission::Allowed`].
 pub fn can_mention_everyone_in(
     guild: &serenity::model::guild::Guild,
     channel_id: ChannelId,
     user_id: UserId,
     role_ids: &[RoleId],
 ) -> bool {
+    mention_permission_in(guild, channel_id, user_id, role_ids) == MentionPermission::Allowed
+}
+
+pub(crate) fn mention_permission_in(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+    user_id: UserId,
+    role_ids: &[RoleId],
+) -> MentionPermission {
     let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
-        return false;
+        return MentionPermission::Unknown;
     };
     let Some(partial) = partial_member(guild.id, role_ids) else {
-        return false;
+        return MentionPermission::Denied;
     };
     let perms = guild.partial_member_permissions_in(channel, user_id, &partial);
-    perms.contains(Permissions::MENTION_EVERYONE)
+    if perms.contains(Permissions::MENTION_EVERYONE) {
+        MentionPermission::Allowed
+    } else {
+        MentionPermission::Denied
+    }
 }
 
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
@@ -225,17 +278,34 @@ fn partial_member(
     .ok()
 }
 
+fn is_thread(kind: serenity::model::channel::ChannelType) -> bool {
+    matches!(
+        kind,
+        serenity::model::channel::ChannelType::PublicThread
+            | serenity::model::channel::ChannelType::PrivateThread
+            | serenity::model::channel::ChannelType::NewsThread
+    )
+}
+
 fn channel_for_member_permissions(
     guild: &serenity::model::guild::Guild,
     channel_id: ChannelId,
 ) -> Option<&serenity::model::channel::GuildChannel> {
-    let channel = guild.channels.get(&channel_id)?;
-    if matches!(
-        channel.kind,
-        serenity::model::channel::ChannelType::PublicThread
-            | serenity::model::channel::ChannelType::PrivateThread
-            | serenity::model::channel::ChannelType::NewsThread
-    ) {
+    if let Some(channel) = guild.channels.get(&channel_id) {
+        return permission_channel(guild, channel);
+    }
+    let thread = guild
+        .threads
+        .iter()
+        .find(|thread| thread.id == channel_id)?;
+    permission_channel(guild, thread)
+}
+
+fn permission_channel<'a>(
+    guild: &'a serenity::model::guild::Guild,
+    channel: &'a serenity::model::channel::GuildChannel,
+) -> Option<&'a serenity::model::channel::GuildChannel> {
+    if is_thread(channel.kind) {
         let parent_id = channel.parent_id?;
         return guild.channels.get(&parent_id);
     }
@@ -1258,13 +1328,9 @@ mod tests {
                 }],
             ),
         );
-        assert!(
-            !super::can_mention_everyone_in(
-                &guild,
-                ChannelId::new(CHANNEL),
-                UserId::new(MEMBER),
-                &[],
-            ),
+        assert_eq!(
+            super::mention_permission_in(&guild, ChannelId::new(CHANNEL), UserId::new(MEMBER), &[],),
+            super::MentionPermission::Denied,
             "channel deny beats the default role"
         );
 
@@ -1300,28 +1366,238 @@ mod tests {
                 }],
             ),
         );
-        guild.channels.insert(
-            ChannelId::new(THREAD),
-            ch(THREAD, ChannelType::PublicThread, Some(PARENT), vec![]),
-        );
-        assert!(
-            super::can_mention_everyone_in(
+        guild
+            .threads
+            .push(ch(THREAD, ChannelType::PublicThread, Some(PARENT), vec![]));
+        assert_eq!(
+            super::mention_permission_in(
                 &guild,
                 ChannelId::new(THREAD),
                 UserId::new(MEMBER),
                 &[RoleId::new(ROLE)],
             ),
+            super::MentionPermission::Allowed,
             "thread uses the parent channel"
         );
         assert!(
-            !super::can_mention_everyone_in(
+            everyone_attempt(true, false).is_none(),
+            "a member allowed in the parent channel is not punished in the thread"
+        );
+
+        guild.threads.clear();
+        guild
+            .threads
+            .push(ch(THREAD, ChannelType::PublicThread, Some(404), vec![]));
+        assert_eq!(
+            super::mention_permission_in(
+                &guild,
+                ChannelId::new(THREAD),
+                UserId::new(MEMBER),
+                &[RoleId::new(ROLE)],
+            ),
+            super::MentionPermission::Unknown,
+            "a thread whose parent is not cached is unknown"
+        );
+        assert_eq!(
+            super::mention_permission_in(
                 &guild,
                 ChannelId::new(404),
                 UserId::new(MEMBER),
                 &[RoleId::new(ROLE)],
             ),
-            "missing channel fails toward moderation"
+            super::MentionPermission::Unknown,
+            "a channel missing from the guild cache is unknown"
         );
+    }
+
+    fn everyone_attempt(can_mention: bool, unknown: bool) -> Option<crate::automod::PendingAction> {
+        use crate::automod::{AutomodEngine, MsgCtx};
+        use crate::state::CachedGuildConfig;
+        use crate::types::{ActionDef, GuildSettings, RuleDef};
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut rules = HashMap::new();
+        rules.insert(
+            "custom:0123456789abcdef".to_string(),
+            RuleDef {
+                name: "custom".into(),
+                description: String::new(),
+                enabled: true,
+                dry_run: false,
+                params: serde_json::json!({ "kind": "everyone_attempt" }),
+                actions: vec![ActionDef {
+                    at: 1,
+                    action: "ban".into(),
+                    duration_minutes: 0,
+                    delete_days: 0,
+                    reason: "r".into(),
+                }],
+                whitelist_roles: vec![],
+                whitelist_channels: vec![],
+                whitelist_users: vec![],
+                skip_moderators: false,
+                include_channels: vec![],
+                log_automod: true,
+                open_case: true,
+            },
+        );
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules,
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let roles = [];
+        let message = MsgCtx {
+            guild_id: 100,
+            message_id: 1,
+            channel_id: 70,
+            author_id: 42,
+            content: "@everyone",
+            attachment_count: 0,
+            everyone_mentions: 1,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: &roles,
+            is_moderator: false,
+            can_mention_everyone: can_mention,
+            mention_permission_unknown: unknown,
+        };
+        AutomodEngine::new().evaluate(&cfg, &message)
+    }
+
+    #[test]
+    fn mention_check_uses_the_message_author_when_the_partial_user_is_null() {
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::guild::{Guild, Member, PartialMember, Role};
+        use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+
+        const GUILD: u64 = 100;
+        const AUTHOR: u64 = 42;
+        const CHANNEL: u64 = 7;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.permissions = perms;
+            role.name = "r".into();
+            role
+        }
+        fn ch(id: u64, overwrites: Vec<PermissionOverwrite>) -> GuildChannel {
+            let mut channel = GuildChannel::default();
+            channel.id = ChannelId::new(id);
+            channel.guild_id = GuildId::new(GUILD);
+            channel.kind = ChannelType::Text;
+            channel.permission_overwrites = overwrites;
+            channel.name = "c".into();
+            channel
+        }
+        fn gateway_partial() -> PartialMember {
+            serde_json::from_value(serde_json::json!({
+                "deaf": false,
+                "joined_at": null,
+                "mute": false,
+                "nick": null,
+                "roles": [],
+                "pending": false,
+                "premium_since": null,
+                "guild_id": GUILD.to_string(),
+                "user": null,
+                "permissions": null,
+                "unusual_dm_activity_until": null,
+                "avatar": null,
+                "banner": null,
+                "avatar_decoration_data": null,
+            }))
+            .unwrap()
+        }
+
+        let partial = gateway_partial();
+        assert!(partial.user.is_none(), "gateway partial has no user");
+        assert_ne!(
+            Member::from(partial.clone()).user.id,
+            UserId::new(AUTHOR),
+            "Member::from fills a default user id"
+        );
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(1);
+        guild.name = "g".into();
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        guild.channels.insert(
+            ChannelId::new(CHANNEL),
+            ch(
+                CHANNEL,
+                vec![PermissionOverwrite {
+                    allow: Permissions::MENTION_EVERYONE,
+                    deny: Permissions::empty(),
+                    kind: PermissionOverwriteType::Member(UserId::new(AUTHOR)),
+                }],
+            ),
+        );
+        let allowed = super::message_author_scope(
+            0,
+            &guild,
+            ChannelId::new(CHANNEL),
+            UserId::new(AUTHOR),
+            &partial,
+        );
+        assert_eq!(allowed.mention, super::MentionPermission::Allowed);
+        assert!(
+            everyone_attempt(
+                allowed.mention == super::MentionPermission::Allowed,
+                allowed.mention == super::MentionPermission::Unknown,
+            )
+            .is_none(),
+            "a channel allow for the message author is not punished"
+        );
+
+        guild.channels.insert(
+            ChannelId::new(CHANNEL),
+            ch(
+                CHANNEL,
+                vec![PermissionOverwrite {
+                    allow: Permissions::empty(),
+                    deny: Permissions::MENTION_EVERYONE,
+                    kind: PermissionOverwriteType::Member(UserId::new(AUTHOR)),
+                }],
+            ),
+        );
+        guild
+            .roles
+            .get_mut(&RoleId::new(GUILD))
+            .unwrap()
+            .permissions = Permissions::MENTION_EVERYONE;
+        let denied = super::message_author_scope(
+            0,
+            &guild,
+            ChannelId::new(CHANNEL),
+            UserId::new(AUTHOR),
+            &partial,
+        );
+        assert_eq!(denied.mention, super::MentionPermission::Denied);
+        let pending = everyone_attempt(
+            denied.mention == super::MentionPermission::Allowed,
+            denied.mention == super::MentionPermission::Unknown,
+        )
+        .expect("author deny still matches");
+        assert!(!pending.mention_permission_unknown);
+        assert_eq!(pending.action.action, "ban");
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub(crate) enum ReportDisposition {
     Retryable,
 }
 
+#[derive(Clone)]
 pub enum MatchPolicy {
     Image(jmodguard::image_spam::Policy),
     Text(jmodguard::text_spam::Policy),
@@ -228,12 +229,21 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
-    enforce(app, ctx, found, rule, name).await
+    enforce(
+        app,
+        ctx.http.as_ref(),
+        ctx.cache.as_ref(),
+        found,
+        rule,
+        name,
+    )
+    .await
 }
 
-async fn enforce(
+pub(crate) async fn enforce(
     app: &Arc<BotState>,
-    ctx: &Context,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
     found: Match,
     rule: &str,
     name: &str,
@@ -288,26 +298,10 @@ async fn enforce(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
-    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
-        .await
-        .unwrap_or(true)
-    {
-        return ReportDisposition::Retryable;
-    }
-    punish_proven_match(
-        app,
-        ctx.http.as_ref(),
-        ctx.cache.as_ref(),
-        found,
-        rule,
-        name,
-        rule_def,
-        enrollment,
-    )
-    .await
+    punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -344,6 +338,36 @@ async fn punish_proven_match(
         ]);
         crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
+    }
+    if !found
+        .policy
+        .clone()
+        .still_proving(app, &found, Instant::now())
+    {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; matched observations were invalidated".into(),
+            ),
+            ("reason".into(), found.reason.clone()),
+            (
+                "content".into(),
+                "one or more proving messages were edited, deleted, or expired".into(),
+            ),
+        ]);
+        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        return ReportDisposition::Consumed;
+    }
+    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
+        .await
+        .unwrap_or(true)
+    {
+        return ReportDisposition::Retryable;
     }
     let roles: Vec<u64> = member
         .as_ref()
@@ -1318,20 +1342,34 @@ mod tests {
         let mut rule = crate::defaults::default_rules().remove(2);
         rule.enabled = true;
         rule.skip_moderators = true;
+        let policy = jmodguard::text_spam::Policy {
+            mode: "exact_text".into(),
+            window_secs: 60,
+            min_channels: 3,
+            min_length: 20,
+            enforce: true,
+        };
+        let now = Instant::now();
+        let text = "abcdefghijklmnopqrst";
+        let messages = app
+            .text_spam
+            .seed_exact_text(
+                10,
+                99,
+                (0, 0),
+                &policy,
+                now,
+                &[(42, 11, text), (43, 12, text), (44, 13, text)],
+            )
+            .expect("three channels still prove the match");
         let found = Match {
             kind: Kind::Text,
             guild: 10,
             author: 99,
             channel: 11,
-            policy: MatchPolicy::Text(jmodguard::text_spam::Policy {
-                mode: "exact_text".into(),
-                window_secs: 60,
-                min_channels: 3,
-                min_length: 20,
-                enforce: true,
-            }),
+            policy: MatchPolicy::Text(policy),
             token: (0, 0),
-            messages: vec![(11, 42)],
+            messages,
             excerpts: Vec::new(),
             attachments: Vec::new(),
             reason: "repeated text".into(),

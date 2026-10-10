@@ -97,8 +97,12 @@ or `ban` with `delete_days` 0–7). Types:
   true): URL/invite detection or `attachment_count > 0`.
 - **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
   flag) when the member lacks Mention Everyone in that channel, including role
-  and member overwrites and the parent channel of a thread. Owning the bot
-  application is not a permission.
+  and member overwrites and the parent channel of a thread. Active threads are
+  read from the guild thread list, then their parent channel. Owning the bot
+  application is not a permission. If the channel is not in the guild channel
+  list or the active thread list, or a thread's parent channel is not cached,
+  the permission is unknown: the message is deleted, a warning is logged, and
+  the bot does not kick or ban. A cached deny still kicks or bans.
 - **honeypot_role** — `params.role_id`; fires when that role is **added** (default
   action kick). Channel include lists do not apply.
 
@@ -118,6 +122,8 @@ before enforcement. The message carries its channel, so the channel list cannot
 fail open or closed. If the guild cache cannot show whether the author is a
 moderator, matched messages are still deleted and a warning is logged, but the
 bot does not kick or ban. Custom rules that skip moderators use that same limit.
+An everyone-attempt whose channel permission cannot be resolved uses the same
+delete-and-warn limit, including when skip moderators is off.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 

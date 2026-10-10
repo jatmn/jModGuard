@@ -58,6 +58,9 @@ pub struct MsgCtx<'a> {
     pub member_roles: &'a [u64],
     pub is_moderator: bool,
     pub can_mention_everyone: bool,
+    /// Set when the channel, active thread, or thread parent was not cached.
+    /// The everyone-attempt rule still matches. Kick and ban are withheld.
+    pub mention_permission_unknown: bool,
 }
 
 /// A rule fired and an action decided (highest severity across rules wins).
@@ -67,6 +70,9 @@ pub struct PendingAction {
     pub action: ActionDef,
     pub strikes: u32,
     pub evidence: serde_json::Value,
+    /// The winning action is an everyone-attempt whose channel permission
+    /// could not be resolved. Kick and ban delete the message and stop.
+    pub mention_permission_unknown: bool,
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -218,6 +224,7 @@ impl AutomodEngine {
                 rule_name: rule.name.clone(),
                 action: action.clone(),
                 strikes,
+                mention_permission_unknown: false,
                 evidence: serde_json::json!({
                     "content": truncate(ctx.content, 2000),
                     "channel_id": ctx.channel_id,
@@ -287,6 +294,8 @@ impl AutomodEngine {
                 rule_name: rule.name.clone(),
                 action,
                 strikes: 1,
+                mention_permission_unknown: kind == "everyone_attempt"
+                    && ctx.mention_permission_unknown,
                 evidence: serde_json::json!({
                     "content": truncate(ctx.content, 2000),
                     "channel_id": ctx.channel_id,
@@ -403,6 +412,35 @@ pub async fn execute_pending(
     msg_channel: Option<u64>,
     pending: &PendingAction,
 ) {
+    execute_pending_with(
+        app,
+        ctx.http.as_ref(),
+        ctx.cache.as_ref(),
+        guild_id,
+        target,
+        provided_member,
+        display_name,
+        msg_id,
+        msg_channel,
+        pending,
+    )
+    .await
+}
+
+/// [`execute_pending`] for a caller that already holds the HTTP client and cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_pending_with(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    target: &serenity::model::user::User,
+    provided_member: Option<Member>,
+    display_name: &str,
+    msg_id: Option<u64>,
+    msg_channel: Option<u64>,
+    pending: &PendingAction,
+) {
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
@@ -441,7 +479,7 @@ pub async fn execute_pending(
                 .unwrap_or("")
                 .to_string(),
         );
-        logging::emit(app, ctx, guild_id, "automod", v).await;
+        logging::emit_to(app, http, guild_id, "automod", v).await;
         return;
     }
 
@@ -462,7 +500,7 @@ pub async fn execute_pending(
         .as_ref()
         .map(|member| member.roles.iter().map(|role| role.get()).collect())
         .or_else(|| {
-            ctx.cache.guild(guild_id).and_then(|guild| {
+            cache.guild(guild_id).and_then(|guild| {
                 guild.members.get(&target.id).map(|member| {
                     member
                         .roles
@@ -473,13 +511,9 @@ pub async fn execute_pending(
             })
         })
         .unwrap_or_default();
-    let moderator_unknown = crate::commands::cached_moderator_status(
-        app,
-        &ctx.cache,
-        guild_id,
-        target.id.get(),
-        &role_ids,
-    ) == crate::commands::ModeratorStatus::Unknown;
+    let moderator_unknown =
+        crate::commands::cached_moderator_status(app, cache, guild_id, target.id.get(), &role_ids)
+            == crate::commands::ModeratorStatus::Unknown;
     if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown)
         && matches!(rule.action.as_str(), "kick" | "ban")
     {
@@ -496,7 +530,7 @@ pub async fn execute_pending(
             }
             let _ = crate::discord::race_discord_call(
                 &app.activation,
-                ctx.http.delete_message(ch.into(), id.into(), None),
+                http.delete_message(ch.into(), id.into(), None),
             )
             .await;
         }
@@ -516,7 +550,46 @@ pub async fn execute_pending(
                     .unwrap_or("")
                     .to_string(),
             );
-            logging::emit(app, ctx, guild_id, "automod", v).await;
+            logging::emit_to(app, http, guild_id, "automod", v).await;
+        }
+        return;
+    }
+
+    if pending.mention_permission_unknown && matches!(rule.action.as_str(), "kick" | "ban") {
+        tracing::warn!(
+            guild_id = guild_id.get(),
+            user_id = target.id.get(),
+            rule_id = pending.rule_id.as_str(),
+            "{}",
+            jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING
+        );
+        if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
+            if !app.activation.may_record() {
+                return;
+            }
+            let _ = crate::discord::race_discord_call(
+                &app.activation,
+                http.delete_message(ch.into(), id.into(), None),
+            )
+            .await;
+        }
+        if log_automod {
+            let mut v = vars;
+            v.insert(
+                "action".into(),
+                format!(
+                    "delete; {}",
+                    jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING
+                ),
+            );
+            v.insert(
+                "content".into(),
+                pending.evidence["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            logging::emit_to(app, http, guild_id, "automod", v).await;
         }
         return;
     }
@@ -531,7 +604,7 @@ pub async fn execute_pending(
                 }
                 let _ = crate::discord::race_discord_call(
                     &app.activation,
-                    ctx.http.delete_message(ch.into(), id.into(), None),
+                    http.delete_message(ch.into(), id.into(), None),
                 )
                 .await;
             }
@@ -576,7 +649,7 @@ pub async fn execute_pending(
             let minutes = rule.duration_minutes.max(1) as i64;
             let member = member_for_selected_action(
                 provided_member.clone(),
-                ctx.cache
+                cache
                     .guild(guild_id)
                     .and_then(|g| g.members.get(&target.id).cloned()),
                 target.id,
@@ -592,7 +665,7 @@ pub async fn execute_pending(
                     }
                     match crate::discord::race_discord_call(
                         &app.activation,
-                        member.disable_communication_until_datetime(&ctx.http, until),
+                        member.disable_communication_until_datetime(http, until),
                     )
                     .await
                     {
@@ -639,7 +712,7 @@ pub async fn execute_pending(
         "kick" => {
             let member = member_for_selected_action(
                 provided_member.clone(),
-                ctx.cache
+                cache
                     .guild(guild_id)
                     .and_then(|g| g.members.get(&target.id).cloned()),
                 target.id,
@@ -650,7 +723,7 @@ pub async fn execute_pending(
                 }
                 let discord_err = match crate::discord::race_discord_call(
                     &app.activation,
-                    member.kick_with_reason(&ctx.http, &reason),
+                    member.kick_with_reason(http, &reason),
                 )
                 .await
                 {
@@ -692,7 +765,7 @@ pub async fn execute_pending(
         "ban" => {
             let decision = crate::member_directory::observe_ban_handoff(
                 app,
-                ctx.http.as_ref(),
+                http,
                 guild_id.get(),
                 target.id.get(),
                 crate::member_directory::MarkerSave::Missing,
@@ -795,7 +868,7 @@ pub async fn execute_pending(
                             let raced = crate::discord::race_discord_call(
                                 &app.activation,
                                 guild_id.ban_with_reason(
-                                    &ctx.http,
+                                    http,
                                     target.id,
                                     rule.delete_days,
                                     &reason,
@@ -893,7 +966,7 @@ pub async fn execute_pending(
             .unwrap_or("")
             .to_string(),
     );
-    logging::emit(app, ctx, guild_id, "automod", v).await;
+    logging::emit_to(app, http, guild_id, "automod", v).await;
 }
 
 fn member_for_selected_action(
@@ -984,6 +1057,7 @@ mod tests {
             member_roles: &roles,
             is_moderator: false,
             can_mention_everyone: false,
+            mention_permission_unknown: false,
         };
         let first = engine.evaluate(&cfg, &message).expect("first ban");
         assert_eq!(first.action.action, "ban");
@@ -1059,6 +1133,7 @@ mod tests {
             member_roles: &[],
             is_moderator: is_mod,
             can_mention_everyone: can_everyone,
+            mention_permission_unknown: false,
         }
     }
 
@@ -1329,5 +1404,281 @@ mod tests {
         assert!(
             jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], true).is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn uncached_thread_deletes_everyone_attempt_without_kick_or_ban() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing::instrument::WithSubscriber;
+
+        use serenity::model::guild::{Guild, PartialMember};
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+        use serenity::model::user::User;
+
+        use crate::automod::{AutomodEngine, MsgCtx, execute_pending_with};
+        use crate::state::{BotState, CachedGuildConfig};
+        use crate::types::{ActionDef, GuildSettings, RuleDef};
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok()?;
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => return None,
+                }
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
+                    break;
+                }
+            }
+            let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+            let header = String::from_utf8_lossy(&buf[..header_end]);
+            let mut parts = header.lines().next()?.split_whitespace();
+            let method = parts.next()?.to_string();
+            let path = parts.next()?.to_string();
+            Some((method, path))
+        }
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop_guard = Stop(Arc::clone(&stop));
+        let server_lines = Arc::clone(&lines);
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let Some((method, path)) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        server_lines
+                            .lock()
+                            .unwrap()
+                            .push(format!("{method} {path}"));
+                        let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        const THREAD: u64 = 70;
+        const AUTHOR: u64 = 99;
+        const MESSAGE: u64 = 42;
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        guild.name = "g".into();
+        assert!(!guild.channels.contains_key(&ChannelId::new(THREAD)));
+        assert!(
+            guild
+                .threads
+                .iter()
+                .all(|thread| thread.id != ChannelId::new(THREAD))
+        );
+        let partial: PartialMember = serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": "10",
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap();
+        let scope = crate::commands::message_author_scope(
+            0,
+            &guild,
+            ChannelId::new(THREAD),
+            UserId::new(AUTHOR),
+            &partial,
+        );
+        assert_eq!(scope.mention, crate::commands::MentionPermission::Unknown);
+
+        let id = "custom:0123456789abcdef".to_string();
+        let mut rules = HashMap::new();
+        rules.insert(
+            id,
+            RuleDef {
+                name: "custom".into(),
+                description: String::new(),
+                enabled: true,
+                dry_run: false,
+                params: serde_json::json!({ "kind": "everyone_attempt" }),
+                actions: vec![ActionDef {
+                    at: 1,
+                    action: "ban".into(),
+                    duration_minutes: 0,
+                    delete_days: 0,
+                    reason: "r".into(),
+                }],
+                whitelist_roles: vec![],
+                whitelist_channels: vec![],
+                whitelist_users: vec![],
+                skip_moderators: false,
+                include_channels: vec![],
+                log_automod: true,
+                open_case: true,
+            },
+        );
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules,
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let roles = [];
+        let message = MsgCtx {
+            guild_id: 10,
+            message_id: MESSAGE,
+            channel_id: THREAD,
+            author_id: AUTHOR,
+            content: "@everyone",
+            attachment_count: 0,
+            everyone_mentions: 1,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: &roles,
+            is_moderator: scope.is_moderator,
+            can_mention_everyone: scope.mention == crate::commands::MentionPermission::Allowed,
+            mention_permission_unknown: scope.mention
+                == crate::commands::MentionPermission::Unknown,
+        };
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &message)
+            .expect("unknown permission still matches");
+        assert!(pending.mention_permission_unknown);
+        assert_eq!(pending.action.action, "ban");
+
+        let path = std::env::temp_dir().join(format!(
+            "mention_unknown_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let mut user = User::default();
+        user.id = UserId::new(AUTHOR);
+        user.name = "member".into();
+        let log = CapturedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        execute_pending_with(
+            &app,
+            &http,
+            &cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(MESSAGE),
+            Some(THREAD),
+            &pending,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        drop(stop_guard);
+        let _ = server.join();
+        let seen = lines.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|line| {
+                line.starts_with("DELETE ") && line.contains(&format!("/messages/{MESSAGE}"))
+            }),
+            "the triggering message must be deleted: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "unknown mention permission must not ban: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/members/"))),
+            "unknown mention permission must not kick: {seen:?}"
+        );
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("WARN")
+                && output.contains(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING),
+            "{output}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 }

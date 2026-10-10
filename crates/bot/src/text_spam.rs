@@ -424,6 +424,44 @@ impl Detector {
             None => AdmitOutcome::Admitted,
         }
     }
+
+    /// Indexes exact-text posts so a punishment test still has a live proof
+    /// after the post-lookup recheck.
+    #[cfg(test)]
+    pub(crate) fn seed_exact_text(
+        &self,
+        guild: u64,
+        author: u64,
+        token: (u64, u64),
+        policy: &Policy,
+        now: Instant,
+        posts: &[(u64, u64, &str)],
+    ) -> Option<Vec<(u64, u64)>> {
+        let mut matched = None;
+        for (id, channel, text) in posts {
+            let outcome = self.admit(
+                guild,
+                author,
+                Post {
+                    id: *id,
+                    channel: *channel,
+                    at: now,
+                    edited_ms: 0,
+                    text: (*text).into(),
+                    cost: text.len(),
+                    revision: self.revision(),
+                },
+                token,
+                policy,
+                now,
+                false,
+            );
+            if let AdmitOutcome::Matched(messages) = outcome {
+                matched = Some(messages);
+            }
+        }
+        matched
+    }
 }
 
 fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
@@ -1169,5 +1207,266 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, 1), (11, 2), (12, 3)]
         );
+    }
+
+    #[tokio::test]
+    async fn enforce_drops_a_match_invalidated_during_member_lookup() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::spam_actions::{self, Kind, Match, MatchPolicy, ReportDisposition};
+        use crate::state::BotState;
+        use crate::types::ActionDef;
+
+        const TEXT: &str = "abcdefghijklmnopqrst";
+        const MEMBER_JSON: &str = r#"{
+            "user": {
+                "id": "99",
+                "username": "member",
+                "global_name": null,
+                "avatar": null,
+                "banner": null,
+                "accent_color": null,
+                "locale": null,
+                "verified": null,
+                "email": null,
+                "public_flags": null,
+                "member": null,
+                "primary_guild": null,
+                "avatar_decoration_data": null,
+                "collectibles": null
+            },
+            "nick": null,
+            "avatar": null,
+            "banner": null,
+            "roles": [],
+            "joined_at": null,
+            "premium_since": null,
+            "deaf": false,
+            "mute": false,
+            "flags": 0,
+            "permissions": null,
+            "communication_disabled_until": null,
+            "unusual_dm_activity_until": null,
+            "avatar_decoration_data": null
+        }"#;
+
+        fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => return None,
+                }
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
+                    break;
+                }
+            }
+            let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+            let header = String::from_utf8_lossy(&buf[..header_end]);
+            let mut parts = header.lines().next()?.split_whitespace();
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        }
+
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop_guard = Stop(Arc::clone(&stop));
+        let server_lines = Arc::clone(&lines);
+        let server_started = Arc::clone(&started);
+        let server_release = Arc::clone(&release);
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let Some((method, path)) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        server_lines.lock().push(format!("{method} {path}"));
+                        let body = if method == "GET" && path.contains("/members/") {
+                            server_started.store(true, Ordering::SeqCst);
+                            while !server_release.load(Ordering::SeqCst)
+                                && !server_stop.load(Ordering::Relaxed)
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            MEMBER_JSON
+                        } else {
+                            ""
+                        };
+                        let status = if body.is_empty() {
+                            "204 No Content"
+                        } else {
+                            "200 OK"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "spam_invalidate_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+        let mut rule = crate::defaults::default_rules().remove(2);
+        rule.enabled = true;
+        rule.dry_run = false;
+        rule.skip_moderators = false;
+        rule.actions = vec![
+            ActionDef {
+                at: 1,
+                action: "delete".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "Repeated text".into(),
+            },
+            ActionDef {
+                at: 1,
+                action: "ban".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "Repeated text".into(),
+            },
+        ];
+        let live = jmodguard::text_spam::Policy::parse(&rule).unwrap();
+        crate::db::upsert_rule(&app.db, 10, "repeat_text", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let now = Instant::now();
+        assert_eq!(
+            app.text_spam
+                .admit(10, 99, post(101, 11, now, TEXT), token, &live, now, false),
+            AdmitOutcome::Admitted
+        );
+        assert_eq!(
+            app.text_spam
+                .admit(10, 99, post(102, 12, now, TEXT), token, &live, now, false),
+            AdmitOutcome::Admitted
+        );
+        let messages = matched(app.text_spam.admit(
+            10,
+            99,
+            post(103, 13, now, TEXT),
+            token,
+            &live,
+            now,
+            false,
+        ))
+        .expect("three channels prove the match before lookup");
+        let found = Match {
+            kind: Kind::Text,
+            guild: 10,
+            author: 99,
+            channel: 11,
+            policy: MatchPolicy::Text(live),
+            token,
+            messages,
+            excerpts: Vec::new(),
+            attachments: Vec::new(),
+            reason: "repeated text".into(),
+        };
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let app_enforce = Arc::clone(&app);
+        let task = tokio::spawn(async move {
+            spam_actions::enforce(
+                &app_enforce,
+                &http,
+                &cache,
+                found,
+                "repeat_text",
+                "Repeated text",
+            )
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "member lookup did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app.text_spam.invalidate(10, 11, 101);
+        release.store(true, Ordering::SeqCst);
+        let disposition = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("enforce hung after the member lookup")
+            .unwrap();
+        drop(stop_guard);
+        let _ = server.join();
+        assert_eq!(disposition, ReportDisposition::Consumed);
+        let seen = lines.lock().clone();
+        assert!(
+            seen.iter()
+                .any(|line| line.starts_with("GET ") && line.contains("/members/")),
+            "lookup must run before the proof is rechecked: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|line| !(line.starts_with("DELETE ") && line.contains("/messages/"))),
+            "an invalidated match must not delete: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|line| !line.contains("/bans/")),
+            "an invalidated match must not ban: {seen:?}"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 }

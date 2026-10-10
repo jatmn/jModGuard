@@ -280,6 +280,11 @@ pub fn rule_scope_skips(
 pub const UNKNOWN_MODERATOR_WARNING: &str =
     "moderator status unknown; deleting the message and skipping kick or ban";
 
+/// Logged when the channel, active thread, or thread parent is not cached.
+/// The message is still deleted. Kick and ban are not.
+pub const UNKNOWN_MENTION_PERMISSION_WARNING: &str =
+    "mention permission unknown; deleting the message and skipping kick or ban";
+
 /// A channel id travels with the message, so only the moderator lookup can fail.
 /// Unknown status must not be treated as permission to kick or ban.
 pub fn withhold_member_penalty(skip_moderators: bool, moderator_unknown: bool) -> bool {
