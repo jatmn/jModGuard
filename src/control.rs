@@ -183,6 +183,9 @@ pub fn parse_private_bind(raw: &str) -> Result<SocketAddr> {
 pub fn public_error(err: &anyhow::Error) -> String {
     for cause in err.chain() {
         let text = cause.to_string();
+        if text.contains(" binding") {
+            return "write failed".to_owned();
+        }
         if !text.is_empty() && text.len() <= 300 && !text.contains(['/', '\\', '@']) {
             return text;
         }

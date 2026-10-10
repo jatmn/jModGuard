@@ -450,6 +450,40 @@ mod tests {
     }
 
     #[test]
+    fn container_read_rejects_a_mismatched_route_signature() {
+        let key = load_writer_key(&"x".repeat(32)).unwrap();
+        let nonces = Mutex::new(NonceWindow::new());
+        let cross = ReadWire {
+            direction: CONTAINER_READ_DIRECTION.to_owned(),
+            route: CONTROL_LINK_ROUTE.to_owned(),
+            nonce: random_nonce().unwrap(),
+            expires_ms: now_ms().saturating_add(CONTROL_REQUEST_LIFETIME_MS),
+        };
+        let cross_body = signed_read_body(&key, &cross);
+        let err = open_read(&key, &cross_body, &nonces).unwrap_err();
+        assert_eq!(err.to_string(), "read failed: route binding");
+    }
+
+    #[test]
+    fn control_link_rejects_a_mismatched_route_signature() {
+        let key = load_writer_key(&"x".repeat(32)).unwrap();
+        let nonces = Mutex::new(NonceWindow::new());
+        let frame = seal(
+            &key,
+            &crate::db::ControlOp::AbortUpgrade { id: "1".into() },
+            7,
+        )
+        .unwrap();
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&frame[4 + MAC_HEX..]).expect("control wire json");
+        wire["route"] = serde_json::Value::String(CONTAINER_READ_PATH.to_owned());
+        let json = serde_json::to_vec(&wire).unwrap();
+        let cross_body = resign_payload(&key, &json);
+        let err = open_frame(&key, &cross_body, &nonces).unwrap_err();
+        assert_eq!(err.to_string(), "write failed: route binding");
+    }
+
+    #[test]
     fn control_link_rejects_a_container_read_bound_signature() {
         let key = load_writer_key(&"x".repeat(32)).unwrap();
         let nonces = Mutex::new(NonceWindow::new());
