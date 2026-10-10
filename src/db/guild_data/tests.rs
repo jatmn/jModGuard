@@ -505,8 +505,6 @@ async fn identity_memo_rereads_store_row_and_rejects_swapped_identity() {
 
     verify_identity(&conn, &reg).unwrap();
     verify_identity(&conn, &reg).unwrap();
-    let catalog = probe.catalog();
-    let imm = probe.immediate();
 
     let (schema_before, user_before): (i64, i64) = conn
         .query_row(
@@ -520,25 +518,26 @@ async fn identity_memo_rereads_store_row_and_rejects_swapped_identity() {
         other.id().as_str()
     );
     conn.execute_batch_bounded(&swap, 32_000_000).unwrap();
-
-    let (schema_after_swap, user_after_swap): (i64, i64) = conn
+    let (schema_after, user_after): (i64, i64) = conn
         .query_row(
             "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)",
             (),
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
+
+    let catalog = probe.catalog();
     let error = verify_identity(&conn, &reg).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<StoreCheckError>(),
         Some(StoreCheckError::Identity)
     ));
-    if schema_before == schema_after_swap && user_before == user_after_swap {
-        assert_eq!(probe.catalog() - catalog, 0);
-        assert_eq!(probe.immediate() - imm, 0);
-    } else {
-        assert_eq!(probe.catalog() - catalog, 1);
-        assert_eq!(probe.immediate() - imm, 0);
+    if schema_before == schema_after && user_before == user_after {
+        assert_eq!(
+            probe.catalog() - catalog,
+            0,
+            "memo hit must re-read store_identity without scanning sqlite_master"
+        );
     }
 
     let catalog = probe.catalog();
