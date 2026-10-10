@@ -316,8 +316,11 @@ pub fn open_read(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Result
     }
     let wire: ReadWire =
         serde_json::from_slice(json).map_err(|_| anyhow::anyhow!("read failed"))?;
-    if wire.direction != CONTAINER_READ_DIRECTION || wire.route != CONTAINER_READ_PATH {
-        anyhow::bail!("read failed");
+    if wire.direction != CONTAINER_READ_DIRECTION {
+        anyhow::bail!("read failed: direction binding");
+    }
+    if wire.route != CONTAINER_READ_PATH {
+        anyhow::bail!("read failed: route binding");
     }
     let now = now_ms();
     if wire.expires_ms < now.saturating_sub(SKEW_MS) {
@@ -411,43 +414,65 @@ mod tests {
         assert!(open_read(&key, &body, &nonces).is_err());
     }
 
+    fn signed_read_body(key: &[u8], wire: &ReadWire) -> Vec<u8> {
+        let json = serde_json::to_vec(wire).unwrap();
+        let mut body = mac_hex(key, &json).into_bytes();
+        body.extend_from_slice(&json);
+        body
+    }
+
+    fn resign_payload(key: &[u8], json: &[u8]) -> Vec<u8> {
+        let mut body = mac_hex(key, json).into_bytes();
+        body.extend_from_slice(json);
+        body
+    }
+
     #[test]
-    fn container_read_rejects_a_control_link_frame() {
+    fn container_read_rejects_a_control_bound_signature() {
         let key = load_writer_key(&"x".repeat(32)).unwrap();
+        let nonces = Mutex::new(NonceWindow::new());
+        let read_body = seal_read(&key).unwrap();
+        open_read(&key, &read_body, &nonces).expect("read route accepts its own frame");
+
+        let cross = ReadWire {
+            direction: CONTROL_LINK_DIRECTION.to_owned(),
+            route: CONTROL_LINK_ROUTE.to_owned(),
+            nonce: random_nonce().unwrap(),
+            expires_ms: now_ms().saturating_add(CONTROL_REQUEST_LIFETIME_MS),
+        };
+        let cross_body = signed_read_body(&key, &cross);
+        let err = open_read(&key, &cross_body, &nonces).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "read failed: direction binding",
+            "control-bound wire must not open on the read route"
+        );
+    }
+
+    #[test]
+    fn control_link_rejects_a_container_read_bound_signature() {
+        let key = load_writer_key(&"x".repeat(32)).unwrap();
+        let nonces = Mutex::new(NonceWindow::new());
         let frame = seal(
             &key,
             &crate::db::ControlOp::AbortUpgrade { id: "1".into() },
             7,
         )
         .unwrap();
-        let body = &frame[4..];
-        let nonces = Mutex::new(NonceWindow::new());
-        assert!(open_read(&key, body, &nonces).is_err());
-        let mut wire: serde_json::Value = serde_json::from_slice(&body[MAC_HEX..]).unwrap();
+        open_frame(&key, &frame[4..], &nonces).expect("control route accepts its own frame");
+
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&frame[4 + MAC_HEX..]).expect("control wire json");
         wire["direction"] = serde_json::Value::String(CONTAINER_READ_DIRECTION.to_owned());
         wire["route"] = serde_json::Value::String(CONTAINER_READ_PATH.to_owned());
         let json = serde_json::to_vec(&wire).unwrap();
-        let mut forged = mac_hex(&key, &json).into_bytes();
-        forged.extend_from_slice(&json);
-        assert!(open_read(&key, &forged, &nonces).is_err());
-    }
-
-    #[test]
-    fn control_link_rejects_a_container_read_frame() {
-        let key = load_writer_key(&"x".repeat(32)).unwrap();
-        let body = seal_read(&key).unwrap();
-        let nonces = Mutex::new(NonceWindow::new());
-        assert!(open_frame(&key, &body, &nonces).is_err());
-        let mut wire: serde_json::Value = serde_json::from_slice(&body[MAC_HEX..]).unwrap();
-        wire["direction"] = serde_json::Value::String(CONTROL_LINK_DIRECTION.to_owned());
-        wire["route"] = serde_json::Value::String(CONTROL_LINK_ROUTE.to_owned());
-        wire["request_id"] = serde_json::Value::String("0".repeat(64));
-        wire["actor_user_id"] = serde_json::json!(0);
-        wire["op"] = serde_json::json!({"AbortUpgrade":{"id":"1"}});
-        let json = serde_json::to_vec(&wire).unwrap();
-        let mut forged = mac_hex(&key, &json).into_bytes();
-        forged.extend_from_slice(&json);
-        assert!(open_frame(&key, &forged, &nonces).is_err());
+        let cross_body = resign_payload(&key, &json);
+        let err = open_frame(&key, &cross_body, &nonces).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "write failed: direction binding",
+            "read-bound wire must not open on the control route"
+        );
     }
 
     #[test]

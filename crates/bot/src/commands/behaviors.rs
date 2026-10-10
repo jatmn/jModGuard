@@ -1536,6 +1536,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // API-read blocking vs the async runtime is covered by
+    // `stats_hanging_api_read_returns_within_fetch_timeout`.
     #[tokio::test]
     async fn stats_api_fetch_does_not_block_concurrent_async_work() {
         let path =
