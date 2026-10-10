@@ -863,7 +863,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
             let response = stats_response(
-                &env.app.reads,
+                env.app,
                 env.guild_id.get() as i64,
                 env.app.start.elapsed().as_secs(),
             )
@@ -882,14 +882,37 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
 // helpers
 // ---------------------------------------------------------------------------
 
-async fn stats_response(db: &db::Db, guild_id: i64, uptime_seconds: u64) -> Result<String> {
+async fn stats_response(
+    app: &crate::state::BotState,
+    guild_id: i64,
+    uptime_seconds: u64,
+) -> Result<String> {
+    let read = jmodguard::read_link::try_read_link(
+        &app.cfg.bot.read_target,
+        app.cfg.bot.control_secret.as_str(),
+    )?;
+    let api_fetch = async {
+        if let Some(link) = read {
+            link.fetch_container_use().await
+        } else {
+            None
+        }
+    };
+    let api_task = tokio::spawn(api_fetch);
     // Cached by the background sampler. This does not open cgroup files or wait.
     let bot_use = jmodguard::cgroup::latest_container_sample();
-    let s = db::guild_stats(db, guild_id).await?;
-    let updates = db::component_updates_status(db)
+    let s = db::guild_stats(&app.reads, guild_id).await?;
+    let updates = db::component_updates_status(&app.reads)
         .await
         .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
         .ok();
+    let api_reading = tokio::time::timeout(jmodguard::read_link::STATS_FETCH_TIMEOUT, api_task)
+        .await
+        .ok()
+        .and_then(|joined| joined.ok().flatten());
+    let (api_sample, api_copy) = api_reading
+        .map(|response| (Some(response.sample), Some(response.copy)))
+        .unwrap_or((None, None));
     Ok(crate::templates::stats_with_container_use(
         crate::templates::stats_response_with_update_availability(
             uptime_seconds,
@@ -900,8 +923,8 @@ async fn stats_response(db: &db::Db, guild_id: i64, uptime_seconds: u64) -> Resu
             chrono::Utc::now().timestamp(),
         ),
         &bot_use,
-        // API numbers stay unavailable until a private reading can be passed here.
-        None,
+        api_sample.as_ref(),
+        api_copy.as_deref(),
     ))
 }
 
@@ -1465,7 +1488,10 @@ mod tests {
             conn.execute_batch_bounded("INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at) VALUES (10, 42, 99, 'test', '2026-10-05T00:00:00Z')", 1024 * 1024)?;
             Ok(())
         }).await.unwrap();
-        let healthy = stats_response(&db, 10, 20).await.unwrap();
+        let app =
+            crate::state::BotState::new(crate::config::BotProcessConfig::default(), db.clone())
+                .unwrap();
+        let healthy = stats_response(&app, 10, 20).await.unwrap();
         assert!(healthy.contains("**⚠️ Warns:** `1`"), "{healthy}");
         assert!(healthy.contains("**Bot CPU:** `unavailable`"), "{healthy}");
         assert!(
@@ -1484,7 +1510,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let unavailable = stats_response(&db, 10, 20).await.unwrap();
+        let unavailable = stats_response(&app, 10, 20).await.unwrap();
         assert!(
             unavailable.contains("**Release status**\nunavailable"),
             "{unavailable}"
@@ -1508,7 +1534,7 @@ mod tests {
             "{unavailable}"
         );
         assert!(!unavailable.contains("0.0%"), "{unavailable}");
-        drop(db);
+        drop(app);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1518,6 +1544,7 @@ mod tests {
         let text = crate::templates::stats_with_container_use(
             "stats".into(),
             &jmodguard::cgroup::latest_container_sample(),
+            None,
             None,
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(200));

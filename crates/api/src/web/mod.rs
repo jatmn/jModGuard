@@ -6,6 +6,7 @@ mod discord_retry;
 pub mod members;
 pub mod oauth;
 pub mod preview;
+mod private_read;
 pub mod recovery;
 pub mod state;
 pub mod updates;
@@ -1253,6 +1254,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/health/", get(health))
             .route("/ready", get(ready))
             .route("/ready/", get(ready))
+            .route(
+                jmodguard::read_link::CONTAINER_READ_PATH,
+                axum::routing::post(private_read::container_use),
+            )
             .merge(sessioned),
     )
     .with_state(app.clone())

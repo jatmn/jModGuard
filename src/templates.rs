@@ -220,19 +220,24 @@ const CONTAINER_USE_TEMPLATE: &str = "\
 
 /// Append this process's container sample to a stats reply.
 ///
-/// `api` stays `None` until a private reading can be supplied. Those rows
-/// then render as `unavailable`, not zero. The bot sample is a cache copy;
+/// `api` stays `None` when no private reading arrived. Those rows then render
+/// as `unavailable`, not zero. `api_copy` labels whichever API copy answered.
+/// The bot sample is a cache copy;
 /// this function does not read cgroup files or wait for a CPU sample.
 pub fn stats_with_container_use(
     moderation: String,
     bot: &crate::cgroup::ContainerSample,
     api: Option<&crate::cgroup::ContainerSample>,
+    api_copy: Option<&str>,
 ) -> String {
     render(
         "{moderation}\n\n{containers}",
         &BTreeMap::from([
             ("moderation".into(), moderation),
-            ("containers".into(), container_use_section(bot, api)),
+            (
+                "containers".into(),
+                container_use_section(bot, api, api_copy),
+            ),
         ]),
     )
 }
@@ -240,35 +245,48 @@ pub fn stats_with_container_use(
 fn container_use_section(
     bot: &crate::cgroup::ContainerSample,
     api: Option<&crate::cgroup::ContainerSample>,
+    api_copy: Option<&str>,
 ) -> String {
     let unavailable = crate::cgroup::ContainerSample::unavailable();
     let api = api.unwrap_or(&unavailable);
     render(
         CONTAINER_USE_TEMPLATE,
         &BTreeMap::from([
-            ("bot_cpu".into(), cpu_value(bot)),
-            ("bot_memory".into(), memory_value(bot)),
-            ("api_cpu".into(), cpu_value(api)),
-            ("api_memory".into(), memory_value(api)),
+            ("bot_cpu".into(), cpu_value(bot, None)),
+            ("bot_memory".into(), memory_value(bot, None)),
+            ("api_cpu".into(), cpu_value(api, api_copy)),
+            ("api_memory".into(), memory_value(api, api_copy)),
         ]),
     )
 }
 
-fn cpu_value(sample: &crate::cgroup::ContainerSample) -> String {
-    sample
+fn cpu_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> String {
+    let base = sample
         .cpu_tenths
         .map(format_cpu_tenths)
-        .unwrap_or_else(|| "unavailable".to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    label_copy(base, copy)
 }
 
-fn memory_value(sample: &crate::cgroup::ContainerSample) -> String {
+fn memory_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> String {
     let Some(memory) = sample.memory else {
-        return "unavailable".to_string();
+        return label_copy("unavailable".to_string(), None);
     };
     let used = format_bytes(memory.program_bytes);
-    match memory.limit {
+    let base = match memory.limit {
         crate::cgroup::MemoryLimit::Unlimited => format!("{used} / no limit"),
         crate::cgroup::MemoryLimit::Bytes(limit) => format!("{used} / {}", format_bytes(limit)),
+    };
+    label_copy(base, copy)
+}
+
+fn label_copy(value: String, copy: Option<&str>) -> String {
+    if value == "unavailable" {
+        return value;
+    }
+    match copy {
+        Some(label) if !label.is_empty() => format!("{value} ({label})"),
+        _ => value,
     }
 }
 
@@ -600,6 +618,7 @@ mod presentation_tests {
             "**📊 Stats (this server)**".into(),
             &crate::cgroup::ContainerSample::unavailable(),
             None,
+            None,
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
@@ -625,7 +644,7 @@ mod presentation_tests {
             }),
             cpu_tenths: Some(250),
         };
-        let text = stats_with_container_use("stats".into(), &bot, None);
+        let text = stats_with_container_use("stats".into(), &bot, None, None);
         assert!(text.contains("**Bot CPU:** `25.0%`"), "{text}");
         assert!(
             text.contains("**Bot memory (real program use):** `900 B / no limit`"),
@@ -647,7 +666,7 @@ mod presentation_tests {
             }),
             cpu_tenths: None,
         };
-        let text = stats_with_container_use("stats".into(), &bot, None);
+        let text = stats_with_container_use("stats".into(), &bot, None, None);
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
             text.contains("**Bot memory (real program use):** `4.0 KiB / 8.0 KiB`"),
@@ -676,7 +695,7 @@ mod presentation_tests {
             memory: reading.memory,
             cpu_tenths: None,
         };
-        let text = stats_with_container_use("stats".into(), &sample, None);
+        let text = stats_with_container_use("stats".into(), &sample, None, None);
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
             text.contains("**Bot memory (real program use):** `unavailable`"),
