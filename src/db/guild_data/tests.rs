@@ -447,12 +447,9 @@ async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
     catalog = probe.catalog();
     imm = probe.immediate();
 
-    conn.clear_schema_verification();
-    verify_identity(&conn, &reg).unwrap();
-    assert_eq!(probe.catalog() - catalog, 1);
-    assert_eq!(probe.immediate() - imm, 0);
-    catalog = probe.catalog();
-    imm = probe.immediate();
+    // Remote checkout resets the stream before every operation. That reset is
+    // not a reconnect and must keep the memo.
+    conn.reset_remote_stream().unwrap();
     verify_identity(&conn, &reg).unwrap();
     assert_eq!(probe.catalog() - catalog, 0);
     assert_eq!(probe.immediate() - imm, 0);
@@ -471,8 +468,8 @@ async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
     store
         .db
         .with_conn(move |conn| {
-            conn.clear_schema_verification();
             verify_identity(conn, &pool_reg)?;
+            conn.reset_remote_stream()?;
             let cat = pool_probe.catalog();
             let start_imm = pool_probe.immediate();
             verify_identity(conn, &pool_reg)?;

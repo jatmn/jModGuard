@@ -1161,20 +1161,16 @@ impl Connection {
     /// autocommit cursor baton. The server may expire it while the lease is
     /// idle. libSQL reset clears local stream state without sending SQL or
     /// replaying a failed request; explicit transactions use separate streams.
+    ///
+    /// Checkout calls this on every remote operation. The guild-store identity
+    /// memo stays. A later check still reads schema_version and user_version,
+    /// and a new connection starts without a memo.
     pub(crate) fn reset_remote_stream(&self) -> Result<()> {
-        self.clear_schema_verification();
         self.runtime
             .block_on_database("reset pooled stream", async {
                 self.inner.reset().await;
                 Ok::<_, anyhow::Error>(())
             })
-    }
-
-    pub(crate) fn clear_schema_verification(&self) {
-        *self
-            .schema_verification
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
