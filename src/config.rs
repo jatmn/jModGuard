@@ -70,6 +70,8 @@ pub struct BotConfig {
     pub control_bind: String,
     /// API dial target for the control link. No default. Empty disables writes.
     pub control_target: String,
+    /// API loopback bind for container-use readings (`JMODGUARD_READ_BIND`).
+    pub read_bind: String,
     /// Bot dial target for private API container-use readings. Empty disables them.
     pub read_target: String,
     /// Shared HMAC secret for the private writer link. Not a database token.
@@ -308,6 +310,7 @@ impl Default for BotConfig {
             message_capture_enabled: true,
             control_bind: "127.0.0.1:8082".into(),
             control_target: String::new(),
+            read_bind: crate::read_link::default_read_bind().to_owned(),
             read_target: String::new(),
             control_secret: ControlSecret::default(),
         }
@@ -800,6 +803,9 @@ impl Config {
         if let Ok(value) = env::var("JMODGUARD_CONTROL_TARGET") {
             self.bot.control_target = value;
         }
+        if let Ok(value) = env::var("JMODGUARD_READ_BIND") {
+            self.bot.read_bind = value;
+        }
         if let Ok(value) = env::var("JMODGUARD_READ_TARGET") {
             self.bot.read_target = value;
         }
@@ -1206,7 +1212,9 @@ mod tests {
         assert_eq!(api_expose, 8080);
         assert_eq!(web, 8080);
         assert_eq!(control, 8082);
-        let mut ports = [bot_health, api_bind, control];
+        let read = port_of(&cfg.bot.read_bind);
+        assert_eq!(read, 8083);
+        let mut ports = [bot_health, api_bind, control, read];
         ports.sort_unstable();
         assert!(
             ports.windows(2).all(|pair| pair[0] != pair[1]),

@@ -26,10 +26,15 @@ pub const CONTROL_REQUEST_LIFETIME_MS: i64 = 15_000;
 const OUTCOME_GRACE_MS: i64 = 4_000;
 const LOOKUP_POLL: Duration = Duration::from_millis(250);
 const _: () = assert!(CONTROL_REQUEST_LIFETIME_MS <= MAX_AGE_MS);
-const SKEW_MS: i64 = 5_000;
+pub(crate) const SKEW_MS: i64 = 5_000;
 const _: () = assert!(OUTCOME_GRACE_MS < SKEW_MS);
 const SEEN_LIMIT: usize = 4096;
 const REQUEST_ID_HEX: usize = 64;
+
+/// HMAC direction for API-to-bot writer frames.
+pub const CONTROL_LINK_DIRECTION: &str = "bot-control";
+/// HMAC route for API-to-bot writer frames.
+pub const CONTROL_LINK_ROUTE: &str = "control-write";
 
 /// Exact status when the API cannot reach the bot writer.
 pub const CONTROL_LINK_UNAVAILABLE: &str = "control link unavailable";
@@ -286,6 +291,8 @@ pub fn seal_with_request(
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(valid_request_id(request_id), "write failed");
     let wire = Wire {
+        direction: CONTROL_LINK_DIRECTION.to_owned(),
+        route: CONTROL_LINK_ROUTE.to_owned(),
         nonce: random_nonce()?,
         request_id: request_id.to_owned(),
         expires_ms,
@@ -319,6 +326,13 @@ pub fn open_frame(
         anyhow::bail!("write failed");
     }
     let wire: Wire = serde_json::from_slice(json).map_err(|_| anyhow::anyhow!("write failed"))?;
+    if wire.direction != CONTROL_LINK_DIRECTION || wire.route != CONTROL_LINK_ROUTE {
+        anyhow::bail!("write failed");
+    }
+    let now = now_ms();
+    if wire.expires_ms < now.saturating_sub(SKEW_MS) {
+        anyhow::bail!("write failed");
+    }
     if !valid_request_id(&wire.request_id) {
         anyhow::bail!("write failed");
     }
@@ -445,6 +459,8 @@ fn is_unique_local(v6: Ipv6Addr) -> bool {
 
 #[derive(Serialize, Deserialize)]
 struct Wire {
+    direction: String,
+    route: String,
     nonce: String,
     request_id: String,
     expires_ms: i64,
