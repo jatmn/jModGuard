@@ -494,6 +494,116 @@ async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
 }
 
 #[tokio::test]
+async fn identity_memo_rereads_store_row_and_rejects_swapped_identity() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let other = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    verify_identity(&conn, &reg).unwrap();
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+
+    let (schema_before, user_before): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)",
+            (),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let swap = format!(
+        "DROP TRIGGER store_identity_no_update; UPDATE store_identity SET store_id='{}'; CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity BEGIN SELECT RAISE(ABORT,'immutable'); END",
+        other.id().as_str()
+    );
+    conn.execute_batch_bounded(&swap, 32_000_000).unwrap();
+
+    let (schema_after_swap, user_after_swap): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT schema_version FROM pragma_schema_version), (SELECT user_version FROM pragma_user_version)",
+            (),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let error = verify_identity(&conn, &reg).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Identity)
+    ));
+    if schema_before == schema_after_swap && user_before == user_after_swap {
+        assert_eq!(probe.catalog() - catalog, 0);
+        assert_eq!(probe.immediate() - imm, 0);
+    } else {
+        assert_eq!(probe.catalog() - catalog, 1);
+        assert_eq!(probe.immediate() - imm, 0);
+    }
+
+    let catalog = probe.catalog();
+    assert!(verify_identity(&conn, &reg).is_err());
+    assert_eq!(probe.catalog() - catalog, 1);
+}
+
+#[tokio::test]
+async fn identity_memo_hit_still_avoids_catalog_reads() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+    verify_identity(&conn, &reg).unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+}
+
+#[tokio::test]
+async fn identity_memo_miss_for_different_expected_registration_rescans_catalog() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let other = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+
+    verify_identity(&conn, &reg).unwrap();
+    let catalog = probe.catalog();
+    assert!(verify_identity(&conn, &other).is_err());
+    assert_eq!(probe.catalog() - catalog, 1);
+}
+
+#[tokio::test]
+async fn identity_memo_survives_pooled_checkout_reset() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let mut store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    crate::db::test_mark_connection_pool_remote(&mut store.db);
+
+    store
+        .db
+        .with_conn_sync(|conn| verify_identity(conn, &reg))
+        .unwrap();
+    let catalog = probe.catalog();
+    let imm = probe.immediate();
+
+    store
+        .db
+        .with_conn_sync(|conn| verify_identity(conn, &reg))
+        .unwrap();
+    assert_eq!(probe.catalog() - catalog, 0);
+    assert_eq!(probe.immediate() - imm, 0);
+}
+
+#[tokio::test]
 async fn identity_verification_uses_one_catalog_read_and_rechecks_schema() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;

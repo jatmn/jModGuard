@@ -1382,4 +1382,11 @@ fn note_writable_open() {
 }
 
 #[cfg(test)]
+pub(crate) fn test_mark_connection_pool_remote(db: &mut Db) {
+    Arc::get_mut(&mut db.connections)
+        .expect("connection pool must be uniquely owned in this test")
+        .remote = true;
+}
+
+#[cfg(test)]
 mod tests;

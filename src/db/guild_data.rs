@@ -124,6 +124,44 @@ fn verify_identity(conn: &impl SqlExecutor, expected: &StoreRegistration) -> Res
     verify_identity_version(conn, expected, VERSION)
 }
 
+fn verify_identity_row(
+    conn: &impl SqlExecutor,
+    expected_store_id: &str,
+    expected_dedicated: Option<i64>,
+) -> Result<()> {
+    let identity = conn
+        .query_row(
+            "SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?)),
+        )
+        .optional()?;
+    let Some((family, id, dedicated)) = identity else {
+        return Err(StoreCheckError::Schema.into());
+    };
+    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+    anyhow::ensure!(
+        id == expected_store_id && dedicated == expected_dedicated,
+        StoreCheckError::Identity
+    );
+    Ok(())
+}
+
+fn clear_identity_memo_for_versions(
+    slot: &std::sync::Arc<std::sync::Mutex<Option<crate::db_compat::SchemaVerification>>>,
+    probe_schema_version: i64,
+    probe_user_version: i64,
+) {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if matches!(
+        guard.as_ref(),
+        Some(memo) if memo.schema_version == probe_schema_version
+            && memo.user_version == probe_user_version
+    ) {
+        *guard = None;
+    }
+}
+
 fn verify_identity_version(
     conn: &impl SqlExecutor,
     expected: &StoreRegistration,
@@ -148,7 +186,11 @@ fn verify_identity_version(
         && memo.store_id == expected_store_id
         && memo.dedicated_guild_id == expected_dedicated
     {
-        return Ok(());
+        let hit = verify_identity_row(conn, expected_store_id, expected_dedicated);
+        if hit.is_err() {
+            clear_identity_memo_for_versions(&slot, probe_schema_version, probe_user_version);
+        }
+        return hit;
     }
 
     let full = (|| -> Result<()> {
@@ -271,15 +313,7 @@ fn verify_identity_version(
                 StoreCheckError::Schema
             );
         }
-        let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
-        let Some((family, id, dedicated)) = identity else {
-            return Err(StoreCheckError::Schema.into());
-        };
-        anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
-        anyhow::ensure!(
-            id == expected_store_id && dedicated == expected_dedicated,
-            StoreCheckError::Identity
-        );
+        verify_identity_row(conn, expected_store_id, expected_dedicated)?;
         *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(crate::db_compat::SchemaVerification {
                 schema_version,
@@ -290,14 +324,7 @@ fn verify_identity_version(
         Ok(())
     })();
     if full.is_err() {
-        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(
-            guard.as_ref(),
-            Some(memo) if memo.schema_version == probe_schema_version
-                && memo.user_version == probe_user_version
-        ) {
-            *guard = None;
-        }
+        clear_identity_memo_for_versions(&slot, probe_schema_version, probe_user_version);
     }
     full
 }

@@ -1163,8 +1163,8 @@ impl Connection {
     /// replaying a failed request; explicit transactions use separate streams.
     ///
     /// Checkout calls this on every remote operation. The guild-store identity
-    /// memo stays. A later check still reads schema_version and user_version,
-    /// and a new connection starts without a memo.
+    /// memo stays. A later check still reads schema_version, user_version, and
+    /// the store_identity row, and a new connection starts without a memo.
     pub(crate) fn reset_remote_stream(&self) -> Result<()> {
         self.runtime
             .block_on_database("reset pooled stream", async {
