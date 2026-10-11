@@ -34,6 +34,11 @@ const SESSION_REFRESH: &str = "refresh_token";
 const COOKIE_OAUTH_STATE: &str = "jmodguard_oauth_state";
 const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
 const SESSION_COOKIE_NAME: &str = "jmodguard_session";
+const SESSION_INACTIVITY_SECS: i64 = 7 * 24 * 60 * 60;
+const AUTH_SESSION_IDLE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(SESSION_INACTIVITY_SECS as u64);
+const AUTH_SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const AUTH_SESSION_DEAD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 /// Bunny (and other CDNs) honor this independently of browser Cache-Control.
@@ -213,9 +218,12 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
             .auth_sessions
             .get(&id)
             .map(|entry| Arc::clone(entry.value()))
-        && auth.lock().await.dead
     {
-        return Err(AuthLost.into());
+        let mut auth = auth.lock().await;
+        if auth.dead {
+            return Err(AuthLost.into());
+        }
+        auth.last_used = Some(std::time::Instant::now());
     }
     let owner = app.cfg.bot.owner_id;
     if owner == 0 || user_id != owner {
@@ -296,11 +304,24 @@ pub(super) struct SessionAuth {
     refresh: Option<String>,
     guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
     dead: bool,
+    dead_since: Option<std::time::Instant>,
+    last_used: Option<std::time::Instant>,
     refresh_hold: Option<(oauth::Cooldown, bool)>,
     refresh_backoff: std::time::Duration,
 }
 
 impl SessionAuth {
+    /// Clear payloads even when a loaded request still owns this coordinator.
+    fn retire(&mut self) {
+        self.dead = true;
+        self.dead_since.get_or_insert_with(std::time::Instant::now);
+        self.token = None;
+        self.refresh = None;
+        self.guilds = None;
+        self.refresh_hold = None;
+        self.refresh_backoff = std::time::Duration::ZERO;
+    }
+
     fn refresh_wait(&self) -> Option<(std::time::Duration, bool)> {
         let (deadline, rate_limited) = self.refresh_hold?;
         let remaining = match deadline {
@@ -318,7 +339,7 @@ impl SessionAuth {
         self.refresh_backoff = if self.refresh_backoff.is_zero() {
             REFRESH_RETRY_MIN
         } else {
-            (self.refresh_backoff * 2).min(REFRESH_RETRY_MAX)
+            (self.refresh_backoff.saturating_mul(2)).min(REFRESH_RETRY_MAX)
         };
         let limit = error.downcast_ref::<oauth::DiscordRateLimit>();
         let wait = limit.map_or_else(
@@ -330,7 +351,7 @@ impl SessionAuth {
             |limit| limit.retry_after,
         );
         self.refresh_hold = Some((
-            oauth::cooldown_deadline(std::time::Instant::now(), wait),
+            oauth::cooldown_deadline(std::time::Instant::now(), wait.min(REFRESH_RETRY_MAX)),
             limit.is_some(),
         ));
     }
@@ -364,11 +385,13 @@ async fn require_auth_with(
     let id = session
         .id()
         .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
+    app.sweep_auth_sessions();
     let state = Arc::clone(app.auth_sessions.entry(id).or_default().value());
     let mut state = state.lock().await;
     if state.dead {
         return Err(AuthLost.into());
     }
+    state.last_used = Some(std::time::Instant::now());
     let token = match &state.token {
         Some(token) => token.clone(),
         None => session
@@ -431,6 +454,10 @@ async fn require_auth_with(
         .as_ref()
         .is_err_and(|error| error.0.is::<oauth::DiscordUnauthorized>())
     {
+        if first.is_ok() {
+            state.refresh_hold = None;
+            state.refresh_backoff = std::time::Duration::ZERO;
+        }
         return first;
     }
     let refresh = state.refresh.clone();
@@ -479,10 +506,7 @@ async fn require_auth_with(
     }
     // Flush the API MemoryStore once. Keep the dead marker for requests that
     // already loaded the deleted record; they must not contact Discord again.
-    state.dead = true;
-    state.token = None;
-    state.refresh = None;
-    state.guilds = None;
+    state.retire();
     session.flush().await.map_err(anyhow::Error::from)?;
     Err(AuthLost.into())
 }
@@ -792,6 +816,7 @@ async fn logout(
         return error_page("untrusted request origin");
     }
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
+    state.retire_auth_session(session.id()).await;
     let _ = session.delete().await;
     Json(serde_json::json!({ "return_to": return_to })).into_response()
 }
@@ -935,13 +960,22 @@ async fn callback(
     headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
-    callback_response(session, &state.cfg, &state.oauth, headers, query.0).await
+    callback_response(
+        session,
+        &state.cfg,
+        &state.oauth,
+        Some(&state),
+        headers,
+        query.0,
+    )
+    .await
 }
 
 async fn callback_response(
     session: Session,
     cfg: &crate::config::ApiProcessConfig,
     oauth: &oauth::OAuthClient,
+    app: Option<&ApiState>,
     headers: HeaderMap,
     query: CallbackQuery,
 ) -> Response {
@@ -974,6 +1008,10 @@ async fn callback_response(
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
+    // Wait for any old-session refresh before rotation, then clear its payload.
+    if let Some(app) = app {
+        app.retire_auth_session(session.id()).await;
+    }
     if let Err(error) = store_login_session(
         &session,
         uid,
@@ -1257,7 +1295,9 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .with_name(SESSION_COOKIE_NAME)
         .with_secure(secure)
         .with_same_site(same_site)
-        .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
+        .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+            SESSION_INACTIVITY_SECS,
+        )));
 
     let sessioned = Router::new();
     #[cfg(feature = "embed-ui")]

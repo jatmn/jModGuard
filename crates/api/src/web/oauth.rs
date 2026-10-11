@@ -1072,6 +1072,31 @@ mod tests {
         assert_eq!(discord_retry_after(Some("0"), b"{}").as_secs(), 1);
         assert_eq!(discord_retry_after(Some("120"), b"{}").as_secs(), 120);
         assert_eq!(discord_retry_after(Some("90000"), b"{}").as_secs(), 90000);
+        for invalid in ["-1", "NaN", "inf", "-inf"] {
+            assert_eq!(
+                discord_retry_after(Some(invalid), b"{}"),
+                Duration::from_secs(1)
+            );
+        }
+        for huge in [u64::MAX.to_string(), f64::MAX.to_string()] {
+            assert_eq!(discord_retry_after(Some(&huge), b"{}"), Duration::MAX);
+        }
+        assert_eq!(
+            discord_retry_after(None, br#"{"retry_after":1e308}"#),
+            Duration::MAX
+        );
+        assert_eq!(
+            discord_retry_after(None, br#"{"retry_after":-1}"#),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            discord_retry_after(None, br#"{"retry_after":NaN}"#),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            discord_retry_after(None, br#"{"retry_after":1e400}"#),
+            Duration::from_secs(1)
+        );
         assert!(matches!(
             cooldown_deadline(Instant::now(), Duration::MAX),
             Cooldown::RestOfProcess

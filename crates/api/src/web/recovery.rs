@@ -264,7 +264,7 @@ async fn maintenance_callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    callback_response(session, &state.cfg, &state.oauth, headers, query).await
+    callback_response(session, &state.cfg, &state.oauth, None, headers, query).await
 }
 
 /// Bound and healthy during control-store startup, without constructing ApiState

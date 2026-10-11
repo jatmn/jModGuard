@@ -24,6 +24,7 @@ pub struct ApiState {
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub(super) auth_sessions:
         DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
+    pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
@@ -70,12 +71,62 @@ impl ApiState {
             writer,
             guild_cache: DashMap::new(),
             auth_sessions: DashMap::new(),
+            auth_sessions_swept_at: std::sync::Mutex::new(None),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
             session_store: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Called on authentication before insertion; no task or store I/O is needed.
+    /// Inactivity uses the same bound as the session cookie. A request owning an
+    /// Arc (including one queued on the mutex) cannot lose its single-flight owner.
+    pub(super) fn sweep_auth_sessions(&self) {
+        let Ok(mut swept_at) = self.auth_sessions_swept_at.try_lock() else {
+            return;
+        };
+        if swept_at.is_some_and(|at| at.elapsed() < super::AUTH_SESSION_SWEEP_INTERVAL) {
+            return;
+        }
+        *swept_at = Some(Instant::now());
+        self.auth_sessions.retain(|_, entry| {
+            if Arc::strong_count(entry) != 1 {
+                return true;
+            }
+            let Ok(mut auth) = entry.try_lock() else {
+                return true;
+            };
+            let expired = if auth.dead {
+                auth.dead_since
+                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_DEAD_TTL)
+            } else {
+                auth.last_used
+                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_IDLE_TTL)
+            };
+            if expired {
+                auth.retire();
+            }
+            !expired
+        });
+    }
+
+    /// Logout and successful OAuth callbacks retire before deleting/rotating
+    /// the store record. Wait for refresh to finish; never split its coordinator.
+    pub(super) async fn retire_auth_session(&self, id: Option<tower_sessions::session::Id>) {
+        let Some(id) = id else { return };
+        let Some(entry) = self
+            .auth_sessions
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return;
+        };
+        let mut auth = entry.lock().await;
+        auth.retire();
+        self.auth_sessions
+            .remove_if(&id, |_, current| Arc::ptr_eq(current, &entry));
     }
 
     /// Use this store for the next `web::router` build. Production leaves it empty.
