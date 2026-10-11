@@ -202,9 +202,23 @@ impl AuthCtx {
     }
 }
 
+async fn reject_retired_session(app: &ApiState, session: &Session) -> ApiResult<()> {
+    if session
+        .id()
+        .is_some_and(|id| app.retired_auth_sessions.contains_key(&id))
+    {
+        // A late response can restore a deleted record. Clear this handle as
+        // well as the store row so response middleware cannot save it again.
+        session.flush().await.map_err(anyhow::Error::from)?;
+        return Err(AuthLost.into());
+    }
+    Ok(())
+}
+
 /// Session owner check that does not call Discord. Preview sessions never
 /// inherit owner authority. The returned context has no guild membership.
 pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthCtx> {
+    reject_retired_session(app, session).await?;
     if preview::current().is_some() {
         return Err(ApiError(anyhow::anyhow!(
             "global config requires the configured bot owner (bot.owner_id)"
@@ -213,6 +227,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
     let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
         return Err(ApiError(anyhow::anyhow!("not authenticated")));
     };
+    reject_retired_session(app, session).await?;
     if let Some(id) = session.id()
         && let Some(auth) = app
             .auth_sessions
@@ -220,7 +235,9 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
             .map(|entry| Arc::clone(entry.value()))
     {
         let mut auth = auth.lock().await;
+        reject_retired_session(app, session).await?;
         if auth.dead {
+            session.flush().await.map_err(anyhow::Error::from)?;
             return Err(AuthLost.into());
         }
         auth.last_used = Some(std::time::Instant::now());
@@ -373,6 +390,7 @@ async fn require_auth_with(
     session: &Session,
     guild_mode: GuildListMode,
 ) -> ApiResult<AuthCtx> {
+    reject_retired_session(app, session).await?;
     let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
         return Err(ApiError(anyhow::anyhow!("not authenticated")));
     };
@@ -386,9 +404,25 @@ async fn require_auth_with(
         .id()
         .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
     app.sweep_auth_sessions();
-    let state = Arc::clone(app.auth_sessions.entry(id).or_default().value());
+    // Hold the vacant tombstone entry through coordinator lookup/insertion.
+    // Retirement cannot insert its fence and remove the coordinator between
+    // this check and insertion. Release all map guards before awaiting.
+    let state = match app.retired_auth_sessions.entry(id) {
+        dashmap::mapref::entry::Entry::Occupied(_) => None,
+        dashmap::mapref::entry::Entry::Vacant(fence) => {
+            let state = Arc::clone(app.auth_sessions.entry(id).or_default().value());
+            drop(fence);
+            Some(state)
+        }
+    };
+    let Some(state) = state else {
+        session.flush().await.map_err(anyhow::Error::from)?;
+        return Err(AuthLost.into());
+    };
     let mut state = state.lock().await;
+    reject_retired_session(app, session).await?;
     if state.dead {
+        session.flush().await.map_err(anyhow::Error::from)?;
         return Err(AuthLost.into());
     }
     state.last_used = Some(std::time::Instant::now());
@@ -504,8 +538,11 @@ async fn require_auth_with(
             return result;
         }
     }
-    // Flush the API MemoryStore once. Keep the dead marker for requests that
-    // already loaded the deleted record; they must not contact Discord again.
+    // Fence before clearing payloads/flushing. The short-lived coordinator
+    // marker may be swept while an independent response still has a late save.
+    app.retired_auth_sessions
+        .entry(id)
+        .or_insert_with(std::time::Instant::now);
     state.retire();
     session.flush().await.map_err(anyhow::Error::from)?;
     Err(AuthLost.into())
@@ -817,7 +854,7 @@ async fn logout(
     }
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
     state.retire_auth_session(session.id()).await;
-    let _ = session.delete().await;
+    let _ = session.flush().await;
     Json(serde_json::json!({ "return_to": return_to })).into_response()
 }
 
