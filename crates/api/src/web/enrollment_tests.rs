@@ -3613,15 +3613,15 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     f.app.sweep_auth_sessions();
     assert!(f.app.auth_sessions.is_empty());
     assert!(f.app.retired_auth_sessions.contains_key(&id));
-    // Seven-day retirement metadata is independent of the 30-second payload marker.
+    // Tombstone retirement metadata is independent of the 30-second payload marker.
     *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_IDLE_TTL - std::time::Duration::from_secs(1))
+        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL - std::time::Duration::from_secs(1))
         .unwrap();
     allow_coordinator_sweep(&f.app);
     f.app.sweep_auth_sessions();
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_IDLE_TTL)
+        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL)
         .unwrap();
     // Rate limiting applies to the tombstone sweep too.
     f.app.sweep_auth_sessions();
@@ -4203,6 +4203,91 @@ async fn review_blocker_oauth_rotation_ignores_unknown_cookie() {
                 .get_all("set-cookie")
                 .iter()
                 .any(|header| header.to_str().unwrap().starts_with(SESSION_COOKIE_NAME))
+        );
+    }
+}
+
+#[tokio::test]
+async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
+    use tower_sessions::SessionStore as _;
+    // Both owner-only recovery and Discord-backed authentication must fail.
+    for route in ["/api/service-upgrade", "/api/me"] {
+        let f = Fixture::new(true).await;
+        let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+        let (finish, response) = delayed_session_save(&f).await;
+        assert_eq!(
+            blocker_request(&f, "POST", "/logout", "").await.0,
+            StatusCode::OK
+        );
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        let retirement = tower_sessions::cookie::time::OffsetDateTime::now_utc();
+        finish.notify_one();
+        response.await.unwrap();
+        let mut revived = f.store.load(&id).await.unwrap().unwrap();
+        assert!(
+            revived.expiry_date >= retirement + CookieDuration::seconds(SESSION_INACTIVITY_SECS)
+        );
+        // Advance both clocks consistently: retirement was seven days + one
+        // second ago; the late response saved two minutes after retirement.
+        // No request observes the restored row before the production sweep.
+        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        revived.expiry_date =
+            tower_sessions::cookie::time::OffsetDateTime::now_utc() + CookieDuration::seconds(119);
+        f.store.save(&revived).await.unwrap();
+        allow_coordinator_sweep(&f.app);
+        f.app.sweep_auth_sessions();
+        let calls = (
+            f.discord.calls.load(Ordering::SeqCst),
+            f.discord.token_calls.load(Ordering::SeqCst),
+            f.discord.me_calls.load(Ordering::SeqCst),
+        );
+        let (status, body) = f.request("GET", route, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "late-saved identity became authoritative: {body}"
+        );
+        assert_eq!(body["code"], "auth_lost");
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst)
+            )
+        );
+
+        // After eight days and the row's own expiry, cleanup leaves an unknown
+        // ID. MemoryStore itself filters expired records on load.
+        revived.expiry_date =
+            tower_sessions::cookie::time::OffsetDateTime::now_utc() - CookieDuration::seconds(1);
+        f.store.save(&revived).await.unwrap();
+        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(24 * 60 * 60 + 1))
+            .unwrap();
+        allow_coordinator_sweep(&f.app);
+        f.app.sweep_auth_sessions();
+        assert!(!f.app.retired_auth_sessions.contains_key(&id));
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        let (status, body) = f.request("GET", "/api/service-upgrade", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "sign in to manage service upgrades");
+        let unknown = Session::new(Some(id), Arc::new(f.store.clone()), None);
+        let failure = session_owner(&f.app, &unknown).await.err().unwrap();
+        assert_eq!(failure.0.to_string(), "not authenticated");
+        assert!(body.get("code").is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst)
+            )
         );
     }
 }

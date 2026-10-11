@@ -25,8 +25,8 @@ pub struct ApiState {
     pub(super) auth_sessions:
         DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
     // One small ID/timestamp per retirement, bounded by sign-outs/rotations
-    // within seven days. This must share the session store's lifetime: if a
-    // persistent store is added, persist tombstones there or clear it on startup.
+    // within the tombstone lifetime. This must share the session store's lifetime:
+    // if a persistent store is added, persist tombstones there or clear it on startup.
     pub(super) retired_auth_sessions: DashMap<tower_sessions::session::Id, Instant>,
     pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -97,7 +97,7 @@ impl ApiState {
         }
         *swept_at = Some(Instant::now());
         self.retired_auth_sessions
-            .retain(|_, retired_at| retired_at.elapsed() < super::AUTH_SESSION_IDLE_TTL);
+            .retain(|_, retired_at| retired_at.elapsed() < super::AUTH_SESSION_TOMBSTONE_TTL);
         self.auth_sessions.retain(|_, entry| {
             if Arc::strong_count(entry) != 1 {
                 return true;

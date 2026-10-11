@@ -37,6 +37,13 @@ const SESSION_COOKIE_NAME: &str = "jmodguard_session";
 const SESSION_INACTIVITY_SECS: i64 = 7 * 24 * 60 * 60;
 const AUTH_SESSION_IDLE_TTL: std::time::Duration =
     std::time::Duration::from_secs(SESSION_INACTIVITY_SECS as u64);
+// A late save can only come from a request already in flight at retirement,
+// so its delay is limited by that request's remaining duration. A generous
+// 24-hour margin lets its renewed seven-day row expire before the tombstone,
+// provided that request finishes within the margin. There is no router-wide
+// request timeout; deliberately keep long service-upgrade applies unrestricted.
+const AUTH_SESSION_TOMBSTONE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(AUTH_SESSION_IDLE_TTL.as_secs() + 24 * 60 * 60);
 const AUTH_SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const AUTH_SESSION_DEAD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
