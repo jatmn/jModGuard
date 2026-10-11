@@ -287,12 +287,53 @@ pub async fn require_auth_fresh(app: &Arc<ApiState>, session: &Session) -> ApiRe
 const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(5);
 
+const REFRESH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+const REFRESH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Default)]
 pub(super) struct SessionAuth {
     token: Option<String>,
     refresh: Option<String>,
     guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
     dead: bool,
+    refresh_hold: Option<(oauth::Cooldown, bool)>,
+    refresh_backoff: std::time::Duration,
+}
+
+impl SessionAuth {
+    fn refresh_wait(&self) -> Option<(std::time::Duration, bool)> {
+        let (deadline, rate_limited) = self.refresh_hold?;
+        let remaining = match deadline {
+            oauth::Cooldown::Until(until) => {
+                until.checked_duration_since(std::time::Instant::now())?
+            }
+            oauth::Cooldown::RestOfProcess | oauth::Cooldown::AwaitingBody => {
+                std::time::Duration::MAX
+            }
+        };
+        Some((remaining, rate_limited))
+    }
+
+    fn hold_refresh(&mut self, error: &anyhow::Error) {
+        self.refresh_backoff = if self.refresh_backoff.is_zero() {
+            REFRESH_RETRY_MIN
+        } else {
+            (self.refresh_backoff * 2).min(REFRESH_RETRY_MAX)
+        };
+        let limit = error.downcast_ref::<oauth::DiscordRateLimit>();
+        let wait = limit.map_or_else(
+            || {
+                error
+                    .downcast_ref::<oauth::DiscordRetryAfter>()
+                    .map_or(self.refresh_backoff, |error| error.retry_after)
+            },
+            |limit| limit.retry_after,
+        );
+        self.refresh_hold = Some((
+            oauth::cooldown_deadline(std::time::Instant::now(), wait),
+            limit.is_some(),
+        ));
+    }
 }
 
 #[derive(Debug)]
@@ -351,6 +392,40 @@ async fn require_auth_with(
             .await
             .map_err(anyhow::Error::from)?;
     }
+    if let Some((retry_after, rate_limited)) = state.refresh_wait() {
+        // A hold never renews a successful snapshot, and permission checks
+        // cannot borrow the longer display cache while refresh is unavailable.
+        let guilds = if guild_list_cache_allowed(guild_mode) {
+            take_cached_guilds(guild_mode, app, user_id)
+        } else {
+            state.guilds.as_ref().and_then(|(at, guilds)| {
+                let max_age = if rate_limited {
+                    GUILD_AUTH_MAX_STALE
+                } else {
+                    GUILD_AUTH_CACHE_TTL
+                };
+                (at.elapsed() < max_age).then(|| guilds.clone())
+            })
+        };
+        if let Some(guilds) = guilds
+            && let Some(user) = cached_user(app, user_id)
+        {
+            let mut auth = AuthCtx {
+                user,
+                guilds,
+                enrollment: None,
+            };
+            preview::apply_overlay(&mut auth)?;
+            return Ok(auth);
+        }
+        return Err(if rate_limited {
+            oauth::DiscordRateLimit { retry_after }.into()
+        } else {
+            ApiError(anyhow::anyhow!(
+                "oauth token request temporarily unavailable"
+            ))
+        });
+    }
     let first = load_auth(app, user_id, &token, guild_mode, &mut state).await;
     if !first
         .as_ref()
@@ -359,11 +434,20 @@ async fn require_auth_with(
         return first;
     }
     let refresh = state.refresh.clone();
-    let refreshed = match refresh {
-        Some(refresh) => app.oauth.refresh(&refresh).await,
+    let refreshed = match &refresh {
+        Some(refresh) => app.oauth.refresh(refresh).await,
         None => Err(anyhow::anyhow!("session expired")),
     };
+    if let Err(error) = &refreshed
+        && refresh.is_some()
+        && !error.is::<oauth::DiscordUnauthorized>()
+    {
+        state.hold_refresh(error);
+        return Err(ApiError(refreshed.unwrap_err()));
+    }
     if let Ok(refreshed) = refreshed {
+        state.refresh_hold = None;
+        state.refresh_backoff = std::time::Duration::ZERO;
         state.token = Some(refreshed.access_token.clone());
         state.guilds = None;
         session

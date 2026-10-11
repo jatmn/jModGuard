@@ -169,6 +169,20 @@ impl std::fmt::Display for DiscordRateLimit {
 
 impl std::error::Error for DiscordRateLimit {}
 
+/// A temporary token-server failure with an explicit wait, without a 429 response.
+#[derive(Debug)]
+pub(super) struct DiscordRetryAfter {
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for DiscordRetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("oauth token request temporarily unavailable")
+    }
+}
+
+impl std::error::Error for DiscordRetryAfter {}
+
 /// Seconds advertised to the browser. Missing or zero Discord values still
 /// impose a one-second floor so callers do not hammer immediately. The HTTP
 /// handler returns immediately; this number is not a sleep.
@@ -329,15 +343,37 @@ impl OAuthClient {
             .context("oauth token request failed")?;
         let status = resp.status();
         let headers = resp.headers().clone();
+        let refused = status.is_client_error() && status.as_u16() != 429;
+        let server_retry_after = if status.is_server_error() {
+            header_retry_after(&headers).map(|header| discord_retry_after(Some(header), b"{}"))
+        } else {
+            None
+        };
         let bytes = match self
             .read_limited_body("token", status, &headers, resp)
             .await
         {
             Ok(bytes) => bytes,
             Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
-            Err(error) => return Err(error.context("oauth token response body failed")),
+            Err(error) => {
+                // A refusal stays permanent even with an unreadable body;
+                // transport/server failures keep credentials and any header wait.
+                if refused {
+                    return Err(DiscordUnauthorized.into());
+                }
+                if let Some(retry_after) = server_retry_after {
+                    return Err(DiscordRetryAfter { retry_after }.into());
+                }
+                return Err(error.context("oauth token response body failed"));
+            }
         };
         self.observe_route("token", status, &headers, &bytes).await;
+        if refused {
+            return Err(DiscordUnauthorized.into());
+        }
+        if let Some(retry_after) = server_retry_after {
+            return Err(DiscordRetryAfter { retry_after }.into());
+        }
         if status.as_u16() == 429 {
             return Err(DiscordRateLimit {
                 retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
