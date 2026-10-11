@@ -1483,8 +1483,8 @@ fn known_bad_image_removal_uses_reclaim_above_scaled_growth_stop() {
                 .unwrap()
                 .unwrap();
             let scope = ConfigurationScope::Guild(enrollment);
-            let write =
-                ConfigurationWriteScope::new(scope.clone(), scope).expect("configuration write scope");
+            let write = ConfigurationWriteScope::new(scope.clone(), scope)
+                .expect("configuration write scope");
             assert!(
                 tokio_test_block_on(add_enrolled_known_bad_image(
                     &bot,
@@ -1492,9 +1492,9 @@ fn known_bad_image_removal_uses_reclaim_above_scaled_growth_stop() {
                     &absent_hash,
                     None,
                 ))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("capacity budget exhausted")
+                .unwrap_err()
+                .to_string()
+                .contains("capacity budget exhausted")
             );
             let before = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
             assert!(
@@ -1516,8 +1516,12 @@ fn known_bad_image_removal_uses_reclaim_above_scaled_growth_stop() {
             let after_repeat = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
             assert_eq!(after_repeat.config, after_remove.config);
             assert!(
-                !tokio_test_block_on(remove_enrolled_known_bad_image(&bot, write.clone(), &absent_hash))
-                    .unwrap()
+                !tokio_test_block_on(remove_enrolled_known_bad_image(
+                    &bot,
+                    write.clone(),
+                    &absent_hash
+                ))
+                .unwrap()
             );
             let after_absent = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
             assert_eq!(after_absent.config, after_repeat.config);

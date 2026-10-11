@@ -785,9 +785,11 @@ async fn known_bad_image_remove_version_failure_rolls_back_and_retries() {
     );
     let unchanged = get_primary_versions(&f.db).await.unwrap();
     assert_eq!(unchanged.config, before.config);
-    f.db.with_conn(|conn| conn.execute_batch_bounded("DROP TRIGGER refuse_hash_remove_version", 4096))
-        .await
-        .unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER refuse_hash_remove_version", 4096)
+    })
+    .await
+    .unwrap();
     assert!(
         remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
             .await
@@ -867,10 +869,7 @@ async fn known_bad_image_add_and_remove_race_on_absent_hash_is_serializable() {
     assert!(remove_res.is_ok());
     let add = add_res.unwrap();
     let remove = remove_res.unwrap();
-    let rows = load_config_parts(&f.db, 10)
-        .await
-        .unwrap()
-        .known_bad_images;
+    let rows = load_config_parts(&f.db, 10).await.unwrap().known_bad_images;
     let present = rows.iter().any(|row| row.hash == hash);
     if remove && present {
         panic!("remove succeeded while the hash remained listed");
