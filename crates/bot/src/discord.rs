@@ -41,6 +41,71 @@ pub(crate) fn cutoff_discord_error() -> serenity::Error {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    Unauthorized,
+    Permanent,
+    Transient,
+}
+
+pub fn classify_retry(error: &serenity::Error) -> RetryClass {
+    if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error {
+        return classify_retry_response(response.status_code.as_u16(), response.error.code);
+    }
+    match classify_nickname_failure(error).0 {
+        NicknameFailureClass::Transient => RetryClass::Transient,
+        _ => RetryClass::Permanent,
+    }
+}
+
+pub fn classify_retry_error(error: &anyhow::Error) -> RetryClass {
+    error
+        .downcast_ref::<serenity::Error>()
+        .map_or(RetryClass::Transient, classify_retry)
+}
+
+fn classify_retry_response(status: u16, code: isize) -> RetryClass {
+    match status {
+        401 => RetryClass::Unauthorized,
+        _ if code == 50001 => RetryClass::Permanent,
+        408 | 429 | 500..=599 => RetryClass::Transient,
+        _ => RetryClass::Permanent,
+    }
+}
+
+/// Process-local REST retry deadline. Permanent errors wait for an explicit
+/// reset; unauthorized errors must never be reset by registry/config changes.
+#[derive(Default)]
+pub struct RestRetry {
+    failures: u32,
+    pub(crate) next: Option<std::time::Instant>,
+    pub(crate) stopped: bool,
+}
+
+impl RestRetry {
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        !self.stopped && self.next.is_none_or(|next| now >= next)
+    }
+
+    pub fn fail(&mut self, class: RetryClass, now: std::time::Instant, base_secs: u64) {
+        if class != RetryClass::Transient {
+            self.stopped = true;
+            return;
+        }
+        let base = base_secs
+            .saturating_mul(1_u64 << self.failures.min(12))
+            .min(3600);
+        self.failures = self.failures.saturating_add(1);
+        // Time-derived jitter avoids aligning all guild retries to the poll.
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % (base / 4 + 1);
+        self.next = Some(now + std::time::Duration::from_secs((base + jitter).min(3600)));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicknameFailureClass {
     Transient,
     Dormant,
@@ -78,7 +143,7 @@ fn classify_nickname_response(status: u16, discord_code: isize) -> (NicknameFail
     if matches!(discord_code, 10004 | 50001) {
         return (NicknameFailureClass::Dormant, code);
     }
-    if status == 408 || status == 429 || status >= 500 {
+    if classify_retry_response(status, discord_code) == RetryClass::Transient {
         return (NicknameFailureClass::Transient, code);
     }
     (NicknameFailureClass::Terminal, code)
@@ -120,6 +185,25 @@ mod tests {
     use super::{NicknameFailureClass, classify_nickname_failure, classify_nickname_response};
 
     #[test]
+    fn transient_deadlines_grow_with_jitter_and_stop_at_one_hour() {
+        let mut retry = super::RestRetry::default();
+        let now = std::time::Instant::now();
+        let mut previous = 0;
+        for _ in 0..16 {
+            retry.fail(super::RetryClass::Transient, now, 30);
+            let wait = retry.next.unwrap().duration_since(now).as_secs();
+            assert!((30..=3600).contains(&wait));
+            assert!(wait >= previous);
+            previous = wait;
+            assert!(!retry.due(now + std::time::Duration::from_secs(5)));
+            assert!(retry.due(now + std::time::Duration::from_secs(3601)));
+        }
+        assert_eq!(previous, 3600);
+        retry.fail(super::RetryClass::Unauthorized, now, 30);
+        assert!(!retry.due(now + std::time::Duration::from_secs(7200)));
+    }
+
+    #[test]
     fn nickname_failure_lifecycle_classification() {
         assert_eq!(
             classify_nickname_response(404, 10004).0,
@@ -131,6 +215,14 @@ mod tests {
         );
         assert_eq!(
             classify_nickname_response(403, 50013).0,
+            NicknameFailureClass::Terminal
+        );
+        assert_eq!(
+            classify_nickname_response(404, 10007).0,
+            NicknameFailureClass::Terminal
+        );
+        assert_eq!(
+            classify_nickname_response(401, 0).0,
             NicknameFailureClass::Terminal
         );
         assert_eq!(

@@ -30,6 +30,12 @@ struct SlashSyncProgress {
     invalidated: bool,
 }
 
+struct SlashRetry {
+    target: u64,
+    revision: String,
+    retry: crate::discord::RestRetry,
+}
+
 #[derive(Default)]
 struct StartupNoticeTask {
     stopping: bool,
@@ -467,6 +473,8 @@ pub struct BotState {
     version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
+    slash_unauthorized: AtomicBool,
+    slash_retries: Mutex<HashMap<u64, SlashRetry>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
@@ -550,6 +558,8 @@ impl BotState {
             force_slash_registry_retry: AtomicBool::new(false),
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
+            slash_unauthorized: AtomicBool::new(false),
+            slash_retries: Mutex::new(HashMap::new()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
@@ -1021,6 +1031,9 @@ impl BotState {
     /// re-sync succeeds. Advancing before sync left failed guilds stale until
     /// the next command-registry write.
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
+        if self.slash_unauthorized.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let _version_reconcile = self.version_reconcile_lock.lock().await;
         let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
@@ -1090,6 +1103,7 @@ impl BotState {
         };
         let config_changed = config_revision_changed || primary.config != previous_config;
         if config_changed {
+            self.slash_retries.lock().clear();
             self.last_config_version
                 .store(primary.config, Ordering::SeqCst);
             self.invalidate_member_sync_scope();
@@ -1155,6 +1169,61 @@ impl BotState {
         self.force_slash_registry_retry
             .store(true, Ordering::SeqCst);
         *progress = None;
+    }
+
+    pub(crate) fn slash_sync_due(
+        &self,
+        guild: u64,
+        target: u64,
+        revision: &str,
+        now: Instant,
+    ) -> bool {
+        if self.slash_unauthorized.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut retries = self.slash_retries.lock();
+        if retries
+            .get(&guild)
+            .is_some_and(|retry| retry.target != target || retry.revision != revision)
+        {
+            retries.remove(&guild);
+        }
+        retries.get(&guild).is_none_or(|retry| retry.retry.due(now))
+    }
+
+    pub(crate) fn slash_sync_failed(
+        &self,
+        guild: u64,
+        target: u64,
+        revision: &str,
+        class: crate::discord::RetryClass,
+    ) {
+        use crate::discord::RetryClass;
+        if class == RetryClass::Unauthorized {
+            if !self.slash_unauthorized.swap(true, Ordering::SeqCst) {
+                tracing::error!(
+                    "slash sync stopped: Discord rejected the bot token; restart with a valid token"
+                );
+            }
+            return;
+        }
+        let mut retries = self.slash_retries.lock();
+        let retry = retries.entry(guild).or_insert_with(|| SlashRetry {
+            target,
+            revision: revision.to_owned(),
+            retry: Default::default(),
+        });
+        if class == RetryClass::Permanent && !retry.retry.stopped {
+            tracing::warn!(
+                guild_id = guild,
+                "slash sync parked until registry/config changes or the bot rejoins"
+            );
+        }
+        retry.retry.fail(class, Instant::now(), 30);
+    }
+
+    pub(crate) fn reset_slash_guild_retry(&self, guild: u64) {
+        self.slash_retries.lock().remove(&guild);
     }
 
     pub fn acknowledged_slash_registry_version(&self) -> u64 {

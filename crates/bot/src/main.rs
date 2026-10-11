@@ -17,6 +17,7 @@ async fn drain_nickname_reconciles(
     app: &Arc<BotState>,
     http: &Arc<serenity::http::Http>,
     identity: &tokio::sync::OnceCell<serenity::model::id::UserId>,
+    retry: &mut jmodguard_bot::discord::RestRetry,
 ) {
     // The bot is the sole nickname side-effect worker. Drain the
     // durable request- and membership-checked outbox every tick so the last
@@ -25,6 +26,9 @@ async fn drain_nickname_reconciles(
     match db::pending_nickname_reconciles(&app.db, now, 25).await {
         Ok(pending) => {
             if pending.is_empty() {
+                return;
+            }
+            if !retry.due(std::time::Instant::now()) {
                 return;
             }
             let me = match identity
@@ -41,9 +45,25 @@ async fn drain_nickname_reconciles(
             {
                 Ok(id) => *id,
                 Err(error) => {
-                    tracing::warn!(
-                        "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                    let class = jmodguard_bot::discord::classify_retry_error(&error);
+                    retry.fail(
+                        if class == jmodguard_bot::discord::RetryClass::Unauthorized {
+                            class
+                        } else {
+                            jmodguard_bot::discord::RetryClass::Transient
+                        },
+                        std::time::Instant::now(),
+                        30,
                     );
+                    if class == jmodguard_bot::discord::RetryClass::Unauthorized {
+                        tracing::error!(
+                            "nickname identity lookup stopped: Discord rejected the bot token"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                        );
+                    }
                     return;
                 }
             };
@@ -406,6 +426,7 @@ async fn main() -> Result<()> {
         let http = Arc::clone(&http);
         tokio::spawn(async move {
             let identity = tokio::sync::OnceCell::new();
+            let mut identity_retry = jmodguard_bot::discord::RestRetry::default();
             let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -413,7 +434,7 @@ async fn main() -> Result<()> {
                 if !app.activation.may_record() {
                     continue;
                 }
-                drain_nickname_reconciles(&app, &http, &identity).await;
+                drain_nickname_reconciles(&app, &http, &identity, &mut identity_retry).await;
             }
         });
     }
@@ -491,9 +512,9 @@ async fn main() -> Result<()> {
                                         "slash registry reconciliation committed"
                                     );
                                 } else {
-                                    tracing::warn!(
-                                        "slash re-sync incomplete ({failed_n} guild(s) failed); \
-                                         will retry those guilds next poll"
+                                    tracing::debug!(
+                                        "slash re-sync pending ({failed_n} guild(s)); \
+                                         waiting for retry deadlines or registry/membership changes"
                                     );
                                 }
                             }

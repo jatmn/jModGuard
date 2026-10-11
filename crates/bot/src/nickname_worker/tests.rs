@@ -482,3 +482,93 @@ async fn stale_nickname_job_is_not_sent_after_a_newer_generation() {
         .remove(0);
     assert_eq!(after, fresh);
 }
+
+#[tokio::test]
+async fn unknown_nickname_read_failures_back_off_and_exhaust_the_budget() {
+    let f = Fixture::new();
+    let mut job = f.job().await;
+    let app = BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    assert!(
+        db::mark_nickname_outcome_unknown(&f.db, &job, 0)
+            .await
+            .unwrap()
+    );
+    let mut previous_wait = 0;
+    for attempt in 1..=8 {
+        let now = chrono::Utc::now().timestamp();
+        apply_nickname_edit(
+            &app,
+            &job,
+            || async { anyhow::bail!("confirmation read unavailable") },
+            || async { panic!("failed confirmation must not resend the edit") },
+        )
+        .await;
+        let status = db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt_count, attempt);
+        if attempt < 8 {
+            assert_eq!(status.state, "pending");
+            assert_eq!(status.last_error_code.as_deref(), Some("outcome_unknown"));
+            let wait = status.next_attempt_at - now;
+            assert!(wait > previous_wait);
+            previous_wait = wait;
+            assert!(
+                db::pending_nickname_reconciles(&f.db, now + 4, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            job = db::pending_nickname_reconciles(&f.db, status.next_attempt_at, 1)
+                .await
+                .unwrap()
+                .remove(0);
+        } else {
+            assert_eq!(status.state, "terminal");
+            assert!(
+                db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn permanent_nickname_read_failure_stops_the_job() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let app = BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    assert!(
+        db::mark_nickname_outcome_unknown(&f.db, &job, 0)
+            .await
+            .unwrap()
+    );
+    apply_nickname_edit(
+        &app,
+        &job,
+        || async {
+            Err(serenity::Error::Http(serenity::http::HttpError::ApplicationIdMissing).into())
+        },
+        || async { panic!("permanent failure must stop edits") },
+    )
+    .await;
+    assert_eq!(
+        db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "terminal"
+    );
+    assert!(
+        db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
