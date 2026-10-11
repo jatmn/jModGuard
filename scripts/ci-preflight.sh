@@ -256,10 +256,14 @@ EOF
     done
     if [ "$can_nextest" -eq 1 ]; then
       echo 'ci-preflight: per-test timeout via cargo-nextest slow-timeout period 60s terminate-after 3; doctests use GNU timeout 180s'
+      set +e
       cargo "${nextest_args[@]}"
+      local nextest_rc=$?
+      set -e
       rm -f "$cfg"
+      [ "$nextest_rc" -eq 0 ] || return "$nextest_rc"
       run_timed_cargo_test_doctests "${cargo_args[@]}"
-      return 0
+      return $?
     fi
     rm -f "$cfg"
     echo 'ci-preflight: cargo-nextest cannot express this cargo test command; using GNU timeout per test'
@@ -272,7 +276,7 @@ EOF
     else
       cargo test "${cargo_args[@]}"
     fi
-    return 0
+    return $?
   fi
 
   echo 'ci-preflight: per-test timeout 180s via GNU timeout'
@@ -289,29 +293,125 @@ run_timed_cargo_test_skip_doctests() {
   return 1
 }
 
+# `if ! cmd; then rc=$?` is 0: the if-test succeeded. Capture the status outside if.
+run_with_test_timeout() {
+  local name=$1 rc
+  shift
+  set +e
+  timeout --foreground --kill-after=10s 180s "$@"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+      echo "ci-preflight: test timed out after 180s: $name" >&2
+    fi
+    return "$rc"
+  fi
+}
+
+# `--list --format terse` prints `name: test` for ignored tests too. The ignore
+# bit is not on that line; `--list --ignored` is the list of ignored names.
+test_list_name() {
+  local line=$1 rest name
+  [ -n "$line" ] || return 1
+  rest="${line#*: }"
+  [ "$rest" != "$line" ] || return 1
+  case "$rest" in
+    test|test,*) ;;
+    *) return 1 ;;
+  esac
+  name="${line%%:*}"
+  [ -n "$name" ] || return 1
+  printf '%s\n' "$name"
+}
+
+# rustdoc splits every --test-args value on whitespace, so
+# `cargo test --doc -- --exact "src/lib.rs - foo (line 2)"` matches nothing
+# and exits 0. Return a whitespace-free substring that selects this doctest.
+doctest_run_token() {
+  local name=$1
+  shift
+  local candidate best="" best_len=0 count n item
+  local -a parts=()
+  read -r -a parts <<<"$name"
+  for candidate in "${parts[@]}"; do
+    case "$candidate" in
+      ''|-) continue ;;
+      -*) continue ;;
+    esac
+    count=0
+    for n in "$@"; do
+      case "$n" in
+        *"$candidate"*) count=$((count + 1)) ;;
+      esac
+    done
+    if [ "$count" -eq 1 ] && [ "${#candidate}" -gt "$best_len" ]; then
+      best=$candidate
+      best_len=${#candidate}
+    fi
+  done
+  if [ -n "$best" ]; then
+    printf '%s\n' "$best"
+    return 0
+  fi
+  item="${name#* - }"
+  item="${item%% \(line *}"
+  case "$item" in
+    ''|*' '*|-*) return 1 ;;
+  esac
+  printf '%s\n' "$item"
+}
+
 run_timed_cargo_test_doctests() {
   if run_timed_cargo_test_skip_doctests "$@"; then
     return 0
   fi
   if ! command -v timeout >/dev/null 2>&1; then
-    return 0
+    cargo test "$@" --doc
+    return $?
   fi
-  local list_out name
-  list_out="$(cargo test "$@" --doc -- --list --format terse 2>/dev/null || true)"
+  local list_out list_rc ignored_out ignored_rc name token n rc
+  local -a doc_names=()
+  local -A ignored_names=() covered=()
+  set +e
+  list_out="$(cargo test "$@" --doc -- --list --format terse)"
+  list_rc=$?
+  set -e
+  if [ "$list_rc" -ne 0 ]; then
+    return "$list_rc"
+  fi
   while IFS= read -r line; do
-    name="${line%%:*}"
-    [ -n "$name" ] || continue
-    case "$name" in
-      ''|test) continue ;;
-    esac
-    if ! timeout --foreground --kill-after=10s 180s cargo test "$@" --doc -- --exact "$name" --test-threads=1; then
-      local rc=$?
-      if [ "$rc" -eq 124 ]; then
-        echo "ci-preflight: test timed out after 180s: $name" >&2
-      fi
-      return "$rc"
-    fi
+    name="$(test_list_name "$line")" || continue
+    doc_names+=("$name")
   done <<<"$list_out"
+  set +e
+  ignored_out="$(cargo test "$@" --doc -- --list --ignored --format terse)"
+  ignored_rc=$?
+  set -e
+  if [ "$ignored_rc" -ne 0 ]; then
+    return "$ignored_rc"
+  fi
+  while IFS= read -r line; do
+    name="$(test_list_name "$line")" || continue
+    ignored_names["$name"]=1
+  done <<<"$ignored_out"
+  for name in "${doc_names[@]}"; do
+    [ -n "${covered[$name]+x}" ] && continue
+    [ -n "${ignored_names[$name]+x}" ] && continue
+    token="$(doctest_run_token "$name" "${doc_names[@]}")" || token=""
+    if [ -z "$token" ]; then
+      run_with_test_timeout "$name" cargo test "$@" --doc -- --test-threads=1
+      return $?
+    fi
+    run_with_test_timeout "$name" cargo test "$@" --doc -- "$token" --test-threads=1
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    for n in "${doc_names[@]}"; do
+      case "$n" in
+        *"$token"*) covered["$n"]=1 ;;
+      esac
+    done
+  done
 }
 
 run_timed_cargo_test_gnu() {
@@ -330,7 +430,8 @@ run_timed_cargo_test_gnu() {
     cargo_args+=("$arg")
   done
 
-  local json_out exe line name type ignored_only=0 include_ignored=0
+  local json_out name ignored_only=0 include_ignored=0 rc list_out
+  local -a test_exes=()
   for arg in "${harness[@]}"; do
     case "$arg" in
       --ignored) ignored_only=1 ;;
@@ -339,12 +440,19 @@ run_timed_cargo_test_gnu() {
   done
 
   json_out="$(mktemp)"
-  if ! cargo test "${cargo_args[@]}" --no-run --message-format=json >"$json_out"; then
-    rm -f "$json_out"
-    return 1
+  local exe_list
+  exe_list="$(mktemp)"
+  set +e
+  cargo test "${cargo_args[@]}" --no-run --message-format=json >"$json_out"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$json_out" "$exe_list"
+    return "$rc"
   fi
 
-  mapfile -t test_exes < <(node --input-type=commonjs - "$json_out" <<'JS'
+  set +e
+  node --input-type=commonjs - "$json_out" >"$exe_list" <<'JS'
 const fs = require("fs");
 const seen = new Set();
 for (const line of fs.readFileSync(process.argv[2], "utf8").split("\n")) {
@@ -363,38 +471,60 @@ for (const exe of seen) {
   process.stdout.write(`${exe}\n`);
 }
 JS
-)
-  local exe
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$json_out" "$exe_list"
+    return "$rc"
+  fi
+  mapfile -t test_exes <"$exe_list"
+  rm -f "$exe_list"
+  local exe run_args=()
+  local -A ignored_names=()
   for exe in "${test_exes[@]}"; do
     [ -n "$exe" ] || continue
+    ignored_names=()
+    set +e
+    list_out="$("$exe" --list --ignored --format terse)"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$json_out"
+      return "$rc"
+    fi
     while IFS= read -r tline; do
-      name="${tline%%:*}"
-      type="${tline#*:}"
-      type="${type%% *}"
-      [ "$type" = test ] || continue
+      name="$(test_list_name "$tline")" || continue
+      ignored_names["$name"]=1
+    done <<<"$list_out"
+    set +e
+    list_out="$("$exe" --list --format terse)"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$json_out"
+      return "$rc"
+    fi
+    while IFS= read -r tline; do
+      name="$(test_list_name "$tline")" || continue
       if [ "$ignored_only" -eq 1 ]; then
-        case "$tline" in
-          *', ignored'*) ;;
-          *) continue ;;
-        esac
-      elif [ "$include_ignored" -eq 0 ]; then
-        case "$tline" in
-          *', ignored'*) continue ;;
-        esac
+        [ -n "${ignored_names[$name]+x}" ] || continue
+        run_args=(--exact "$name" --ignored --test-threads=1)
+      elif [ "$include_ignored" -eq 1 ]; then
+        run_args=(--exact "$name" --include-ignored --test-threads=1)
+      else
+        [ -n "${ignored_names[$name]+x}" ] && continue
+        run_args=(--exact "$name" --test-threads=1)
       fi
-      local run_args=(--exact "$name" --test-threads=1)
       for arg in "${harness[@]}"; do
         [ "$arg" = --nocapture ] && run_args+=(--nocapture)
       done
-      if ! timeout --foreground --kill-after=10s 180s "$exe" "${run_args[@]}"; then
-        local rc=$?
-        if [ "$rc" -eq 124 ]; then
-          echo "ci-preflight: test timed out after 180s: $name" >&2
-        fi
+      run_with_test_timeout "$name" "$exe" "${run_args[@]}"
+      rc=$?
+      if [ "$rc" -ne 0 ]; then
         rm -f "$json_out"
         return "$rc"
       fi
-    done < <("$exe" --list --format terse)
+    done <<<"$list_out"
   done
   rm -f "$json_out"
 
@@ -681,7 +811,7 @@ if [ -z "${only_names}" ]; then
   cargo build --locked -p jmodguard-api
 
   echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-  cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
 
   echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
   cargo build --locked -p jmodguard-api --no-default-features
