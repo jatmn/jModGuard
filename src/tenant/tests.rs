@@ -74,6 +74,7 @@ async fn enroll(f: &Fixture, guild: i64, joined: i64) -> crate::db::GuildEnrollm
 
 fn case_data(subject: i64) -> CaseData {
     CaseData {
+        ban_attempt_tag: None,
         source: CaseSource::Application {
             operation_id: CaseId::new(),
         },

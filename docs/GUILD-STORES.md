@@ -79,13 +79,15 @@ Version13 preserves exact, dated bot-executor audit actions while their local ca
 source association remains unresolved; a later exact source link consumes the staged
 action without creating a duplicate case. Version14 lets case-retention updates
 preserve in-flight member import pages. Version 15 is the local write fence checked before guild-store mutations, plus one `guild_writer_epoch` row. A leased guild commit reads that row in the same transaction and rolls back unless it equals the holder's generation. There are no core
-configuration/default/enrollment tables or general event archives. Core bootstrap
+configuration/default/enrollment tables or general event archives. Version16 adds an
+optional immutable ban-attempt tag to case JSON, without table changes or rewriting
+legacy cases. Core bootstrap
 never applies this schema; the existing core version is 17.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 15, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current schema 15 identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 16, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current schema 16 identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

@@ -439,7 +439,9 @@ async fn fetch_audit_page(
                 executor_id: i64::try_from(entry.user_id.get()).ok().filter(|id| *id > 0),
                 action: stream.history_action(),
                 occurred_at_ms,
-                reason: entry.reason,
+                reason: entry
+                    .reason
+                    .map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
             })
         })
         .collect();
@@ -529,7 +531,9 @@ async fn fetch_page(
                         user_id: b.user.id.get() as i64,
                         username: Some(b.user.name),
                         global_name: b.user.global_name,
-                        reason: b.reason,
+                        reason: b
+                            .reason
+                            .map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
                     })
                     .collect(),
                 audits: Vec::new(),
@@ -618,7 +622,9 @@ async fn fetch_page(
                         user_id,
                         username: Some(b.user.name),
                         global_name: b.user.global_name,
-                        reason: b.reason,
+                        reason: b
+                            .reason
+                            .map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
                     });
                     (present, None, ban)
                 }
@@ -742,7 +748,9 @@ async fn fetch_target_check(
                 user_id: check.user_id,
                 username: Some(b.user.name),
                 global_name: b.user.global_name,
-                reason: b.reason,
+                reason: b
+                    .reason
+                    .map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
             });
             (present, None, ban)
         }

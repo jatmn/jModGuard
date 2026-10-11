@@ -30,6 +30,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             delete_days,
         } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
+            let reason = jmodguard::ban_reason::without_tag(&reason).to_owned();
             let target_user = user_lookup(env, target).await?;
             let member = env
                 .ctx
@@ -116,6 +117,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         }
                         Err(_) => None,
                     };
+                    let discord_reason =
+                        crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
@@ -126,7 +129,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     let raced = if let Some(m) = member {
                         crate::discord::race_discord_call(
                             &env.app.activation,
-                            m.ban_with_reason(&env.ctx.http, *delete_days, &reason),
+                            m.ban_with_reason(&env.ctx.http, *delete_days, &discord_reason),
                         )
                         .await
                     } else {
@@ -136,7 +139,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                 &env.ctx.http,
                                 target,
                                 *delete_days,
-                                &reason,
+                                &discord_reason,
                             ),
                         )
                         .await

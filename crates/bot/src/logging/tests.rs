@@ -1419,7 +1419,12 @@ fn member_audit_requires_unique_recent_target_and_action() {
     let observed = 1_790_086_832_000;
     for event in ["member_ban", "member_unban"] {
         let action = member_audit_action(event).unwrap();
-        let mut logs = audit_fixture(action, 123, observed, Some("actual reason"));
+        let mut logs = audit_fixture(
+            action,
+            123,
+            observed,
+            Some("[jmg:0123456789abcdef0123] actual reason"),
+        );
         let vars = unclaimed_audit_vars(&logs, action, 123, observed).unwrap();
         assert_eq!(vars["actor"], "moderator (<@777>)");
         assert_eq!(vars["actor_id"], "777");

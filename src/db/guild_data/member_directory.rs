@@ -1613,6 +1613,7 @@ fn ingest_member_audits(
             conn.member_execute("INSERT INTO guild_member_unresolved_audits(guild_id,enrollment_id,entry_id,user_id,action,occurred_at_ms,executor_id,reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![scope.guild_id(),scope.enrollment.id.as_str(),audit.entry_id,audit.user_id,action,audit.occurred_at_ms,audit.executor_id,audit.reason.as_deref()])?;
         } else {
             let data = CaseData {
+                ban_attempt_tag: None,
                 source,
                 action: match audit.action {
                     MemberAuditAction::Ban => CaseAction::Ban,

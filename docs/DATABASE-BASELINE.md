@@ -111,8 +111,10 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version14,
-using `migrations/guild/0001_identity.sql` through `0015_local_write_fence.sql`. This separate
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version16,
+using `migrations/guild/0001_identity.sql` through `0015_local_write_fence.sql`. Version 16
+adds optional immutable ban attempt tags to case payloads without changing tables or
+rewriting legacy cases. Earlier binaries must not read these payloads. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded

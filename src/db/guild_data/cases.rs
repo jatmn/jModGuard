@@ -121,6 +121,9 @@ pub enum CaseEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseData {
+    /// Persisted only by record_case; never serialized into API responses.
+    #[serde(default, skip_serializing)]
+    pub ban_attempt_tag: Option<crate::ban_reason::BanAttemptTag>,
     pub source: CaseSource,
     pub action: CaseAction,
     pub outcome: CaseOutcome,
@@ -194,6 +197,12 @@ fn validate_data(data: &CaseData, limits: CaseLimits) -> Result<()> {
         data.subject_id > 0 && data.actor_id.is_none_or(|id| id > 0) && data.occurred_at_ms > 0,
         CaseError::Invalid
     );
+    anyhow::ensure!(
+        data.ban_attempt_tag.is_none()
+            || (data.action == CaseAction::Ban
+                && matches!(data.source, CaseSource::Application { .. })),
+        CaseError::Invalid
+    );
     let mut text_bytes = data.reason.as_ref().map_or(0, |s| s.len());
     if let CaseEvidence::Text(items) = &data.evidence {
         anyhow::ensure!(
@@ -228,14 +237,28 @@ impl GuildDataStore {
         &self,
         scope: GuildDataScope,
         id: CaseId,
-        data: CaseData,
+        mut data: CaseData,
         limits: CaseLimits,
     ) -> Result<RecordCase> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         validate_data(&data, limits)?;
         let source = data.source.key()?;
-        let payload = serde_json::to_string(&data)?;
+        data.reason = data
+            .reason
+            .map(|reason| crate::ban_reason::without_tag(&reason).to_owned());
+        // Preserve the legacy field order for exact-payload replay comparisons.
+        #[derive(Serialize)]
+        struct StoredCase<'a> {
+            #[serde(flatten)]
+            data: &'a CaseData,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ban_attempt_tag: Option<&'a crate::ban_reason::BanAttemptTag>,
+        }
+        let payload = serde_json::to_string(&StoredCase {
+            data: &data,
+            ban_attempt_tag: data.ban_attempt_tag.as_ref(),
+        })?;
         anyhow::ensure!(
             payload.len() <= limits.max_record_bytes as usize,
             CaseError::Limit
@@ -464,9 +487,8 @@ impl GuildDataStore {
         }).await
     }
 
-    /// Settle the newest Attempted application ban whose stored reason matches the
-    /// reason Discord kept. Older attempts and foreign bans stay attempted.
-    pub async fn settle_matching_application_ban(
+    /// Settle only the subject's own tagged attempt. Legacy untagged cases stay pending.
+    pub async fn settle_tagged_application_ban(
         &self,
         scope: GuildDataScope,
         subject_id: i64,
@@ -476,46 +498,46 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         anyhow::ensure!(subject_id > 0, CaseError::Invalid);
-        let wanted = discord_audit_reason(discord_reason);
-        if wanted.is_empty() {
+        let Some(tag) = crate::ban_reason::attempt_tag(discord_reason) else {
             return Ok(Vec::new());
-        }
+        };
+        let tag = tag.to_owned();
         let expected = self.expected.clone();
         let chosen = self
             .db
             .with_conn({
                 let scope = scope.clone();
-                let expected = expected.clone();
                 move |conn| {
                     let tx = conn.transaction_primary_snapshot()?;
                     verify_scope(&tx, &expected, &scope, true)?;
+                    // Include final cases so replay cannot select another pending case.
+                    // Refuse an ambiguous tag rather than guessing an identity.
                     let mut stmt = tx.prepare(
-                        "SELECT case_id, json_extract(payload, '$.reason') FROM guild_cases
+                        "SELECT case_id FROM guild_cases
                      WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 AND json_valid(payload)
                        AND json_extract(payload, '$.action')='ban'
-                       AND json_extract(payload, '$.outcome')='attempted'
                        AND CAST(json_extract(payload, '$.subject_id') AS INTEGER)=?3
                        AND json_type(payload, '$.source.application') IS NOT NULL
-                     ORDER BY CAST(json_extract(payload, '$.occurred_at_ms') AS INTEGER) DESC, case_id DESC",
+                       AND json_extract(payload, '$.ban_attempt_tag')=?4 LIMIT 2",
                     )?;
-                    let rows = stmt.query_map(
-                        params![scope.guild_id(), scope.enrollment.id.as_str(), subject_id],
-                        |row| Ok((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
-                    )?;
-                    let mut chosen = None;
-                    for row in rows {
-                        let (id, reason) = row?;
-                        let Some(reason) = reason else {
-                            continue;
-                        };
-                        if discord_audit_reason(&reason) == wanted {
-                            chosen = Some(CaseId::try_from(id)?);
-                            break;
-                        }
-                    }
+                    let ids = stmt
+                        .query_map(
+                            params![
+                                scope.guild_id(),
+                                scope.enrollment.id.as_str(),
+                                subject_id,
+                                tag
+                            ],
+                            |row| Ok(row.get::<String>(0)?),
+                        )?
+                        .collect::<Result<Vec<_>>>()?;
                     drop(stmt);
                     tx.finish_read()?;
-                    Ok(chosen)
+                    if ids.len() == 1 {
+                        Ok(Some(CaseId::try_from(ids[0].clone())?))
+                    } else {
+                        Ok(None)
+                    }
                 }
             })
             .await?;
@@ -552,11 +574,6 @@ fn stall_case_source(source: &str) -> bool {
         .ok()
         .and_then(|guard| guard.clone())
         .is_some_and(|stalled| stalled == source)
-}
-
-/// Discord stores at most 512 characters of an audit reason.
-fn discord_audit_reason(reason: &str) -> String {
-    reason.chars().take(512).collect()
 }
 
 fn outcome_sql(outcome: &CaseOutcome) -> Result<&'static str> {

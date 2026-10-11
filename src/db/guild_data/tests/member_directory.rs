@@ -2437,6 +2437,7 @@ async fn case_projection_keeps_noop_and_ambiguous_app_unban_in_history_without_r
         .await
         .unwrap();
     let data = |source, action, outcome, subject_id| CaseData {
+        ban_attempt_tag: None,
         source,
         action,
         outcome,
@@ -3519,6 +3520,7 @@ async fn failed_historical_ban_does_not_hide_confirmed_undated_ban_state() {
             scope.clone(),
             CaseId::new(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -3751,6 +3753,7 @@ async fn equal_millisecond_opposite_ban_events_need_persisted_target_check() {
                     scope.clone(),
                     CaseId::new(),
                     CaseData {
+                        ban_attempt_tag: None,
                         source: CaseSource::DiscordAudit { entry_id },
                         action,
                         outcome: CaseOutcome::Succeeded,
@@ -4180,6 +4183,7 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
             scope.clone(),
             app_case.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: app_source.clone(),
                 action: CaseAction::Ban,
                 outcome: CaseOutcome::Succeeded,
@@ -4420,6 +4424,7 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
             scope.clone(),
             second_case.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: second_source.clone(),
                 action: CaseAction::Ban,
                 outcome: CaseOutcome::Succeeded,
@@ -4475,6 +4480,7 @@ async fn removed_application_case_consumes_exact_staged_audit_as_tombstone() {
             scope.clone(),
             case_id.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: app_source.clone(),
                 action: CaseAction::Unban,
                 outcome: CaseOutcome::Succeeded,
@@ -4833,6 +4839,7 @@ async fn audit_alias_before_recovery_retains_a_confirmed_unban() {
             scope.clone(),
             case_id.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: app_source.clone(),
                 action: CaseAction::Unban,
                 outcome: CaseOutcome::Succeeded,
@@ -4929,6 +4936,7 @@ async fn recovery_before_alias_and_attempted_unban_keep_retention_rules() {
             scope.clone(),
             case_id.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: app_source.clone(),
                 action: CaseAction::Unban,
                 outcome: CaseOutcome::Succeeded,
@@ -4970,6 +4978,7 @@ async fn recovery_before_alias_and_attempted_unban_keep_retention_rules() {
             scope.clone(),
             noop_case.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: noop_source.clone(),
                 action: CaseAction::Unban,
                 outcome: CaseOutcome::Attempted,
@@ -5100,6 +5109,7 @@ async fn linking_an_audit_that_is_already_attached_still_retains_the_unban() {
             scope.clone(),
             case_id.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: app_source.clone(),
                 action: CaseAction::Unban,
                 outcome: CaseOutcome::Succeeded,

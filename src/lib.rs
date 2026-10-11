@@ -1,6 +1,7 @@
 //! Shared jModGuard configuration, data model, database and tracing setup.
 //! Service implementations live in independent bot and API packages.
 
+pub mod ban_reason;
 pub mod bot_actions;
 #[cfg(unix)]
 pub mod bunny_evidence;
