@@ -1361,7 +1361,7 @@ pub async fn add_known_bad_image(
     Path(guild_id): Path<u64>,
     Json(body): Json<KnownBadImageBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = authorize_manage_guild(&app, &session, guild_id).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let hash = db::canonical_image_hash(&body.hash)?;
@@ -1387,7 +1387,7 @@ pub async fn remove_known_bad_image(
     headers: axum::http::HeaderMap,
     Path((guild_id, hash)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = authorize_manage_guild(&app, &session, guild_id).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let hash = db::canonical_image_hash(&hash)?;
