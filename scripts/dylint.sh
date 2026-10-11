@@ -14,10 +14,10 @@ cd "$root"
 JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
 
 # BEGIN dylint-lib-key
-# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
-jmodguard_dylint_lib_key() {
-  local toml=$1 out=$2 version lints_rev channel commit_hash toml_sha
-  local remote_lines peeled toolchain_toml vv
+# Discovers source metadata without requiring the lint toolchain to be installed.
+jmodguard_dylint_lib_metadata() {
+  local toml=$1 version lints_rev channel toml_sha
+  local remote_lines peeled toolchain_toml
   version=$(awk '
     /^\[\[workspace\.metadata\.dylint\.libraries\]\]/ { inlib = 1; next }
     inlib && /^\[/ { inlib = 0 }
@@ -43,14 +43,20 @@ jmodguard_dylint_lib_key() {
   toolchain_toml=$(curl -fsSL "https://raw.githubusercontent.com/trailofbits/dylint/${lints_rev}/examples/general/rust-toolchain.toml") || return 1
   channel=$(printf '%s\n' "$toolchain_toml" | awk -F'"' '/^channel = / {print $2; exit}')
   [ -n "$channel" ] || return 1
+  printf 'dylint_toml_sha256=%s\n' "$toml_sha"
+  printf 'lints_rev=%s\n' "$lints_rev"
+  printf 'toolchain=%s\n' "$channel"
+}
+
+# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
+jmodguard_dylint_lib_key() {
+  local metadata channel vv commit_hash
+  metadata=$(jmodguard_dylint_lib_metadata "$1") || return 1
+  channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
   vv=$(rustc "+${channel}" -vV) || return 1
   commit_hash=$(printf '%s\n' "$vv" | awk '/^commit-hash: / {print $2; exit}')
   [ -n "$commit_hash" ] || return 1
-  {
-    printf 'dylint_toml_sha256=%s\n' "$toml_sha"
-    printf 'lints_rev=%s\n' "$lints_rev"
-    printf 'toolchain=%s %s\n' "$channel" "$commit_hash"
-  } >"$out"
+  printf '%s %s\n' "$metadata" "$commit_hash" >"$2"
 }
 # END dylint-lib-key
 

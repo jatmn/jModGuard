@@ -209,6 +209,10 @@ set -euo pipefail
 if [ "${DYLINT_TEST_RUSTC_FAIL:-0}" = 1 ]; then
   exit 1
 fi
+if [ -n "${DYLINT_TEST_TOOLCHAIN_STATE:-}" ] && [ ! -f "$DYLINT_TEST_TOOLCHAIN_STATE" ]; then
+  echo 'dylint test rustc: toolchain is not installed (auto-install disabled)' >&2
+  exit 1
+fi
 if [ "${1:-}" = '+nightly-2026-08-20' ] && [ "${2:-}" = -vV ]; then
   printf '%s\n' 'commit-hash: abcdefabcdefabcdefabcdefabcdefabcdefabcd' 'host: x86_64-unknown-linux-gnu'
   exit 0
@@ -217,6 +221,40 @@ echo "dylint test rustc: unexpected invocation: $*" >&2
 exit 1
 SH
 chmod +x "$fixture/bin/rustc"
+
+# Provisioning must explicitly install a missing nightly before querying its
+# compiler identity, including when rustup's automatic installation is disabled.
+cat > "$fixture/bin/rustup" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  'component list --toolchain nightly-2026-08-20')
+    [ -f "$DYLINT_TEST_TOOLCHAIN_STATE" ] || exit 1
+    printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)' 'rustc-dev-x86_64-unknown-linux-gnu (installed)'
+    ;;
+  'toolchain install nightly-2026-08-20 --component llvm-tools-preview,rustc-dev')
+    echo installed >> "$DYLINT_TEST_TOOLCHAIN_STATE"
+    ;;
+  *) echo "dylint test rustup: unexpected invocation: $*" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$fixture/bin/rustup"
+# Load the production functions without running the unrelated tool/library builds.
+sed '/^ensure_main_toolchain$/,$d' "$fixture/ci-agent-setup.sh" > "$fixture/setup-functions.sh"
+(
+  cd "$fixture/project"
+  export PATH="$fixture/bin:$PATH"
+  export DYLINT_TEST_TOOLCHAIN_STATE="$fixture/nightly-installed"
+  # shellcheck source=/dev/null
+  source "$fixture/setup-functions.sh"
+  ensure_dylint_toolchain
+  jmodguard_dylint_lib_key dylint.toml "$fixture/provisioned-key"
+  grep -Fq 'toolchain=nightly-2026-08-20 abcdefabcdefabcdefabcdefabcdefabcdefabcd' "$fixture/provisioned-key" \
+    || fail 'provisioning did not produce the installed compiler identity'
+  ensure_dylint_toolchain
+  [ "$(wc -l < "$DYLINT_TEST_TOOLCHAIN_STATE")" -eq 1 ] \
+    || fail 'provisioning reinstalled an already complete nightly'
+)
 
 key_body_file="$fixture/key-body.txt"
 lib_key_dir="$prefix/dylint-libs"
