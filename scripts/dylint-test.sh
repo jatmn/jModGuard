@@ -195,6 +195,10 @@ chmod +x "$fixture/bin/git"
 cat > "$fixture/bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${DYLINT_TEST_CURL_FAIL:-0}" = 1 ]; then
+  echo "dylint test curl: network down" >&2
+  exit 1
+fi
 printf '%s\n' '[toolchain]' 'channel = "nightly-2026-08-20"' 'components = ["llvm-tools-preview", "rustc-dev"]'
 SH
 chmod +x "$fixture/bin/curl"
@@ -233,6 +237,12 @@ expect "$capture" argv 'dylint --all --no-metadata --fail-on-no-libraries -- --l
 expect "$capture" DYLINT_LIBRARY_PATH "$lib_dir"
 grep -Fq 'using prebuilt libs at' "$stdout_file" || fail 'missing prebuilt libs message'
 
+printf 'x' >"$lib_dir/libextra@${tc}.so"
+run_dylint "$fixture/external"
+grep -Fq 'does not contain exactly the 6 libraries' "$stdout_file" || fail 'missing extra library message'
+expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+rm -f "$lib_dir/libextra@${tc}.so"
+
 printf 'wrong\n' >"$lib_dir/key.txt"
 run_dylint "$fixture/external"
 grep -Fq 'missing or key.txt mismatch' "$stdout_file" || fail 'missing key mismatch message'
@@ -256,6 +266,10 @@ expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-ta
 
 run_dylint "$fixture/external" DYLINT_TEST_RUSTC_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message'
+expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+
+run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1
+grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message for curl'
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 
 setup_key="$(sed -n '/^# BEGIN dylint-lib-key$/,/^# END dylint-lib-key$/p' "$fixture/ci-agent-setup.sh")"

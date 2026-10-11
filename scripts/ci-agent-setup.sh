@@ -87,9 +87,14 @@ crates_list_version() {
 toolchain_components_installed() {
   local channel="$1"
   shift
-  local comp missing=0
+  local comp needle missing=0
   for comp in "$@"; do
-    if ! rustup component list --toolchain "$channel" | awk -v c="$comp" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
+    # rustup lists the preview component as llvm-tools-<host>.
+    needle=$comp
+    if [ "$comp" = llvm-tools-preview ]; then
+      needle=llvm-tools
+    fi
+    if ! rustup component list --toolchain "$channel" | awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
       missing=1
     fi
   done
@@ -180,9 +185,10 @@ dylint_lib_dir_valid() {
 }
 
 ensure_dylint_libs() {
-  local key_file KEY dest stage aside lib_toolchain name fname
-  local cargo_target_dir=""
-  trap 'if [ -n "$cargo_target_dir" ] && [ -d "$cargo_target_dir" ]; then rm -rf "$cargo_target_dir"; fi' EXIT
+  local key_file KEY dest stage aside lib_toolchain name fname src
+  # EXIT runs after this function returns, so the path cannot be a local.
+  JMODGUARD_SETUP_CARGO_TARGET=""
+  trap 'if [ -n "${JMODGUARD_SETUP_CARGO_TARGET:-}" ] && [ -d "${JMODGUARD_SETUP_CARGO_TARGET}" ]; then rm -rf "${JMODGUARD_SETUP_CARGO_TARGET}"; fi' EXIT
 
   key_file="$(mktemp)"
   if ! jmodguard_dylint_lib_key dylint.toml "$key_file"; then
@@ -202,8 +208,8 @@ ensure_dylint_libs() {
     return 0
   fi
 
-  cargo_target_dir="$(mktemp -d)"
-  export CARGO_TARGET_DIR="$cargo_target_dir"
+  JMODGUARD_SETUP_CARGO_TARGET="$(mktemp -d)"
+  export CARGO_TARGET_DIR="$JMODGUARD_SETUP_CARGO_TARGET"
   for name in "${dylint_lib_names[@]}"; do
     cargo dylint list --lib "$name"
   done
@@ -212,7 +218,7 @@ ensure_dylint_libs() {
   cp "$key_file" "$stage/key.txt"
   for name in "${dylint_lib_names[@]}"; do
     fname="lib${name}@${lib_toolchain}.so"
-    src="$cargo_target_dir/dylint/libraries/${lib_toolchain}/release/$fname"
+    src="$JMODGUARD_SETUP_CARGO_TARGET/dylint/libraries/${lib_toolchain}/release/$fname"
     if [ ! -s "$src" ]; then
       echo "ci-agent-setup: missing library $fname" >&2
       rm -rf "$stage"
