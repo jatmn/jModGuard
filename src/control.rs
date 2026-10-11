@@ -148,6 +148,7 @@ impl WriterLink {
 
 fn outcome_unknown() -> ControlReply {
     ControlReply::Failed {
+        code: None,
         message: OUTCOME_UNKNOWN.to_owned(),
     }
 }
@@ -178,6 +179,41 @@ pub fn parse_private_bind(raw: &str) -> Result<SocketAddr> {
         anyhow::bail!("control bind is not private");
     }
     Ok(addr)
+}
+
+/// Preserve only the admission errors the API already exposes as typed failures.
+pub fn failure_reply(error: &anyhow::Error) -> ControlReply {
+    use crate::bot_actions::RequestKeyError;
+    let code = if let Some(error) = error.downcast_ref::<RequestKeyError>() {
+        Some(match error {
+            RequestKeyError::Expired => "action_request_expired",
+            RequestKeyError::Invalid => "action_request_invalid",
+            RequestKeyError::EnrollmentChanged => "action_enrollment_changed",
+        })
+    } else if error.is::<crate::db::EnrollmentChanged>() {
+        Some("enrollment_changed")
+    } else if error.is::<crate::db::EnrollmentUnverified>() {
+        Some("enrollment_unverified")
+    } else {
+        None
+    };
+    ControlReply::Failed {
+        message: public_error(error),
+        code: code.map(str::to_owned),
+    }
+}
+
+/// Older peers omit the code; future codes must remain generic failures.
+pub fn failure_error(message: String, code: Option<&str>) -> anyhow::Error {
+    use crate::bot_actions::RequestKeyError;
+    match code {
+        Some("action_request_expired") => RequestKeyError::Expired.into(),
+        Some("action_request_invalid") => RequestKeyError::Invalid.into(),
+        Some("action_enrollment_changed") => RequestKeyError::EnrollmentChanged.into(),
+        Some("enrollment_changed") => crate::db::EnrollmentChanged.into(),
+        Some("enrollment_unverified") => crate::db::EnrollmentUnverified.into(),
+        _ => anyhow::anyhow!(message),
+    }
 }
 
 pub fn public_error(err: &anyhow::Error) -> String {
@@ -523,6 +559,48 @@ mod tests {
 
     fn sample_op() -> crate::db::ControlOp {
         crate::db::ControlOp::AbortUpgrade { id: "1".into() }
+    }
+
+    #[test]
+    fn admission_error_codes_survive_context_and_changed_messages() {
+        use crate::bot_actions::RequestKeyError;
+        #[derive(Deserialize)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        enum LegacyReply {
+            Failed { message: String },
+        }
+        let errors: Vec<anyhow::Error> = vec![
+            RequestKeyError::Expired.into(),
+            RequestKeyError::Invalid.into(),
+            RequestKeyError::EnrollmentChanged.into(),
+            crate::db::EnrollmentChanged.into(),
+            crate::db::EnrollmentUnverified.into(),
+        ];
+        for error in errors {
+            let expected = error.to_string();
+            let reply = failure_reply(&error.context("admission failed"));
+            let encoded = serde_json::to_vec(&reply).unwrap();
+            let LegacyReply::Failed { message } = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(message, "admission failed");
+            let ControlReply::Failed { code, .. } = serde_json::from_slice(&encoded).unwrap()
+            else {
+                panic!("expected failure");
+            };
+            assert!(code.is_some());
+            let restored = failure_error("changed peer wording".into(), code.as_deref());
+            assert_eq!(restored.to_string(), expected);
+            assert!(
+                restored.is::<RequestKeyError>()
+                    || restored.is::<crate::db::EnrollmentChanged>()
+                    || restored.is::<crate::db::EnrollmentUnverified>()
+            );
+        }
+        let generic = failure_reply(&anyhow::anyhow!("private /database/path"));
+        let encoded = serde_json::to_value(generic).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"status":"failed", "message":"write failed"})
+        );
     }
 
     #[test]

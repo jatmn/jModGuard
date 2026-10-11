@@ -82,12 +82,13 @@ fn evict_and_insert(
 
 fn not_the_writer() -> ControlReply {
     ControlReply::Failed {
+        code: None,
         message: control::NOT_THE_WRITER.into(),
     }
 }
 
 fn is_not_the_writer(reply: &ControlReply) -> bool {
-    matches!(reply, ControlReply::Failed { message } if message == control::NOT_THE_WRITER || message == control::RECOVERY_IN_PROGRESS)
+    matches!(reply, ControlReply::Failed { message, .. } if message == control::NOT_THE_WRITER || message == control::RECOVERY_IN_PROGRESS)
 }
 
 fn remember(results: &Results, request_id: &str, reply: &ControlReply) {
@@ -130,6 +131,7 @@ fn lookup_reply(
     drop(guard);
     if control::now_ms() > expires_ms {
         ControlReply::Failed {
+            code: None,
             message: control::OUTCOME_UNKNOWN.into(),
         }
     } else {
@@ -186,6 +188,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                 not_the_writer()
             } else if control::now_ms() > job.expires_ms {
                 ControlReply::Failed {
+                    code: None,
                     message: "request expired".into(),
                 }
             } else {
@@ -196,6 +199,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     not_the_writer()
                 } else if control::now_ms() > job.expires_ms {
                     ControlReply::Failed {
+                        code: None,
                         message: "request expired".into(),
                     }
                 } else if let Some(rejected) = reject_unauthorized_control(decision) {
@@ -211,9 +215,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     {
                         Ok(ControlReply::Waiting) => not_the_writer(),
                         Ok(reply) => reply,
-                        Err(error) => ControlReply::Failed {
-                            message: control::public_error(&error),
-                        },
+                        Err(error) => control::failure_reply(&error),
                     }
                 }
             };
@@ -235,6 +237,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
 fn reject_unauthorized_control(decision: Result<(), &'static str>) -> Option<ControlReply> {
     match decision {
         Err(message) => Some(ControlReply::Failed {
+            code: None,
             message: message.to_owned(),
         }),
         Ok(()) => None,
@@ -299,6 +302,7 @@ fn handle(
             let _ = reply(
                 stream,
                 &ControlReply::Failed {
+                    code: None,
                     message: control::public_error(&error),
                 },
             );
@@ -314,6 +318,7 @@ fn handle(
         let _ = reply(
             stream,
             &ControlReply::Failed {
+                code: None,
                 message: control::RECOVERY_IN_PROGRESS.into(),
             },
         );
@@ -353,6 +358,7 @@ fn handle(
                 let _ = reply(
                     stream,
                     &ControlReply::Failed {
+                        code: None,
                         message: control::OUTCOME_UNKNOWN.into(),
                     },
                 );
@@ -417,7 +423,7 @@ mod tests {
         };
         assert!(!applied);
         assert!(
-            matches!(reply, ControlReply::Failed { message } if message == "actor is not allowed")
+            matches!(reply, ControlReply::Failed { message, .. } if message == "actor is not allowed")
         );
         let mut applied = false;
         let reply = match reject_unauthorized_control(Ok(())) {
@@ -611,7 +617,7 @@ mod tests {
 
     fn failure_message(reply: &ControlReply) -> &str {
         match reply {
-            ControlReply::Failed { message } => message,
+            ControlReply::Failed { message, .. } => message,
             other => panic!("expected a failure reply, got {other:?}"),
         }
     }

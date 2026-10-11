@@ -759,11 +759,11 @@ impl UpdateControl {
             Ok(ControlReply::Waiting) => Err(receipt_not_saved("waiting")),
             Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
             Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
-            Ok(ControlReply::Failed { message }) if transient_receipt(&message) => {
+            Ok(ControlReply::Failed { message, .. }) if transient_receipt(&message) => {
                 tracing::warn!("API launcher receipt was not recorded: {message}");
                 Err(receipt_not_saved(message))
             }
-            Ok(ControlReply::Failed { message }) => {
+            Ok(ControlReply::Failed { message, .. }) => {
                 tracing::warn!("API launcher receipt was not recorded: {message}");
                 anyhow::bail!("{message}")
             }

@@ -148,7 +148,7 @@ pub fn prefix_shown_after_write(reply: &db::ControlReply) -> Result<String> {
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .context("write failed"),
-        db::ControlReply::Failed { message } => anyhow::bail!(message.clone()),
+        db::ControlReply::Failed { message, .. } => anyhow::bail!(message.clone()),
         db::ControlReply::Waiting | db::ControlReply::StillWaiting => anyhow::bail!("waiting"),
         db::ControlReply::Busy => anyhow::bail!("busy"),
     }
