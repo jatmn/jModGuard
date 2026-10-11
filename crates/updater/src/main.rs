@@ -53,6 +53,25 @@ fn api_writer_link(target: &str, secret: &str) -> Option<jmodguard::control::Wri
     }
 }
 
+/// Retry transport failures promptly, with a fixed attempt bound per tick.
+async fn renew_launcher_fence_promptly<F, Fut>(mut renew: F) -> Result<bool>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<bool>> + Send,
+{
+    let mut backoff = Duration::from_millis(100);
+    for attempt in 0..3 {
+        match renew().await {
+            Err(_) if attempt < 2 => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("last attempt returns")
+}
+
 fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -60,7 +79,7 @@ fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHand
         interval.tick().await;
         loop {
             interval.tick().await;
-            match control.renew_launcher_fence().await {
+            match renew_launcher_fence_promptly(|| control.renew_launcher_fence_cas()).await {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
                 Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
@@ -1713,6 +1732,67 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn launcher_fence_retries_a_transient_failure_promptly_and_stops_at_zero_rows() {
+        let path =
+            std::env::temp_dir().join(format!("launcher_retry_{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let started = Instant::now();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let renewed = renew_launcher_fence_promptly(|| async {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(anyhow::anyhow!("transient provider failure"))
+            } else {
+                control.renew_launcher_fence_cas().await
+            }
+        })
+        .await
+        .unwrap();
+        assert!(renewed);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retry must precede the next 5 s tick"
+        );
+        control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !renew_launcher_fence_promptly(|| async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                control.renew_launcher_fence_cas().await
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "zero rows must not retry"
+        );
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        let error = renew_launcher_fence_promptly(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("persistent failure"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "failure retries must stay bounded"
+        );
+        assert!(error.to_string().contains("persistent failure"));
+        drop(control);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     use super::*;
     use db::Db;
 

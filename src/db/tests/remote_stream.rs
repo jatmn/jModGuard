@@ -17,6 +17,7 @@ struct HranaState {
     expire_next_cursor: bool,
     expired_requests: usize,
     fail_next_commit: bool,
+    fail_next_cas: bool,
     commit_timeouts: usize,
     rollback_requests: usize,
     in_transaction: bool,
@@ -38,6 +39,7 @@ struct HranaState {
     progress: Arc<Notify>,
     // Optional real SQLite backing for configuration transaction/transport tests.
     backing: Option<(DbRuntime, libsql::Connection)>,
+    provider: Option<Arc<ProviderModel>>,
     requests: usize,
     statements: Vec<String>,
 }
@@ -51,6 +53,7 @@ impl HranaState {
             expire_next_cursor: false,
             expired_requests: 0,
             fail_next_commit: false,
+            fail_next_cas: false,
             commit_timeouts: 0,
             rollback_requests: 0,
             in_transaction: false,
@@ -71,10 +74,164 @@ impl HranaState {
             rollback_started: false,
             progress: Arc::new(Notify::new()),
             backing: None,
+            provider: None,
             requests: 0,
             statements: Vec::new(),
         }
     }
+}
+
+// A scaled provider: one core writer, per-request latency, and an interactive
+// transaction lifetime. The actual statements still execute on real SQLite.
+struct ProviderModel {
+    writer: Arc<tokio::sync::Semaphore>,
+    transactions: Mutex<
+        std::collections::HashMap<String, (tokio::sync::OwnedSemaphorePermit, std::time::Instant)>,
+    >,
+    timed_out: Mutex<HashSet<String>>,
+    delay: Duration,
+    limit: Duration,
+    timeouts: AtomicUsize,
+}
+
+impl ProviderModel {
+    fn new(delay: Duration, limit: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            writer: Arc::new(tokio::sync::Semaphore::new(1)),
+            transactions: Mutex::new(std::collections::HashMap::new()),
+            timed_out: Mutex::new(HashSet::new()),
+            delay,
+            limit,
+            timeouts: AtomicUsize::new(0),
+        })
+    }
+}
+
+async fn provider_response(
+    path: &str,
+    input: &Json,
+    state: &Arc<Mutex<HranaState>>,
+    model: &ProviderModel,
+) -> Response<Body> {
+    let baton = {
+        let mut state = state.lock().unwrap();
+        state.requests += 1;
+        match input["baton"].as_str() {
+            Some(baton) => baton.to_owned(),
+            None => {
+                state.next_baton += 1;
+                format!("provider-baton-{}", state.next_baton)
+            }
+        }
+    };
+    tokio::time::sleep(model.delay).await;
+    let requests = if path == "/v3/pipeline" {
+        input["requests"].as_array().unwrap().clone()
+    } else {
+        vec![input.clone()]
+    };
+    let mut responses = Vec::new();
+    let mut closed = false;
+    for request in &requests {
+        let sql = statement_sql(request);
+        if request["type"] == "close" {
+            let owned = model.transactions.lock().unwrap().remove(&baton);
+            if owned.is_some() {
+                let mut state = state.lock().unwrap();
+                let (runtime, conn) = state.backing.as_ref().unwrap();
+                runtime.block_on(conn.execute("ROLLBACK", ())).unwrap();
+                state.in_transaction = false;
+                state.write_locked = false;
+            }
+            drop(owned);
+            closed = true;
+            responses.push(json!({"type":"ok","response":{"type":"close"}}));
+            continue;
+        }
+        if request["type"] == "describe" {
+            responses.push(json!({"type":"ok","response":{"type":"describe","result":{"params":[],"cols":[{"name":"value","decltype":"INTEGER"}],"is_explain":false,"is_readonly":true}}}));
+            continue;
+        }
+        if sql.is_empty() {
+            let owns = model.transactions.lock().unwrap().contains_key(&baton);
+            responses.push(
+                json!({"type":"ok","response":{"type":"get_autocommit","is_autocommit":!owns}}),
+            );
+            continue;
+        }
+        let expired = model
+            .transactions
+            .lock()
+            .unwrap()
+            .get(&baton)
+            .is_some_and(|(_, start)| start.elapsed() > model.limit);
+        if expired {
+            let owned = model.transactions.lock().unwrap().remove(&baton);
+            let mut state = state.lock().unwrap();
+            let (runtime, conn) = state.backing.as_ref().unwrap();
+            runtime.block_on(conn.execute("ROLLBACK", ())).unwrap();
+            state.in_transaction = false;
+            state.write_locked = false;
+            model.timed_out.lock().unwrap().insert(baton.clone());
+            model.timeouts.fetch_add(1, Ordering::SeqCst);
+            drop(owned);
+        }
+        if model.timed_out.lock().unwrap().contains(&baton) {
+            let error = json!({"message":"Transaction timed out","code":"TRANSACTION_TIMEOUT"});
+            if path == "/v3/cursor" {
+                return body(
+                    StatusCode::OK,
+                    format!(
+                        "{}\n{}\n",
+                        json!({"baton":baton}),
+                        json!({"type":"step_error","step":0,"error":error})
+                    ),
+                );
+            }
+            responses.push(json!({"type":"ok","response":{"type":"batch","result":{"step_results":[null],"step_errors":[error]}}}));
+            continue;
+        }
+        let owns = model.transactions.lock().unwrap().contains_key(&baton);
+        // Autocommit statements hold the writer for just their execution. BEGIN
+        // retains it on that stream; a competing writer waits for the permit.
+        let permit = if owns {
+            None
+        } else {
+            Some(Arc::clone(&model.writer).acquire_owned().await.unwrap())
+        };
+        let result = {
+            let mut state = state.lock().unwrap();
+            state.in_transaction = owns;
+            state.write_locked = owns;
+            backed_statement_result(request, &mut state)
+        };
+        if sql.starts_with("BEGIN") {
+            state.lock().unwrap().begin_sql.push(sql.clone());
+            model
+                .transactions
+                .lock()
+                .unwrap()
+                .insert(baton.clone(), (permit.unwrap(), std::time::Instant::now()));
+        } else if sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") {
+            model.transactions.lock().unwrap().remove(&baton);
+        }
+        if path == "/v3/cursor" {
+            let mut lines = vec![
+                json!({"baton":baton}).to_string(),
+                json!({"type":"step_begin","step":0,"cols":result["cols"]}).to_string(),
+            ];
+            for row in result["rows"].as_array().unwrap() {
+                lines.push(json!({"type":"row","row":row}).to_string());
+            }
+            lines.push(json!({"type":"step_end","step":0,"affected_row_count":result["affected_row_count"]}).to_string());
+            return body(StatusCode::OK, format!("{}\n", lines.join("\n")));
+        }
+        responses.push(json!({"type":"ok","response":{"type":"batch","result":{"step_results":[result],"step_errors":[null]}}}));
+    }
+    body(
+        StatusCode::OK,
+        json!({"baton":if closed {None} else {Some(baton)},"results":responses}).to_string(),
+    )
 }
 
 struct HranaFixture {
@@ -141,8 +298,8 @@ impl HranaFixture {
             startup_deferred: false,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
-                database,
-                runtime,
+                database: Arc::clone(&database),
+                runtime: runtime.clone(),
                 remote: true,
                 read_only: false,
                 busy_timeout_ms: 5_000,
@@ -151,6 +308,9 @@ impl HranaFixture {
                 launcher_fence: Arc::clone(&launcher_fence),
                 commit_lease_probe: Arc::new(Mutex::new(None)),
             }),
+            lease_connection: Arc::new(Mutex::new(Some(
+                Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap(),
+            ))),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),
             required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -352,6 +512,10 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
     let path = request.uri().path().to_owned();
     let bytes = hyper::body::to_bytes(request.into_body()).await.unwrap();
     let input: Json = serde_json::from_slice(&bytes).unwrap();
+    let provider = state.lock().unwrap().provider.clone();
+    if let Some(provider) = provider {
+        return provider_response(&path, &input, &state, &provider).await;
+    }
     if hold_immediate_begin(&path, &input, &state).await {
         // The lock was taken when the request arrived. This response is that
         // same BEGIN, so it must not be reported as a second writer.
@@ -475,6 +639,10 @@ fn statement_sql(request: &Json) -> String {
 
 fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
     let sql = statement_sql(request);
+    if sql.starts_with("UPDATE META") && state.fail_next_cas {
+        state.fail_next_cas = false;
+        return json!({"type":"batch","result":{"step_results":[null],"step_errors":[{"message":"Transaction timed out","code":"TRANSACTION_TIMEOUT"}]}});
+    }
     if sql.starts_with("ROLLBACK") {
         state.rollback_requests += 1;
         state.in_transaction = false;
@@ -1030,4 +1198,323 @@ async fn startup_connection_close_lets_the_next_writer_take_the_lock() {
     let tx = next.transaction_primary_read().unwrap();
     tx.commit().unwrap();
     assert!(!fixture.write_locked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_renewal_survives_provider_bulk_writer() {
+    let path = super::tmp_db_path("lease_provider_contention");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let initial = crate::control::now_ms();
+    assert!(
+        claim_active_bot(&local, instance, initial, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    let model = ProviderModel::new(Duration::from_millis(60), Duration::from_millis(550));
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.backing = Some((runtime, backing));
+        state.provider = Some(Arc::clone(&model));
+    }
+    let remote = fixture.db();
+    remote.arm_writer_term(instance, local.leased_generation().unwrap());
+    let bulk = remote.clone();
+    let began = Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = Arc::clone(&began);
+    let writer = tokio::task::spawn_blocking(move || {
+        bulk.with_conn_sync(move |conn| {
+            for _ in 0..6 {
+                // Real interactive core write transactions holding the provider
+                // writer ~440 ms (0.8 of its scaled lifetime).
+                let tx = conn.transaction_primary_read()?;
+                signal.add_permits(1);
+                std::thread::sleep(Duration::from_millis(380));
+                tx.finish_read()?;
+            }
+            Ok(())
+        })
+    });
+    began.acquire().await.unwrap().forget();
+    let mut kept = 0;
+    let mut failure = None;
+    for _ in 0..4 {
+        match renew_active_bot(
+            &remote,
+            instance,
+            crate::control::now_ms(),
+            Arc::clone(&refuse),
+        )
+        .await
+        {
+            Ok(true) => kept += 1,
+            result => {
+                failure = Some(format!("{result:?}"));
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    let writer_result = writer.await.unwrap();
+    assert!(writer_result.is_ok(), "bulk writer: {writer_result:?}");
+    assert_eq!(
+        kept,
+        4,
+        "lease renewal lost under provider contention: {failure:?}; provider TRANSACTION_TIMEOUT count={}",
+        model.timeouts.load(Ordering::SeqCst)
+    );
+    let state = fixture.state.lock().unwrap();
+    let renewal_statements = state
+        .statements
+        .iter()
+        .filter(|sql| sql.contains("'active_bot_lease'") && sql.starts_with("UPDATE"))
+        .count();
+    assert_eq!(renewal_statements, 4, "one statement per renewal attempt");
+    assert_eq!(
+        state.begin_sql.len(),
+        6,
+        "only bulk writer may open interactive transactions"
+    );
+    eprintln!("lease kept over 4 renewals; 4 CAS statements; 0 renewal BEGIN; provider timeouts=0");
+    drop(state);
+    let renewed = local
+        .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
+        .unwrap()
+        .unwrap();
+    let expiry = renewed.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+    assert!(
+        expiry > initial + ACTIVE_BOT_LEASE_TTL_MS,
+        "authority must be extended durably"
+    );
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_renewal_bypasses_exhausted_core_pool() {
+    let path = super::tmp_db_path("lease_pool_exhaustion");
+    let db = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(&db, instance, crate::control::now_ms(), Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let blocked = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let blocked = Arc::clone(&blocked);
+        let entered = Arc::clone(&entered);
+        holders.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                entered.add_permits(1);
+                let (lock, ready) = &*blocked;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+    }
+    entered.acquire_many(2).await.unwrap().forget();
+    assert_eq!(db.permits.available_permits(), 0);
+    let renewed = tokio::time::timeout(
+        Duration::from_millis(500),
+        renew_active_bot(&db, instance, crate::control::now_ms(), refuse),
+    )
+    .await;
+    *blocked.0.lock().unwrap() = true;
+    blocked.1.notify_all();
+    for holder in holders {
+        holder.await.unwrap();
+    }
+    assert!(
+        matches!(renewed, Ok(Ok(true))),
+        "lease renewal waited for exhausted core pool: {renewed:?}"
+    );
+    drop(db);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
+    let path = super::tmp_db_path("lease_cas_fences");
+    let db = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let foreign = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let now = crate::control::now_ms();
+    assert!(
+        claim_active_bot(&db, instance, now, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let generation = db.leased_generation();
+    assert!(
+        renew_active_bot(&db, instance, now + 1, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.leased_generation(), generation);
+    refuse.store(true, Ordering::Release);
+    assert!(
+        !renew_active_bot(&db, instance, now + 2, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    refuse.store(false, Ordering::Release);
+    assert!(
+        !renew_active_bot(&db, foreign, now + 3, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !renew_active_bot(&db, instance, now + 30_000, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    db.with_conn(|conn| {
+        conn.set_expected_lease_owner(None);
+        let tx = conn.transaction_immediate()?;
+        write_meta_string_conn(&tx, "restore_fence", "1")?;
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    assert!(
+        !renew_active_bot(&db, instance, now + 4, refuse)
+            .await
+            .unwrap()
+    );
+    drop(db);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn launcher_cas_preserves_existing_fence_semantics() {
+    let path = super::tmp_db_path("launcher_cas");
+    let db = Db::open(&path, 2).unwrap();
+    let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let foreign = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let control = UpdateControl::from_application(&db);
+    control.arm_launcher_fence(owner);
+    assert!(
+        !control.renew_launcher_fence_cas().await.unwrap(),
+        "missing row must use acquisition path"
+    );
+    assert!(control.renew_launcher_fence().await.unwrap());
+    assert!(control.renew_launcher_fence_cas().await.unwrap());
+    control.arm_launcher_fence(foreign);
+    assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    db.with_conn(move |conn| {
+        conn.set_expected_launcher(None);
+        let tx = conn.transaction_immediate()?;
+        write_meta_string_conn(&tx, "launcher_lease", &format!("{owner} 0"))?;
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    assert!(
+        control.renew_launcher_fence_cas().await.unwrap(),
+        "expired foreign fence may be taken"
+    );
+    db.with_conn(|conn| {
+        conn.set_expected_launcher(None);
+        let tx = conn.transaction_immediate()?;
+        write_meta_string_conn(&tx, "restore_fence", "1")?;
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    drop(control);
+    drop(db);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_lease_cas_discards_and_recreates_the_dedicated_stream() {
+    let path = super::tmp_db_path("lease_cas_stream");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(
+            &local,
+            instance,
+            crate::control::now_ms(),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
+    );
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let remote = fixture.db();
+    remote.arm_writer_term(instance, local.leased_generation().unwrap());
+    fixture.state.lock().unwrap().fail_next_cas = true;
+    let error = renew_active_bot(
+        &remote,
+        instance,
+        crate::control::now_ms(),
+        Arc::clone(&refuse),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("TRANSACTION_TIMEOUT"));
+    assert!(remote.lease_connection.lock().unwrap().is_none());
+    assert!(
+        renew_active_bot(
+            &remote,
+            instance,
+            crate::control::now_ms(),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
+    );
+    assert!(remote.lease_connection.lock().unwrap().is_some());
+    fixture.expire_latest();
+    assert!(
+        renew_active_bot(&remote, instance, crate::control::now_ms(), refuse)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.expired_requests(),
+        0,
+        "CAS must reset each remote stream before use"
+    );
+    assert_eq!(
+        fixture.state.lock().unwrap().requests,
+        3,
+        "each CAS attempt is exactly one HTTP request"
+    );
+    assert!(fixture.begin_sql().is_empty());
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }

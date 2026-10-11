@@ -1790,15 +1790,18 @@ pub async fn emit_mod_action(
     vars.insert("reason".into(), reason.to_string());
     emit(app, ctx, guild_id, "mod_action", vars).await;
 
-    let _ = db::insert_enrolled_event(
-        &app.db,
-        enrollment.clone(),
-        "mod_action",
-        Some(target_id as i64),
-        Some(actor_id as i64),
-        &serde_json::json!({"action": action, "reason": reason}),
-    )
-    .await;
+    crate::logging::log_persistence_result(
+        "mod_action event",
+        db::insert_enrolled_event(
+            &app.db,
+            enrollment.clone(),
+            "mod_action",
+            Some(target_id as i64),
+            Some(actor_id as i64),
+            &serde_json::json!({"action": action, "reason": reason}),
+        )
+        .await,
+    );
 }
 
 /// Emits a member event (join/leave/ban/unban/kick) with full member context.
@@ -1899,3 +1902,88 @@ fn default_template(event: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+/// Preserve the optional persistence result while making failed writes visible.
+pub(crate) fn log_persistence_result<T>(
+    kind: &'static str,
+    result: anyhow::Result<T>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!("{kind} write failed: {error:#}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod persistence_log_tests {
+    use super::log_persistence_result;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLog(pub(crate) Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        pub(crate) fn dispatch(&self) -> tracing::Dispatch {
+            let writer = self.clone();
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn failed_moderation_writes_log_each_operation_without_identifiers() {
+        let log = CapturedLog::default();
+        tracing::dispatcher::with_default(&log.dispatch(), || {
+            for kind in [
+                "automod event",
+                "timeout_add event",
+                "timeout_remove event",
+                "mod_action event",
+                "gateway ban row",
+            ] {
+                let result =
+                    Err::<(), _>(anyhow::anyhow!("provider failure").context("write rejected"));
+                assert!(log_persistence_result(kind, result).is_none());
+            }
+            assert_eq!(log_persistence_result("gateway ban row", Ok(7)), Some(7));
+        });
+        let text = log.text();
+        assert_eq!(text.lines().count(), 5);
+        for (line, kind) in text.lines().zip([
+            "automod event",
+            "timeout_add event",
+            "timeout_remove event",
+            "mod_action event",
+            "gateway ban row",
+        ]) {
+            assert!(line.contains("WARN"));
+            assert!(
+                line.ends_with(&format!(
+                    "{kind} write failed: write rejected: provider failure"
+                )),
+                "{line}"
+            );
+        }
+    }
+}

@@ -8,7 +8,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 5;
+pub const LAUNCHER_REVISION: u32 = 6;
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
@@ -441,6 +441,32 @@ impl UpdateControl {
     /// Bot-launcher fence. The API launcher never calls this and never writes.
     pub fn arm_launcher_fence(&self, instance: &str) {
         self.db.arm_launcher_fence(instance);
+    }
+
+    /// One-statement periodic renewal of an existing launcher fence. Initial
+    /// acquisition stays on the interactive path because the row may be absent.
+    pub async fn renew_launcher_fence_cas(&self) -> Result<bool> {
+        let Some(instance) = self
+            .db
+            .launcher_instance()
+            .filter(|_| self.writes_locally())
+        else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid launcher instance"
+        );
+        self.db
+            .with_lease_conn(move |conn| {
+                let now = crate::control::now_ms();
+                let next = format!("{instance} {}", now.saturating_add(20_000));
+                Ok(conn.execute_lease_cas(
+                    crate::db_compat::LAUNCHER_FENCE_CAS,
+                    params![next, format!("{instance} "), now],
+                )? == 1)
+            })
+            .await
     }
 
     /// Extend this process's launcher fence. The transaction writes that fence

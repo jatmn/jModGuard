@@ -540,6 +540,40 @@ pub async fn claim_active_bot(
     Ok(true)
 }
 
+/// Renew only an already-armed owner; startup and generation-zero claims keep
+/// the interactive claim path. A zero-row CAS means authority has been lost.
+pub async fn renew_active_bot(
+    db: &Db,
+    instance: &str,
+    now_ms: i64,
+    refuse: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<bool> {
+    anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
+    if db.leased_owner().as_deref() != Some(instance)
+        || db
+            .leased_generation()
+            .is_none_or(|generation| generation <= 0)
+    {
+        return claim_active_bot(db, instance, now_ms, refuse).await;
+    }
+    let instance = instance.to_owned();
+    db.with_lease_conn(move |conn| {
+        if refuse.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
+        let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+        Ok(conn.execute_lease_cas(
+            crate::db_compat::ACTIVE_BOT_LEASE_CAS,
+            params![
+                format!("{instance} {expires}"),
+                format!("{instance} "),
+                now_ms
+            ],
+        )? == 1)
+    })
+    .await
+}
+
 /// Drop the lease only when this instance still owns the row.
 ///
 /// The generation is left in place. The next fresh claim increments it.

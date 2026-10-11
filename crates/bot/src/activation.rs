@@ -36,6 +36,8 @@ pub struct Activation {
     #[cfg(test)]
     renewal_fault: AtomicBool,
     #[cfg(test)]
+    renewal_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     renewal_stall: AtomicBool,
     #[cfg(test)]
     lease_ttl: Mutex<Duration>,
@@ -94,6 +96,8 @@ impl Activation {
             startup_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             renewal_fault: AtomicBool::new(false),
+            #[cfg(test)]
+            renewal_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             renewal_stall: AtomicBool::new(false),
             #[cfg(test)]
@@ -390,17 +394,21 @@ fn spawn_renewal_every(
     tenant: Option<crate::tenant::TenantRuntime>,
     every: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    use tracing::instrument::WithSubscriber;
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     tokio::spawn(async move {
         let mut armed = db.leased_generation();
         let mut interval = tokio::time::interval(every);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
+        let mut last_error = None;
+        let mut loss_reason = "active-bot lease expired before renewal";
         loop {
             let lost_at_deadline = wait_for_renewal_tick(&activation, &mut interval, every).await;
             if lost_at_deadline {
                 // Shutdown notices still record until the notice drain cuts off.
                 if !activation.is_shutting_down() {
-                    lose_lease(&activation, "active-bot lease expired before renewal");
+                    lose_lease(&activation);
                 }
                 break;
             }
@@ -408,52 +416,76 @@ fn spawn_renewal_every(
                 break;
             }
             if !activation.authority_current() {
-                lose_lease(&activation, "active-bot lease expired before renewal");
+                lose_lease(&activation);
                 break;
             }
-            #[cfg(test)]
-            let fault = activation.renewal_fault.swap(false, Ordering::AcqRel);
-            #[cfg(not(test))]
-            let fault = false;
-            #[cfg(test)]
-            let stall = activation.renewal_stall.swap(false, Ordering::AcqRel);
-            #[cfg(not(test))]
-            let stall = false;
-            let requested_at = Instant::now();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let claim = async {
-                if fault {
-                    Err(anyhow::anyhow!("active-bot lease renewal failed"))
-                } else if stall {
-                    std::future::pending::<anyhow::Result<bool>>().await
-                } else {
-                    db::claim_active_bot(
-                        &db,
-                        activation.instance(),
-                        now_ms,
-                        activation.refuse_flag(),
-                    )
-                    .await
-                }
-            };
-            let result = if let Some(deadline) = activation.authority_deadline() {
-                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), claim).await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        if !activation.is_shutting_down() {
-                            lose_lease(&activation, "active-bot lease renewal timed out");
-                        }
-                        break;
+            let mut backoff = Duration::from_millis(100);
+            let (requested_at, result) = loop {
+                #[cfg(test)]
+                activation.renewal_attempts.fetch_add(1, Ordering::AcqRel);
+                #[cfg(test)]
+                let fault = activation.renewal_fault.swap(false, Ordering::AcqRel);
+                #[cfg(not(test))]
+                let fault = false;
+                #[cfg(test)]
+                let stall = activation.renewal_stall.swap(false, Ordering::AcqRel);
+                #[cfg(not(test))]
+                let stall = false;
+                let requested_at = Instant::now();
+                let claim = async {
+                    if fault {
+                        Err(anyhow::anyhow!("active-bot lease renewal failed"))
+                    } else if stall {
+                        std::future::pending::<anyhow::Result<bool>>().await
+                    } else {
+                        db::renew_active_bot(
+                            &db,
+                            activation.instance(),
+                            chrono::Utc::now().timestamp_millis(),
+                            activation.refuse_flag(),
+                        )
+                        .await
                     }
+                };
+                let deadline = activation
+                    .authority_deadline()
+                    .map(|deadline| deadline.checked_sub(RENEW_START_MARGIN).unwrap_or(deadline));
+                let result = if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), claim)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("active-bot lease renewal timed out")),
+                    }
+                } else {
+                    claim.await
+                };
+                match result {
+                    Err(error) => {
+                        last_error = Some(format!("{error:#}"));
+                        let remaining = deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                        if activation.is_shutting_down()
+                            || remaining.is_none_or(|remaining| remaining <= backoff)
+                        {
+                            loss_reason = "active-bot lease renewal exhausted its authority window";
+                            break (requested_at, Err(error));
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+                    }
+                    Ok(false) => {
+                        loss_reason = "active-bot lease renewal matched no row: another instance holds it, it expired, or a restore is in progress";
+                        break (requested_at, Ok(false));
+                    }
+                    Ok(true) => break (requested_at, Ok(true)),
                 }
-            } else {
-                claim.await
             };
             if matches!(result, Ok(true)) {
                 if !activation.authority_current() {
                     if !activation.is_shutting_down() {
-                        lose_lease(&activation, "active-bot lease renewal completed too late");
+                        loss_reason = "active-bot lease renewal completed too late";
+                        lose_lease(&activation);
                     }
                     break;
                 }
@@ -465,10 +497,13 @@ fn spawn_renewal_every(
                     {
                         if writer_lease_lost(&error) {
                             let _ = db::release_active_bot(&db, activation.instance()).await;
-                            lose_lease(&activation, "active bot lease is not held");
+                            loss_reason = "active bot lease is not held";
+                            last_error = Some(format!("{error:#}"));
+                            lose_lease(&activation);
                         } else {
-                            tracing::warn!("guild writer epoch raise failed: {error:#}");
-                            lose_lease(&activation, "guild writer epoch raise failed");
+                            loss_reason = "guild writer epoch raise failed";
+                            last_error = Some(format!("{error:#}"));
+                            lose_lease(&activation);
                         }
                         break;
                     }
@@ -484,10 +519,14 @@ fn spawn_renewal_every(
             // an already-observed cutoff. A running, unleased bot is unhealthy.
             activation.note_lease_lost();
             set_process_ready(false);
-            tracing::error!("active-bot lease lost outside shutdown; exiting for restart");
+            tracing::error!(
+                reason = loss_reason,
+                last_error = last_error.as_deref().unwrap_or("none"),
+                "active-bot lease lost outside shutdown; exiting for restart"
+            );
             (activation.exit_hook)(1);
         }
-    })
+    }.with_subscriber(dispatch))
 }
 
 /// `true` when the confirmed deadline arrives before the next renewal tick.
@@ -515,8 +554,7 @@ async fn wait_for_renewal_tick(
     }
 }
 
-fn lose_lease(activation: &Activation, message: &str) {
-    tracing::warn!("{message}");
+fn lose_lease(activation: &Activation) {
     activation.note_lease_lost();
     set_process_ready(false);
 }
@@ -533,11 +571,6 @@ fn settle_renewal(activation: &Activation, result: &anyhow::Result<bool>) -> boo
     }
     if activation.is_shutting_down() {
         return false;
-    }
-    match result {
-        Err(error) => tracing::warn!("active-bot lease renewal failed: {error:#}"),
-        Ok(false) => tracing::warn!("active-bot lease lost"),
-        Ok(true) => return true,
     }
     activation.note_lease_lost();
     set_process_ready(false);
@@ -831,22 +864,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_renewal_cancels_an_inflight_discord_call() {
-        let (path, db) = temp_db("renew-err");
+    async fn transient_renewal_failure_retries_before_the_next_tick() {
+        let (path, db) = temp_db("renew-transient");
         let activation = Activation::new();
+        activation.set_lease_window(Duration::from_secs(3), Duration::from_millis(100));
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         activation.fail_next_renewal();
+        let began = Instant::now();
         let renewal = spawn_renewal_every(
             db.clone(),
             Arc::clone(&activation),
             None,
-            Duration::from_millis(30),
+            Duration::from_millis(500),
         );
-        assert_cancelled(task).await;
-        assert!(!activation.may_record());
+        tokio::time::timeout(Duration::from_millis(950), async {
+            while activation.authority_deadline() == Some(before)
+                && !activation.cut_off.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retry must finish before the next 500 ms tick");
+        assert!(activation.authority_deadline().unwrap() > before);
+        assert!(began.elapsed() < Duration::from_millis(950));
+        assert!(
+            !activation.renewal_fault.load(Ordering::Acquire),
+            "injected first attempt ran"
+        );
+        assert!(activation.may_record());
+        assert!(
+            !task.is_finished(),
+            "one transport failure must preserve Discord authority"
+        );
+        task.abort();
         renewal.abort();
+        let _ = task.await;
+        let _ = renewal.await;
         drop(db);
         cleanup(&path);
     }
@@ -1110,33 +1167,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpected_lease_loss_calls_the_nonzero_exit_hook() {
+    async fn zero_row_renewal_logs_once_and_exits_without_retry() {
+        use crate::logging::persistence_log_tests::CapturedLog;
+        use tracing::instrument::WithSubscriber;
         static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-        let (path, db) = temp_db("lease-exit");
-        let mut activation = Activation::new();
-        Arc::get_mut(&mut activation).unwrap().exit_hook = |code| {
-            EXIT_CODE.store(code, Ordering::Release);
-        };
-        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
-        activation.fail_next_renewal();
-        let renewal = spawn_renewal_every(
-            db.clone(),
-            Arc::clone(&activation),
-            None,
-            Duration::from_millis(30),
-        );
-        tokio::time::timeout(Duration::from_secs(2), renewal)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(activation.cut_off.load(Ordering::Acquire));
-        assert!(!activation.may_record());
-        assert!(
-            EXIT_CODE.load(Ordering::Acquire) != 0,
-            "unexpected lease loss must call the exit hook with a non-zero code"
-        );
-        drop(db);
-        cleanup(&path);
+        for expired in [false, true] {
+            EXIT_CODE.store(0, Ordering::Release);
+            let (path, db) = temp_db("lease-zero-row");
+            let mut activation = Activation::new();
+            Arc::get_mut(&mut activation).unwrap().exit_hook = |code| {
+                EXIT_CODE.store(code, Ordering::Release);
+            };
+            assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+            let owner = if expired {
+                activation.instance().to_owned()
+            } else {
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()
+            };
+            let writer = Db::open(&path, 2).unwrap();
+            writer
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_immediate()?;
+                    let expires = if expired {
+                        0
+                    } else {
+                        chrono::Utc::now().timestamp_millis() + 20_000
+                    };
+                    db::write_meta_string_conn(
+                        &tx,
+                        "active_bot_lease",
+                        &format!("{owner} {expires}"),
+                    )?;
+                    tx.commit()
+                })
+                .await
+                .unwrap();
+            let log = CapturedLog::default();
+            let dispatch = log.dispatch();
+            let renewal = tracing::dispatcher::with_default(&dispatch, || {
+                spawn_renewal_every(
+                    db.clone(),
+                    Arc::clone(&activation),
+                    None,
+                    Duration::from_millis(20),
+                )
+            });
+            tokio::time::timeout(Duration::from_secs(2), renewal.with_subscriber(dispatch))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                activation.renewal_attempts.load(Ordering::Acquire),
+                1,
+                "zero rows must not retry"
+            );
+            assert!(activation.cut_off.load(Ordering::Acquire));
+            assert!(!activation.may_record());
+            assert_eq!(EXIT_CODE.load(Ordering::Acquire), 1);
+            let text = log.text();
+            assert_eq!(
+                text.lines().filter(|line| line.contains("ERROR")).count(),
+                1,
+                "{text}"
+            );
+            assert_eq!(
+                text.lines().count(),
+                1,
+                "lease loss must not double-log: {text}"
+            );
+            assert!(text.contains("renewal matched no row: another instance holds it, it expired, or a restore is in progress"));
+            drop(writer);
+            drop(db);
+            cleanup(&path);
+        }
     }
 
     #[test]
