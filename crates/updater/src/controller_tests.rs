@@ -2546,7 +2546,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
             tx.execute_batch_bounded(
-                "DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
+                "DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
                  DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
                  DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
                  PRAGMA user_version=16;",
@@ -2624,7 +2624,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                 .baked_compatibility(role, &bot.base_sha, true)
                 .await
                 .unwrap();
-            assert_eq!(contract.core, 18);
+            assert_eq!(contract.core, db::CORE_SCHEMA_VERSION);
             assert_eq!(contract.source_sha, bot.base_sha);
             if role == "bot" {
                 bot.baked_compatibility = contract;
@@ -2653,10 +2653,13 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             "baked migrator must start from core16"
         );
         assert!(bot.running.as_ref().unwrap().release.is_none());
-        // Real application bootstrap applies migrations 17-18 and the readiness
+        // Real application bootstrap applies the remaining migrations and the readiness
         // marker. The ELF child itself deliberately does no DB/application work.
         let migrated = Db::open(&path, 2).unwrap();
-        assert_eq!(control.schema_version().await.unwrap(), 18);
+        assert_eq!(
+            control.schema_version().await.unwrap(),
+            db::CORE_SCHEMA_VERSION
+        );
         tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
             .await
             .unwrap();
@@ -2671,7 +2674,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         assert_eq!(after.candidate, before.candidate);
         assert!(after.installed.is_none() && after.previous.is_none());
         assert_eq!(after.state, "queued");
-        assert_eq!(after.observed.unwrap().min_schema, 18);
+        assert_eq!(after.observed.unwrap().min_schema, db::CORE_SCHEMA_VERSION);
         api.restore(&control.component("api").await.unwrap())
             .await
             .unwrap();

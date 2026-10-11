@@ -140,6 +140,7 @@ function App() {
     ["dashboard", "◈", "Dashboard"],
     ["rules", "◇", "Automod Rules"],
     ["badwords", "⊘", "Badwords"],
+    ["known-bad-images", "▧", "Known-bad images"],
     ["commands", "⌘", "Commands"],
     ["templates", "≡", "Templates"],
     ["logchannels", "#", "Log Channels"],
@@ -380,6 +381,7 @@ function Notification() {
 function trackDraft(event) {
   if (
     event.target.matches("input, textarea, select") &&
+    !event.target.hasAttribute("data-search") &&
     !["events", "members", "bans"].includes(state.tab)
   )
     markDirty();
@@ -389,6 +391,7 @@ function Content() {
     dashboard: tabDashboard,
     rules: tabRules,
     badwords: tabBadwords,
+    "known-bad-images": tabKnownBadImages,
     commands: tabCommands,
     templates: tabTemplates,
     logchannels: tabLogChannels,
@@ -528,6 +531,7 @@ const tabs = [
   "dashboard",
   "rules",
   "badwords",
+  "known-bad-images",
   "commands",
   "templates",
   "logchannels",
@@ -775,7 +779,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -783,6 +787,7 @@ function pageEnrollment(path, method = "GET") {
       [
         "rules",
         "badwords",
+        "known-bad-images",
         "commands",
         "templates",
         "logchannels",
@@ -5031,6 +5036,65 @@ function tabEvents() {
     ),
   );
 }
+function tabKnownBadImages() {
+  const [query, setQuery] = useState("");
+  const { drafts } = useStore(ui);
+  const hashDraft = drafts["known-bad:hash"]?.value ?? "";
+  const guildId = state.guildId;
+  const rows = (state.config.known_bad_images || []).filter((row) =>
+    `${row.hash} ${row.note || ""} ${row.added_via} ${row.actor}`.toLowerCase().includes(query.toLowerCase()),
+  );
+  if (guildId === "0") return h("p", { className: "muted" }, "Known-bad images are managed per server. Select a server.");
+  return h("div", null,
+    h("h2", null, "Known-bad images"),
+    h("p", { className: "muted" }, "Add a confirmed SHA-256 digest from an exact-image notice. A listed image matches on its first post under the exact-image rule. Dry-run logs only; normal mode deletes and bans. Up to 1024 digests per server. Only hashes and safe labels are retained."),
+    field("Search hashes or notes", h(Input, {
+      className: "input w-full", "data-search": true, value: query, onChange: (event) => setQuery(event.target.value),
+    })),
+    h(
+      DraftCard,
+      { group: "known-bad-images", className: "card bg-base-100 card-border" },
+      h(
+        "div",
+        { className: "card-body" },
+        field("SHA-256 digest", h(Input, {
+          className: "input w-full", draftKey: "known-bad:hash", maxLength: 64,
+        })),
+        field("Optional safe note", h(Input, {
+          className: "input w-full", draftKey: "known-bad:note", maxLength: 256,
+        })),
+        h(ActionButton, {
+          className: "btn btn-sm",
+          disabled: !/^[a-fA-F0-9]{64}$/.test(hashDraft),
+          savedFields: ["known-bad:hash", "known-bad:note"],
+          onClick: async () => {
+            const hash = drafts["known-bad:hash"]?.value ?? "";
+            const note = drafts["known-bad:note"]?.value ?? "";
+            await reloadAfter(
+              () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
+              (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
+            );
+          },
+        }, "Add hash"),
+      ),
+    ),
+    h(DataTable, { headings: ["SHA-256", "Added", "Source", "Actor", "Note", "Actions"] },
+      rows.length ? rows.map((row) => h("tr", { key: row.hash },
+        h("td", { style: { overflowWrap: "anywhere" } }, row.hash),
+        h("td", null, row.added_at), h("td", null, row.added_via),
+        h("td", null, row.actor), h("td", null, row.note || "—"),
+        h("td", null, h(ActionButton, { className: "btn btn-sm",
+          onClick: async () => {
+            if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
+            await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
+            if (state.guildId === guildId && await loadConfig()) renderTab();
+          },
+        }, "Remove")),
+      )) : h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No matching hashes.")),
+    ),
+  );
+}
+
 function tabBans() {
   const guildId = state.guildId;
   const result = useApiRead(`/api/guilds/${guildId}/bans?limit=200`);

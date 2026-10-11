@@ -118,7 +118,7 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
                 scope: db::ScopeWire {
                     global: false,
                     guild_id: 55_555,
-                    enrollment_id: enrollment.id,
+                    enrollment_id: enrollment.id.clone(),
                     joined_at_ns: 1,
                 },
                 prefix: db::FieldPatch::Set("!saved".into()),
@@ -137,6 +137,49 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
     assert_eq!(
         db::get_settings(&bot.db, 55_555).await.unwrap().prefix,
         "!saved"
+    );
+    // Only the production bot writer can persist the managed list.
+    let scope = db::ConfigurationScope::Guild(enrollment.clone());
+    let hash = "ab".repeat(32);
+    let add = db::ControlOp::AddKnownBadImage {
+        scope: scope.to_wire(),
+        hash: hash.clone(),
+        note: Some("confirmed spam".into()),
+    };
+    assert!(matches!(
+        app.commit_actor(9, add.clone()).await.unwrap(),
+        db::ControlReply::Failed { .. }
+    ));
+    assert!(matches!(
+        app.commit_actor(7, add.clone()).await.unwrap(),
+        db::ControlReply::Saved { .. }
+    ));
+    assert!(matches!(
+        app.commit_actor(7, add).await.unwrap(),
+        db::ControlReply::Unchanged { .. }
+    ));
+    let rows = db::load_enrolled_web_config_snapshot(&app.db, scope.clone())
+        .await
+        .unwrap()
+        .known_bad_images;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].hash, hash);
+    assert_eq!(rows[0].actor, "unknown");
+    assert_eq!(probe.immediate(), 0, "hash saves open no API writer");
+    let remove = db::ControlOp::RemoveKnownBadImage {
+        scope: scope.to_wire(),
+        hash,
+    };
+    assert!(matches!(
+        app.commit_actor(7, remove).await.unwrap(),
+        db::ControlReply::Saved { .. }
+    ));
+    assert!(
+        db::load_enrolled_web_config_snapshot(&app.db, scope)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
     );
     drop(app);
     drop(bot);

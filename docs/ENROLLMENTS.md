@@ -126,10 +126,10 @@ Bot configuration callers retain their existing helpers. No schema change is int
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
 it does not infer membership from existing guild settings or old queue jobs. The current
-recognized core lineage extends through migration 0018: 0015 stores component-update
+recognized core lineage extends through migration 0019: 0015 stores component-update
 coordination, 0016 persists shared per-bot member-sync pacing, 0017 indexes
-ordered event/ban pages and expiring bot actions, and 0018 keeps one active ban
-row per guild and user.
+ordered event/ban pages and expiring bot actions, 0018 keeps one active ban
+row per guild and user, and 0019 stores guild-local known-bad image digests.
 Older binaries reject newer versions;
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported. Live guild-store erasure is described in

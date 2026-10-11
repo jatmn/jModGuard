@@ -3,9 +3,8 @@
 `bunny_evidence::BunnyEvidenceStore` is an opt-in Unix library adapter for selected case
 attachments. It performs real HTTP transfers and uses the guild journal for durable progress.
 Current bot/API services do not call Bunny HTTP from a background worker.
-After selected image-spam enforcement, the bot re-fetches proving attachments with the
-Hasher CDN contract and tenant runtime can stream that local capture file into this
-adapter; the API does not perform that Discord re-fetch. Operator
+Exact-image spam retains hash-only evidence and does not re-fetch or store image
+bytes. The API can still serve previously available journal objects. Operator
 resolution of uncertain uploads is not enabled.
 
 ## Installation boundary

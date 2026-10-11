@@ -6,6 +6,17 @@ use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
+pub fn parse_hash(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut hash = [0; 32];
+    for (i, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(hash)
+}
+
 pub const TEST_MODE: &str = "exact_image_test";
 pub const ENFORCE_MODE: &str = "exact_image";
 pub const MODE: &str = TEST_MODE;
@@ -19,6 +30,8 @@ pub struct Policy {
     pub min_attachments: usize,
     #[serde(default, skip_deserializing)]
     pub enforce: bool,
+    #[serde(default, skip_deserializing)]
+    pub known_bad_hashes: std::collections::BTreeSet<[u8; 32]>,
 }
 impl Policy {
     pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {

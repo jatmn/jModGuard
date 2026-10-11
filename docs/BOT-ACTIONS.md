@@ -92,7 +92,7 @@ Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
 bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation
-adds no schema migration; the current core lineage runs through step 0018.
+adds no schema migration; the current core lineage runs through step 0019.
 Migration 0015 stores component-update coordination; 0016 persists shared per-bot
 member-sync pacing. Migration 0017 indexes ordered event/ban pages and expiring
 bot actions. Migration 0018 keeps one active ban row per guild and user.

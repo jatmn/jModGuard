@@ -1436,6 +1436,14 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             axum::routing::post(api::test_regex),
         )
         .route("/api/guilds/{guild_id}/events", get_post(api::events))
+        .route(
+            "/api/guilds/{guild_id}/known-bad-images",
+            axum::routing::post(api::add_known_bad_image),
+        )
+        .route(
+            "/api/guilds/{guild_id}/known-bad-images/{hash}",
+            axum::routing::delete(api::remove_known_bad_image),
+        )
         .route("/api/guilds/{guild_id}/bans", get_post(api::bans))
         .route(
             "/api/guilds/{guild_id}/unban",

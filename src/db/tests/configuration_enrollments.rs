@@ -556,3 +556,331 @@ async fn configuration_copy_cannot_write_a_fenced_destination() {
         Some("destination".into())
     );
 }
+
+#[tokio::test]
+async fn known_bad_images_are_durable_scoped_validated_and_noop_safe() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let other = f.scope(20).await;
+    let write = ConfigurationWriteScope::new(scope.clone(), scope.clone()).unwrap();
+    let hash = "ab".repeat(32);
+    let before = get_config_version(&f.db).await.unwrap();
+    for invalid in [
+        "".to_owned(),
+        "unknown".into(),
+        "g".repeat(64),
+        "a".repeat(63),
+    ] {
+        assert!(
+            add_enrolled_known_bad_image(&f.db, write.clone(), &invalid, None)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(get_config_version(&f.db).await.unwrap(), before);
+    assert!(
+        add_enrolled_known_bad_image(
+            &f.db,
+            write.clone(),
+            &hash.to_uppercase(),
+            Some("confirmed spam".into())
+        )
+        .await
+        .unwrap()
+    );
+    let added_version = get_config_version(&f.db).await.unwrap();
+    assert!(added_version > before);
+    assert!(
+        !add_enrolled_known_bad_image(&f.db, write.clone(), &hash, Some("duplicate".into()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(get_config_version(&f.db).await.unwrap(), added_version);
+    let snapshot = load_enrolled_web_config_snapshot(&f.db, scope.clone())
+        .await
+        .unwrap();
+    let rows = snapshot.known_bad_images;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].hash, hash);
+    assert_eq!(rows[0].note.as_deref(), Some("confirmed spam"));
+    assert_eq!(rows[0].actor, "unknown");
+    assert_eq!(rows[0].added_via, "webui");
+    assert!(chrono::DateTime::parse_from_rfc3339(&rows[0].added_at).is_ok());
+    assert!(
+        load_enrolled_web_config_snapshot(&f.db, other.clone())
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
+    );
+    let reloaded = Db::open(&f.path, 2).unwrap();
+    assert_eq!(
+        load_config_parts(&reloaded, 10)
+            .await
+            .unwrap()
+            .known_bad_images,
+        rows
+    );
+    let foreign = ConfigurationWriteScope::new(other.clone(), other).unwrap();
+    assert!(
+        !remove_enrolled_known_bad_image(&f.db, foreign, &hash)
+            .await
+            .unwrap()
+    );
+    assert_eq!(get_config_version(&f.db).await.unwrap(), added_version);
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    enroll_guild(&f.db, 10, 101).await.unwrap();
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write, &hash, None)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    let fresh = ConfigurationScope::Guild(guild_enrollment(&f.db, 10).await.unwrap().unwrap());
+    let write = ConfigurationWriteScope::new(fresh.clone(), fresh).unwrap();
+    assert!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty(),
+        "departure erases the guild list"
+    );
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
+            .await
+            .unwrap()
+    );
+    let removed_version = get_config_version(&f.db).await.unwrap();
+    assert!(removed_version > added_version);
+    assert!(
+        !remove_enrolled_known_bad_image(&f.db, write, &hash)
+            .await
+            .unwrap()
+    );
+    assert_eq!(get_config_version(&f.db).await.unwrap(), removed_version);
+    let global =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    assert!(
+        add_enrolled_known_bad_image(&f.db, global, &hash, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_admission_bounds_and_version_failure_are_atomic() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = ConfigurationWriteScope::new(scope.clone(), scope).unwrap();
+    let hash = "cd".repeat(32);
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write.clone(), &hash, Some("x".repeat(257)))
+            .await
+            .is_err()
+    );
+    assert!(safe_image_note(Some("9".repeat(15))).is_err());
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("CREATE TRIGGER refuse_hash_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'fixture'); END", 4096)
+    }).await.unwrap();
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
+    );
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER refuse_hash_version", 4096)?;
+        let tx = conn.transaction_immediate()?;
+        for n in 0..MAX_KNOWN_BAD_IMAGES {
+            tx.execute_rows(
+                "INSERT INTO known_bad_images VALUES (?1, ?2, 'fixture', 'webui', 'unknown', NULL)",
+                params![10, format!("{n:064x}")],
+                1,
+            )?;
+        }
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None)
+            .await
+            .is_err()
+    );
+    let present = format!("{:064x}", 0);
+    assert!(
+        !add_enrolled_known_bad_image(&f.db, write.clone(), &present, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &present)
+            .await
+            .unwrap()
+    );
+    assert!(
+        add_enrolled_known_bad_image(&f.db, write, &hash, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .len(),
+        MAX_KNOWN_BAD_IMAGES
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_remove_version_failure_rolls_back_and_retries() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = ConfigurationWriteScope::new(scope.clone(), scope).unwrap();
+    let hash = "ab".repeat(32);
+    add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None)
+        .await
+        .unwrap();
+    let before = get_primary_versions(&f.db).await.unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER refuse_hash_remove_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'fixture'); END",
+            4096,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .len(),
+        1
+    );
+    let unchanged = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(unchanged.config, before.config);
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER refuse_hash_remove_version", 4096)
+    })
+    .await
+    .unwrap();
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
+            .await
+            .unwrap()
+    );
+    assert!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_remove_cannot_write_a_fenced_guild() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = ConfigurationWriteScope::new(scope.clone(), scope).unwrap();
+    let hash = "ab".repeat(32);
+    add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None)
+        .await
+        .unwrap();
+    let store = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        store.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    {
+        use crate::db::SqlExecutor as _;
+        let destination = store;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
+    .await
+    .unwrap();
+    let before = get_primary_versions(&f.db).await.unwrap();
+    assert!(
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        load_config_parts(&f.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .len(),
+        1
+    );
+    let after = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(after.config, before.config);
+}
+
+#[tokio::test]
+async fn known_bad_image_add_and_remove_race_on_absent_hash_is_serializable() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = ConfigurationWriteScope::new(scope.clone(), scope).unwrap();
+    let hash = "fe".repeat(32);
+    let (add_res, remove_res) = tokio::join!(
+        add_enrolled_known_bad_image(&f.db, write.clone(), &hash, None),
+        remove_enrolled_known_bad_image(&f.db, write.clone(), &hash),
+    );
+    assert!(add_res.is_ok());
+    assert!(remove_res.is_ok());
+    let add = add_res.unwrap();
+    let remove = remove_res.unwrap();
+    let rows = load_config_parts(&f.db, 10).await.unwrap().known_bad_images;
+    let present = rows.iter().any(|row| row.hash == hash);
+    if remove && present {
+        panic!("remove succeeded while the hash remained listed");
+    }
+    match (remove, add) {
+        (false, true) => {
+            assert!(present);
+            assert_eq!(rows.len(), 1);
+        }
+        (true, false) => assert!(!present),
+        (true, true) => assert!(!present),
+        _ => panic!("unexpected add/remove pair: add={add}, remove={remove}"),
+    }
+}

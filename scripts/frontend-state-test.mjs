@@ -88,7 +88,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -98,7 +98,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -2880,4 +2880,208 @@ test('transient Discord errors leave Members polling and sign-in state unchanged
   }
   assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
   assert.ok(h.app.state.me);
+});
+
+test('known-bad images renders hash-only metadata and searches without re-fetching', async () => {
+  const requests = [];
+  const h = harness(async (url, options) => { requests.push({url, options}); return response({}); });
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_bad_images: [
+    {hash: 'ab'.repeat(32), added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'confirmed spam'},
+    {hash: 'cd'.repeat(32), added_at: '2026-01-02T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'other'},
+  ] };
+  const panel = h.app.tabKnownBadImages();
+  assert.match(textOf(panel), /confirmed spam/);
+  assert.match(textOf(panel), /unknown/);
+  const search = panel.querySelector('input');
+  search.value = 'confirmed'; await fire(search, 'input');
+  assert.match(textOf(panel), /confirmed spam/);
+  assert.doesNotMatch(textOf(panel), /cdcdcdcd/);
+  assert.equal(requests.length, 0);
+  const add = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash');
+  assert.equal(add.disabled, true);
+  const digest = panel.querySelectorAll('input')[1];
+  digest.value = 'ab'.repeat(32); await fire(digest, 'input');
+  assert.equal(add.disabled, false);
+});
+
+test('known-bad image writes retain the loaded page membership and send only metadata', async () => {
+  const requests = [];
+  const h = harness(async (url, options) => { requests.push({url, options}); return response({ok: true}); });
+  h.app.state.config = {enrollment_id: 'fixture-membership', known_bad_images: []};
+  const hash = 'ab'.repeat(32);
+  const base = `/api/guilds/${h.app.state.guildId}/known-bad-images`;
+  await h.app.api(base, 'POST', {hash, note: 'confirmed spam'});
+  await h.app.api(`${base}/${hash}`, 'DELETE');
+  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert.equal(requests[1].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert.deepEqual(JSON.parse(requests[0].options.body), {hash, note: 'confirmed spam'});
+});
+
+
+test('known-bad image add and remove buttons save then reload the coherent list', async () => {
+  const requests = [], hash = 'ab'.repeat(32);
+  let rows = [];
+  const config = () => ({enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: []});
+  const h = harness(async (url, options) => {
+    requests.push({url, options});
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body);
+      assert.deepEqual(payload, {hash, note: 'confirmed spam'});
+      rows = [{hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note}];
+    } else if (options.method === 'DELETE') rows = [];
+    return response({ok: true, changed: true});
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = hash; await fire(inputs[1], 'input');
+  inputs[2].value = 'confirmed spam'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  panel = h.app.tabKnownBadImages();
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+  const removal = requests.find(r => r.options.method === 'DELETE');
+  assert.equal(removal.options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert(removal.url.endsWith(hash));
+});
+
+test('known-bad image remove keeps unrelated add drafts', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  let rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') rows = [];
+    return response({ ok: true, changed: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  assert.equal(h.app.isDirty(), true);
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, draftHash);
+  assert.equal(after[2].value, 'draft note');
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+});
+
+test('known-bad image add clears only its draft fields', async () => {
+  const hash = 'ab'.repeat(32);
+  let rows = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body);
+      rows = [{ hash: payload.hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note }];
+    }
+    return response({ ok: true, changed: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = hash; await fire(inputs[1], 'input');
+  inputs[2].value = 'saved note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const cleared = panel.querySelectorAll('input');
+  assert.equal(cleared[1].value, '');
+  assert.equal(cleared[2].value, '');
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('known-bad image delete 429 keeps draft and listed row', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  const rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
+    return response({ ok: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('known-bad image delete succeeds after 429 without losing unrelated draft', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  let rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  let deleteCalls = 0;
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') {
+      deleteCalls += 1;
+      if (deleteCalls === 1) return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
+      rows = [];
+      return response({ ok: true, changed: true });
+    }
+    return response({ ok: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, draftHash);
+  assert.equal(after[2].value, 'draft note');
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('known-bad drafts do not restore after enrollment replacement', async () => {
+  const h = harness(async url => response(url.endsWith('/config') ? { enrollment_id: 'replacement', known_bad_images: [], log_channels: [] } : {}));
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_bad_images: [], log_channels: [] };
+  h.app.state.tab = 'known-bad-images';
+  h.app.renderTab();
+  await settle();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = 'cd'.repeat(32); await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await h.app.handleEvent(async () => {
+    h.app.state.config = { ...h.app.state.config, enrollment_id: 'replacement' };
+    h.app.renderTab();
+  }, {});
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, '');
+  assert.equal(after[2].value, '');
+  assert.equal(h.app.isDirty(), false);
 });

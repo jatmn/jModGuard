@@ -1007,6 +1007,7 @@ pub struct ConfigParts {
     pub log_channels: std::collections::HashMap<String, i64>,
     pub log_filters: std::collections::HashMap<String, LogFilter>,
     pub badwords: Vec<String>,
+    pub known_bad_images: Vec<KnownBadImage>,
 }
 
 /// Raw and effective data needed by one WebUI config response. Every field is
@@ -1019,6 +1020,7 @@ pub struct WebConfigSnapshot {
     pub guild_rules: std::collections::HashMap<String, RuleDef>,
     pub global_rules: std::collections::HashMap<String, RuleDef>,
     pub badwords: Vec<Badword>,
+    pub known_bad_images: Vec<KnownBadImage>,
     pub guild_commands: std::collections::HashMap<String, CommandDef>,
     pub global_commands: std::collections::HashMap<String, CommandDef>,
     pub guild_templates: std::collections::HashMap<String, String>,
@@ -1084,6 +1086,10 @@ SELECT
   (SELECT last_error FROM nickname_reconcile WHERE guild_id = ?1),
   (SELECT last_error_at FROM nickname_reconcile WHERE guild_id = ?1)
   ,(SELECT json_group_object(event_type, data) FROM log_filters WHERE guild_id = ?1)
+  ,(SELECT json_group_array(json_object('hash', hash, 'added_at', added_at,
+        'added_via', added_via, 'actor', actor, 'note', note))
+     FROM (SELECT hash, added_at, added_via, actor, note FROM known_bad_images
+           WHERE guild_id = ?1 ORDER BY hash LIMIT 1024))
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1100,6 +1106,7 @@ struct ConfigurationSnapshotRows {
     guild_log_channels: std::collections::HashMap<String, i64>,
     guild_log_filters: std::collections::HashMap<String, LogFilter>,
     badwords: Vec<Badword>,
+    known_bad_images: Vec<KnownBadImage>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
 }
 
@@ -1202,6 +1209,10 @@ fn load_configuration_snapshot_conn(
                 guild_log_channels: parse_json_map(row.get(13)?, "log_channels")?,
                 guild_log_filters: parse_json_encoded_map(row.get(21)?, "log_filters")?,
                 badwords: parse_json_vec(row.get(14)?, "badwords")?,
+                known_bad_images: safe_known_bad_rows(parse_json_vec(
+                    row.get(22)?,
+                    "known_bad_images",
+                )?),
                 nickname_reconcile,
             })
         },
@@ -1238,6 +1249,7 @@ impl ConfigurationSnapshotRows {
             guild_rules: self.guild_rules,
             global_rules: self.global_rules,
             badwords: self.badwords,
+            known_bad_images: self.known_bad_images,
             guild_commands: self.guild_commands,
             global_commands: self.global_commands,
             guild_templates: self.guild_templates,
@@ -1327,6 +1339,7 @@ impl ConfigurationSnapshotRows {
                 log_channels,
                 log_filters: self.guild_log_filters,
                 badwords,
+                known_bad_images: self.known_bad_images,
             },
         )
     }

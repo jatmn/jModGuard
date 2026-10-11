@@ -353,6 +353,14 @@ bot owner).
   rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
   see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
+### Known-bad images
+
+Known-bad images are managed per server under **Known-bad images**. Search by
+hash or note; add a confirmed SHA-256 digest and optional safe label, or remove it.
+Saves require Manage Server permission and an online bot writer. See
+[exact-image detection](IMAGE-SPAM.md#known-bad-image-management) for first-post
+matching, dry-run/enforcement behavior and hash-only retention.
+
 ### Appearance
 
 Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page. daisyUI widgets reuse those same tokens: cards and stats use `--panel`, hero and tinted surfaces use `--hero`, and primary actions use `--accent`. They do not switch the workspace to daisyUI’s default palette.

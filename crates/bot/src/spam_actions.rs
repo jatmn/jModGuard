@@ -89,6 +89,7 @@ pub struct Match {
     pub token: (u64, u64),
     pub messages: Vec<(u64, u64)>,
     pub excerpts: Vec<TextEvidence>,
+    pub proving_hashes: Vec<jmodguard::image_spam::Hash>,
     pub attachments: Vec<ProvingAttachment>,
     pub reason: String,
 }
@@ -257,7 +258,11 @@ pub(crate) async fn enforce(
     let Some(rule_def) = cfg.rules.get(rule) else {
         return ReportDisposition::Consumed;
     };
-    let Some(policy) = MatchPolicy::parse(found.kind, rule_def) else {
+    let policy = match found.kind {
+        Kind::Image => crate::image_spam::policy_for_config(&cfg, rule_def).map(MatchPolicy::Image),
+        Kind::Text => MatchPolicy::parse(found.kind, rule_def),
+    };
+    let Some(policy) = policy else {
         return ReportDisposition::Consumed;
     };
     if !policy.enforce() || !rule_def.enabled {
@@ -640,11 +645,7 @@ fn delete_outcome(error: &serenity::Error) -> CaseOutcome {
 }
 
 fn proving_hashes(found: &Match) -> Vec<jmodguard::image_spam::Hash> {
-    let mut hashes: Vec<_> = found
-        .attachments
-        .iter()
-        .map(|item| item.proving_hash)
-        .collect();
+    let mut hashes = found.proving_hashes.clone();
     hashes.sort_unstable();
     hashes.dedup();
     hashes
@@ -939,24 +940,14 @@ mod tests {
                 window_secs: 60,
                 min_channels: 3,
                 min_attachments: 2,
+                known_bad_hashes: Default::default(),
                 enforce: false,
             }),
             token: (0, 0),
             messages: vec![(10, 100), (11, 101)],
             excerpts: vec![],
-            attachments: vec![ProvingAttachment {
-                channel: 10,
-                message: 100,
-                file: jmodguard::image_spam::Attachment::new(
-                    10,
-                    1,
-                    3,
-                    "https://cdn.discordapp.com/attachments/10/1/a.png",
-                    10,
-                )
-                .unwrap(),
-                proving_hash: hash,
-            }],
+            proving_hashes: vec![hash],
+            attachments: Vec::new(),
             reason: "Verified identical image bytes".into(),
         };
         let evidence = automod_evidence(&found);
@@ -1083,11 +1074,13 @@ mod tests {
                     window_secs: 60,
                     min_channels: 3,
                     min_attachments: 2,
+                    known_bad_hashes: Default::default(),
                     enforce: true,
                 }),
                 token: (0, 0),
                 messages: Vec::new(),
                 excerpts: Vec::new(),
+                proving_hashes: Vec::new(),
                 attachments: Vec::new(),
                 reason: "image spam".into(),
             };
@@ -1371,6 +1364,7 @@ mod tests {
             token: (0, 0),
             messages,
             excerpts: Vec::new(),
+            proving_hashes: Vec::new(),
             attachments: Vec::new(),
             reason: "repeated text".into(),
         };
