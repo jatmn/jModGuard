@@ -123,7 +123,7 @@ classify() {
       add dylint
       return
       ;;
-    scripts/ci-ensure-cargo-tool.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
+    scripts/ci-cargo-log.sh|scripts/ci-ensure-cargo-tool.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
       add supply-chain
       return
       ;;

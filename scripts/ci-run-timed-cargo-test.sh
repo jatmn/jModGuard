@@ -1,38 +1,88 @@
 #!/usr/bin/env bash
 # Per-test GNU timeout helpers for scripts/ci-preflight.sh (sourced, not executed).
 
+_run_timed_cargo_test_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/ci-cargo-log.sh
+source "$_run_timed_cargo_test_dir/ci-cargo-log.sh"
+
 JMODGUARD_TEST_TIMEOUT_SEC="${JMODGUARD_TEST_TIMEOUT_SEC:-180}"
+JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+
+jmodguard_kill_active_test_session() {
+  local pgid
+  pgid="${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}"
+  [ -n "$pgid" ] || return 0
+  kill -TERM "-$pgid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "-$pgid" 2>/dev/null || true
+  JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+}
+
+jmodguard_runner_trap_exit() {
+  if [ -n "${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}" ]; then
+    jmodguard_kill_active_test_session
+  fi
+}
+
+jmodguard_runner_trap_signal() {
+  local sig=$1
+  jmodguard_kill_active_test_session
+  trap - INT TERM EXIT
+  if [ "$sig" -eq 2 ]; then
+    exit 130
+  fi
+  if [ "$sig" -eq 15 ]; then
+    exit 143
+  fi
+  exit 128
+}
+
+jmodguard_timed_cargo_install_traps() {
+  if [ -n "${JMODGUARD_TIMED_CARGO_TRAPS_INSTALLED:-}" ]; then
+    return 0
+  fi
+  JMODGUARD_TIMED_CARGO_TRAPS_INSTALLED=1
+  trap 'jmodguard_runner_trap_exit' EXIT
+  trap 'jmodguard_runner_trap_signal 2' INT
+  trap 'jmodguard_runner_trap_signal 15' TERM
+}
 
 # Run a single test invocation under timeout. Uses setsid so descendant processes
 # (smoke services, fixtures) share a session and are terminated on timeout.
 run_with_test_timeout() {
   local name=$1
   shift
-  local rc leader_rc duration="${JMODGUARD_TEST_TIMEOUT_SEC}s" kill_after=10s leader pgid had_errexit=0
+  local rc=0 leader_rc duration_sec="${JMODGUARD_TEST_TIMEOUT_SEC}" kill_after=10s leader session_pgid
+  local had_errexit=0 deadline now
   case $- in *e*) had_errexit=1 ;; esac
+  jmodguard_timed_cargo_install_traps
   set +o errexit
   if command -v setsid >/dev/null 2>&1; then
     setsid "$@" &
     leader=$!
-    # `wait` only works on shell children; tail --pid blocks until the leader exits.
-    timeout --kill-after="$kill_after" "$duration" tail --pid="$leader" -f /dev/null
-    rc=$?
-    if [ "$rc" -eq 124 ]; then
-      pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || pgid=""
-      if [ -n "$pgid" ]; then
-        kill -TERM "-$pgid" 2>/dev/null || true
-        sleep 1
-        kill -KILL "-$pgid" 2>/dev/null || true
+    session_pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || session_pgid=""
+    JMODGUARD_ACTIVE_TEST_SESSION_PGID="$session_pgid"
+    # Poll so INT/TERM traps are not deferred behind a long-running external `timeout`.
+    deadline=$(( $(date +%s) + duration_sec ))
+    while kill -0 "$leader" 2>/dev/null; do
+      now=$(date +%s)
+      if [ "$now" -ge "$deadline" ]; then
+        rc=124
+        jmodguard_kill_active_test_session
+        break
       fi
-      kill -KILL "$leader" 2>/dev/null || true
-    fi
-    wait "$leader"
-    leader_rc=$?
-    if [ "$rc" -ne 124 ] && [ "$leader_rc" -ne 0 ]; then
-      rc=$leader_rc
+      sleep 0.2
+    done
+    if [ "$rc" -eq 0 ]; then
+      wait "$leader"
+      leader_rc=$?
+      JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+      if [ "$leader_rc" -ne 0 ]; then
+        rc=$leader_rc
+      fi
     fi
   else
-    timeout --kill-after="$kill_after" "$duration" "$@"
+    timeout --kill-after="$kill_after" "${duration_sec}s" "$@"
     rc=$?
   fi
   if [ "$rc" -eq 124 ]; then
@@ -48,20 +98,26 @@ run_with_test_timeout() {
 run_cargo_test_timed() {
   local name=$1
   shift
-  local log rc
+  local log rc had_errexit=0
+  case $- in *e*) had_errexit=1 ;; esac
   log="$(mktemp)"
-  set +e
-  run_with_test_timeout "$name" cargo test "$@" >"$log" 2>&1
+  set +o errexit
+  run_with_test_timeout "$name" env CARGO_TERM_COLOR=never cargo test "$@" >"$log" 2>&1
   rc=$?
-  set -e
-  if grep -qE '^   Compiling ' "$log"; then
+  if ci_cargo_log_has_compiling "$log"; then
     cat "$log" >&2
     rm -f "$log"
     echo "ci-preflight: timed cargo test recompiled for $name" >&2
+    if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
+      set -o errexit
+    fi
     return 1
   fi
   cat "$log" >&2
   rm -f "$log"
+  if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    set -o errexit
+  fi
   return "$rc"
 }
 
@@ -203,9 +259,15 @@ run_timed_cargo_test_gnu() {
     esac
   done
 
+  jmodguard_timed_cargo_install_traps
+
   if ! cargo test "${cargo_args[@]}" --no-run >/dev/null 2>&1; then
     cargo test "${cargo_args[@]}" --no-run
     return 1
+  fi
+  if ! run_timed_cargo_test_skip_doctests "${cargo_args[@]}"; then
+    cargo test "${cargo_args[@]}" --doc --no-run >/dev/null 2>&1 \
+      || cargo test "${cargo_args[@]}" --doc --no-run
   fi
 
   if [ "$ignored_only" -eq 1 ]; then
