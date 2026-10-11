@@ -661,13 +661,17 @@ impl EventHandler for Handler {
             // or unban has a different ID; a replay of this entry is idempotent.
             if let Some(enrollment) = crate::cases::capture(self.app(), guild_id.get()).await {
                 let data = crate::db::guild_data::CaseData {
+                    ban_attempt_tag: None,
                     source: crate::db::guild_data::CaseSource::DiscordAudit { entry_id },
                     action: action.clone(),
                     outcome: crate::db::guild_data::CaseOutcome::Succeeded,
                     subject_id: target.get() as i64,
                     actor_id: i64::try_from(entry.user_id.get()).ok(),
                     occurred_at_ms: entry.id.created_at().timestamp_millis(),
-                    reason: entry.reason.clone(),
+                    reason: entry
+                        .reason
+                        .clone()
+                        .map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
                     evidence: crate::db::guild_data::CaseEvidence::Unavailable,
                 };
                 if crate::cases::record_data(&self.app().tenant, enrollment, data)

@@ -538,6 +538,8 @@ async fn punish_proven_match(
                             }
                             Err(_) => None,
                         };
+                        let discord_reason =
+                            crate::cases::ban_dispatch_reason(&found.reason, attempted.as_ref());
                         if let Some(outcome) = dispatch_spam_ban(
                             app,
                             enrollment.clone(),
@@ -550,7 +552,7 @@ async fn punish_proven_match(
                                 http,
                                 UserId::new(found.author),
                                 0,
-                                &found.reason,
+                                &discord_reason,
                             ),
                         )
                         .await

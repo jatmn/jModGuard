@@ -2263,15 +2263,17 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     let right = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
     f.app.tenant.activate(left.clone()).await.unwrap().unwrap();
     f.app.tenant.activate(right.clone()).await.unwrap().unwrap();
+    let tag = jmodguard::ban_reason::BanAttemptTag::new();
     f.app
         .tenant
         .record_selected_case(
             left.clone(),
             CaseData {
+                ban_attempt_tag: Some(tag.clone()),
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
-                action: CaseAction::Warning,
+                action: CaseAction::Ban,
                 outcome: CaseOutcome::Succeeded,
                 subject_id: 1,
                 actor_id: None,
@@ -2291,6 +2293,13 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(status, StatusCode::OK, "{other}");
     assert!(other["cases"].as_array().unwrap().is_empty());
     let id = ids[0].as_str().unwrap();
+    let (status, detail) = f
+        .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["case"]["reason"], "secret");
+    assert!(detail["case"].get("ban_attempt_tag").is_none());
+    assert!(!detail.to_string().contains(tag.as_str()));
     let note_url = format!("/api/guilds/10/cases/{id}/history");
     let note = serde_json::json!({"entry_id":"a".repeat(32),"text":"one intent"}).to_string();
     let (status, first) = f.request("POST", &note_url, &note).await;
@@ -2337,6 +2346,7 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
         .record_selected_case(
             enrollment.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -2419,6 +2429,7 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
         .record_selected_case(
             enrollment.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -2529,6 +2540,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .record_selected_case(
             e,
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },

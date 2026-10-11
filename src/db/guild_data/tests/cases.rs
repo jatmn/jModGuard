@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn data(source: i64) -> CaseData {
     CaseData {
+        ban_attempt_tag: None,
         source: CaseSource::DiscordAudit { entry_id: source },
         action: CaseAction::Ban,
         outcome: CaseOutcome::Succeeded,
@@ -466,6 +467,79 @@ async fn upgrade_from_two_preserves_scoped_settings_without_adopting_cases() {
     assert!(
         store
             .case_ids(s, None, 1, CaseLimits::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn tagged_attempt_survives_reopen_and_cannot_be_retagged_or_exposed() {
+    use crate::ban_reason::{BanAttemptTag, discord_reason};
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    // The payload-format upgrade must admit an existing v15 database.
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), 15).unwrap();
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let captured = scope(&f, &store, &reg, 10).await;
+    let limits = CaseLimits::default();
+    let id = CaseId::new();
+    let tag = BanAttemptTag::new();
+    let copied = discord_reason("selected reason", Some(&BanAttemptTag::new()));
+    let mut facts = data(1);
+    facts.source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    facts.outcome = CaseOutcome::Attempted;
+    facts.ban_attempt_tag = Some(tag.clone());
+    facts.reason = Some(copied.clone());
+    store
+        .record_case(captured.clone(), id.clone(), facts.clone(), limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .record_case(captured.clone(), id.clone(), facts, limits)
+            .await
+            .unwrap(),
+        RecordCase::Existing(id.clone())
+    );
+    let id_for_update = id.as_str().to_owned();
+    let error = store.db.with_conn(move |conn| {
+        conn.execute_rows("UPDATE guild_cases SET payload=json_set(payload, '$.ban_attempt_tag', ?2) WHERE case_id=?1", params![id_for_update, "0".repeat(20)], 1)?;
+        Ok(())
+    }).await.unwrap_err();
+    assert!(error.to_string().contains("immutable"), "{error:#}");
+    drop(store);
+    let store = GuildDataStore::open(f.options(), reg).unwrap();
+    let saved = store
+        .case(captured.clone(), id, limits)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.ban_attempt_tag.as_ref(), Some(&tag));
+    assert_eq!(saved.reason.as_deref(), Some("selected reason"));
+    let public = serde_json::to_value(&saved).unwrap();
+    assert!(public.get("ban_attempt_tag").is_none());
+    assert!(!public.to_string().contains(tag.as_str()));
+    let sent = discord_reason(&copied, Some(&tag));
+    assert!(
+        store
+            .settle_tagged_application_ban(captured.clone(), 42, &sent, limits)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let settled = store
+        .settle_tagged_application_ban(captured.clone(), i64::MAX, &sent, limits)
+        .await
+        .unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].1.outcome, CaseOutcome::Succeeded);
+    assert_eq!(settled[0].1.ban_attempt_tag.as_ref(), Some(&tag));
+    assert!(
+        store
+            .settle_tagged_application_ban(captured, i64::MAX, &sent, limits)
             .await
             .unwrap()
             .is_empty()

@@ -74,6 +74,7 @@ impl Fixture {
             scope.clone(),
             case.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::DiscordAudit { entry_id: 1 },
                 action: CaseAction::Ban,
                 outcome: CaseOutcome::Uncertain,
