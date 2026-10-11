@@ -18,6 +18,7 @@ struct HranaState {
     expired_requests: usize,
     fail_next_commit: bool,
     fail_next_cas: bool,
+    reset_next_request: bool,
     commit_timeouts: usize,
     rollback_requests: usize,
     in_transaction: bool,
@@ -54,6 +55,7 @@ impl HranaState {
             expired_requests: 0,
             fail_next_commit: false,
             fail_next_cas: false,
+            reset_next_request: false,
             commit_timeouts: 0,
             rollback_requests: 0,
             in_transaction: false,
@@ -251,7 +253,20 @@ impl HranaFixture {
             async move {
                 Ok::<_, Infallible>(service_fn(move |request| {
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(respond(request, state).await) }
+                    async move {
+                        let reset = {
+                            let mut guard = state.lock().unwrap();
+                            std::mem::take(&mut guard.reset_next_request)
+                        };
+                        if reset {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "connection reset",
+                            ))
+                        } else {
+                            Ok::<_, std::io::Error>(respond(request, state).await)
+                        }
+                    }
                 }))
             }
         });
@@ -1251,6 +1266,7 @@ async fn lease_renewal_survives_provider_bulk_writer() {
             &remote,
             instance,
             crate::control::now_ms(),
+            std::time::Instant::now() + Duration::from_secs(10),
             Arc::clone(&refuse),
         )
         .await
@@ -1336,7 +1352,13 @@ async fn lease_renewal_bypasses_exhausted_core_pool() {
     assert_eq!(db.permits.available_permits(), 0);
     let renewed = tokio::time::timeout(
         Duration::from_millis(500),
-        renew_active_bot(&db, instance, crate::control::now_ms(), refuse),
+        renew_active_bot(
+            &db,
+            instance,
+            crate::control::now_ms(),
+            std::time::Instant::now() + Duration::from_secs(10),
+            refuse,
+        ),
     )
     .await;
     *blocked.0.lock().unwrap() = true;
@@ -1367,27 +1389,51 @@ async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
     );
     let generation = db.leased_generation();
     assert!(
-        renew_active_bot(&db, instance, now + 1, Arc::clone(&refuse))
-            .await
-            .unwrap()
+        renew_active_bot(
+            &db,
+            instance,
+            now + 1,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(db.leased_generation(), generation);
     refuse.store(true, Ordering::Release);
     assert!(
-        !renew_active_bot(&db, instance, now + 2, Arc::clone(&refuse))
-            .await
-            .unwrap()
+        !renew_active_bot(
+            &db,
+            instance,
+            now + 2,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
     );
     refuse.store(false, Ordering::Release);
     assert!(
-        !renew_active_bot(&db, foreign, now + 3, Arc::clone(&refuse))
-            .await
-            .unwrap()
+        !renew_active_bot(
+            &db,
+            foreign,
+            now + 3,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        !renew_active_bot(&db, instance, now + 30_000, Arc::clone(&refuse))
-            .await
-            .unwrap()
+        !renew_active_bot(
+            &db,
+            instance,
+            now + 30_000,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
     );
     db.with_conn(|conn| {
         conn.set_expected_lease_owner(None);
@@ -1398,9 +1444,15 @@ async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
     .await
     .unwrap();
     assert!(
-        !renew_active_bot(&db, instance, now + 4, refuse)
-            .await
-            .unwrap()
+        !renew_active_bot(
+            &db,
+            instance,
+            now + 4,
+            std::time::Instant::now() + Duration::from_secs(10),
+            refuse
+        )
+        .await
+        .unwrap()
     );
     drop(db);
     super::cleanup_db(&path);
@@ -1422,10 +1474,12 @@ async fn launcher_cas_preserves_existing_fence_semantics() {
     assert!(control.renew_launcher_fence_cas().await.unwrap());
     control.arm_launcher_fence(foreign);
     assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    control.arm_launcher_fence(owner);
+    assert!(control.renew_launcher_fence().await.unwrap());
     db.with_conn(move |conn| {
         conn.set_expected_launcher(None);
         let tx = conn.transaction_immediate()?;
-        write_meta_string_conn(&tx, "launcher_lease", &format!("{owner} 0"))?;
+        write_meta_string_conn(&tx, "launcher_lease", &format!("{foreign} 0"))?;
         tx.commit()
     })
     .await
@@ -1479,6 +1533,7 @@ async fn failed_lease_cas_discards_and_recreates_the_dedicated_stream() {
         &remote,
         instance,
         crate::control::now_ms(),
+        std::time::Instant::now() + Duration::from_secs(10),
         Arc::clone(&refuse),
     )
     .await
@@ -1490,6 +1545,7 @@ async fn failed_lease_cas_discards_and_recreates_the_dedicated_stream() {
             &remote,
             instance,
             crate::control::now_ms(),
+            std::time::Instant::now() + Duration::from_secs(10),
             Arc::clone(&refuse)
         )
         .await
@@ -1498,9 +1554,15 @@ async fn failed_lease_cas_discards_and_recreates_the_dedicated_stream() {
     assert!(remote.lease_connection.lock().unwrap().is_some());
     fixture.expire_latest();
     assert!(
-        renew_active_bot(&remote, instance, crate::control::now_ms(), refuse)
-            .await
-            .unwrap()
+        renew_active_bot(
+            &remote,
+            instance,
+            crate::control::now_ms(),
+            std::time::Instant::now() + Duration::from_secs(10),
+            refuse
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(
         fixture.expired_requests(),
@@ -1513,6 +1575,235 @@ async fn failed_lease_cas_discards_and_recreates_the_dedicated_stream() {
         "each CAS attempt is exactly one HTTP request"
     );
     assert!(fixture.begin_sql().is_empty());
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+// Scale 1:1: TTL 20s, margin 5s, first renewal at 5s leaves 10s.
+// Keeping actual 3s/4.8s delays ensures the old *real* 2s cap is what fails.
+async fn lease_window_provider_case(writer_wait: bool) {
+    let path = super::tmp_db_path("lease_window_provider");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let initial = crate::control::now_ms() - 5_000;
+    assert!(
+        claim_active_bot(&local, instance, initial, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    let model = ProviderModel::new(
+        if writer_wait {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(3)
+        },
+        Duration::from_secs(5),
+    );
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.backing = Some((runtime, backing));
+        state.provider = Some(Arc::clone(&model));
+    }
+    let remote = fixture.db();
+    remote.arm_writer_term(instance, local.leased_generation().unwrap());
+    let began = Arc::new(tokio::sync::Semaphore::new(0));
+    let writer = if writer_wait {
+        let bulk = remote.clone();
+        let began = Arc::clone(&began);
+        Some(tokio::task::spawn_blocking(move || {
+            bulk.with_conn_sync(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                began.add_permits(1);
+                // 4.5s hold + 0.3s COMMIT request = about 4.8s owning the writer.
+                std::thread::sleep(Duration::from_millis(4_500));
+                tx.finish_read()
+            })
+        }))
+    } else {
+        None
+    };
+    if writer_wait {
+        began.acquire().await.unwrap().forget();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let result = renew_active_bot(
+        &remote,
+        instance,
+        crate::control::now_ms(),
+        deadline,
+        refuse,
+    )
+    .await;
+    if let Some(writer) = writer {
+        writer.await.unwrap().unwrap();
+    }
+    assert!(
+        matches!(result, Ok(true)),
+        "healthy CAS must fit the 10s authority window: {result:?}"
+    );
+    assert!(std::time::Instant::now() < deadline);
+    let renewed = local
+        .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
+        .unwrap()
+        .unwrap();
+    let expiry = renewed.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+    assert!(
+        expiry > initial + ACTIVE_BOT_LEASE_TTL_MS,
+        "confirmed authority extended durably"
+    );
+    if !writer_wait {
+        assert_eq!(model.timeouts.load(Ordering::SeqCst), 0);
+    }
+    // Loaded hosts may push the holder over the 5s provider lifetime; a killed
+    // holder also releases the writer and must allow the autocommit CAS through.
+    eprintln!(
+        "healthy CAS confirmed; authority extended; 10s window; writer_wait={writer_wait}; provider timeouts={}",
+        model.timeouts.load(Ordering::SeqCst)
+    );
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_window_three_second_response_extends_authority() {
+    lease_window_provider_case(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_window_four_point_eight_second_writer_extends_authority() {
+    lease_window_provider_case(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn launcher_window_three_second_response_renews() {
+    // Scale 1:1; a 3s response must fit the unchanged 20s fence TTL.
+    let path = super::tmp_db_path("launcher_window_provider");
+    let local = Db::open(&path, 2).unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let remote = fixture.db();
+    let control = UpdateControl::from_application(&remote);
+    control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert!(control.renew_launcher_fence().await.unwrap());
+    let before = control.launcher_fence_deadline().unwrap();
+    fixture.state.lock().unwrap().provider = Some(ProviderModel::new(
+        Duration::from_secs(3),
+        Duration::from_secs(5),
+    ));
+    assert!(control.renew_launcher_fence_cas().await.unwrap());
+    assert!(control.launcher_fence_deadline().unwrap() > before);
+    eprintln!("launcher 3s response confirmed; fence deadline extended");
+    drop(control);
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_window_expired_never_sends_cas() {
+    let fixture = HranaFixture::start().await;
+    let remote = fixture.db();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    remote.arm_writer_term(instance, 1);
+    let result = renew_active_bot(
+        &remote,
+        instance,
+        crate::control::now_ms(),
+        std::time::Instant::now(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(fixture.state.lock().unwrap().requests, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_window_fast_connection_reset_recovers_before_deadline() {
+    let path = super::tmp_db_path("lease_reset_provider");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(
+            &local,
+            instance,
+            crate::control::now_ms(),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
+    );
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.backing = Some((runtime, backing));
+        state.provider = Some(ProviderModel::new(
+            Duration::from_millis(60),
+            Duration::from_secs(5),
+        ));
+        state.reset_next_request = true;
+    }
+    let remote = fixture.db();
+    remote.arm_writer_term(instance, local.leased_generation().unwrap());
+    let started = std::time::Instant::now();
+    let window = Duration::from_secs(10);
+    let deadline = started + window;
+    let error = renew_active_bot(
+        &remote,
+        instance,
+        crate::control::now_ms(),
+        deadline,
+        Arc::clone(&refuse),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        is_fast_lease_renewal_failure(&error, started.elapsed(), window),
+        "reset must qualify for prompt retry: {error:#}"
+    );
+    assert!(remote.lease_connection.lock().unwrap().is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        renew_active_bot(
+            &remote,
+            instance,
+            crate::control::now_ms(),
+            deadline,
+            refuse
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        started.elapsed() < window / 2,
+        "retry finishes with ample authority; generous 5s slack"
+    );
+    eprintln!("fast connection reset retried; CAS confirmed well before 10s deadline");
     drop(remote);
     drop(fixture);
     drop(local);

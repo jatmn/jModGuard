@@ -432,9 +432,11 @@ fn spawn_renewal_every(
                 #[cfg(not(test))]
                 let stall = false;
                 let requested_at = Instant::now();
+                let deadline = activation.authority_deadline().unwrap_or(requested_at);
+                let window = deadline.saturating_duration_since(requested_at);
                 let claim = async {
                     if fault {
-                        Err(anyhow::anyhow!("active-bot lease renewal failed"))
+                        Err(anyhow::anyhow!("active-bot lease renewal failed: connection reset"))
                     } else if stall {
                         std::future::pending::<anyhow::Result<bool>>().await
                     } else {
@@ -442,33 +444,31 @@ fn spawn_renewal_every(
                             &db,
                             activation.instance(),
                             chrono::Utc::now().timestamp_millis(),
+                            deadline,
                             activation.refuse_flag(),
                         )
                         .await
                     }
                 };
-                let deadline = activation
-                    .authority_deadline()
-                    .map(|deadline| deadline.checked_sub(RENEW_START_MARGIN).unwrap_or(deadline));
-                let result = if let Some(deadline) = deadline {
-                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), claim)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!("active-bot lease renewal timed out")),
-                    }
-                } else {
-                    claim.await
+                let result = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline), claim,
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!("active-bot lease renewal timed out")),
                 };
                 match result {
                     Err(error) => {
                         last_error = Some(format!("{error:#}"));
-                        let remaining = deadline
-                            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                        let remaining = deadline.saturating_duration_since(Instant::now());
                         if activation.is_shutting_down()
-                            || remaining.is_none_or(|remaining| remaining <= backoff)
+                            || remaining <= backoff
+                            || !db::is_fast_lease_renewal_failure(&error, requested_at.elapsed(), window)
                         {
-                            loss_reason = "active-bot lease renewal exhausted its authority window";
+                            loss_reason = if remaining <= backoff {
+                                "active-bot lease renewal exhausted its authority window"
+                            } else {
+                                "active-bot lease renewal failed without a fast retry"
+                            };
                             break (requested_at, Err(error));
                         }
                         tokio::time::sleep(backoff).await;
@@ -489,6 +489,7 @@ fn spawn_renewal_every(
                     }
                     break;
                 }
+                last_error = None;
                 activation.note_authority(requested_at);
                 let generation = db.leased_generation();
                 if generation != armed {
@@ -1240,6 +1241,215 @@ mod tests {
             drop(db);
             cleanup(&path);
         }
+    }
+
+    async fn hold_core_writer(db: Db, hold: Duration) -> tokio::task::JoinHandle<()> {
+        let began = Arc::new(tokio::sync::Semaphore::new(0));
+        let signal = Arc::clone(&began);
+        let writer = tokio::spawn(async move {
+            db.with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                signal.add_permits(1);
+                std::thread::sleep(hold);
+                tx.commit()
+            })
+            .await
+            .unwrap();
+        });
+        began.acquire().await.unwrap().forget();
+        writer
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cas_wait_within_authority_extends_bot_deadline() {
+        // Uniform 1/2 clock scale: TTL 10s, margin 2.5s, tick 2.5s, 5s remaining.
+        // The ~3s CAS lock wait exceeds the actual native 2s busy timeout.
+        // The provider cap regressions separately retain unscaled timings.
+        let (path, db) = temp_db("cas-wait");
+        let writer_db = Db::open(&path, 2).unwrap();
+        let activation = Activation::new();
+        activation.set_lease_window(Duration::from_secs(10), Duration::from_millis(2500));
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
+        let writer = hold_core_writer(writer_db, Duration::from_millis(5500)).await;
+        use crate::logging::persistence_log_tests::CapturedLog;
+        let log = CapturedLog::default();
+        let renewal = tracing::dispatcher::with_default(&log.dispatch(), || {
+            spawn_renewal_every(
+                db.clone(),
+                Arc::clone(&activation),
+                None,
+                Duration::from_millis(2500),
+            )
+        });
+        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while activation.authority_deadline() == Some(before)
+                && !activation.cut_off.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            activation.authority_deadline().unwrap() > before,
+            "authority lost: {}",
+            log.text()
+        );
+        assert!(activation.may_record());
+        activation.begin_shutdown();
+        renewal.abort();
+        let _ = renewal.await;
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn cas_reply_after_authority_deadline_is_lost_without_extension() {
+        use crate::logging::persistence_log_tests::CapturedLog;
+        static EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        // Uniform 1/5 clock scale: TTL 4s, margin 1s, tick 1s.
+        // Release a real SQLite writer once CAS starts, then block only the
+        // caller's dispatcher until its horizon passes. CAS commits in time,
+        // but its ready response must not count after the dispatcher resumes.
+        let (path, db) = temp_db("cas-late");
+        let writer_db = Db::open(&path, 2).unwrap();
+        let mut activation = Activation::new();
+        Arc::get_mut(&mut activation).unwrap().exit_hook = |code| {
+            EXIT.store(code, Ordering::Release);
+        };
+        activation.set_lease_window(Duration::from_secs(4), Duration::from_secs(1));
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
+        fn expiry(conn: &impl db::SqlExecutor) -> anyhow::Result<i64> {
+            Ok(db::meta_string_conn(conn, "active_bot_lease")?
+                .unwrap()
+                .rsplit_once(' ')
+                .unwrap()
+                .1
+                .parse::<i64>()?)
+        }
+        let before_expiry = db.with_conn_sync(|conn| expiry(conn)).unwrap();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = Arc::clone(&release);
+        let began = Arc::new(tokio::sync::Semaphore::new(0));
+        let signal = Arc::clone(&began);
+        let writer = tokio::spawn(async move {
+            writer_db
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_immediate()?;
+                    signal.add_permits(1);
+                    let (lock, ready) = &*gate;
+                    let _released = ready
+                        .wait_while(lock.lock().unwrap(), |released| !*released)
+                        .unwrap();
+                    tx.commit()
+                })
+                .await
+                .unwrap();
+        });
+        began.acquire().await.unwrap().forget();
+        let log = CapturedLog::default();
+        let renewal = tracing::dispatcher::with_default(&log.dispatch(), || {
+            spawn_renewal_every(
+                db.clone(),
+                Arc::clone(&activation),
+                None,
+                Duration::from_secs(1),
+            )
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while activation.renewal_attempts.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        started.unwrap();
+        std::thread::sleep(
+            before.saturating_duration_since(Instant::now()) + Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(5), renewal)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.await.unwrap();
+        assert!(
+            db.with_conn_sync(|conn| expiry(conn)).unwrap() > before_expiry,
+            "real CAS committed before reply acceptance"
+        );
+        assert_eq!(activation.authority_deadline(), Some(before));
+        assert!(!activation.may_record());
+        assert!(activation.cut_off.load(Ordering::Acquire));
+        assert_eq!(EXIT.load(Ordering::Acquire), 1);
+        assert_eq!(
+            activation.renewal_attempts.load(Ordering::Acquire),
+            1,
+            "late CAS is never retried"
+        );
+        let text = log.text();
+        assert!(text.contains("completed too late"), "{text}");
+        assert_eq!(
+            text.lines().filter(|line| line.contains("ERROR")).count(),
+            1
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_clears_last_error_before_later_zero_row_loss() {
+        use crate::logging::persistence_log_tests::CapturedLog;
+        let (path, db) = temp_db("renew-error-clear");
+        let activation = Activation::new();
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
+        activation.fail_next_renewal();
+        let log = CapturedLog::default();
+        let renewal = tracing::dispatcher::with_default(&log.dispatch(), || {
+            spawn_renewal_every(
+                db.clone(),
+                Arc::clone(&activation),
+                None,
+                Duration::from_millis(500),
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while activation.authority_deadline() == Some(before) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let foreign = Db::open(&path, 2).unwrap();
+        foreign
+            .with_conn(|conn| {
+                let tx = conn.transaction_immediate()?;
+                db::write_meta_string_conn(
+                    &tx,
+                    "active_bot_lease",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 9999999999999",
+                )?;
+                tx.commit()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), renewal)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = log.text();
+        assert!(text.contains("last_error=\"none\""), "{text}");
+        assert!(
+            !text.contains("connection reset"),
+            "stale error leaked: {text}"
+        );
+        drop(foreign);
+        drop(db);
+        cleanup(&path);
     }
 
     #[test]

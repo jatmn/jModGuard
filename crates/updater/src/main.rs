@@ -53,16 +53,34 @@ fn api_writer_link(target: &str, secret: &str) -> Option<jmodguard::control::Wri
     }
 }
 
-/// Retry transport failures promptly, with a fixed attempt bound per tick.
-async fn renew_launcher_fence_promptly<F, Fut>(mut renew: F) -> Result<bool>
+/// Retry only fast transport failures within the last confirmed fence.
+async fn renew_launcher_fence_promptly<F, Fut>(deadline: Instant, mut renew: F) -> Result<bool>
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<bool>> + Send,
 {
     let mut backoff = Duration::from_millis(100);
     for attempt in 0..3 {
-        match renew().await {
-            Err(_) if attempt < 2 => {
+        let requested_at = Instant::now();
+        let window = deadline.saturating_duration_since(requested_at);
+        ensure!(!window.is_zero(), "launcher fence authority window expired");
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renew())
+            .await
+            .context("launcher fence renewal timed out")?;
+        ensure!(
+            Instant::now() < deadline,
+            "launcher fence renewal completed too late"
+        );
+        match result {
+            Err(error)
+                if attempt < 2
+                    && db::is_fast_lease_renewal_failure(
+                        &error,
+                        requested_at.elapsed(),
+                        window,
+                    )
+                    && deadline.saturating_duration_since(Instant::now()) > backoff =>
+            {
                 tokio::time::sleep(backoff).await;
                 backoff *= 2;
             }
@@ -79,7 +97,12 @@ fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHand
         interval.tick().await;
         loop {
             interval.tick().await;
-            match renew_launcher_fence_promptly(|| control.renew_launcher_fence_cas()).await {
+            let deadline = control
+                .launcher_fence_deadline()
+                .unwrap_or_else(Instant::now);
+            match renew_launcher_fence_promptly(deadline, || control.renew_launcher_fence_cas())
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
                 Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
@@ -1742,26 +1765,27 @@ mod tests {
         assert!(control.renew_launcher_fence().await.unwrap());
         let started = Instant::now();
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let renewed = renew_launcher_fence_promptly(|| async {
-            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if attempt == 0 {
-                Err(anyhow::anyhow!("transient provider failure"))
-            } else {
-                control.renew_launcher_fence_cas().await
-            }
-        })
-        .await
-        .unwrap();
+        let renewed =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(anyhow::anyhow!("connection reset"))
+                } else {
+                    control.renew_launcher_fence_cas().await
+                }
+            })
+            .await
+            .unwrap();
         assert!(renewed);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < POLL,
             "retry must precede the next 5 s tick"
         );
         control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);
         assert!(
-            !renew_launcher_fence_promptly(|| async {
+            !renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 control.renew_launcher_fence_cas().await
             })
@@ -1774,23 +1798,54 @@ mod tests {
             "zero rows must not retry"
         );
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);
-        let error = renew_launcher_fence_promptly(|| async {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(anyhow::anyhow!("persistent failure"))
-        })
-        .await
-        .unwrap_err();
+        let error =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::anyhow!("connection refused"))
+            })
+            .await
+            .unwrap_err();
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "failure retries must stay bounded"
         );
-        assert!(error.to_string().contains("persistent failure"));
+        assert!(error.to_string().contains("connection refused"));
         drop(control);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn launcher_rejects_ready_late_reply_and_does_not_retry_slow_errors() {
+        // Blocking the poll models a response ready just after timeout_at's
+        // deadline; timeout_at may return it before polling the expired timer.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_millis(100), || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(true)
+            })
+            .await;
+        assert!(result.is_err(), "late success must never count");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        let result =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                Err(anyhow::anyhow!("connection reset"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "slow error is not a quick retry"
+        );
     }
 
     use super::*;

@@ -10,6 +10,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
 /// Bump when shipping launcher changes; raise the minimum only when required.
 pub const LAUNCHER_REVISION: u32 = 6;
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
+pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
 /// A controller restarted, or an owner replaced/cancelled the operation while
@@ -81,6 +82,7 @@ fn require_progress(current: bool) -> Result<()> {
 pub struct UpdateControl {
     db: Db,
     writer: Option<crate::control::WriterLink>,
+    confirmed_fence_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Immutable application compatibility of this container's baked image. A
@@ -423,13 +425,18 @@ impl UpdateControl {
             },
             |_| Ok(()),
         )?;
-        Ok((!empty.get()).then_some(Self { db, writer: None }))
+        Ok((!empty.get()).then_some(Self {
+            db,
+            writer: None,
+            confirmed_fence_deadline: Arc::new(Mutex::new(None)),
+        }))
     }
 
     pub fn from_application(db: &Db) -> Self {
         Self {
             db: db.clone(),
             writer: None,
+            confirmed_fence_deadline: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -441,6 +448,22 @@ impl UpdateControl {
     /// Bot-launcher fence. The API launcher never calls this and never writes.
     pub fn arm_launcher_fence(&self, instance: &str) {
         self.db.arm_launcher_fence(instance);
+        *self.confirmed_fence_deadline.lock().unwrap() = None;
+    }
+
+    /// Local monotonic horizon from the last successful acquisition or renewal.
+    pub fn launcher_fence_deadline(&self) -> Option<std::time::Instant> {
+        *self.confirmed_fence_deadline.lock().unwrap()
+    }
+
+    fn confirm_launcher_fence(&self, requested_at: std::time::Instant) -> Result<()> {
+        let next = requested_at + Duration::from_millis(LAUNCHER_FENCE_TTL_MS as u64);
+        anyhow::ensure!(
+            std::time::Instant::now() < next,
+            "launcher fence acquisition completed too late"
+        );
+        *self.confirmed_fence_deadline.lock().unwrap() = Some(next);
+        Ok(())
     }
 
     /// One-statement periodic renewal of an existing launcher fence. Initial
@@ -457,16 +480,35 @@ impl UpdateControl {
             instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "invalid launcher instance"
         );
-        self.db
-            .with_lease_conn(move |conn| {
-                let now = crate::control::now_ms();
-                let next = format!("{instance} {}", now.saturating_add(20_000));
-                Ok(conn.execute_lease_cas(
-                    crate::db_compat::LAUNCHER_FENCE_CAS,
-                    params![next, format!("{instance} "), now],
-                )? == 1)
-            })
+        let Some(deadline) = self.launcher_fence_deadline() else {
+            return Ok(false);
+        };
+        let requested_at = std::time::Instant::now();
+        anyhow::ensure!(
+            requested_at < deadline,
+            "launcher fence authority window expired"
+        );
+        let renewal = self.db.with_lease_conn(move |conn| {
+            let now = crate::control::now_ms();
+            let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
+            Ok(conn.execute_lease_cas(
+                crate::db_compat::LAUNCHER_FENCE_CAS,
+                params![next, format!("{instance} "), now],
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )? == 1)
+        });
+        let renewed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renewal)
             .await
+            .context("launcher fence renewal timed out")??;
+        // timeout_at can poll a ready response before its timer on a busy executor.
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "launcher fence renewal completed too late"
+        );
+        if renewed {
+            self.confirm_launcher_fence(requested_at)?;
+        }
+        Ok(renewed)
     }
 
     /// Extend this process's launcher fence. The transaction writes that fence
@@ -476,6 +518,7 @@ impl UpdateControl {
         if !self.writes_locally() || self.db.launcher_instance().is_none() {
             return Ok(false);
         }
+        let requested_at = std::time::Instant::now();
         match self
             .db
             .with_conn(|conn| {
@@ -485,7 +528,10 @@ impl UpdateControl {
             })
             .await
         {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.confirm_launcher_fence(requested_at)?;
+                Ok(true)
+            }
             Err(error) if launcher_fence_held(&error) => Ok(false),
             Err(error) => Err(error),
         }
@@ -1309,6 +1355,86 @@ mod tests {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_launcher_cas_never_extends_confirmed_deadline() {
+        let path =
+            std::env::temp_dir().join(format!("launcher_late_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let writer_db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let expiry = |conn: &mut crate::db_compat::Connection| {
+            Ok(meta_string_conn(conn, "launcher_lease")?
+                .unwrap()
+                .rsplit_once(' ')
+                .unwrap()
+                .1
+                .parse::<i64>()?)
+        };
+        let before_expiry = db.with_conn_sync(expiry).unwrap();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = Arc::clone(&release);
+        let began = Arc::new(tokio::sync::Semaphore::new(0));
+        let signal = Arc::clone(&began);
+        let writer = tokio::spawn(async move {
+            writer_db
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_immediate()?;
+                    signal.add_permits(1);
+                    let (lock, ready) = &*gate;
+                    let _released = ready
+                        .wait_while(lock.lock().unwrap(), |released| !*released)
+                        .unwrap();
+                    tx.commit()
+                })
+                .await
+                .unwrap();
+        });
+        began.acquire().await.unwrap().forget();
+        // Unscaled TTL; a delayed tick has two seconds of confirmed fence left.
+        // CAS commits while the single-thread caller dispatcher is blocked;
+        // its already-ready successful response is accepted only after expiry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        *control.confirmed_fence_deadline.lock().unwrap() = Some(deadline);
+        let renewing = control.clone();
+        let cas = tokio::spawn(async move { renewing.renew_launcher_fence_cas().await });
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while db.lease_connection.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        started.unwrap();
+        std::thread::sleep(
+            deadline.saturating_duration_since(std::time::Instant::now())
+                + Duration::from_millis(100),
+        );
+        let error = cas.await.unwrap().unwrap_err();
+        writer.await.unwrap();
+        assert!(
+            error.to_string().contains("completed too late"),
+            "{error:#}"
+        );
+        assert!(
+            db.with_conn_sync(expiry).unwrap() > before_expiry,
+            "real CAS committed before reply acceptance"
+        );
+        assert_eq!(control.launcher_fence_deadline(), Some(deadline));
+        assert!(
+            control.renew_launcher_fence_cas().await.is_err(),
+            "expired fence must not send again"
+        );
+        drop(control);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 
