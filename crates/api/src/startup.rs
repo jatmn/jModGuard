@@ -30,18 +30,15 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
         let probe = db::current_startup_probe();
         let opened = tokio::task::spawn_blocking(move || {
             let _probe = db::enter_startup_probe(probe);
-            let path = opts.path.clone();
-            let local = !remote && opts.token.trim().is_empty();
-            Db::open_with(opts).map_err(|error| {
-                if local && local_database_is_missing(&path) {
-                    db::SchemaNotReady(format!(
-                        "local database file is not yet created by the bot: {error:#}"
-                    ))
-                    .into()
-                } else {
-                    error
-                }
-            })
+            // Check before opening: the bot may create the file at any time.
+            // A post-error check could mistake creation for a fatal open error.
+            if !remote && opts.token.trim().is_empty() && local_database_is_missing(&opts.path) {
+                return Err(db::SchemaNotReady(
+                    "local database file is not yet created by the bot".into(),
+                )
+                .into());
+            }
+            Db::open_with(opts)
         })
         .await
         .context("database open worker stopped before returning")?;
