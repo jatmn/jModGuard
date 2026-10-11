@@ -36,6 +36,8 @@ pub struct Activation {
     #[cfg(test)]
     renewal_fault: AtomicBool,
     #[cfg(test)]
+    renewal_fault_delay: Mutex<Duration>,
+    #[cfg(test)]
     renewal_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     renewal_stall: AtomicBool,
@@ -96,6 +98,8 @@ impl Activation {
             startup_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             renewal_fault: AtomicBool::new(false),
+            #[cfg(test)]
+            renewal_fault_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             renewal_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -419,7 +423,7 @@ fn spawn_renewal_every(
                 lose_lease(&activation);
                 break;
             }
-            let mut backoff = Duration::from_millis(100);
+            let mut backoff = Duration::from_millis(250);
             let (requested_at, result) = loop {
                 #[cfg(test)]
                 activation.renewal_attempts.fetch_add(1, Ordering::AcqRel);
@@ -433,9 +437,13 @@ fn spawn_renewal_every(
                 let stall = false;
                 let requested_at = Instant::now();
                 let deadline = activation.authority_deadline().unwrap_or(requested_at);
-                let window = deadline.saturating_duration_since(requested_at);
                 let claim = async {
                     if fault {
+                        #[cfg(test)]
+                        {
+                            let delay = *activation.renewal_fault_delay.lock().unwrap();
+                            tokio::time::sleep(delay).await;
+                        }
                         Err(anyhow::anyhow!("active-bot lease renewal failed: connection reset"))
                     } else if stall {
                         std::future::pending::<anyhow::Result<bool>>().await
@@ -462,12 +470,12 @@ fn spawn_renewal_every(
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if activation.is_shutting_down()
                             || remaining <= backoff
-                            || !db::is_fast_lease_renewal_failure(&error, requested_at.elapsed(), window)
+                            || db::is_database_operation_timeout(&error)
                         {
-                            loss_reason = if remaining <= backoff {
+                            loss_reason = if remaining <= backoff || db::is_database_operation_timeout(&error) {
                                 "active-bot lease renewal exhausted its authority window"
                             } else {
-                                "active-bot lease renewal failed without a fast retry"
+                                "active-bot lease renewal interrupted by shutdown"
                             };
                             break (requested_at, Err(error));
                         }
@@ -905,6 +913,102 @@ mod tests {
         renewal.abort();
         let _ = task.await;
         let _ = renewal.await;
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn slow_renewal_error_retries_through_the_activation_loop() {
+        // Scale 1:1: 20s TTL, 5s margin and 5s tick leave a 10s window.
+        let (path, db) = temp_db("renew-slow-error");
+        let activation = Activation::new();
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
+        let read_lease = || {
+            db.with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key='active_bot_lease'",
+                    (),
+                    |row| Ok(row.get::<String>(0)?),
+                )
+            })
+            .unwrap()
+        };
+        let before_row = read_lease();
+        *activation.renewal_fault_delay.lock().unwrap() = Duration::from_secs(3);
+        activation.fail_next_renewal();
+        let began = Instant::now();
+        let renewal = spawn_renewal(db.clone(), Arc::clone(&activation), None);
+        let observed = tokio::time::timeout(Duration::from_secs(12), async {
+            while activation.authority_deadline() == Some(before)
+                && !activation.cut_off.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        renewal.abort();
+        let _ = renewal.await;
+        observed.unwrap();
+        assert!(
+            activation.authority_deadline().unwrap() > before,
+            "a 3s non-timeout error must retry and extend authority"
+        );
+        assert!(activation.may_record());
+        assert_eq!(activation.renewal_attempts.load(Ordering::Acquire), 2);
+        let after_row = read_lease();
+        let expires = |row: &str| row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+        assert!(
+            expires(&after_row) > expires(&before_row),
+            "lease extended durably"
+        );
+        assert!(began.elapsed() >= RENEW_EVERY + Duration::from_secs(3));
+        eprintln!(
+            "3s injected transport error; activation loop retried twice; authority and SQLite lease extended"
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn instant_renewal_errors_have_bounded_backoff_inside_authority() {
+        let (path, db) = temp_db("renew-instant-errors");
+        let activation = Activation::new();
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let window = Duration::from_secs(10);
+        let deadline = Instant::now() + window;
+        *activation.authority_deadline.lock().unwrap() = Some(deadline);
+        activation.fail_next_renewal();
+        let retrying = Arc::clone(&activation);
+        let faults = tokio::spawn(async move {
+            loop {
+                retrying.fail_next_renewal();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let began = Instant::now();
+        let renewal = spawn_renewal_every(
+            db.clone(),
+            Arc::clone(&activation),
+            None,
+            Duration::from_millis(20),
+        );
+        let finished = tokio::time::timeout(window + Duration::from_secs(1), renewal).await;
+        faults.abort();
+        let _ = faults.await;
+        finished.unwrap().unwrap();
+        let attempts = activation.renewal_attempts.load(Ordering::Acquire);
+        assert!(
+            (9..=12).contains(&attempts),
+            "250ms to 1s backoff: {attempts} attempts"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "must stop before sleeping across deadline"
+        );
+        assert!(began.elapsed() >= Duration::from_secs(8));
+        assert!(!activation.may_record());
+        eprintln!("instant bot errors: {attempts} attempts; stopped before deadline");
         drop(db);
         cleanup(&path);
     }

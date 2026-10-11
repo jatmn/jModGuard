@@ -1636,6 +1636,7 @@ async fn lease_window_provider_case(writer_wait: bool) {
         began.acquire().await.unwrap().forget();
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let started = std::time::Instant::now();
     let result = renew_active_bot(
         &remote,
         instance,
@@ -1644,6 +1645,7 @@ async fn lease_window_provider_case(writer_wait: bool) {
         refuse,
     )
     .await;
+    let renewal_elapsed = started.elapsed();
     if let Some(writer) = writer {
         writer.await.unwrap().unwrap();
     }
@@ -1651,6 +1653,12 @@ async fn lease_window_provider_case(writer_wait: bool) {
         matches!(result, Ok(true)),
         "healthy CAS must fit the 10s authority window: {result:?}"
     );
+    if writer_wait {
+        assert!(
+            renewal_elapsed > Duration::from_secs(2),
+            "writer test must exceed the old two-second cap"
+        );
+    }
     assert!(std::time::Instant::now() < deadline);
     let renewed = local
         .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
@@ -1783,8 +1791,8 @@ async fn lease_window_fast_connection_reset_recovers_before_deadline() {
     .await
     .unwrap_err();
     assert!(
-        is_fast_lease_renewal_failure(&error, started.elapsed(), window),
-        "reset must qualify for prompt retry: {error:#}"
+        !is_database_operation_timeout(&error),
+        "reset must be a non-timeout error: {error:#}"
     );
     assert!(remote.lease_connection.lock().unwrap().is_none());
     tokio::time::sleep(Duration::from_millis(100)).await;

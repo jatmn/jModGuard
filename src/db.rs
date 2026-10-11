@@ -180,26 +180,6 @@ pub fn is_remote_interactive_timeout(err: &anyhow::Error) -> bool {
     crate::db_compat::is_remote_interactive_timeout(err)
 }
 
-/// Only prompt transient failures leave enough confirmed authority for a retry.
-/// A CAS timeout spends the entire remaining window and is never retried.
-pub fn is_fast_lease_renewal_failure(
-    error: &anyhow::Error,
-    elapsed: Duration,
-    window: Duration,
-) -> bool {
-    !is_database_operation_timeout(error)
-        && elapsed <= Duration::from_secs(1)
-        && elapsed < window / 4
-        && (is_transient_remote_open(error)
-            || is_sqlite_startup_lock(error)
-            || is_remote_interactive_timeout(error)
-            || error.chain().any(|cause| {
-                let message = cause.to_string().to_ascii_lowercase();
-                (message.contains("stream") && message.contains("expired"))
-                    || message.contains("connection closed")
-            }))
-}
-
 /// Interactive remote reads that lost their Hrana stream may be retried.
 /// Never use this around a mutation: COMMIT could have succeeded.
 const REMOTE_INTERACTIVE_READ_ATTEMPTS: u32 = 3;

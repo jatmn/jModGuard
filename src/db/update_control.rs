@@ -1429,8 +1429,16 @@ mod tests {
         assert_eq!(control.launcher_fence_deadline(), Some(deadline));
         assert!(
             control.renew_launcher_fence_cas().await.is_err(),
-            "expired fence must not send again"
+            "expired window must not send another CAS"
         );
+        assert!(
+            control.renew_launcher_fence().await.unwrap(),
+            "full acquisition can recover expired authority"
+        );
+        let rearmed = control.launcher_fence_deadline().unwrap();
+        assert!(rearmed > deadline);
+        assert!(control.renew_launcher_fence_cas().await.unwrap());
+        assert!(control.launcher_fence_deadline().unwrap() > rearmed);
         drop(control);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
