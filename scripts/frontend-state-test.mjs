@@ -2840,3 +2840,44 @@ test('custom pattern draft save uses dry_run and custom id', () => {
   const record = h.app.newCustomRuleDraft();
   assert.match(record.rule_id, /^custom:[0-9a-f]{16}$/);
 });
+
+for (const failure of [
+  { status: 401, error: 'authorization expired' },
+  { status: 400, error: 'authorization expired', code: 'auth_lost' },
+  { status: 400, error: 'discord authorization failed' },
+]) test(`auth loss stops Members polling and returns to sign-in: ${JSON.stringify(failure)}`, async () => {
+  let rejected = false, reads = 0;
+  const h = harness(async url => {
+    reads++;
+    if (rejected) return { ok: false, status: failure.status, headers: { get: () => null }, text: async () => JSON.stringify(failure) };
+    return response(url.endsWith('/member-sync') ? { status: 'running', phase: 'members', progress_revision: 1 } : { members: [] });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  h.app.tabMembers();
+  await settle();
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
+  rejected = true;
+  await assert.rejects(h.app.api('/api/me'));
+  await settle();
+  assert.equal([...h.timers.values()].filter(timer => [1000, 10000].includes(timer.delay)).length, 0);
+  assert.equal(h.documentListeners.has('visibilitychange'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
+  const afterLoss = reads;
+  h.app.handleAuthLoss(Object.assign(new Error(failure.error), failure));
+  await settle();
+  assert.equal(reads, afterLoss);
+});
+
+test('transient Discord errors leave Members polling and sign-in state unchanged', async () => {
+  const h = harness(async url => response(url.endsWith('/member-sync') ? { status: 'running', phase: 'members', progress_revision: 1 } : { members: [] }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  h.app.tabMembers();
+  await settle();
+  for (const status of [429, 503]) {
+    assert.equal(h.app.handleAuthLoss(Object.assign(new Error('temporary failure'), { status })), false);
+  }
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
+  assert.ok(h.app.state.me);
+});

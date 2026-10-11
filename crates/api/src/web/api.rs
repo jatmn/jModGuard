@@ -11,10 +11,7 @@ use std::sync::Arc;
 use tower_sessions::Session;
 
 use super::state::ApiState;
-use super::{
-    ApiError, ApiResult, AuthCtx, authorize_manage_guild, guild_scope, is_bot_owner,
-    require_bot_owner,
-};
+use super::{ApiError, ApiResult, AuthCtx, guild_scope, is_bot_owner, require_bot_owner};
 use crate::bot_actions::Action;
 use crate::db;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
@@ -1011,14 +1008,16 @@ pub async fn copy_config(
     Path(guild_id): Path<u64>,
     Json(body): Json<CopyBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    // Destination: owner gate when guild_id=0, else fresh Manage Guild.
-    let dest = guild_scope(&app, &session, guild_id).await?;
+    // One permission snapshot checks both servers; global destinations still
+    // require the independent session-owner gate.
+    let auth = super::require_auth_fresh(&app, &session).await?;
+    let dest = if guild_id == 0 {
+        super::session_owner(&app, &session).await?
+    } else {
+        super::manage_guild_from_auth(&app, auth.clone(), guild_id).await?
+    };
     super::check_page_enrollment(&dest, guild_id, &headers)?;
-    // Source is a *second* Discord guild authorization. Never reuse `dest`'s
-    // AuthCtx: when destination is global, guild_scope returns CachedOk and
-    // can_manage(from) would trust a stale ≤60s guild list (owner demoted on
-    // source could still copy into global). Always refresh for source.
-    let source = authorize_manage_guild(&app, &session, body.from_guild_id)
+    let source = super::manage_guild_from_auth(&app, auth, body.from_guild_id)
         .await
         .map_err(|error| {
             if error.0.is::<super::GuildAccessError>() {

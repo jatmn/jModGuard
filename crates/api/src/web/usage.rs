@@ -58,6 +58,12 @@ async fn authorize(
 ) -> Result<(), (StatusCode, Json<Value>)> {
     match session_owner(app, session).await {
         Ok(_) => {}
+        Err(failure) if failure.0.is::<super::AuthLost>() => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
+            ));
+        }
         Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
             return Err(error(StatusCode::UNAUTHORIZED, "sign in required"));
         }

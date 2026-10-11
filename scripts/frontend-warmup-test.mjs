@@ -15,8 +15,11 @@ const src = appSource.slice(appSource.indexOf("let state ="))
 
 function loadFrontend(fetchImpl, clock, timers) {
   const now = clock || { ms: 0 };
+  let view = "startup-view";
   const context = vm.createContext({
-    fetch: fetchImpl, showView() {}, setStartupStatus() {}, showPreviewUnavailable() {},
+    fetch: fetchImpl, showView(next) { view = next; },
+    ui: { getSnapshot: () => ({ view }) },
+    setStartupStatus() {}, showPreviewUnavailable() {},
     window: { JMODGUARD_API_BASE: "" },
     Date: { now: () => now.ms },
     Number,

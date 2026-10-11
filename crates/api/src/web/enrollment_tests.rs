@@ -11,6 +11,10 @@ struct DiscordStub {
     failed: AtomicBool,
     calls: AtomicUsize,
     token_calls: AtomicUsize,
+    refresh_failed: AtomicBool,
+    still_unauthorized: AtomicBool,
+    me_unauthorized: AtomicBool,
+    spent_budget: AtomicBool,
     rate_limited: AtomicBool,
     /// Discord marked the 429 as the shared global limit, which also closes `oauth.me`.
     global_scope: AtomicBool,
@@ -22,7 +26,7 @@ struct DiscordStub {
     /// `fixture-token` is rejected until `/token` issues `refreshed-token`.
     unauthorized_until_refresh: AtomicBool,
     retire_during_lookup: std::sync::Mutex<Option<db::Db>>,
-    retire_destination_on_second_lookup: std::sync::Mutex<Option<db::Db>>,
+    replace_destination_during_lookup: std::sync::Mutex<Option<db::Db>>,
 }
 struct Fixture {
     app: Arc<ApiState>,
@@ -51,6 +55,10 @@ impl Fixture {
             failed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
+            refresh_failed: AtomicBool::new(false),
+            still_unauthorized: AtomicBool::new(false),
+            me_unauthorized: AtomicBool::new(false),
+            spent_budget: AtomicBool::new(false),
             rate_limited: AtomicBool::new(false),
             global_scope: AtomicBool::new(false),
             me_calls: AtomicUsize::new(0),
@@ -59,7 +67,7 @@ impl Fixture {
             limit_on_next_page: AtomicBool::new(false),
             unauthorized_until_refresh: AtomicBool::new(false),
             retire_during_lookup: std::sync::Mutex::new(None),
-            retire_destination_on_second_lookup: std::sync::Mutex::new(None),
+            replace_destination_during_lookup: std::sync::Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -73,11 +81,14 @@ impl Fixture {
                     let handler = Arc::clone(&token_handler);
                     async move {
                         handler.token_calls.fetch_add(1, Ordering::SeqCst);
+                        if handler.refresh_failed.load(Ordering::SeqCst) {
+                            return StatusCode::BAD_REQUEST.into_response();
+                        }
                         Json(serde_json::json!({
                             "access_token": "refreshed-token",
                             "refresh_token": "refreshed-refresh",
                             "expires_in": 3600,
-                        }))
+                        })).into_response()
                     }
                 }),
             )
@@ -87,12 +98,15 @@ impl Fixture {
                     let handler = Arc::clone(&me_handler);
                     async move {
                         handler.me_calls.fetch_add(1, Ordering::SeqCst);
+                        if handler.me_unauthorized.load(Ordering::SeqCst) {
+                            return StatusCode::FORBIDDEN.into_response();
+                        }
                         Json(serde_json::json!({
                             "id": "42",
                             "username": "live-profile",
                             "global_name": null,
                             "avatar": null
-                        }))
+                        })).into_response()
                     }
                 }),
             )
@@ -107,6 +121,7 @@ impl Fixture {
                         .unwrap_or("");
                     if handler.unauthorized_until_refresh.load(Ordering::SeqCst)
                         && bearer != "Bearer refreshed-token"
+                        || handler.still_unauthorized.load(Ordering::SeqCst)
                     {
                         handler.calls.fetch_add(1, Ordering::SeqCst);
                         return (
@@ -121,9 +136,9 @@ impl Fixture {
                         "{bearer}"
                     );
                     let call = handler.calls.fetch_add(1, Ordering::SeqCst);
-                    if call == 1 {
+                    if call == 0 {
                         let db = handler
-                            .retire_destination_on_second_lookup
+                            .replace_destination_during_lookup
                             .lock()
                             .unwrap()
                             .take();
@@ -174,9 +189,14 @@ impl Fixture {
                     } else {
                         handler.guilds.lock().unwrap().clone()
                     };
+                    let mut headers = HeaderMap::new();
+                    if handler.spent_budget.load(Ordering::SeqCst) {
+                        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+                        headers.insert("x-ratelimit-reset-after", HeaderValue::from_static("30"));
+                    }
                     (
                         StatusCode::OK,
-                        axum::http::HeaderMap::new(),
+                        headers,
                         Json(serde_json::json!(guilds)),
                     )
                         .into_response()
@@ -478,6 +498,7 @@ async fn current_enrollment_allows_access_but_live_permission_revocation_wins_ov
         f.request("GET", "/api/guilds/10/config", "").await.0,
         StatusCode::OK
     );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     let (status, body) = f
         .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"revoked"}"#)
@@ -488,7 +509,7 @@ async fn current_enrollment_allows_access_but_live_permission_revocation_wins_ov
         db::get_settings(&f.app.db, 10).await.unwrap().prefix,
         "current"
     );
-    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -583,6 +604,17 @@ async fn discord_failure_never_uses_cached_authority_or_retires_membership() {
     let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
     assert!(!status.is_success());
     assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        !f.request("GET", "/api/guilds/10/config", "")
+            .await
+            .0
+            .is_success()
+    );
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        2,
+        "failed fetch must not populate the authorization cache"
+    );
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert!(db::guild_enrollment(&f.app.db, 10).await.unwrap().is_some());
 }
@@ -874,6 +906,7 @@ async fn expired_guild_token_refreshes_once_and_server_errors_do_not() {
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.failed.store(true, Ordering::SeqCst);
     f.discord
         .unauthorized_until_refresh
@@ -890,6 +923,7 @@ async fn revoked_permission_stays_denied_after_token_refresh() {
     f.discord
         .unauthorized_until_refresh
         .store(true, Ordering::SeqCst);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     let (status, _) = f
         .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"nope"}"#)
@@ -948,10 +982,7 @@ async fn copy_cannot_write_destination_replaced_after_its_authorization() {
     db::patch_settings(&f.app.db, 10, Some(Some("source".into())), None, None)
         .await
         .unwrap();
-    *f.discord
-        .retire_destination_on_second_lookup
-        .lock()
-        .unwrap() = Some(f.app.db.clone());
+    *f.discord.replace_destination_during_lookup.lock().unwrap() = Some(f.app.db.clone());
     let (status, body) = f
         .request(
             "POST",
@@ -1658,6 +1689,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
         .await;
     let mut manage_only = managed_guild(10);
     manage_only.permissions = Some(oauth::PermissionsField::Number(1 << 5));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     *f.discord.guilds.lock().unwrap() = vec![manage_only];
     let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(status, StatusCode::OK);
@@ -1682,6 +1714,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
     assert_eq!(f.request("DELETE", &path, "").await.0, StatusCode::OK);
     let mut ban_only = managed_guild(10);
     ban_only.permissions = Some(oauth::PermissionsField::Number(1 << 2));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     *f.discord.guilds.lock().unwrap() = vec![ban_only];
     let (_, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(history.as_array().unwrap().len(), 1);
@@ -1698,6 +1731,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
         f.request("GET", "/api/guilds/0/actions", "").await.0,
         StatusCode::BAD_REQUEST
     );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     assert_eq!(
         f.request("GET", "/api/guilds/10/actions", "").await.0,
@@ -1910,6 +1944,7 @@ async fn moderation_pages_require_loaded_membership_and_current_permissions() {
             StatusCode::BAD_REQUEST
         );
     }
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     for route in ["events", "bans", "stats"] {
         assert_eq!(
@@ -1970,6 +2005,7 @@ async fn individual_configuration_reads_require_page_membership_and_fresh_guild_
         assert_eq!(body["code"], "guild_enrollment_changed");
         assert_eq!(f.request("GET", &path, "").await.0, StatusCode::OK);
     }
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     for suffix in configuration_read_routes() {
         assert_eq!(
@@ -2238,6 +2274,7 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
     let (status, body) = f.request("GET", "/api/guilds/10/cases", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = body["cases"][0].as_str().unwrap().to_owned();
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     let (status, deleted) = f
@@ -2370,6 +2407,7 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
     std::fs::write(&object, b"bad").unwrap();
     std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
 
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     let (status, deleted) = f
@@ -2432,6 +2470,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .request("GET", "/api/guilds/10/cases?removed=true", "")
         .await;
     assert_ne!(denied, StatusCode::OK);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     f.app.db.with_conn(|c|{c.execute_batch_bounded("CREATE TRIGGER review_fail BEFORE INSERT ON backup_cleanup_intents BEGIN SELECT RAISE(ABORT,'injected'); END", 64 * 1024 * 1024)?;Ok(())}).await.unwrap();
@@ -2637,4 +2676,300 @@ async fn guild_user_cannot_launch_preview() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap_or("").contains("bot owner"));
+}
+
+// Age the production snapshot without sleeping or altering its success payload.
+async fn expire_auth_cache(app: &ApiState, age: std::time::Duration) {
+    let entries: Vec<_> = app
+        .auth_sessions
+        .iter()
+        .map(|e| Arc::clone(e.value()))
+        .collect();
+    for entry in entries {
+        if let Some((at, _)) = &mut entry.lock().await.guilds {
+            *at = std::time::Instant::now().checked_sub(age).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_guild_requests_reuse_coalesce_and_refetch_after_expiry() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let requests = (
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+    );
+    let (a, b, c) = tokio::join!(requests.0, requests.1, requests.2);
+    for (status, body) in [a, b, c] {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn bounded_auth_snapshot_handles_discord_and_local_rate_limits() {
+    for budget in [false, true] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.discord.spent_budget.store(budget, Ordering::SeqCst);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::OK
+        );
+        expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+        f.discord.rate_limited.store(true, Ordering::SeqCst);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.discord.calls.load(Ordering::SeqCst),
+            if budget { 1 } else { 2 }
+        );
+        // A fallback must not reset the successful snapshot's age.
+        expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "discord_rate_limited");
+        let entries: Vec<_> = f
+            .app
+            .auth_sessions
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for entry in entries {
+            entry.lock().await.guilds = None;
+        }
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_rejected_tokens_refresh_once_or_die_without_more_discord_calls() {
+    for failure in ["refresh", "guild", "profile", "none"] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        f.discord
+            .refresh_failed
+            .store(failure == "refresh", Ordering::SeqCst);
+        f.discord
+            .still_unauthorized
+            .store(failure == "guild", Ordering::SeqCst);
+        f.discord
+            .me_unauthorized
+            .store(failure == "profile", Ordering::SeqCst);
+        if failure == "profile" {
+            // Exercise profile recovery as the first rejection too.
+            f.discord
+                .unauthorized_until_refresh
+                .store(false, Ordering::SeqCst);
+            f.app.user_cache.clear();
+        }
+        let (a, b, c) = tokio::join!(
+            f.request("GET", "/api/guilds/10/config", ""),
+            f.request("GET", "/api/guilds/10/config", ""),
+            f.request("GET", "/api/guilds/10/config", "")
+        );
+        for (status, body) in [a, b, c] {
+            if failure == "none" {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            } else {
+                assert!(
+                    status == StatusCode::UNAUTHORIZED || body["error"] == "not authenticated",
+                    "{status}: {body}"
+                );
+                if status == StatusCode::UNAUTHORIZED {
+                    assert_eq!(body["code"], "auth_lost");
+                }
+            }
+        }
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1, "{failure}");
+        let calls = f.discord.calls.load(Ordering::SeqCst);
+        let me_calls = f.discord.me_calls.load(Ordering::SeqCst);
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        if failure != "none" {
+            assert!(!status.is_success(), "{body}");
+        }
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), me_calls);
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn copy_uses_one_permission_snapshot() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/api/guilds/20/copy",
+            r#"{"from_guild_id":10,"sections":["settings"]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn display_saves_live_profile_while_guilds_are_cooling_down() {
+    let f = Fixture::new(false).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let _ = f.app.oauth.my_guilds(42, "fixture-token").await;
+    f.app.user_cache.clear();
+    for _ in 0..3 {
+        assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
+    }
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
+    let f = Fixture::new(false).await;
+    let first = tests::session_for_user(42).await;
+    first
+        .insert(SESSION_TOKEN, "fixture-token")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let second = tests::session_for_user(42).await;
+    second
+        .insert(SESSION_TOKEN, "refreshed-token")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    require_auth_fresh(&f.app, &first)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    f.discord
+        .guilds
+        .lock()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .clear();
+    assert!(
+        require_auth_fresh(&f.app, &second)
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+            .guilds
+            .is_empty()
+    );
+    assert!(
+        !require_auth_fresh(&f.app, &first)
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+            .guilds
+            .is_empty()
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn owner_routes_preserve_auth_loss_for_an_already_loaded_session() {
+    let f = Fixture::new(true).await;
+    let store = Arc::new(MemoryStore::default());
+    let session = Session::new(None, store.clone(), None);
+    session.insert(SESSION_USER, 42u64).await.unwrap();
+    session
+        .insert(SESSION_TOKEN, "fixture-token")
+        .await
+        .unwrap();
+    session
+        .insert(SESSION_REFRESH, "fixture-refresh")
+        .await
+        .unwrap();
+    session.save().await.unwrap();
+    let stale = Session::new(session.id(), store, None);
+    assert_eq!(stale.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_failed.store(true, Ordering::SeqCst);
+    let error = require_auth_fresh(&f.app, &session).await.err().unwrap();
+    assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+    let usage = usage::overview(
+        axum::extract::State(f.app.clone()),
+        stale.clone(),
+        HeaderMap::new(),
+    )
+    .await
+    .unwrap_err();
+    let updates = updates::status(axum::extract::State(f.app.clone()), stale)
+        .await
+        .unwrap_err();
+    for (status, body) in [usage, updates] {
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0["code"], "auth_lost");
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn waiting_session_saves_the_new_access_and_rotated_refresh_tokens() {
+    let f = Fixture::new(false).await;
+    let store = Arc::new(MemoryStore::default());
+    let first = Session::new(None, store.clone(), None);
+    first.insert(SESSION_USER, 42u64).await.unwrap();
+    first.insert(SESSION_TOKEN, "fixture-token").await.unwrap();
+    first
+        .insert(SESSION_REFRESH, "fixture-refresh")
+        .await
+        .unwrap();
+    first.save().await.unwrap();
+    let waiting = Session::new(first.id(), store.clone(), None);
+    assert_eq!(
+        waiting
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fixture-refresh")
+    );
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    require_auth_fresh(&f.app, &first)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    require_auth_fresh(&f.app, &waiting)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    waiting.save().await.unwrap();
+    let reloaded = Session::new(first.id(), store, None);
+    assert_eq!(
+        reloaded
+            .get::<String>(SESSION_TOKEN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("refreshed-token")
+    );
+    assert_eq!(
+        reloaded
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("refreshed-refresh")
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }

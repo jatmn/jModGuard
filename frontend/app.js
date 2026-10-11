@@ -520,6 +520,7 @@ let state = {
 let configRequest = 0;
 
 const pendingLogChannelActions = new Map();
+const authLossCleanups = new Set();
 
 const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 80000, 120000, 150000];
 
@@ -710,6 +711,8 @@ function isUnauthenticated(err) {
   const msg = String(err && err.message);
   return (
     err.status === 401 ||
+    err.code === "auth_lost" ||
+    msg.includes("discord authorization failed") ||
     msg.includes("not authenticated") ||
     msg === "session expired" ||
     msg.includes("401")
@@ -718,11 +721,18 @@ function isUnauthenticated(err) {
 
 function handleAuthLoss(error) {
   if (!isUnauthenticated(error)) return false;
+  for (const dispose of authLossCleanups) dispose();
+  for (const key of pendingLogChannelActions.keys()) clearPendingLogChannelEntry(key);
   if (currentPreviewToken()) {
     showPreviewUnavailable();
     return true;
   }
-  showView("login-view");
+  if (ui.getSnapshot().view !== "login-view") {
+    state.me = null;
+    state.guilds = [];
+    state.guildId = null;
+    showView("login-view");
+  }
   return true;
 }
 
@@ -3962,6 +3972,7 @@ function tabMembers() {
     };
     document.addEventListener("visibilitychange", visibility);
     const dispose = () => {
+      authLossCleanups.delete(dispose);
       disposed = true;
       clearTimer();
       clearCountdown();
@@ -3971,6 +3982,7 @@ function tabMembers() {
       detailAbort?.abort();
       document.removeEventListener("visibilitychange", visibility);
     };
+    authLossCleanups.add(dispose);
     loadStatus();
     loadMembers();
     return dispose;

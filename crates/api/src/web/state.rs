@@ -22,6 +22,8 @@ pub struct ApiState {
     writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
+    pub(super) auth_sessions:
+        DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
@@ -67,6 +69,7 @@ impl ApiState {
             oauth,
             writer,
             guild_cache: DashMap::new(),
+            auth_sessions: DashMap::new(),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),

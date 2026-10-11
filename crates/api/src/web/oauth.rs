@@ -140,6 +140,17 @@ pub enum GuildListError {
     Failed(anyhow::Error),
 }
 
+#[derive(Debug)]
+pub(super) struct DiscordUnauthorized;
+
+impl std::fmt::Display for DiscordUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("discord authorization failed")
+    }
+}
+
+impl std::error::Error for DiscordUnauthorized {}
+
 /// Browser-facing temporary failure. Not an authentication or client error.
 #[derive(Debug)]
 pub struct DiscordRateLimit {
@@ -363,6 +374,9 @@ impl OAuthClient {
             .context("discord me request failed")?;
         let status = resp.status();
         let headers = resp.headers().clone();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(DiscordUnauthorized.into());
+        }
         let bytes = match self.read_limited_body(&key, status, &headers, resp).await {
             Ok(bytes) => bytes,
             Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
@@ -393,9 +407,10 @@ impl OAuthClient {
                 fresh: false,
             });
         }
-        // One lookup per user. A different user does not wait, and a refreshed
-        // access token does not start a second request for this user.
-        match self.begin_flight(&user_key) {
+        // Only identical user/token lookups share a result. Cooldowns remain
+        // per user, so rotating a token cannot bypass the Discord budget.
+        let flight_key = format!("{user_key}:{access_token}");
+        match self.begin_flight(&flight_key) {
             FlightJoin::Follow(receiver) => self.wait_for_flight(receiver).await,
             FlightJoin::Lead(mut guard) => {
                 if let Some(retry_after) = self.route_remaining(&user_key) {
@@ -453,7 +468,7 @@ impl OAuthClient {
             };
             let status = resp.status();
             let headers = resp.headers().clone();
-            if status.as_u16() == 401 {
+            if matches!(status.as_u16(), 401 | 403) {
                 return Err(GuildListError::Unauthorized);
             }
             if status.as_u16() == 429 {
@@ -1521,6 +1536,31 @@ mod tests {
                 .is_some()
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_profile_headers_do_not_require_a_readable_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [401, 403] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                // Deliberately truncate the advertised body after sending the status.
+                socket.write_all(format!("HTTP/1.1 {status} Refused\r\ncontent-length: 20\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let client = test_oauth(
+                reqwest::Client::new(),
+                None,
+                None,
+                Some(format!("http://{address}/me")),
+            );
+            let error = client.me(42, "fixture-token").await.unwrap_err();
+            assert!(error.is::<DiscordUnauthorized>(), "{error:#}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
