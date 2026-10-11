@@ -320,7 +320,8 @@ test_list_name() {
     test|test,*) ;;
     *) return 1 ;;
   esac
-  name="${line%%:*}"
+  # Shortest suffix: module paths contain '::', so the first colon is not the separator.
+  name="${line%:*}"
   [ -n "$name" ] || return 1
   printf '%s\n' "$name"
 }
@@ -463,7 +464,10 @@ for (const line of fs.readFileSync(process.argv[2], "utf8").split("\n")) {
   } catch {
     continue;
   }
-  if (j.reason === "compiler-artifact" && j.executable) {
+  // `cargo test --no-run` also emits the package binary (profile.test false).
+  // That binary is the service, not a libtest harness, and exits when CI
+  // credentials are absent. Only the test-profile harnesses accept --list.
+  if (j.reason === "compiler-artifact" && j.executable && j.profile && j.profile.test) {
     seen.add(j.executable);
   }
 }
