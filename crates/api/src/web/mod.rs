@@ -853,7 +853,9 @@ async fn logout(
         return error_page("untrusted request origin");
     }
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
-    state.retire_auth_session(session.id()).await;
+    if let Err(error) = state.retire_auth_session(&session).await {
+        return ApiError(error).into_response();
+    }
     let _ = session.flush().await;
     Json(serde_json::json!({ "return_to": return_to })).into_response()
 }
@@ -1046,8 +1048,10 @@ async fn callback_response(
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
     // Wait for any old-session refresh before rotation, then clear its payload.
-    if let Some(app) = app {
-        app.retire_auth_session(session.id()).await;
+    if let Some(app) = app
+        && app.retire_auth_session(&session).await.is_err()
+    {
+        return finish(error_page("failed to load login session"));
     }
     if let Err(error) = store_login_session(
         &session,

@@ -57,6 +57,27 @@ fn problem(status: StatusCode, message: impl ToString) -> (StatusCode, Json<Valu
 }
 
 async fn owner(state: &RecoveryState, session: &Session) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(api) = state.api.as_ref() {
+        return match session_owner(api, session).await {
+            Ok(_) => Ok(()),
+            Err(failure) if failure.0.is::<AuthLost>() => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
+            )),
+            Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
+                Err(problem(
+                    StatusCode::UNAUTHORIZED,
+                    "sign in to manage service upgrades",
+                ))
+            }
+            Err(_) => Err(problem(
+                StatusCode::FORBIDDEN,
+                "only the configured owner can manage upgrades",
+            )),
+        };
+    }
+    // Maintenance has its own fresh MemoryStore and no production retirement
+    // paths or coordinator/tombstone state. Keep its OAuth owner check intact.
     let uid = session
         .get::<u64>(SESSION_USER)
         .await

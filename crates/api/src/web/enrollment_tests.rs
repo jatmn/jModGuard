@@ -3930,3 +3930,279 @@ async fn retired_delayed_response_save_cannot_restore_authority() {
         );
     }
 }
+
+async fn blocker_request(
+    f: &Fixture,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let response = f
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(COOKIE, &f.cookie)
+                .header(axum::http::header::ORIGIN, origin)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+// Hold a modified response so the real session middleware writes its old row
+// after a different request has deleted or rotated that row.
+async fn delayed_session_save(
+    f: &Fixture,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>) {
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let delayed = Router::new()
+        .route(
+            "/delayed",
+            get({
+                let hydrated = Arc::clone(&hydrated);
+                let finish = Arc::clone(&finish);
+                move |session: Session| {
+                    let hydrated = Arc::clone(&hydrated);
+                    let finish = Arc::clone(&finish);
+                    async move {
+                        assert!(session.get::<u64>(SESSION_USER).await.unwrap().is_some());
+                        session.insert("delayed_response", true).await.unwrap();
+                        hydrated.notify_one();
+                        finish.notified().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .layer(
+            SessionManagerLayer::new(f.store.clone())
+                .with_name(SESSION_COOKIE_NAME)
+                .with_secure(false)
+                .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+                    SESSION_INACTIVITY_SECS,
+                ))),
+        );
+    let request = Request::builder()
+        .uri("/delayed")
+        .header(COOKIE, &f.cookie)
+        .body(Body::empty())
+        .unwrap();
+    let response = tokio::spawn(async move {
+        assert_eq!(
+            delayed.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    });
+    hydrated.notified().await;
+    (finish, response)
+}
+
+async fn oauth_callback_request(f: &Fixture, cookie: &str) -> Response {
+    f.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=fixture&state=fixture")
+                .header(COOKIE, format!("{cookie}; {COOKIE_OAUTH_STATE}=fixture"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn recovery_rejects_late_save(definitive_refusal: bool) {
+    use tower_sessions::SessionStore as _;
+    for (method, route, body) in [
+        ("GET", "/api/service-upgrade", ""),
+        (
+            "POST",
+            "/api/service-upgrade/check",
+            r#"{"channel":"invalid"}"#,
+        ),
+        (
+            "POST",
+            "/api/service-upgrade",
+            r#"{"bot_digest":"","api_digest":"","confirmed":false}"#,
+        ),
+        ("POST", "/api/service-upgrade/cancel", r#"{"id":""}"#),
+    ] {
+        let f = Fixture::new(true).await;
+        let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+        let (finish, response) = delayed_session_save(&f).await;
+        if definitive_refusal {
+            f.app.guild_cache.clear();
+            f.discord.still_unauthorized.store(true, Ordering::SeqCst);
+            f.discord.refresh_failed.store(true, Ordering::SeqCst);
+            let (status, body) = f.request("POST", "/api/me", "").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["code"], "auth_lost");
+            let entry = refresh_state(&f).await;
+            entry.lock().await.dead_since = Some(
+                std::time::Instant::now()
+                    .checked_sub(AUTH_SESSION_DEAD_TTL)
+                    .unwrap(),
+            );
+            drop(entry);
+            allow_coordinator_sweep(&f.app);
+            f.app.sweep_auth_sessions();
+        } else {
+            assert_eq!(
+                blocker_request(&f, "POST", "/logout", "").await.0,
+                StatusCode::OK
+            );
+        }
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        finish.notify_one();
+        response.await.unwrap();
+        assert!(f.store.load(&id).await.unwrap().is_some());
+        let calls = (
+            f.discord.calls.load(Ordering::SeqCst),
+            f.discord.token_calls.load(Ordering::SeqCst),
+            f.discord.me_calls.load(Ordering::SeqCst),
+        );
+        let (status, body) = blocker_request(&f, method, route, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {route}: {body}");
+        assert_eq!(body["code"], "auth_lost");
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst),
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_blocker_recovery_rejects_late_save_after_logout() {
+    recovery_rejects_late_save(false).await;
+}
+
+#[tokio::test]
+async fn review_blocker_recovery_rejects_late_save_after_refusal() {
+    recovery_rejects_late_save(true).await;
+}
+
+#[tokio::test]
+async fn review_blocker_oauth_rotation_rejects_late_save() {
+    use tower_sessions::SessionStore as _;
+    let f = Fixture::new(true).await;
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let (finish, response) = delayed_session_save(&f).await;
+    let callback = oauth_callback_request(&f, &f.cookie).await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let new_cookie = callback
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .find(|cookie| cookie.starts_with(SESSION_COOKIE_NAME))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_ne!(new_cookie, f.cookie);
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    assert!(f.store.load(&id).await.unwrap().is_none());
+    finish.notify_one();
+    response.await.unwrap();
+    assert!(f.store.load(&id).await.unwrap().is_some());
+    let calls = f.discord.calls.load(Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_lost");
+    assert!(f.store.load(&id).await.unwrap().is_none());
+    assert!(f.app.auth_sessions.is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+    let current = Session::new(
+        Some(new_cookie.split_once('=').unwrap().1.parse().unwrap()),
+        Arc::new(f.store.clone()),
+        None,
+    );
+    require_auth_fresh(&f.app, &current).await.ok().unwrap();
+}
+
+#[tokio::test]
+async fn review_blocker_logout_ignores_unknown_cookie() {
+    use tower_sessions::SessionStore as _;
+    let mut f = Fixture::new(true).await;
+    let real_cookie = f.cookie.clone();
+    let real_id = real_cookie.split_once('=').unwrap().1.parse().unwrap();
+    for _ in 0..8 {
+        let id = tower_sessions::session::Id::default();
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        f.cookie = format!("{SESSION_COOKIE_NAME}={id}");
+        assert_eq!(
+            blocker_request(&f, "POST", "/logout", "").await.0,
+            StatusCode::OK
+        );
+        assert!(
+            f.app.retired_auth_sessions.is_empty(),
+            "unknown cookie allocated a tombstone"
+        );
+    }
+    // A persisted identity without a coordinator must still be fenced.
+    f.cookie = real_cookie;
+    assert!(f.app.auth_sessions.is_empty());
+    assert_eq!(
+        blocker_request(&f, "POST", "/logout", "").await.0,
+        StatusCode::OK
+    );
+    assert!(f.app.retired_auth_sessions.contains_key(&real_id));
+    assert!(f.store.load(&real_id).await.unwrap().is_none());
+    // A coordinator also proves ownership if its store row has disappeared.
+    let g = Fixture::new(true).await;
+    let id = g.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(g.store.clone()), None);
+    require_auth_fresh(&g.app, &session).await.ok().unwrap();
+    g.store.delete(&id).await.unwrap();
+    assert_eq!(
+        blocker_request(&g, "POST", "/logout", "").await.0,
+        StatusCode::OK
+    );
+    assert!(g.app.retired_auth_sessions.contains_key(&id));
+    assert!(g.app.auth_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn review_blocker_oauth_rotation_ignores_unknown_cookie() {
+    let f = Fixture::new(true).await;
+    for _ in 0..2 {
+        let id = tower_sessions::session::Id::default();
+        let cookie = format!("{SESSION_COOKIE_NAME}={id}");
+        let response = oauth_callback_request(&f, &cookie).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            f.app.retired_auth_sessions.is_empty(),
+            "unknown OAuth cookie allocated a tombstone"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|header| header.to_str().unwrap().starts_with(SESSION_COOKIE_NAME))
+        );
+    }
+}

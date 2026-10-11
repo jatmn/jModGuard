@@ -121,8 +121,18 @@ impl ApiState {
 
     /// Logout and successful OAuth callbacks retire before deleting/rotating
     /// the store record. Wait for refresh to finish; never split its coordinator.
-    pub(super) async fn retire_auth_session(&self, id: Option<tower_sessions::session::Id>) {
-        let Some(id) = id else { return };
+    pub(super) async fn retire_auth_session(
+        &self,
+        session: &tower_sessions::Session,
+    ) -> Result<()> {
+        let cookie_id = session.id();
+        // Loading clears an unknown cookie ID. A coordinator can still belong
+        // to a real session whose store row was deleted by another request.
+        session.get::<u64>(super::SESSION_USER).await?;
+        let id = session
+            .id()
+            .or_else(|| cookie_id.filter(|id| self.auth_sessions.contains_key(id)));
+        let Some(id) = id else { return Ok(()) };
         // Fence even independently hydrated handles that never acquired an Arc.
         self.retired_auth_sessions
             .entry(id)
@@ -132,12 +142,13 @@ impl ApiState {
             .get(&id)
             .map(|entry| Arc::clone(entry.value()))
         else {
-            return;
+            return Ok(());
         };
         let mut auth = entry.lock().await;
         auth.retire();
         self.auth_sessions
             .remove_if(&id, |_, current| Arc::ptr_eq(current, &entry));
+        Ok(())
     }
 
     /// Use this store for the next `web::router` build. Production leaves it empty.
