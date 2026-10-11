@@ -11,6 +11,13 @@ struct DiscordStub {
     failed: AtomicBool,
     calls: AtomicUsize,
     token_calls: AtomicUsize,
+    refresh_failed: AtomicBool,
+    refresh_rate_limited: AtomicBool,
+    refresh_server_failed: AtomicBool,
+    refresh_server_retry_after: std::sync::Mutex<Option<String>>,
+    still_unauthorized: AtomicBool,
+    me_unauthorized: AtomicBool,
+    spent_budget: AtomicBool,
     rate_limited: AtomicBool,
     /// Discord marked the 429 as the shared global limit, which also closes `oauth.me`.
     global_scope: AtomicBool,
@@ -22,12 +29,21 @@ struct DiscordStub {
     /// `fixture-token` is rejected until `/token` issues `refreshed-token`.
     unauthorized_until_refresh: AtomicBool,
     retire_during_lookup: std::sync::Mutex<Option<db::Db>>,
-    retire_destination_on_second_lookup: std::sync::Mutex<Option<db::Db>>,
+    replace_destination_during_lookup: std::sync::Mutex<Option<db::Db>>,
 }
+#[derive(Clone, Copy)]
+enum TokenTransport {
+    Normal,
+    Closed,
+    Timeout,
+}
+
 struct Fixture {
     app: Arc<ApiState>,
     router: Router,
     cookie: String,
+    store: MemoryStore,
+    token_server: Option<tokio::task::JoinHandle<()>>,
     discord: Arc<DiscordStub>,
     server: tokio::task::JoinHandle<()>,
     path: std::path::PathBuf,
@@ -46,11 +62,25 @@ impl Fixture {
         Self::with_oauth_client_id(operator, "42").await
     }
     async fn with_oauth_client_id(operator: bool, oauth_client_id: &str) -> Self {
+        Self::with_token_transport(operator, oauth_client_id, TokenTransport::Normal).await
+    }
+    async fn with_token_transport(
+        operator: bool,
+        oauth_client_id: &str,
+        token_transport: TokenTransport,
+    ) -> Self {
         let discord = Arc::new(DiscordStub {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
             failed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
+            refresh_failed: AtomicBool::new(false),
+            refresh_rate_limited: AtomicBool::new(false),
+            refresh_server_failed: AtomicBool::new(false),
+            refresh_server_retry_after: std::sync::Mutex::new(None),
+            still_unauthorized: AtomicBool::new(false),
+            me_unauthorized: AtomicBool::new(false),
+            spent_budget: AtomicBool::new(false),
             rate_limited: AtomicBool::new(false),
             global_scope: AtomicBool::new(false),
             me_calls: AtomicUsize::new(0),
@@ -59,7 +89,7 @@ impl Fixture {
             limit_on_next_page: AtomicBool::new(false),
             unauthorized_until_refresh: AtomicBool::new(false),
             retire_during_lookup: std::sync::Mutex::new(None),
-            retire_destination_on_second_lookup: std::sync::Mutex::new(None),
+            replace_destination_during_lookup: std::sync::Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -73,11 +103,37 @@ impl Fixture {
                     let handler = Arc::clone(&token_handler);
                     async move {
                         handler.token_calls.fetch_add(1, Ordering::SeqCst);
+                        if handler.refresh_rate_limited.load(Ordering::SeqCst) {
+                            let mut headers = HeaderMap::new();
+                            let retry_after = handler.retry_after.lock().unwrap().clone();
+                            if !retry_after.is_empty() {
+                                headers.insert(axum::http::header::RETRY_AFTER, retry_after.parse().unwrap());
+                            }
+                            let mut body = serde_json::json!({"error": "rate limited"});
+                            if let Some(seconds) = *handler.body_retry_after.lock().unwrap() {
+                                body["retry_after"] = serde_json::json!(seconds);
+                            }
+                            return (StatusCode::TOO_MANY_REQUESTS, headers, Json(body)).into_response();
+                        }
+                        if handler.refresh_server_failed.load(Ordering::SeqCst) {
+                            let mut headers = HeaderMap::new();
+                            if let Some(wait) = handler.refresh_server_retry_after.lock().unwrap().as_ref() {
+                                headers.insert(axum::http::header::RETRY_AFTER, wait.parse().unwrap());
+                            }
+                            if handler.spent_budget.load(Ordering::SeqCst) {
+                                headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+                                headers.insert("x-ratelimit-reset-after", HeaderValue::from_static("30"));
+                            }
+                            return (StatusCode::SERVICE_UNAVAILABLE, headers).into_response();
+                        }
+                        if handler.refresh_failed.load(Ordering::SeqCst) {
+                            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid_grant"}))).into_response();
+                        }
                         Json(serde_json::json!({
                             "access_token": "refreshed-token",
                             "refresh_token": "refreshed-refresh",
                             "expires_in": 3600,
-                        }))
+                        })).into_response()
                     }
                 }),
             )
@@ -87,12 +143,15 @@ impl Fixture {
                     let handler = Arc::clone(&me_handler);
                     async move {
                         handler.me_calls.fetch_add(1, Ordering::SeqCst);
+                        if handler.me_unauthorized.load(Ordering::SeqCst) {
+                            return StatusCode::FORBIDDEN.into_response();
+                        }
                         Json(serde_json::json!({
                             "id": "42",
                             "username": "live-profile",
                             "global_name": null,
                             "avatar": null
-                        }))
+                        })).into_response()
                     }
                 }),
             )
@@ -107,6 +166,7 @@ impl Fixture {
                         .unwrap_or("");
                     if handler.unauthorized_until_refresh.load(Ordering::SeqCst)
                         && bearer != "Bearer refreshed-token"
+                        || handler.still_unauthorized.load(Ordering::SeqCst)
                     {
                         handler.calls.fetch_add(1, Ordering::SeqCst);
                         return (
@@ -121,9 +181,9 @@ impl Fixture {
                         "{bearer}"
                     );
                     let call = handler.calls.fetch_add(1, Ordering::SeqCst);
-                    if call == 1 {
+                    if call == 0 {
                         let db = handler
-                            .retire_destination_on_second_lookup
+                            .replace_destination_during_lookup
                             .lock()
                             .unwrap()
                             .take();
@@ -174,9 +234,14 @@ impl Fixture {
                     } else {
                         handler.guilds.lock().unwrap().clone()
                     };
+                    let mut headers = HeaderMap::new();
+                    if handler.spent_budget.load(Ordering::SeqCst) {
+                        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+                        headers.insert("x-ratelimit-reset-after", HeaderValue::from_static("30"));
+                    }
                     (
                         StatusCode::OK,
-                        axum::http::HeaderMap::new(),
+                        headers,
                         Json(serde_json::json!(guilds)),
                     )
                         .into_response()
@@ -186,6 +251,28 @@ impl Fixture {
         let server = tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
         });
+        let (token_endpoint, token_server) = if !matches!(token_transport, TokenTransport::Normal) {
+            let listener = tokio::net::TcpListener::bind((address.ip(), 0))
+                .await
+                .unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let handler = Arc::clone(&discord);
+            let server = tokio::spawn(async move {
+                let mut connections = Vec::new();
+                loop {
+                    let (connection, _) = listener.accept().await.unwrap();
+                    handler.token_calls.fetch_add(1, Ordering::SeqCst);
+                    if matches!(token_transport, TokenTransport::Timeout) {
+                        connections.push(connection);
+                    } else {
+                        drop(connection);
+                    }
+                }
+            });
+            (endpoint, Some(server))
+        } else {
+            (format!("http://{address}/token"), None)
+        };
         let path = std::env::temp_dir().join(format!(
             "jmodguard_api_enrollment_{:032x}.db",
             rand::random::<u128>()
@@ -200,10 +287,18 @@ impl Fixture {
             .guilds_endpoint = Some(format!("http://{address}/guilds"));
         Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
             .unwrap()
-            .token_endpoint = Some(format!("http://{address}/token"));
+            .token_endpoint = Some(token_endpoint);
         Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
             .unwrap()
             .me_endpoint = Some(format!("http://{address}/me"));
+        if matches!(token_transport, TokenTransport::Timeout) {
+            Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
+                .unwrap()
+                .http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap();
+        }
         tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
         let store = MemoryStore::default();
         let session = Session::new(None, Arc::new(store.clone()), None);
@@ -218,11 +313,13 @@ impl Fixture {
             .unwrap();
         session.save().await.unwrap();
         let cookie = format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap());
-        let router = router_with_store(Arc::clone(&app), store);
+        let router = router_with_store(Arc::clone(&app), store.clone());
         Self {
             app,
             router,
             cookie,
+            store,
+            token_server,
             discord,
             server,
             path,
@@ -357,6 +454,9 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
+        if let Some(server) = &self.token_server {
+            server.abort();
+        }
         crate::tenant::remove_sidecars(&self.path);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
@@ -478,6 +578,7 @@ async fn current_enrollment_allows_access_but_live_permission_revocation_wins_ov
         f.request("GET", "/api/guilds/10/config", "").await.0,
         StatusCode::OK
     );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     let (status, body) = f
         .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"revoked"}"#)
@@ -488,7 +589,7 @@ async fn current_enrollment_allows_access_but_live_permission_revocation_wins_ov
         db::get_settings(&f.app.db, 10).await.unwrap().prefix,
         "current"
     );
-    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -583,6 +684,17 @@ async fn discord_failure_never_uses_cached_authority_or_retires_membership() {
     let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
     assert!(!status.is_success());
     assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        !f.request("GET", "/api/guilds/10/config", "")
+            .await
+            .0
+            .is_success()
+    );
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        2,
+        "failed fetch must not populate the authorization cache"
+    );
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert!(db::guild_enrollment(&f.app.db, 10).await.unwrap().is_some());
 }
@@ -874,6 +986,7 @@ async fn expired_guild_token_refreshes_once_and_server_errors_do_not() {
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.failed.store(true, Ordering::SeqCst);
     f.discord
         .unauthorized_until_refresh
@@ -890,6 +1003,7 @@ async fn revoked_permission_stays_denied_after_token_refresh() {
     f.discord
         .unauthorized_until_refresh
         .store(true, Ordering::SeqCst);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     let (status, _) = f
         .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"nope"}"#)
@@ -948,10 +1062,7 @@ async fn copy_cannot_write_destination_replaced_after_its_authorization() {
     db::patch_settings(&f.app.db, 10, Some(Some("source".into())), None, None)
         .await
         .unwrap();
-    *f.discord
-        .retire_destination_on_second_lookup
-        .lock()
-        .unwrap() = Some(f.app.db.clone());
+    *f.discord.replace_destination_during_lookup.lock().unwrap() = Some(f.app.db.clone());
     let (status, body) = f
         .request(
             "POST",
@@ -1658,6 +1769,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
         .await;
     let mut manage_only = managed_guild(10);
     manage_only.permissions = Some(oauth::PermissionsField::Number(1 << 5));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     *f.discord.guilds.lock().unwrap() = vec![manage_only];
     let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(status, StatusCode::OK);
@@ -1682,6 +1794,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
     assert_eq!(f.request("DELETE", &path, "").await.0, StatusCode::OK);
     let mut ban_only = managed_guild(10);
     ban_only.permissions = Some(oauth::PermissionsField::Number(1 << 2));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     *f.discord.guilds.lock().unwrap() = vec![ban_only];
     let (_, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(history.as_array().unwrap().len(), 1);
@@ -1698,6 +1811,7 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
         f.request("GET", "/api/guilds/0/actions", "").await.0,
         StatusCode::BAD_REQUEST
     );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     assert_eq!(
         f.request("GET", "/api/guilds/10/actions", "").await.0,
@@ -1910,6 +2024,7 @@ async fn moderation_pages_require_loaded_membership_and_current_permissions() {
             StatusCode::BAD_REQUEST
         );
     }
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     for route in ["events", "bans", "stats"] {
         assert_eq!(
@@ -1970,6 +2085,7 @@ async fn individual_configuration_reads_require_page_membership_and_fresh_guild_
         assert_eq!(body["code"], "guild_enrollment_changed");
         assert_eq!(f.request("GET", &path, "").await.0, StatusCode::OK);
     }
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap().clear();
     for suffix in configuration_read_routes() {
         assert_eq!(
@@ -2238,6 +2354,7 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
     let (status, body) = f.request("GET", "/api/guilds/10/cases", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = body["cases"][0].as_str().unwrap().to_owned();
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     let (status, deleted) = f
@@ -2370,6 +2487,7 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
     std::fs::write(&object, b"bad").unwrap();
     std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
 
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     let (status, deleted) = f
@@ -2432,6 +2550,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .request("GET", "/api/guilds/10/cases?removed=true", "")
         .await;
     assert_ne!(denied, StatusCode::OK);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
     f.app.db.with_conn(|c|{c.execute_batch_bounded("CREATE TRIGGER review_fail BEFORE INSERT ON backup_cleanup_intents BEGIN SELECT RAISE(ABORT,'injected'); END", 64 * 1024 * 1024)?;Ok(())}).await.unwrap();
@@ -2637,4 +2756,1538 @@ async fn guild_user_cannot_launch_preview() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap_or("").contains("bot owner"));
+}
+
+// Age the production snapshot without sleeping or altering its success payload.
+async fn expire_auth_cache(app: &ApiState, age: std::time::Duration) {
+    let entries: Vec<_> = app
+        .auth_sessions
+        .iter()
+        .map(|e| Arc::clone(e.value()))
+        .collect();
+    for entry in entries {
+        if let Some((at, _)) = &mut entry.lock().await.guilds {
+            *at = std::time::Instant::now().checked_sub(age).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_guild_requests_reuse_coalesce_and_refetch_after_expiry() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let requests = (
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+    );
+    let (a, b, c) = tokio::join!(requests.0, requests.1, requests.2);
+    for (status, body) in [a, b, c] {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn bounded_auth_snapshot_handles_discord_and_local_rate_limits() {
+    for budget in [false, true] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.discord.spent_budget.store(budget, Ordering::SeqCst);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::OK
+        );
+        expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+        f.discord.rate_limited.store(true, Ordering::SeqCst);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.discord.calls.load(Ordering::SeqCst),
+            if budget { 1 } else { 2 }
+        );
+        // A fallback must not reset the successful snapshot's age.
+        expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "discord_rate_limited");
+        let entries: Vec<_> = f
+            .app
+            .auth_sessions
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for entry in entries {
+            entry.lock().await.guilds = None;
+        }
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_rejected_tokens_refresh_once_or_die_without_more_discord_calls() {
+    for failure in ["refresh", "guild", "profile", "none"] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        f.discord
+            .refresh_failed
+            .store(failure == "refresh", Ordering::SeqCst);
+        f.discord
+            .still_unauthorized
+            .store(failure == "guild", Ordering::SeqCst);
+        f.discord
+            .me_unauthorized
+            .store(failure == "profile", Ordering::SeqCst);
+        if failure == "profile" {
+            // Exercise profile recovery as the first rejection too.
+            f.discord
+                .unauthorized_until_refresh
+                .store(false, Ordering::SeqCst);
+            f.app.user_cache.clear();
+        }
+        let (a, b, c) = tokio::join!(
+            f.request("GET", "/api/guilds/10/config", ""),
+            f.request("GET", "/api/guilds/10/config", ""),
+            f.request("GET", "/api/guilds/10/config", "")
+        );
+        for (status, body) in [a, b, c] {
+            if failure == "none" {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            } else {
+                assert!(
+                    status == StatusCode::UNAUTHORIZED || body["error"] == "not authenticated",
+                    "{status}: {body}"
+                );
+                if status == StatusCode::UNAUTHORIZED {
+                    assert_eq!(body["code"], "auth_lost");
+                }
+            }
+        }
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1, "{failure}");
+        let calls = f.discord.calls.load(Ordering::SeqCst);
+        let me_calls = f.discord.me_calls.load(Ordering::SeqCst);
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        if failure != "none" {
+            assert!(!status.is_success(), "{body}");
+        }
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), me_calls);
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn copy_uses_one_permission_snapshot() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/api/guilds/20/copy",
+            r#"{"from_guild_id":10,"sections":["settings"]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn display_saves_live_profile_while_guilds_are_cooling_down() {
+    let f = Fixture::new(false).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let _ = f.app.oauth.my_guilds(42, "fixture-token").await;
+    f.app.user_cache.clear();
+    for _ in 0..3 {
+        assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
+    }
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
+    let f = Fixture::new(false).await;
+    let first = tests::session_for_user(42).await;
+    first
+        .insert(SESSION_TOKEN, "fixture-token")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let second = tests::session_for_user(42).await;
+    second
+        .insert(SESSION_TOKEN, "refreshed-token")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    require_auth_fresh(&f.app, &first)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    f.discord
+        .guilds
+        .lock()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .clear();
+    assert!(
+        require_auth_fresh(&f.app, &second)
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+            .guilds
+            .is_empty()
+    );
+    assert!(
+        !require_auth_fresh(&f.app, &first)
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+            .guilds
+            .is_empty()
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn owner_routes_preserve_auth_loss_for_an_already_loaded_session() {
+    let f = Fixture::new(true).await;
+    let store = Arc::new(MemoryStore::default());
+    let session = Session::new(None, store.clone(), None);
+    session.insert(SESSION_USER, 42u64).await.unwrap();
+    session
+        .insert(SESSION_TOKEN, "fixture-token")
+        .await
+        .unwrap();
+    session
+        .insert(SESSION_REFRESH, "fixture-refresh")
+        .await
+        .unwrap();
+    session.save().await.unwrap();
+    // Separate requests hydrate separate records; Session::clone shares a
+    // handle, which the first rejection now correctly clears.
+    let stale = Session::new(session.id(), store.clone(), None);
+    let stale_updates = Session::new(session.id(), store, None);
+    assert_eq!(stale.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+    assert_eq!(
+        stale_updates.get::<u64>(SESSION_USER).await.unwrap(),
+        Some(42)
+    );
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_failed.store(true, Ordering::SeqCst);
+    let error = require_auth_fresh(&f.app, &session).await.err().unwrap();
+    assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+    let usage = usage::overview(axum::extract::State(f.app.clone()), stale, HeaderMap::new())
+        .await
+        .unwrap_err();
+    let updates = updates::status(axum::extract::State(f.app.clone()), stale_updates)
+        .await
+        .unwrap_err();
+    for (status, body) in [usage, updates] {
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0["code"], "auth_lost");
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn waiting_session_saves_the_new_access_and_rotated_refresh_tokens() {
+    let f = Fixture::new(false).await;
+    let store = Arc::new(MemoryStore::default());
+    let first = Session::new(None, store.clone(), None);
+    first.insert(SESSION_USER, 42u64).await.unwrap();
+    first.insert(SESSION_TOKEN, "fixture-token").await.unwrap();
+    first
+        .insert(SESSION_REFRESH, "fixture-refresh")
+        .await
+        .unwrap();
+    first.save().await.unwrap();
+    let waiting = Session::new(first.id(), store.clone(), None);
+    assert_eq!(
+        waiting
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fixture-refresh")
+    );
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    require_auth_fresh(&f.app, &first)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    require_auth_fresh(&f.app, &waiting)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    waiting.save().await.unwrap();
+    let reloaded = Session::new(first.id(), store, None);
+    assert_eq!(
+        reloaded
+            .get::<String>(SESSION_TOKEN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("refreshed-token")
+    );
+    assert_eq!(
+        reloaded
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("refreshed-refresh")
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn temporary_refresh_rate_limit_keeps_session_and_allows_later_authorization() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    assert_refresh_session_kept(&f).await;
+    assert_refresh_wait(&f, std::time::Duration::from_secs(2)).await;
+    // Clear only the shared budget first: the session hold must still suppress refresh.
+    clear_oauth_budget(&f);
+    let (a, b, c) = tokio::join!(
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", "")
+    );
+    for (status, body) in [a, b, c] {
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "discord_rate_limited");
+    }
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    f.discord
+        .refresh_rate_limited
+        .store(false, Ordering::SeqCst);
+    expire_refresh_hold(&f).await;
+    let (a, b, c) = tokio::join!(
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("GET", "/api/guilds/10/config", "")
+    );
+    for (status, body) in [a, b, c] {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 2);
+    let state = refresh_state(&f).await;
+    let state = state.lock().await;
+    assert!(state.refresh_hold.is_none());
+    assert!(state.refresh_backoff.is_zero());
+}
+
+async fn refresh_state(f: &Fixture) -> Arc<tokio::sync::Mutex<SessionAuth>> {
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    Arc::clone(f.app.auth_sessions.get(&id).unwrap().value())
+}
+
+async fn assert_refresh_session_kept(f: &Fixture) {
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    assert!(session.get::<u64>(SESSION_USER).await.unwrap().is_some());
+    assert_eq!(
+        session
+            .get::<String>(SESSION_TOKEN)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fixture-token")
+    );
+    assert_eq!(
+        session
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fixture-refresh")
+    );
+    let state = refresh_state(f).await;
+    let state = state.lock().await;
+    assert!(!state.dead);
+    assert_eq!(state.token.as_deref(), Some("fixture-token"));
+    assert_eq!(state.refresh.as_deref(), Some("fixture-refresh"));
+}
+
+async fn assert_refresh_wait(f: &Fixture, expected: std::time::Duration) {
+    let state = refresh_state(f).await;
+    let state = state.lock().await;
+    let remaining = state.refresh_wait().unwrap().0;
+    assert!(
+        remaining <= expected && remaining > expected - std::time::Duration::from_secs(1),
+        "{remaining:?}"
+    );
+}
+
+fn clear_oauth_budget(f: &Fixture) {
+    *f.app.oauth.guild_list.lock().unwrap() = oauth::GuildListGate::new();
+}
+
+// Like expire_auth_cache, move only the production deadline; no real sleeps.
+async fn expire_refresh_hold(f: &Fixture) {
+    let state = refresh_state(f).await;
+    let mut state = state.lock().await;
+    let (_, limited) = state.refresh_hold.unwrap();
+    state.refresh_hold = Some((
+        oauth::Cooldown::Until(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        limited,
+    ));
+}
+
+#[tokio::test]
+async fn temporary_refresh_body_retry_after_and_local_budget_keep_sessions() {
+    for local_budget in [false, true] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        f.discord.refresh_rate_limited.store(true, Ordering::SeqCst);
+        *f.discord.retry_after.lock().unwrap() = String::new();
+        *f.discord.body_retry_after.lock().unwrap() = Some(30.0);
+        if local_budget {
+            // Another session spent the shared token budget before this request.
+            assert!(
+                f.app
+                    .oauth
+                    .refresh("fixture-refresh")
+                    .await
+                    .unwrap_err()
+                    .is::<oauth::DiscordRateLimit>()
+            );
+        }
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "discord_rate_limited");
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+        assert_refresh_session_kept(&f).await;
+        assert_refresh_wait(&f, std::time::Duration::from_secs(30)).await;
+        clear_oauth_budget(&f);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+        f.discord
+            .refresh_rate_limited
+            .store(false, Ordering::SeqCst);
+        expire_refresh_hold(&f).await;
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn temporary_refresh_server_failures_back_off_and_reset_after_success() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord
+        .refresh_server_failed
+        .store(true, Ordering::SeqCst);
+    for (attempt, seconds) in [5, 10, 20, 40, 60, 60].into_iter().enumerate() {
+        if attempt != 0 {
+            expire_refresh_hold(&f).await;
+        }
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["code"], "auth_lost");
+        assert_refresh_session_kept(&f).await;
+        assert_refresh_wait(&f, std::time::Duration::from_secs(seconds)).await;
+        let calls = f.discord.token_calls.load(Ordering::SeqCst);
+        assert_eq!(calls, attempt + 1);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), calls);
+    }
+    f.discord
+        .refresh_server_failed
+        .store(false, Ordering::SeqCst);
+    expire_refresh_hold(&f).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    let state = refresh_state(&f).await;
+    assert!(state.lock().await.refresh_hold.is_none());
+    assert!(state.lock().await.refresh_backoff.is_zero());
+    // A fresh consecutive-failure sequence starts at the minimum again.
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    f.discord.still_unauthorized.store(true, Ordering::SeqCst);
+    f.discord
+        .refresh_server_failed
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_refresh_wait(&f, std::time::Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn temporary_refresh_transport_failures_keep_session_and_release_lock() {
+    for transport in [TokenTransport::Closed, TokenTransport::Timeout] {
+        let f = Fixture::with_token_transport(false, "42", transport).await;
+        f.enroll(10).await;
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["code"], "auth_lost");
+        assert_refresh_session_kept(&f).await;
+        assert_refresh_wait(&f, std::time::Duration::from_secs(5)).await;
+        let calls = f.discord.token_calls.load(Ordering::SeqCst);
+        assert!(calls > 0);
+        assert_eq!(
+            f.request("GET", "/api/guilds/10/config", "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), calls);
+    }
+}
+
+#[tokio::test]
+async fn temporary_refresh_hold_never_extends_permission_snapshot_or_copy_authority() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_rate_limited.store(true, Ordering::SeqCst);
+    *f.discord.retry_after.lock().unwrap() = "30".into();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+    f.discord.guilds.lock().unwrap().clear();
+    assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
+    for (method, path, request) in [
+        ("GET", "/api/guilds/10/config", ""),
+        (
+            "POST",
+            "/api/guilds/20/copy",
+            r#"{"from_guild_id":10,"sections":["settings"]}"#,
+        ),
+    ] {
+        let (status, body) = f.request(method, path, request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "discord_rate_limited");
+    }
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    clear_oauth_budget(&f);
+    expire_refresh_hold(&f).await;
+    f.discord
+        .refresh_rate_limited
+        .store(false, Ordering::SeqCst);
+    let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "you cannot manage this server (needs MANAGE_GUILD permission)"
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn refresh_invalid_grant_drops_session_and_next_request_calls_no_discord() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_failed.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_lost");
+    let calls = f.discord.calls.load(Ordering::SeqCst);
+    let me_calls = f.discord.me_calls.load(Ordering::SeqCst);
+    assert!(
+        !f.request("GET", "/api/guilds/10/config", "")
+            .await
+            .0
+            .is_success()
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), me_calls);
+    let state = refresh_state(&f).await;
+    let state = state.lock().await;
+    assert!(state.dead && state.token.is_none() && state.refresh.is_none());
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    assert!(session.get::<u64>(SESSION_USER).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn temporary_refresh_server_retry_after_overrides_default_backoff() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord
+        .refresh_server_failed
+        .store(true, Ordering::SeqCst);
+    *f.discord.refresh_server_retry_after.lock().unwrap() = Some("30".into());
+    f.discord.spent_budget.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_refresh_wait(&f, std::time::Duration::from_secs(30)).await;
+    assert_refresh_session_kept(&f).await;
+    // Other sessions still obey the token endpoint's existing shared budget.
+    assert!(
+        f.app
+            .oauth
+            .refresh("fixture-refresh")
+            .await
+            .unwrap_err()
+            .is::<oauth::DiscordRateLimit>()
+    );
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn coordinator_authenticate_sign_out_cycles_release_entries() {
+    let f = Fixture::new(false).await;
+    for _ in 0..20 {
+        let session = Session::new(None, Arc::new(f.store.clone()), None);
+        store_login_session(&session, 42, "fixture-token", Some("fixture-refresh"))
+            .await
+            .unwrap();
+        require_auth_fresh(&f.app, &session).await.ok().unwrap();
+        assert_eq!(f.app.auth_sessions.len(), 1);
+        let entry = Arc::clone(
+            f.app
+                .auth_sessions
+                .get(&session.id().unwrap())
+                .unwrap()
+                .value(),
+        );
+        {
+            let mut auth = entry.lock().await;
+            assert!(auth.token.is_some() && auth.refresh.is_some() && auth.guilds.is_some());
+            auth.hold_refresh(&anyhow::anyhow!("temporary failure"));
+        }
+        let mut headers = HeaderMap::new();
+        let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+        let response = logout(
+            session,
+            axum::extract::State(Arc::clone(&f.app)),
+            headers,
+            Query(ReturnToQuery { return_to: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            f.app.auth_sessions.is_empty(),
+            "sign-out retained a coordinator"
+        );
+        assert_coordinator_payload_released(&entry).await;
+    }
+}
+
+// Move lifecycle timestamps like the existing snapshot/refresh deadline helpers.
+fn allow_coordinator_sweep(app: &ApiState) {
+    *app.auth_sessions_swept_at.lock().unwrap() = None;
+}
+
+async fn assert_coordinator_payload_released(entry: &tokio::sync::Mutex<SessionAuth>) {
+    let auth = entry.lock().await;
+    assert!(auth.dead);
+    assert!(auth.token.is_none());
+    assert!(auth.refresh.is_none());
+    assert!(auth.guilds.is_none());
+    assert!(auth.refresh_hold.is_none());
+    assert!(auth.refresh_backoff.is_zero());
+}
+
+#[tokio::test]
+async fn coordinator_oauth_rotation_retires_old_entry_and_payload() {
+    let f = Fixture::new(false).await;
+    let old_id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(old_id), Arc::new(f.store.clone()), None);
+    require_auth_fresh(&f.app, &session).await.ok().unwrap();
+    let old_entry = refresh_state(&f).await;
+    let waiting = Session::new(Some(old_id), Arc::new(f.store.clone()), None);
+    assert_eq!(waiting.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        COOKIE,
+        format!("{COOKIE_OAUTH_STATE}=fixture").parse().unwrap(),
+    );
+    let response = callback_response(
+        session.clone(),
+        &f.app.cfg,
+        &f.app.oauth,
+        Some(&f.app),
+        headers,
+        CallbackQuery {
+            code: Some("fixture".into()),
+            state: Some("fixture".into()),
+            error: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_ne!(session.id(), Some(old_id));
+    assert!(!f.app.auth_sessions.contains_key(&old_id));
+    assert_coordinator_payload_released(&old_entry).await;
+    assert!(f.app.retired_auth_sessions.contains_key(&old_id));
+    let calls = f.discord.calls.load(Ordering::SeqCst);
+    assert!(require_auth_fresh(&f.app, &waiting).await.is_err());
+    assert!(!f.app.auth_sessions.contains_key(&old_id));
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+    let old_session = Session::new(Some(old_id), Arc::new(f.store.clone()), None);
+    assert!(
+        old_session
+            .get::<u64>(SESSION_USER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    session.save().await.unwrap();
+    require_auth_fresh(&f.app, &session).await.ok().unwrap();
+    assert!(f.app.auth_sessions.contains_key(&session.id().unwrap()));
+}
+
+#[tokio::test]
+async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() {
+    let f = Fixture::new(false).await;
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    require_auth_fresh(&f.app, &session).await.ok().unwrap();
+    let entry = refresh_state(&f).await;
+    let mut refreshing = entry.lock().await;
+    refreshing.last_used = Some(
+        std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL)
+            .unwrap(),
+    );
+    // Refresh holds this exact mutex across token recovery. A sweep must not
+    // replace its owner, even when its recorded activity has expired.
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(f.app.auth_sessions.contains_key(&id));
+    drop(refreshing);
+    // A loaded request queued on this Arc must also retain the same owner.
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(Arc::ptr_eq(
+        f.app.auth_sessions.get(&id).unwrap().value(),
+        &entry
+    ));
+    let old_owner = Arc::downgrade(&entry);
+    drop(entry);
+    // The preceding sweep is rate-limited, even though the entry is now idle.
+    f.app.sweep_auth_sessions();
+    assert!(f.app.auth_sessions.contains_key(&id));
+    allow_coordinator_sweep(&f.app);
+    // Exercise the production sweep trigger, then recreate from the live store.
+    require_auth_fresh(&f.app, &session).await.ok().unwrap();
+    assert!(
+        old_owner.upgrade().is_none(),
+        "idle coordinator was retained"
+    );
+    let replacement = refresh_state(&f).await;
+    assert!(replacement.lock().await.last_used.unwrap().elapsed() < AUTH_SESSION_IDLE_TTL);
+    drop(replacement);
+    // An abandoned record is bounded by coordinator inactivity, regardless of
+    // whether MemoryStore has already removed it.
+    let entry = refresh_state(&f).await;
+    entry.lock().await.last_used = Some(
+        std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL)
+            .unwrap(),
+    );
+    drop(entry);
+    session.delete().await.unwrap();
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(f.app.auth_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
+    let f = Fixture::new(false).await;
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let stale_session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    // Load before the permanent refusal deletes the store record.
+    assert!(
+        stale_session
+            .get::<u64>(SESSION_USER)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.refresh_failed.store(true, Ordering::SeqCst);
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    assert!(
+        require_auth_fresh(&f.app, &session)
+            .await
+            .err()
+            .unwrap()
+            .0
+            .is::<AuthLost>()
+    );
+    let entry = refresh_state(&f).await;
+    assert_coordinator_payload_released(&entry).await;
+    drop(entry);
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(f.app.auth_sessions.contains_key(&id));
+    let calls = f.discord.token_calls.load(Ordering::SeqCst);
+    assert!(
+        require_auth_fresh(&f.app, &stale_session)
+            .await
+            .err()
+            .unwrap()
+            .0
+            .is::<AuthLost>()
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), calls);
+    let entry = refresh_state(&f).await;
+    entry.lock().await.dead_since = Some(
+        std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_DEAD_TTL)
+            .unwrap(),
+    );
+    drop(entry);
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(f.app.auth_sessions.is_empty());
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    // Tombstone retirement metadata is independent of the 30-second payload marker.
+    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL - std::time::Duration::from_secs(1))
+        .unwrap();
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL)
+        .unwrap();
+    // Rate limiting applies to the tombstone sweep too.
+    f.app.sweep_auth_sessions();
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    allow_coordinator_sweep(&f.app);
+    f.app.sweep_auth_sessions();
+    assert!(!f.app.retired_auth_sessions.contains_key(&id));
+}
+
+#[tokio::test]
+async fn refresh_server_waits_are_capped_without_overflow() {
+    for (rate_limited, header, body) in [
+        (false, "3600".to_owned(), None),
+        (false, u64::MAX.to_string(), None),
+        (false, f64::MAX.to_string(), None),
+        (true, u64::MAX.to_string(), None),
+        (true, String::new(), Some(f64::MAX)),
+    ] {
+        let f = Fixture::new(false).await;
+        f.app.guild_cache.clear();
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        if rate_limited {
+            f.discord.refresh_rate_limited.store(true, Ordering::SeqCst);
+            *f.discord.retry_after.lock().unwrap() = header;
+            *f.discord.body_retry_after.lock().unwrap() = body;
+        } else {
+            f.discord
+                .refresh_server_failed
+                .store(true, Ordering::SeqCst);
+            *f.discord.refresh_server_retry_after.lock().unwrap() = Some(header);
+        }
+        let (status, response) = f.request("POST", "/api/me", "").await;
+        assert_eq!(
+            status,
+            if rate_limited {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{response}"
+        );
+        assert_refresh_session_kept(&f).await;
+        assert_refresh_wait(&f, REFRESH_RETRY_MAX).await;
+        let state = refresh_state(&f).await;
+        assert!(matches!(
+            state.lock().await.refresh_hold.unwrap().0,
+            oauth::Cooldown::Until(_)
+        ));
+        // Shared cooldowns also feed the hold; their larger remaining wait
+        // must not reintroduce a process-lifetime session hold.
+        if rate_limited {
+            expire_refresh_hold(&f).await;
+            assert_eq!(
+                f.request("POST", "/api/me", "").await.0,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_refresh_wait(&f, REFRESH_RETRY_MAX).await;
+            assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_hold_resets_when_existing_access_token_authorizes_again() {
+    let f = Fixture::new(false).await;
+    f.app.guild_cache.clear();
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord
+        .refresh_server_failed
+        .store(true, Ordering::SeqCst);
+    for seconds in [5, 10] {
+        assert_eq!(
+            f.request("POST", "/api/me", "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_refresh_wait(&f, std::time::Duration::from_secs(seconds)).await;
+        expire_refresh_hold(&f).await;
+    }
+    f.discord
+        .unauthorized_until_refresh
+        .store(false, Ordering::SeqCst);
+    assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 2);
+    let state = refresh_state(&f).await;
+    assert!(state.lock().await.refresh_hold.is_none());
+    assert!(state.lock().await.refresh_backoff.is_zero());
+    assert_eq!(state.lock().await.token.as_deref(), Some("fixture-token"));
+    drop(state);
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    f.app.guild_cache.clear();
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request("POST", "/api/me", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_refresh_wait(&f, REFRESH_RETRY_MIN).await;
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn retired_hydrated_handle_cannot_recreate_coordinator() {
+    let f = Fixture::new(true).await;
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let waiting = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    assert_eq!(waiting.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+    assert!(f.app.auth_sessions.is_empty());
+    let mut headers = HeaderMap::new();
+    let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+    let response = logout(
+        Session::new(Some(id), Arc::new(f.store.clone()), None),
+        axum::extract::State(Arc::clone(&f.app)),
+        headers,
+        Query(ReturnToQuery { return_to: None }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let calls = f.discord.calls.load(Ordering::SeqCst);
+    assert!(
+        require_auth_fresh(&f.app, &waiting).await.is_err(),
+        "retired hydrated handle authorized again"
+    );
+    assert!(
+        f.app.auth_sessions.is_empty(),
+        "retired ID recreated a coordinator"
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+    assert!(session_owner(&f.app, &waiting).await.is_err());
+    assert!(waiting.is_empty().await);
+    let fresh = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        COOKIE,
+        format!("{COOKIE_OAUTH_STATE}=fixture").parse().unwrap(),
+    );
+    let response = callback_response(
+        fresh.clone(),
+        &f.app.cfg,
+        &f.app.oauth,
+        Some(&f.app),
+        headers,
+        CallbackQuery {
+            code: Some("fixture".into()),
+            state: Some("fixture".into()),
+            error: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_ne!(fresh.id(), Some(id));
+    fresh.save().await.unwrap();
+    require_auth_fresh(&f.app, &fresh).await.ok().unwrap();
+    session_owner(&f.app, &fresh).await.ok().unwrap();
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    assert!(
+        !f.app
+            .retired_auth_sessions
+            .contains_key(&fresh.id().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn retired_delayed_response_save_cannot_restore_authority() {
+    for definitive_refusal in [false, true] {
+        let f = Fixture::new(true).await;
+        f.enroll(10).await;
+        let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+        let hydrated = Arc::new(tokio::sync::Notify::new());
+        let authenticate = Arc::new(tokio::sync::Notify::new());
+        let authorized = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let delayed = Router::new()
+            .route(
+                "/delayed",
+                get({
+                    let app = Arc::clone(&f.app);
+                    let hydrated = Arc::clone(&hydrated);
+                    let authenticate = Arc::clone(&authenticate);
+                    let authorized = Arc::clone(&authorized);
+                    let finish = Arc::clone(&finish);
+                    move |session: Session| {
+                        let (app, hydrated, authenticate, authorized, finish) = (
+                            Arc::clone(&app),
+                            Arc::clone(&hydrated),
+                            Arc::clone(&authenticate),
+                            Arc::clone(&authorized),
+                            Arc::clone(&finish),
+                        );
+                        async move {
+                            assert_eq!(session.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+                            hydrated.notify_one();
+                            authenticate.notified().await;
+                            require_auth_fresh(&app, &session).await.ok().unwrap();
+                            // The leader's rotated credentials modified this old snapshot.
+                            assert!(session.is_modified());
+                            authorized.notify_one();
+                            finish.notified().await;
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .layer(
+                SessionManagerLayer::new(f.store.clone())
+                    .with_name(SESSION_COOKIE_NAME)
+                    .with_secure(false)
+                    .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+                        SESSION_INACTIVITY_SECS,
+                    ))),
+            );
+        let request = Request::builder()
+            .uri("/delayed")
+            .header(COOKIE, &f.cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::spawn(delayed.oneshot(request));
+        hydrated.notified().await;
+        f.discord
+            .unauthorized_until_refresh
+            .store(true, Ordering::SeqCst);
+        let leader = Session::new(Some(id), Arc::new(f.store.clone()), None);
+        require_auth_fresh(&f.app, &leader).await.ok().unwrap();
+        authenticate.notify_one();
+        authorized.notified().await;
+        if definitive_refusal {
+            expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+            f.discord.still_unauthorized.store(true, Ordering::SeqCst);
+            f.discord.refresh_failed.store(true, Ordering::SeqCst);
+            assert_eq!(
+                f.request("GET", "/api/guilds/10/config", "").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            let entry = refresh_state(&f).await;
+            entry.lock().await.dead_since = Some(
+                std::time::Instant::now()
+                    .checked_sub(AUTH_SESSION_DEAD_TTL)
+                    .unwrap(),
+            );
+            drop(entry);
+            allow_coordinator_sweep(&f.app);
+            f.app.sweep_auth_sessions();
+        } else {
+            let mut headers = HeaderMap::new();
+            let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
+            headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(
+                logout(
+                    leader,
+                    axum::extract::State(Arc::clone(&f.app)),
+                    headers,
+                    Query(ReturnToQuery { return_to: None })
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        assert!(f.app.auth_sessions.is_empty());
+        use tower_sessions::SessionStore as _;
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        finish.notify_one();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+        // Real response middleware has now saved the modified, nonempty record.
+        assert!(f.store.load(&id).await.unwrap().is_some());
+        let owner = Session::new(Some(id), Arc::new(f.store.clone()), None);
+        assert_eq!(owner.get::<u64>(SESSION_USER).await.unwrap(), Some(42));
+        let calls = (
+            f.discord.calls.load(Ordering::SeqCst),
+            f.discord.token_calls.load(Ordering::SeqCst),
+            f.discord.me_calls.load(Ordering::SeqCst),
+        );
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["code"], "auth_lost");
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        // The independently hydrated owner handle must also reject and clear.
+        assert!(
+            session_owner(&f.app, &owner)
+                .await
+                .err()
+                .unwrap()
+                .0
+                .is::<AuthLost>()
+        );
+        assert!(owner.is_empty().await);
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst)
+            ),
+            calls
+        );
+    }
+}
+
+async fn blocker_request(
+    f: &Fixture,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let response = f
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(COOKIE, &f.cookie)
+                .header(axum::http::header::ORIGIN, origin)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+// Hold a modified response so the real session middleware writes its old row
+// after a different request has deleted or rotated that row.
+async fn delayed_session_save(
+    f: &Fixture,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>) {
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let delayed = Router::new()
+        .route(
+            "/delayed",
+            get({
+                let hydrated = Arc::clone(&hydrated);
+                let finish = Arc::clone(&finish);
+                move |session: Session| {
+                    let hydrated = Arc::clone(&hydrated);
+                    let finish = Arc::clone(&finish);
+                    async move {
+                        assert!(session.get::<u64>(SESSION_USER).await.unwrap().is_some());
+                        session.insert("delayed_response", true).await.unwrap();
+                        hydrated.notify_one();
+                        finish.notified().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .layer(
+            SessionManagerLayer::new(f.store.clone())
+                .with_name(SESSION_COOKIE_NAME)
+                .with_secure(false)
+                .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+                    SESSION_INACTIVITY_SECS,
+                ))),
+        );
+    let request = Request::builder()
+        .uri("/delayed")
+        .header(COOKIE, &f.cookie)
+        .body(Body::empty())
+        .unwrap();
+    let response = tokio::spawn(async move {
+        assert_eq!(
+            delayed.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    });
+    hydrated.notified().await;
+    (finish, response)
+}
+
+async fn oauth_callback_request(f: &Fixture, cookie: &str) -> Response {
+    f.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=fixture&state=fixture")
+                .header(COOKIE, format!("{cookie}; {COOKIE_OAUTH_STATE}=fixture"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn recovery_rejects_late_save(definitive_refusal: bool) {
+    use tower_sessions::SessionStore as _;
+    for (method, route, body) in [
+        ("GET", "/api/service-upgrade", ""),
+        (
+            "POST",
+            "/api/service-upgrade/check",
+            r#"{"channel":"invalid"}"#,
+        ),
+        (
+            "POST",
+            "/api/service-upgrade",
+            r#"{"bot_digest":"","api_digest":"","confirmed":false}"#,
+        ),
+        ("POST", "/api/service-upgrade/cancel", r#"{"id":""}"#),
+    ] {
+        let f = Fixture::new(true).await;
+        let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+        let (finish, response) = delayed_session_save(&f).await;
+        if definitive_refusal {
+            f.app.guild_cache.clear();
+            f.discord.still_unauthorized.store(true, Ordering::SeqCst);
+            f.discord.refresh_failed.store(true, Ordering::SeqCst);
+            let (status, body) = f.request("POST", "/api/me", "").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["code"], "auth_lost");
+            let entry = refresh_state(&f).await;
+            entry.lock().await.dead_since = Some(
+                std::time::Instant::now()
+                    .checked_sub(AUTH_SESSION_DEAD_TTL)
+                    .unwrap(),
+            );
+            drop(entry);
+            allow_coordinator_sweep(&f.app);
+            f.app.sweep_auth_sessions();
+        } else {
+            assert_eq!(
+                blocker_request(&f, "POST", "/logout", "").await.0,
+                StatusCode::OK
+            );
+        }
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        finish.notify_one();
+        response.await.unwrap();
+        assert!(f.store.load(&id).await.unwrap().is_some());
+        let calls = (
+            f.discord.calls.load(Ordering::SeqCst),
+            f.discord.token_calls.load(Ordering::SeqCst),
+            f.discord.me_calls.load(Ordering::SeqCst),
+        );
+        let (status, body) = blocker_request(&f, method, route, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {route}: {body}");
+        assert_eq!(body["code"], "auth_lost");
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst),
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_blocker_recovery_rejects_late_save_after_logout() {
+    recovery_rejects_late_save(false).await;
+}
+
+#[tokio::test]
+async fn review_blocker_recovery_rejects_late_save_after_refusal() {
+    recovery_rejects_late_save(true).await;
+}
+
+#[tokio::test]
+async fn review_blocker_oauth_rotation_rejects_late_save() {
+    use tower_sessions::SessionStore as _;
+    let f = Fixture::new(true).await;
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let (finish, response) = delayed_session_save(&f).await;
+    let callback = oauth_callback_request(&f, &f.cookie).await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let new_cookie = callback
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .find(|cookie| cookie.starts_with(SESSION_COOKIE_NAME))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_ne!(new_cookie, f.cookie);
+    assert!(f.app.retired_auth_sessions.contains_key(&id));
+    assert!(f.store.load(&id).await.unwrap().is_none());
+    finish.notify_one();
+    response.await.unwrap();
+    assert!(f.store.load(&id).await.unwrap().is_some());
+    let calls = f.discord.calls.load(Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "auth_lost");
+    assert!(f.store.load(&id).await.unwrap().is_none());
+    assert!(f.app.auth_sessions.is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
+    let current = Session::new(
+        Some(new_cookie.split_once('=').unwrap().1.parse().unwrap()),
+        Arc::new(f.store.clone()),
+        None,
+    );
+    require_auth_fresh(&f.app, &current).await.ok().unwrap();
+}
+
+#[tokio::test]
+async fn review_blocker_logout_ignores_unknown_cookie() {
+    use tower_sessions::SessionStore as _;
+    let mut f = Fixture::new(true).await;
+    let real_cookie = f.cookie.clone();
+    let real_id = real_cookie.split_once('=').unwrap().1.parse().unwrap();
+    for _ in 0..8 {
+        let id = tower_sessions::session::Id::default();
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        f.cookie = format!("{SESSION_COOKIE_NAME}={id}");
+        assert_eq!(
+            blocker_request(&f, "POST", "/logout", "").await.0,
+            StatusCode::OK
+        );
+        assert!(
+            f.app.retired_auth_sessions.is_empty(),
+            "unknown cookie allocated a tombstone"
+        );
+    }
+    // A persisted identity without a coordinator must still be fenced.
+    f.cookie = real_cookie;
+    assert!(f.app.auth_sessions.is_empty());
+    assert_eq!(
+        blocker_request(&f, "POST", "/logout", "").await.0,
+        StatusCode::OK
+    );
+    assert!(f.app.retired_auth_sessions.contains_key(&real_id));
+    assert!(f.store.load(&real_id).await.unwrap().is_none());
+    // A coordinator also proves ownership if its store row has disappeared.
+    let g = Fixture::new(true).await;
+    let id = g.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(g.store.clone()), None);
+    require_auth_fresh(&g.app, &session).await.ok().unwrap();
+    g.store.delete(&id).await.unwrap();
+    assert_eq!(
+        blocker_request(&g, "POST", "/logout", "").await.0,
+        StatusCode::OK
+    );
+    assert!(g.app.retired_auth_sessions.contains_key(&id));
+    assert!(g.app.auth_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn review_blocker_oauth_rotation_ignores_unknown_cookie() {
+    let f = Fixture::new(true).await;
+    for _ in 0..2 {
+        let id = tower_sessions::session::Id::default();
+        let cookie = format!("{SESSION_COOKIE_NAME}={id}");
+        let response = oauth_callback_request(&f, &cookie).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            f.app.retired_auth_sessions.is_empty(),
+            "unknown OAuth cookie allocated a tombstone"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|header| header.to_str().unwrap().starts_with(SESSION_COOKIE_NAME))
+        );
+    }
+}
+
+#[tokio::test]
+async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
+    use tower_sessions::SessionStore as _;
+    // Both owner-only recovery and Discord-backed authentication must fail.
+    for route in ["/api/service-upgrade", "/api/me"] {
+        let f = Fixture::new(true).await;
+        let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+        let (finish, response) = delayed_session_save(&f).await;
+        assert_eq!(
+            blocker_request(&f, "POST", "/logout", "").await.0,
+            StatusCode::OK
+        );
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        let retirement = tower_sessions::cookie::time::OffsetDateTime::now_utc();
+        finish.notify_one();
+        response.await.unwrap();
+        let mut revived = f.store.load(&id).await.unwrap().unwrap();
+        assert!(
+            revived.expiry_date >= retirement + CookieDuration::seconds(SESSION_INACTIVITY_SECS)
+        );
+        // Advance both clocks consistently: retirement was seven days + one
+        // second ago; the late response saved two minutes after retirement.
+        // No request observes the restored row before the production sweep.
+        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        revived.expiry_date =
+            tower_sessions::cookie::time::OffsetDateTime::now_utc() + CookieDuration::seconds(119);
+        f.store.save(&revived).await.unwrap();
+        allow_coordinator_sweep(&f.app);
+        f.app.sweep_auth_sessions();
+        let calls = (
+            f.discord.calls.load(Ordering::SeqCst),
+            f.discord.token_calls.load(Ordering::SeqCst),
+            f.discord.me_calls.load(Ordering::SeqCst),
+        );
+        let (status, body) = f.request("GET", route, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "late-saved identity became authoritative: {body}"
+        );
+        assert_eq!(body["code"], "auth_lost");
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst)
+            )
+        );
+
+        // After eight days and the row's own expiry, cleanup leaves an unknown
+        // ID. MemoryStore itself filters expired records on load.
+        revived.expiry_date =
+            tower_sessions::cookie::time::OffsetDateTime::now_utc() - CookieDuration::seconds(1);
+        f.store.save(&revived).await.unwrap();
+        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
+            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(24 * 60 * 60 + 1))
+            .unwrap();
+        allow_coordinator_sweep(&f.app);
+        f.app.sweep_auth_sessions();
+        assert!(!f.app.retired_auth_sessions.contains_key(&id));
+        assert!(f.store.load(&id).await.unwrap().is_none());
+        let (status, body) = f.request("GET", "/api/service-upgrade", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "sign in to manage service upgrades");
+        let unknown = Session::new(Some(id), Arc::new(f.store.clone()), None);
+        let failure = session_owner(&f.app, &unknown).await.err().unwrap();
+        assert_eq!(failure.0.to_string(), "not authenticated");
+        assert!(body.get("code").is_none());
+        assert!(f.app.auth_sessions.is_empty());
+        assert_eq!(
+            calls,
+            (
+                f.discord.calls.load(Ordering::SeqCst),
+                f.discord.token_calls.load(Ordering::SeqCst),
+                f.discord.me_calls.load(Ordering::SeqCst)
+            )
+        );
+    }
 }

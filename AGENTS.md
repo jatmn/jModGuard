@@ -346,7 +346,8 @@ authorize live provider calls or require a Codex skill to contribute.
   check that identity use the session user id and do not fetch the Discord
   guild list.
 - Guild-scoped WebUI authorization (`guild_scope` for real guild ids) always
-  re-fetches Discord `/users/@me/guilds` before `can_manage`. The 60s guild
+  checks a session/token-bound successful Discord guild snapshot before `can_manage`: 3s reuse,
+  at most 5s fallback only on rate limits, then fail closed. The 60s guild
   cache is **display-only** (`/api/me`). While Discord is rate-limiting that
   user, display may keep serving the last good list. Never authorize mutations
   from the display cache (post-demotion access window).

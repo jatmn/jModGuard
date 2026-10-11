@@ -22,6 +22,13 @@ pub struct ApiState {
     writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
+    pub(super) auth_sessions:
+        DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
+    // One small ID/timestamp per retirement, bounded by sign-outs/rotations
+    // within the tombstone lifetime. This must share the session store's lifetime:
+    // if a persistent store is added, persist tombstones there or clear it on startup.
+    pub(super) retired_auth_sessions: DashMap<tower_sessions::session::Id, Instant>,
+    pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
@@ -67,12 +74,81 @@ impl ApiState {
             oauth,
             writer,
             guild_cache: DashMap::new(),
+            auth_sessions: DashMap::new(),
+            retired_auth_sessions: DashMap::new(),
+            auth_sessions_swept_at: std::sync::Mutex::new(None),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
             session_store: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Called on authentication before insertion; no task or store I/O is needed.
+    /// Inactivity uses the same bound as the session cookie. A request owning an
+    /// Arc (including one queued on the mutex) cannot lose its single-flight owner.
+    pub(super) fn sweep_auth_sessions(&self) {
+        let Ok(mut swept_at) = self.auth_sessions_swept_at.try_lock() else {
+            return;
+        };
+        if swept_at.is_some_and(|at| at.elapsed() < super::AUTH_SESSION_SWEEP_INTERVAL) {
+            return;
+        }
+        *swept_at = Some(Instant::now());
+        self.retired_auth_sessions
+            .retain(|_, retired_at| retired_at.elapsed() < super::AUTH_SESSION_TOMBSTONE_TTL);
+        self.auth_sessions.retain(|_, entry| {
+            if Arc::strong_count(entry) != 1 {
+                return true;
+            }
+            let Ok(mut auth) = entry.try_lock() else {
+                return true;
+            };
+            let expired = if auth.dead {
+                auth.dead_since
+                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_DEAD_TTL)
+            } else {
+                auth.last_used
+                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_IDLE_TTL)
+            };
+            if expired {
+                auth.retire();
+            }
+            !expired
+        });
+    }
+
+    /// Logout and successful OAuth callbacks retire before deleting/rotating
+    /// the store record. Wait for refresh to finish; never split its coordinator.
+    pub(super) async fn retire_auth_session(
+        &self,
+        session: &tower_sessions::Session,
+    ) -> Result<()> {
+        let cookie_id = session.id();
+        // Loading clears an unknown cookie ID. A coordinator can still belong
+        // to a real session whose store row was deleted by another request.
+        session.get::<u64>(super::SESSION_USER).await?;
+        let id = session
+            .id()
+            .or_else(|| cookie_id.filter(|id| self.auth_sessions.contains_key(id)));
+        let Some(id) = id else { return Ok(()) };
+        // Fence even independently hydrated handles that never acquired an Arc.
+        self.retired_auth_sessions
+            .entry(id)
+            .or_insert_with(Instant::now);
+        let Some(entry) = self
+            .auth_sessions
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return Ok(());
+        };
+        let mut auth = entry.lock().await;
+        auth.retire();
+        self.auth_sessions
+            .remove_if(&id, |_, current| Arc::ptr_eq(current, &entry));
+        Ok(())
     }
 
     /// Use this store for the next `web::router` build. Production leaves it empty.

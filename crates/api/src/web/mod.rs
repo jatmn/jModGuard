@@ -34,6 +34,18 @@ const SESSION_REFRESH: &str = "refresh_token";
 const COOKIE_OAUTH_STATE: &str = "jmodguard_oauth_state";
 const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
 const SESSION_COOKIE_NAME: &str = "jmodguard_session";
+const SESSION_INACTIVITY_SECS: i64 = 7 * 24 * 60 * 60;
+const AUTH_SESSION_IDLE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(SESSION_INACTIVITY_SECS as u64);
+// A late save can only come from a request already in flight at retirement,
+// so its delay is limited by that request's remaining duration. A generous
+// 24-hour margin lets its renewed seven-day row expire before the tombstone,
+// provided that request finishes within the margin. There is no router-wide
+// request timeout; deliberately keep long service-upgrade applies unrestricted.
+const AUTH_SESSION_TOMBSTONE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(AUTH_SESSION_IDLE_TTL.as_secs() + 24 * 60 * 60);
+const AUTH_SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const AUTH_SESSION_DEAD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 /// Bunny (and other CDNs) honor this independently of browser Cache-Control.
@@ -48,6 +60,9 @@ pub struct ApiError(pub anyhow::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is::<AuthLost>() {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "discord authorization failed", "code": "auth_lost"}))).into_response();
+        }
         if self.0.is::<crate::db::EnrollmentUnverified>() {
             return ApiError(GuildAccessError::Unverified.into()).into_response();
         }
@@ -194,9 +209,23 @@ impl AuthCtx {
     }
 }
 
+async fn reject_retired_session(app: &ApiState, session: &Session) -> ApiResult<()> {
+    if session
+        .id()
+        .is_some_and(|id| app.retired_auth_sessions.contains_key(&id))
+    {
+        // A late response can restore a deleted record. Clear this handle as
+        // well as the store row so response middleware cannot save it again.
+        session.flush().await.map_err(anyhow::Error::from)?;
+        return Err(AuthLost.into());
+    }
+    Ok(())
+}
+
 /// Session owner check that does not call Discord. Preview sessions never
 /// inherit owner authority. The returned context has no guild membership.
 pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthCtx> {
+    reject_retired_session(app, session).await?;
     if preview::current().is_some() {
         return Err(ApiError(anyhow::anyhow!(
             "global config requires the configured bot owner (bot.owner_id)"
@@ -205,6 +234,21 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
     let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
         return Err(ApiError(anyhow::anyhow!("not authenticated")));
     };
+    reject_retired_session(app, session).await?;
+    if let Some(id) = session.id()
+        && let Some(auth) = app
+            .auth_sessions
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+    {
+        let mut auth = auth.lock().await;
+        reject_retired_session(app, session).await?;
+        if auth.dead {
+            session.flush().await.map_err(anyhow::Error::from)?;
+            return Err(AuthLost.into());
+        }
+        auth.last_used = Some(std::time::Instant::now());
+    }
     let owner = app.cfg.bot.owner_id;
     if owner == 0 || user_id != owner {
         return Err(ApiError(anyhow::anyhow!(
@@ -248,13 +292,12 @@ pub fn require_bot_owner(app: &ApiState, auth: &AuthCtx) -> ApiResult<()> {
 ///
 /// Display (`/api/me`) may use a short in-memory cache to spare Discord rate
 /// limits, and may keep showing the last good list while that route is cooling
-/// down. Authorization (`guild_scope` for real guilds) must **not** — a
-/// demoted admin must lose WebUI access on the next request, not after a TTL.
+/// down. Authorization uses a separate session/token snapshot bounded to seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuildListMode {
     /// Prefer cache ≤60s (sidebar / profile listing only).
     CachedOk,
-    /// Always re-fetch `/users/@me/guilds` from Discord before `can_manage`.
+    /// Reuse only the short session/token authorization snapshot.
     MustRefresh,
 }
 
@@ -271,21 +314,254 @@ pub async fn require_auth_fresh(app: &Arc<ApiState>, session: &Session) -> ApiRe
     require_auth_with(app, session, GuildListMode::MustRefresh).await
 }
 
+// Authorization never uses the 60s display cache. Even during rate limits,
+// permissions may be stale for at most five seconds after a successful fetch.
+const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+
+const REFRESH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+const REFRESH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+pub(super) struct SessionAuth {
+    token: Option<String>,
+    refresh: Option<String>,
+    guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
+    dead: bool,
+    dead_since: Option<std::time::Instant>,
+    last_used: Option<std::time::Instant>,
+    refresh_hold: Option<(oauth::Cooldown, bool)>,
+    refresh_backoff: std::time::Duration,
+}
+
+impl SessionAuth {
+    /// Clear payloads even when a loaded request still owns this coordinator.
+    fn retire(&mut self) {
+        self.dead = true;
+        self.dead_since.get_or_insert_with(std::time::Instant::now);
+        self.token = None;
+        self.refresh = None;
+        self.guilds = None;
+        self.refresh_hold = None;
+        self.refresh_backoff = std::time::Duration::ZERO;
+    }
+
+    fn refresh_wait(&self) -> Option<(std::time::Duration, bool)> {
+        let (deadline, rate_limited) = self.refresh_hold?;
+        let remaining = match deadline {
+            oauth::Cooldown::Until(until) => {
+                until.checked_duration_since(std::time::Instant::now())?
+            }
+            oauth::Cooldown::RestOfProcess | oauth::Cooldown::AwaitingBody => {
+                std::time::Duration::MAX
+            }
+        };
+        Some((remaining, rate_limited))
+    }
+
+    fn hold_refresh(&mut self, error: &anyhow::Error) {
+        self.refresh_backoff = if self.refresh_backoff.is_zero() {
+            REFRESH_RETRY_MIN
+        } else {
+            (self.refresh_backoff.saturating_mul(2)).min(REFRESH_RETRY_MAX)
+        };
+        let limit = error.downcast_ref::<oauth::DiscordRateLimit>();
+        let wait = limit.map_or_else(
+            || {
+                error
+                    .downcast_ref::<oauth::DiscordRetryAfter>()
+                    .map_or(self.refresh_backoff, |error| error.retry_after)
+            },
+            |limit| limit.retry_after,
+        );
+        self.refresh_hold = Some((
+            oauth::cooldown_deadline(std::time::Instant::now(), wait.min(REFRESH_RETRY_MAX)),
+            limit.is_some(),
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct AuthLost;
+
+impl std::fmt::Display for AuthLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("discord authorization failed")
+    }
+}
+
+impl std::error::Error for AuthLost {}
+
 async fn require_auth_with(
     app: &Arc<ApiState>,
     session: &Session,
     guild_mode: GuildListMode,
 ) -> ApiResult<AuthCtx> {
+    reject_retired_session(app, session).await?;
     let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
         return Err(ApiError(anyhow::anyhow!("not authenticated")));
     };
-    let token = session
-        .get::<String>(SESSION_TOKEN)
-        .await
-        .ok()
-        .flatten()
+    // MemoryStore gives each login its own identity. The lock spans token
+    // recovery, so waiters use the leader's token even if their Session handle
+    // loaded the old record before that leader saved it.
+    if session.id().is_none() {
+        session.save().await.map_err(anyhow::Error::from)?;
+    }
+    let id = session
+        .id()
         .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
+    app.sweep_auth_sessions();
+    // Hold the vacant tombstone entry through coordinator lookup/insertion.
+    // Retirement cannot insert its fence and remove the coordinator between
+    // this check and insertion. Release all map guards before awaiting.
+    let state = match app.retired_auth_sessions.entry(id) {
+        dashmap::mapref::entry::Entry::Occupied(_) => None,
+        dashmap::mapref::entry::Entry::Vacant(fence) => {
+            let state = Arc::clone(app.auth_sessions.entry(id).or_default().value());
+            drop(fence);
+            Some(state)
+        }
+    };
+    let Some(state) = state else {
+        session.flush().await.map_err(anyhow::Error::from)?;
+        return Err(AuthLost.into());
+    };
+    let mut state = state.lock().await;
+    reject_retired_session(app, session).await?;
+    if state.dead {
+        session.flush().await.map_err(anyhow::Error::from)?;
+        return Err(AuthLost.into());
+    }
+    state.last_used = Some(std::time::Instant::now());
+    let token = match &state.token {
+        Some(token) => token.clone(),
+        None => session
+            .get::<String>(SESSION_TOKEN)
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?,
+    };
+    if state.token.is_none() {
+        state.refresh = session.get::<String>(SESSION_REFRESH).await.ok().flatten();
+    }
+    state.token = Some(token.clone());
+    session
+        .insert(SESSION_TOKEN, &token)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if let Some(refresh) = &state.refresh {
+        session
+            .insert(SESSION_REFRESH, refresh)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+    if let Some((retry_after, rate_limited)) = state.refresh_wait() {
+        // A hold never renews a successful snapshot, and permission checks
+        // cannot borrow the longer display cache while refresh is unavailable.
+        let guilds = if guild_list_cache_allowed(guild_mode) {
+            take_cached_guilds(guild_mode, app, user_id)
+        } else {
+            state.guilds.as_ref().and_then(|(at, guilds)| {
+                let max_age = if rate_limited {
+                    GUILD_AUTH_MAX_STALE
+                } else {
+                    GUILD_AUTH_CACHE_TTL
+                };
+                (at.elapsed() < max_age).then(|| guilds.clone())
+            })
+        };
+        if let Some(guilds) = guilds
+            && let Some(user) = cached_user(app, user_id)
+        {
+            let mut auth = AuthCtx {
+                user,
+                guilds,
+                enrollment: None,
+            };
+            preview::apply_overlay(&mut auth)?;
+            return Ok(auth);
+        }
+        return Err(if rate_limited {
+            oauth::DiscordRateLimit { retry_after }.into()
+        } else {
+            ApiError(anyhow::anyhow!(
+                "oauth token request temporarily unavailable"
+            ))
+        });
+    }
+    let first = load_auth(app, user_id, &token, guild_mode, &mut state).await;
+    if !first
+        .as_ref()
+        .is_err_and(|error| error.0.is::<oauth::DiscordUnauthorized>())
+    {
+        if first.is_ok() {
+            state.refresh_hold = None;
+            state.refresh_backoff = std::time::Duration::ZERO;
+        }
+        return first;
+    }
+    let refresh = state.refresh.clone();
+    let refreshed = match &refresh {
+        Some(refresh) => app.oauth.refresh(refresh).await,
+        None => Err(anyhow::anyhow!("session expired")),
+    };
+    if let Err(error) = &refreshed
+        && refresh.is_some()
+        && !error.is::<oauth::DiscordUnauthorized>()
+    {
+        state.hold_refresh(error);
+        return Err(ApiError(refreshed.unwrap_err()));
+    }
+    if let Ok(refreshed) = refreshed {
+        state.refresh_hold = None;
+        state.refresh_backoff = std::time::Duration::ZERO;
+        state.token = Some(refreshed.access_token.clone());
+        state.guilds = None;
+        session
+            .insert(SESSION_TOKEN, &refreshed.access_token)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if let Some(refresh) = refreshed.refresh_token {
+            state.refresh = Some(refresh.clone());
+            session
+                .insert(SESSION_REFRESH, refresh)
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        session.save().await.map_err(anyhow::Error::from)?;
+        let result = load_auth(
+            app,
+            user_id,
+            &refreshed.access_token,
+            guild_mode,
+            &mut state,
+        )
+        .await;
+        if !result
+            .as_ref()
+            .is_err_and(|error| error.0.is::<oauth::DiscordUnauthorized>())
+        {
+            return result;
+        }
+    }
+    // Fence before clearing payloads/flushing. The short-lived coordinator
+    // marker may be swept while an independent response still has a late save.
+    app.retired_auth_sessions
+        .entry(id)
+        .or_insert_with(std::time::Instant::now);
+    state.retire();
+    session.flush().await.map_err(anyhow::Error::from)?;
+    Err(AuthLost.into())
+}
 
+async fn load_auth(
+    app: &Arc<ApiState>,
+    user_id: u64,
+    token: &str,
+    guild_mode: GuildListMode,
+    state: &mut SessionAuth,
+) -> ApiResult<AuthCtx> {
     let now = std::time::Instant::now();
     let cached_user = cached_user(app, user_id);
 
@@ -293,7 +569,11 @@ async fn require_auth_with(
     // Discord is still cooling down. Authorization never takes this branch.
     // A rate-limited profile lookup must not drop that list.
     if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        let (user, _) = display_identity(app, user_id, &token, cached_user).await?;
+        let (user, live) = display_identity(app, user_id, token, cached_user).await?;
+        if live {
+            app.user_cache
+                .insert(user_id, (std::time::Instant::now(), user.clone()));
+        }
         let mut auth = AuthCtx {
             user,
             guilds,
@@ -303,49 +583,34 @@ async fn require_auth_with(
         return Ok(auth);
     }
 
-    // Authorization / cold display: always re-fetch guilds from Discord.
-    // Fail closed — never authorize from a stale guild snapshot (MustRefresh).
-    // User profile may stay cached; `can_manage` only needs guild membership.
-    let (access, guilds) = match app.oauth.my_guilds(user_id, &token).await {
-        Ok(g) => (token.clone(), g),
-        Err(oauth::GuildListError::Unauthorized) => {
-            tracing::warn!(
-                "webui auth: guilds fetch unauthorized for user {user_id}; trying refresh"
-            );
-            let refresh = session
-                .get::<String>(SESSION_REFRESH)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
-            let tok = app.oauth.refresh(&refresh).await.map_err(ApiError)?;
-            let _ = session.insert(SESSION_TOKEN, &tok.access_token).await;
-            if let Some(r) = &tok.refresh_token {
-                let _ = session.insert(SESSION_REFRESH, r).await;
+    let guilds = if let Some((at, guilds)) = &state.guilds
+        && at.elapsed() < GUILD_AUTH_CACHE_TTL
+    {
+        guilds.clone()
+    } else {
+        match app.oauth.my_guilds(user_id, token).await {
+            Ok(guilds) => {
+                state.guilds = Some((std::time::Instant::now(), guilds.clone()));
+                guilds
             }
-            match app.oauth.my_guilds(user_id, &tok.access_token).await {
-                Ok(g) => (tok.access_token, g),
-                Err(error) => {
-                    return finish_guild_list(
-                        app,
-                        guild_mode,
-                        user_id,
-                        &tok.access_token,
-                        cached_user,
-                        error,
-                    )
+            Err(oauth::GuildListError::RateLimited { .. })
+                if state
+                    .guilds
+                    .as_ref()
+                    .is_some_and(|(at, _)| at.elapsed() < GUILD_AUTH_MAX_STALE) =>
+            {
+                state.guilds.as_ref().unwrap().1.clone()
+            }
+            Err(error) => {
+                return finish_guild_list(app, guild_mode, user_id, token, cached_user, error)
                     .await;
-                }
             }
-        }
-        Err(error) => {
-            return finish_guild_list(app, guild_mode, user_id, &token, cached_user, error).await;
         }
     };
 
     let user = match cached_user {
         Some(u) => u,
-        None => app.oauth.me(user_id, &access).await.map_err(ApiError)?,
+        None => app.oauth.me(user_id, token).await.map_err(ApiError)?,
     };
 
     app.guild_cache.insert(user_id, (now, guilds.clone()));
@@ -426,7 +691,7 @@ fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
         }
         oauth::GuildListError::Unauthorized => {
             tracing::warn!("webui auth: guilds fetch still unauthorized for user {user_id}");
-            ApiError(anyhow::anyhow!("discord authorization failed"))
+            ApiError(oauth::DiscordUnauthorized.into())
         }
         oauth::GuildListError::Failed(error) => {
             tracing::warn!("webui auth: guilds fetch failed for user {user_id}: {error:#}");
@@ -484,7 +749,7 @@ fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
 }
 
 /// Returns cached guilds only when the mode permits it (display path).
-/// `MustRefresh` always returns `None` so callers hit Discord.
+/// `MustRefresh` uses only the separate short session/token snapshot.
 fn take_cached_guilds(
     mode: GuildListMode,
     app: &ApiState,
@@ -595,7 +860,10 @@ async fn logout(
         return error_page("untrusted request origin");
     }
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
-    let _ = session.delete().await;
+    if let Err(error) = state.retire_auth_session(&session).await {
+        return ApiError(error).into_response();
+    }
+    let _ = session.flush().await;
     Json(serde_json::json!({ "return_to": return_to })).into_response()
 }
 
@@ -738,13 +1006,22 @@ async fn callback(
     headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
-    callback_response(session, &state.cfg, &state.oauth, headers, query.0).await
+    callback_response(
+        session,
+        &state.cfg,
+        &state.oauth,
+        Some(&state),
+        headers,
+        query.0,
+    )
+    .await
 }
 
 async fn callback_response(
     session: Session,
     cfg: &crate::config::ApiProcessConfig,
     oauth: &oauth::OAuthClient,
+    app: Option<&ApiState>,
     headers: HeaderMap,
     query: CallbackQuery,
 ) -> Response {
@@ -777,6 +1054,12 @@ async fn callback_response(
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
+    // Wait for any old-session refresh before rotation, then clear its payload.
+    if let Some(app) = app
+        && app.retire_auth_session(&session).await.is_err()
+    {
+        return finish(error_page("failed to load login session"));
+    }
     if let Err(error) = store_login_session(
         &session,
         uid,
@@ -1060,7 +1343,9 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .with_name(SESSION_COOKIE_NAME)
         .with_secure(secure)
         .with_same_site(same_site)
-        .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
+        .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+            SESSION_INACTIVITY_SECS,
+        )));
 
     let sessioned = Router::new();
     #[cfg(feature = "embed-ui")]
@@ -1393,6 +1678,20 @@ pub async fn authorize_manage_guild(
     Ok(auth)
 }
 
+pub(super) async fn manage_guild_from_auth(
+    app: &Arc<ApiState>,
+    mut auth: AuthCtx,
+    guild_id: u64,
+) -> ApiResult<AuthCtx> {
+    if guild_id == 0 || !auth.can_manage(guild_id) {
+        return Err(ApiError(anyhow::anyhow!(
+            "you cannot manage this server (needs MANAGE_GUILD permission)"
+        )));
+    }
+    auth.enrollment = Some(require_active_enrollment(app, guild_id).await?);
+    Ok(auth)
+}
+
 /// Authorizes a bot-token unban with fresh Discord ban authority, rather than
 /// configuration-only MANAGE_GUILD authority.
 pub async fn authorize_ban_members(
@@ -1421,7 +1720,7 @@ pub async fn authorize_ban_members(
 
 /// Parses a guild id path segment, checking the session can manage it.
 ///
-/// Real guild ids always re-fetch Discord guild permissions (`MustRefresh`) so
+/// Real guild ids use the bounded session/token permission snapshot so
 /// a demoted admin cannot keep mutating via a stale display cache. `guild_id=0`
 /// (global) checks the session user against `bot.owner_id` and does not fetch
 /// the guild list.
@@ -2308,7 +2607,7 @@ mod tests {
     }
 
     /// Seeds session + caches so `require_auth` succeeds without Discord OAuth.
-    async fn session_for_user(user_id: u64) -> Session {
+    pub(super) async fn session_for_user(user_id: u64) -> Session {
         let store = Arc::new(MemoryStore::default());
         let session = Session::new(None, store, None);
         session.insert(SESSION_USER, user_id).await.unwrap();
@@ -2411,7 +2710,7 @@ mod tests {
     #[test]
     fn guild_list_cache_forbidden_for_authorization() {
         // Root cause of post-demotion WebUI access: authorizing with CachedOk.
-        // guild_scope (real guilds) must use MustRefresh → cache never consulted.
+        // Guild scope must use MustRefresh: the display cache is never consulted.
         assert!(guild_list_cache_allowed(GuildListMode::CachedOk));
         assert!(!guild_list_cache_allowed(GuildListMode::MustRefresh));
     }
@@ -2420,9 +2719,9 @@ mod tests {
     fn copy_source_must_not_trust_guild_scope_zero_authctx() {
         // Regression: guild_scope(0) returns an owner identity with no guild
         // list. A caller that stuffed a stale guild onto that context must not
-        // authorize a copy source from it. copy_config must call
-        // authorize_manage_guild(from) — never auth.can_manage(from) on the
-        // destination AuthCtx.
+        // authorize a copy source from it. copy_config must obtain one
+        // require_auth_fresh snapshot for both servers, never use the
+        // owner-only destination AuthCtx for the source.
         let stale = AuthCtx {
             enrollment: None,
             user: crate::web::oauth::DiscordUser {
