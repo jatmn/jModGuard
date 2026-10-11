@@ -272,8 +272,46 @@ set -e
 if grep -q ' --doc ' "$CARGO_INVOCATION_LOG"; then
   fail 'contract: bin-only package must skip cargo test --doc'
 fi
-run_timed_cargo_test_package_has_lib -p timed-bin-only-probe && fail 'bin-only metadata must not report lib target'
-run_timed_cargo_test_package_has_lib -p timed-doctest-probe || fail 'doctest probe must have lib target'
+set +e
+run_timed_cargo_test_may_run_doctests -p timed-bin-only-probe
+bin_only_rc=$?
+run_timed_cargo_test_may_run_doctests -p timed-doctest-probe
+lib_pkg_rc=$?
+set -e
+[ "$bin_only_rc" -eq 1 ] || fail "bin-only -p must skip doctests (rc=1), got $bin_only_rc"
+[ "$lib_pkg_rc" -eq 0 ] || fail "lib package -p must run doctests (rc=0), got $lib_pkg_rc"
+set +e
+run_timed_cargo_test_may_run_doctests -p definitely-missing-package-name
+missing_pkg_rc=$?
+set -e
+[ "$missing_pkg_rc" -ge 2 ] || fail "missing -p must error (rc>=2), got $missing_pkg_rc"
+mkdir -p "$fixture/bin-no-jq"
+cat >"$fixture/bin-no-jq/command" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+  exit 1
+fi
+exec /usr/bin/command "$@"
+SH
+chmod +x "$fixture/bin-no-jq/command"
+set +e
+PATH="$fixture/bin-no-jq:/usr/bin:/bin" run_timed_cargo_test_may_run_doctests -p timed-doctest-probe
+no_jq_rc=$?
+set -e
+[ "$no_jq_rc" -eq 2 ] || fail "missing jq for -p must error (rc=2), got $no_jq_rc"
+: >"$CARGO_INVOCATION_LOG"
+ws_contract_log="$fixture/contract-workspace.log"
+set +e
+run_timed_cargo_test_gnu --workspace -- >"$ws_contract_log" 2>&1
+ws_rc=$?
+set -e
+[ "$ws_rc" -eq 0 ] || { cat "$ws_contract_log" >&2; fail "workspace runner failed with $ws_rc"; }
+grep -q ' --doc ' "$CARGO_INVOCATION_LOG" || fail 'contract: --workspace must invoke cargo test --doc'
+set +e
+run_timed_cargo_test_may_run_doctests --workspace
+ws_gate_rc=$?
+set -e
+[ "$ws_gate_rc" -eq 0 ] || fail "workspace scope must allow doctests (rc=0), got $ws_gate_rc"
 PATH="${PATH#"$fixture/bin:"}"
 
 buildrs_log="$fixture/buildrs-run.log"

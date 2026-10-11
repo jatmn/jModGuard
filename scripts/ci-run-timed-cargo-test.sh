@@ -195,18 +195,52 @@ run_timed_cargo_test_package_name() {
   printf '%s\n' "$pkg"
 }
 
-# True when `-p` names a package that has a `lib` target (doctests need it).
-run_timed_cargo_test_package_has_lib() {
-  local pkg
+run_timed_cargo_test_is_workspace_doctest_scope() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --workspace|--all) return 0 ;;
+    esac
+  done
+  [ -z "$(run_timed_cargo_test_package_name "$@")" ] && return 0
+  return 1
+}
+
+# Whether to run the doctest phase: 0 = run, 1 = skip (confirmed bin-only -p), 2+ = error.
+run_timed_cargo_test_may_run_doctests() {
+  local pkg arg meta meta_err
+  if run_timed_cargo_test_is_workspace_doctest_scope "$@"; then
+    return 0
+  fi
   pkg="$(run_timed_cargo_test_package_name "$@")"
-  [ -n "$pkg" ] || return 1
-  cargo metadata --no-deps --format-version 1 2>/dev/null \
-    | jq -e --arg p "$pkg" '
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ci-preflight: jq is required for per-package doctest selection (-p $pkg)" >&2
+    return 2
+  fi
+  meta="$(mktemp)"
+  meta_err="$(mktemp)"
+  if ! cargo metadata --no-deps --format-version 1 >"$meta" 2>"$meta_err"; then
+    echo "ci-preflight: cargo metadata failed; cannot determine doctests for -p $pkg" >&2
+    cat "$meta_err" >&2
+    rm -f "$meta" "$meta_err"
+    return 2
+  fi
+  if ! jq -e --arg p "$pkg" '.packages[] | select(.name == $p)' "$meta" >/dev/null; then
+    echo "ci-preflight: package $pkg not found in cargo metadata" >&2
+    rm -f "$meta" "$meta_err"
+    return 2
+  fi
+  if jq -e --arg p "$pkg" '
         .packages[]
         | select(.name == $p)
         | .targets[]
         | select(.kind | index("lib"))
-      ' >/dev/null
+      ' "$meta" >/dev/null; then
+    rm -f "$meta" "$meta_err"
+    return 0
+  fi
+  rm -f "$meta" "$meta_err"
+  return 1
 }
 
 # Doctest `cargo test --doc` under timeout; no compile guard (rustdoc compiles as it runs).
@@ -231,8 +265,15 @@ run_timed_cargo_test_doctests() {
   if run_timed_cargo_test_skip_doctests "$@"; then
     return 0
   fi
-  if ! run_timed_cargo_test_package_has_lib "$@"; then
+  set +e
+  run_timed_cargo_test_may_run_doctests "$@"
+  local doctest_gate_rc=$?
+  set -e
+  if [ "$doctest_gate_rc" -eq 1 ]; then
     return 0
+  fi
+  if [ "$doctest_gate_rc" -ne 0 ]; then
+    return "$doctest_gate_rc"
   fi
   if ! command -v timeout >/dev/null 2>&1; then
     cargo test "$@" --doc
