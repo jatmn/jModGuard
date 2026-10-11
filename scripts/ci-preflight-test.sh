@@ -42,11 +42,22 @@ cat >"$fixture/bin/cargo" <<'SH'
 set -euo pipefail
 if [ "${1:-}" = install ]; then
   install_root=""
+  install_target=""
   shift
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --root)
         install_root="$2"
+        shift 2
+        ;;
+      --target-dir)
+        install_target="$2"
+        shift 2
+        ;;
+      --locked)
+        shift
+        ;;
+      --version)
         shift 2
         ;;
       *)
@@ -55,7 +66,7 @@ if [ "${1:-}" = install ]; then
     esac
   done
   [ -n "$install_root" ] || { echo 'ci-preflight test cargo: missing --root' >&2; exit 1; }
-  printf 'argv=%s\n' "install --root $install_root" >>"$CI_PREFLIGHT_TEST_INSTALL_LOG"
+  printf 'argv=%s\n' "install --root $install_root --target-dir $install_target" >>"$CI_PREFLIGHT_TEST_INSTALL_LOG"
   mkdir -p "$install_root/bin"
   cat >"$install_root/bin/cargo-deny" <<'INNER'
 #!/bin/bash
@@ -116,6 +127,7 @@ mkdir -p "$fake_home/.cargo/bin"
 printf 'marker\n' >"$fake_home/.cargo/bin/shared-marker"
 write_cargo_deny "$fixture/bin/cargo-deny" 9.9.9 wrong-path
 rm -rf "$tool_root"
+set +e
 (
   export JMODGUARD_CI_PREFIX="$fixture/opt"
   export HOME="$fake_home"
@@ -126,9 +138,16 @@ rm -rf "$tool_root"
   rm -f "$install_log"
   ensure_cargo_tool cargo-deny cargo-deny 0.20.2
 ) >"$fixture/stdout" 2>&1
+install_rc=$?
+set -e
+if [ "$install_rc" -ne 0 ]; then
+  cat "$fixture/stdout" >&2
+  fail "path wrong: ensure_cargo_tool install failed with $install_rc"
+fi
 grep -Fq 'installing cargo-deny 0.20.2' "$fixture/stdout" || fail 'path wrong: expected install message'
 [ -f "$install_log" ] || fail 'path wrong: expected cargo install'
 grep -Fq -- '--root' "$install_log" || fail 'path wrong: expected --root install'
+grep -Fq -- '--target-dir' "$install_log" || fail 'path wrong: expected --target-dir install'
 grep -Fq "$tool_root" "$install_log" || fail 'path wrong: expected job-local root in install log'
 [ -x "$tool_root/bin/cargo-deny" ] || fail 'path wrong: expected binary under job-local root'
 cmp -s "$fake_home/.cargo/bin/shared-marker" - <<<marker || fail 'path wrong: shared cargo home marker was modified'

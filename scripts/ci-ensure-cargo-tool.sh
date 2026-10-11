@@ -14,11 +14,12 @@ jmodguard_preflight_cargo_tool_root() {
     printf '%s\n' "$JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT"
     return 0
   fi
-  local root
+  local root checkout="${BUILDKITE_BUILD_CHECKOUT_PATH:-$PWD}"
+  mkdir -p "$checkout/target"
   if [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
-    root="${TMPDIR:-/tmp}/jmodguard-preflight-tools-${BUILDKITE_BUILD_ID}"
+    root="$checkout/target/ci-preflight-tools-${BUILDKITE_BUILD_ID}"
   else
-    root="$(mktemp -d "${TMPDIR:-/tmp}/jmodguard-preflight-tools.XXXXXX")"
+    root="$(mktemp -d "$checkout/target/ci-preflight-tools.XXXXXX")"
   fi
   JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT=$root
   export JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT
@@ -31,7 +32,7 @@ ensure_cargo_tool() {
   local crate="$2"
   local version="$3"
   local pinned="$JMODGUARD_CI_PREFIX/${crate}-${version}/bin/${bin}"
-  local pinned_ver out got_ver path_bin tool_root
+  local pinned_ver out got_ver path_bin tool_root install_target_dir
 
   if [ -x "$pinned" ]; then
     pinned_ver="$(cargo_tool_version_last_field "$pinned")"
@@ -61,10 +62,14 @@ ensure_cargo_tool() {
   fi
 
   tool_root="$(jmodguard_preflight_cargo_tool_root)"
-  if ! cargo install --locked --root "$tool_root" --version "$version" "$crate"; then
+  install_target_dir="$tool_root/cargo-install-target"
+  mkdir -p "$install_target_dir"
+  if ! cargo install --locked --root "$tool_root" --target-dir "$install_target_dir" --version "$version" "$crate"; then
+    rm -rf "$install_target_dir"
     echo "ci-preflight: failed to install $crate $version into $tool_root" >&2
     return 1
   fi
+  rm -rf "$install_target_dir"
 
   PATH="$tool_root/bin:$PATH"
   export PATH
