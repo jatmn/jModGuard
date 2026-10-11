@@ -37,6 +37,24 @@ if ! ci_cargo_log_has_compiling "$log"; then
 fi
 rm -f "$log"
 
+large_log="$fixture/large-compile.log"
+{
+  printf '   Compiling big-crate v0.1.0 (/tmp/ws)\n'
+  head -c 210000 </dev/zero | tr '\0' 'x'
+} >"$large_log"
+ci_cargo_log_has_compiling "$large_log" || fail 'large log with Compiling first line must match under pipefail'
+large_colored="$fixture/large-compile-colored.log"
+{
+  printf '%s[1;32m   Compiling big-crate v0.1.0 (/tmp/ws)%s[0m\n' "$esc" "$esc"
+  head -c 210000 </dev/zero | tr '\0' 'x'
+} >"$large_colored"
+ci_cargo_log_has_compiling "$large_colored" || fail 'large colored log with Compiling first line must match under pipefail'
+large_plain="$fixture/large-no-compile.log"
+head -c 210000 </dev/zero | tr '\0' 'y' >"$large_plain"
+if ci_cargo_log_has_compiling "$large_plain"; then
+  fail 'large log without Compiling must not match under pipefail'
+fi
+
 # Timed-out command must not leave a background child running.
 hang_script="$fixture/hang.sh"
 cat >"$hang_script" <<'SH'
