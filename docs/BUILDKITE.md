@@ -43,15 +43,17 @@ no fail-open switch), Rust 1.96.0 with Clippy and
 rustfmt, rustup able to install **nightly-2026-08-20** (the Dylint lint
 libraries' toolchain at tag `v6.1.0`) with `rustc-dev` and
 `llvm-tools-preview`, outbound HTTPS to `github.com` and
-`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers` (the
-`dylint` group installs matching `cargo-dylint` and `dylint-link` from
-source on cold agents), `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
+`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers`. The
+`dylint` group uses the `scripts/ci-agent-setup.sh` pins when they match, and
+otherwise installs from source. `cargo-deny` 0.20.x and `cargo-audit` 0.22.x:
+use the pinned binary when its `--version` last field is `0.20.2` or `0.22.2`,
+otherwise the `PATH` copy, and `cargo install --locked` only when `PATH` has no
+copy. Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`
 for each selected group after GitHub git-credential setup on cargo steps
 (`bash .buildkite/with-cargo-auth.sh`). `.buildkite/pipeline.yml` only
-selects those groups (`bash .buildkite/select-checks.sh upload`). If `cargo-deny` or `cargo-audit` is missing,
-that script installs the pinned versions with `cargo install --locked`.
+selects those groups (`bash .buildkite/select-checks.sh upload`).
 Optional local `pre-commit`/`pre-push` hooks (`bash scripts/install-git-hooks.sh`)
 wrap the same full test script and set worktree-local `core.hooksPath` to
 `.githooks` (they do not chain previous hook directories). They are not GitHub

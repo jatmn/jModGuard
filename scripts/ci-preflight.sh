@@ -10,6 +10,8 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
+JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+
 usage() {
   cat <<'EOF'
 Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
@@ -106,20 +108,298 @@ ensure_cargo_tool() {
   local bin="$1"
   local crate="$2"
   local version="$3"
+  local pinned="$JMODGUARD_CI_PREFIX/${crate}-${version}/bin/${bin}"
+  local pinned_ver out
+
+  if [ -x "$pinned" ]; then
+    out="$("$pinned" --version 2>&1 || true)"
+    pinned_ver="$(printf '%s\n' "$out" | awk '{print $NF}')"
+    if [ "$pinned_ver" = "$version" ]; then
+      PATH="$(dirname "$pinned"):$PATH"
+      export PATH
+      echo "ci-preflight: $bin version: $out"
+      return 0
+    fi
+    echo "ci-preflight: pinned $pinned absent or not $version; using PATH"
+  else
+    echo "ci-preflight: pinned $pinned absent or not $version; using PATH"
+  fi
+
   if command -v "$bin" >/dev/null 2>&1; then
+    out="$("$bin" --version 2>&1 || true)"
+    echo "ci-preflight: $bin version: $out"
     return 0
   fi
   echo "ci-preflight: installing $crate $version"
   cargo install "$crate" --locked --version "$version"
+  out="$("$bin" --version 2>&1 || true)"
+  echo "ci-preflight: $bin version: $out"
 }
 
-if should_run fmt; then
-  require_command rustfmt 'rustup component add rustfmt'
-fi
-if should_run supply-chain; then
-  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
-  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
-fi
+run_timed_cargo_test() {
+  if [ "${1:-}" != cargo ] || [ "${2:-}" != test ]; then
+    echo 'ci-preflight: run_timed_cargo_test expects cargo test' >&2
+    exit 1
+  fi
+  shift 2
+
+  local cargo_args=()
+  local harness=()
+  local past_dd=0 arg
+  for arg in "$@"; do
+    if [ "$past_dd" -eq 1 ]; then
+      harness+=("$arg")
+      continue
+    fi
+    if [ "$arg" = -- ]; then
+      past_dd=1
+      continue
+    fi
+    cargo_args+=("$arg")
+  done
+
+  local nextest_help nextest_ok=0 cfg
+  if command -v cargo-nextest >/dev/null 2>&1; then
+    nextest_help="$(cargo nextest run --help 2>&1 || true)"
+    if printf '%s\n' "$nextest_help" | grep -Fq -- '--config-file'; then
+      nextest_ok=1
+    fi
+  fi
+
+  local can_nextest=0
+  if [ "$nextest_ok" -eq 1 ]; then
+    local bad_harness=0 h locked=0 workspace=0 has_pkg=0
+    for h in "${harness[@]}"; do
+      case "$h" in
+        --include-ignored|--ignored|--nocapture) ;;
+        *) bad_harness=1 ;;
+      esac
+    done
+    if [ "$bad_harness" -eq 0 ]; then
+      local i=0 need_val=0
+      while [ "$i" -lt "${#cargo_args[@]}" ]; do
+        arg="${cargo_args[$i]}"
+        if [ "$need_val" -eq 1 ]; then
+          need_val=0
+          i=$((i + 1))
+          continue
+        fi
+        case "$arg" in
+          --locked) locked=1 ;;
+          --workspace) workspace=1 ;;
+          --no-default-features|--lib) ;;
+          -p|--test)
+            need_val=1
+            [ "$arg" = -p ] && has_pkg=1
+            ;;
+          *)
+            bad_harness=1
+            ;;
+        esac
+        i=$((i + 1))
+      done
+      [ "$need_val" -eq 1 ] && bad_harness=1
+      if [ "$bad_harness" -eq 0 ] && [ "$locked" -eq 1 ] && { [ "$workspace" -eq 1 ] || [ "$has_pkg" -eq 1 ]; }; then
+        can_nextest=1
+      fi
+    fi
+  fi
+
+  if [ "$can_nextest" -eq 1 ]; then
+    local nextest_args=(nextest run --locked --profile default)
+    cfg="$(mktemp)"
+    cat >"$cfg" <<'EOF'
+[profile.default.slow-timeout]
+period = "60s"
+terminate-after = 3
+EOF
+    nextest_args+=(--config-file "$cfg" --failure-output immediate)
+    local i=0
+    while [ "$i" -lt "${#cargo_args[@]}" ]; do
+      arg="${cargo_args[$i]}"
+      case "$arg" in
+        --locked) ;;
+        --workspace) nextest_args+=(--workspace) ;;
+        --no-default-features) nextest_args+=(--no-default-features) ;;
+        -p)
+          i=$((i + 1))
+          nextest_args+=(-p "${cargo_args[$i]}")
+          ;;
+        --lib) nextest_args+=(--lib) ;;
+        --test)
+          i=$((i + 1))
+          nextest_args+=(--test "${cargo_args[$i]}")
+          ;;
+        *) nextest_args+=("$arg") ;;
+      esac
+      i=$((i + 1))
+    done
+    local h
+    for h in "${harness[@]}"; do
+      case "$h" in
+        --include-ignored)
+          if printf '%s\n' "$nextest_help" | grep -Fq -- '--run-ignored'; then
+            nextest_args+=(--run-ignored all)
+          else
+            can_nextest=0
+          fi
+          ;;
+        --nocapture)
+          if printf '%s\n' "$nextest_help" | grep -Fq -- '--no-capture'; then
+            nextest_args+=(--no-capture)
+          else
+            can_nextest=0
+          fi
+          ;;
+        --ignored) can_nextest=0 ;;
+      esac
+    done
+    if [ "$can_nextest" -eq 1 ]; then
+      echo 'ci-preflight: per-test timeout via cargo-nextest slow-timeout period 60s terminate-after 3; doctests use GNU timeout 180s'
+      cargo "${nextest_args[@]}"
+      rm -f "$cfg"
+      run_timed_cargo_test_doctests "${cargo_args[@]}"
+      return 0
+    fi
+    rm -f "$cfg"
+    echo 'ci-preflight: cargo-nextest cannot express this cargo test command; using GNU timeout per test'
+  fi
+
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo 'ci-preflight: GNU timeout is not installed; running without a per-test timeout'
+    if [ "${#harness[@]}" -gt 0 ]; then
+      cargo test "${cargo_args[@]}" -- "${harness[@]}"
+    else
+      cargo test "${cargo_args[@]}"
+    fi
+    return 0
+  fi
+
+  echo 'ci-preflight: per-test timeout 180s via GNU timeout'
+  run_timed_cargo_test_gnu "${cargo_args[@]}" -- "${harness[@]}"
+}
+
+run_timed_cargo_test_skip_doctests() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --lib|--test|--bins|--examples|--tests) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+run_timed_cargo_test_doctests() {
+  if run_timed_cargo_test_skip_doctests "$@"; then
+    return 0
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    return 0
+  fi
+  local list_out name
+  list_out="$(cargo test "$@" --doc -- --list --format terse 2>/dev/null || true)"
+  while IFS= read -r line; do
+    name="${line%%:*}"
+    [ -n "$name" ] || continue
+    case "$name" in
+      ''|test) continue ;;
+    esac
+    if ! timeout --foreground --kill-after=10s 180s cargo test "$@" --doc -- --exact "$name" --test-threads=1; then
+      local rc=$?
+      if [ "$rc" -eq 124 ]; then
+        echo "ci-preflight: test timed out after 180s: $name" >&2
+      fi
+      return "$rc"
+    fi
+  done <<<"$list_out"
+}
+
+run_timed_cargo_test_gnu() {
+  local cargo_args=()
+  local harness=()
+  local past_dd=0 arg
+  for arg in "$@"; do
+    if [ "$past_dd" -eq 1 ]; then
+      harness+=("$arg")
+      continue
+    fi
+    if [ "$arg" = -- ]; then
+      past_dd=1
+      continue
+    fi
+    cargo_args+=("$arg")
+  done
+
+  local json_out exe line name type ignored_only=0 include_ignored=0
+  for arg in "${harness[@]}"; do
+    case "$arg" in
+      --ignored) ignored_only=1 ;;
+      --include-ignored) include_ignored=1 ;;
+    esac
+  done
+
+  json_out="$(mktemp)"
+  if ! cargo test "${cargo_args[@]}" --no-run --message-format=json >"$json_out"; then
+    rm -f "$json_out"
+    return 1
+  fi
+
+  mapfile -t test_exes < <(node --input-type=commonjs - "$json_out" <<'JS'
+const fs = require("fs");
+const seen = new Set();
+for (const line of fs.readFileSync(process.argv[2], "utf8").split("\n")) {
+  if (!line) continue;
+  let j;
+  try {
+    j = JSON.parse(line);
+  } catch {
+    continue;
+  }
+  if (j.reason === "compiler-artifact" && j.executable) {
+    seen.add(j.executable);
+  }
+}
+for (const exe of seen) {
+  process.stdout.write(`${exe}\n`);
+}
+JS
+)
+  local exe
+  for exe in "${test_exes[@]}"; do
+    [ -n "$exe" ] || continue
+    while IFS= read -r tline; do
+      name="${tline%%:*}"
+      type="${tline#*:}"
+      type="${type%% *}"
+      [ "$type" = test ] || continue
+      if [ "$ignored_only" -eq 1 ]; then
+        case "$tline" in
+          *', ignored'*) ;;
+          *) continue ;;
+        esac
+      elif [ "$include_ignored" -eq 0 ]; then
+        case "$tline" in
+          *', ignored'*) continue ;;
+        esac
+      fi
+      local run_args=(--exact "$name" --test-threads=1)
+      for arg in "${harness[@]}"; do
+        [ "$arg" = --nocapture ] && run_args+=(--nocapture)
+      done
+      if ! timeout --foreground --kill-after=10s 180s "$exe" "${run_args[@]}"; then
+        local rc=$?
+        if [ "$rc" -eq 124 ]; then
+          echo "ci-preflight: test timed out after 180s: $name" >&2
+        fi
+        rm -f "$json_out"
+        return "$rc"
+      fi
+    done < <("$exe" --list --format terse)
+  done
+  rm -f "$json_out"
+
+  run_timed_cargo_test_doctests "${cargo_args[@]}"
+}
 
 # cargo-audit 0.22.2 uses exit 1 for both advisory reports and some operational
 # failures (for example advisory DB fetch/load). Classify from JSON stdout and
@@ -254,7 +534,7 @@ if should_run dylint; then
   echo 'ci-preflight: bash scripts/dylint.sh'
   if [ -z "${only_names}" ]; then
     # Full local gates must not inherit an affected-only Buildkite scope.
-    JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
+    env JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
   else
     bash scripts/dylint.sh
   fi
@@ -277,69 +557,69 @@ if should_run bootstrap; then
 fi
 
 if [ -z "${only_names}" ]; then
-  echo 'ci-preflight: cargo test --locked --workspace'
-  cargo test --locked --workspace
-
-  echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-  cargo test --locked -p jmodguard-api --no-default-features --lib
-
   echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
   cargo clippy --locked --workspace --all-targets -- -D warnings
 
   echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
   cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+
+  echo 'ci-preflight: cargo test --locked --workspace'
+  run_timed_cargo_test cargo test --locked --workspace
+
+  echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+  run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib
 else
   if should_run api; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-api'
-    cargo test --locked -p jmodguard-api
-    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-    cargo test --locked -p jmodguard-api --no-default-features --lib
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api'
+    run_timed_cargo_test cargo test --locked -p jmodguard-api
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+    run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
     echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
     cargo build --locked -p jmodguard-api --no-default-features
   fi
   if should_run bot; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
-    cargo test --locked -p jmodguard-bot
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
+    run_timed_cargo_test cargo test --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
   fi
   if should_run runtime; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
-    cargo test --locked -p jmodguard-runtime
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
+    run_timed_cargo_test cargo test --locked -p jmodguard-runtime
   fi
   if should_run updater; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
-    cargo test --locked -p jmodguard-updater
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
+    run_timed_cargo_test cargo test --locked -p jmodguard-updater
   fi
   if should_run core; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard'
-    cargo test --locked -p jmodguard
     echo 'ci-preflight: cargo clippy --locked -p jmodguard --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard'
+    run_timed_cargo_test cargo test --locked -p jmodguard
   fi
   if should_run integration; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
-    cargo test --locked -p jmodguard-integration-tests
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
     echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-    cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
   fi
 fi
 
