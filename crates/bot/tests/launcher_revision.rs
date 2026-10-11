@@ -104,7 +104,7 @@ fn get(addr: &str, path: &str) -> String {
                 "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
             )?;
             let mut body = String::new();
-            let _ = stream.read_to_string(&mut body);
+            stream.read_to_string(&mut body)?;
             Ok(body)
         })();
         match result {
