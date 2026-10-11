@@ -122,8 +122,23 @@ mkdir -p "$ws/probe/src" "$ws/doctest-probe/src" "$ws/buildrs-probe/src"
 cat >"$ws/Cargo.toml" <<'EOF'
 [workspace]
 resolver = "2"
-members = ["probe", "doctest-probe", "buildrs-probe"]
+members = ["probe", "doctest-probe", "buildrs-probe", "bin-only-probe"]
 EOF
+mkdir -p "$ws/bin-only-probe/src"
+cat >"$ws/bin-only-probe/Cargo.toml" <<'EOF'
+[package]
+name = "timed-bin-only-probe"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[[bin]]
+name = "timed-bin-only-probe"
+path = "src/main.rs"
+EOF
+cat >"$ws/bin-only-probe/src/main.rs" <<'RS'
+fn main() {}
+RS
 printf 'ok\n' >"$ws/probe/probe-data.txt"
 cat >"$ws/probe/Cargo.toml" <<'EOF'
 [package]
@@ -217,10 +232,49 @@ run_timed_cargo_test_gnu -p timed-doctest-probe -- >"$doctest_log" 2>&1
 doctest_rc=$?
 set -e
 [ "$doctest_rc" -eq 0 ] || { cat "$doctest_log" >&2; fail "doctest probe failed with $doctest_rc"; }
-if ci_cargo_log_has_compiling "$doctest_log"; then
-  cat "$doctest_log" >&2
-  fail 'doctest per-test runs must not false-trip compile guard'
+
+if ! command -v jq >/dev/null 2>&1; then
+  fail 'jq is required for timed-cargo contract tests'
 fi
+real_cargo="$(command -v cargo)"
+CARGO_INVOCATION_LOG="$fixture/cargo-invocations.log"
+: >"$CARGO_INVOCATION_LOG"
+mkdir -p "$fixture/bin"
+cat >"$fixture/bin/cargo" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$CARGO_INVOCATION_LOG"
+exec "$real_cargo" "\$@"
+SH
+chmod +x "$fixture/bin/cargo"
+PATH="$fixture/bin:$PATH"
+contract_log="$fixture/contract-no-target.log"
+set +e
+run_timed_cargo_test_gnu -p timed-doctest-probe -- >"$contract_log" 2>&1
+contract_rc=$?
+set -e
+[ "$contract_rc" -eq 0 ] || { cat "$contract_log" >&2; fail "contract no-target runner failed with $contract_rc"; }
+no_run_line="$(grep ' --no-run' "$CARGO_INVOCATION_LOG" | head -n1 || true)"
+[ -n "$no_run_line" ] || fail 'contract: expected cargo test --no-run prebuild'
+case "$no_run_line" in
+  *' --doc '*) fail 'contract: --no-run prebuild must not include --doc' ;;
+esac
+grep -q ' --doc ' "$CARGO_INVOCATION_LOG" || fail 'contract: expected separate cargo test --doc invocation'
+if grep -E ' --doc .* --no-run | --no-run .* --doc ' "$CARGO_INVOCATION_LOG" >/dev/null; then
+  fail 'contract: cargo must not combine --doc with --no-run'
+fi
+: >"$CARGO_INVOCATION_LOG"
+bin_log="$fixture/contract-bin-only.log"
+set +e
+run_timed_cargo_test_gnu -p timed-bin-only-probe -- >"$bin_log" 2>&1
+bin_rc=$?
+set -e
+[ "$bin_rc" -eq 0 ] || { cat "$bin_log" >&2; fail "bin-only contract runner failed with $bin_rc"; }
+if grep -q ' --doc ' "$CARGO_INVOCATION_LOG"; then
+  fail 'contract: bin-only package must skip cargo test --doc'
+fi
+run_timed_cargo_test_package_has_lib -p timed-bin-only-probe && fail 'bin-only metadata must not report lib target'
+run_timed_cargo_test_package_has_lib -p timed-doctest-probe || fail 'doctest probe must have lib target'
+PATH="${PATH#"$fixture/bin:"}"
 
 buildrs_log="$fixture/buildrs-run.log"
 set +e

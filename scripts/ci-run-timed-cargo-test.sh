@@ -179,8 +179,59 @@ run_timed_cargo_test_skip_doctests() {
   return 1
 }
 
+run_timed_cargo_test_package_name() {
+  local -a args=("$@")
+  local i=0 arg pkg=""
+  while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      -p|--package)
+        i=$((i + 1))
+        pkg="${args[$i]}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s\n' "$pkg"
+}
+
+# True when `-p` names a package that has a `lib` target (doctests need it).
+run_timed_cargo_test_package_has_lib() {
+  local pkg
+  pkg="$(run_timed_cargo_test_package_name "$@")"
+  [ -n "$pkg" ] || return 1
+  cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | jq -e --arg p "$pkg" '
+        .packages[]
+        | select(.name == $p)
+        | .targets[]
+        | select(.kind | index("lib"))
+      ' >/dev/null
+}
+
+# Doctest `cargo test --doc` under timeout; no compile guard (rustdoc compiles as it runs).
+run_cargo_test_doc_timed() {
+  local name=$1
+  shift
+  local log rc had_errexit=0
+  case $- in *e*) had_errexit=1 ;; esac
+  log="$(mktemp)"
+  set +o errexit
+  run_with_test_timeout "$name" env CARGO_TERM_COLOR=never cargo test "$@" >"$log" 2>&1
+  rc=$?
+  cat "$log" >&2
+  rm -f "$log"
+  if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    set -o errexit
+  fi
+  return "$rc"
+}
+
 run_timed_cargo_test_doctests() {
   if run_timed_cargo_test_skip_doctests "$@"; then
+    return 0
+  fi
+  if ! run_timed_cargo_test_package_has_lib "$@"; then
     return 0
   fi
   if ! command -v timeout >/dev/null 2>&1; then
@@ -217,10 +268,10 @@ run_timed_cargo_test_doctests() {
     [ -n "${ignored_names[$name]+x}" ] && continue
     token="$(doctest_run_token "$name" "${doc_names[@]}")" || token=""
     if [ -z "$token" ]; then
-      run_cargo_test_timed "$name" "$@" --doc -- --test-threads=1
+      run_cargo_test_doc_timed "$name" "$@" --doc -- --test-threads=1
       return $?
     fi
-    run_cargo_test_timed "$name" "$@" --doc -- "$token" --test-threads=1
+    run_cargo_test_doc_timed "$name" "$@" --doc -- "$token" --test-threads=1
     rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
     for n in "${doc_names[@]}"; do
@@ -264,10 +315,6 @@ run_timed_cargo_test_gnu() {
   if ! cargo test "${cargo_args[@]}" --no-run >/dev/null 2>&1; then
     cargo test "${cargo_args[@]}" --no-run
     return 1
-  fi
-  if ! run_timed_cargo_test_skip_doctests "${cargo_args[@]}"; then
-    cargo test "${cargo_args[@]}" --doc --no-run >/dev/null 2>&1 \
-      || cargo test "${cargo_args[@]}" --doc --no-run
   fi
 
   if [ "$ignored_only" -eq 1 ]; then
