@@ -87,19 +87,43 @@ fn health_addr(log: &str) -> String {
 }
 
 fn get(addr: &str, path: &str) -> String {
-    let mut stream = std::net::TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    use std::io::Write;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut body = String::new();
-    let _ = stream.read_to_string(&mut body);
-    body
+    use std::io::{ErrorKind, Write};
+    // Under parallel test load the health listener can reset or close a
+    // just-accepted connection (BrokenPipe on write, ConnectionReset), as in
+    // Buildkite 697/715. Retry only those two errors, at most 3 attempts.
+    // Anything else (connection refused, other I/O errors) panics at once and
+    // any response, even an empty one, is returned unchanged, so a child that
+    // really died still fails the test.
+    let mut attempt = 1;
+    loop {
+        let result = (|| -> std::io::Result<String> {
+            let mut stream = std::net::TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )?;
+            let mut body = String::new();
+            let _ = stream.read_to_string(&mut body);
+            Ok(body)
+        })();
+        match result {
+            Ok(body) => return body,
+            Err(error)
+                if attempt < 3
+                    && matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+                    ) =>
+            {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => {
+                panic!("health request to {addr}{path} failed on attempt {attempt}: {error}")
+            }
+        }
+    }
 }
 
 fn lease_present(path: &Path) -> bool {
