@@ -102,9 +102,12 @@ fn main() {{
     if !maintenance {{
         event("start");
         let _health = if root.join("bind-health-{name}").exists() {{
-            let bind = std::env::var("JMODGUARD_HEALTH_BIND").unwrap();
+            let bind = std::fs::read_to_string(root.join("bind-health-{name}")).unwrap();
             let listener = std::net::TcpListener::bind(&bind).unwrap();
-            std::fs::write(root.join("health-bound-{name}"), "").unwrap();
+            let bound = root.join("health-bound-{name}");
+            let pending = bound.with_extension("tmp");
+            std::fs::write(&pending, listener.local_addr().unwrap().to_string()).unwrap();
+            std::fs::rename(pending, bound).unwrap();
             while !root.join("exit-code-{name}").exists() && !STOP.load(Ordering::SeqCst) {{
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }}
@@ -2698,27 +2701,17 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
 #[tokio::test]
 async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let root = std::env::temp_dir().join(format!("token-hold-{:032x}", rand::random::<u128>()));
+    // Exercise direct executable launch with characters that require shell quoting.
+    let root = std::env::temp_dir().join(format!(
+        "token-hold-quoted ' path-{:032x}",
+        rand::random::<u128>()
+    ));
     tokio::fs::create_dir_all(&root).await.unwrap();
-    // Both processes use this concrete configured address. Port allocation is
-    // ephemeral only to avoid collisions with other tests and local services.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    // Let the child allocate and retain its socket, avoiding a reserve/drop/bind
+    // race before the handoff. Its published address configures both processes.
     let child = executable(&root, "health-bot").await;
-    tokio::fs::write(root.join("bind-health-health-bot"), "")
-        .await
-        .unwrap();
-    let script = root.join("rejected-bot");
-    tokio::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nexport JMODGUARD_HEALTH_BIND='{addr}'\nexec '{}'\n",
-            child.display()
-        ),
-    )
-    .await
-    .unwrap();
-    tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+    let bind_request = root.join("bind-health-health-bot");
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
         .await
         .unwrap();
     let opts = DbOpenOptions {
@@ -2734,11 +2727,9 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     let db = Db::open_with(opts.clone()).unwrap();
     let control = UpdateControl::open(&opts).unwrap().unwrap();
     let mut bot = offline_controller("bot", control, &root);
-    bot.baked = script.clone();
+    bot.baked = child.clone();
     bot.enabled = false;
-    drop(listener);
-    bot.health_bind = Some(addr.to_string());
-    bot.start(&script, &"b".repeat(40), None).await.unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
     let bound = root.join("health-bound-health-bot");
     tokio::time::timeout(Duration::from_secs(5), async {
         while !bound.exists() {
@@ -2757,6 +2748,16 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     })
     .await
     .expect("child never bound the configured health address");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    // Retries must use the same concrete address, too.
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
     assert_eq!(
         tokio::net::TcpListener::bind(addr)
             .await
@@ -2839,12 +2840,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         ]
     );
     // A ready retry child resumes normal behavior and resets the auth interval.
-    tokio::fs::write(
-        &script,
-        "#!/bin/sh\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 60\n",
-    )
-    .await
-    .unwrap();
+    tokio::fs::remove_file(bind_request).await.unwrap();
+    tokio::fs::remove_file(root.join("exit-code-health-bot"))
+        .await
+        .unwrap();
     bot.restart.auth_retry_at = Some(Instant::now());
     assert!(!bot.tick().await.unwrap());
     let deadline = Instant::now() + Duration::from_secs(2);
