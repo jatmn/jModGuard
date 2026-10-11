@@ -43,15 +43,20 @@ no fail-open switch), Rust 1.96.0 with Clippy and
 rustfmt, rustup able to install **nightly-2026-08-20** (the Dylint lint
 libraries' toolchain at tag `v6.1.0`) with `rustc-dev` and
 `llvm-tools-preview`, outbound HTTPS to `github.com` and
-`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers` (the
-`dylint` group installs matching `cargo-dylint` and `dylint-link` from
-source on cold agents), `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
+`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers`. The
+`dylint` group uses the `scripts/ci-agent-setup.sh` pins when they match, and
+otherwise installs from source. `cargo-deny` 0.20.x and `cargo-audit` 0.22.x:
+use the pinned binary under `/opt/jmodguard-ci` when its `--version` last field
+is `0.20.2` or `0.22.2`, otherwise a matching `PATH` copy when that last field
+matches, and otherwise `cargo install --locked --version … --root` into a
+job-local directory under the checkout's `target/` directory (never the agent shared
+`~/.cargo/bin`). Preflight prepends that job-local `bin` directory to `PATH` for
+the rest of the supply-chain step. Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`
 for each selected group after GitHub git-credential setup on cargo steps
 (`bash .buildkite/with-cargo-auth.sh`). `.buildkite/pipeline.yml` only
-selects those groups (`bash .buildkite/select-checks.sh upload`). If `cargo-deny` or `cargo-audit` is missing,
-that script installs the pinned versions with `cargo install --locked`.
+selects those groups (`bash .buildkite/select-checks.sh upload`).
 Optional local `pre-commit`/`pre-push` hooks (`bash scripts/install-git-hooks.sh`)
 wrap the same full test script and set worktree-local `core.hooksPath` to
 `.githooks` (they do not chain previous hook directories). They are not GitHub
@@ -89,7 +94,7 @@ also runs the publisher contract tests. An `crates/api` diff runs the API test, 
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core
 and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs the Trail of Bits lints listed in `dylint.toml` with `--locked --all-targets`. For a scoped plan, the selector sets `JMODGUARD_DYLINT_PACKAGES` on the Dylint job to the selected Rust check packages and affected test/binary consumers: bot changes include API unit tests; runtime changes include all service/updater targets; remote-database includes root and integration tests. Cargo also checks their dependencies. Global Cargo/toolchain/vendor changes, lint-tool changes, unknown paths and full plans retain `--workspace`. Full local preflight clears the scoped setting and always lints the whole workspace. The gate uses `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) and `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which uses the pinned 6.1.0 tools and prebuilt libraries when `/opt/jmodguard-ci` matches, and otherwise installs `cargo-dylint` and `dylint-link` 6.1.0 from source, and runs the Trail of Bits lints listed in `dylint.toml` with `--locked --all-targets`. For a scoped plan, the selector sets `JMODGUARD_DYLINT_PACKAGES` on the Dylint job to the selected Rust check packages and affected test/binary consumers: bot changes include API unit tests; runtime changes include all service/updater targets; remote-database includes root and integration tests. Cargo also checks their dependencies. Global Cargo/toolchain/vendor changes, lint-tool changes, unknown paths and full plans retain `--workspace`. Full local preflight clears the scoped setting and always lints the whole workspace. The gate uses `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) and `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
 checks, formatting/lints, supply-chain, and remote-database checks. It does not
 select independent runtime package tests or the bootstrap/publisher
 shell contract tests. Migration edits select the same core consumers. Vendor changes retain all Rust checks. The operator sample

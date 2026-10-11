@@ -13,9 +13,10 @@ env:
   CARGO_BUILD_JOBS: "1"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  # jobs=1 already caps concurrent LLVM workers through the jobserver. Forcing
-  # one codegen unit puts the whole root library test into a single LLVM module,
-  # and that is the rustc process agents SIGKILL. Sixteen units keep each module small.
+  # dev and test both use 16 codegen units so `cargo build` reuses dependency
+  # artifacts from `cargo test`; one unit OOMs the root library test;
+  # jobs=1 already limits LLVM workers; sixteen units keep each module small.
+  CARGO_PROFILE_DEV_CODEGEN_UNITS: "16"
   CARGO_PROFILE_TEST_CODEGEN_UNITS: "16"
   CARGO_INCREMENTAL: "0"
 

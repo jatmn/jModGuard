@@ -10,6 +10,10 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
+JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+# shellcheck source=scripts/ci-ensure-cargo-tool.sh
+source "$root/scripts/ci-ensure-cargo-tool.sh"
+
 usage() {
   cat <<'EOF'
 Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
@@ -102,23 +106,8 @@ require_command() {
   fi
 }
 
-ensure_cargo_tool() {
-  local bin="$1"
-  local crate="$2"
-  local version="$3"
-  if command -v "$bin" >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "ci-preflight: installing $crate $version"
-  cargo install "$crate" --locked --version "$version"
-}
-
 if should_run fmt; then
   require_command rustfmt 'rustup component add rustfmt'
-fi
-if should_run supply-chain; then
-  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
-  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
 fi
 
 # cargo-audit 0.22.2 uses exit 1 for both advisory reports and some operational
@@ -254,7 +243,7 @@ if should_run dylint; then
   echo 'ci-preflight: bash scripts/dylint.sh'
   if [ -z "${only_names}" ]; then
     # Full local gates must not inherit an affected-only Buildkite scope.
-    JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
+    env JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
   else
     bash scripts/dylint.sh
   fi
@@ -277,63 +266,63 @@ if should_run bootstrap; then
 fi
 
 if [ -z "${only_names}" ]; then
-  echo 'ci-preflight: cargo test --locked --workspace'
-  cargo test --locked --workspace
-
-  echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-  cargo test --locked -p jmodguard-api --no-default-features --lib
-
   echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
   cargo clippy --locked --workspace --all-targets -- -D warnings
 
   echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
   cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+
+  echo 'ci-preflight: cargo test --locked --workspace'
+  cargo test --locked --workspace
+
+  echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+  cargo test --locked -p jmodguard-api --no-default-features --lib
 else
   if should_run api; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-api'
-    cargo test --locked -p jmodguard-api
-    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-    cargo test --locked -p jmodguard-api --no-default-features --lib
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api'
+    cargo test --locked -p jmodguard-api
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+    cargo test --locked -p jmodguard-api --no-default-features --lib
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
     echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
     cargo build --locked -p jmodguard-api --no-default-features
   fi
   if should_run bot; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
-    cargo test --locked -p jmodguard-bot
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
+    cargo test --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
   fi
   if should_run runtime; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
-    cargo test --locked -p jmodguard-runtime
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
+    cargo test --locked -p jmodguard-runtime
   fi
   if should_run updater; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
-    cargo test --locked -p jmodguard-updater
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
+    cargo test --locked -p jmodguard-updater
   fi
   if should_run core; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard'
-    cargo test --locked -p jmodguard
     echo 'ci-preflight: cargo clippy --locked -p jmodguard --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard'
+    cargo test --locked -p jmodguard
   fi
   if should_run integration; then
-    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
-    cargo test --locked -p jmodguard-integration-tests
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings
+    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
+    cargo test --locked -p jmodguard-integration-tests
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
@@ -408,6 +397,12 @@ if [ -z "${only_names}" ]; then
 fi
 
 if should_run supply-chain; then
+  echo 'ci-preflight: bash scripts/ci-preflight-test.sh'
+  bash scripts/ci-preflight-test.sh
+
+  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
+  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
+
   echo 'ci-preflight: cargo deny check bans licenses sources'
   cargo deny check bans licenses sources
 
