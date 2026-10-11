@@ -413,6 +413,8 @@ struct Supervisor {
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
+    // Independent replacement rejected before its activation receipt.
+    rejected_candidate: Option<ComponentRelease>,
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
@@ -430,6 +432,9 @@ impl Supervisor {
             && let Some(status) = child.child.try_wait()?
             && status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
         {
+            if !self.reported && self.standby.is_some() && self.rollback.is_none() {
+                self.rejected_candidate = child.release.clone();
+            }
             self.restart
                 .exited(true, status.code(), child.started.elapsed(), Instant::now());
             jmodguard::set_process_ready(false);
@@ -673,6 +678,7 @@ impl Supervisor {
         }
         self.end_idle().await?;
         self.running = Some(launch(path, sha, release).await?);
+        self.rejected_candidate = None;
         self.reported = false;
         self.last_observed = None;
         Ok(())
@@ -794,6 +800,7 @@ impl Supervisor {
         // Independent rollback artifacts cannot survive a potential core OR
         // guild migration, even after later operations replace the status row.
         self.standby = None;
+        self.rejected_candidate = None;
         self.rollback = None;
         let op = self
             .control
@@ -1109,6 +1116,17 @@ impl Supervisor {
 
     async fn normal(&mut self) -> Result<bool> {
         let state = self.control.component(&self.role).await?;
+        // Only an unactivated auth-rejected independent selection skips restore.
+        // Reuse candidate admission below, including current schema/launcher gates.
+        let retrying_rejected = self.running.is_none()
+            && self.enabled
+            && self.rollback.is_none()
+            && self.standby.is_some()
+            && self.rejected_candidate.is_some()
+            && self.rejected_candidate == state.desired;
+        if !retrying_rejected {
+            self.rejected_candidate = None;
+        }
         if self.enabled && (state.desired_launcher.is_some() || self.running.is_none()) {
             match self.launcher(&state).await {
                 Ok(ControlStep::Reexec) => return Ok(true),
@@ -1143,7 +1161,7 @@ impl Supervisor {
                 }
             }
         }
-        if self.running.is_none() {
+        if self.running.is_none() && !retrying_rejected {
             let restored = async {
                 if let Some(installed) = &state.installed {
                     match self.required_launcher(installed, None).await? {
@@ -1267,7 +1285,7 @@ impl Supervisor {
         if restoring_previous || self.rollback.is_some() {
             return Ok(false);
         }
-        if !self.reported || !self.enabled {
+        if (!self.reported && !retrying_rejected) || !self.enabled {
             return Ok(false);
         }
         let Some(candidate) = state.desired.clone() else {
@@ -1353,15 +1371,23 @@ impl Supervisor {
                 .is_none_or(|op| !op.phase.active()),
             "coordinated upgrade started"
         );
-        let child = self
-            .running
-            .as_ref()
-            .context("current application missing")?;
-        self.standby = Some((
-            child.path.clone(),
-            child.source_sha.clone(),
-            child.release.clone(),
-        ));
+        if retrying_rejected {
+            // A selection can change during staging; never revive that artifact.
+            if self.control.component(&self.role).await?.desired.as_ref() != Some(&candidate) {
+                self.rejected_candidate = None;
+                return Ok(false);
+            }
+        } else {
+            let child = self
+                .running
+                .as_ref()
+                .context("current application missing")?;
+            self.standby = Some((
+                child.path.clone(),
+                child.source_sha.clone(),
+                child.release.clone(),
+            ));
+        }
         self.stop_application().await?;
         if let Err(error) = self
             .start(&path, &candidate.source_sha, Some(candidate.clone()))
@@ -1859,6 +1885,7 @@ async fn main() -> Result<()> {
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
+        rejected_candidate: None,
         rollback: None,
         pending_failure: None,
         pending_startup,

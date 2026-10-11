@@ -101,6 +101,9 @@ fn main() {{
     }};
     if !maintenance {{
         event("start");
+        if let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
+            std::process::exit(code.trim().parse().unwrap());
+        }}
         if root.join("fail-{name}").exists() {{
             std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "stale marker").unwrap();
             std::process::exit(7);
@@ -164,6 +167,7 @@ fn controller(
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
+        rejected_candidate: None,
         rollback: None,
         pending_failure: None,
         pending_startup: Vec::new(),
@@ -181,6 +185,7 @@ async fn restart(service: &mut Supervisor) {
     service.prepared = None;
     service.instance = format!("{:032x}", rand::random::<u128>());
     service.standby = None;
+    service.rejected_candidate = None;
     service.rollback = None;
     service.pending_failure = None;
     service.pending_startup.clear();
@@ -2803,6 +2808,285 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     drop(guard);
     bot.stop_application().await.unwrap();
     bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn independent_exiting_bot(
+    code: i32,
+) -> (
+    PathBuf,
+    Db,
+    Supervisor,
+    ComponentRelease,
+    tokio::task::JoinHandle<()>,
+) {
+    let root =
+        std::env::temp_dir().join(format!("independent-exit-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let installed = executable(&root, "installed-bot").await;
+    let desired = executable(&root, "desired-bot").await;
+    let mut objects = HashMap::new();
+    let mut releases = Vec::new();
+    for path in [installed, desired] {
+        let mut release = image(&mut objects, "bot", &tokio::fs::read(path).await.unwrap());
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+        releases.push(release);
+    }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    let installed = &releases[0];
+    control
+        .checked("bot", "latest", Some(installed.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &installed.digest, now())
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed.digest
+    );
+    let candidate = releases.pop().unwrap();
+    tokio::fs::write(root.join("exit-code-desired-bot"), code.to_string())
+        .await
+        .unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    // Record only the replacement and recovery starts, after both baselines ran.
+    tokio::fs::write(root.join("events"), "").await.unwrap();
+    bot.tick().await.unwrap();
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    assert!(!bot.running.as_ref().unwrap().ready_file.exists());
+    (root, db, bot, candidate, server)
+}
+
+async fn wait_for_bot_ready(bot: &mut Supervisor) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bot.reported {
+        assert!(
+            Instant::now() < deadline,
+            "fixture bot did not become ready"
+        );
+        bot.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn independent_exit_starts(root: &Path) -> Vec<String> {
+    tokio::fs::read_to_string(root.join("events"))
+        .await
+        .unwrap()
+        .lines()
+        .filter(|line| line.ends_with(".start"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn independent_rejected_token_retries_desired_before_installed_and_doubles_hold() {
+    let (root, db, mut bot, candidate, server) =
+        independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
+    bot.tick().await.unwrap();
+    assert!(bot.restart.held);
+    assert!(bot.running.is_none());
+    assert_eq!(bot.restart.auth_failures, 1);
+    let first = bot
+        .restart
+        .auth_retry_at
+        .unwrap()
+        .duration_since(Instant::now());
+    assert!(first > Duration::from_secs(1790) && first <= Duration::from_secs(1800));
+    assert_ne!(
+        bot.control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    bot.restart.auth_retry_at = Some(Instant::now());
+    bot.tick().await.unwrap();
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest,
+        "timed retry must start the desired candidate before any installed/baked child"
+    );
+    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        ["desired-bot.start", "desired-bot.start"]
+    );
+    bot.tick().await.unwrap();
+    assert!(bot.restart.held);
+    assert!(bot.running.is_none());
+    assert_eq!(bot.restart.auth_failures, 2);
+    let second = bot
+        .restart
+        .auth_retry_at
+        .unwrap()
+        .duration_since(Instant::now());
+    assert!(second > Duration::from_secs(3590) && second <= Duration::from_secs(3600));
+    assert_eq!(
+        bot.control
+            .component("bot")
+            .await
+            .unwrap()
+            .desired
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    bot.end_idle().await.unwrap();
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_non_auth_exit_before_readiness_still_rolls_back() {
+    let (root, db, mut bot, candidate, server) = independent_exiting_bot(7).await;
+    let installed = bot
+        .control
+        .component("bot")
+        .await
+        .unwrap()
+        .installed
+        .unwrap();
+    bot.tick().await.unwrap();
+    assert!(!bot.restart.held);
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        installed.digest
+    );
+    assert!(
+        bot.control
+            .component("bot")
+            .await
+            .unwrap()
+            .desired
+            .is_none()
+    );
+    wait_for_bot_ready(&mut bot).await;
+    for _ in 0..3 {
+        bot.tick().await.unwrap();
+    }
+    assert_ne!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        ["desired-bot.start", "installed-bot.start"]
+    );
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_rejected_token_cleared_selection_restores_installed() {
+    let (root, db, mut bot, candidate, server) =
+        independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
+    bot.tick().await.unwrap();
+    bot.control
+        .failed("bot", &candidate, "selection cleared")
+        .await
+        .unwrap();
+    let installed = bot
+        .control
+        .component("bot")
+        .await
+        .unwrap()
+        .installed
+        .unwrap();
+    bot.restart.auth_retry_at = Some(Instant::now());
+    bot.tick().await.unwrap();
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        installed.digest
+    );
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        ["desired-bot.start", "installed-bot.start"]
+    );
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
