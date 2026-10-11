@@ -11,6 +11,8 @@ root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
 JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+# shellcheck source=scripts/ci-ensure-cargo-tool.sh
+source "$root/scripts/ci-ensure-cargo-tool.sh"
 
 usage() {
   cat <<'EOF'
@@ -102,38 +104,6 @@ require_command() {
     echo "ci-preflight: missing $command; install it with: $install" >&2
     exit 2
   fi
-}
-
-ensure_cargo_tool() {
-  local bin="$1"
-  local crate="$2"
-  local version="$3"
-  local pinned="$JMODGUARD_CI_PREFIX/${crate}-${version}/bin/${bin}"
-  local pinned_ver out
-
-  if [ -x "$pinned" ]; then
-    out="$("$pinned" --version 2>&1 || true)"
-    pinned_ver="$(printf '%s\n' "$out" | awk '{print $NF}')"
-    if [ "$pinned_ver" = "$version" ]; then
-      PATH="$(dirname "$pinned"):$PATH"
-      export PATH
-      echo "ci-preflight: $bin version: $out"
-      return 0
-    fi
-    echo "ci-preflight: pinned $pinned absent or not $version; using PATH"
-  else
-    echo "ci-preflight: pinned $pinned absent or not $version; using PATH"
-  fi
-
-  if command -v "$bin" >/dev/null 2>&1; then
-    out="$("$bin" --version 2>&1 || true)"
-    echo "ci-preflight: $bin version: $out"
-    return 0
-  fi
-  echo "ci-preflight: installing $crate $version"
-  cargo install "$crate" --locked --version "$version"
-  out="$("$bin" --version 2>&1 || true)"
-  echo "ci-preflight: $bin version: $out"
 }
 
 run_timed_cargo_test() {
@@ -822,6 +792,12 @@ if [ -z "${only_names}" ]; then
 fi
 
 if should_run supply-chain; then
+  echo 'ci-preflight: bash scripts/ci-preflight-test.sh'
+  bash scripts/ci-preflight-test.sh
+
+  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
+  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
+
   echo 'ci-preflight: cargo deny check bans licenses sources'
   cargo deny check bans licenses sources
 
