@@ -9,12 +9,29 @@ cargo_tool_version_last_field() {
   printf '%s\n' "$vout" | awk '{print $NF}'
 }
 
+jmodguard_preflight_cargo_tool_root() {
+  if [ -n "${JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT:-}" ]; then
+    printf '%s\n' "$JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT"
+    return 0
+  fi
+  local root
+  if [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
+    root="${TMPDIR:-/tmp}/jmodguard-preflight-tools-${BUILDKITE_BUILD_ID}"
+  else
+    root="$(mktemp -d "${TMPDIR:-/tmp}/jmodguard-preflight-tools.XXXXXX")"
+  fi
+  JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT=$root
+  export JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT
+  mkdir -p "$root"
+  printf '%s\n' "$root"
+}
+
 ensure_cargo_tool() {
   local bin="$1"
   local crate="$2"
   local version="$3"
   local pinned="$JMODGUARD_CI_PREFIX/${crate}-${version}/bin/${bin}"
-  local pinned_ver out got_ver path_bin cargo_bin
+  local pinned_ver out got_ver path_bin tool_root
 
   if [ -x "$pinned" ]; then
     pinned_ver="$(cargo_tool_version_last_field "$pinned")"
@@ -43,23 +60,28 @@ ensure_cargo_tool() {
     echo "ci-preflight: installing $crate $version"
   fi
 
-  if ! cargo install "$crate" --locked --version "$version"; then
-    echo "ci-preflight: failed to install $crate $version" >&2
+  tool_root="$(jmodguard_preflight_cargo_tool_root)"
+  if ! cargo install --locked --root "$tool_root" --version "$version" "$crate"; then
+    echo "ci-preflight: failed to install $crate $version into $tool_root" >&2
     return 1
   fi
 
-  cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-  if [ -d "$cargo_bin" ]; then
-    PATH="$cargo_bin:$PATH"
-    export PATH
-  fi
+  PATH="$tool_root/bin:$PATH"
+  export PATH
 
   if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "ci-preflight: $crate $version installed but $bin not found on PATH" >&2
+    echo "ci-preflight: $crate $version installed under $tool_root but $bin not found on PATH" >&2
     return 1
   fi
 
   path_bin="$(command -v "$bin")"
+  case "$path_bin" in
+    "$tool_root/bin/"*) ;;
+    *)
+      echo "ci-preflight: $bin resolved outside job-local root $tool_root ($path_bin)" >&2
+      return 1
+      ;;
+  esac
   got_ver="$(cargo_tool_version_last_field "$path_bin")"
   if [ "$got_ver" != "$version" ]; then
     echo "ci-preflight: after install, $bin at $path_bin is version $got_ver, expected $version" >&2

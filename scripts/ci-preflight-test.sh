@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Exercise ensure_cargo_tool without running supply-chain gates.
+# shellcheck disable=SC2030,SC2031
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
@@ -34,14 +35,29 @@ SH
 
 mkdir -p "$fixture/bin" "$fixture/opt" "$fixture/cargo-home/bin"
 install_log="$fixture/install.log"
+tool_root="$fixture/job-local-tools"
 
 cat >"$fixture/bin/cargo" <<'SH'
 #!/bin/bash
 set -euo pipefail
 if [ "${1:-}" = install ]; then
-  printf 'argv=%s\n' "$*" >>"$CI_PREFLIGHT_TEST_INSTALL_LOG"
-  mkdir -p "$CARGO_HOME/bin"
-  cat >"$CARGO_HOME/bin/cargo-deny" <<'INNER'
+  install_root=""
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --root)
+        install_root="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  [ -n "$install_root" ] || { echo 'ci-preflight test cargo: missing --root' >&2; exit 1; }
+  printf 'argv=%s\n' "install --root $install_root" >>"$CI_PREFLIGHT_TEST_INSTALL_LOG"
+  mkdir -p "$install_root/bin"
+  cat >"$install_root/bin/cargo-deny" <<'INNER'
 #!/bin/bash
 if [ "${1:-}" = --version ]; then
   echo "cargo-deny 0.20.2"
@@ -49,7 +65,7 @@ if [ "${1:-}" = --version ]; then
 fi
 exit 0
 INNER
-  chmod +x "$CARGO_HOME/bin/cargo-deny"
+  chmod +x "$install_root/bin/cargo-deny"
   exit 0
 fi
 echo "ci-preflight test cargo: unexpected: $*" >&2
@@ -62,6 +78,7 @@ run_ensure() {
   (
     export JMODGUARD_CI_PREFIX="$fixture/opt"
     export CARGO_HOME="$fixture/cargo-home"
+    export JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT="$tool_root"
     export CI_PREFLIGHT_TEST_INSTALL_LOG="$install_log"
     export PATH="$1:/usr/bin:/bin"
     rm -f "$install_log"
@@ -93,23 +110,33 @@ if [ -f "$install_log" ]; then
   fail 'path correct: must not install'
 fi
 
-# Pinned missing, PATH wrong version -> install pin, never run wrong binary.
+# Pinned missing, PATH wrong version -> job-local --root install; shared ~/.cargo untouched.
+fake_home="$fixture/fake-home"
+mkdir -p "$fake_home/.cargo/bin"
+printf 'marker\n' >"$fake_home/.cargo/bin/shared-marker"
 write_cargo_deny "$fixture/bin/cargo-deny" 9.9.9 wrong-path
-out="$(run_ensure "$fixture/bin")"
+rm -rf "$tool_root"
+(
+  export JMODGUARD_CI_PREFIX="$fixture/opt"
+  export HOME="$fake_home"
+  export CARGO_HOME="$fake_home/.cargo"
+  export JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT="$tool_root"
+  export CI_PREFLIGHT_TEST_INSTALL_LOG="$install_log"
+  export PATH="$fixture/bin:/usr/bin:/bin"
+  rm -f "$install_log"
+  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
+) >"$fixture/stdout" 2>&1
 grep -Fq 'installing cargo-deny 0.20.2' "$fixture/stdout" || fail 'path wrong: expected install message'
 [ -f "$install_log" ] || fail 'path wrong: expected cargo install'
-grep -Fq 'using cargo-deny at' "$fixture/stdout" || fail 'path wrong: expected resolved binary message'
-resolved="$(PATH="$fixture/cargo-home/bin:$fixture/bin" command -v cargo-deny)"
+grep -Fq -- '--root' "$install_log" || fail 'path wrong: expected --root install'
+grep -Fq "$tool_root" "$install_log" || fail 'path wrong: expected job-local root in install log'
+[ -x "$tool_root/bin/cargo-deny" ] || fail 'path wrong: expected binary under job-local root'
+cmp -s "$fake_home/.cargo/bin/shared-marker" - <<<marker || fail 'path wrong: shared cargo home marker was modified'
+resolved="$(PATH="$tool_root/bin:$fixture/bin" command -v cargo-deny)"
 case "$resolved" in
-  "$fixture/cargo-home/bin/cargo-deny") ;;
-  *) fail "path wrong: expected install in cargo home, got $resolved" ;;
+  "$tool_root/bin/cargo-deny") ;;
+  *) fail "path wrong: expected job-local binary, got $resolved" ;;
 esac
-if PATH="$fixture/cargo-home/bin:$fixture/bin" cargo-deny check 2>/dev/null; then
-  :
-else
-  rc=$?
-  [ "$rc" -eq 9 ] && fail 'path wrong: wrong deny binary was executed'
-fi
 
 # Pinned present but wrong version -> PATH correct copy used.
 mkdir -p "$pinned_root"

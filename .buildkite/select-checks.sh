@@ -123,6 +123,10 @@ classify() {
       add dylint
       return
       ;;
+    scripts/ci-ensure-cargo-tool.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
+      add supply-chain
+      return
+      ;;
     crates/api/Cargo.toml)
       add fmt; add dylint; add api; add boundaries; add integration; add supply-chain
       return

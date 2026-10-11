@@ -46,9 +46,12 @@ libraries' toolchain at tag `v6.1.0`) with `rustc-dev` and
 `static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers`. The
 `dylint` group uses the `scripts/ci-agent-setup.sh` pins when they match, and
 otherwise installs from source. `cargo-deny` 0.20.x and `cargo-audit` 0.22.x:
-use the pinned binary when its `--version` last field is `0.20.2` or `0.22.2`,
-otherwise the `PATH` copy, and `cargo install --locked` only when `PATH` has no
-copy. Docker with the Buildx
+use the pinned binary under `/opt/jmodguard-ci` when its `--version` last field
+is `0.20.2` or `0.22.2`, otherwise a matching `PATH` copy when that last field
+matches, and otherwise `cargo install --locked --version … --root` into a
+job-local directory under the build temp dir (never the agent shared
+`~/.cargo/bin`). Preflight prepends that job-local `bin` directory to `PATH` for
+the rest of the supply-chain step. Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`
 for each selected group after GitHub git-credential setup on cargo steps
