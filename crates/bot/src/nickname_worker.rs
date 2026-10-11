@@ -227,7 +227,12 @@ async fn record_nickname_failure(
         (NicknameFailureClass::Transient, "read_failed".into()),
         crate::discord::classify_nickname_failure,
     );
-    if preserve_unknown && class == NicknameFailureClass::Transient {
+    if preserve_unknown
+        && matches!(
+            class,
+            NicknameFailureClass::Transient | NicknameFailureClass::Dormant
+        )
+    {
         // A failed read cannot establish whether the previous edit took effect.
         code = "outcome_unknown".into();
     }
