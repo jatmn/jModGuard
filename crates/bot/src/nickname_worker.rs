@@ -58,20 +58,13 @@ pub async fn reconcile_nickname_job(
                 guild_id = job.guild_id,
                 "nickname membership verification deferred: {error:#}"
             );
-            if let Err(error) = db::schedule_nickname_reconcile_retry(
-                &app.db,
+            record_nickname_failure(
+                &app,
                 &job,
-                chrono::Utc::now().timestamp(),
-                "membership_unverified",
-                "could not verify current bot membership",
+                &error,
+                nickname_outcome_unknown(&app.db, job.guild_id).await,
             )
-            .await
-            {
-                tracing::warn!(
-                    guild_id = job.guild_id,
-                    "nickname verification retry unavailable: {error:#}"
-                );
-            }
+            .await;
             return;
         }
     }
@@ -140,7 +133,19 @@ async fn apply_nickname_edit<R, E, RF, EF>(
                 return;
             }
             Ok(Ok(_)) => {}
-            _ => return,
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => anyhow::Error::from(error),
+                    Ok(Ok(_)) => unreachable!("successful reads handled above"),
+                };
+                tracing::warn!(
+                    guild_id = job.guild_id,
+                    "nickname confirmation read failed: {error:#}"
+                );
+                record_nickname_failure(app, job, &error, true).await;
+                return;
+            }
         }
         if !app.activation.may_record() {
             return;
@@ -202,58 +207,78 @@ async fn apply_nickname_edit<R, E, RF, EF>(
             if !app.activation.may_record() {
                 return;
             }
-            let now = chrono::Utc::now().timestamp();
-            use crate::discord::NicknameFailureClass;
-            let (class, code) = crate::discord::classify_nickname_failure(&error);
-            let message = error.to_string();
-            let result = match class {
-                NicknameFailureClass::Transient => {
-                    db::schedule_nickname_reconcile_retry(&app.db, job, now, &code, &message)
-                        .await
-                        .map(|exhausted| {
-                            if exhausted {
-                                tracing::error!(
-                                    guild_id = job.guild_id,
-                                    attempts = job.attempt_count + 1,
-                                    "nickname reconciliation exhausted its retry budget: {message}"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    guild_id = job.guild_id,
-                                    attempt = job.attempt_count + 1,
-                                    "nickname reconciliation scheduled for retry: {message}"
-                                );
-                            }
-                        })
-                }
-                NicknameFailureClass::Dormant => {
-                    db::finish_nickname_reconcile(&app.db, job, "dormant", &code, &message, now)
-                        .await
-                        .map(|()| {
-                            tracing::warn!(
-                                guild_id = job.guild_id,
-                                "nickname reconciliation awaits membership reconfirmation or a fresh request: {message}"
-                            )
-                        })
-                }
-                NicknameFailureClass::Terminal => {
-                    db::finish_nickname_reconcile(&app.db, job, "terminal", &code, &message, now)
-                        .await
-                        .map(|()| {
-                            tracing::error!(
-                                guild_id = job.guild_id,
-                                "nickname reconciliation needs operator action: {message}"
-                            )
-                        })
-                }
-            };
-            if let Err(state_error) = result {
-                tracing::error!(
-                    guild_id = job.guild_id,
-                    "failed to persist nickname reconciliation failure: {state_error:#}"
-                );
-            }
+            record_nickname_failure(app, job, &error.into(), false).await;
         }
+    }
+}
+
+async fn record_nickname_failure(
+    app: &BotState,
+    job: &db::NicknameReconcileJob,
+    error: &anyhow::Error,
+    preserve_unknown: bool,
+) {
+    if !app.activation.may_record() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    use crate::discord::NicknameFailureClass;
+    let (class, mut code) = error.downcast_ref::<serenity::Error>().map_or(
+        (NicknameFailureClass::Transient, "read_failed".into()),
+        crate::discord::classify_nickname_failure,
+    );
+    if preserve_unknown
+        && matches!(
+            class,
+            NicknameFailureClass::Transient | NicknameFailureClass::Dormant
+        )
+    {
+        // A failed read cannot establish whether the previous edit took effect.
+        code = "outcome_unknown".into();
+    }
+    let message = error.to_string();
+    let result = match class {
+        NicknameFailureClass::Transient => {
+            db::schedule_nickname_reconcile_retry(&app.db, job, now, &code, &message)
+                .await
+                .map(|exhausted| {
+                    if exhausted {
+                        tracing::error!(
+                            guild_id = job.guild_id,
+                            attempts = job.attempt_count + 1,
+                            "nickname reconciliation exhausted its retry budget: {message}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            guild_id = job.guild_id,
+                            attempt = job.attempt_count + 1,
+                            "nickname reconciliation scheduled for retry: {message}"
+                        );
+                    }
+                })
+        }
+        NicknameFailureClass::Dormant => {
+            db::finish_nickname_reconcile(&app.db, job, "dormant", &code, &message, now)
+                .await
+                .map(|()| tracing::warn!(
+                    guild_id = job.guild_id,
+                    "nickname reconciliation awaits membership reconfirmation or a fresh request: {message}"
+                ))
+        }
+        NicknameFailureClass::Terminal => {
+            db::finish_nickname_reconcile(&app.db, job, "terminal", &code, &message, now)
+                .await
+                .map(|()| tracing::error!(
+                    guild_id = job.guild_id,
+                    "nickname reconciliation needs operator action: {message}"
+                ))
+        }
+    };
+    if let Err(state_error) = result {
+        tracing::error!(
+            guild_id = job.guild_id,
+            "failed to persist nickname reconciliation failure: {state_error:#}"
+        );
     }
 }
 

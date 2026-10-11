@@ -405,3 +405,15 @@ async fn bot_cache_invalidation_tracks_committed_membership_changes() {
         "a committed prefix must invalidate even when a later join fails"
     );
 }
+
+// Shared with the local HTTP regression in commands: inspect the production
+// scheduler state and make its time deadline eligible without sleeping.
+pub(crate) fn assert_auth_stopped_after_deadline(repair: &mut EnrollmentRepair) {
+    assert!(repair.retry.stopped, "401 must stop, not merely back off");
+    assert!(
+        !repair
+            .retry
+            .due(Instant::now() + Duration::from_secs(24 * 3600))
+    );
+    repair.next = Instant::now() - Duration::from_secs(1);
+}

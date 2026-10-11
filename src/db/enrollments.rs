@@ -90,9 +90,12 @@ async fn observe_membership(
                 if dormant {
                     super::guild_stores::refuse_fenced_write(&tx, guild)?;
                     tx.ensure_mutation_receipt()?;
+                    // Membership confirmation cannot settle an unknown Discord edit.
                     tx.execute_rows(
                         "UPDATE nickname_reconcile SET generation=generation+1,state='pending',
-                         attempt_count=0,next_attempt_at=0,last_error_code=NULL,last_error=NULL,
+                         attempt_count=0,next_attempt_at=0,
+                         last_error_code=CASE WHEN last_error_code='outcome_unknown'
+                             THEN last_error_code ELSE NULL END,last_error=NULL,
                          last_error_at=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND state='dormant'",
                         params![guild, id.as_str()], 1,
                     )?;

@@ -15,12 +15,82 @@ use tokio::process::{Child, Command};
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Process-local only: container restart is the explicit reset for a bad token.
+#[derive(Default)]
+struct RestartPolicy {
+    held: bool,
+    failures: u32,
+    not_before: Option<Instant>,
+    auth_failures: u32,
+    auth_retry_at: Option<Instant>,
+}
+
+impl RestartPolicy {
+    fn exited(&mut self, bot: bool, code: Option<i32>, uptime: Duration, now: Instant) {
+        if uptime >= Duration::from_secs(300) {
+            self.failures = 0;
+            self.recovered();
+        }
+        if bot && code == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+            if !self.held {
+                tracing::error!(
+                    "discord token rejected; bot held, fix token and restart container"
+                );
+            }
+            self.held = true;
+            let delay = Duration::from_secs(30 * 60)
+                .saturating_mul(1_u32 << self.auth_failures.min(4))
+                .min(Duration::from_secs(6 * 3600));
+            self.auth_failures = self.auth_failures.saturating_add(1);
+            self.auth_retry_at = Some(now + delay);
+            return;
+        }
+        if code == Some(0) {
+            return;
+        }
+        let delay = POLL
+            .saturating_mul(1_u32 << self.failures.min(4))
+            .min(Duration::from_secs(60));
+        self.failures = self.failures.saturating_add(1);
+        self.not_before = Some(now + delay);
+    }
+
+    fn retry_auth(&mut self, now: Instant) -> bool {
+        if self.held && self.auth_retry_at.is_some_and(|at| now >= at) {
+            self.held = false;
+            self.auth_retry_at = None;
+            self.not_before = None;
+            tracing::warn!("retrying bot after discord token rejection hold");
+            return true;
+        }
+        false
+    }
+
+    fn recovered(&mut self) {
+        self.auth_failures = 0;
+        self.auth_retry_at = None;
+    }
+
+    fn not_ready_reason(&self) -> &'static str {
+        if self.held {
+            "discord token rejected"
+        } else {
+            "not ready"
+        }
+    }
+
+    fn waiting(&self, now: Instant) -> bool {
+        self.held || self.not_before.is_some_and(|at| now < at)
+    }
+}
+
 struct Running {
     child: Child,
     ready_file: PathBuf,
     source_sha: String,
     executable_sha256: String,
     started_at: i64,
+    started: Instant,
     release: Option<ComponentRelease>,
     path: PathBuf,
 }
@@ -166,6 +236,7 @@ async fn launch_mode(
         source_sha: source_sha.to_owned(),
         executable_sha256: hash,
         started_at: now(),
+        started: Instant::now(),
         release,
         path: path.to_owned(),
     })
@@ -335,12 +406,15 @@ struct Supervisor {
     control: UpdateControl,
     instance: String,
     running: Option<Running>,
+    restart: RestartPolicy,
     maintenance: Option<Running>,
     health: Option<tokio::task::JoinHandle<Result<()>>>,
     health_bind: Option<String>,
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
+    // Independent replacement rejected before its activation receipt.
+    rejected_candidate: Option<ComponentRelease>,
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
@@ -352,6 +426,26 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    async fn hold_rejected_token(&mut self) -> Result<bool> {
+        if self.role == "bot"
+            && let Some(child) = self.running.as_mut()
+            && let Some(status) = child.child.try_wait()?
+            && status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+        {
+            if !self.reported && self.standby.is_some() && self.rollback.is_none() {
+                self.rejected_candidate = child.release.clone();
+            }
+            self.restart
+                .exited(true, status.code(), child.started.elapsed(), Instant::now());
+            jmodguard::set_process_ready(false);
+            self.stop_application().await?;
+        }
+        if self.restart.held {
+            self.idle().await?;
+        }
+        Ok(self.restart.held)
+    }
+
     fn receipt_not_saved(error: &anyhow::Error) -> bool {
         error.is::<db::ReceiptNotSaved>()
     }
@@ -532,9 +626,13 @@ impl Supervisor {
             && let Some(bind) = &self.health_bind
         {
             let listener = jmodguard::health::bind(bind).await?;
-            self.health = Some(tokio::spawn(jmodguard::health::serve_listener_as(
-                listener, "launcher",
-            )));
+            self.health = Some(tokio::spawn(
+                jmodguard::health::serve_listener_as_with_reason(
+                    listener,
+                    "launcher",
+                    self.restart.not_ready_reason(),
+                ),
+            ));
         }
         Ok(())
     }
@@ -568,6 +666,10 @@ impl Supervisor {
         sha: &str,
         release: Option<ComponentRelease>,
     ) -> Result<()> {
+        ensure!(
+            !self.restart.held,
+            "bot held after Discord token rejection; restart container"
+        );
         if self.running.is_some() {
             anyhow::bail!("application process is already running");
         }
@@ -576,18 +678,41 @@ impl Supervisor {
         }
         self.end_idle().await?;
         self.running = Some(launch(path, sha, release).await?);
+        self.rejected_candidate = None;
         self.reported = false;
         self.last_observed = None;
         Ok(())
     }
 
     async fn report_ready(&mut self) -> Result<bool> {
+        // Check again here for exits racing the tick's initial check, before
+        // normal/paired startup can interpret rejection as a rollback trigger.
+        if self.hold_rejected_token().await? {
+            return Ok(false);
+        }
         let (release, seen) = {
             let Some(child) = self.running.as_mut() else {
                 return Ok(false);
             };
             if let Some(status) = child.child.try_wait()? {
+                // A 401 can race the check above. Keep it out of generic errors.
+                if self.role == "bot"
+                    && status.code()
+                        == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+                {
+                    self.hold_rejected_token().await?;
+                    return Ok(false);
+                }
+                self.restart.exited(
+                    self.role == "bot",
+                    status.code(),
+                    child.started.elapsed(),
+                    Instant::now(),
+                );
                 bail!("application exited: {status}");
+            }
+            if child.started.elapsed() >= Duration::from_secs(300) {
+                self.restart.recovered();
             }
             if tokio::fs::metadata(&child.ready_file).await.is_err() {
                 ensure!(
@@ -609,6 +734,7 @@ impl Supervisor {
                 ),
             )
         };
+        self.restart.recovered();
         if self.reported {
             if self
                 .last_observed
@@ -674,6 +800,7 @@ impl Supervisor {
         // Independent rollback artifacts cannot survive a potential core OR
         // guild migration, even after later operations replace the status row.
         self.standby = None;
+        self.rejected_candidate = None;
         self.rollback = None;
         let op = self
             .control
@@ -989,6 +1116,17 @@ impl Supervisor {
 
     async fn normal(&mut self) -> Result<bool> {
         let state = self.control.component(&self.role).await?;
+        // Only an unactivated auth-rejected independent selection skips restore.
+        // Reuse candidate admission below, including current schema/launcher gates.
+        let retrying_rejected = self.running.is_none()
+            && self.enabled
+            && self.rollback.is_none()
+            && self.standby.is_some()
+            && self.rejected_candidate.is_some()
+            && self.rejected_candidate == state.desired;
+        if !retrying_rejected {
+            self.rejected_candidate = None;
+        }
         if self.enabled && (state.desired_launcher.is_some() || self.running.is_none()) {
             match self.launcher(&state).await {
                 Ok(ControlStep::Reexec) => return Ok(true),
@@ -1023,7 +1161,7 @@ impl Supervisor {
                 }
             }
         }
-        if self.running.is_none() {
+        if self.running.is_none() && !retrying_rejected {
             let restored = async {
                 if let Some(installed) = &state.installed {
                     match self.required_launcher(installed, None).await? {
@@ -1147,7 +1285,7 @@ impl Supervisor {
         if restoring_previous || self.rollback.is_some() {
             return Ok(false);
         }
-        if !self.reported || !self.enabled {
+        if (!self.reported && !retrying_rejected) || !self.enabled {
             return Ok(false);
         }
         let Some(candidate) = state.desired.clone() else {
@@ -1233,15 +1371,23 @@ impl Supervisor {
                 .is_none_or(|op| !op.phase.active()),
             "coordinated upgrade started"
         );
-        let child = self
-            .running
-            .as_ref()
-            .context("current application missing")?;
-        self.standby = Some((
-            child.path.clone(),
-            child.source_sha.clone(),
-            child.release.clone(),
-        ));
+        if retrying_rejected {
+            // A selection can change during staging; never revive that artifact.
+            if self.control.component(&self.role).await?.desired.as_ref() != Some(&candidate) {
+                self.rejected_candidate = None;
+                return Ok(false);
+            }
+        } else {
+            let child = self
+                .running
+                .as_ref()
+                .context("current application missing")?;
+            self.standby = Some((
+                child.path.clone(),
+                child.source_sha.clone(),
+                child.release.clone(),
+            ));
+        }
         self.stop_application().await?;
         if let Err(error) = self
             .start(&path, &candidate.source_sha, Some(candidate.clone()))
@@ -1293,6 +1439,14 @@ impl Supervisor {
     }
 
     async fn tick(&mut self) -> Result<bool> {
+        // Hold before control reads, restore, update selection or rollback.
+        let held = self.hold_rejected_token().await?;
+        if (held && !self.restart.retry_auth(Instant::now()))
+            || (self.running.is_none() && self.restart.waiting(Instant::now()))
+        {
+            self.idle().await?;
+            return Ok(false);
+        }
         self.flush_startup_receipts().await?;
         if self.flush_pending_failure().await? {
             return Ok(false);
@@ -1509,6 +1663,7 @@ async fn main() -> Result<()> {
     // Only a verified empty store permits the baked bot to initialize it.
     // Neither a network error nor an unknown/newer schema means "start baked".
     let mut initial: Option<Running> = None;
+    let mut restart = RestartPolicy::default();
     let mut maintenance = if role == "api" {
         Some(launch_mode(&baked, &base_sha, None, true).await?)
     } else {
@@ -1524,22 +1679,28 @@ async fn main() -> Result<()> {
     };
     let control = loop {
         if let Some(child) = initial.as_mut()
-            && child.child.try_wait()?.is_some()
+            && let Some(status) = child.child.try_wait()?
         {
+            restart.exited(true, status.code(), child.started.elapsed(), Instant::now());
+            let _ = tokio::fs::remove_file(&child.ready_file).await;
             initial = None;
             if let Some(bind) = &health_bind {
-                boot_health = Some(tokio::spawn(jmodguard::health::serve_listener_as(
-                    jmodguard::health::bind(bind).await?,
-                    "launcher",
-                )));
+                boot_health = Some(tokio::spawn(
+                    jmodguard::health::serve_listener_as_with_reason(
+                        jmodguard::health::bind(bind).await?,
+                        "launcher",
+                        restart.not_ready_reason(),
+                    ),
+                ));
             }
         }
+        restart.retry_auth(Instant::now());
         let open_opts = opts.clone();
         match tokio::task::spawn_blocking(move || UpdateControl::open(&open_opts)).await? {
             Ok(Some(control)) => {
                 break control;
             }
-            Ok(None) if role == "bot" && initial.is_none() => {
+            Ok(None) if role == "bot" && initial.is_none() && !restart.waiting(Instant::now()) => {
                 if let Some(task) = boot_health.take() {
                     task.abort();
                     let _ = task.await;
@@ -1717,12 +1878,14 @@ async fn main() -> Result<()> {
         control,
         instance,
         running: initial,
+        restart,
         maintenance,
         health: boot_health,
         health_bind,
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
+        rejected_candidate: None,
         rollback: None,
         pending_failure: None,
         pending_startup,
@@ -2017,6 +2180,66 @@ mod tests {
 
     use super::*;
     use db::{Db, SqlExecutor};
+
+    #[test]
+    fn crash_restarts_back_off_and_a_stable_child_resets_the_delay() {
+        let mut policy = RestartPolicy::default();
+        let now = Instant::now();
+        for seconds in [5, 10, 20, 40, 60, 60, 60] {
+            policy.exited(true, Some(2), Duration::from_secs(1), now);
+            let deadline = now + Duration::from_secs(seconds);
+            assert!(policy.waiting(deadline - Duration::from_millis(1)));
+            assert!(!policy.waiting(deadline));
+        }
+        policy.exited(true, Some(1), Duration::from_secs(300), now);
+        assert_eq!(policy.not_before, Some(now + POLL));
+        assert!(!policy.held);
+    }
+
+    #[test]
+    fn auth_fallback_doubles_to_six_hours_and_recovery_resets_it() {
+        let mut policy = RestartPolicy::default();
+        let now = Instant::now();
+        let code = Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE);
+        for seconds in [1800, 3600, 7200, 14400, 21600, 21600] {
+            policy.exited(true, code, Duration::ZERO, now);
+            let deadline = now + Duration::from_secs(seconds);
+            assert_eq!(policy.auth_retry_at, Some(deadline));
+            assert!(!policy.retry_auth(deadline - Duration::from_millis(1)));
+            assert!(policy.retry_auth(deadline));
+            assert!(!policy.retry_auth(deadline));
+            assert!(!policy.waiting(deadline));
+        }
+        // A retry that stays alive five minutes also resets, even before readiness.
+        policy.exited(true, code, Duration::from_secs(300), now);
+        assert_eq!(policy.auth_retry_at, Some(now + Duration::from_secs(1800)));
+        policy.retry_auth(now + Duration::from_secs(1800));
+        policy.recovered();
+        policy.exited(true, code, Duration::ZERO, now);
+        assert_eq!(policy.auth_retry_at, Some(now + Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn lost_lease_restarts_on_the_first_poll_and_only_bot_auth_is_held() {
+        let now = Instant::now();
+        for code in [Some(1), Some(2), None] {
+            let mut policy = RestartPolicy::default();
+            policy.exited(true, code, Duration::ZERO, now);
+            assert!(!policy.held);
+            assert!(!policy.waiting(now + POLL));
+        }
+        let code = Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE);
+        let mut bot = RestartPolicy::default();
+        bot.exited(true, code, Duration::ZERO, now);
+        assert!(bot.waiting(now + Duration::from_secs(3600)));
+        let mut api = RestartPolicy::default();
+        api.exited(false, code, Duration::ZERO, now);
+        assert!(!api.held);
+        assert!(!api.waiting(now + POLL));
+        let mut clean = RestartPolicy::default();
+        clean.exited(true, Some(0), Duration::ZERO, now);
+        assert!(!clean.waiting(now));
+    }
 
     #[tokio::test]
     async fn published_schema_and_launcher_observations_allow_only_matching_services() {

@@ -17,6 +17,7 @@ async fn drain_nickname_reconciles(
     app: &Arc<BotState>,
     http: &Arc<serenity::http::Http>,
     identity: &tokio::sync::OnceCell<serenity::model::id::UserId>,
+    retry: &mut jmodguard_bot::discord::RestRetry,
 ) {
     // The bot is the sole nickname side-effect worker. Drain the
     // durable request- and membership-checked outbox every tick so the last
@@ -25,6 +26,9 @@ async fn drain_nickname_reconciles(
     match db::pending_nickname_reconciles(&app.db, now, 25).await {
         Ok(pending) => {
             if pending.is_empty() {
+                return;
+            }
+            if !retry.due(std::time::Instant::now()) {
                 return;
             }
             let me = match identity
@@ -41,9 +45,25 @@ async fn drain_nickname_reconciles(
             {
                 Ok(id) => *id,
                 Err(error) => {
-                    tracing::warn!(
-                        "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                    let class = jmodguard_bot::discord::classify_retry_error(&error);
+                    retry.fail(
+                        if class == jmodguard_bot::discord::RetryClass::Unauthorized {
+                            class
+                        } else {
+                            jmodguard_bot::discord::RetryClass::Transient
+                        },
+                        std::time::Instant::now(),
+                        30,
                     );
+                    if class == jmodguard_bot::discord::RetryClass::Unauthorized {
+                        tracing::error!(
+                            "nickname identity lookup stopped: Discord rejected the bot token"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                        );
+                    }
                     return;
                 }
             };
@@ -84,6 +104,20 @@ fn persist_member_sync_rate_limit(db: &db::Db, bot_id: i64, deadline_ms: i64) ->
             deadline_ms,
         ))
     })
+}
+
+/// Release the writer lease before an already-fatal authentication exit.
+/// Running REST workers keep their existing parked behavior; only startup
+/// discovery and the gateway's fatal 4004 return use this process boundary.
+async fn auth_failure_exit_code(app: &BotState, error: &serenity::Error) -> Option<i32> {
+    let code = jmodguard_bot::discord::fatal_auth_exit_code(error)?;
+    app.activation.begin_shutdown();
+    app.activation.note_lease_lost();
+    jmodguard::set_process_ready(false);
+    if let Err(error) = db::release_active_bot(&app.db, app.activation.instance()).await {
+        tracing::warn!("active-bot lease release after token rejection failed: {error:#}");
+    }
+    Some(code)
 }
 
 #[tokio::main]
@@ -406,6 +440,7 @@ async fn main() -> Result<()> {
         let http = Arc::clone(&http);
         tokio::spawn(async move {
             let identity = tokio::sync::OnceCell::new();
+            let mut identity_retry = jmodguard_bot::discord::RestRetry::default();
             let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -413,7 +448,7 @@ async fn main() -> Result<()> {
                 if !app.activation.may_record() {
                     continue;
                 }
-                drain_nickname_reconciles(&app, &http, &identity).await;
+                drain_nickname_reconciles(&app, &http, &identity, &mut identity_retry).await;
             }
         });
     }
@@ -463,9 +498,8 @@ async fn main() -> Result<()> {
                                 );
                             }
                             jmodguard_bot::state::SlashResyncPlan::Sync { guilds, invalidate } => {
-                                tracing::info!(
-                                    "slash_registry_version changed; re-syncing Discord slash \
-                                     commands ({} guild(s))",
+                                tracing::debug!(
+                                    "slash registry reconciliation pending ({} guild(s))",
                                     guilds.len()
                                 );
                                 if invalidate {
@@ -491,9 +525,9 @@ async fn main() -> Result<()> {
                                         "slash registry reconciliation committed"
                                     );
                                 } else {
-                                    tracing::warn!(
-                                        "slash re-sync incomplete ({failed_n} guild(s) failed); \
-                                         will retry those guilds next poll"
+                                    tracing::debug!(
+                                        "slash re-sync pending ({failed_n} guild(s)); \
+                                         waiting for retry deadlines or registry/membership changes"
                                     );
                                 }
                             }
@@ -521,7 +555,19 @@ async fn main() -> Result<()> {
         });
     }
 
-    if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
+    let may_identify =
+        match jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await {
+            Err(error) => {
+                if let Some(discord_error) = error.downcast_ref::<serenity::Error>()
+                    && let Some(code) = auth_failure_exit_code(&app, discord_error).await
+                {
+                    std::process::exit(code);
+                }
+                return Err(error);
+            }
+            result => result?,
+        };
+    if !may_identify {
         tracing::info!("shutdown before gateway identify");
         activation.begin_shutdown();
         activation.note_lease_lost();
@@ -565,6 +611,9 @@ async fn main() -> Result<()> {
         shard_manager.shutdown_all().await;
     });
     if let Err(error) = client.start().await {
+        if let Some(code) = auth_failure_exit_code(&app, &error).await {
+            std::process::exit(code);
+        }
         anyhow::bail!("discord client error: {error:#}");
     }
     jmodguard::log_shutdown_finished("bot");
@@ -575,6 +624,80 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_401_and_gateway_4004_release_the_lease_before_auth_exit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path =
+            std::env::temp_dir().join(format!("auth-exit-{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let received = stream.read(&mut request).await.unwrap();
+            assert!(received > 0, "gateway fixture must receive a request");
+            let body = r#"{"code":0,"message":"fixture rejection"}"#;
+            stream.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let startup = tokio::time::timeout(
+            Duration::from_secs(2),
+            jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &db),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.await.unwrap();
+        let startup = startup.downcast::<serenity::Error>().unwrap();
+        assert_eq!(
+            jmodguard_bot::discord::http_error_response(&startup),
+            Some((401, 0))
+        );
+        let gateway =
+            serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidAuthentication);
+        for error in [startup, gateway] {
+            let app = BotState::new(Default::default(), db.clone()).unwrap();
+            assert!(
+                jmodguard_bot::activation::wait_for_writer_lock(&db, &app.activation)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                auth_failure_exit_code(&app, &error).await,
+                Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+            );
+            assert!(!app.activation.may_record());
+            // Direct claim must succeed now, without the old ~20-second expiry.
+            let next = jmodguard_bot::activation::Activation::new();
+            assert!(
+                db::claim_active_bot(
+                    &db,
+                    next.instance(),
+                    chrono::Utc::now().timestamp_millis(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false))
+                )
+                .await
+                .unwrap()
+            );
+            db::release_active_bot(&db, next.instance()).await.unwrap();
+        }
+        assert_eq!(
+            jmodguard_bot::discord::fatal_auth_exit_code(&serenity::Error::Gateway(
+                serenity::gateway::GatewayError::DisallowedGatewayIntents
+            )),
+            None
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        jmodguard::tenant::remove_sidecars(&path);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn callback_deadline_is_committed_before_request_can_be_cancelled() {

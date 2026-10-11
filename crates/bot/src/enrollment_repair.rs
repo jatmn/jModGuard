@@ -84,6 +84,7 @@ pub struct EnrollmentRepair {
     config: EnrollmentConfig,
     after: Option<u64>,
     next: Instant,
+    retry: crate::discord::RestRetry,
 }
 impl EnrollmentRepair {
     pub fn new(config: EnrollmentConfig, now: Instant) -> Result<Self> {
@@ -92,6 +93,7 @@ impl EnrollmentRepair {
             config,
             after: None,
             next: now,
+            retry: Default::default(),
         })
     }
     /// Repair can enroll a guild without a Gateway event. Wake the importer
@@ -127,13 +129,30 @@ impl EnrollmentRepair {
         source: &impl MembershipSource,
         membership_changed: &mut bool,
     ) -> Result<Option<RepairReport>> {
-        if Instant::now() < self.next {
+        if Instant::now() < self.next || self.retry.stopped {
             return Ok(None);
         }
         match self.page(db, tenant, source, membership_changed).await {
-            Ok(report) => Ok(Some(report)),
+            Ok(report) => {
+                self.retry = Default::default();
+                Ok(Some(report))
+            }
             Err(error) => {
-                self.next = Instant::now() + Duration::from_secs(u64::from(self.config.retry_secs));
+                let class = crate::discord::classify_retry_error(&error);
+                if class == crate::discord::RetryClass::Unauthorized {
+                    tracing::error!("enrollment repair stopped: Discord rejected the bot token");
+                }
+                // Forbidden listings can recover without a membership event.
+                self.retry.fail(
+                    if class == crate::discord::RetryClass::Unauthorized {
+                        class
+                    } else {
+                        crate::discord::RetryClass::Transient
+                    },
+                    Instant::now(),
+                    u64::from(self.config.retry_secs),
+                );
+                self.next = self.retry.next.unwrap_or(self.next);
                 Err(error)
             }
         }
@@ -173,6 +192,12 @@ impl EnrollmentRepair {
         for guild in &guilds {
             let joined = match tokio::time::timeout(timeout, source.joined_at_ns(*guild)).await {
                 Ok(Ok(joined)) if joined > 0 => joined,
+                Ok(Err(error))
+                    if crate::discord::classify_retry_error(&error)
+                        == crate::discord::RetryClass::Unauthorized =>
+                {
+                    return Err(error);
+                }
                 _ => {
                     report.failed += 1;
                     continue;
@@ -252,4 +277,4 @@ pub async fn observe_gateway_membership(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

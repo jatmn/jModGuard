@@ -102,6 +102,12 @@ pub async fn wait_for_gateway_identify(http: &serenity::http::Http, db: &db::Db)
                 }
             }
             Err(error) => {
+                if crate::discord::classify_retry(&error)
+                    == crate::discord::RetryClass::Unauthorized
+                {
+                    tracing::error!("gateway discovery stopped: Discord rejected the bot token");
+                    return Err(error.into());
+                }
                 tracing::warn!(
                     "gateway session start limit unavailable; not identifying yet: {error}"
                 );

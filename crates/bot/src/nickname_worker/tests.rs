@@ -482,3 +482,246 @@ async fn stale_nickname_job_is_not_sent_after_a_newer_generation() {
         .remove(0);
     assert_eq!(after, fresh);
 }
+
+#[tokio::test]
+async fn unknown_nickname_read_failures_back_off_and_exhaust_the_budget() {
+    let f = Fixture::new();
+    let mut job = f.job().await;
+    let app = BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    assert!(
+        db::mark_nickname_outcome_unknown(&f.db, &job, 0)
+            .await
+            .unwrap()
+    );
+    let mut previous_wait = 0;
+    for attempt in 1..=8 {
+        let now = chrono::Utc::now().timestamp();
+        apply_nickname_edit(
+            &app,
+            &job,
+            || async { anyhow::bail!("confirmation read unavailable") },
+            || async { panic!("failed confirmation must not resend the edit") },
+        )
+        .await;
+        let status = db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.attempt_count, attempt);
+        if attempt < 8 {
+            assert_eq!(status.state, "pending");
+            assert_eq!(status.last_error_code.as_deref(), Some("outcome_unknown"));
+            let wait = status.next_attempt_at - now;
+            assert!(wait > previous_wait);
+            previous_wait = wait;
+            assert!(
+                db::pending_nickname_reconciles(&f.db, now + 4, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            job = db::pending_nickname_reconciles(&f.db, status.next_attempt_at, 1)
+                .await
+                .unwrap()
+                .remove(0);
+        } else {
+            assert_eq!(status.state, "terminal");
+            assert!(
+                db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn permanent_nickname_read_failure_stops_the_job() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let app = BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    assert!(
+        db::mark_nickname_outcome_unknown(&f.db, &job, 0)
+            .await
+            .unwrap()
+    );
+    apply_nickname_edit(
+        &app,
+        &job,
+        || async {
+            Err(serenity::Error::Http(serenity::http::HttpError::ApplicationIdMissing).into())
+        },
+        || async { panic!("permanent failure must stop edits") },
+    )
+    .await;
+    assert_eq!(
+        db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "terminal"
+    );
+    assert!(
+        db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn dormant_read_http(
+    code: isize,
+) -> (Arc<serenity::http::Http>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut buf = [0; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(request.starts_with(b"GET "), "only a read may fail here");
+        let status = if code == 50001 { 403 } else { 404 };
+        let body = format!(r#"{{"code":{code},"message":"fixture rejection"}}"#);
+        let response = format!(
+            "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let http = serenity::http::HttpBuilder::new("")
+        .proxy(format!("http://{address}"))
+        .ratelimiter_disabled(true)
+        .build();
+    (Arc::new(http), server)
+}
+
+async fn unknown_nickname_dormant_read_resumes_with_confirmation(membership_read: bool) {
+    for code in [50001, 10004] {
+        let f = Fixture::new();
+        let job = f.job().await;
+        let app = BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        assert!(
+            db::mark_nickname_outcome_unknown(&f.db, &job, 0)
+                .await
+                .unwrap()
+        );
+        let (http, server) = dormant_read_http(code).await;
+        let me = serenity::model::id::UserId::new(1);
+        if membership_read {
+            reconcile_nickname_job(Arc::clone(&app), http, me, job.clone()).await;
+        } else {
+            assert!(
+                dispatch_ready(&f.db, &job, &Source::default())
+                    .await
+                    .unwrap()
+            );
+            apply_nickname_edit(
+                &app,
+                &job,
+                || async {
+                    http.get_member(serenity::model::id::GuildId::new(job.guild_id as u64), me)
+                        .await
+                        .map(|member| member.nick)
+                        .map_err(anyhow::Error::from)
+                },
+                || async { panic!("a failed confirmation must not send an edit") },
+            )
+            .await;
+        }
+        server.await.unwrap();
+        let dormant = db::nickname_reconcile_status(&f.db, job.guild_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dormant.state, "dormant");
+        assert_eq!(dormant.attempt_count, 1);
+        assert!(
+            db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let (enrollment, changed) =
+            db::enroll_guild_with_change(&f.db, job.guild_id, job.joined_at_ns)
+                .await
+                .unwrap();
+        assert!(!changed);
+        assert_eq!(enrollment.unwrap().id, job.enrollment_id);
+        let resumed = db::pending_nickname_reconciles(&f.db, 0, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(resumed.job_id, job.job_id);
+        assert_eq!(resumed.enrollment_id, job.enrollment_id);
+        assert_eq!(resumed.nickname, job.nickname);
+        assert_eq!(resumed.generation, job.generation + 1);
+        assert_eq!(resumed.attempt_count, 0);
+        assert!(
+            !dispatch_ready(&f.db, &job, &Source::default())
+                .await
+                .unwrap()
+        );
+        assert!(
+            dispatch_ready(&f.db, &resumed, &Source::default())
+                .await
+                .unwrap()
+        );
+
+        let confirmations = AtomicUsize::new(0);
+        let edits = AtomicUsize::new(0);
+        apply_nickname_edit(
+            &app,
+            &resumed,
+            || async {
+                confirmations.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(resumed.nickname.clone()))
+            },
+            || async {
+                edits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            edits.load(Ordering::SeqCst),
+            0,
+            "dormant recovery must confirm an unknown edit before any resend"
+        );
+        assert_eq!(confirmations.load(Ordering::SeqCst), 1);
+        assert_eq!(dormant.last_error_code.as_deref(), Some("outcome_unknown"));
+        assert!(
+            db::nickname_reconcile_status(&f.db, job.guild_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "confirmation of the requested nickname must settle the job"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_nickname_membership_read_dormant_recovery_confirms_before_resend() {
+    unknown_nickname_dormant_read_resumes_with_confirmation(true).await;
+}
+
+#[tokio::test]
+async fn unknown_nickname_confirmation_read_dormant_recovery_confirms_before_resend() {
+    unknown_nickname_dormant_read_resumes_with_confirmation(false).await;
+}

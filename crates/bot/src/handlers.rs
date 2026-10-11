@@ -281,6 +281,8 @@ impl EventHandler for Handler {
                 );
             }
         }
+        // Rejoin permits another attempt for a parked guild, never for a bad token.
+        app.reset_slash_guild_retry(gid.get());
         // No guild_settings seed on join — global inheritance stays unblocked.
         if !commands::sync_slash_commands(&app, &ctx, gid).await {
             app.retry_slash_registry_version();
@@ -298,6 +300,9 @@ impl EventHandler for Handler {
         }
         let _rule_hold = self.app.activation.hold_rule();
         self.app.invalidate_member_sync_scope();
+        if !incomplete.unavailable {
+            self.app.reset_slash_guild_retry(incomplete.id.get());
+        }
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());

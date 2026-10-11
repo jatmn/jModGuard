@@ -600,6 +600,14 @@ pub async fn sync_slash_commands_versioned_http(
     target_version: u64,
 ) -> bool {
     let expected_revision = app.slash_registry_revision();
+    if !app.slash_sync_due(
+        guild_id.get(),
+        target_version,
+        &expected_revision,
+        std::time::Instant::now(),
+    ) {
+        return false;
+    }
     let (mut loaded_version, mut loaded_revision, mut commands) =
         match db::load_slash_commands_with_version(&app.db, guild_id.get() as i64).await {
             Ok(loaded) => loaded,
@@ -634,13 +642,24 @@ pub async fn sync_slash_commands_versioned_http(
     if !app.activation.may_record() {
         return false;
     }
-    set_slash_commands(http, guild_id, &commands).await
+    set_slash_commands(
+        app,
+        http,
+        guild_id,
+        &commands,
+        target_version,
+        &expected_revision,
+    )
+    .await
 }
 
 async fn set_slash_commands(
+    app: &BotState,
     http: impl AsRef<serenity::http::Http>,
     guild_id: GuildId,
     registry: &std::collections::HashMap<String, CommandDef>,
+    target: u64,
+    revision: &str,
 ) -> bool {
     let mut commands: Vec<CreateCommand> = Vec::new();
     for cmd in registry.values() {
@@ -663,18 +682,43 @@ async fn set_slash_commands(
         }
         commands.push(builder);
     }
+    tracing::info!(
+        guild_id = guild_id.get(),
+        target,
+        "syncing Discord slash commands"
+    );
     match tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild_id.set_commands(http.as_ref(), commands),
     )
     .await
     {
-        Ok(Ok(_)) => true,
+        Ok(Ok(_)) => {
+            app.reset_slash_guild_retry(guild_id.get());
+            true
+        }
         Ok(Err(e)) => {
-            tracing::warn!("slash sync failed for {guild_id}: {e}");
+            let class = crate::discord::classify_retry(&e);
+            app.slash_sync_failed(
+                guild_id.get(),
+                target,
+                revision,
+                class,
+                crate::discord::http_error_response(&e),
+            );
+            if class == crate::discord::RetryClass::Transient {
+                tracing::warn!("slash sync deferred for {guild_id}: {e}");
+            }
             false
         }
         Err(_) => {
+            app.slash_sync_failed(
+                guild_id.get(),
+                target,
+                revision,
+                crate::discord::RetryClass::Transient,
+                None,
+            );
             tracing::warn!("slash sync timed out for {guild_id}");
             false
         }
@@ -1135,6 +1179,160 @@ pub async fn resolve_user(
 mod tests {
     use super::*;
     use crate::types::Behavior;
+
+    #[tokio::test]
+    async fn slash_http_failures_are_parked_backed_off_or_stopped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for (status, code) in [
+            (403, 50013),
+            (404, 10004),
+            (400, 50035),
+            (400, 50001),
+            (503, 0),
+            (401, 0),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&calls);
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buf = [0; 4096];
+                        let n = stream.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = format!(r#"{{"code":{code},"message":"fixture rejection"}}"#);
+                    let response = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let path = std::env::temp_dir()
+                .join(format!("slash_retry_{:032x}.db", rand::random::<u128>()));
+            let db = db::Db::open(&path, 2).unwrap();
+            let app = BotState::new(Default::default(), db).unwrap();
+            app.activation.mark_lock_held(true);
+            let http = serenity::http::HttpBuilder::new("fixture")
+                .proxy(format!("http://{address}"))
+                .application_id(serenity::model::id::ApplicationId::new(1))
+                .ratelimiter_disabled(true)
+                .build();
+            let target = app.acknowledged_slash_registry_version();
+            let guild = GuildId::new(10);
+            assert!(!sync_slash_commands_versioned_http(&app, &http, guild, target).await);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!app.slash_sync_due(
+                10,
+                target,
+                &app.slash_registry_revision(),
+                std::time::Instant::now() + std::time::Duration::from_secs(5)
+            ));
+            assert!(!sync_slash_commands_versioned_http(&app, &http, guild, target).await);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "next poll must not send REST"
+            );
+            if status == 401 {
+                app.reset_slash_guild_retry(10);
+                assert!(
+                    app.pending_slash_registry_version()
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    !sync_slash_commands_versioned_http(&app, &http, GuildId::new(20), target)
+                        .await
+                );
+                assert!(!app.slash_sync_due(10, target + 1, "changed", std::time::Instant::now()));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        crate::gateway_budget::wait_for_gateway_identify(&http, &app.db)
+                    )
+                    .await
+                    .unwrap()
+                    .is_err()
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    2,
+                    "gateway 401 must be surfaced without retrying"
+                );
+            } else if status == 503 {
+                assert!(app.slash_sync_due(
+                    10,
+                    target,
+                    &app.slash_registry_revision(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(3601)
+                ));
+            } else {
+                assert!(!app.slash_sync_due(
+                    10,
+                    target,
+                    &app.slash_registry_revision(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(7200)
+                ));
+                assert!(app.slash_sync_due(10, target + 1, "changed", std::time::Instant::now()));
+                app.reset_slash_guild_retry(10);
+                assert!(app.slash_sync_due(
+                    10,
+                    target,
+                    &app.slash_registry_revision(),
+                    std::time::Instant::now()
+                ));
+            }
+            if matches!(status, 401 | 403 | 503) {
+                let mut repair = crate::enrollment_repair::EnrollmentRepair::new(
+                    Default::default(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+                let source = crate::enrollment_repair::DiscordMembership {
+                    http: &http,
+                    bot_user_id: serenity::model::id::UserId::new(1),
+                };
+                assert!(repair.step(&app.db, &app.tenant, &source).await.is_err());
+                if status == 401 {
+                    crate::enrollment_repair::tests::assert_auth_stopped_after_deadline(
+                        &mut repair,
+                    );
+                }
+                assert!(
+                    repair
+                        .step(&app.db, &app.tenant, &source)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if status == 401 { 3 } else { 2 },
+                    "enrollment errors must not repeat on the next poll"
+                );
+            }
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            drop(app);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+            crate::tenant::remove_sidecars(&path);
+        }
+    }
 
     fn say_cmd(response: &str) -> CommandDef {
         CommandDef {
