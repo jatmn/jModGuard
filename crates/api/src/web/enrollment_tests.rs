@@ -4303,25 +4303,6 @@ async fn known_bad_image_routes_require_current_page_and_live_permission() {
         .request_token("POST", "/api/guilds/10/known-bad-images", &body, None)
         .await;
     assert_ne!(status, StatusCode::OK);
-    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
-    f.discord.guilds.lock().unwrap().clear();
-    assert_ne!(
-        f.request("POST", "/api/guilds/10/known-bad-images", &body)
-            .await
-            .0,
-        StatusCode::OK
-    );
-    assert_ne!(
-        f.request(
-            "DELETE",
-            &format!("/api/guilds/10/known-bad-images/{hash}"),
-            ""
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    f.discord.guilds.lock().unwrap().push(managed_guild(10));
     db::retire_guild_enrollment(&f.app.db, 10, 100)
         .await
         .unwrap();
@@ -4347,6 +4328,24 @@ async fn known_bad_image_routes_require_current_page_and_live_permission() {
         f.request("POST", "/api/guilds/0/known-bad-images", &body)
             .await
             .0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    f.discord.guilds.lock().unwrap().clear();
+    assert_ne!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_ne!(
+        f.request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            ""
+        )
+        .await
+        .0,
         StatusCode::OK
     );
 }
