@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One-time re-runnable Linux agent setup for jModGuard CI pins.
-# Usage:
-#   sudo install -d -o buildkite-agent -g buildkite-agent /opt/jmodguard-ci
-#   sudo -u buildkite-agent -H bash scripts/ci-agent-setup.sh
-# from a checkout of the PR head.
+# From a checkout of the PR head, run as the agent's job user (the user with rustup):
+#   sudo install -d -o "$(whoami)" -g "$(id -gn)" /opt/jmodguard-ci
+#   TMPDIR=/var/tmp bash scripts/ci-agent-setup.sh
+# Point TMPDIR at disk; large installs and library builds can exhaust a small /tmp RAM disk.
 # Installs: /opt/jmodguard-ci/dylint-6.1.0/bin/{cargo-dylint,dylint-link},
 # /opt/jmodguard-ci/cargo-deny-0.20.2/bin/cargo-deny,
 # /opt/jmodguard-ci/cargo-audit-0.22.2/bin/cargo-audit,
