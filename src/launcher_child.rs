@@ -6,6 +6,11 @@
 
 use crate::db::REQUIRED_LAUNCHER_REVISION;
 
+/// Fatal Discord HTTP 401 at startup or gateway close 4004 uses this code.
+/// The launcher holds this child with a long fallback retry (30 minutes,
+/// doubling to six hours). Fixing the token and restarting resets the hold. Keep distinct from lost-lease/crash exit 1 and launcher handoff 77.
+pub const DISCORD_TOKEN_REJECTED_EXIT_CODE: i32 = 78;
+
 /// `None` when this process was not started by a launcher.
 /// A present value is the launcher revision to compare with
 /// [`REQUIRED_LAUNCHER_REVISION`].

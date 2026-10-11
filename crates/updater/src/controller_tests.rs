@@ -157,6 +157,7 @@ fn controller(
         control,
         instance: format!("{:032x}", rand::random::<u128>()),
         running: None,
+        restart: RestartPolicy::default(),
         maintenance: None,
         health: None,
         health_bind: None,
@@ -1244,7 +1245,12 @@ impl tracing::Subscriber for ContractWarnings {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut message = String::new();
         event.record(&mut MessageVisit(&mut message));
-        if message.contains("no capability contract") {
+        if message.contains("no capability contract")
+            || (event.metadata().level() == &tracing::Level::ERROR
+                && message == "discord token rejected; bot held, fix token and restart container")
+            || (event.metadata().level() == &tracing::Level::WARN
+                && message == "retrying bot after discord token rejection hold")
+        {
             self.0.lock().expect("warning log").push(message);
         }
     }
@@ -2290,6 +2296,7 @@ async fn replaced_uncontracted_clear_drains_and_restarts_a_crashed_child() {
         desired.launcher.unwrap().revision,
         db::LAUNCHER_REVISION + 1
     );
+    tokio::time::sleep(POLL).await;
     assert!(!service.tick().await.unwrap());
     let restarted = service
         .running
@@ -2352,6 +2359,7 @@ async fn lost_uncontracted_clear_reply_drains_and_restarts_a_crashed_child() {
             .desired_launcher
             .is_none()
     );
+    tokio::time::sleep(POLL).await;
     assert!(!service.tick().await.unwrap());
     let restarted = service
         .running
@@ -2489,6 +2497,7 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
             .digest,
         replacement.digest
     );
+    tokio::time::sleep(POLL).await;
     assert!(!service.tick().await.unwrap());
     let restarted = service
         .running
@@ -2667,4 +2676,133 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         drop((api, bot, control, migrated));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = std::env::temp_dir().join(format!("token-hold-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let script = root.join("rejected-bot");
+    tokio::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nexit {}\n",
+            jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .await
+        .unwrap();
+    let opts = DbOpenOptions {
+        path: root.join("core.db"),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        read_only: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let db = Db::open_with(opts.clone()).unwrap();
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    let mut bot = offline_controller("bot", control, &root);
+    bot.baked = script.clone();
+    bot.enabled = false;
+    // Reserve an ephemeral health socket; production uses the configured 8081.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    bot.health_bind = Some(addr.to_string());
+    bot.start(&script, &"b".repeat(40), None).await.unwrap();
+    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    assert!(
+        bot.report_ready().await.is_ok(),
+        "token rejection must hold rather than surface a restart error"
+    );
+    assert!(bot.running.is_none());
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(bot.running.is_none(), "held bot must never be restored");
+    }
+    for (path, expected) in [("/health", "HTTP/1.1 200"), ("/ready", "HTTP/1.1 503")] {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(expected), "{response}");
+        if path == "/ready" {
+            assert!(response.contains("discord token rejected"), "{response}");
+        }
+    }
+    assert_eq!(
+        *logs.lock().unwrap(),
+        ["discord token rejected; bot held, fix token and restart container"]
+    );
+    // Advance the policy clock to its deadline instead of waiting 30 minutes.
+    bot.restart.auth_retry_at = Some(Instant::now());
+    assert!(!bot.tick().await.unwrap());
+    if let Some(child) = bot.running.as_mut() {
+        child.child.wait().await.unwrap();
+        assert!(!bot.report_ready().await.unwrap());
+    }
+    assert!(bot.restart.held);
+    assert_eq!(bot.restart.auth_failures, 2);
+    let next = bot
+        .restart
+        .auth_retry_at
+        .unwrap()
+        .duration_since(Instant::now());
+    assert!(next > Duration::from_secs(3590) && next <= Duration::from_secs(3600));
+    assert_eq!(
+        *logs.lock().unwrap(),
+        [
+            "discord token rejected; bot held, fix token and restart container",
+            "retrying bot after discord token rejection hold",
+            "discord token rejected; bot held, fix token and restart container",
+        ]
+    );
+    // A ready retry child resumes normal behavior and resets the auth interval.
+    tokio::fs::write(
+        &script,
+        "#!/bin/sh\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 60\n",
+    )
+    .await
+    .unwrap();
+    bot.restart.auth_retry_at = Some(Instant::now());
+    assert!(!bot.tick().await.unwrap());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !bot.report_ready().await.unwrap() {
+        assert!(Instant::now() < deadline, "retry child never ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!bot.restart.held);
+    assert_eq!(bot.restart.auth_failures, 0);
+    assert!(bot.restart.auth_retry_at.is_none());
+    assert_eq!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.as_str() == "retrying bot after discord token rejection hold")
+            .count(),
+        2
+    );
+    drop(guard);
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
 }

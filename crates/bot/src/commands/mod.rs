@@ -682,6 +682,11 @@ async fn set_slash_commands(
         }
         commands.push(builder);
     }
+    tracing::info!(
+        guild_id = guild_id.get(),
+        target,
+        "syncing Discord slash commands"
+    );
     match tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild_id.set_commands(http.as_ref(), commands),
@@ -694,7 +699,13 @@ async fn set_slash_commands(
         }
         Ok(Err(e)) => {
             let class = crate::discord::classify_retry(&e);
-            app.slash_sync_failed(guild_id.get(), target, revision, class);
+            app.slash_sync_failed(
+                guild_id.get(),
+                target,
+                revision,
+                class,
+                crate::discord::http_error_response(&e),
+            );
             if class == crate::discord::RetryClass::Transient {
                 tracing::warn!("slash sync deferred for {guild_id}: {e}");
             }
@@ -706,6 +717,7 @@ async fn set_slash_commands(
                 target,
                 revision,
                 crate::discord::RetryClass::Transient,
+                None,
             );
             tracing::warn!("slash sync timed out for {guild_id}");
             false
@@ -1294,6 +1306,11 @@ mod tests {
                     bot_user_id: serenity::model::id::UserId::new(1),
                 };
                 assert!(repair.step(&app.db, &app.tenant, &source).await.is_err());
+                if status == 401 {
+                    crate::enrollment_repair::tests::assert_auth_stopped_after_deadline(
+                        &mut repair,
+                    );
+                }
                 assert!(
                     repair
                         .step(&app.db, &app.tenant, &source)

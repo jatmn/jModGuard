@@ -63,11 +63,26 @@ pub async fn serve_listener(listener: TcpListener) -> Result<()> {
 /// Same listener as [`serve_listener`], with the process role in the log line
 /// so a launcher bind and the later bot bind are not the same sentence.
 pub async fn serve_listener_as(listener: TcpListener, role: &'static str) -> Result<()> {
+    serve_listener_as_with_reason(listener, role, "not ready").await
+}
+
+/// An operator-facing reason for `/ready` while this listener owns the port.
+/// Liveness and all other routes retain their existing responses.
+pub async fn serve_listener_as_with_reason(
+    listener: TcpListener,
+    role: &'static str,
+    not_ready_reason: &'static str,
+) -> Result<()> {
     tracing::info!(
         "health listener ({role}) on http://{}/health",
         listener.local_addr()?
     );
-    serve_while(&listener, std::future::pending::<Result<()>>()).await
+    serve_while_with_reason(
+        &listener,
+        std::future::pending::<Result<()>>(),
+        not_ready_reason,
+    )
+    .await
 }
 
 /// Binds `addr` and serves `/health` until the process exits.
@@ -78,6 +93,17 @@ pub async fn serve(addr: &str) -> Result<()> {
 /// Accepts liveness probes on `listener` until `work` completes, then
 /// returns that result so the same socket can be handed to axum.
 pub async fn serve_while<F, T>(listener: &TcpListener, work: F) -> T
+where
+    F: Future<Output = T>,
+{
+    serve_while_with_reason(listener, work, "not ready").await
+}
+
+async fn serve_while_with_reason<F, T>(
+    listener: &TcpListener,
+    work: F,
+    not_ready_reason: &'static str,
+) -> T
 where
     F: Future<Output = T>,
 {
@@ -100,7 +126,7 @@ where
                 Ok((stream, _)) => {
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = answer_connection(stream).await {
+                        if let Err(error) = answer_connection_with_reason(stream, not_ready_reason).await {
                             tracing::debug!("health connection ended: {error:#}");
                         }
                     });
@@ -117,7 +143,14 @@ where
 /// `/login` or `/oauth/callback` retries the same URL. `/` is not
 /// liveness: Bunny serves the admin UI from Storage, and the API image
 /// has no `/` route after axum takes over.
-pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
+pub async fn answer_connection(stream: TcpStream) -> Result<()> {
+    answer_connection_with_reason(stream, "not ready").await
+}
+
+async fn answer_connection_with_reason(
+    mut stream: TcpStream,
+    not_ready_reason: &str,
+) -> Result<()> {
     let mut buf = [0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
         .await
@@ -125,13 +158,13 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
         .and_then(Result::ok)
         .unwrap_or(0);
     let probe = parse_probe(&buf[..n]);
-    let response = probe_response(probe, crate::process_ready());
+    let response = probe_response(probe, crate::process_ready(), not_ready_reason);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
 }
 
-fn probe_response(probe: Probe, ready: bool) -> String {
+fn probe_response(probe: Probe, ready: bool, not_ready_reason: &str) -> String {
     let (status, content_type, extra, body) = if probe.liveness {
         ("200 OK", "text/plain; charset=utf-8", "", LIVENESS_BODY)
     } else if probe.readiness {
@@ -142,7 +175,7 @@ fn probe_response(probe: Probe, ready: bool) -> String {
                 "503 Service Unavailable",
                 "text/plain; charset=utf-8",
                 "retry-after: 1\r\n",
-                "not ready",
+                not_ready_reason,
             )
         }
     } else if probe.json_error {

@@ -48,13 +48,33 @@ pub enum RetryClass {
 }
 
 pub fn classify_retry(error: &serenity::Error) -> RetryClass {
-    if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error {
-        return classify_retry_response(response.status_code.as_u16(), response.error.code);
+    if let Some((status, code)) = http_error_response(error) {
+        return classify_retry_response(status, code);
     }
     match classify_nickname_failure(error).0 {
         NicknameFailureClass::Transient => RetryClass::Transient,
         _ => RetryClass::Permanent,
     }
+}
+
+/// Provider fields for structured diagnostics, without parsing error text.
+pub fn http_error_response(error: &serenity::Error) -> Option<(u16, isize)> {
+    if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error {
+        Some((response.status_code.as_u16(), response.error.code))
+    } else {
+        None
+    }
+}
+
+/// Only use at already-fatal process boundaries. Serenity maps gateway close
+/// 4004 to InvalidAuthentication; HTTP 401 is the startup discovery equivalent.
+pub fn fatal_auth_exit_code(error: &serenity::Error) -> Option<i32> {
+    (classify_retry(error) == RetryClass::Unauthorized
+        || matches!(
+            error,
+            serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidAuthentication)
+        ))
+    .then_some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
 }
 
 pub fn classify_retry_error(error: &anyhow::Error) -> RetryClass {

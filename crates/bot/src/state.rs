@@ -1197,6 +1197,7 @@ impl BotState {
         target: u64,
         revision: &str,
         class: crate::discord::RetryClass,
+        response: Option<(u16, isize)>,
     ) {
         use crate::discord::RetryClass;
         if class == RetryClass::Unauthorized {
@@ -1216,6 +1217,8 @@ impl BotState {
         if class == RetryClass::Permanent && !retry.retry.stopped {
             tracing::warn!(
                 guild_id = guild,
+                status = response.map(|(status, _)| status),
+                discord_code = response.map(|(_, code)| code),
                 "slash sync parked until registry/config changes or the bot rejoins"
             );
         }

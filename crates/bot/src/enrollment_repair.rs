@@ -277,4 +277,4 @@ pub async fn observe_gateway_membership(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

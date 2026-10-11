@@ -22,6 +22,23 @@ Bunny selects the base bot/API images. Runtime updates replace executables insid
 
 Launcher updates use the same verified role images and the fixed shell bootstrap. A selected launcher is restored before normal application startup; the stable baked controller can recover applications if a replacement launcher fails. The one-time baseline must include this controller **and** API maintenance mode. Downloaded execution still needs a controlled proof in the actual Magic Container before enabling the update gates.
 
+The launcher restarts ordinary crashed children on its 5-second poll, with
+successive delays of 5, 10, 20, 40 and at most 60 seconds. A child that stays
+up for five minutes resets that backoff. Lost-lease exit code 1 still restarts
+with the initial delay. A fatal startup Discord 401 or gateway authentication close 4004 releases the
+bot's active lease and exits with code 78
+(`DISCORD_TOKEN_REJECTED_EXIT_CODE`, shared by bot and launcher). The launcher
+holds that bot without immediate restart or rollback and logs once per hold entry:
+`discord token rejected; bot held, fix token and restart container`.
+Fix the token and restart the container to resume immediately. As a fallback,
+the launcher retries once after 30 minutes, doubling subsequent rejected-token
+intervals up to six hours, with one warning per attempt. A ready child, or one that stays up for five
+minutes, resets the interval. While held, the launcher serves `/health` as 200 and `/ready` as
+503 with the reason `discord token rejected` on the bot's configured health port
+(8081 in the image); the platform uses only `/health` for liveness. Running
+slash synchronization, identity lookup and enrollment workers still stop their
+own retries on 401 without adding a process exit.
+
 ### Application and launcher updates
 
 **Update** installs the selected bot/API application and automatically installs its
