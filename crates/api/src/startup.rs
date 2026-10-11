@@ -30,7 +30,18 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
         let probe = db::current_startup_probe();
         let opened = tokio::task::spawn_blocking(move || {
             let _probe = db::enter_startup_probe(probe);
-            Db::open_with(opts)
+            let path = opts.path.clone();
+            let local = !remote && opts.token.trim().is_empty();
+            Db::open_with(opts).map_err(|error| {
+                if local && local_database_is_missing(&path) {
+                    db::SchemaNotReady(format!(
+                        "local database file is not yet created by the bot: {error:#}"
+                    ))
+                    .into()
+                } else {
+                    error
+                }
+            })
         })
         .await
         .context("database open worker stopped before returning")?;
@@ -51,6 +62,25 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
             Err(error) => return Err(error),
         }
     }
+}
+
+// SQLite's open error also covers permissions and invalid paths. Retry only
+// confirmed absence of the final entry, not a dangling symlink or missing parent.
+fn local_database_is_missing(path: &Path) -> bool {
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+    {
+        return false;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && parent.is_dir()
 }
 
 /// Prime API state. An older schema or a retryable read waits with a capped
@@ -392,6 +422,75 @@ mod tests {
         let opened = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
         assert!(opened.unwrap().is_err(), "a newer schema must exit");
         cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_local_database_paths_and_contents_do_not_retry() {
+        let root = temp_db("invalid_paths");
+        std::fs::create_dir(&root).unwrap();
+        let corrupt = root.join("corrupt.db");
+        std::fs::write(&corrupt, b"not a SQLite database").unwrap();
+        let foreign = root.join("foreign.db");
+        let foreign_db = libsql::Builder::new_local(&foreign).build().await.unwrap();
+        foreign_db
+            .connect()
+            .unwrap()
+            .execute("CREATE TABLE foreign_data (value TEXT)", ())
+            .await
+            .unwrap();
+        drop(foreign_db);
+        for path in [
+            root.join("absent_parent/app.db"),
+            corrupt.join("app.db"),
+            root.clone(),
+            root.join("absent.db/"),
+            corrupt,
+            foreign,
+        ] {
+            let cfg = api_config(&path);
+            let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg))
+                .await
+                .expect("invalid local databases must fail, not retry");
+            assert!(result.is_err(), "unexpectedly opened {}", path.display());
+        }
+        let mut cfg = api_config(&root.join("absent.db"));
+        cfg.db.token = "token-without-url".into();
+        let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg))
+            .await
+            .expect("invalid database configuration must fail, not retry");
+        assert!(result.err().unwrap().to_string().contains("db.url"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inaccessible_parent_and_dangling_database_symlink_do_not_retry() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = temp_db("denied_paths");
+        std::fs::create_dir(&root).unwrap();
+        let link = root.join("dangling.db");
+        symlink(root.join("absent.db"), &link).unwrap();
+        let cfg = api_config(&link);
+        let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
+        assert!(result.expect("dangling link must fail promptly").is_err());
+        let denied = root.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let path = denied.join("app.db");
+        // Root may bypass mode bits; only claim a permission failure when real.
+        if std::fs::metadata(&path).unwrap_err().kind() == std::io::ErrorKind::PermissionDenied {
+            let cfg = api_config(&path);
+            let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                result
+                    .expect("permission error must fail promptly")
+                    .is_err()
+            );
+        } else {
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn guild_path(core: &Path) -> PathBuf {

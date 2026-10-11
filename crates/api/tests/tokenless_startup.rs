@@ -13,13 +13,12 @@ fn tmp_db_path(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn api_process_starts_without_a_discord_bot_token() {
+async fn api_process_waits_for_first_boot_without_a_discord_bot_token() {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let root = tmp_db_path("tokenless_api").with_extension("");
     std::fs::create_dir(&root).unwrap();
     let database = root.join("app.db");
-    drop(Db::open(&database, 2).unwrap());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let config = root.join("config.toml");
@@ -44,7 +43,7 @@ async fn api_process_starts_without_a_discord_bot_token() {
             .env_clear()
             .env("JMODGUARD_CONFIG", &config)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
         root,
@@ -53,6 +52,40 @@ async fn api_process_starts_without_a_discord_bot_token() {
         .timeout(Duration::from_secs(1))
         .build()
         .unwrap();
+    // Keep the database absent across an open attempt and its retry backoff.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            process.child.try_wait().unwrap().is_none(),
+            "API exited while waiting for the bot to create the database"
+        );
+        if let Ok(response) = client.get(format!("http://{address}/health")).send().await
+            && response.status() == reqwest::StatusCode::OK
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "API did not serve liveness");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for _ in 0..12 {
+        assert!(process.child.try_wait().unwrap().is_none());
+        assert!(!database.exists(), "API must not create the database");
+        for (path, expected) in [("health", 200), ("ready", 503)] {
+            assert_eq!(
+                client
+                    .get(format!("http://{address}/{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                expected
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The real bot-owned bootstrap creates the schema; no Discord is contacted.
+    drop(Db::open(&database, 2).unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
@@ -64,6 +97,16 @@ async fn api_process_starts_without_a_discord_bot_token() {
         {
             let body = response.text().await.unwrap();
             assert!(body.contains("not authenticated"), "{body}");
+            assert_eq!(
+                client
+                    .get(format!("http://{address}/ready"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                200
+            );
             break;
         }
         assert!(Instant::now() < deadline, "API did not finish startup");
