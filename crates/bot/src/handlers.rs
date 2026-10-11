@@ -447,18 +447,20 @@ impl EventHandler for Handler {
         let echo_operation = app.gateway_ban_echo_operation(guild_id.get(), banned_user.id.get());
         let owned_echo = suppressed || echo_operation.is_some();
         let operation_id = echo_operation.flatten();
-        let ban_write = db::record_gateway_ban(
-            &app.db,
-            enrollment.clone(),
-            banned_user.id.get() as i64,
-            Some(&banned_user.name),
-            banned_user.global_name.as_deref(),
-            Some(&observed_at),
-            owned_echo,
-            operation_id.as_deref(),
-        )
-        .await
-        .ok();
+        let ban_write = crate::logging::log_persistence_result(
+            "gateway ban row",
+            db::record_gateway_ban(
+                &app.db,
+                enrollment.clone(),
+                banned_user.id.get() as i64,
+                Some(&banned_user.name),
+                banned_user.global_name.as_deref(),
+                Some(&observed_at),
+                owned_echo,
+                operation_id.as_deref(),
+            )
+            .await,
+        );
         let ban_row_id = ban_write.and_then(gateway_ban_row_to_attribute);
         // Every unsuppressed delivery is a distinct unresolved observation.
         // A matching saved status is not an action identity: an opposite event
@@ -1042,27 +1044,33 @@ impl EventHandler for Handler {
                 vars.insert("duration".into(), "timed out".into());
                 vars.insert("reason".into(), "moderation action".into());
                 logging::emit(&app, &ctx, guild_id, "timeout_add", vars).await;
-                let _ = db::insert_enrolled_event(
-                    &app.db,
-                    enrollment.clone(),
-                    "timeout_add",
-                    Some(new.user.id.get() as i64),
-                    None,
-                    &serde_json::json!({"until": new_to.map(|t| t.to_string())}),
-                )
-                .await;
+                crate::logging::log_persistence_result(
+                    "timeout_add event",
+                    db::insert_enrolled_event(
+                        &app.db,
+                        enrollment.clone(),
+                        "timeout_add",
+                        Some(new.user.id.get() as i64),
+                        None,
+                        &serde_json::json!({"until": new_to.map(|t| t.to_string())}),
+                    )
+                    .await,
+                );
             } else {
                 vars.insert("reason".into(), "timeout expired or removed".into());
                 logging::emit(&app, &ctx, guild_id, "timeout_remove", vars).await;
-                let _ = db::insert_enrolled_event(
-                    &app.db,
-                    enrollment.clone(),
-                    "timeout_remove",
-                    Some(new.user.id.get() as i64),
-                    None,
-                    &serde_json::json!({}),
-                )
-                .await;
+                crate::logging::log_persistence_result(
+                    "timeout_remove event",
+                    db::insert_enrolled_event(
+                        &app.db,
+                        enrollment.clone(),
+                        "timeout_remove",
+                        Some(new.user.id.get() as i64),
+                        None,
+                        &serde_json::json!({}),
+                    )
+                    .await,
+                );
             }
         }
         if let Some(old) = old_if_available {

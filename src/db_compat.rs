@@ -715,6 +715,9 @@ fn active_caller_abandon() -> Option<Arc<AbandonWatch>> {
     CALLER_ABANDON.with(|slot| slot.borrow().clone())
 }
 
+pub(crate) const ACTIVE_BOT_LEASE_CAS: &str = "UPDATE meta SET value=?1 WHERE key='active_bot_lease' AND substr(value,1,33)=?2 AND CAST(substr(value,34) AS INTEGER) > ?3 AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
+pub(crate) const LAUNCHER_FENCE_CAS: &str = "UPDATE meta SET value=?1 WHERE key='launcher_lease' AND (substr(value,1,33)=?2 OR CAST(substr(value,34) AS INTEGER) <= ?3) AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
+
 pub struct Connection {
     inner: libsql::Connection,
     database: Arc<libsql::Database>,
@@ -1338,6 +1341,40 @@ impl Connection {
         self.execute_batch_bounded(&format!("PRAGMA {pragma} = {value}"), 65_536)
     }
 
+    /// Only fixed-format, existing lease rows may bypass mutation admission.
+    pub(crate) fn execute_lease_cas(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send,
+        timeout: Duration,
+    ) -> Result<usize> {
+        anyhow::ensure!(!timeout.is_zero(), "lease CAS authority window expired");
+        anyhow::ensure!(
+            matches!(sql, ACTIVE_BOT_LEASE_CAS | LAUNCHER_FENCE_CAS),
+            "lease CAS mutation refused"
+        );
+        self.refuse_writer_lock()?;
+        anyhow::ensure!(self.inner.is_autocommit(), "lease CAS requires autocommit");
+        // Defensive callers cannot ask for longer than either unchanged TTL.
+        // Local SQLite must wait on its writer for this same budget, rather
+        // than fail at the connection's default two-second busy timeout.
+        // libSQL's remote busy_timeout setter is a no-op (no extra request).
+        let timeout = timeout.min(Duration::from_millis(
+            crate::db::ACTIVE_BOT_LEASE_TTL_MS.max(crate::db::LAUNCHER_FENCE_TTL_MS) as u64,
+        ));
+        self.inner.busy_timeout(timeout)?;
+        // In-place replacement of an existing fixed-length meta lease cannot
+        // allocate pages, so it needs no capacity reservation or receipt. The
+        // CAS is idempotent: a lost response is resolved by retry/re-read. Its
+        // WHERE clause is the fence; no Transaction::commit re-check is needed.
+        Ok(self.runtime.block_on_database_within(
+            "lease CAS",
+            Some(timeout),
+            self.inner.execute(sql, params),
+            true,
+        )? as usize)
+    }
+
     pub fn is_autocommit(&self) -> bool {
         self.inner.is_autocommit()
     }
@@ -1899,7 +1936,7 @@ impl Transaction {
 
     fn renew_launcher_fence(&self, instance: &str) -> Result<()> {
         const KEY: &str = "launcher_lease";
-        const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
+
         let now = crate::control::now_ms();
         let current: Option<String> = self
             .query_row("SELECT value FROM meta WHERE key=?1", params![KEY], |row| {
@@ -1917,7 +1954,10 @@ impl Transaction {
                 anyhow::bail!("launcher fence held");
             }
         }
-        let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
+        let next = format!(
+            "{instance} {}",
+            now.saturating_add(crate::db::LAUNCHER_FENCE_TTL_MS)
+        );
         self.execute_bounded(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2403,6 +2443,40 @@ impl SqlExecutor for Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lease_cas_rejects_nonallowlisted_readonly_and_transactional_calls() {
+        let mut connection = Connection::open(":memory:").unwrap();
+        assert!(
+            connection
+                .execute_lease_cas("UPDATE meta SET value='bad'", (), Duration::from_secs(10))
+                .unwrap_err()
+                .to_string()
+                .contains("lease CAS mutation refused")
+        );
+        assert!(
+            connection.execute(ACTIVE_BOT_LEASE_CAS, ()).is_err(),
+            "general execute must remain read-only"
+        );
+        connection.set_read_only(true);
+        assert!(
+            connection
+                .execute_lease_cas(ACTIVE_BOT_LEASE_CAS, (), Duration::from_secs(10))
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+        connection.set_read_only(false);
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            connection
+                .execute_lease_cas(ACTIVE_BOT_LEASE_CAS, (), Duration::from_secs(10))
+                .unwrap_err()
+                .to_string()
+                .contains("autocommit")
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+    }
+
     use super::*;
 
     #[test]

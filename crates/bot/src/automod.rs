@@ -944,15 +944,18 @@ pub(crate) async fn execute_pending_with(
             "rule": pending.rule_id, "action": rule.action,
             "reason": reason, "evidence": pending.evidence,
         });
-        let _ = db::insert_enrolled_event(
-            &app.db,
-            enrollment.clone(),
-            "automod",
-            Some(target.id.get() as i64),
-            None,
-            &evidence,
-        )
-        .await;
+        crate::logging::log_persistence_result(
+            "automod event",
+            db::insert_enrolled_event(
+                &app.db,
+                enrollment.clone(),
+                "automod",
+                Some(target.id.get() as i64),
+                None,
+                &evidence,
+            )
+            .await,
+        );
     }
 
     if !log_automod {

@@ -53,6 +53,37 @@ fn api_writer_link(target: &str, secret: &str) -> Option<jmodguard::control::Wri
     }
 }
 
+/// Retry non-timeout errors while the last confirmed fence leaves room.
+async fn renew_launcher_fence_promptly<F, Fut>(deadline: Instant, mut renew: F) -> Result<bool>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<bool>> + Send,
+{
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        let requested_at = Instant::now();
+        let window = deadline.saturating_duration_since(requested_at);
+        ensure!(!window.is_zero(), "launcher fence authority window expired");
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renew())
+            .await
+            .context("launcher fence renewal timed out")?;
+        ensure!(
+            Instant::now() < deadline,
+            "launcher fence renewal completed too late"
+        );
+        match result {
+            Err(error)
+                if !db::is_database_operation_timeout(&error)
+                    && deadline.saturating_duration_since(Instant::now()) > backoff =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -60,7 +91,16 @@ fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHand
         interval.tick().await;
         loop {
             interval.tick().await;
-            match control.renew_launcher_fence().await {
+            let result = match control.launcher_fence_deadline() {
+                Some(deadline) if Instant::now() < deadline => {
+                    renew_launcher_fence_promptly(deadline, || control.renew_launcher_fence_cas())
+                        .await
+                }
+                // Confirm authority again through the existing fenced acquisition;
+                // extending an expired local horizon would trust an unconfirmed owner.
+                _ => control.renew_launcher_fence().await,
+            };
+            match result {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
                 Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
@@ -1713,8 +1753,270 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn launcher_fence_retries_a_transient_failure_promptly_and_stops_at_zero_rows() {
+        let path =
+            std::env::temp_dir().join(format!("launcher_retry_{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let started = Instant::now();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let renewed =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(anyhow::anyhow!("connection reset"))
+                } else {
+                    control.renew_launcher_fence_cas().await
+                }
+            })
+            .await
+            .unwrap();
+        assert!(renewed);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() < POLL,
+            "retry must precede the next 5 s tick"
+        );
+        control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                control.renew_launcher_fence_cas().await
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "zero rows must not retry"
+        );
+        drop(control);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_rejects_ready_late_reply() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result =
+            renew_launcher_fence_promptly(Instant::now() + Duration::from_millis(100), || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(true)
+            })
+            .await;
+        assert!(result.is_err(), "late success must never count");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_launcher_error_retries_and_extends_the_fence() {
+        let path =
+            std::env::temp_dir().join(format!("launcher_slow_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence(&"a".repeat(32));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let before = control.launcher_fence_deadline().unwrap();
+        let read_fence = || {
+            db.with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key='launcher_lease'",
+                    (),
+                    |row| Ok(row.get::<String>(0)?),
+                )
+            })
+            .unwrap()
+        };
+        let before_row = read_fence();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let began = Instant::now();
+        let result = renew_launcher_fence_promptly(before, || async {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Err(anyhow::anyhow!("provider unavailable"))
+            } else {
+                control.renew_launcher_fence_cas().await
+            }
+        })
+        .await;
+        assert!(
+            matches!(result, Ok(true)),
+            "3s non-timeout error must retry: {result:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(control.launcher_fence_deadline().unwrap() > before);
+        let expires = |row: &str| row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+        assert!(
+            expires(&read_fence()) > expires(&before_row),
+            "fence renewed durably"
+        );
+        assert!(began.elapsed() >= Duration::from_secs(3));
+        eprintln!("3s injected provider error; production launcher retry owner extended fence");
+        drop(control);
+        drop(db);
+        remove_launcher_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn instant_launcher_errors_stop_before_the_deadline_with_the_last_error() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let began = Instant::now();
+        let deadline = began + Duration::from_secs(10);
+        let error = renew_launcher_fence_promptly(deadline, || async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("connection refused"))
+        })
+        .await
+        .unwrap_err();
+        let count = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (9..=12).contains(&count),
+            "250ms to 1s backoff: {count} attempts"
+        );
+        assert!(Instant::now() < deadline, "must not sleep across deadline");
+        assert!(began.elapsed() >= Duration::from_secs(8));
+        assert!(error.to_string().contains("connection refused"));
+        eprintln!(
+            "instant launcher errors: {count} attempts; stopped before deadline with last error"
+        );
+    }
+
+    fn remove_launcher_test_db(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_periodic_tick_recovers_after_a_hung_tick_and_resumes_cas() {
+        let path = std::env::temp_dir().join(format!(
+            "launcher_recover_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence(&"a".repeat(32));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let before = control.launcher_fence_deadline().unwrap();
+        // Real 20s fence: a hung production renewal owner spends the window.
+        assert!(
+            renew_launcher_fence_promptly(before, std::future::pending::<Result<bool>>)
+                .await
+                .is_err()
+        );
+        assert_eq!(control.launcher_fence_deadline(), Some(before));
+        assert!(Instant::now() >= before);
+        let renewal = spawn_launcher_fence_renewal(control.clone());
+        let recovered = tokio::time::timeout(POLL + Duration::from_secs(3), async {
+            while control.launcher_fence_deadline() == Some(before) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if recovered.is_err() {
+            renewal.abort();
+            let _ = renewal.await;
+            panic!("next periodic tick must reacquire after expiry");
+        }
+        let rearmed = control.launcher_fence_deadline().unwrap();
+        let resumed = tokio::time::timeout(POLL + Duration::from_secs(3), async {
+            while control.launcher_fence_deadline() == Some(rearmed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        renewal.abort();
+        let _ = renewal.await;
+        resumed.expect("CAS renewal must resume on the following tick");
+        assert!(rearmed > before);
+        assert!(control.launcher_fence_deadline().unwrap() > rearmed);
+        let row: String = db
+            .with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key='launcher_lease'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+            })
+            .unwrap();
+        assert!(row.starts_with(&"a".repeat(32)));
+        assert!(
+            row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap() > jmodguard::control::now_ms()
+        );
+        eprintln!(
+            "hung tick expired; periodic task reacquired, rearmed horizon and resumed CAS; durable fence live"
+        );
+        drop(control);
+        drop(db);
+        remove_launcher_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn launcher_periodic_tick_never_steals_a_live_foreign_fence_after_expiry() {
+        let path = std::env::temp_dir().join(format!(
+            "launcher_no_steal_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence(&"a".repeat(32));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let before = control.launcher_fence_deadline().unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            before + Duration::from_millis(50),
+        ))
+        .await;
+        let other_db = Db::open(&path, 2).unwrap();
+        let other = UpdateControl::from_application(&other_db);
+        other.arm_launcher_fence(&"b".repeat(32));
+        assert!(other.renew_launcher_fence().await.unwrap());
+        let row = || {
+            db.with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key='launcher_lease'",
+                    (),
+                    |row| Ok(row.get::<String>(0)?),
+                )
+            })
+            .unwrap()
+        };
+        let held = row();
+        let renewal = spawn_launcher_fence_renewal(control.clone());
+        tokio::time::sleep(POLL + Duration::from_millis(500)).await;
+        renewal.abort();
+        let _ = renewal.await;
+        assert_eq!(
+            row(),
+            held,
+            "periodic recovery must leave another live owner untouched"
+        );
+        assert_eq!(
+            control.launcher_fence_deadline(),
+            Some(before),
+            "lost fence must not rearm"
+        );
+        assert!(
+            !control.renew_launcher_fence().await.unwrap(),
+            "existing lost-fence result is false"
+        );
+        eprintln!("expired launcher did not steal live foreign fence; lost-fence result false");
+        drop(other);
+        drop(other_db);
+        drop(control);
+        drop(db);
+        remove_launcher_test_db(&path);
+    }
+
     use super::*;
-    use db::Db;
+    use db::{Db, SqlExecutor};
 
     #[tokio::test]
     async fn published_schema_and_launcher_observations_allow_only_matching_services() {

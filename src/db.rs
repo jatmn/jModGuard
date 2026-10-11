@@ -430,6 +430,8 @@ pub struct Db {
     runtime: DbRuntime,
     startup_deferred: bool,
     connections: Arc<ConnectionPool>,
+    /// Renewal never waits for a core pool permit. Errors discard this stream.
+    lease_connection: Arc<Mutex<Option<Connection>>>,
     permits: Arc<tokio::sync::Semaphore>,
     permit_timeout: Option<Duration>,
     required_config_version: Arc<std::sync::atomic::AtomicU64>,
@@ -982,6 +984,11 @@ impl Db {
                 connections.push(connection);
             }
 
+            let mut lease_connection =
+                Connection::from_database(Arc::clone(&database), runtime.clone())?;
+            lease_connection.set_read_only(opts.read_only);
+            configure_connection(&lease_connection, remote, 2_000, opts.read_only)?;
+
             // Publish readiness only after the pool exists. A retry of
             // `open_with_until_ready` (remote first-boot) would otherwise
             // clear this marker after a later pool-connect failure, while an
@@ -1013,6 +1020,7 @@ impl Db {
                     launcher_fence: Arc::clone(&launcher_fence),
                     commit_lease_probe,
                 }),
+                lease_connection: Arc::new(Mutex::new(Some(lease_connection))),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 permit_timeout: remote.then_some(if opts.migrate {
                     REMOTE_OPERATION_TIMEOUT
@@ -1263,6 +1271,46 @@ impl Db {
         })
         .await
         .context("db task panicked")?
+    }
+
+    /// Serialized, dedicated connection for the two narrow lease CAS operations.
+    /// Cancellation abandons the request and discards its stream before reuse.
+    async fn with_lease_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        anyhow::ensure!(!self.read_only, "read-only database cannot renew a lease");
+        let slot = Arc::clone(&self.lease_connection);
+        let database = Arc::clone(&self._database);
+        let runtime = self.runtime.clone();
+        let remote = self.remote;
+        let watch = crate::db_compat::AbandonWatch::new();
+        let _caller = CallerCancel::arm(Arc::clone(&watch));
+        tokio::task::spawn_blocking(move || {
+            let _caller = crate::db_compat::enter_caller_abandon(watch);
+            let mut slot = slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lease connection lock poisoned"))?;
+            let result = (|| {
+                if slot.is_none() {
+                    let connection = Connection::from_database(database, runtime)?;
+                    configure_connection(&connection, remote, 2_000, false)?;
+                    *slot = Some(connection);
+                }
+                let connection = slot.as_mut().expect("lease connection initialized");
+                if remote {
+                    connection.reset_remote_stream()?;
+                }
+                f(connection)
+            })();
+            if result.is_err() {
+                *slot = None;
+            }
+            result
+        })
+        .await
+        .context("lease db task panicked")?
     }
 
     /// Runs a closure synchronously (tests only).
