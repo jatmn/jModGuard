@@ -130,19 +130,19 @@ if [ "$(printf '%s\n' "$schedule" | sort)" != "$(printf '%s\n' $all | sort)" ]; 
   fail "schedule did not select every group"
 fi
 
-if ! bash "$selector" plan --files docs/INSTALL.md | grep -qx contracts; then
+if ! bash "$selector" plan --files docs/INSTALL.md | grep -x contracts >/dev/null; then
   fail "docs plan was not only contracts"
 fi
-if bash "$selector" plan --files docs/INSTALL.md | grep -qx remote-database; then
+if bash "$selector" plan --files docs/INSTALL.md | grep -x remote-database >/dev/null; then
   fail "docs plan included remote-database"
 fi
-if bash "$selector" plan --files frontend/app.js | grep -Eq '^(bot|remote-database)$'; then
+if bash "$selector" plan --files frontend/app.js | grep -E '^(bot|remote-database)$' >/dev/null; then
   fail "frontend plan included an unrelated rust group"
 fi
-if ! bash "$selector" plan --files frontend/app.js | grep -qx api; then
+if ! bash "$selector" plan --files frontend/app.js | grep -x api >/dev/null; then
   fail "root frontend plan omitted api (embed-ui include_str)"
 fi
-if bash "$selector" plan --files crates/api/src/lib.rs | grep -Eq '^(frontend|bot|remote-database)$'; then
+if bash "$selector" plan --files crates/api/src/lib.rs | grep -E '^(frontend|bot|remote-database)$' >/dev/null; then
   fail "api plan included an unrelated group"
 fi
 
