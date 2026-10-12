@@ -561,34 +561,21 @@ mod tests {
         let _clear_ready = ClearReady;
         std::thread::sleep(Duration::from_millis(50));
 
+        // Fill the slots without successful probes: response EOF can arrive
+        // before a probe's blocking handler releases its permit.
         let mut held = Vec::new();
-        let mut saw_drop = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while held.len() <= MAX_CONTAINER_READ_CONNECTIONS && std::time::Instant::now() < deadline {
+        for _ in 0..MAX_CONTAINER_READ_CONNECTIONS {
             let stream = TcpStream::connect(addr).expect("slow connection");
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .expect("timeout");
             held.push(stream);
-            match sealed_read_exchange(addr, &secret) {
-                Exchange::Served => {}
-                Exchange::Dropped => {
-                    saw_drop = true;
-                    break;
-                }
-                Exchange::Other(detail) => panic!("expected serve or drop, got {detail}"),
-            }
         }
-        assert!(
-            saw_drop,
-            "connections past the cap were still served; held {}",
-            held.len()
-        );
-        assert_eq!(
-            held.len(),
-            MAX_CONTAINER_READ_CONNECTIONS,
-            "the extra connection must be dropped only once the cap is full"
-        );
+        match sealed_read_exchange(addr, &secret) {
+            Exchange::Dropped => {}
+            Exchange::Served => panic!("a connection past the cap was served"),
+            Exchange::Other(detail) => panic!("expected drop at the cap, got {detail}"),
+        }
 
         held.pop();
         let mut served_after_release = false;
