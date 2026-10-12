@@ -88,16 +88,19 @@ impl ApiState {
     /// Called on authentication before insertion; no task or store I/O is needed.
     /// Inactivity uses the same bound as the session cookie. A request owning an
     /// Arc (including one queued on the mutex) cannot lose its single-flight owner.
-    pub(super) fn sweep_auth_sessions(&self) {
+    pub(super) fn sweep_auth_sessions(&self, now: Instant) {
         let Ok(mut swept_at) = self.auth_sessions_swept_at.try_lock() else {
             return;
         };
-        if swept_at.is_some_and(|at| at.elapsed() < super::AUTH_SESSION_SWEEP_INTERVAL) {
+        if swept_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < super::AUTH_SESSION_SWEEP_INTERVAL
+        }) {
             return;
         }
-        *swept_at = Some(Instant::now());
-        self.retired_auth_sessions
-            .retain(|_, retired_at| retired_at.elapsed() < super::AUTH_SESSION_TOMBSTONE_TTL);
+        *swept_at = Some(now);
+        self.retired_auth_sessions.retain(|_, retired_at| {
+            now.saturating_duration_since(*retired_at) < super::AUTH_SESSION_TOMBSTONE_TTL
+        });
         self.auth_sessions.retain(|_, entry| {
             if Arc::strong_count(entry) != 1 {
                 return true;
@@ -106,11 +109,13 @@ impl ApiState {
                 return true;
             };
             let expired = if auth.dead {
-                auth.dead_since
-                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_DEAD_TTL)
+                auth.dead_since.is_some_and(|at| {
+                    now.saturating_duration_since(at) >= super::AUTH_SESSION_DEAD_TTL
+                })
             } else {
-                auth.last_used
-                    .is_some_and(|at| at.elapsed() >= super::AUTH_SESSION_IDLE_TTL)
+                auth.last_used.is_some_and(|at| {
+                    now.saturating_duration_since(at) >= super::AUTH_SESSION_IDLE_TTL
+                })
             };
             if expired {
                 auth.retire();
