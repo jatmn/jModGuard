@@ -27,9 +27,11 @@ require_absent() {
   fi
 }
 
-# test_license_is_polyform_noncommercial
-require_contains LICENSE.md "PolyForm Noncommercial License 1.0.0"
-require_contains Cargo.toml "LicenseRef-PolyForm-Noncommercial-1.0.0"
+# test_license_is_apache_with_commons_clause
+require_contains LICENSE.md '"Commons Clause" License Condition v1.0'
+require_contains LICENSE.md "License: Apache License 2.0"
+require_contains LICENSE.md "Software: jModGuard"
+require_contains Cargo.toml "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 # test_install_guide_is_public_and_lists_deferred_checks
 require_contains docs/INSTALL.md "without the private"

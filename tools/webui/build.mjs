@@ -21,7 +21,7 @@ const bundle = buildSync({
   define: { "process.env.NODE_ENV": '"production"' },
   legalComments: "inline",
 });
-// Preserve dependency license text inside the existing assets, not new files.
+// Preserve project and dependency license text inside the existing assets.
 function licenseText(directory) {
   const name = fs.readdirSync(directory).find((name) => /^licen[cs]e(?:\.(?:md|txt))?$/i.test(name));
   if (!name) throw new Error("Missing dependency license: " + directory);
@@ -37,7 +37,8 @@ for (const [file, emitted] of Object.entries(bundle.metafile.outputs)) {
   }
   const notices = [...packages].sort().map((directory) =>
     "/*! " + path.relative(root, directory) + "\n" + licenseText(directory) + "\n*/").join("\n");
-  fs.appendFileSync(path.join(root, file), "\n" + notices + "\n");
+  const projectNotice = "/*! jModGuard\n" + licenseText(root) + "\n*/";
+  fs.appendFileSync(path.join(root, file), "\n" + projectNotice + "\n" + notices + "\n");
 }
 const daisyui = fileURLToPath(import.meta.resolve("daisyui/daisyui.css"));
 const css = buildSync({

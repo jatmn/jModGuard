@@ -4,9 +4,9 @@
 # CVE advisories on the fail-open path; cargo-audit operational failures still fail the job.
 # Scheduled builds fail closed so the advisory is visible.
 #
-# The root workspace uses LicenseRef-PolyForm-Noncommercial-1.0.0 and is not
-# published to crates.io. Ignore unpublished workspace crates; third-party
-# crates still go through the allow list.
+# jModGuard uses Apache 2.0 with Commons Clause 1.0 (a custom LicenseRef).
+# Ignore workspace crates marked publish = false; the root crate and
+# third-party crates still go through the allow list.
 
 [graph]
 all-features = true
@@ -19,7 +19,7 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "ISC",
-    "LicenseRef-PolyForm-Noncommercial-1.0.0",
+    "LicenseRef-Apache-2.0-with-Commons-Clause-1.0",
     "MIT",
     "MPL-2.0",
     "OpenSSL",
