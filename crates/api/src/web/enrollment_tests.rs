@@ -325,6 +325,22 @@ impl Fixture {
             path,
         }
     }
+    fn use_writer_link(&mut self, target: std::net::SocketAddr) {
+        let mut cfg = (*self.app.cfg).clone();
+        cfg.db.path = self.path.clone();
+        cfg.bot.control_target = target.to_string();
+        cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+        let db = db::Db::open_with(cfg.db_open_options()).unwrap();
+        assert!(db.is_read_only());
+        let mut app = ApiState::new(cfg, db).unwrap();
+        let oauth = Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth).unwrap();
+        oauth.guilds_endpoint = self.app.oauth.guilds_endpoint.clone();
+        oauth.token_endpoint = self.app.oauth.token_endpoint.clone();
+        oauth.me_endpoint = self.app.oauth.me_endpoint.clone();
+        tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
+        self.router = router_with_store(Arc::clone(&app), self.store.clone());
+        self.app = app;
+    }
     async fn request(
         &self,
         method: &str,
@@ -1980,6 +1996,115 @@ async fn action_requests_require_ids_reject_forged_authority_and_report_expiry()
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_key_errors_survive_the_bot_control_link() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let mut cfg = crate::config::BotProcessConfig::default();
+    cfg.db.path = f.path.clone();
+    cfg.bot.control_bind = "127.0.0.1:0".into();
+    cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+    let bot = jmodguard_bot::state::BotState::new(cfg, f.app.db.clone()).unwrap();
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let target = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .unwrap();
+    f.use_writer_link(target);
+    for (key, status, code) in [
+        (
+            format!("{}_old", chrono::Utc::now().timestamp() - 10 * 86400),
+            StatusCode::GONE,
+            "action_request_expired",
+        ),
+        (
+            "invalid".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "action_request_invalid",
+        ),
+    ] {
+        let (actual, body) = f
+            .request(
+                "POST",
+                "/api/guilds/10/unban",
+                &serde_json::json!({"request_id":key,"user_id":"99"}).to_string(),
+            )
+            .await;
+        assert_eq!(actual, status, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+    }
+    assert!(
+        db::recent_bot_actions(&bot.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_errors_from_legacy_or_future_control_peers_stay_generic() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.use_writer_link(listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        for code in [None, Some("future_action_error")] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap();
+            let mut request = vec![0; length as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            let (op, _, _, _) = jmodguard::control::open_frame(
+                &"x".repeat(32).into_bytes(),
+                &request,
+                &std::sync::Mutex::new(jmodguard::control::NonceWindow::new()),
+            )
+            .unwrap();
+            assert!(matches!(op, db::ControlOp::EnqueueBotAction { .. }));
+            // This is the old wire shape, not serialization of the new reply type.
+            // Recognizable text must not substitute for a known error code.
+            let mut reply = serde_json::json!({
+                "status":"failed",
+                "message":"Server membership changed. Reload before making a new request.",
+            });
+            if let Some(code) = code {
+                reply["code"] = code.into();
+            }
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    for _ in 0..2 {
+        let (status, body) = f
+            .request(
+                "POST",
+                "/api/guilds/10/unban",
+                &serde_json::json!({"request_id":action_key("compat"),"user_id":"99"}).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.get("code").is_none(), "{body}");
+        assert_eq!(
+            body["error"],
+            "Could not queue action. Check pending actions and retry using the same request ID."
+        );
+    }
+    peer.await.unwrap();
 }
 
 #[tokio::test]

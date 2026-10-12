@@ -238,7 +238,9 @@ impl ApiState {
             db::ControlReply::StillWaiting => {
                 anyhow::bail!("{}", jmodguard::control::OUTCOME_UNKNOWN)
             }
-            db::ControlReply::Failed { message } => anyhow::bail!(message),
+            db::ControlReply::Failed { message, code } => {
+                Err(jmodguard::control::failure_error(message, code.as_deref()))
+            }
         }
     }
 }

@@ -296,12 +296,20 @@ pub enum ControlOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControlReply {
-    Saved { body: serde_json::Value },
-    Unchanged { body: serde_json::Value },
+    Saved {
+        body: serde_json::Value,
+    },
+    Unchanged {
+        body: serde_json::Value,
+    },
     Waiting,
     Busy,
     StillWaiting,
-    Failed { message: String },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +737,7 @@ async fn apply_control_inner(
             saved_null()
         }
         ControlOp::LookupResult => Ok(ControlReply::Failed {
+            code: None,
             message: crate::control::OUTCOME_UNKNOWN.into(),
         }),
         ControlOp::RecordComponentFailure {

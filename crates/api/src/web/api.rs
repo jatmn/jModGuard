@@ -1218,14 +1218,11 @@ pub(super) async fn enqueue_action(
         })
         .await
         .map_err(|error| {
-            if error.is::<db::EnrollmentChanged>()
-                || error.to_string().contains("Server membership changed")
-            {
+            if error.is::<db::EnrollmentChanged>() {
                 return ApiError(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
             }
             if error.is::<db::EnrollmentUnverified>()
                 || error.is::<crate::bot_actions::RequestKeyError>()
-                || error.to_string().contains("could not be verified")
             {
                 return ApiError(error);
             }
