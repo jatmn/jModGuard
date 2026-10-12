@@ -64,11 +64,14 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
 // SQLite's open error also covers permissions and invalid paths. Retry only
 // confirmed absence of the final entry, not a dangling symlink or missing parent.
 fn local_database_is_missing(path: &Path) -> bool {
+    // Inspect the raw final component: Path::parent normalizes a trailing `/.`,
+    // but the filesystem still treats it as a directory, never a database file.
     if path
         .as_os_str()
         .as_encoded_bytes()
-        .last()
-        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+        .rsplit(|byte| std::path::is_separator(char::from(*byte)))
+        .next()
+        .is_some_and(|component| component.is_empty() || component == b".")
     {
         return false;
     }
@@ -441,6 +444,7 @@ mod tests {
             corrupt.join("app.db"),
             root.clone(),
             root.join("absent.db/"),
+            root.join("absent.db/."),
             corrupt,
             foreign,
         ] {
