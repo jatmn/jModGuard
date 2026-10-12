@@ -1296,6 +1296,7 @@ function applyConfigPatch(res) {
       row.guild_override = patch.value;
       row.effective = patch.value ?? row.global;
     }
+    if (custom) row.name = row.effective.name;
     return true;
   }
   if (patch.kind === "badword") {

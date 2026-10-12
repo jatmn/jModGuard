@@ -2790,6 +2790,47 @@ test('appearance retains the session choice across startup and workspace when st
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });
 
+test('custom rule rename updates the card heading after save without reloading', async () => {
+  const id = 'custom:0123456789abcdef';
+  const calls = [];
+  let acknowledge;
+  const h = harness(async (url, options) => {
+    calls.push({ url, method: options.method, body: JSON.parse(options.body) });
+    assert.equal(options.method, 'PUT');
+    assert.ok(url.endsWith(`/rules/${id}`));
+    return new Promise(resolve => { acknowledge = resolve; });
+  });
+  const rule = {
+    name: 'Original name', enabled: true, dry_run: true,
+    params: { kind: 'pattern', pattern: 'scam' },
+    actions: [{ at: 1, action: 'delete', duration_minutes: 0, delete_days: 0, reason: '' }],
+  };
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    rules: [{ rule_id: id, name: rule.name, effective: rule, guild_override: rule, global: null }],
+  };
+  h.app.navigate('rules');
+  const heading = () => h.document.querySelector('#content .rule-heading h3').textContent;
+  assert.equal(heading(), 'Original name');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  const modal = h.document.querySelector('.modal-overlay');
+  const nameField = [...modal.querySelectorAll('.field')].find(n => n.querySelector('label')?.textContent === 'Name');
+  const name = nameField.querySelector('input');
+  name.value = 'Renamed rule';
+  await fire(name, 'input');
+  assert.equal(heading(), 'Original name');
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(calls[0].body.data.name, 'Renamed rule');
+  assert.equal(heading(), 'Original name');
+  acknowledge(response({ ok: true, config_patch: { kind: 'rule', id, scope: 'guild', value: calls[0].body.data } }));
+  await settle();
+  assert.equal(h.document.querySelector('.modal-overlay'), null);
+  assert.equal(heading(), 'Renamed rule');
+  assert.equal(calls.length, 1, 'the acknowledged patch must not need a configuration reload');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  assert.equal(h.document.querySelector('.modal-overlay h3').textContent, 'Edit custom rule: Renamed rule');
+});
+
 test('honeypot switch shows the kick action that save submits', async () => {
   const calls = [];
   const h = harness(async (_url, options) => {
