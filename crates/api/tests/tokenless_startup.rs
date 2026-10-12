@@ -13,7 +13,7 @@ fn tmp_db_path(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn api_process_waits_for_first_boot_without_a_discord_bot_token() {
+async fn api_process_waits_for_first_boot_with_overlapping_read_bind_without_a_bot_token() {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let root = tmp_db_path("tokenless_api").with_extension("");
@@ -42,6 +42,9 @@ async fn api_process_waits_for_first_boot_without_a_discord_bot_token() {
         child: Command::new(env!("CARGO_BIN_EXE_jmodguard-api"))
             .env_clear()
             .env("JMODGUARD_CONFIG", &config)
+            // A valid key makes the private listener actually attempt the same bind.
+            .env("JMODGUARD_CONTROL_SECRET", "x".repeat(32))
+            .env("JMODGUARD_READ_BIND", address.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
