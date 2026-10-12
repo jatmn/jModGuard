@@ -863,6 +863,18 @@ pub trait SqlExecutor {
 
     fn record_config_version(&self, version: u64);
 
+    /// Shared identity memo for this executor's connection.
+    ///
+    /// The memo type is available through the public database facade:
+    ///
+    /// ```
+    /// use jmodguard::db::{SchemaVerification, SqlExecutor};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// fn verification_slot(executor: &impl SqlExecutor) -> Arc<Mutex<Option<SchemaVerification>>> {
+    ///     executor.schema_verification_slot()
+    /// }
+    /// ```
     fn schema_verification_slot(&self) -> Arc<Mutex<Option<SchemaVerification>>>;
 }
 
