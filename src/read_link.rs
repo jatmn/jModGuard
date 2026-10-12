@@ -11,8 +11,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub const CONTAINER_READ_PATH: &str = "/private/container-use";
 pub const CONTAINER_READ_DIRECTION: &str = "api-container-read";
@@ -23,6 +24,9 @@ pub const STATS_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
 const DEFAULT_READ_BIND: &str = "127.0.0.1:8083";
+/// In-flight private reads. Each one holds a blocking thread until its socket
+/// timeout, so a local flood must not be able to grow that set without bound.
+const MAX_CONTAINER_READ_CONNECTIONS: usize = 4;
 
 #[derive(Clone)]
 pub struct ReadLink {
@@ -123,6 +127,7 @@ pub fn spawn_container_read_listener(bind: &str, secret: &str) -> Option<SocketA
         "container read listener on http://{bound}{path}",
         path = CONTAINER_READ_PATH
     );
+    let permits = Arc::new(Semaphore::new(MAX_CONTAINER_READ_CONNECTIONS));
     tokio::spawn(async move {
         let listener =
             tokio::net::TcpListener::from_std(listener).expect("container read listener transport");
@@ -130,8 +135,14 @@ pub fn spawn_container_read_listener(bind: &str, secret: &str) -> Option<SocketA
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        tracing::debug!("container read connection dropped: concurrency limit");
+                        drop(stream);
+                        continue;
+                    };
                     let key = key.clone();
                     tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         let stream = match stream.into_std() {
                             Ok(stream) => stream,
                             Err(error) => {
@@ -534,5 +545,97 @@ mod tests {
         body.extend_from_slice(&json);
         let nonces = Mutex::new(NonceWindow::new());
         assert!(open_read(&key, &body, &nonces).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_read_listener_drops_connections_over_the_concurrency_limit() {
+        let secret = "c".repeat(32);
+        let addr = spawn_container_read_listener("127.0.0.1:0", &secret).expect("listener");
+        crate::set_process_ready(true);
+        struct ClearReady;
+        impl Drop for ClearReady {
+            fn drop(&mut self) {
+                crate::set_process_ready(false);
+            }
+        }
+        let _clear_ready = ClearReady;
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Fill the slots without successful probes: response EOF can arrive
+        // before a probe's blocking handler releases its permit.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONTAINER_READ_CONNECTIONS {
+            let stream = TcpStream::connect(addr).expect("slow connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            held.push(stream);
+        }
+        match sealed_read_exchange(addr, &secret) {
+            Exchange::Dropped => {}
+            Exchange::Served => panic!("a connection past the cap was served"),
+            Exchange::Other(detail) => panic!("expected drop at the cap, got {detail}"),
+        }
+
+        held.pop();
+        let mut served_after_release = false;
+        for _ in 0..20 {
+            if matches!(sealed_read_exchange(addr, &secret), Exchange::Served) {
+                served_after_release = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            served_after_release,
+            "a connection under the cap must still return container use"
+        );
+    }
+
+    enum Exchange {
+        Served,
+        Dropped,
+        Other(String),
+    }
+
+    fn sealed_read_exchange(addr: SocketAddr, secret: &str) -> Exchange {
+        let started = std::time::Instant::now();
+        let result = (|| -> std::io::Result<String> {
+            let body = seal_read(secret.as_bytes()).expect("seal");
+            let mut stream = TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(Duration::from_millis(400)))?;
+            stream.set_write_timeout(Some(Duration::from_millis(400)))?;
+            let headers = format!(
+                "POST {CONTAINER_READ_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(headers.as_bytes())?;
+            stream.write_all(&body)?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        })();
+        let elapsed = started.elapsed();
+        match result {
+            Ok(text) if text.contains("HTTP/1.1 200") => Exchange::Served,
+            Ok(text) if elapsed < Duration::from_millis(400) && !text.contains("HTTP/1.1") => {
+                Exchange::Dropped
+            }
+            Err(error)
+                if elapsed < Duration::from_millis(400)
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::NotConnected
+                    ) =>
+            {
+                Exchange::Dropped
+            }
+            Ok(text) => Exchange::Other(format!("status after {elapsed:?}: {text}")),
+            Err(error) => Exchange::Other(format!("{error} after {elapsed:?}")),
+        }
     }
 }
