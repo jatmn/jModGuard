@@ -868,7 +868,7 @@ async fn copy_guild_config_inner(
                 let replacement = prepare_copied_rules(dst, rows)?;
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 insert_copied_rules(dst, &replacement, |sql, args, rows| {
-                    tx.execute_rows(sql, params_from_iter(args), rows)
+                    tx.execute_insert_batch(sql, params_from_iter(args), rows)
                 })?;
             } else {
                 for (id, rule) in &rows {
