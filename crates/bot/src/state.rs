@@ -229,11 +229,8 @@ impl GatewayCaseSuppressions {
 
     fn clear_ban_echo(&mut self, guild: u64, user: u64) {
         self.recent_ban_echo.remove(&(guild, user));
-        // A delayed callback must not consume an older pending ban token and
-        // restore ownership after this unban. Later dispatches get new tokens.
-        self.entries.retain(|_, entry| {
-            entry.action != GatewayCaseAction::Ban || entry.guild != guild || entry.user != user
-        });
+        // Pending tokens may belong to a newer dispatch that started before
+        // this unban callback. Only consumed echo ownership ends here.
     }
 }
 
@@ -1671,26 +1668,33 @@ mod tests {
     }
 
     #[test]
-    fn unban_invalidates_only_older_ban_tokens_for_its_member() {
+    fn unban_preserves_pending_ban_dispatches_for_its_member() {
         let mut s = GatewayCaseSuppressions::default();
-        let old_a = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-a".into()));
-        let old_b = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-b".into()));
+        let old = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-attempt".into()));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        // The next dispatch can start before the preceding unban callback.
+        s.insert(GatewayCaseAction::Ban, 10, 20, Some("new-attempt".into()));
         s.insert(GatewayCaseAction::Unban, 10, 20, None);
         s.insert(GatewayCaseAction::Ban, 10, 21, Some("other-member".into()));
         s.insert(GatewayCaseAction::Ban, 11, 20, Some("other-guild".into()));
         s.clear_ban_echo(10, 20);
-        assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(s.ban_echo_operation(10, 20).is_none());
-        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
-        assert!(s.remove(GatewayCaseAction::Ban, 10, 21));
-        assert!(s.remove(GatewayCaseAction::Ban, 11, 20));
-        s.insert(GatewayCaseAction::Ban, 10, 20, Some("new-attempt".into()));
-        s.release(old_a);
-        s.release(old_b);
+        s.release(old);
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert_eq!(
             s.ban_echo_operation(10, 20),
             Some(Some("new-attempt".into()))
+        );
+        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 21));
+        assert!(s.remove(GatewayCaseAction::Ban, 11, 20));
+        s.clear_ban_echo(10, 20);
+        s.insert(GatewayCaseAction::Ban, 10, 20, Some("later-attempt".into()));
+        s.release(old);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert_eq!(
+            s.ban_echo_operation(10, 20),
+            Some(Some("later-attempt".into()))
         );
     }
 
