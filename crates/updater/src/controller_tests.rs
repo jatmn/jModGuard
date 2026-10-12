@@ -2698,6 +2698,258 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
     }
 }
 
+/// Historical desired rows omit `upgrade`. Migration keeps them queued; the
+/// next updater pass must refuse each one and later passes must leave it.
+#[tokio::test]
+async fn stale_schema_selections_without_upgrade_are_refused_once_after_migration() {
+    let root = std::env::temp_dir().join(format!(
+        "stale-schema-selection-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let next_bot = executable(&root, "next-bot").await;
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
+    db.with_conn({
+        let fixture = fixture.clone();
+        move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
+                 DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
+                 DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
+                 PRAGMA user_version=16;",
+                1024 * 1024,
+            )?;
+            for row in fixture["component_updates"].as_array().unwrap() {
+                for (column, value) in row.as_object().unwrap() {
+                    if column == "component" {
+                        continue;
+                    }
+                    let sql =
+                        format!("UPDATE component_updates SET {column}=?1 WHERE component=?2");
+                    let value = match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(value) => Some(value.clone()),
+                        value => Some(value.to_string()),
+                    };
+                    tx.execute_bounded(
+                        &sql,
+                        params![value, row["component"].as_str().unwrap()],
+                        64 * 1024,
+                    )?;
+                }
+            }
+            for (key, value) in fixture["meta"].as_object().unwrap() {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                db::write_meta_string_conn(&tx, key, &value)?;
+            }
+            tx.commit()
+        }
+    })
+    .await
+    .unwrap();
+    let raw_desired = db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let mut rows = Vec::new();
+            for role in ["bot", "api"] {
+                let raw: String = tx.query_row(
+                    "SELECT desired FROM component_updates WHERE component=?1",
+                    params![role],
+                    |row| Ok(row.get(0)?),
+                )?;
+                rows.push(raw);
+            }
+            tx.finish_read()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    for raw in &raw_desired {
+        let parsed: ComponentRelease = serde_json::from_str(raw).unwrap();
+        assert_ne!(serde_json::to_string(&parsed).unwrap(), *raw);
+        assert!(parsed.upgrade.is_none(), "{raw}");
+        assert_eq!(parsed.max_schema, 15, "{raw}");
+    }
+    drop(db);
+    let opts = DbOpenOptions {
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        read_only: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    assert_eq!(control.schema_version().await.unwrap(), 16);
+    let mut bot = controller(
+        "bot",
+        baked.clone(),
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    for role in ["bot", "api"] {
+        let contract = control
+            .baked_compatibility(role, &bot.base_sha, true)
+            .await
+            .unwrap();
+        assert_eq!(contract.core, db::CORE_SCHEMA_VERSION);
+        if role == "bot" {
+            bot.baked_compatibility = contract;
+        }
+    }
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    tokio::fs::write(root.join("hold-baked-bot-ready"), "")
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    assert!(bot.running.is_some());
+    let migrated = Db::open(&path, 2).unwrap();
+    assert_eq!(
+        control.schema_version().await.unwrap(),
+        db::CORE_SCHEMA_VERSION
+    );
+    api.tick().await.unwrap();
+    assert!(api.running.is_some());
+    tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bot.reported || !api.reported {
+        assert!(Instant::now() < deadline);
+        bot.report_ready().await.unwrap();
+        api.report_ready().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for role in ["bot", "api"] {
+        let queued = control.component(role).await.unwrap();
+        assert!(
+            queued.desired.is_some(),
+            "{role} queue cleared during migration"
+        );
+        assert_eq!(queued.state, "queued", "{role}");
+        assert!(queued.installed.is_none(), "{role}");
+    }
+    assert!(!bot.tick().await.unwrap());
+    assert!(!api.tick().await.unwrap());
+    let mut refused_at = Vec::new();
+    for role in ["bot", "api"] {
+        let row = control.component(role).await.unwrap();
+        assert!(
+            row.desired.is_none(),
+            "{role} selection was rechecked without settling"
+        );
+        assert_eq!(row.state, "failed", "{role}");
+        let error = row.last_error.unwrap();
+        assert!(
+            error.contains("candidate cannot open current database schema"),
+            "{role}: {error}"
+        );
+        refused_at.push(error);
+        assert!(row.installed.is_none(), "{role}");
+    }
+    let bot_pid = bot.running.as_ref().unwrap().child.id();
+    let api_pid = api.running.as_ref().unwrap().child.id();
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert!(api.running.as_ref().unwrap().release.is_none());
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(!api.tick().await.unwrap());
+    }
+    assert_eq!(bot.running.as_ref().unwrap().child.id(), bot_pid);
+    assert_eq!(api.running.as_ref().unwrap().child.id(), api_pid);
+    for (role, error) in ["bot", "api"].into_iter().zip(refused_at) {
+        let row = control.component(role).await.unwrap();
+        assert!(row.desired.is_none(), "{role}");
+        assert_eq!(row.state, "failed", "{role}");
+        assert_eq!(row.last_error.as_deref(), Some(error.as_str()), "{role}");
+    }
+
+    let mut objects = HashMap::new();
+    let bytes = tokio::fs::read(&next_bot).await.unwrap();
+    let mut release = image(&mut objects, "bot", &bytes);
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    bot.registry = registry;
+    control
+        .checked("bot", "latest", Some(release.clone()), None, now())
+        .await
+        .unwrap();
+    let install_db = Db::open(&path, 2).unwrap();
+    db::request_component_install(&install_db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    let apply_deadline = Instant::now() + Duration::from_secs(10);
+    while control
+        .component("bot")
+        .await
+        .unwrap()
+        .installed
+        .as_ref()
+        .map(|installed| &installed.digest)
+        != Some(&release.digest)
+    {
+        assert!(
+            Instant::now() < apply_deadline,
+            "compatible selection did not apply"
+        );
+        assert!(!bot.tick().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let applied = control.component("bot").await.unwrap();
+    assert_eq!(applied.state, "running");
+    assert_eq!(applied.installed.unwrap().digest, release.digest);
+    assert_eq!(applied.desired.unwrap().digest, release.digest);
+    assert!(applied.last_error.is_none());
+    assert_ne!(bot.running.as_ref().unwrap().child.id(), bot_pid);
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        release.digest
+    );
+    assert_eq!(api.running.as_ref().unwrap().child.id(), api_pid);
+    assert!(control.component("api").await.unwrap().desired.is_none());
+    bot.stop_application().await.unwrap();
+    api.stop_application().await.unwrap();
+    server.abort();
+    drop((api, bot, control, migrated, install_db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
 #[tokio::test]
 async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
