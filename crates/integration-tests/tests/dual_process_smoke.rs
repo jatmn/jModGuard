@@ -178,6 +178,7 @@ async fn smoke_dual_process_config_sync() {
             .commit_actor(
                 1,
                 db::ControlOp::UpsertRule {
+                    clear_guild_override: false,
                     request: scope.clone(),
                     target: scope,
                     id: custom_id.clone(),

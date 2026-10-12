@@ -1492,6 +1492,48 @@ pub async fn upsert_enrolled_rule(
     .await
 }
 
+/// The global rule editor's save and override clear are one captured mutation.
+pub async fn upsert_global_rule_and_clear_enrolled_override(
+    db: &Db,
+    request: ConfigurationScope,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    anyhow::ensure!(
+        request.guild_id() > 0,
+        "override clearing requires a server"
+    );
+    anyhow::ensure!(
+        crate::custom_rules::known_rule_id(id) && !crate::custom_rules::is_custom_id(id),
+        "global rule must be built-in"
+    );
+    crate::image_spam::validate_rule(id, rule)?;
+    let global = ConfigurationWriteScope::new(request.clone(), ConfigurationScope::Global)?;
+    let guild = ConfigurationWriteScope::new(request.clone(), request)?;
+    let id = id.to_owned();
+    let json = serde_json::to_string(rule)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        global.verify_conn(&tx)?;
+        // The global target's check alone does not cover the guild write fence.
+        guild.verify_conn(&tx)?;
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, ?1, ?2)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![id.as_str(), json],
+            1,
+        )?;
+        tx.execute_reclaim(
+            "DELETE FROM rules WHERE guild_id = ?1 AND rule_id = ?2",
+            params![guild.guild_id(), id.as_str()],
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 async fn upsert_enrolled_custom_rule(
     db: &Db,
     scope: ConfigurationWriteScope,

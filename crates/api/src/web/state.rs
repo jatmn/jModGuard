@@ -224,6 +224,9 @@ impl ApiState {
                     db::ControlReply::Failed {
                         code: Some(code), ..
                     } if code == "save_unknown" => Err(super::save::SaveError::Unknown.into()),
+                    db::ControlReply::Failed {
+                        code: Some(code), ..
+                    } if code == "save_expired" => Err(super::save::SaveError::Expired.into()),
                     reply => Ok(reply),
                 };
             }

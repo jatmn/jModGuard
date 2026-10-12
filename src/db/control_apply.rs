@@ -54,6 +54,8 @@ pub enum ControlOp {
         target: ScopeWire,
         id: String,
         rule: RuleDef,
+        #[serde(default)]
+        clear_guild_override: bool,
     },
     DeleteRule {
         request: ScopeWire,
@@ -554,8 +556,18 @@ async fn apply_control_inner(
             target,
             id,
             rule,
+            clear_guild_override,
         } => {
-            upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?;
+            if clear_guild_override {
+                anyhow::ensure!(
+                    target.global,
+                    "override clearing requires a global rule target"
+                );
+                upsert_global_rule_and_clear_enrolled_override(db, scope_of(request)?, &id, &rule)
+                    .await?;
+            } else {
+                upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?;
+            }
             saved_null()
         }
         ControlOp::DeleteRule {

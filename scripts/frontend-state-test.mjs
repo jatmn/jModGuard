@@ -1661,7 +1661,8 @@ for (const kind of ['rule', 'command']) {
 
 async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const calls = [];
-  const failures = { put: false, delete: false, refresh: false };
+  const failures = { put: false, lost: false, refresh: false };
+  let receipt;
   let globalRule = { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] };
   let guildRule = override ? structuredClone(globalRule) : null;
   const snapshot = () => ({ rules: [{
@@ -1670,14 +1671,17 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   }] });
   const h = harness(async (url, options) => {
     const body = options.body && JSON.parse(options.body);
-    calls.push({ url, method: options.method, body });
+    calls.push({ url, method: options.method, body, headers: options.headers });
     if (options.method === 'PUT') {
+      if (options.headers['x-jmodguard-save-lookup'] === '1' && receipt) return response(receipt);
       if (failures.put) throw new Error('write refused');
       if (body.scope === 'global') globalRule = body.data;
       else guildRule = body.data;
-      return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data } });
+      if (body.clear_guild_override) guildRule = null;
+      receipt = { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
+      if (failures.lost) throw new Error('lost acknowledgement');
+      return response(receipt);
     } else if (options.method === 'DELETE') {
-      if (failures.delete) throw new Error('cleanup unavailable');
       guildRule = null;
       return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: 'guild', value: null } });
     } else {
@@ -1696,46 +1700,42 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const enabled = findNode(modal, (n) => n.getAttribute("type") === 'checkbox');
   const save = findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save');
   const cancel = findNode(modal, (n) => n.textContent === 'Cancel');
-  return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot };
+  return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot, replaceOverride: rule => { guildRule = rule; } };
 }
 
-test('global rule partial success reconciles the committed value before navigation', async () => {
-  const h = await ruleSaveHarness();
-  h.failures.delete = true;
+test('recovered global rule save preserves a newer guild override without another mutation', async () => {
+  const h = await ruleSaveHarness({override: true});
+  h.failures.lost = true;
   await fire(h.enabled, 'change', { target: { checked: false } });
-  await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
-  assert.equal(h.snapshot().rules[0].effective.enabled, false);
-  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
-  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
-  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
-  assert.match(h.nodes.get('#toast').className, /error/);
-  await fire(h.cancel, 'click', {});
-  h.app.navigate('rules');
-  assert.match(textOf(h.content), /disabled/);
+  await fire(h.save, 'click');
+  assert.equal(h.modal.isConnected, true);
+  const newer = {...h.snapshot().rules[0].global, enabled: true, name: 'newer override'};
+  h.replaceOverride(newer);
+  await fire(h.save, 'click');
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST']);
+  assert.equal(h.calls[1].headers['x-jmodguard-save-lookup'], '1');
+  assert.equal(h.calls[1].headers['x-jmodguard-save'], h.calls[0].headers['x-jmodguard-save']);
+  assert.equal(h.app.state.config.rules[0].guild_override.name, 'newer override');
+  assert.equal(h.app.state.config.rules[0].effective.enabled, true);
   assert.equal(h.app.isBusy(), false);
 });
 
-test('global rule partial success with failed reconciliation stays unavailable through Retry', async () => {
+test('recovered global rule save with failed reconciliation stays unavailable through Retry', async () => {
   const h = await ruleSaveHarness();
-  h.failures.delete = h.failures.refresh = true;
+  h.failures.lost = h.failures.refresh = true;
   await fire(h.enabled, 'change', { target: { checked: false } });
-  await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
+  await fire(h.save, 'click');
+  await fire(h.save, 'click');
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST']);
   assert.equal(h.app.state.config, null);
   assert.match(textOf(h.content), /Configuration unavailable/);
-  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
-  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
-  assert.match(h.nodes.get('#toast').textContent, /Retry/);
   assert.equal(h.app.isBusy(), false);
-  assert.equal(h.modal.isConnected, false);
-  assertAccessible(findNode(h.content, n => n.textContent === 'Retry'));
   h.failures.refresh = false;
-  const retry = findNode(h.content, (n) => n.textContent === 'Retry');
-  await fire(retry, 'click', {});
+  const retry = findNode(h.content, n => n.textContent === 'Retry');
+  assertAccessible(retry);
+  await fire(retry, 'click');
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
-  assert.match(textOf(h.content), /disabled/);
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST', 'POST']);
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST', 'POST']);
 });
 
 test('a refused rule PUT retains the checkbox draft and never deletes an override', async () => {
@@ -1755,13 +1755,13 @@ test('a refused rule PUT retains the checkbox draft and never deletes an overrid
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
 });
 
-test('a successful global rule save applies both acknowledgments without a config reload', async () => {
+test('a successful global rule save acknowledges both atomic effects without a config reload', async () => {
   const h = await ruleSaveHarness({ override: true });
   await fire(h.enabled, 'change', { target: { checked: false } });
   await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
   assert.equal(h.calls[0].body.scope, 'global');
-  assert.equal(h.calls[1].body.scope, 'guild');
+  assert.equal(h.calls[0].body.clear_guild_override, true);
   assert.equal(h.app.state.config.rules[0].guild_override, null);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.equal(h.modal.isConnected, false);
@@ -1964,6 +1964,40 @@ test('retrieved save refreshes configuration instead of appending its old patch 
   assert.equal(reads, 1, 'a historical acknowledgement must refresh the current configuration');
   assert.equal(h.app.state.config.badwords.length, 1);
   assert.equal(h.app.state.config.badwords[0].id, 7);
+});
+
+test('retrieved pre-apply expiry settles the save identity but uncertain failures retain it', async () => {
+  const calls = [], path = '/api/guilds/987654321098765432/badwords';
+  const h = harness(async (_, opts) => {
+    calls.push(opts);
+    if (calls.length === 1) throw new Error('lost acknowledgement');
+    if (calls.length === 2) return {ok: false, status: 409, headers: {get: () => null}, text: async () => JSON.stringify({code: 'save_expired', error: 'Save expired before it was applied.'})};
+    return response({ok: true, id: 9});
+  });
+  h.app.state.config = {enrollment_id: 'membership'};
+  const save = () => h.app.api(path, 'POST', {scope: 'guild', pattern: 'once'});
+  await assert.rejects(save(), /lost acknowledgement/);
+  assert.equal(h.session.size, 1);
+  await assert.rejects(save(), /expired/);
+  assert.equal(h.session.size, 0, 'the definitive non-applied result settles the identity');
+  await save();
+  assert.deepEqual(calls.map(c => c.headers['x-jmodguard-save-lookup']), ['0', '1', '0']);
+  assert.equal(calls[0].headers['x-jmodguard-save'], calls[1].headers['x-jmodguard-save']);
+  assert.notEqual(calls[1].headers['x-jmodguard-save'], calls[2].headers['x-jmodguard-save']);
+});
+
+test('an unclassified save failure retains identity even when its message says expired', async () => {
+  const calls = [];
+  const h = harness(async (_, opts) => {
+    calls.push(opts);
+    return {ok: false, status: 400, headers: {get: () => null}, text: async () => JSON.stringify({error: 'request expired'})};
+  });
+  const save = () => h.app.api('/api/guilds/987654321098765432/badwords', 'POST', {pattern: 'once'});
+  await assert.rejects(save(), /expired/);
+  await assert.rejects(save(), /expired/);
+  assert.equal(h.session.size, 1);
+  assert.deepEqual(calls.map(c => c.headers['x-jmodguard-save-lookup']), ['0', '1']);
+  assert.equal(calls[0].headers['x-jmodguard-save'], calls[1].headers['x-jmodguard-save']);
 });
 
 test('save identity cannot move to a replacement membership or dispatch without storage', async () => {

@@ -65,6 +65,7 @@ impl IntoResponse for ApiError {
             let (status, code) = match error {
                 save::SaveError::Pending => (StatusCode::ACCEPTED, "save_pending"),
                 save::SaveError::Unknown => (StatusCode::CONFLICT, "save_unknown"),
+                save::SaveError::Expired => (StatusCode::CONFLICT, "save_expired"),
             };
             return (
                 status,

@@ -868,6 +868,9 @@ async function submitSave(path, method, body, signal) {
     // current configuration instead of applying a historical patch again.
     return lookup ? { ...result, config_patch: null } : result;
   } catch (error) {
+    if (error.code === "save_expired") {
+      try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
+    }
     if (error.code === "save_unknown" && confirm("The earlier save may already have completed, but its result is unavailable. Have you checked the current configuration and want to clear this saved request? This will not submit another save.")) {
       window.sessionStorage.removeItem(key);
       throw new Error("Saved request cleared. Review the current configuration before saving again.");
@@ -1340,6 +1343,7 @@ function applyConfigPatch(res) {
     if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
     if (patch.scope === "global") {
       row.global = patch.value;
+      if (patch.cleared_guild_override) row.guild_override = null;
       if (!row.guild_override) row.effective = patch.value;
     } else {
       row.guild_override = patch.value;
@@ -2217,32 +2221,9 @@ function RuleEditor({ record: r }) {
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", {
               scope,
               data: rule,
+              clear_guild_override: scope === "global" && state.guildId !== "0",
             });
             const savedLocally = applyConfigPatch(saved);
-            if (scope === "global") {
-              try {
-                const cleared = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", {
-                  scope: "guild",
-                });
-                applyConfigPatch(cleared);
-              } catch (e) {
-                // The global write already committed. A failed second request must
-                // not leave the pre-save snapshot visible as current configuration.
-                const refreshed = await loadConfig();
-                if (refreshed) {
-                  closeOverlay();
-                  renderTab();
-                }
-                toast(
-                  `Global rule saved, but clearing this server's override could not be confirmed: ${e.message || String(e)}` +
-                    (refreshed
-                      ? ""
-                      : " Configuration refresh also failed. Use Retry to load the saved state."),
-                  "error",
-                );
-                return;
-              }
-            }
             if (!savedLocally && !(await loadConfig())) return;
             toast("Rule saved", "success");
             closeOverlay();

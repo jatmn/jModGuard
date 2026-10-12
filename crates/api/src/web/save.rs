@@ -45,6 +45,7 @@ pub(super) async fn middleware(request: Request, next: Next) -> Response {
 pub(super) enum SaveError {
     Pending,
     Unknown,
+    Expired,
 }
 
 impl std::fmt::Display for SaveError {
@@ -52,6 +53,9 @@ impl std::fmt::Display for SaveError {
         f.write_str(match self {
             Self::Pending => {
                 "Save accepted and still pending. Retry this save to check its result."
+            }
+            Self::Expired => {
+                "Save expired before it was applied. Save again to make a new attempt."
             }
             Self::Unknown => {
                 "Save outcome unavailable. Check the current configuration before saving again."

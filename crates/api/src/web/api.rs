@@ -290,6 +290,8 @@ pub async fn update_settings(
 pub struct RuleBody {
     scope: Option<String>,
     data: RuleDef,
+    #[serde(default)]
+    clear_guild_override: bool,
 }
 
 pub async fn get_rule(
@@ -352,6 +354,11 @@ pub async fn put_rule(
         jmodguard::custom_rules::validate_custom_rule_shape(scope, &rule_id, &body.data)
             .map_err(ApiError)?;
     }
+    if body.clear_guild_override && (scope != GLOBAL_SCOPE || guild_id == 0) {
+        return Err(ApiError(anyhow::anyhow!(
+            "override clearing requires a global rule save from a server"
+        )));
+    }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -361,6 +368,7 @@ pub async fn put_rule(
             target,
             id: rule_id.clone(),
             rule: body.data.clone(),
+            clear_guild_override: body.clear_guild_override,
         },
     )
     .await?;
@@ -371,6 +379,7 @@ pub async fn put_rule(
             "id": rule_id,
             "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
             "value": body.data,
+            "cleared_guild_override": body.clear_guild_override,
         }
     })))
 }

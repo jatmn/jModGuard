@@ -98,8 +98,18 @@ control identity binds the actor and complete captured operation, including memb
 and payload. Every HTTP attempt still passes the route's current permission checks.
 HTTP 202 `save_pending` keeps the draft and displays a pending notice; retrying the
 same save retrieves its acknowledgement without applying another write. Successful
-acknowledgement clears the browser identity. Network failures retain it, including
+acknowledgement clears the browser identity. HTTP 409 `save_expired` also settles it: the
+bot rejected this job before applying it, so the user can explicitly submit a new save
+with the unchanged draft. Transport errors and unclassified failures retain the identity;
+error text alone never proves that a write was not applied. Network failures retain it, including
 across page reloads. DELETE and the separately queued bot actions keep their existing contracts.
+
+The global rule editor sends `clear_guild_override: true` on its PUT from a server
+page. The bot writes the global rule and clears that captured server's override in
+one transaction and under one save identity. Both permission checks, membership,
+the server write fence and the configuration version update remain part of this
+operation. It sends no follow-up DELETE when retrieving an acknowledgement. Other
+PUT callers default to global-only behavior when the flag is absent.
 
 Results remain bounded and in memory on the bot (currently up to 4096 entries and
 two minutes). Eviction, a writer restart, or an unmatched lookup returns HTTP 409

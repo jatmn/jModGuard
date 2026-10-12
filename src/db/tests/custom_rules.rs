@@ -193,6 +193,7 @@ async fn apply_control_rejects_live_create_without_row() {
         joined_at_ns: enrollment.joined_at_ns,
     };
     let op = ControlOp::UpsertRule {
+        clear_guild_override: false,
         request: wire.clone(),
         target: wire,
         id: id.clone(),

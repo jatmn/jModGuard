@@ -179,7 +179,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                 not_the_writer()
             } else if control::now_ms() > job.expires_ms {
                 ControlReply::Failed {
-                    code: None,
+                    code: Some("save_expired".into()),
                     message: "request expired".into(),
                 }
             } else {
@@ -190,7 +190,7 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
                     not_the_writer()
                 } else if control::now_ms() > job.expires_ms {
                     ControlReply::Failed {
-                        code: None,
+                        code: Some("save_expired".into()),
                         message: "request expired".into(),
                     }
                 } else if let Some(rejected) = reject_unauthorized_control(decision) {
@@ -813,6 +813,7 @@ mod tests {
         let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
         let hold = bot.activation.hold_rule();
         let op = db::ControlOp::UpsertRule {
+            clear_guild_override: false,
             request: scope(&enrollment),
             target: db::ScopeWire {
                 global: true,
