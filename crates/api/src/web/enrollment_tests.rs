@@ -3657,12 +3657,12 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     // Refresh holds this exact mutex across token recovery. A sweep must not
     // replace its owner, even when its recorded activity has expired.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     drop(refreshing);
     // A loaded request queued on this Arc must also retain the same owner.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(Arc::ptr_eq(
         f.app.auth_sessions.get(&id).unwrap().value(),
         &entry
@@ -3670,7 +3670,7 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     let old_owner = Arc::downgrade(&entry);
     drop(entry);
     // The preceding sweep is rate-limited, even though the entry is now idle.
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     allow_coordinator_sweep(&f.app);
     // Exercise the production sweep trigger, then recreate from the live store.
@@ -3693,7 +3693,7 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     drop(entry);
     session.delete().await.unwrap();
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.is_empty());
 }
 
@@ -3727,7 +3727,7 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     assert_coordinator_payload_released(&entry).await;
     drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     let calls = f.discord.token_calls.load(Ordering::SeqCst);
     assert!(
@@ -3747,24 +3747,23 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     );
     drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.is_empty());
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     // Tombstone retirement metadata is independent of the 30-second payload marker.
-    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL - std::time::Duration::from_secs(1))
-        .unwrap();
+    // Advance the sweep time instead of subtracting days from Instant::now():
+    // a host with short uptime may not represent those past instants.
+    let retired_at = *f.app.retired_auth_sessions.get(&id).unwrap();
+    let expires_at = retired_at + AUTH_SESSION_TOMBSTONE_TTL;
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app
+        .sweep_auth_sessions(expires_at - std::time::Duration::from_secs(1));
     assert!(f.app.retired_auth_sessions.contains_key(&id));
-    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL)
-        .unwrap();
     // Rate limiting applies to the tombstone sweep too.
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(expires_at);
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(expires_at);
     assert!(!f.app.retired_auth_sessions.contains_key(&id));
 }
 
@@ -4008,7 +4007,7 @@ async fn retired_delayed_response_save_cannot_restore_authority() {
             );
             drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions();
+            f.app.sweep_auth_sessions(std::time::Instant::now());
         } else {
             let mut headers = HeaderMap::new();
             let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
@@ -4197,7 +4196,7 @@ async fn recovery_rejects_late_save(definitive_refusal: bool) {
             );
             drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions();
+            f.app.sweep_auth_sessions(std::time::Instant::now());
         } else {
             assert_eq!(
                 blocker_request(&f, "POST", "/logout", "").await.0,
@@ -4364,17 +4363,18 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
         assert!(
             revived.expiry_date >= retirement + CookieDuration::seconds(SESSION_INACTIVITY_SECS)
         );
-        // Advance both clocks consistently: retirement was seven days + one
-        // second ago; the late response saved two minutes after retirement.
+        // Sweep seven days + one second after retirement without subtracting
+        // days from the host clock. Model the matching store lifetime with 119
+        // seconds left from a response saved two minutes after retirement.
         // No request observes the restored row before the production sweep.
-        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1))
-            .unwrap();
+        let retired_at = *f.app.retired_auth_sessions.get(&id).unwrap();
+        let after_inactivity =
+            retired_at + AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1);
         revived.expiry_date =
             tower_sessions::cookie::time::OffsetDateTime::now_utc() + CookieDuration::seconds(119);
         f.store.save(&revived).await.unwrap();
         allow_coordinator_sweep(&f.app);
-        f.app.sweep_auth_sessions();
+        f.app.sweep_auth_sessions(after_inactivity);
         let calls = (
             f.discord.calls.load(Ordering::SeqCst),
             f.discord.token_calls.load(Ordering::SeqCst),
@@ -4403,11 +4403,10 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
         revived.expiry_date =
             tower_sessions::cookie::time::OffsetDateTime::now_utc() - CookieDuration::seconds(1);
         f.store.save(&revived).await.unwrap();
-        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(24 * 60 * 60 + 1))
-            .unwrap();
         allow_coordinator_sweep(&f.app);
-        f.app.sweep_auth_sessions();
+        f.app.sweep_auth_sessions(
+            retired_at + AUTH_SESSION_TOMBSTONE_TTL + std::time::Duration::from_secs(1),
+        );
         assert!(!f.app.retired_auth_sessions.contains_key(&id));
         assert!(f.store.load(&id).await.unwrap().is_none());
         let (status, body) = f.request("GET", "/api/service-upgrade", "").await;

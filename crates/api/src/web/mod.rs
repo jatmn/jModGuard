@@ -410,7 +410,7 @@ async fn require_auth_with(
     let id = session
         .id()
         .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
-    app.sweep_auth_sessions();
+    app.sweep_auth_sessions(std::time::Instant::now());
     // Hold the vacant tombstone entry through coordinator lookup/insertion.
     // Retirement cannot insert its fence and remove the coordinator between
     // this check and insertion. Release all map guards before awaiting.
