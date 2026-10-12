@@ -101,6 +101,18 @@ fn main() {{
     }};
     if !maintenance {{
         event("start");
+        let _health = if root.join("bind-health-{name}").exists() {{
+            let bind = std::fs::read_to_string(root.join("bind-health-{name}")).unwrap();
+            let listener = std::net::TcpListener::bind(&bind).unwrap();
+            let bound = root.join("health-bound-{name}");
+            let pending = bound.with_extension("tmp");
+            std::fs::write(&pending, listener.local_addr().unwrap().to_string()).unwrap();
+            std::fs::rename(pending, bound).unwrap();
+            while !root.join("exit-code-{name}").exists() && !STOP.load(Ordering::SeqCst) {{
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }}
+            Some(listener)
+        }} else {{ None }};
         if let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
             std::process::exit(code.trim().parse().unwrap());
         }}
@@ -2689,19 +2701,17 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
 #[tokio::test]
 async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let root = std::env::temp_dir().join(format!("token-hold-{:032x}", rand::random::<u128>()));
+    // Exercise direct executable launch with characters that require shell quoting.
+    let root = std::env::temp_dir().join(format!(
+        "token-hold-quoted ' path-{:032x}",
+        rand::random::<u128>()
+    ));
     tokio::fs::create_dir_all(&root).await.unwrap();
-    let script = root.join("rejected-bot");
-    tokio::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nexit {}\n",
-            jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE
-        ),
-    )
-    .await
-    .unwrap();
-    tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+    // Let the child allocate and retain its socket, avoiding a reserve/drop/bind
+    // race before the handoff. Its published address configures both processes.
+    let child = executable(&root, "health-bot").await;
+    let bind_request = root.join("bind-health-health-bot");
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
         .await
         .unwrap();
     let opts = DbOpenOptions {
@@ -2717,26 +2727,72 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     let db = Db::open_with(opts.clone()).unwrap();
     let control = UpdateControl::open(&opts).unwrap().unwrap();
     let mut bot = offline_controller("bot", control, &root);
-    bot.baked = script.clone();
+    bot.baked = child.clone();
     bot.enabled = false;
-    // Reserve an ephemeral health socket; production uses the configured 8081.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-bot");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !bound.exists() {
+            assert!(
+                bot.running
+                    .as_mut()
+                    .unwrap()
+                    .child
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+                "child exited before binding the configured health address"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound the configured health address");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
     bot.health_bind = Some(addr.to_string());
-    bot.start(&script, &"b".repeat(40), None).await.unwrap();
-    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    // Retries must use the same concrete address, too.
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    bot.idle().await.unwrap();
+    assert!(
+        bot.health.is_none(),
+        "launcher must not listen while the child runs"
+    );
+    // Publish the complete code before its path releases the waiting child.
+    let exit_code = root.join("exit-code-health-bot");
+    let pending_exit = exit_code.with_extension("tmp");
+    tokio::fs::write(
+        &pending_exit,
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::rename(pending_exit, exit_code).await.unwrap();
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        bot.running.as_mut().unwrap().child.wait(),
+    )
+    .await
+    .expect("child did not exit after token rejection")
+    .unwrap();
+    assert_eq!(status.code(), Some(78));
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
-    assert!(
-        bot.report_ready().await.is_ok(),
-        "token rejection must hold rather than surface a restart error"
-    );
+    // Exactly one production poll must reap the child and bind the same socket.
+    assert!(!bot.tick().await.unwrap());
     assert!(bot.running.is_none());
-    for _ in 0..3 {
-        assert!(!bot.tick().await.unwrap());
-        assert!(bot.running.is_none(), "held bot must never be restored");
-    }
     for (path, expected) in [("/health", "HTTP/1.1 200"), ("/ready", "HTTP/1.1 503")] {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
@@ -2755,6 +2811,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         if path == "/ready" {
             assert!(response.contains("discord token rejected"), "{response}");
         }
+    }
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(bot.running.is_none(), "held bot must never be restored");
     }
     assert_eq!(
         *logs.lock().unwrap(),
@@ -2784,12 +2844,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         ]
     );
     // A ready retry child resumes normal behavior and resets the auth interval.
-    tokio::fs::write(
-        &script,
-        "#!/bin/sh\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 60\n",
-    )
-    .await
-    .unwrap();
+    tokio::fs::remove_file(bind_request).await.unwrap();
+    tokio::fs::remove_file(root.join("exit-code-health-bot"))
+        .await
+        .unwrap();
     bot.restart.auth_retry_at = Some(Instant::now());
     assert!(!bot.tick().await.unwrap());
     let deadline = Instant::now() + Duration::from_secs(2);
