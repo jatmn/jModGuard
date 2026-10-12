@@ -2770,12 +2770,16 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         bot.health.is_none(),
         "launcher must not listen while the child runs"
     );
+    // Publish the complete code before its path releases the waiting child.
+    let exit_code = root.join("exit-code-health-bot");
+    let pending_exit = exit_code.with_extension("tmp");
     tokio::fs::write(
-        root.join("exit-code-health-bot"),
+        &pending_exit,
         jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
     )
     .await
     .unwrap();
+    tokio::fs::rename(pending_exit, exit_code).await.unwrap();
     let status = tokio::time::timeout(
         Duration::from_secs(5),
         bot.running.as_mut().unwrap().child.wait(),
