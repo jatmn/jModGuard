@@ -7,6 +7,7 @@ pub mod members;
 pub mod oauth;
 pub mod preview;
 pub mod recovery;
+mod save;
 pub mod state;
 pub mod updates;
 pub mod usage;
@@ -60,6 +61,17 @@ pub struct ApiError(pub anyhow::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Some(error) = self.0.downcast_ref::<save::SaveError>() {
+            let (status, code) = match error {
+                save::SaveError::Pending => (StatusCode::ACCEPTED, "save_pending"),
+                save::SaveError::Unknown => (StatusCode::CONFLICT, "save_unknown"),
+            };
+            return (
+                status,
+                Json(serde_json::json!({"error": error.to_string(), "code": code})),
+            )
+                .into_response();
+        }
         if self.0.is::<AuthLost>() {
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "discord authorization failed", "code": "auth_lost"}))).into_response();
         }
@@ -1506,6 +1518,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             api: Some(Arc::clone(&app)),
             writer: None,
         })))
+        .layer(axum::middleware::from_fn(save::middleware))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
@@ -1533,6 +1546,8 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
                 axum::http::header::COOKIE,
                 axum::http::HeaderName::from_static("x-jmodguard-enrollment"),
                 axum::http::HeaderName::from_static("x-jmodguard-preview"),
+                axum::http::HeaderName::from_static("x-jmodguard-save"),
+                axum::http::HeaderName::from_static("x-jmodguard-save-lookup"),
             ])
             .allow_credentials(true);
         sessioned.layer(cors)

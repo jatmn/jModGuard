@@ -215,8 +215,23 @@ impl ApiState {
             let Some(writer) = self.writer.clone() else {
                 anyhow::bail!("{}", jmodguard::control::CONTROL_LINK_UNAVAILABLE);
             };
+            if let Some(save) = super::save::current() {
+                return match writer
+                    .submit_save(op, actor_user_id, &save.id, save.lookup)
+                    .await?
+                {
+                    db::ControlReply::StillWaiting => Err(super::save::SaveError::Pending.into()),
+                    db::ControlReply::Failed {
+                        code: Some(code), ..
+                    } if code == "save_unknown" => Err(super::save::SaveError::Unknown.into()),
+                    reply => Ok(reply),
+                };
+            }
             writer.submit(op, actor_user_id).await
         } else {
+            if super::save::current().is_some_and(|save| save.lookup) {
+                return Err(super::save::SaveError::Unknown.into());
+            }
             db::apply_control(&self.db, Some(&self.tenant), op, None).await
         }
     }

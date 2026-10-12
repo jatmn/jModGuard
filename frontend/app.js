@@ -741,7 +741,7 @@ function handleAuthLoss(error) {
 }
 
 function reportApiError(error) {
-  if (!handleAuthLoss(error)) toast(error.message || String(error), "error");
+  if (!handleAuthLoss(error)) toast(error.message || String(error), error.code === "save_pending" ? "info" : "error");
 }
 
 function isApiWarmup(err) {
@@ -829,7 +829,56 @@ function throwApiFailure(data, status, retryAfterMs) {
 }
 
 async function api(path, method = "GET", body = null, signal) {
+  const save = ["POST", "PUT"].includes(method) &&
+    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
+    (method !== "POST" || body !== null);
+  if (save) return submitSave(path, method, body, signal);
+  return apiRequest(path, method, body, signal);
+}
+
+async function submitSave(path, method, body, signal) {
+  const canonical = body && Object.fromEntries(Object.keys(body).sort().map(key => [key, body[key]]));
+  const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
+  const enrollment = pageEnrollment(path, method);
+  let saved, lookup;
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    lookup = raw !== null;
+    saved = raw ? JSON.parse(raw) : {
+      id: (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", ""),
+      enrollment,
+    };
+    window.sessionStorage.setItem(key, JSON.stringify(saved));
+  } catch (_) {
+    throw new Error("Browser session storage must be available and valid to safely save changes.");
+  }
+  if (!saved || !/^[0-9a-f]{64}$/.test(saved.id) || saved.enrollment !== enrollment) {
+    if (confirm("This saved request belongs to an earlier page membership. Check its outcome before clearing it. Clear the saved request without submitting another save?")) {
+      window.sessionStorage.removeItem(key);
+    }
+    throw new Error("Saved request was not submitted. Reload and review this server before saving again.");
+  }
+  try {
+    const result = await apiRequest(path, method, body, signal, {
+      "x-jmodguard-save": saved.id,
+      "x-jmodguard-save-lookup": lookup ? "1" : "0",
+    });
+    try { window.sessionStorage.removeItem(key); } catch (_) { /* A retained ID only queries its result. */ }
+    // The page may already include this commit, or a newer edit. Reconcile
+    // current configuration instead of applying a historical patch again.
+    return lookup ? { ...result, config_patch: null } : result;
+  } catch (error) {
+    if (error.code === "save_unknown" && confirm("The earlier save may already have completed, but its result is unavailable. Have you checked the current configuration and want to clear this saved request? This will not submit another save.")) {
+      window.sessionStorage.removeItem(key);
+      throw new Error("Saved request cleared. Review the current configuration before saving again.");
+    }
+    throw error;
+  }
+}
+
+async function apiRequest(path, method = "GET", body = null, signal, headers = {}) {
   const opts = credentialedOpts(path, method);
+  Object.assign(opts.headers, headers);
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -846,7 +895,7 @@ async function api(path, method = "GET", body = null, signal) {
     } catch (_) {
       data = text;
     }
-    if (!res.ok) throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
+    if (!res.ok || data?.code === "save_pending") throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
     return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {

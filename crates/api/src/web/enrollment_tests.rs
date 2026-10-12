@@ -2053,6 +2053,99 @@ async fn action_key_errors_survive_the_bot_control_link() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delayed_save_is_pending_then_retrievable_without_another_insert() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let mut cfg = crate::config::BotProcessConfig::default();
+    cfg.db.path = f.path.clone();
+    cfg.bot.control_bind = "127.0.0.1:0".into();
+    cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+    let bot = jmodguard_bot::state::BotState::new(cfg, f.app.db.clone()).unwrap();
+    bot.install_control_actor_lookup(|actor, _| {
+        (actor == 42).then_some(db::CachedGuildActor {
+            guild_owner_id: 42,
+            permissions: 1 << 5,
+        })
+    });
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let target = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .unwrap();
+    f.use_writer_link(target);
+    let id = "a".repeat(64);
+    let request = |lookup: bool, pattern: &str| {
+        f.router.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/guilds/10/badwords")
+                .header("cookie", &f.cookie)
+                .header("content-type", "application/json")
+                .header("x-jmodguard-enrollment", &enrollment.id)
+                .header("x-jmodguard-save", &id)
+                .header("x-jmodguard-save-lookup", if lookup { "1" } else { "0" })
+                .body(Body::from(
+                    serde_json::json!({"scope":"guild","pattern":pattern}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let hold = bot.activation.hold_rule();
+    let pending = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        request(false, "retry-once"),
+    )
+    .await;
+    drop(hold);
+    let pending = pending
+        .expect("accepted save must return pending before moderation completes")
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(pending.into_body(), 4096)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(pending["code"], "save_pending");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let saved = loop {
+        let response = request(true, "retry-once").await.unwrap();
+        if response.status() != StatusCode::ACCEPTED {
+            break response;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(saved.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(saved.into_body(), 4096).await.unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // A lost final response can be fetched again with the same identity.
+    let replay = request(true, "retry-once").await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(replay.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        saved
+    );
+    let changed = request(true, "different-payload").await.unwrap();
+    assert_eq!(changed.status(), StatusCode::CONFLICT);
+    let words = db::list_badwords(&bot.db, 10).await.unwrap();
+    assert_eq!(words.len(), 1);
+    assert_eq!(words[0].pattern, "retry-once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn action_errors_from_legacy_or_future_control_peers_stay_generic() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut f = Fixture::new(true).await;

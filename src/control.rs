@@ -94,6 +94,44 @@ impl WriterLink {
         self.submit_request(op, actor_user_id, request_id).await
     }
 
+    /// Browser retries only retrieve the original result. They never enqueue
+    /// another write, including after eviction or a writer restart. Hash the
+    /// captured operation and actor into the ID so a lookup cannot change scope.
+    pub async fn submit_save(
+        &self,
+        op: ControlOp,
+        actor_user_id: i64,
+        save_id: &str,
+        lookup: bool,
+    ) -> Result<ControlReply> {
+        anyhow::ensure!(valid_request_id(save_id), "invalid save request ID");
+        let identity = serde_json::to_vec(&(save_id, actor_user_id, &op))?;
+        let request_id = to_hex(ring::digest::digest(&ring::digest::SHA256, &identity).as_ref());
+        let op = if lookup { ControlOp::LookupResult } else { op };
+        let addr = self.addr;
+        let key = self.key.clone();
+        let expires_ms = now_ms().saturating_add(CONTROL_REQUEST_LIFETIME_MS);
+        tokio::task::spawn_blocking(move || {
+            let reply = submit_blocking(addr, &key, &op, actor_user_id, expires_ms, &request_id)?;
+            if !lookup && matches!(reply, ControlReply::StillWaiting) {
+                // A socket timeout alone does not prove admission. Ask the
+                // bot's cache before telling the browser its save is pending.
+                submit_blocking(
+                    addr,
+                    &key,
+                    &ControlOp::LookupResult,
+                    actor_user_id,
+                    expires_ms,
+                    &request_id,
+                )
+            } else {
+                Ok(reply)
+            }
+        })
+        .await
+        .context("write failed")?
+    }
+
     /// One dashboard attempt keeps `request_id` and one expiry. A later attempt
     /// calls [`Self::submit`] and gets a new id.
     pub async fn submit_request(
@@ -303,6 +341,7 @@ fn submit_blocking(
         .map_err(|_| anyhow::anyhow!("waiting"))?;
     match read_frame(&mut stream) {
         Ok(body) => serde_json::from_slice(&body).context("write failed"),
+        Err(_) if matches!(op, ControlOp::LookupResult) => anyhow::bail!(OUTCOME_UNKNOWN),
         Err(_) => Ok(ControlReply::StillWaiting),
     }
 }

@@ -1894,6 +1894,95 @@ function queuedAction(state = 'pending') {
 }
 const actionPath = '/api/guilds/987654321098765432/unban';
 
+test('lost save acknowledgement retains identity across reload and only looks up the original save', async () => {
+  const calls = [], session = new Map();
+  const path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async (_, opts) => { calls.push(opts); throw new Error('lost response'); }, new Map(), session);
+  first.app.state.config = { enrollment_id: 'membership' };
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once', scope: 'guild'}), /lost response/);
+  assert.equal(session.size, 1);
+  const next = harness(async (_, opts) => { calls.push(opts); return response({ok: true, id: 7}); }, new Map(), session);
+  next.app.state.config = { enrollment_id: 'membership' };
+  const saved = await next.app.api(path, 'POST', {scope: 'guild', pattern: 'once'});
+  assert.equal(saved.id, 7);
+  assert.match(calls[0].headers['x-jmodguard-save'], /^[0-9a-f]{64}$/);
+  assert.equal(calls[1].headers['x-jmodguard-save'], calls[0].headers['x-jmodguard-save']);
+  assert.equal(calls[0].headers['x-jmodguard-save-lookup'], '0');
+  assert.equal(calls[1].headers['x-jmodguard-save-lookup'], '1');
+  assert.equal(session.size, 0);
+});
+
+test('pending save preserves the draft and retry queries the result', async () => {
+  const calls = [];
+  const word = {id: 8, guild_id: '987654321098765432', pattern: 'pending', note: null};
+  const config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], log_channels: [], badwords: []};
+  const h = harness(async (url, opts) => {
+    if (url.endsWith('/config')) return response({...config, badwords: [word]});
+    calls.push(opts);
+    return calls.length === 1
+      ? {ok: true, status: 202, headers: {get: () => null}, text: async () => JSON.stringify({code: 'save_pending', error: 'Save accepted and still pending. Retry to check its result.'})}
+      : response({ok: true, id: 8});
+  });
+  h.app.state.config = config;
+  h.app.state.tab = 'badwords';
+  h.app.renderTab();
+  const pattern = h.document.querySelector('input');
+  pattern.value = 'pending'; await fire(pattern, 'input');
+  const add = () => [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
+  await fire(add(), 'click');
+  assert.equal(h.document.querySelector('input').value, 'pending');
+  assert.equal(h.app.isDirty(), true);
+  assert.match(h.nodes.get('#toast').textContent, /accepted and still pending/);
+  assert.doesNotMatch(h.nodes.get('#toast').textContent, /added|failed/i);
+  assert.equal(h.session.size, 1);
+  await fire(add(), 'click');
+  assert.equal(h.app.state.config.badwords.length, 1);
+  assert.equal(h.app.state.config.badwords[0].id, 8);
+  assert.equal(calls[1].headers['x-jmodguard-save-lookup'], '1');
+});
+
+test('retrieved save refreshes configuration instead of appending its old patch again', async () => {
+  const session = new Map(), path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async () => {throw new Error('lost');}, new Map(), session);
+  first.app.state.config = {enrollment_id: 'membership'};
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once', scope: 'guild', note: null}));
+  const word = {id: 7, guild_id: '987654321098765432', pattern: 'once', note: null};
+  const config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], log_channels: [], badwords: [word]};
+  let reads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/config')) {reads++; return response(config);}
+    return response({ok: true, id: 7, config_patch: {kind: 'badword', operation: 'add', value: word}});
+  }, new Map(), session);
+  h.app.state.config = structuredClone(config);
+  h.app.state.tab = 'badwords';
+  h.app.renderTab();
+  const pattern = h.document.querySelector('input');
+  pattern.value = 'once'; await fire(pattern, 'input');
+  const add = [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
+  await fire(add, 'click');
+  await settle();
+  assert.equal(reads, 1, 'a historical acknowledgement must refresh the current configuration');
+  assert.equal(h.app.state.config.badwords.length, 1);
+  assert.equal(h.app.state.config.badwords[0].id, 7);
+});
+
+test('save identity cannot move to a replacement membership or dispatch without storage', async () => {
+  const session = new Map();
+  const path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async () => {throw new Error('lost');}, new Map(), session);
+  first.app.state.config = {enrollment_id: 'old'};
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once'}));
+  let calls = 0;
+  const next = harness(async () => {calls++;}, new Map(), session, () => false);
+  next.app.state.config = {enrollment_id: 'replacement'};
+  await assert.rejects(next.app.api(path, 'POST', {pattern: 'once'}), /not submitted/);
+  assert.equal(calls, 0);
+  const blocked = harness(async () => {calls++;}, new Map(), {get() {throw new Error('disabled');}});
+  blocked.app.state.config = {enrollment_id: 'membership'};
+  await assert.rejects(blocked.app.api(path, 'POST', {pattern: 'once'}), /session storage/);
+  assert.equal(calls, 0);
+});
+
 test('lost action acknowledgment reuses request and membership across reload', async () => {
   const calls = [], session = new Map();
   const first = harness(async (_,opts) => { calls.push(opts); throw new Error('lost response'); }, new Map(), session);

@@ -111,15 +111,11 @@ fn remember(results: &Results, request_id: &str, reply: &ControlReply) {
     );
 }
 
-fn lookup_reply(
-    results: &Results,
-    request_id: &str,
-    actor_user_id: i64,
-    expires_ms: i64,
-) -> ControlReply {
-    let guard = results
+fn lookup_reply(results: &Results, request_id: &str, actor_user_id: i64) -> ControlReply {
+    let mut guard = results
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    evict_results(&mut guard, Instant::now());
     if let Some(entry) = guard.get(request_id)
         && entry.actor_user_id == actor_user_id
     {
@@ -128,14 +124,9 @@ fn lookup_reply(
             ReplyState::Pending => ControlReply::StillWaiting,
         };
     }
-    drop(guard);
-    if control::now_ms() > expires_ms {
-        ControlReply::Failed {
-            code: None,
-            message: control::OUTCOME_UNKNOWN.into(),
-        }
-    } else {
-        ControlReply::StillWaiting
+    ControlReply::Failed {
+        code: Some("save_unknown".into()),
+        message: control::OUTCOME_UNKNOWN.into(),
     }
 }
 
@@ -310,7 +301,7 @@ fn handle(
         }
     };
     if matches!(op, db::ControlOp::LookupResult) {
-        let done = lookup_reply(results, &request_id, actor_user_id, expires_ms);
+        let done = lookup_reply(results, &request_id, actor_user_id);
         let _ = reply(stream, &done);
         return;
     }
@@ -1196,7 +1187,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a lookup must not wait behind moderation"
         );
-        assert!(matches!(reply, ControlReply::StillWaiting), "{reply:?}");
+        assert_eq!(failure_message(&reply), control::OUTCOME_UNKNOWN);
         assert!(
             db::list_badwords(&bot.db, enrollment.guild_id)
                 .await
@@ -1242,7 +1233,7 @@ mod tests {
             .unwrap(),
         );
         assert!(
-            matches!(other, ControlReply::StillWaiting),
+            matches!(other, ControlReply::Failed { .. }),
             "another actor must not read the stored result: {other:?}"
         );
         assert_eq!(
