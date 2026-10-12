@@ -884,3 +884,79 @@ async fn known_bad_image_add_and_remove_race_on_absent_hash_is_serializable() {
         _ => panic!("unexpected add/remove pair: add={add}, remove={remove}"),
     }
 }
+
+#[tokio::test]
+async fn atomic_global_rule_save_preserves_both_rows_on_fence_membership_or_commit_failure() {
+    for failure in ["fence", "membership", "commit"] {
+        let f = Fixture::new();
+        let request = f.scope(10).await;
+        let original: RuleDef =
+            serde_json::from_value(serde_json::json!({"name":"original", "description":""}))
+                .unwrap();
+        upsert_rule(&f.db, 0, "mention_spam", &original)
+            .await
+            .unwrap();
+        upsert_rule(&f.db, 10, "mention_spam", &original)
+            .await
+            .unwrap();
+        if failure == "fence" {
+            let store = crate::db::guild_stores::StoreId::new();
+            crate::db::guild_stores::register_store(
+                &f.db,
+                store.clone(),
+                crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+            )
+            .await
+            .unwrap();
+            f.db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+                     VALUES(10,?1,'freeze',?2,?1,unixepoch())",
+                    params![format!("{:032x}", 9u128), store.as_str()], 4096,
+                )?;
+                Ok(())
+            }).await.unwrap();
+        } else if failure == "membership" {
+            retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+            enroll_guild(&f.db, 10, 101).await.unwrap();
+            // Retirement erased the old membership's rows; protect a replacement override.
+            upsert_rule(&f.db, 10, "mention_spam", &original)
+                .await
+                .unwrap();
+        } else {
+            f.db.with_conn(|conn| conn.execute_batch_bounded(
+                "CREATE TRIGGER refuse_rule_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'fixture'); END", 4096
+            )).await.unwrap();
+        }
+        let before = get_primary_versions(&f.db).await.unwrap();
+        let mut changed = original;
+        changed.name = "must roll back".into();
+        assert!(
+            upsert_global_rule_and_clear_enrolled_override(
+                &f.db,
+                request,
+                "mention_spam",
+                &changed
+            )
+            .await
+            .is_err(),
+            "{failure}"
+        );
+        for guild in [0, 10] {
+            assert_eq!(
+                get_rule(&f.db, guild, "mention_spam")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .name,
+                "original",
+                "{failure}: guild {guild}"
+            );
+        }
+        assert_eq!(
+            get_primary_versions(&f.db).await.unwrap(),
+            before,
+            "{failure}"
+        );
+    }
+}

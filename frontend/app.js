@@ -741,7 +741,7 @@ function handleAuthLoss(error) {
 }
 
 function reportApiError(error) {
-  if (!handleAuthLoss(error)) toast(error.message || String(error), "error");
+  if (!handleAuthLoss(error)) toast(error.message || String(error), error.code === "save_pending" ? "info" : "error");
 }
 
 function isApiWarmup(err) {
@@ -828,8 +828,87 @@ function throwApiFailure(data, status, retryAfterMs) {
   throw error;
 }
 
-async function api(path, method = "GET", body = null, signal) {
+async function api(path, method = "GET", body = null, signal, reconcileRecovered) {
+  const save = ["POST", "PUT"].includes(method) &&
+    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
+    (method !== "POST" || body !== null);
+  if (save) return submitSave(path, method, body, signal, reconcileRecovered);
+  return apiRequest(path, method, body, signal);
+}
+
+function canonicalSaveBody(value) {
+  if (Array.isArray(value)) return value.map(canonicalSaveBody);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalSaveBody(value[key])]));
+  }
+  return value;
+}
+
+async function submitSave(path, method, body, signal, reconcileRecovered) {
+  // A remount reads the current role revision while retaining an unresolved
+  // role draft. Match that intent by its roles, then look up the captured revision.
+  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/case-delete-roles$/.test(path);
+  const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
+  const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
+  const enrollment = pageEnrollment(path, method);
+  let raw, saved, lookup;
+  try {
+    raw = window.sessionStorage.getItem(key);
+    lookup = raw !== null;
+  } catch (_) {
+    throw new Error("Browser session storage must be available and valid to safely save changes.");
+  }
+  // Only a new save needs the initial read. An unresolved save already owns
+  // its original revision and must remain lookup-only while that read is pending.
+  if (roleSave && !lookup && !body.revision) {
+    throw new Error("Case-removal roles have not loaded yet. Wait for them to load before saving.");
+  }
+  try {
+    saved = raw ? JSON.parse(raw) : {
+      id: (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", ""),
+      enrollment,
+      ...(roleSave ? { revision: body.revision } : {}),
+    };
+    window.sessionStorage.setItem(key, JSON.stringify(saved));
+  } catch (_) {
+    throw new Error("Browser session storage must be available and valid to safely save changes.");
+  }
+  if (!saved || !/^[0-9a-f]{64}$/.test(saved.id) || saved.enrollment !== enrollment ||
+    (roleSave && typeof saved.revision !== "string")) {
+    if (confirm("This saved request belongs to an earlier page membership. Check its outcome before clearing it. Clear the saved request without submitting another save?")) {
+      window.sessionStorage.removeItem(key);
+    }
+    throw new Error("Saved request was not submitted. Reload and review this server before saving again.");
+  }
+  try {
+    const capturedBody = roleSave ? { ...body, revision: saved.revision } : body;
+    let result = await apiRequest(path, method, capturedBody, signal, {
+      "x-jmodguard-save": saved.id,
+      "x-jmodguard-save-lookup": lookup ? "1" : "0",
+    });
+    // Specialized editors also consume fields outside config_patch. Keep the
+    // identity until their current-state read succeeds, so a failed read retries
+    // the acknowledgement without submitting another mutation.
+    if (lookup && reconcileRecovered) result = await reconcileRecovered();
+    try { window.sessionStorage.removeItem(key); } catch (_) { /* A retained ID only queries its result. */ }
+    // The page may already include this commit, or a newer edit. Reconcile
+    // current configuration instead of applying a historical patch again.
+    return lookup ? { ...result, config_patch: null } : result;
+  } catch (error) {
+    if (error.code === "save_expired") {
+      try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
+    }
+    if (error.code === "save_unknown" && confirm("The earlier save may already have completed, but its result is unavailable. Have you checked the current configuration and want to clear this saved request? This will not submit another save.")) {
+      window.sessionStorage.removeItem(key);
+      throw new Error("Saved request cleared. Review the current configuration before saving again.");
+    }
+    throw error;
+  }
+}
+
+async function apiRequest(path, method = "GET", body = null, signal, headers = {}) {
   const opts = credentialedOpts(path, method);
+  Object.assign(opts.headers, headers);
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -846,7 +925,7 @@ async function api(path, method = "GET", body = null, signal) {
     } catch (_) {
       data = text;
     }
-    if (!res.ok) throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
+    if (!res.ok || data?.code === "save_pending") throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
     return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
@@ -1291,6 +1370,7 @@ function applyConfigPatch(res) {
     if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
     if (patch.scope === "global") {
       row.global = patch.value;
+      if (patch.cleared_guild_override) row.guild_override = null;
       if (!row.guild_override) row.effective = patch.value;
     } else {
       row.guild_override = patch.value;
@@ -2169,32 +2249,9 @@ function RuleEditor({ record: r }) {
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", {
               scope,
               data: rule,
+              clear_guild_override: scope === "global" && state.guildId !== "0",
             });
             const savedLocally = applyConfigPatch(saved);
-            if (scope === "global") {
-              try {
-                const cleared = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", {
-                  scope: "guild",
-                });
-                applyConfigPatch(cleared);
-              } catch (e) {
-                // The global write already committed. A failed second request must
-                // not leave the pre-save snapshot visible as current configuration.
-                const refreshed = await loadConfig();
-                if (refreshed) {
-                  closeOverlay();
-                  renderTab();
-                }
-                toast(
-                  `Global rule saved, but clearing this server's override could not be confirmed: ${e.message || String(e)}` +
-                    (refreshed
-                      ? ""
-                      : " Configuration refresh also failed. Use Retry to load the saved state."),
-                  "error",
-                );
-                return;
-              }
-            }
             if (!savedLocally && !(await loadConfig())) return;
             toast("Rule saved", "success");
             closeOverlay();
@@ -3012,6 +3069,7 @@ function tabLogChannels() {
 
 function LogChannelCard({ lc }) {
   const guildId = state.guildId;
+  const enrollmentId = state.config.enrollment_id;
   const inputRef = useRef(null);
   const input = h(Input, {
     ref: inputRef,
@@ -3151,6 +3209,12 @@ function LogChannelCard({ lc }) {
               const saved = await api(`/api/guilds/${guildId}/logfilters/${lc.event}`, "PUT", {
                 users,
                 channels,
+              }, undefined, async () => {
+                const config = await apiRead(`/api/guilds/${guildId}/config`);
+                if (config.enrollment_id !== enrollmentId) {
+                  throw new Error("Bot membership changed. Reload and review this server before saving again.");
+                }
+                return { ignore: config.log_channels.find(row => row.event === lc.event).ignore };
               });
               lc.ignore = saved.ignore;
               toast("Ignore list saved", "success");
@@ -4608,10 +4672,10 @@ function tabSettings() {
                 const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", {
                   roles: splitIds(roleInputRef.current.value),
                   revision: roleRevision.current,
-                });
+                }, undefined, () => apiRead(`/api/guilds/${state.guildId}/case-delete-roles`));
                 roleWriteGeneration.current++;
                 roleRevision.current = saved.revision;
-                setRoleBaseline(roleInputRef.current.value);
+                setRoleBaseline(saved.roles ? saved.roles.join(", ") : roleInputRef.current.value);
                 const drafts = { ...currentDrafts() };
                 delete drafts["settings:roles"];
                 ui.set({ drafts, dirty: Object.keys(drafts).length > 0 });

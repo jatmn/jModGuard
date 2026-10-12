@@ -205,10 +205,10 @@ receipt automatically; the queued badge does not claim bot validation has comple
 Drafts remain in memory only and are discarded when
 you confirm leaving the workspace.
 
-A Global rule save writes the global rule before clearing the current server's
-override. If that second request fails, the workspace refreshes the saved state
-and reports the partial result; if the refresh also fails, use **Retry**. Closing
-the editor does not undo an acknowledged global write.
+A Global rule save writes the global rule and clears the current server's override
+in one transaction. Retrying an unresolved save retrieves its acknowledgement;
+the workspace then refreshes current configuration. If that refresh fails, use
+**Retry**. Closing the editor does not undo an acknowledged global write.
 
 ## Tabs
 
