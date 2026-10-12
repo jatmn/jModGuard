@@ -25,7 +25,7 @@ pub use crate::db_compat::{
     install_startup_probe,
 };
 // SQL operations/parameters for connections supplied by Db::with_conn.
-pub use crate::db_compat::{SqlExecutor, params};
+pub use crate::db_compat::{SchemaVerification, SqlExecutor, params};
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
 };
