@@ -836,8 +836,19 @@ async function api(path, method = "GET", body = null, signal, reconcileRecovered
   return apiRequest(path, method, body, signal);
 }
 
+function canonicalSaveBody(value) {
+  if (Array.isArray(value)) return value.map(canonicalSaveBody);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalSaveBody(value[key])]));
+  }
+  return value;
+}
+
 async function submitSave(path, method, body, signal, reconcileRecovered) {
-  const canonical = body && Object.fromEntries(Object.keys(body).sort().map(key => [key, body[key]]));
+  // A remount reads the current role revision while retaining an unresolved
+  // role draft. Match that intent by its roles, then look up the captured revision.
+  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/case-delete-roles$/.test(path);
+  const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
   let saved, lookup;
@@ -847,19 +858,22 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
     saved = raw ? JSON.parse(raw) : {
       id: (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", ""),
       enrollment,
+      ...(roleSave ? { revision: body.revision } : {}),
     };
     window.sessionStorage.setItem(key, JSON.stringify(saved));
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely save changes.");
   }
-  if (!saved || !/^[0-9a-f]{64}$/.test(saved.id) || saved.enrollment !== enrollment) {
+  if (!saved || !/^[0-9a-f]{64}$/.test(saved.id) || saved.enrollment !== enrollment ||
+    (roleSave && typeof saved.revision !== "string")) {
     if (confirm("This saved request belongs to an earlier page membership. Check its outcome before clearing it. Clear the saved request without submitting another save?")) {
       window.sessionStorage.removeItem(key);
     }
     throw new Error("Saved request was not submitted. Reload and review this server before saving again.");
   }
   try {
-    let result = await apiRequest(path, method, body, signal, {
+    const capturedBody = roleSave ? { ...body, revision: saved.revision } : body;
+    let result = await apiRequest(path, method, capturedBody, signal, {
       "x-jmodguard-save": saved.id,
       "x-jmodguard-save-lookup": lookup ? "1" : "0",
     });

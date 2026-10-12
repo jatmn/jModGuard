@@ -1772,7 +1772,7 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const calls = [];
   const failures = { put: false, lost: false, refresh: false };
   let receipt;
-  let globalRule = { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] };
+  let globalRule = { name: 'Mention spam', description: '', enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 0, reason: '' }], whitelist_roles: [], whitelist_channels: [], whitelist_users: [], skip_moderators: false, include_channels: [], log_automod: true, open_case: true };
   let guildRule = override ? structuredClone(globalRule) : null;
   const snapshot = () => ({ rules: [{
     rule_id: 'mention_spam', name: 'Mention spam', global: globalRule,
@@ -1926,7 +1926,8 @@ test('configuration mutations retain the loaded membership without refreshing or
   app.state.config = { enrollment_id: 'old-membership' };
   for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy'], ['PUT', 'case-delete-roles'], ['DELETE', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']]) {
     const count = calls.length;
-    await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, {}), /Membership changed/);
+    const body = suffix === 'case-delete-roles' ? {roles: [], revision: '1'.repeat(32)} : {};
+    await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, body), /Membership changed/);
     assert.equal(calls.length, count + 1);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'old-membership');
   }
@@ -3316,4 +3317,141 @@ test('known-bad drafts do not restore after enrollment replacement', async () =>
   assert.equal(after[1].value, '');
   assert.equal(after[2].value, '');
   assert.equal(h.app.isDirty(), false);
+});
+
+for (const reload of [false, true]) test(`role retry preserves its captured revision after ${reload ? 'reload' : 'a sibling save remount'}`, async () => {
+  const calls = [];
+  let revision = '11111111111111111111111111111111', roles = ['1'], roleWrites = 0;
+  const config = {enrollment_id:'abcdef0123456789abcdef0123456789', settings:{prefix:'!',bot_name:''}, settings_override:{}, global_settings:{prefix:'/'}, rules:[], commands:[], badwords:[], log_channels:[]};
+  const session = new Map();
+  const fetchRoles = async (url,opts) => {
+    const body=opts.body ? JSON.parse(opts.body):null;
+    calls.push({url,opts,body});
+    if(url.endsWith('/case-delete-roles') && opts.method==='POST') return response({roles,revision});
+    if(url.endsWith('/case-delete-roles') && opts.method==='PUT') {
+      if(opts.headers['x-jmodguard-save-lookup']==='1') {
+        assert.deepEqual(body, {roles:['2'],revision:'1'.repeat(32)}, 'lookup must hash the complete original operation');
+        return response({revision:'2'.repeat(32)});
+      }
+      assert.equal(body.revision, revision, 'fixture must enforce the current role revision just like production');
+      roleWrites++;
+      if(roleWrites===1) {roles=['2']; revision='22222222222222222222222222222222'; throw new Error('ack lost');}
+      roles=body.roles; revision='44444444444444444444444444444444'; return response({revision});
+    }
+    if(url.endsWith('/settings')) return response({config_patch:{kind:'settings',scope:'guild',settings:{prefix:'?',bot_name:''},prefix_present:true,prefix:'?'}});
+    throw new Error('unexpected '+url);
+  };
+  const make = () => {
+    const page = harness(fetchRoles, new Map(), session);
+    page.app.state.config = structuredClone(config); page.app.state.tab = 'settings'; page.app.renderTab();
+    return page;
+  };
+  let h = make();
+  h.app.state.config=config; h.app.state.tab='settings'; h.app.renderTab(); await settle();
+  const roleInput=()=>h.elements.find(n=>n.localName==='input' && /role id/i.test(n.getAttribute('placeholder')||''));
+  const roleSave=()=>h.elements.find(n=>n.localName==='button' && n.textContent==='Save case-removal roles');
+  roleInput().value='2'; await fire(roleInput(),'input'); await fire(roleSave(),'click');
+  // An independent administrator changed roles after the first save committed.
+  roles=['3']; revision='33333333333333333333333333333333';
+  if (reload) {
+    h = make(); await settle();
+    roleInput().value='2'; await fire(roleInput(),'input');
+  } else {
+    const prefix=h.elements.find(n=>n.localName==='input' && n.value==='!');
+    prefix.value='?'; await fire(prefix,'input');
+    await fire(h.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+    await settle();
+  }
+  assert.equal(roleInput().value,'2','unrelated prefix save preserves the unresolved role draft');
+  await fire(roleSave(),'click');
+  const puts=calls.filter(c=>c.url.endsWith('/case-delete-roles') && c.opts.method==='PUT');
+  assert.equal(puts[1].opts.headers['x-jmodguard-save-lookup'],'1','retry must retrieve accepted original identity');
+  assert.equal(puts[1].opts.headers['x-jmodguard-save'],puts[0].opts.headers['x-jmodguard-save']);
+  assert.equal(roleWrites,1,'retry may not replace newer roles');
+  assert.deepEqual(roles,['3']);
+  assert.equal(roleInput().value,'3','recovery displays current roles');
+  assert.equal(session.size,0);
+  roleInput().value='4'; await fire(roleInput(),'input'); await fire(roleSave(),'click');
+  const next = calls.filter(c=>c.url.endsWith('/case-delete-roles') && c.opts.method==='PUT')[2];
+  assert.equal(next.body.revision,'3'.repeat(32),'next edit uses reconciled revision');
+  assert.equal(next.opts.headers['x-jmodguard-save-lookup'],'0');
+  assert.notEqual(next.opts.headers['x-jmodguard-save'],puts[0].opts.headers['x-jmodguard-save']);
+  assert.equal(roleWrites,2);
+});
+
+test('untouched rule reload recovers reordered nested parameters', async () => {
+  const wire = value => Array.isArray(value) ? value.map(wire) : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).sort().map(key=>[key,wire(value[key])])) : value;
+  const first = await ruleSaveHarness({scope:'guild', override:true});
+  const membership = 'abcdef0123456789abcdef0123456789';
+  first.app.state.config.enrollment_id = membership;
+  const initial = wire(first.app.state.config.rules[0]);
+  first.app.state.config.rules[0] = initial;
+  await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Cancel'),'click');
+  await first.app.editRule(initial);
+  first.failures.lost = true;
+  const params = first.document.querySelector('.modal-overlay textarea');
+  params.value = '{"z":1,"a":2}'; await fire(params,'input');
+  await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+  const original = first.calls.find(c=>c.method==='PUT');
+  assert.equal(first.session.size,1);
+  const current = wire(first.snapshot().rules[0]); // production /config builds serde_json::Value, ordered object maps
+  const nextConfig = {enrollment_id:membership,settings:{prefix:'!',bot_name:''},rules:[current],commands:[],badwords:[],templates:[],log_channels:[]};
+  const calls = [];
+  const next = harness(async (url,opts) => {
+    calls.push({url,opts,body:opts.body && JSON.parse(opts.body)});
+    if (opts.method === 'PUT') {
+      assert.equal(opts.headers['x-jmodguard-save-lookup'],'1','reloaded editor must query, never apply a second mutation');
+      return response({ok:true});
+    }
+    return response(nextConfig);
+  },new Map(),first.session);
+  next.app.state.me.is_bot_owner = true;
+  next.app.state.config = nextConfig;
+  next.app.state.tab = 'rules';
+  await next.app.editRule(current);
+  // No input, change or scope event occurs in this reloaded editor.
+  await fire(next.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+  const retry = calls.find(c=>c.opts.method==='PUT');
+  assert.deepEqual(wire(original.body), wire(retry.body),'complete captured request has identical values');
+  assert.equal(retry.opts.headers['x-jmodguard-save-lookup'],'1','untouched reloaded request must recover the accepted identity');
+  assert.equal(retry.opts.headers['x-jmodguard-save'],original.headers['x-jmodguard-save']);
+});
+
+test('nested command matching preserves array order and changed values as new saves', async () => {
+  const calls = [], session = new Map(), path = '/api/guilds/987654321098765432/commands/test';
+  const h = harness(async (_, opts) => { calls.push(opts); throw new Error('lost'); }, new Map(), session);
+  h.app.state.config = {enrollment_id:'abcdef0123456789abcdef0123456789'};
+  const body = {scope:'guild',data:{name:'test',aliases:[],category:'',description:'',usage:'',enabled:true,permission:'everyone',roles:[],channels:[],cooldown_secs:0,response:'',log_event:'',behavior:{kind:'plan',params:{steps:[{type:'log',event:'join',template:'first'},{type:'reply',template:'second'}]}}}};
+  await assert.rejects(h.app.api(path,'PUT',body));
+  const reordered = structuredClone(body);
+  reordered.data.behavior.params.steps[0] = {template:'first',event:'join',type:'log'};
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  reordered.data.behavior.params.steps.reverse();
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  reordered.data.behavior.params.steps[0].template = 'changed';
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  assert.deepEqual(calls.map(c=>c.headers['x-jmodguard-save-lookup']),['0','1','0','0']);
+  assert.equal(calls[0].headers['x-jmodguard-save'],calls[1].headers['x-jmodguard-save']);
+  assert.notEqual(calls[1].headers['x-jmodguard-save'],calls[2].headers['x-jmodguard-save']);
+  assert.notEqual(calls[2].headers['x-jmodguard-save'],calls[3].headers['x-jmodguard-save']);
+});
+
+test('reordered global rule retry preserves a newer guild override', async () => {
+  const h = await ruleSaveHarness({scope:'global', override:true});
+  h.app.state.config.enrollment_id = 'abcdef0123456789abcdef0123456789';
+  h.failures.lost = true;
+  const params = h.document.querySelector('.modal-overlay textarea');
+  params.value = '{"z":1,"a":2}'; await fire(params,'input'); await fire(h.save,'click');
+  const first = h.calls.find(c=>c.method==='PUT');
+  assert.equal(first.body.scope,'global');
+  assert.equal(first.body.clear_guild_override,true);
+  h.replaceOverride({...h.snapshot().rules[0].global, name:'Newer override'});
+  h.failures.lost = false;
+  params.value = '{"a":2,"z":1}'; await fire(params,'input'); await fire(h.save,'click');
+  const retry = h.calls.filter(c=>c.method==='PUT')[1];
+  assert.deepEqual(retry.body,first.body,'JSON member order preserves complete payload values');
+  assert.equal(retry.headers['x-jmodguard-save-lookup'],'1');
+  assert.equal(retry.headers['x-jmodguard-save'],first.headers['x-jmodguard-save']);
+  assert.equal(h.snapshot().rules[0].guild_override.name,'Newer override');
 });

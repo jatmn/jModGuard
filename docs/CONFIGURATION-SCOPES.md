@@ -96,6 +96,9 @@ session storage before dispatch. The first request sends `x-jmodguard-save-looku
 subsequent attempts send `1` and only query the bot's existing result cache. The
 control identity binds the actor and complete captured operation, including membership
 and payload. Every HTTP attempt still passes the route's current permission checks.
+Browser matching ignores JSON object member order at every depth, preserving array
+order and changed values. Unresolved role saves also retain their original revision:
+remounting or reloading the editor must not bind the same roles to a newer revision.
 HTTP 202 `save_pending` keeps the draft and displays a pending notice; retrying the
 same save retrieves its acknowledgement without applying another write. Successful
 acknowledgement clears the browser identity. HTTP 409 `save_expired` also settles it: the
