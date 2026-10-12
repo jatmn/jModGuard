@@ -569,14 +569,20 @@ mod tests {
         enum LegacyReply {
             Failed { message: String },
         }
-        let errors: Vec<anyhow::Error> = vec![
-            RequestKeyError::Expired.into(),
-            RequestKeyError::Invalid.into(),
-            RequestKeyError::EnrollmentChanged.into(),
-            crate::db::EnrollmentChanged.into(),
-            crate::db::EnrollmentUnverified.into(),
+        let errors: Vec<(anyhow::Error, &str)> = vec![
+            (RequestKeyError::Expired.into(), "action_request_expired"),
+            (RequestKeyError::Invalid.into(), "action_request_invalid"),
+            (
+                RequestKeyError::EnrollmentChanged.into(),
+                "action_enrollment_changed",
+            ),
+            (crate::db::EnrollmentChanged.into(), "enrollment_changed"),
+            (
+                crate::db::EnrollmentUnverified.into(),
+                "enrollment_unverified",
+            ),
         ];
-        for error in errors {
+        for (error, expected_code) in errors {
             let expected = error.to_string();
             let reply = failure_reply(&error.context("admission failed"));
             let encoded = serde_json::to_vec(&reply).unwrap();
@@ -586,7 +592,7 @@ mod tests {
             else {
                 panic!("expected failure");
             };
-            assert!(code.is_some());
+            assert_eq!(code.as_deref(), Some(expected_code));
             let restored = failure_error("changed peer wording".into(), code.as_deref());
             assert_eq!(restored.to_string(), expected);
             assert!(
