@@ -116,10 +116,13 @@ echo 'Gateway ban events suppress bot echoes and retain external cases'
 extract_handler guild_ban_addition | awk '
   /consume_gateway_ban_echo/ { suppression = NR }
   /\.await/ && !first_await { first_await = NR }
+  /\.await/ && !mirror { last_initial_await = NR }
+  /let echo = echo\.resolve\(\);/ { resolved = NR }
+  /db::record_gateway_ban\(/ { mirror = NR }
   /crate::cases::record\(/ { external_case = NR }
   /logging::lookup_member_audit\(/ { audit = NR }
-  END { exit !(suppression && first_await && external_case && audit && suppression < first_await && external_case < audit) }
-' || fail 'Gateway ban ownership must precede awaits and case routing must precede audit lookup'
+  END { exit !(suppression && first_await && resolved && mirror && external_case && audit && suppression < first_await && last_initial_await < resolved && resolved < mirror && external_case < audit) }
+' || fail 'Gateway ban capture must precede awaits, resolution must precede persistence, and case routing must precede audit lookup'
 
 check_tree() {
   local package="$1"

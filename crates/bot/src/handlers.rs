@@ -418,7 +418,8 @@ impl EventHandler for Handler {
         }
         // Capture ownership before any await: an unban can clear remembered
         // ownership while this callback waits, but this already-started echo keeps
-        // its own suppression and operation id without restoring that state.
+        // its own identity without restoring that state. Its dispatch can still
+        // revoke ownership on a definitive failure before persistence.
         let echo = self
             .app
             .consume_gateway_ban_echo(guild_id.get(), banned_user.id.get());
@@ -439,9 +440,10 @@ impl EventHandler for Handler {
             observed.timestamp_millis(),
         )
         .await;
+        let echo = echo.resolve();
         let observed_at = observed.to_rfc3339();
         // A bot echo is not a second ban and not a manual moderation record.
-        // The entry snapshot also remembers duplicate echoes until an unban.
+        // Consumed echoes stay remembered until expiry, unban or release.
         // If Discord applied the ban but the command never stored a row, that
         // owned echo still inserts the one active row, marked with this
         // attempt's operation id, and does not add a member_ban event. A
@@ -1373,6 +1375,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_dispatch_after_ban_capture_preserves_the_manual_record() {
+        use crate::{db, state::GatewayCaseAction};
+
+        // Production state, enrolled SQLite, case routing and attribution.
+        // Schedule the REST completion during the handler's initial awaits;
+        // no live Discord Gateway or audit lookup is used.
+        let directory =
+            std::env::temp_dir().join(format!("released_ban_echo_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let operation = db::guild_data::CaseId::new();
+        let token = app.suppress_next_gateway_case(
+            GatewayCaseAction::Ban,
+            10,
+            20,
+            Some(operation.as_str()),
+        );
+        let captured = app.consume_gateway_ban_echo(10, 20);
+        // The pending bot request definitively fails, so its production
+        // dispatch path releases this exact token before the mirror write.
+        app.release_gateway_case_suppression(token);
+        let echo = captured.resolve();
+        let write = db::record_gateway_ban(
+            &app.db,
+            Some(enrollment.clone()),
+            20,
+            Some("member"),
+            None,
+            None,
+            echo.owned_by_bot,
+            echo.operation_id.as_deref(),
+        )
+        .await
+        .unwrap();
+        let recorded_case = if record_unresolved_gateway_observation(echo.suppress_case) {
+            crate::cases::record(
+                &app,
+                Some(enrollment.clone()),
+                db::guild_data::CaseAction::Ban,
+                db::guild_data::CaseOutcome::Succeeded,
+                20,
+                None,
+                None,
+                db::guild_data::CaseEvidence::Unavailable,
+                db::guild_data::CaseSource::GatewayObservation {
+                    observation_id: db::guild_data::CaseId::new(),
+                },
+            )
+            .await
+        } else {
+            None
+        };
+        let events = db::query_enrolled_events(
+            &app.db,
+            enrollment.clone(),
+            Some("member_ban"),
+            Some(20),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1, "the manual ban needs its event");
+        let case_id = recorded_case.expect("the manual ban needs its Gateway case");
+        let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+        let case = store
+            .case(scope, case_id, crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            case.source,
+            db::guild_data::CaseSource::GatewayObservation { .. }
+        ));
+        let row_id = gateway_ban_row_to_attribute(write).expect("manual row permits attribution");
+        db::attribute_enrolled_ban(
+            &app.db,
+            Some(enrollment.clone()),
+            row_id,
+            20,
+            77,
+            Some("moderator"),
+            "manual reason",
+        )
+        .await
+        .unwrap();
+        let rows = db::list_enrolled_bans(&app.db, enrollment, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].moderator_id, Some(77));
+        assert_eq!(rows[0].reason.as_deref(), Some("manual reason"));
+        assert!(!echo.owned_by_bot);
+        assert!(echo.operation_id.is_none());
+        assert!(app.gateway_ban_echo_operation(10, 20).is_none());
+        drop(store);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn delayed_ban_echo_preserves_manual_and_bot_rebans_after_unban() {
         use crate::{db, state::GatewayCaseAction};
 
@@ -1410,6 +1529,7 @@ mod tests {
                 app.suppress_next_gateway_case(GatewayCaseAction::Ban, 10, 20, Some(operation));
             }
             app.clear_gateway_ban_echo(10, 20);
+            let delayed = delayed.resolve();
             assert!(delayed.suppress_case);
             assert!(delayed.owned_by_bot);
             assert_eq!(delayed.operation_id.as_deref(), Some("old-attempt"));
@@ -1449,7 +1569,7 @@ mod tests {
             } else {
                 None
             };
-            let next = app.consume_gateway_ban_echo(10, 20);
+            let next = app.consume_gateway_ban_echo(10, 20).resolve();
             assert_eq!(
                 record_unresolved_gateway_observation(next.suppress_case),
                 next_operation.is_none(),
