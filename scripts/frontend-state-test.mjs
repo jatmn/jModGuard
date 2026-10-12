@@ -1267,6 +1267,115 @@ test('log channel ignore editor saves user and channel IDs as strings', async ()
   assert.equal(calls.length, 1, 'names must be rejected before calling the API');
 });
 
+for (const failRead of [false, true]) {
+  test(`recovered ignore save reads current values and retains failed reconciliation (${failRead})`, async () => {
+    const calls = [];
+    const oldUser = '9007199254740993', currentUser = '9007199254740995';
+    const cfg = {
+      enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+      settings: { prefix: '!', bot_name: '' },
+      log_channels: [{ event: 'message_edit', effective: '111', guild_override: '111', global: null, ignore: { users: [], channels: [] } }],
+    };
+    let writes = 0, reads = 0, unavailable = failRead;
+    const h = harness(async (url, opts) => {
+      calls.push({ url, opts });
+      if (opts.method === 'PUT') {
+        if (opts.headers['x-jmodguard-save-lookup'] === '0') {
+          writes++;
+          throw new Error('acknowledgement lost');
+        }
+        return response({ ignore: { users: [oldUser], channels: [] } });
+      }
+      assert.ok(url.endsWith('/config'));
+      reads++;
+      if (unavailable) throw new Error('current configuration unavailable');
+      return response({ ...cfg, log_channels: [{ ...cfg.log_channels[0], ignore: { users: [currentUser], channels: [] } }] });
+    });
+    h.app.state.config = cfg;
+    h.app.state.tab = 'logchannels';
+    h.app.renderTab();
+    const userField = () => h.elements.find(n => n.localName === 'textarea');
+    const save = () => h.elements.find(n => n.localName === 'button' && n.textContent === 'Save ignores');
+    userField().value = oldUser;
+    await fire(userField(), 'input');
+    await fire(save(), 'click');
+    await fire(save(), 'click');
+    const puts = () => calls.filter(c => c.opts.method === 'PUT');
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[0].opts.headers['x-jmodguard-save'], puts()[1].opts.headers['x-jmodguard-save']);
+    assert.equal(reads, 1, 'recovery must read current ignores');
+    if (failRead) {
+      assert.equal(userField().value, oldUser);
+      assert.equal(h.app.isDirty(), true);
+      assert.match(h.nodes.get('#toast').textContent, /current configuration unavailable/);
+      assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 1);
+      unavailable = false;
+      await fire(save(), 'click');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save-lookup'], '1');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    }
+    assert.equal(writes, 1, 'reconciliation must never submit a new mutation');
+    assert.equal(userField().value, currentUser);
+    assert.equal(h.app.state.config.log_channels[0].ignore.users[0], currentUser);
+    assert.equal(h.app.isDirty(), false);
+    assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 0);
+  });
+
+  test(`recovered role save reads current roles and revision before settling (${failRead})`, async () => {
+    const calls = [];
+    let reads = 0, writes = 0, unavailable = failRead;
+    const h = harness(async (url, opts) => {
+      assert.ok(url.endsWith('/case-delete-roles'));
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ opts, body });
+      if (opts.method === 'POST') {
+        reads++;
+        if (reads === 1) return response({ roles: ['1'], revision: 'revision-1' });
+        if (unavailable) throw new Error('current roles unavailable');
+        return response({ roles: ['3'], revision: 'revision-3' });
+      }
+      if (opts.headers['x-jmodguard-save-lookup'] === '1') return response({ revision: 'revision-2' });
+      writes++;
+      if (writes === 1) throw new Error('acknowledgement lost');
+      assert.equal(body.revision, 'revision-3', 'next mutation must use the reconciled revision');
+      return response({ revision: 'revision-4' });
+    });
+    h.app.state.config = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+    h.app.state.tab = 'settings';
+    h.app.renderTab();
+    await settle();
+    const input = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute('placeholder') || ''));
+    const save = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
+    input.value = '2';
+    await fire(input, 'input');
+    await fire(save, 'click');
+    await fire(save, 'click');
+    const puts = () => calls.filter(c => c.opts.method === 'PUT');
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[0].opts.headers['x-jmodguard-save'], puts()[1].opts.headers['x-jmodguard-save']);
+    assert.equal(reads, 2, 'recovery must reread roles and their revision');
+    if (failRead) {
+      assert.equal(input.value, '2');
+      assert.equal(h.app.isDirty(), true);
+      assert.match(h.nodes.get('#toast').textContent, /current roles unavailable/);
+      assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 1);
+      unavailable = false;
+      await fire(save, 'click');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save-lookup'], '1');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    }
+    assert.equal(writes, 1);
+    assert.equal(input.value, '3');
+    assert.equal(h.app.isDirty(), false);
+    input.value = '4';
+    await fire(input, 'input');
+    await fire(save, 'click');
+    assert.equal(writes, 2);
+    assert.equal(puts().at(-1).body.revision, 'revision-3');
+    assert.equal(h.app.isDirty(), false);
+  });
+}
+
 test('queued log-channel receipts reconcile without a configuration refresh', async () => {
   const pending = {
     id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',

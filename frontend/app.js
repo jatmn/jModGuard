@@ -828,15 +828,15 @@ function throwApiFailure(data, status, retryAfterMs) {
   throw error;
 }
 
-async function api(path, method = "GET", body = null, signal) {
+async function api(path, method = "GET", body = null, signal, reconcileRecovered) {
   const save = ["POST", "PUT"].includes(method) &&
     /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
     (method !== "POST" || body !== null);
-  if (save) return submitSave(path, method, body, signal);
+  if (save) return submitSave(path, method, body, signal, reconcileRecovered);
   return apiRequest(path, method, body, signal);
 }
 
-async function submitSave(path, method, body, signal) {
+async function submitSave(path, method, body, signal, reconcileRecovered) {
   const canonical = body && Object.fromEntries(Object.keys(body).sort().map(key => [key, body[key]]));
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
@@ -859,10 +859,14 @@ async function submitSave(path, method, body, signal) {
     throw new Error("Saved request was not submitted. Reload and review this server before saving again.");
   }
   try {
-    const result = await apiRequest(path, method, body, signal, {
+    let result = await apiRequest(path, method, body, signal, {
       "x-jmodguard-save": saved.id,
       "x-jmodguard-save-lookup": lookup ? "1" : "0",
     });
+    // Specialized editors also consume fields outside config_patch. Keep the
+    // identity until their current-state read succeeds, so a failed read retries
+    // the acknowledgement without submitting another mutation.
+    if (lookup && reconcileRecovered) result = await reconcileRecovered();
     try { window.sessionStorage.removeItem(key); } catch (_) { /* A retained ID only queries its result. */ }
     // The page may already include this commit, or a newer edit. Reconcile
     // current configuration instead of applying a historical patch again.
@@ -3041,6 +3045,7 @@ function tabLogChannels() {
 
 function LogChannelCard({ lc }) {
   const guildId = state.guildId;
+  const enrollmentId = state.config.enrollment_id;
   const inputRef = useRef(null);
   const input = h(Input, {
     ref: inputRef,
@@ -3180,6 +3185,12 @@ function LogChannelCard({ lc }) {
               const saved = await api(`/api/guilds/${guildId}/logfilters/${lc.event}`, "PUT", {
                 users,
                 channels,
+              }, undefined, async () => {
+                const config = await apiRead(`/api/guilds/${guildId}/config`);
+                if (config.enrollment_id !== enrollmentId) {
+                  throw new Error("Bot membership changed. Reload and review this server before saving again.");
+                }
+                return { ignore: config.log_channels.find(row => row.event === lc.event).ignore };
               });
               lc.ignore = saved.ignore;
               toast("Ignore list saved", "success");
@@ -4637,10 +4648,10 @@ function tabSettings() {
                 const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", {
                   roles: splitIds(roleInputRef.current.value),
                   revision: roleRevision.current,
-                });
+                }, undefined, () => apiRead(`/api/guilds/${state.guildId}/case-delete-roles`));
                 roleWriteGeneration.current++;
                 roleRevision.current = saved.revision;
-                setRoleBaseline(roleInputRef.current.value);
+                setRoleBaseline(saved.roles ? saved.roles.join(", ") : roleInputRef.current.value);
                 const drafts = { ...currentDrafts() };
                 delete drafts["settings:roles"];
                 ui.set({ drafts, dirty: Object.keys(drafts).length > 0 });

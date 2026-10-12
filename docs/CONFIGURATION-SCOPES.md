@@ -102,7 +102,11 @@ acknowledgement clears the browser identity. HTTP 409 `save_expired` also settle
 bot rejected this job before applying it, so the user can explicitly submit a new save
 with the unchanged draft. Transport errors and unclassified failures retain the identity;
 error text alone never proves that a write was not applied. Network failures retain it, including
-across page reloads. DELETE and the separately queued bot actions keep their existing contracts.
+across page reloads. Recovered results are historical acknowledgements, not current
+configuration. Patch consumers refresh configuration; the ignore and case-removal-role
+editors read current values (and the current role revision) before clearing the identity
+or draft. A failed specialized read retains both for lookup-only recovery on the next
+attempt. DELETE and the separately queued bot actions keep their existing contracts.
 
 The global rule editor sends `clear_guild_override: true` on its PUT from a server
 page. The bot writes the global rule and clears that captured server's override in
