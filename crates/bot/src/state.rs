@@ -54,6 +54,13 @@ const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GatewayCaseSuppression(u128);
 
+/// Ownership captured once for a Gateway ban, before asynchronous work.
+pub(crate) struct GatewayBanEcho {
+    pub(crate) suppress_case: bool,
+    pub(crate) owned_by_bot: bool,
+    pub(crate) operation_id: Option<String>,
+}
+
 struct GatewayCaseEntry {
     action: GatewayCaseAction,
     guild: u64,
@@ -222,6 +229,11 @@ impl GatewayCaseSuppressions {
 
     fn clear_ban_echo(&mut self, guild: u64, user: u64) {
         self.recent_ban_echo.remove(&(guild, user));
+        // A delayed callback must not consume an older pending ban token and
+        // restore ownership after this unban. Later dispatches get new tokens.
+        self.entries.retain(|_, entry| {
+            entry.action != GatewayCaseAction::Ban || entry.guild != guild || entry.user != user
+        });
     }
 }
 
@@ -860,7 +872,19 @@ impl BotState {
             .remove(action, guild, user)
     }
 
+    pub(crate) fn consume_gateway_ban_echo(&self, guild: u64, user: u64) -> GatewayBanEcho {
+        let mut suppressions = self.gateway_case_suppressions.lock();
+        let suppress_case = suppressions.remove(GatewayCaseAction::Ban, guild, user);
+        let operation = suppressions.ban_echo_operation(guild, user);
+        GatewayBanEcho {
+            suppress_case,
+            owned_by_bot: suppress_case || operation.is_some(),
+            operation_id: operation.flatten(),
+        }
+    }
+
     /// Operation id saved with a consumed bot ban echo, when one is still remembered.
+    #[cfg(test)]
     pub(crate) fn gateway_ban_echo_operation(
         &self,
         guild: u64,
@@ -1644,6 +1668,30 @@ mod tests {
         assert!(suppressions.ban_echo_operation(10, 21).is_none());
         suppressions.clear_ban_echo(10, 20);
         assert!(suppressions.ban_echo_operation(10, 20).is_none());
+    }
+
+    #[test]
+    fn unban_invalidates_only_older_ban_tokens_for_its_member() {
+        let mut s = GatewayCaseSuppressions::default();
+        let old_a = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-a".into()));
+        let old_b = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-b".into()));
+        s.insert(GatewayCaseAction::Unban, 10, 20, None);
+        s.insert(GatewayCaseAction::Ban, 10, 21, Some("other-member".into()));
+        s.insert(GatewayCaseAction::Ban, 11, 20, Some("other-guild".into()));
+        s.clear_ban_echo(10, 20);
+        assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(s.ban_echo_operation(10, 20).is_none());
+        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 21));
+        assert!(s.remove(GatewayCaseAction::Ban, 11, 20));
+        s.insert(GatewayCaseAction::Ban, 10, 20, Some("new-attempt".into()));
+        s.release(old_a);
+        s.release(old_b);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert_eq!(
+            s.ban_echo_operation(10, 20),
+            Some(Some("new-attempt".into()))
+        );
     }
 
     #[test]

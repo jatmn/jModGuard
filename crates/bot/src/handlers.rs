@@ -416,6 +416,12 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        // Capture ownership before any await: an unban can invalidate shared
+        // tokens while this callback waits, but this already-started echo keeps
+        // its own suppression and operation id without restoring that state.
+        let echo = self
+            .app
+            .consume_gateway_ban_echo(guild_id.get(), banned_user.id.get());
         let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
@@ -435,8 +441,7 @@ impl EventHandler for Handler {
         .await;
         let observed_at = observed.to_rfc3339();
         // A bot echo is not a second ban and not a manual moderation record.
-        // Consume the one-shot token before the write, and remember that
-        // consumption so a second delivery of the same echo stays owned.
+        // The entry snapshot also remembers duplicate echoes until an unban.
         // If Discord applied the ban but the command never stored a row, that
         // owned echo still inserts the one active row, marked with this
         // attempt's operation id, and does not add a member_ban event. A
@@ -444,14 +449,6 @@ impl EventHandler for Handler {
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. A later delivery does not insert
         // and does not replace the actor or reason already stored.
-        let suppressed = app.consume_gateway_case_suppression(
-            crate::state::GatewayCaseAction::Ban,
-            guild_id.get(),
-            banned_user.id.get(),
-        );
-        let echo_operation = app.gateway_ban_echo_operation(guild_id.get(), banned_user.id.get());
-        let owned_echo = suppressed || echo_operation.is_some();
-        let operation_id = echo_operation.flatten();
         let ban_write = crate::logging::log_persistence_result(
             "gateway ban row",
             db::record_gateway_ban(
@@ -461,8 +458,8 @@ impl EventHandler for Handler {
                 Some(&banned_user.name),
                 banned_user.global_name.as_deref(),
                 Some(&observed_at),
-                owned_echo,
-                operation_id.as_deref(),
+                echo.owned_by_bot,
+                echo.operation_id.as_deref(),
             )
             .await,
         );
@@ -470,7 +467,7 @@ impl EventHandler for Handler {
         // Every unsuppressed delivery is a distinct unresolved observation.
         // A matching saved status is not an action identity: an opposite event
         // may have been missed while Gateway coverage was unavailable.
-        if record_unresolved_gateway_observation(suppressed) {
+        if record_unresolved_gateway_observation(echo.suppress_case) {
             let recorded = crate::cases::record(
                 &app,
                 enrollment.clone(),
@@ -1373,6 +1370,109 @@ mod tests {
             gateway_ban_row_to_attribute(crate::db::GatewayBanWrite::OwnedByBot { row_id: 4 }),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_ban_echo_does_not_own_a_manual_reban_after_unban() {
+        use crate::{db, state::GatewayCaseAction};
+
+        // Real suppression state, enrolled SQLite writes, and attribution.
+        // Schedule the two handler phases explicitly; no live Discord Gateway.
+        for consume_before_unban in [true, false] {
+            let directory = std::env::temp_dir()
+                .join(format!("delayed_ban_echo_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("core.db");
+            let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+            let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            db::record_enrolled_ban_with_identity(
+                &app.db,
+                Some(enrollment.clone()),
+                20,
+                Some("member"),
+                None,
+                Some(42),
+                Some("bot"),
+                "bot reason",
+                None,
+            )
+            .await
+            .unwrap();
+            app.suppress_next_gateway_case(GatewayCaseAction::Ban, 10, 20, Some("old-attempt"));
+            let started = consume_before_unban.then(|| app.consume_gateway_ban_echo(10, 20));
+            // Unban observation invalidates ownership before its database work.
+            app.clear_gateway_ban_echo(10, 20);
+            let delayed = started.unwrap_or_else(|| app.consume_gateway_ban_echo(10, 20));
+            if consume_before_unban {
+                assert!(delayed.suppress_case);
+                assert!(delayed.owned_by_bot);
+                assert_eq!(delayed.operation_id.as_deref(), Some("old-attempt"));
+            }
+            let old_write = db::record_gateway_ban(
+                &app.db,
+                Some(enrollment.clone()),
+                20,
+                Some("member"),
+                None,
+                None,
+                delayed.owned_by_bot,
+                delayed.operation_id.as_deref(),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(old_write, db::GatewayBanWrite::Existing { .. }));
+            // Complete the observed unban, then deliver a manual reban inside TTL.
+            db::mark_enrolled_unbanned(&app.db, Some(enrollment.clone()), 20)
+                .await
+                .unwrap();
+            let manual = app.consume_gateway_ban_echo(10, 20);
+            let write = db::record_gateway_ban(
+                &app.db,
+                Some(enrollment.clone()),
+                20,
+                Some("member"),
+                None,
+                None,
+                manual.owned_by_bot,
+                manual.operation_id.as_deref(),
+            )
+            .await
+            .unwrap();
+            let events = db::query_enrolled_events(
+                &app.db,
+                enrollment.clone(),
+                Some("member_ban"),
+                Some(20),
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(events.len(), 1, "manual reban must have one event");
+            let row_id =
+                gateway_ban_row_to_attribute(write).expect("manual reban can be attributed");
+            db::attribute_enrolled_ban(
+                &app.db,
+                Some(enrollment.clone()),
+                row_id,
+                20,
+                77,
+                Some("moderator"),
+                "manual reason",
+            )
+            .await
+            .unwrap();
+            let rows = db::list_enrolled_bans(&app.db, enrollment, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+            let manual_row = rows.iter().find(|row| row.id == row_id).unwrap();
+            assert!(manual_row.active);
+            assert_eq!(manual_row.moderator_id, Some(77));
+            assert_eq!(manual_row.reason.as_deref(), Some("manual reason"));
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[tokio::test]
