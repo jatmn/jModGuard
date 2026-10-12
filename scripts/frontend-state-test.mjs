@@ -1640,41 +1640,6 @@ test('case-delete-role save rejects invalid IDs instead of clearing roles', asyn
   assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
 });
 
-test('late case-delete-role load cannot overwrite an acknowledged save', async () => {
-  const calls = [];
-  let resolveInitialRoles;
-  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
-  const h = harness(async (url, options) => {
-    const body = options.body ? JSON.parse(options.body) : null;
-    calls.push({ url, method: options.method, body });
-    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
-      return new Promise(resolve => { resolveInitialRoles = resolve; });
-    }
-    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
-      return response({ revision: calls.filter(c => c.method === 'PUT').length === 1 ? 'revision-2' : 'revision-3' });
-    }
-    return response(cfg);
-  });
-  h.app.state.config = cfg;
-  h.app.state.tab = 'settings';
-  h.app.tabSettings();
-
-  const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
-  const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
-  roleInput.value = '2';
-  await fire(roleInput, 'input');
-  await fire(saveRoles, 'click', {});
-
-  resolveInitialRoles(response({ roles: ['1'], revision: 'revision-1' }));
-  await settle();
-  assert.equal(roleInput.value, '2');
-
-  await fire(saveRoles, 'click', {});
-  const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
-  assert.equal(puts.length, 2);
-  assert.equal(puts[1].body.revision, 'revision-2');
-});
-
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
@@ -3377,6 +3342,74 @@ for (const reload of [false, true]) test(`role retry preserves its captured revi
   assert.equal(next.opts.headers['x-jmodguard-save-lookup'],'0');
   assert.notEqual(next.opts.headers['x-jmodguard-save'],puts[0].opts.headers['x-jmodguard-save']);
   assert.equal(roleWrites,2);
+});
+
+for (const recovering of [false, true]) test(`role save with a pending initial read ${recovering ? 'recovers its accepted revision' : 'waits before capturing a new revision'}`, async () => {
+  const calls = [], session = new Map();
+  const originalRevision = '1'.repeat(32), currentRevision = '3'.repeat(32);
+  const config = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+  let resolveInitialRead, reads = 0, writes = 0, receipt;
+  const fetchRoles = async (url, opts) => {
+    assert.ok(url.endsWith('/case-delete-roles'));
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ opts, body });
+    if (opts.method === 'POST') {
+      reads++;
+      if (reads === 1) return new Promise(resolve => { resolveInitialRead = resolve; });
+      return response({ roles: ['3'], revision: currentRevision });
+    }
+    if (opts.headers['x-jmodguard-save-lookup'] === '1') {
+      assert.deepEqual(body, { roles: ['2'], revision: originalRevision });
+      return response(receipt);
+    }
+    const expectedRevision = recovering && writes > 0 ? currentRevision : originalRevision;
+    if (body.revision !== expectedRevision) {
+      return { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'tenant settings changed' }) };
+    }
+    writes++;
+    receipt = { revision: '2'.repeat(32) };
+    if (recovering && writes === 1) throw new Error('acknowledgement lost');
+    return response(receipt);
+  };
+  if (recovering) {
+    const original = harness(fetchRoles, new Map(), session);
+    original.app.state.config = structuredClone(config);
+    await assert.rejects(original.app.api(`/api/guilds/${original.app.state.guildId}/case-delete-roles`, 'PUT', {
+      roles: ['2'], revision: originalRevision,
+    }), /acknowledgement lost/);
+  }
+  const h = harness(fetchRoles, new Map(), session);
+  h.app.state.config = structuredClone(config);
+  h.app.state.tab = 'settings'; h.app.renderTab(); await settle();
+  const input = () => h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute('placeholder') || ''));
+  const save = () => h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
+  const puts = () => calls.filter(c => c.opts.method === 'PUT');
+  input().value = '2'; await fire(input(), 'input'); await fire(save(), 'click');
+  if (recovering) {
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[1].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    assert.equal(writes, 1, 'recovery before the initial read completes must not mutate again');
+    assert.equal(input().value, '3');
+  } else {
+    assert.equal(puts().length, 0, 'a loading placeholder must not be submitted or retained as a save');
+    assert.equal(session.size, 0);
+    assert.equal(input().value, '2');
+    assert.equal(h.app.isDirty(), true);
+    assert.match(h.nodes.get('#toast').textContent, /roles.*load/i);
+  }
+  resolveInitialRead(response({ roles: ['1'], revision: originalRevision })); await settle();
+  if (recovering) {
+    assert.equal(input().value, '3', 'the late initial read must not replace reconciled roles');
+    input().value = '4'; await fire(input(), 'input');
+  }
+  await fire(save(), 'click');
+  const latest = puts().at(-1);
+  assert.equal(latest.opts.headers['x-jmodguard-save-lookup'], '0');
+  assert.equal(latest.body.revision, recovering ? currentRevision : originalRevision);
+  assert.deepEqual(latest.body.roles, recovering ? ['4'] : ['2']);
+  assert.equal(writes, recovering ? 2 : 1);
+  assert.equal(session.size, 0);
+  assert.equal(h.app.isDirty(), false);
 });
 
 test('untouched rule reload recovers reordered nested parameters', async () => {

@@ -851,10 +851,19 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
   const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
-  let saved, lookup;
+  let raw, saved, lookup;
   try {
-    const raw = window.sessionStorage.getItem(key);
+    raw = window.sessionStorage.getItem(key);
     lookup = raw !== null;
+  } catch (_) {
+    throw new Error("Browser session storage must be available and valid to safely save changes.");
+  }
+  // Only a new save needs the initial read. An unresolved save already owns
+  // its original revision and must remain lookup-only while that read is pending.
+  if (roleSave && !lookup && !body.revision) {
+    throw new Error("Case-removal roles have not loaded yet. Wait for them to load before saving.");
+  }
+  try {
     saved = raw ? JSON.parse(raw) : {
       id: (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", ""),
       enrollment,
