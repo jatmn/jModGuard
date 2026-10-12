@@ -100,21 +100,29 @@ extract_handler() {
 for event in guild_ban_addition guild_ban_removal; do
   function="$(extract_handler "$event")"
   [[ -n "$function" ]] || fail "Missing gateway handler: $event"
-  printf '%s\n' "$function" | grep -Fq 'consume_gateway_case_suppression' \
+  suppression='consume_gateway_case_suppression'
+  if [[ "$event" == guild_ban_addition ]]; then
+    suppression='consume_gateway_ban_echo'
+  fi
+  printf '%s\n' "$function" | grep -Fq "$suppression" \
     || fail "Gateway $event must suppress bot echoes and retain external cases"
   printf '%s\n' "$function" | grep -Fq 'cases::record' \
     || fail "Gateway $event must suppress bot echoes and retain external cases"
 done
 echo 'Gateway ban events suppress bot echoes and retain external cases'
 
-# Audit enrichment may wait for Discord. Decide whether BanAdd is a bot echo
-# and record an external case before that wait can expire the suppression.
+# Capture BanAdd ownership before any await can race an unban. Record an
+# external case before audit enrichment can expire the suppression.
 extract_handler guild_ban_addition | awk '
-  /consume_gateway_case_suppression/ { suppression = NR }
+  /consume_gateway_ban_echo/ { suppression = NR }
+  /\.await/ && !first_await { first_await = NR }
+  /\.await/ && !mirror { last_initial_await = NR }
+  /let echo = echo\.resolve\(\);/ { resolved = NR }
+  /db::record_gateway_ban\(/ { mirror = NR }
   /crate::cases::record\(/ { external_case = NR }
   /logging::lookup_member_audit\(/ { audit = NR }
-  END { exit !(suppression && external_case && audit && suppression < audit && external_case < audit) }
-' || fail 'Gateway ban case routing must precede audit lookup'
+  END { exit !(suppression && first_await && resolved && mirror && external_case && audit && suppression < first_await && last_initial_await < resolved && resolved < mirror && external_case < audit) }
+' || fail 'Gateway ban capture must precede awaits, resolution must precede persistence, and case routing must precede audit lookup'
 
 check_tree() {
   local package="$1"

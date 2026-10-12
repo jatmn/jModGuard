@@ -51,8 +51,42 @@ pub(crate) enum GatewayCaseAction {
 const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct GatewayCaseSuppression(u128);
+#[derive(Debug, Clone)]
+pub(crate) struct GatewayCaseSuppression {
+    id: u128,
+    released: Arc<AtomicBool>,
+}
+
+/// One decision shared by the mirror, case routing and attribution.
+pub(crate) struct GatewayBanEcho {
+    pub(crate) suppress_case: bool,
+    pub(crate) owned_by_bot: bool,
+    pub(crate) operation_id: Option<String>,
+}
+
+/// Identity captured before awaits, still revocable by its own failed dispatch.
+pub(crate) struct GatewayBanEchoCapture {
+    echo: GatewayBanEcho,
+    released: Option<Arc<AtomicBool>>,
+}
+
+impl GatewayBanEchoCapture {
+    /// Resolve once before persistence so every consumer uses the same decision.
+    pub(crate) fn resolve(self) -> GatewayBanEcho {
+        if self
+            .released
+            .is_some_and(|released| released.load(Ordering::Acquire))
+        {
+            GatewayBanEcho {
+                suppress_case: false,
+                owned_by_bot: false,
+                operation_id: None,
+            }
+        } else {
+            self.echo
+        }
+    }
+}
 
 struct GatewayCaseEntry {
     action: GatewayCaseAction,
@@ -60,16 +94,24 @@ struct GatewayCaseEntry {
     user: u64,
     operation_id: Option<String>,
     expires: Instant,
+    released: Arc<AtomicBool>,
+}
+
+struct GatewayBanEchoEntry {
+    expires: Instant,
+    operation_id: Option<String>,
+    released: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
 struct GatewayCaseSuppressions {
     next_token: u128,
-    entries: HashMap<GatewayCaseSuppression, GatewayCaseEntry>,
+    entries: HashMap<u128, GatewayCaseEntry>,
     /// Ban tokens already consumed. A second delivery of the same bot echo
     /// has no token left, but it is still the bot's ban until this expires
-    /// or an unban clears it. The string is that attempt's operation id.
-    recent_ban_echo: HashMap<(u64, u64), (Instant, Option<String>)>,
+    /// or an unban clears it or its dispatch is released. The string is that
+    /// attempt's operation id.
+    recent_ban_echo: HashMap<(u64, u64), GatewayBanEchoEntry>,
 }
 
 /// A write failure cannot be recorded in the same unavailable guild store.
@@ -144,7 +186,7 @@ impl GatewayCaseSuppressions {
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, entry| entry.expires > now);
         self.recent_ban_echo
-            .retain(|_, (expires, _)| *expires > now);
+            .retain(|_, entry| entry.expires > now && !entry.released.load(Ordering::Acquire));
     }
 
     fn insert(
@@ -166,23 +208,30 @@ impl GatewayCaseSuppressions {
             self.entries.remove(&oldest);
         }
         self.next_token += 1;
-        let token = GatewayCaseSuppression(self.next_token);
+        let token = GatewayCaseSuppression {
+            id: self.next_token,
+            released: Arc::new(AtomicBool::new(false)),
+        };
         self.entries.insert(
-            token,
+            token.id,
             GatewayCaseEntry {
                 action,
                 guild,
                 user,
                 operation_id,
                 expires: now + GATEWAY_CASE_SUPPRESSION_TTL,
+                released: Arc::clone(&token.released),
             },
         );
         token
     }
 
     fn release(&mut self, token: GatewayCaseSuppression) {
+        // Consumption must not detach the captured echo from a definitive
+        // failure. This flag belongs only to this dispatch, even after unban.
+        token.released.store(true, Ordering::Release);
         self.prune(Instant::now());
-        self.entries.remove(&token);
+        self.entries.remove(&token.id);
     }
 
     fn remove(&mut self, action: GatewayCaseAction, guild: u64, user: u64) -> bool {
@@ -201,10 +250,11 @@ impl GatewayCaseSuppressions {
         if entry.action == GatewayCaseAction::Ban {
             self.recent_ban_echo.insert(
                 (entry.guild, entry.user),
-                (
-                    Instant::now() + GATEWAY_CASE_SUPPRESSION_TTL,
-                    entry.operation_id,
-                ),
+                GatewayBanEchoEntry {
+                    expires: Instant::now() + GATEWAY_CASE_SUPPRESSION_TTL,
+                    operation_id: entry.operation_id,
+                    released: entry.released,
+                },
             );
         }
         true
@@ -212,16 +262,19 @@ impl GatewayCaseSuppressions {
 
     /// `Some` when a consumed bot ban echo is still remembered.
     /// The string is that attempt's operation id, when the dispatch saved one.
+    #[cfg(test)]
     fn ban_echo_operation(&mut self, guild: u64, user: u64) -> Option<Option<String>> {
         let now = Instant::now();
         self.prune(now);
         self.recent_ban_echo
             .get(&(guild, user))
-            .map(|(_, operation_id)| operation_id.clone())
+            .map(|entry| entry.operation_id.clone())
     }
 
     fn clear_ban_echo(&mut self, guild: u64, user: u64) {
         self.recent_ban_echo.remove(&(guild, user));
+        // Pending tokens may belong to a newer dispatch that started before
+        // this unban callback. Only consumed echo ownership ends here.
     }
 }
 
@@ -860,7 +913,22 @@ impl BotState {
             .remove(action, guild, user)
     }
 
+    pub(crate) fn consume_gateway_ban_echo(&self, guild: u64, user: u64) -> GatewayBanEchoCapture {
+        let mut suppressions = self.gateway_case_suppressions.lock();
+        let suppress_case = suppressions.remove(GatewayCaseAction::Ban, guild, user);
+        let remembered = suppressions.recent_ban_echo.get(&(guild, user));
+        GatewayBanEchoCapture {
+            echo: GatewayBanEcho {
+                suppress_case,
+                owned_by_bot: suppress_case || remembered.is_some(),
+                operation_id: remembered.and_then(|entry| entry.operation_id.clone()),
+            },
+            released: remembered.map(|entry| Arc::clone(&entry.released)),
+        }
+    }
+
     /// Operation id saved with a consumed bot ban echo, when one is still remembered.
+    #[cfg(test)]
     pub(crate) fn gateway_ban_echo_operation(
         &self,
         guild: u64,
@@ -1609,13 +1677,14 @@ mod tests {
         assert!(!suppressions.remove(GatewayCaseAction::Ban, 10, 20));
 
         suppressions.entries.insert(
-            GatewayCaseSuppression(0),
+            0,
             GatewayCaseEntry {
                 action: GatewayCaseAction::Ban,
                 guild: 30,
                 user: 40,
                 operation_id: None,
                 expires: Instant::now() - Duration::from_secs(1),
+                released: Arc::new(AtomicBool::new(false)),
             },
         );
         suppressions.insert(GatewayCaseAction::Unban, 30, 40, None);
@@ -1644,6 +1713,37 @@ mod tests {
         assert!(suppressions.ban_echo_operation(10, 21).is_none());
         suppressions.clear_ban_echo(10, 20);
         assert!(suppressions.ban_echo_operation(10, 20).is_none());
+    }
+
+    #[test]
+    fn unban_preserves_pending_ban_dispatches_for_its_member() {
+        let mut s = GatewayCaseSuppressions::default();
+        let old = s.insert(GatewayCaseAction::Ban, 10, 20, Some("old-attempt".into()));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        // The next dispatch can start before the preceding unban callback.
+        s.insert(GatewayCaseAction::Ban, 10, 20, Some("new-attempt".into()));
+        s.insert(GatewayCaseAction::Unban, 10, 20, None);
+        s.insert(GatewayCaseAction::Ban, 10, 21, Some("other-member".into()));
+        s.insert(GatewayCaseAction::Ban, 11, 20, Some("other-guild".into()));
+        s.clear_ban_echo(10, 20);
+        assert!(s.ban_echo_operation(10, 20).is_none());
+        s.release(old.clone());
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert_eq!(
+            s.ban_echo_operation(10, 20),
+            Some(Some("new-attempt".into()))
+        );
+        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 21));
+        assert!(s.remove(GatewayCaseAction::Ban, 11, 20));
+        s.clear_ban_echo(10, 20);
+        s.insert(GatewayCaseAction::Ban, 10, 20, Some("later-attempt".into()));
+        s.release(old);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert_eq!(
+            s.ban_echo_operation(10, 20),
+            Some(Some("later-attempt".into()))
+        );
     }
 
     #[test]
