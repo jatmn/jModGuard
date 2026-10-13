@@ -20,12 +20,10 @@ jmodguard_preflight_cargo_tool_root() {
     printf '%s\n' "$JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT"
     return 0
   fi
-  local root checkout="${GITHUB_WORKSPACE:-${BUILDKITE_BUILD_CHECKOUT_PATH:-$PWD}}"
+  local root checkout="${GITHUB_WORKSPACE:-$PWD}"
   mkdir -p "$checkout/target"
   if [ -n "${GITHUB_RUN_ID:-}" ]; then
     root="$checkout/target/ci-preflight-tools-${GITHUB_RUN_ID}"
-  elif [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
-    root="$checkout/target/ci-preflight-tools-${BUILDKITE_BUILD_ID}"
   else
     root="$(mktemp -d "$checkout/target/ci-preflight-tools.XXXXXX")"
   fi

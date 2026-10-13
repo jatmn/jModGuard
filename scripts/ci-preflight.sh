@@ -425,10 +425,10 @@ if [ -z "${only_names}" ]; then
   cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
 
   echo 'ci-preflight: cargo test --locked --workspace'
-  run_timed_cargo_test cargo test --locked --workspace
+  run_timed_cargo_test cargo test --locked --workspace || exit $?
 
   echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-  run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib
+  run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
 else
   if should_run api; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings'
@@ -436,9 +436,9 @@ else
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-api'
-    cargo test --locked -p jmodguard-api
+    run_timed_cargo_test cargo test --locked -p jmodguard-api || exit $?
     echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-    cargo test --locked -p jmodguard-api --no-default-features --lib
+    run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
     echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
@@ -448,7 +448,7 @@ else
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
-    cargo test --locked -p jmodguard-bot
+    run_timed_cargo_test cargo test --locked -p jmodguard-bot || exit $?
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
   fi
@@ -456,31 +456,31 @@ else
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
-    cargo test --locked -p jmodguard-runtime
+    run_timed_cargo_test cargo test --locked -p jmodguard-runtime || exit $?
   fi
   if should_run updater; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
-    cargo test --locked -p jmodguard-updater
+    run_timed_cargo_test cargo test --locked -p jmodguard-updater || exit $?
   fi
   if should_run core; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard'
-    cargo test --locked -p jmodguard
+    run_timed_cargo_test cargo test --locked -p jmodguard || exit $?
   fi
   if should_run integration; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
-    cargo test --locked -p jmodguard-integration-tests
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests || exit $?
     echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
     cargo build --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
     echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-    cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture || exit $?
   fi
 fi
 
@@ -542,7 +542,7 @@ if [ -z "${only_names}" ]; then
   cargo build --locked -p jmodguard-api
 
   echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture || exit $?
 
   echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
   cargo build --locked -p jmodguard-api --no-default-features

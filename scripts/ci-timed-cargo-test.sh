@@ -55,6 +55,16 @@ if ci_cargo_log_has_compiling "$large_plain"; then
   fail 'large log without Compiling must not match under pipefail'
 fi
 
+# Failed commands must restore errexit so a sourced preflight cannot continue with -e off.
+set -e
+run_with_test_timeout errexit-restore-probe false || errexit_probe_rc=$?
+errexit_probe_rc=${errexit_probe_rc:-0}
+[ "$errexit_probe_rc" -ne 0 ] || fail "errexit probe expected non-zero, got $errexit_probe_rc"
+case $- in
+  *e*) ;;
+  *) fail 'errexit must be on after a failed run_with_test_timeout' ;;
+esac
+
 # Timed-out command must not leave a background child running.
 hang_script="$fixture/hang.sh"
 cat >"$hang_script" <<'SH'

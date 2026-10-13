@@ -47,6 +47,34 @@ jmodguard_timed_cargo_install_traps() {
   trap 'jmodguard_runner_trap_signal 15' TERM
 }
 
+jmodguard_restore_errexit_if_needed() {
+  local had_errexit=$1
+  if [ "$had_errexit" -eq 1 ]; then
+    set -o errexit
+  fi
+}
+
+# Wait until the leader is its own session (pgid == pid) before killing by pgid.
+jmodguard_leader_session_pgid() {
+  local leader=$1
+  local pgid="" tries=0
+  while [ "$tries" -lt 50 ]; do
+    if ! kill -0 "$leader" 2>/dev/null; then
+      return 1
+    fi
+    pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || pgid=""
+    if [ -n "$pgid" ] && [ "$pgid" = "$leader" ]; then
+      printf '%s\n' "$pgid"
+      return 0
+    fi
+    sleep 0.02
+    tries=$((tries + 1))
+  done
+  pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || pgid=""
+  [ -n "$pgid" ] || return 1
+  printf '%s\n' "$pgid"
+}
+
 # Run a single test invocation under timeout. Uses setsid so descendant processes
 # (smoke services, fixtures) share a session and are terminated on timeout.
 run_with_test_timeout() {
@@ -60,7 +88,7 @@ run_with_test_timeout() {
   if command -v setsid >/dev/null 2>&1; then
     setsid "$@" &
     leader=$!
-    session_pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || session_pgid=""
+    session_pgid="$(jmodguard_leader_session_pgid "$leader")" || session_pgid=""
     JMODGUARD_ACTIVE_TEST_SESSION_PGID="$session_pgid"
     # Poll so INT/TERM traps are not deferred behind a long-running external `timeout`.
     deadline=$(( $(date +%s) + duration_sec ))
@@ -88,9 +116,7 @@ run_with_test_timeout() {
   if [ "$rc" -eq 124 ]; then
     echo "ci-preflight: test timed out after ${JMODGUARD_TEST_TIMEOUT_SEC}s: $name" >&2
   fi
-  if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
-    set -o errexit
-  fi
+  jmodguard_restore_errexit_if_needed "$had_errexit"
   return "$rc"
 }
 
@@ -108,16 +134,12 @@ run_cargo_test_timed() {
     cat "$log" >&2
     rm -f "$log"
     echo "ci-preflight: timed cargo test recompiled for $name" >&2
-    if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
-      set -o errexit
-    fi
+    jmodguard_restore_errexit_if_needed "$had_errexit"
     return 1
   fi
   cat "$log" >&2
   rm -f "$log"
-  if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
-    set -o errexit
-  fi
+  jmodguard_restore_errexit_if_needed "$had_errexit"
   return "$rc"
 }
 
@@ -255,9 +277,7 @@ run_cargo_test_doc_timed() {
   rc=$?
   cat "$log" >&2
   rm -f "$log"
-  if [ "$had_errexit" -eq 1 ] && [ "$rc" -eq 0 ]; then
-    set -o errexit
-  fi
+  jmodguard_restore_errexit_if_needed "$had_errexit"
   return "$rc"
 }
 
