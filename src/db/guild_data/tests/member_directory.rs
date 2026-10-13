@@ -5778,6 +5778,100 @@ fn assert_member_statement_bound(kind: &str, members: u64, queries: u64) {
 }
 
 #[tokio::test]
+async fn coverage_gap_mark_batches_writes_for_remote_transport() {
+    let (_f, mut store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    crate::db::test_mark_connection_pool_remote(&mut store.db);
+    let queries = probe.queries();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap();
+    assert!(
+        probe.queries() - queries <= 8,
+        "coverage-gap mark used {} remote calls",
+        probe.queries() - queries
+    );
+    let status = store
+        .member_sync_status(scope.clone(), 42, 122_001)
+        .await
+        .unwrap();
+    assert!(status.reconciliation_needed);
+    assert_eq!(status.reconciliation_reason.as_deref(), Some("gateway_gap"));
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_skips_audit_recovery_until_initial_completion() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap();
+    let audit: Option<i64> = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx
+                .query_row(
+                    "SELECT bot_id FROM guild_member_audit_recovery WHERE guild_id=10",
+                    (),
+                    |r| Ok(r.get(0)?),
+                )
+                .optional()?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert!(audit.is_none());
+    let status = store
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(status.reconciliation_needed);
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_is_idempotent_across_retries() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "second_gap", 4_000)
+        .await
+        .unwrap();
+    let generation: i64 = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx.query_row(
+                "SELECT gap_generation FROM guild_member_seed WHERE guild_id=10",
+                (),
+                |r| Ok(r.get(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert_eq!(generation, 2);
+    let status = store
+        .member_sync_status(scope.clone(), 42, 4_001)
+        .await
+        .unwrap();
+    assert_eq!(status.reconciliation_reason.as_deref(), Some("second_gap"));
+}
+
+#[tokio::test]
 async fn member_page_statements_scale_by_batch_not_by_member() {
     for members in [10_usize, 1_000] {
         let (_f, store, scope) = ready_guild(QUERY_COUNT_GUILD).await;

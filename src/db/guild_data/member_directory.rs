@@ -475,6 +475,12 @@ fn random_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+const COVERAGE_GAP_MARK_GROWTH: u64 = 256 * 1024;
+
 fn ensure_seed_bot(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
@@ -994,15 +1000,25 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         let reason = reason.to_string();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
-            tx.member_execute("UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason=?3,gap_at_ms=MAX(coalesce(gap_at_ms,0),?4),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str(),reason,now_ms])?;
-            let completed:Option<i64>=tx.query_row("SELECT initial_completed_at_ms FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?)).optional()?.flatten();
-            if completed.is_some(){let bot_id:i64=tx.query_row("SELECT bot_id FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
-                tx.member_execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) VALUES(?1,?2,?3,?4,?5,'queued',?5) ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete'",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,random_id(),now_ms])?;
-                tx.member_execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),?2) WHERE guild_id=?1 AND status!='complete' AND (cursor IS NOT NULL OR status='running')",params![scope.guild_id(),now_ms])?;
-            }
+        self.db.with_conn(move |conn| {
+            // Membership and placement checks are autocommit reads so they do not
+            // extend the remote interactive write transaction.
+            verify_scope(conn, &expected, &scope, true)?;
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            let guild_id = scope.guild_id();
+            let enrollment = sql_literal(scope.enrollment.id.as_str());
+            let reason_sql = sql_literal(&reason);
+            let run_id = sql_literal(&random_id());
+            let batch = format!(
+                "UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment};
+INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
+UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.initial_completed_at_ms IS NOT NULL);"
+            );
+            tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH)?;
             tx.commit()
-        }).await
+        })
+        .await
     }
 
     pub async fn initialize_member_directory(
