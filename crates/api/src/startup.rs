@@ -374,11 +374,16 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
             503
         );
         assert_eq!(
-            http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(
+                addr,
+                "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                None
+            )
+            .await,
             503
         );
         assert!(
@@ -393,7 +398,7 @@ mod tests {
         .unwrap();
         let mut ready = 0;
         for _ in 0..40 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await;
             if ready == 200 {
                 break;
             }
@@ -558,16 +563,21 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
             503
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(
+                addr,
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                None
+            )
+            .await,
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
             503
         );
         assert!(
@@ -583,9 +593,13 @@ mod tests {
         let mut ready = 0;
         let mut app_route = 0;
         for _ in 0..80 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
-            app_route =
-                http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await;
+            app_route = http_status(
+                addr,
+                "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                None,
+            )
+            .await;
             if ready == 200 && app_route != 503 && app_route != 0 {
                 break;
             }
@@ -601,7 +615,12 @@ mod tests {
         );
         assert_ne!(app_route, 0);
         assert_eq!(
-            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            http_status(
+                addr,
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                None
+            )
+            .await,
             200
         );
         assert!(
@@ -643,7 +662,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut seen = 0;
         while tokio::time::Instant::now() < deadline {
-            seen = http_status(addr, request).await;
+            seen = http_status(addr, request, Some(deadline)).await;
             if seen == want {
                 return seen;
             }
@@ -659,13 +678,35 @@ mod tests {
         request.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n")
     }
 
+    fn try_parse_http_status_line(response: &[u8]) -> Option<u16> {
+        let end = response.windows(2).position(|window| window == b"\r\n")?;
+        let text = String::from_utf8_lossy(&response[..end]);
+        text.split_whitespace().nth(1).unwrap_or("0").parse().ok()
+    }
+
     fn parse_http_status(response: &[u8]) -> u16 {
-        let text = String::from_utf8_lossy(response);
-        text.split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0)
+        try_parse_http_status_line(response).unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn abort_tcp_with_reset(stream: tokio::net::TcpStream) {
+        use std::os::unix::io::AsRawFd;
+        let std_stream = stream.into_std().unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                std_stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "setsockopt(SO_LINGER) failed");
+        drop(std_stream);
     }
 
     fn probe_io_error_is_transient(error: &std::io::Error) -> bool {
@@ -675,23 +716,71 @@ mod tests {
                 | std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionAborted
                 | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::TimedOut
         )
     }
 
-    async fn http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn read_probe_http_status(
+        stream: &mut tokio::net::TcpStream,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<u16, std::io::Error> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(512);
+        let mut chunk = [0u8; 256];
+        loop {
+            if let Some(status) = try_parse_http_status_line(&buf) {
+                return Ok(status);
+            }
+            let read_deadline =
+                deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(2));
+            if tokio::time::Instant::now() >= read_deadline {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            let n = tokio::time::timeout_at(read_deadline, stream.read(&mut chunk))
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+            if n == 0 {
+                return Ok(try_parse_http_status_line(&buf).unwrap_or(0));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 8192 {
+                return Ok(0);
+            }
+        }
+    }
+
+    async fn http_probe_once(
+        addr: std::net::SocketAddr,
+        request: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<u16, std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+        let work = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream.write_all(request.as_bytes()).await?;
+            read_probe_http_status(&mut stream, deadline).await
+        };
+        match deadline {
+            Some(end) => tokio::time::timeout_at(end, work)
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+            None => work.await,
+        }
+    }
+
+    async fn http_status(
+        addr: std::net::SocketAddr,
+        request: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> u16 {
         let request = probe_request_with_close(request);
         // Under parallel test load the health accept loop can reset a just-opened
         // connection (BrokenPipe/ConnectionReset) or refuse while saturated.
         for attempt in 1..=3 {
-            let result: Result<u16, std::io::Error> = async {
-                let mut stream = tokio::net::TcpStream::connect(addr).await?;
-                stream.write_all(request.as_bytes()).await?;
-                let mut buf = vec![0u8; 1024];
-                let n = stream.read(&mut buf).await?;
-                Ok(parse_http_status(&buf[..n]))
+            if matches!(deadline, Some(end) if tokio::time::Instant::now() >= end) {
+                return 0;
             }
-            .await;
+            let result = http_probe_once(addr, &request, deadline).await;
             match result {
                 Ok(status) => {
                     if status != 0 {
@@ -718,6 +807,11 @@ mod tests {
         );
         assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n\r\nok"), 200);
         assert_eq!(parse_http_status(b""), 0);
+        assert_eq!(try_parse_http_status_line(b"HTTP/1.1 2"), None);
+        assert_eq!(
+            try_parse_http_status_line(b"HTTP/1.1 200 OK\r\n"),
+            Some(200)
+        );
     }
 
     #[test]
@@ -728,12 +822,16 @@ mod tests {
         assert!(probe_io_error_is_transient(&std::io::Error::from(
             std::io::ErrorKind::ConnectionRefused
         )));
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
         assert!(!probe_io_error_is_transient(&std::io::Error::from(
             std::io::ErrorKind::InvalidData
         )));
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(not(unix), ignore = "needs SO_LINGER reset semantics")]
     async fn http_status_retries_after_connection_reset() {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
@@ -741,14 +839,40 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            drop(stream);
+            abort_tcp_with_reset(stream);
             let (mut stream, _) = listener.accept().await.unwrap();
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
                 .unwrap();
         });
-        let status = http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        let status = http_status(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_status_reads_fragmented_status_line() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"HTTP/1.1 ").await.unwrap();
+            stream.write_all(b"200 OK\r\n\r\nok").await.unwrap();
+        });
+        let status = http_status(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            None,
+        )
+        .await;
         assert_eq!(status, 200);
         server.await.unwrap();
     }
@@ -762,7 +886,16 @@ mod tests {
         drop(listener);
         let server = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let listener = TcpListener::bind(addr).await.unwrap();
+            let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let listener = loop {
+                if tokio::time::Instant::now() >= bind_deadline {
+                    panic!("timed out rebinding delayed probe listener");
+                }
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+            };
             let (mut stream, _) = listener.accept().await.unwrap();
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
