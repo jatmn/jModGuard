@@ -74,8 +74,8 @@ fn client_config() -> Result<ClientConfig> {
             .context("invalid rustls protocol versions")?
             .with_root_certificates(roots)
             .with_no_client_auth();
-    // hyper is compiled with HTTP/1.1 only; advertise that ALPN so HTTPS
-    // libSQL endpoints do not negotiate HTTP/2.
+    // Remote libSQL uses HTTP/1.1 over TLS; advertise that ALPN so HTTPS
+    // endpoints do not negotiate HTTP/2 even though hyper still supports it.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
