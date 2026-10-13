@@ -17,6 +17,31 @@ fail() {
   exit 1
 }
 
+# Cargo shim lines for per-package timed runs must use -p, not workspace-wide selectors.
+jmodguard_assert_per_scope_test_invocations() {
+  local label=$1
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      test\ *)
+        case "$line" in
+          *' --doc '*|*' --doc --'*) continue ;;
+          *' -p '*|*' --package '*)
+            case "$line" in
+              *' --no-run'*|*' --list'*|*' --exact'*) ;;
+              *) continue ;;
+            esac
+            echo "$line" | grep -q -- '--workspace' \
+              && fail "$label: per-scope cargo must not include --workspace"
+            echo "$line" | grep -qE '(^|[[:space:]])--all([[:space:]]|$)' \
+              && fail "$label: per-scope cargo must not include --all"
+            ;;
+        esac
+        ;;
+    esac
+  done <"$CARGO_INVOCATION_LOG"
+}
+
 if ! command -v timeout >/dev/null 2>&1; then
   echo 'ci-timed-cargo-test: GNU timeout not installed; skipping'
   exit 0
@@ -399,6 +424,43 @@ echo "$scoped_args_line" | grep -q -- '-p' \
   || fail 'scoped cargo-args: package selector must be applied per scope'
 echo "$scoped_args_line" | grep -q -- 'timed-runner-probe' \
   || fail 'scoped cargo-args: scoped package name must be present'
+echo "$scoped_args_line" | grep -q -- '--workspace' \
+  && fail 'scoped cargo-args: --workspace must not be passed to per-scope cargo test'
+scoped_ws_only="$(jmodguard_scoped_cargo_args lib:timed-harness-probe --workspace --locked)"
+echo "$scoped_ws_only" | grep -q -- '--workspace' \
+  && fail 'scoped cargo-args: --workspace input must not appear in scoped builder output'
+echo "$scoped_ws_only" | grep -q -- '-p' \
+  || fail 'scoped cargo-args: --workspace input must still add per-package -p selector'
+scoped_all_line="$(jmodguard_scoped_cargo_args lib:timed-harness-probe --all --locked)"
+echo "$scoped_all_line" | grep -qE '(^|[[:space:]])--all([[:space:]]|$)' \
+  && fail 'scoped cargo-args: --all input must not appear in scoped builder output'
+echo "$scoped_all_line" | grep -q -- '--workspace' \
+  && fail 'scoped cargo-args: --all input must not leak --workspace into scoped builder output'
+echo "$scoped_all_line" | grep -q -- '-p' \
+  || fail 'scoped cargo-args: --all input must still add per-package -p selector'
+
+: >"$CARGO_INVOCATION_LOG"
+workspace_scope_log="$fixture/workspace-per-scope.log"
+set +e
+run_timed_cargo_test_gnu --workspace --locked -p timed-harness-probe -- >"$workspace_scope_log" 2>&1
+workspace_scope_rc=$?
+set -e
+[ "$workspace_scope_rc" -eq 0 ] || { cat "$workspace_scope_log" >&2; fail "workspace per-scope runner failed with $workspace_scope_rc"; }
+jmodguard_assert_per_scope_test_invocations 'workspace per-scope'
+grep -q -- ' -p timed-harness-probe' "$CARGO_INVOCATION_LOG" \
+  || fail 'workspace per-scope: timed runner must invoke cargo test with -p for the package'
+
+: >"$CARGO_INVOCATION_LOG"
+all_scope_log="$fixture/all-per-scope.log"
+set +e
+run_timed_cargo_test_gnu --all --locked -p timed-harness-probe -- >"$all_scope_log" 2>&1
+all_scope_rc=$?
+set -e
+[ "$all_scope_rc" -eq 0 ] || { cat "$all_scope_log" >&2; fail "--all per-scope runner failed with $all_scope_rc"; }
+jmodguard_assert_per_scope_test_invocations '--all per-scope'
+grep -q -- ' -p timed-harness-probe' "$CARGO_INVOCATION_LOG" \
+  || fail '--all per-scope: timed runner must invoke cargo test with -p for the package'
+
 : >"$CARGO_INVOCATION_LOG"
 scoped_flags_log="$fixture/scoped-cargo-args.log"
 set +e
