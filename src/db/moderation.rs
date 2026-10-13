@@ -840,7 +840,7 @@ fn bot_echo_matches_mirror(
             Ok(true)
         }
         Some(_) => {
-            if mirror.operation_id.is_some() && mirror.created_at.as_str() >= observed_at {
+            if mirror.created_at.as_str() >= observed_at {
                 return Ok(true);
             }
             Ok(mirror.operation_id.is_none()
@@ -853,12 +853,52 @@ fn bot_echo_matches_mirror(
     }
 }
 
+/// Gateway ban redeliveries for the same Discord ban usually arrive soon after the row.
+const GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS: i64 = 60;
+
+fn gateway_manual_redelivery_within_window(
+    mirror_created_at: &str,
+    incoming_at: &str,
+) -> Result<bool> {
+    let mirror = chrono::DateTime::parse_from_rfc3339(mirror_created_at)
+        .map_err(|error| anyhow::anyhow!("mirror created_at: {error}"))?;
+    let incoming = chrono::DateTime::parse_from_rfc3339(incoming_at)
+        .map_err(|error| anyhow::anyhow!("incoming gateway time: {error}"))?;
+    Ok(incoming <= mirror + chrono::Duration::seconds(GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS))
+}
+
+fn completed_bot_gateway_mirror(mirror: &ActiveBanMirror) -> bool {
+    mirror.operation_id.is_some()
+        && mirror.moderator_id.is_some()
+        && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON)
+}
+
+fn same_gateway_delivery_as_mirror(
+    conn: &impl SqlExecutor,
+    mirror: &ActiveBanMirror,
+    guild_id: i64,
+    user_id: i64,
+    member_was_banned: bool,
+    incoming_at: &str,
+) -> Result<bool> {
+    let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
+    let completed_bot = completed_bot_gateway_mirror(mirror);
+    if !manual && !completed_bot {
+        return Ok(false);
+    }
+    if !member_was_banned {
+        return Ok(true);
+    }
+    gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)
+}
+
 fn replace_manual_gateway_mirror(
     conn: &impl SqlExecutor,
     mirror: &ActiveBanMirror,
     guild_id: i64,
     user_id: i64,
     member_was_banned: bool,
+    incoming_at: &str,
 ) -> Result<bool> {
     if bot_owned_mirror_without_manual_event(conn, guild_id, user_id, mirror)? {
         return Ok(true);
@@ -876,6 +916,20 @@ fn replace_manual_gateway_mirror(
         return Ok(false);
     }
     if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
+        return Ok(true);
+    }
+    if same_gateway_delivery_as_mirror(
+        conn,
+        mirror,
+        guild_id,
+        user_id,
+        member_was_banned,
+        incoming_at,
+    )? {
+        return Ok(false);
+    }
+    let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
+    if (manual || completed_bot_gateway_mirror(mirror)) && member_was_banned {
         return Ok(true);
     }
     Ok(!member_was_banned)
@@ -902,7 +956,14 @@ fn record_gateway_ban_conn(
         let keep = if owned_by_bot {
             bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
         } else {
-            !replace_manual_gateway_mirror(&tx, &mirror, guild_id, user_id, member_was_banned)?
+            !replace_manual_gateway_mirror(
+                &tx,
+                &mirror,
+                guild_id,
+                user_id,
+                member_was_banned,
+                &now,
+            )?
         };
         if keep {
             tx.finish_read()?;
