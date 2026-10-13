@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Shared by scripts/ci-preflight.sh and scripts/ci-preflight-test.sh.
-JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
+  if [ -n "${HOME:-}" ]; then
+    JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
+  else
+    JMODGUARD_CI_PREFIX=/opt/jmodguard-ci
+  fi
+fi
 
 cargo_tool_version_last_field() {
   local tool="$1"
