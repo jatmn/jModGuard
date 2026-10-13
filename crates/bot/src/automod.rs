@@ -439,14 +439,21 @@ async fn automod_try_delete_message(
     {
         return;
     }
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
     if let crate::discord::DiscordCall::Finished(Err(error)) = crate::discord::race_discord_call(
         &app.activation,
         http.delete_message(channel.into(), message.into(), None),
     )
     .await
     {
-        app.remembered_discord_targets
-            .remember_rest_rejection(&error, target, Instant::now());
+        app.remembered_discord_targets.remember_rest_rejection(
+            recovery,
+            &error,
+            target,
+            Instant::now(),
+        );
     }
 }
 
@@ -459,14 +466,19 @@ fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -
 
 fn automod_remember_member_failure(
     app: &BotState,
+    since: crate::discord::RecoveryEpoch,
     guild: u64,
     user: u64,
     action: &str,
     error: &serenity::Error,
 ) {
     if let Some(target) = automod_member_target(guild, user, action) {
-        app.remembered_discord_targets
-            .remember_rest_rejection(error, target, Instant::now());
+        app.remembered_discord_targets.remember_rest_rejection(
+            since,
+            error,
+            target,
+            Instant::now(),
+        );
     }
 }
 
@@ -730,6 +742,13 @@ pub(crate) async fn execute_pending_with(
                     if automod_member_blocked(app, guild_id.get(), target.id.get(), "timeout") {
                         called = false;
                     } else {
+                        let recovery =
+                            automod_member_target(guild_id.get(), target.id.get(), "timeout").map(
+                                |member_target| {
+                                    app.remembered_discord_targets
+                                        .capture_recovery_epoch(member_target)
+                                },
+                            );
                         match crate::discord::race_discord_call(
                             &app.activation,
                             member.disable_communication_until_datetime(http, until),
@@ -740,9 +759,10 @@ pub(crate) async fn execute_pending_with(
                                 discord_err = Some(crate::discord::cutoff_discord_error());
                             }
                             crate::discord::DiscordCall::Finished(result) => {
-                                if let Err(error) = &result {
+                                if let (Some(recovery), Err(error)) = (recovery, &result) {
                                     automod_remember_member_failure(
                                         app,
+                                        recovery,
                                         guild_id.get(),
                                         target.id.get(),
                                         "timeout",
@@ -801,6 +821,11 @@ pub(crate) async fn execute_pending_with(
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
+                    let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
+                        .map(|member_target| {
+                            app.remembered_discord_targets
+                                .capture_recovery_epoch(member_target)
+                        });
                     let discord_err = match crate::discord::race_discord_call(
                         &app.activation,
                         member.kick_with_reason(http, &reason),
@@ -811,9 +836,10 @@ pub(crate) async fn execute_pending_with(
                             Some(crate::discord::cutoff_discord_error())
                         }
                         crate::discord::DiscordCall::Finished(result) => {
-                            if let Err(error) = &result {
+                            if let (Some(recovery), Err(error)) = (recovery, &result) {
                                 automod_remember_member_failure(
                                     app,
+                                    recovery,
                                     guild_id.get(),
                                     target.id.get(),
                                     "kick",
@@ -967,7 +993,14 @@ pub(crate) async fn execute_pending_with(
                             ) {
                                 None
                             } else {
-                                Some(
+                                let recovery =
+                                    automod_member_target(guild_id.get(), target.id.get(), "ban")
+                                        .map(|member_target| {
+                                            app.remembered_discord_targets
+                                                .capture_recovery_epoch(member_target)
+                                        });
+                                Some((
+                                    recovery,
                                     crate::discord::race_discord_call(
                                         &app.activation,
                                         guild_id.ban_with_reason(
@@ -978,7 +1011,7 @@ pub(crate) async fn execute_pending_with(
                                         ),
                                     )
                                     .await,
-                                )
+                                ))
                             };
                             match raced {
                                 None => {
@@ -998,16 +1031,20 @@ pub(crate) async fn execute_pending_with(
                                     }
                                     publish_report = false;
                                 }
-                                Some(crate::discord::DiscordCall::Cancelled) => {
+                                Some((_, crate::discord::DiscordCall::Cancelled)) => {
                                     pending_ban
                                         .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
                                         .await;
                                     publish_report = false;
                                 }
-                                Some(crate::discord::DiscordCall::Finished(discord)) => {
-                                    if let Err(error) = &discord {
+                                Some((
+                                    recovery,
+                                    crate::discord::DiscordCall::Finished(discord),
+                                )) => {
+                                    if let (Some(recovery), Err(error)) = (recovery, &discord) {
                                         automod_remember_member_failure(
                                             app,
+                                            recovery,
                                             guild_id.get(),
                                             target.id.get(),
                                             "ban",

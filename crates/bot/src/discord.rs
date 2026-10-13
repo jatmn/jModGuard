@@ -139,41 +139,91 @@ impl AutomodRestAction {
     }
 }
 
+impl DiscordRestTarget {
+    pub(crate) fn guild_id(self) -> u64 {
+        match self {
+            DiscordRestTarget::GuildChannel { guild, .. }
+            | DiscordRestTarget::AutomodDelete { guild, .. }
+            | DiscordRestTarget::AutomodMember { guild, .. } => guild,
+        }
+    }
+}
+
+/// Recovery invalidation captured before an outbound Discord call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryEpoch {
+    global: u64,
+    guild: u64,
+}
+
+#[derive(Default)]
+struct RememberedDiscordState {
+    expires: HashMap<DiscordRestTarget, Instant>,
+    global_recovery: u64,
+    guild_recovery: HashMap<u64, u64>,
+}
+
 /// Process-local memory of permanent Discord REST rejections (invalid-request budget).
 #[derive(Default)]
 pub(crate) struct RememberedDiscordTargets {
-    expires: Mutex<HashMap<DiscordRestTarget, Instant>>,
+    state: Mutex<RememberedDiscordState>,
 }
 
 impl RememberedDiscordTargets {
-    pub(crate) fn blocked(&self, target: DiscordRestTarget, now: Instant) -> bool {
-        let mut map = self.expires.lock();
-        map.retain(|_, until| *until > now);
-        map.get(&target).is_some_and(|until| *until > now)
+    pub(crate) fn capture_recovery_epoch(&self, target: DiscordRestTarget) -> RecoveryEpoch {
+        let guild = target.guild_id();
+        let state = self.state.lock();
+        RecoveryEpoch {
+            global: state.global_recovery,
+            guild: state.guild_recovery.get(&guild).copied().unwrap_or(0),
+        }
     }
 
-    pub(crate) fn remember_permanent(&self, target: DiscordRestTarget, now: Instant) {
-        let mut map = self.expires.lock();
-        map.retain(|_, until| *until > now);
-        if map.len() >= MAX_REMEMBERED_REST_TARGETS
-            && !map.contains_key(&target)
-            && let Some(oldest) = map.iter().min_by_key(|(_, until)| *until).map(|(k, _)| *k)
+    fn recovery_epoch_unchanged(&self, target: DiscordRestTarget, epoch: RecoveryEpoch) -> bool {
+        let guild = target.guild_id();
+        let state = self.state.lock();
+        state.global_recovery == epoch.global
+            && state.guild_recovery.get(&guild).copied().unwrap_or(0) == epoch.guild
+    }
+
+    pub(crate) fn blocked(&self, target: DiscordRestTarget, now: Instant) -> bool {
+        let mut state = self.state.lock();
+        state.expires.retain(|_, until| *until > now);
+        state.expires.get(&target).is_some_and(|until| *until > now)
+    }
+
+    fn remember_permanent(&self, target: DiscordRestTarget, now: Instant) {
+        let mut state = self.state.lock();
+        state.expires.retain(|_, until| *until > now);
+        if state.expires.len() >= MAX_REMEMBERED_REST_TARGETS
+            && !state.expires.contains_key(&target)
+            && let Some(oldest) = state
+                .expires
+                .iter()
+                .min_by_key(|(_, until)| *until)
+                .map(|(k, _)| *k)
         {
-            map.remove(&oldest);
+            state.expires.remove(&oldest);
         }
-        map.insert(target, now + REMEMBERED_REST_TARGET_TTL);
+        state
+            .expires
+            .insert(target, now + REMEMBERED_REST_TARGET_TTL);
     }
 
     pub(crate) fn forget(&self, target: DiscordRestTarget) {
-        self.expires.lock().remove(&target);
+        self.state.lock().expires.remove(&target);
     }
 
     pub(crate) fn remember_rest_rejection(
         &self,
+        since: RecoveryEpoch,
         error: &serenity::Error,
         target: DiscordRestTarget,
         now: Instant,
     ) {
+        if !self.recovery_epoch_unchanged(target, since) {
+            return;
+        }
         if should_remember_rest_rejection(error, target) {
             self.remember_permanent(target, now);
         }
@@ -181,28 +231,38 @@ impl RememberedDiscordTargets {
 
     pub(crate) fn observe_discord_error(
         &self,
+        since: RecoveryEpoch,
         error: &serenity::Error,
         target: DiscordRestTarget,
         now: Instant,
     ) {
-        self.remember_rest_rejection(error, target, now);
+        self.remember_rest_rejection(since, error, target, now);
     }
 
     pub(crate) fn observe_anyhow_error(
         &self,
+        since: RecoveryEpoch,
         error: &anyhow::Error,
         target: DiscordRestTarget,
         now: Instant,
     ) {
+        if !self.recovery_epoch_unchanged(target, since) {
+            return;
+        }
         if let Some(error) = error.downcast_ref::<serenity::Error>() {
-            self.remember_rest_rejection(error, target, now);
+            if should_remember_rest_rejection(error, target) {
+                self.remember_permanent(target, now);
+            }
         } else if classify_retry_error(error) == RetryClass::Permanent {
             self.remember_permanent(target, now);
         }
     }
 
     pub(crate) fn clear_guild(&self, guild: u64) {
-        self.expires.lock().retain(|target, _| match target {
+        let mut state = self.state.lock();
+        let next = state.guild_recovery.get(&guild).copied().unwrap_or(0) + 1;
+        state.guild_recovery.insert(guild, next);
+        state.expires.retain(|target, _| match target {
             DiscordRestTarget::GuildChannel { guild: g, .. } => *g != guild,
             DiscordRestTarget::AutomodDelete { guild: g, .. } => *g != guild,
             DiscordRestTarget::AutomodMember { guild: g, .. } => *g != guild,
@@ -210,7 +270,14 @@ impl RememberedDiscordTargets {
     }
 
     pub(crate) fn clear_all(&self) {
-        self.expires.lock().clear();
+        let mut state = self.state.lock();
+        state.global_recovery += 1;
+        state.expires.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remember_permanent_for_test(&self, target: DiscordRestTarget, now: Instant) {
+        self.remember_permanent(target, now);
     }
 }
 
@@ -407,7 +474,7 @@ mod tests {
             guild: 1,
             channel: 2,
         };
-        cache.remember_permanent(channel, now);
+        cache.remember_permanent_for_test(channel, now);
         assert!(cache.blocked(channel, now));
         cache.forget(channel);
         assert!(!cache.blocked(channel, now));
@@ -422,7 +489,7 @@ mod tests {
             channel: 20,
         };
         assert!(!cache.blocked(channel, now));
-        cache.remember_permanent(channel, now);
+        cache.remember_permanent_for_test(channel, now);
         assert!(cache.blocked(channel, now));
         assert!(!cache.blocked(
             channel,
@@ -456,7 +523,8 @@ mod tests {
         let cache = RememberedDiscordTargets::default();
         let now = Instant::now();
         let missing = fixture_discord_http_error(404, 10008).await;
-        cache.remember_rest_rejection(&missing, delete, now);
+        let epoch = cache.capture_recovery_epoch(delete);
+        cache.remember_rest_rejection(epoch, &missing, delete, now);
         assert!(!cache.blocked(delete, now));
         assert!(!cache.blocked(other, now));
         assert!(!should_remember_rest_rejection(&missing, delete));
@@ -476,8 +544,8 @@ mod tests {
             guild: 3,
             channel: 4,
         };
-        cache.remember_permanent(a, now);
-        cache.remember_permanent(b, now);
+        cache.remember_permanent_for_test(a, now);
+        cache.remember_permanent_for_test(b, now);
         cache.clear_guild(1);
         assert!(!cache.blocked(a, now));
         assert!(cache.blocked(b, now));
@@ -496,11 +564,92 @@ mod tests {
         };
         let deny = fixture_discord_http_error(403, 50013).await;
         assert!(should_remember_rest_rejection(&deny, target));
-        cache.remember_rest_rejection(&deny, target, now);
+        let epoch = cache.capture_recovery_epoch(target);
+        cache.remember_rest_rejection(epoch, &deny, target, now);
         assert!(cache.blocked(target, now));
         cache.clear_guild(5);
         assert!(!cache.blocked(target, now));
         cache.forget(target);
+        assert!(!cache.blocked(target, now));
+    }
+
+    #[tokio::test]
+    async fn recovery_clear_guild_during_in_flight_skips_remember() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 11,
+            channel: 12,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.clear_guild(11);
+        cache.remember_rest_rejection(epoch, &deny, target, now);
+        assert!(!cache.blocked(target, now));
+    }
+
+    #[tokio::test]
+    async fn recovery_clear_all_during_in_flight_skips_remember() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 21,
+            channel: 22,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.clear_all();
+        cache.remember_rest_rejection(epoch, &deny, target, now);
+        assert!(!cache.blocked(target, now));
+    }
+
+    #[tokio::test]
+    async fn recovery_unchanged_epoch_still_remembers_permanent_failure() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 31,
+            channel: 32,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.remember_rest_rejection(epoch, &deny, target, now);
+        assert!(cache.blocked(target, now));
+    }
+
+    #[tokio::test]
+    async fn recovery_clear_one_guild_does_not_invalidate_another_guild_epoch() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let guild_a = DiscordRestTarget::GuildChannel {
+            guild: 41,
+            channel: 1,
+        };
+        let guild_b = DiscordRestTarget::GuildChannel {
+            guild: 42,
+            channel: 2,
+        };
+        let epoch_b = cache.capture_recovery_epoch(guild_b);
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.clear_guild(41);
+        cache.remember_rest_rejection(epoch_b, &deny, guild_b, now);
+        assert!(!cache.blocked(guild_a, now));
+        assert!(cache.blocked(guild_b, now));
+    }
+
+    #[tokio::test]
+    async fn recovery_double_clear_guild_still_skips_stale_epoch() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 51,
+            channel: 52,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.clear_guild(51);
+        cache.clear_guild(51);
+        cache.remember_rest_rejection(epoch, &deny, target, now);
         assert!(!cache.blocked(target, now));
     }
 

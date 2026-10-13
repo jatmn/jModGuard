@@ -2559,9 +2559,12 @@ fn bulk_channel_delivery_forget_after_successful_fallback_clears_remembered() {
     };
     let now = std::time::Instant::now();
     app.remembered_discord_targets
-        .remember_permanent(target, now);
+        .remember_permanent_for_test(target, now);
     assert!(app.remembered_discord_targets.blocked(target, now));
-    settle_bulk_channel_delivery(&app, target, true, None);
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, true, None);
     assert!(!app.remembered_discord_targets.blocked(target, now));
     drop(app);
     let _ = std::fs::remove_dir_all(&path);
@@ -2583,7 +2586,10 @@ async fn bulk_channel_delivery_terminal_fallback_failure_is_remembered() {
     };
     let now = std::time::Instant::now();
     let error = fixture_discord_http_error(403, 50013).await;
-    settle_bulk_channel_delivery(&app, target, false, Some(&error));
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, false, Some(&error));
     assert!(app.remembered_discord_targets.blocked(target, now));
     drop(app);
     let _ = std::fs::remove_dir_all(&path);
@@ -2605,7 +2611,10 @@ async fn bulk_channel_delivery_clear_guild_unblocks_before_next_attempt() {
     };
     let now = std::time::Instant::now();
     let error = fixture_discord_http_error(403, 50013).await;
-    settle_bulk_channel_delivery(&app, target, false, Some(&error));
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, false, Some(&error));
     assert!(app.remembered_discord_targets.blocked(target, now));
     app.remembered_discord_targets.clear_guild(7);
     assert!(!app.remembered_discord_targets.blocked(target, now));

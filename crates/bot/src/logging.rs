@@ -878,6 +878,9 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::Blocked);
         }
+        let recovery = app
+            .remembered_discord_targets
+            .capture_recovery_epoch(rest_target);
         match crate::discord::race_discord_call(
             &app.activation,
             sink.send(channel_id, log_message(&rendered)),
@@ -890,6 +893,7 @@ async fn emit_to_observed_with_audit(
             }
             crate::discord::DiscordCall::Finished(Err(error)) => {
                 app.remembered_discord_targets.observe_anyhow_error(
+                    recovery,
                     &error,
                     rest_target,
                     Instant::now(),
@@ -1660,6 +1664,9 @@ pub(crate) async fn emit_retained_bulk(
         log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
     let mut delivered = false;
     let mut terminal_error: Option<serenity::Error> = None;
+    let mut failure_recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
     match tokio::time::timeout(
         deadline.saturating_sub(started.elapsed()),
         crate::discord::race_discord_call(
@@ -1685,6 +1692,9 @@ pub(crate) async fn emit_retained_bulk(
                     if left.is_zero() {
                         break;
                     }
+                    failure_recovery = app
+                        .remembered_discord_targets
+                        .capture_recovery_epoch(rest_target);
                     match tokio::time::timeout(
                         left,
                         crate::discord::race_discord_call(
@@ -1716,8 +1726,12 @@ pub(crate) async fn emit_retained_bulk(
     if delivered {
         app.remembered_discord_targets.forget(rest_target);
     } else if let Some(error) = terminal_error.as_ref() {
-        app.remembered_discord_targets
-            .remember_rest_rejection(error, rest_target, Instant::now());
+        app.remembered_discord_targets.remember_rest_rejection(
+            failure_recovery,
+            error,
+            rest_target,
+            Instant::now(),
+        );
         record_delivery_failure(app);
     }
 }
@@ -1725,6 +1739,7 @@ pub(crate) async fn emit_retained_bulk(
 #[cfg(test)]
 pub(crate) fn settle_bulk_channel_delivery(
     app: &BotState,
+    recovery: crate::discord::RecoveryEpoch,
     rest_target: crate::discord::DiscordRestTarget,
     delivered: bool,
     terminal_error: Option<&serenity::Error>,
@@ -1732,8 +1747,12 @@ pub(crate) fn settle_bulk_channel_delivery(
     if delivered {
         app.remembered_discord_targets.forget(rest_target);
     } else if let Some(error) = terminal_error {
-        app.remembered_discord_targets
-            .remember_rest_rejection(error, rest_target, Instant::now());
+        app.remembered_discord_targets.remember_rest_rejection(
+            recovery,
+            error,
+            rest_target,
+            Instant::now(),
+        );
     }
 }
 

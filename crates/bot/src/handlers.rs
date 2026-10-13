@@ -1454,7 +1454,7 @@ mod tests {
         let guild = 42_u64;
         let channel = DiscordRestTarget::GuildChannel { guild, channel: 99 };
         app.remembered_discord_targets
-            .remember_permanent(channel, now);
+            .remember_permanent_for_test(channel, now);
         assert!(app.remembered_discord_targets.blocked(channel, now));
         let bot = UserId::new(1);
         let other = UserId::new(2);

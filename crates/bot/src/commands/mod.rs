@@ -1058,6 +1058,9 @@ async fn raced_channel_say(
     {
         return RacedWrite::Finished;
     }
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
     match crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             app.remembered_discord_targets.forget(target);
@@ -1065,6 +1068,7 @@ async fn raced_channel_say(
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
             app.remembered_discord_targets.observe_discord_error(
+                recovery,
                 &error,
                 target,
                 std::time::Instant::now(),
