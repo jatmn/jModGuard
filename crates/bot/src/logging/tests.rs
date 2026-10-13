@@ -92,6 +92,10 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
         long.push(MessageId::new(id), None);
     }
     let bounded = fallback_bulk_parts("{details}", &display, &long);
+    assert!(
+        bounded.len() > 1,
+        "large transcripts must split across messages"
+    );
     let shown: usize = bounded
         .iter()
         .map(|part| part.matches(" | retained content unavailable").count())
@@ -2399,4 +2403,351 @@ fn automod_content_bound_stays_within_budget_across_sizes() {
             }
         }
     }
+}
+
+async fn discord_status_proxy(
+    status: u16,
+    code: isize,
+) -> (
+    serenity::http::Http,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let body = format!(r#"{{"code":{code},"message":"fixture"}}"#);
+            let response = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, calls, server)
+}
+
+struct ProxyLogSink {
+    http: serenity::http::Http,
+}
+
+#[serenity::async_trait]
+impl LogDelivery for ProxyLogSink {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        channel.send_message(&self.http, message).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn permanent_log_channel_failure_skips_second_delivery_attempt() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = discord_status_proxy(404, 10003).await;
+    let sink = ProxyLogSink { http };
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Blocked
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    f.app.invalidate_configs();
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn transient_log_channel_failure_is_retried_on_next_event() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = discord_status_proxy(503, 0).await;
+    let sink = ProxyLogSink { http };
+    for _ in 0..2 {
+        assert_eq!(
+            emit_to(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                "message_delete",
+                BTreeMap::new(),
+            )
+            .await,
+            Delivery::Failed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+async fn fixture_discord_http_error(status: u16, code: isize) -> serenity::Error {
+    let (http, _, server) = discord_status_proxy(status, code).await;
+    let err = ChannelId::new(1)
+        .send_message(&http, serenity::builder::CreateMessage::new().content("x"))
+        .await
+        .unwrap_err();
+    server.abort();
+    err
+}
+
+#[test]
+fn incomplete_bulk_fallback_without_rest_error_counts_delivery_failure() {
+    let f = Fixture::new();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 1,
+        channel: 2,
+    };
+    let recovery = f
+        .app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    assert_eq!(
+        f.app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    settle_bulk_channel_delivery(&f.app, recovery, target, false, None);
+    assert_eq!(
+        f.app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn bulk_channel_delivery_forget_after_successful_fallback_clears_remembered() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-forget-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 1,
+        channel: 2,
+    };
+    let now = std::time::Instant::now();
+    app.remembered_discord_targets
+        .remember_permanent_for_test(target, now);
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, true, None);
+    assert!(!app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[tokio::test]
+async fn bulk_channel_delivery_terminal_fallback_failure_is_remembered() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-remember-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 3,
+        channel: 4,
+    };
+    let now = std::time::Instant::now();
+    let error = fixture_discord_http_error(403, 50013).await;
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, false, Some(&error));
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[tokio::test]
+async fn bulk_channel_delivery_clear_guild_unblocks_before_next_attempt() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-clear-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 7,
+        channel: 8,
+    };
+    let now = std::time::Instant::now();
+    let error = fixture_discord_http_error(403, 50013).await;
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    settle_bulk_channel_delivery(&app, recovery, target, false, Some(&error));
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    app.remembered_discord_targets.clear_guild(7);
+    assert!(!app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+const CREATED_MESSAGE_JSON: &str = r#"{"id":"1","channel_id":"456","author":{"id":"1","username":"fixture","discriminator":"0"},"content":"","timestamp":"2016-01-01T00:00:00.000000+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"mention_channels":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#;
+
+async fn discord_bulk_attachment_forbidden_proxy() -> (
+    serenity::http::Http,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let attachment = request
+                .windows("deleted-messages.txt".len())
+                .any(|w| w == b"deleted-messages.txt");
+            let (status, body) = if attachment {
+                ("403 Forbidden", r#"{"code":50013,"message":"fixture"}"#)
+            } else {
+                ("200 OK", CREATED_MESSAGE_JSON)
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, calls, server)
+}
+
+#[tokio::test]
+async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let f = Fixture::with_timeout(30);
+    let mut transcript = BulkTranscript::new(200);
+    for id in 1..=200 {
+        transcript.push(MessageId::new(id), None);
+    }
+    let display = BTreeMap::from([
+        ("channel".into(), "<#456>".into()),
+        ("details".into(), "transcript attached".into()),
+    ]);
+    let parts = fallback_bulk_parts("{details}", &display, &transcript);
+    assert!(parts.len() > 1);
+    let (http, calls, server) = discord_bulk_attachment_forbidden_proxy().await;
+    let destination = ChannelId::new(456);
+    let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 789,
+        channel: 456,
+    };
+    let recovery = f
+        .app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
+    let started = Instant::now();
+    let (delivered, error, _) = deliver_bulk_text_fallback_parts(
+        &f.app,
+        &http,
+        destination,
+        rest_target,
+        "{details}",
+        &display,
+        &transcript,
+        Duration::from_secs(30),
+        started,
+        recovery,
+    )
+    .await;
+    assert!(error.is_none(), "unexpected discord error: {:?}", error);
+    assert!(delivered, "expected every fallback part to succeed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        parts.len(),
+        "every text fallback part must reach Discord"
+    );
+    server.abort();
 }
