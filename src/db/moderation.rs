@@ -840,13 +840,15 @@ fn bot_echo_matches_mirror(
             Ok(true)
         }
         Some(_) => {
+            if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
+                return Ok(true);
+            }
             if mirror.created_at.as_str() >= observed_at {
                 return Ok(true);
             }
             Ok(mirror.operation_id.is_none()
                 && mirror.moderator_id.is_some()
-                && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON)
-                && !manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?)
+                && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON))
         }
         None if gateway_placeholder_mirror(mirror) => Ok(true),
         None => Ok(mirror.operation_id.is_some() && mirror.moderator_id.is_some()),

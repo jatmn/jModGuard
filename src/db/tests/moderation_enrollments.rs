@@ -1541,7 +1541,7 @@ async fn stale_bot_owned_mirror_manual_reban_records_a_new_row() {
 }
 
 #[tokio::test]
-async fn bot_echo_with_a_new_operation_id_replaces_an_attributed_manual_mirror() {
+async fn bot_echo_with_a_different_operation_id_keeps_an_attributed_manual_mirror() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let manual = record_gateway_ban(
@@ -1557,13 +1557,13 @@ async fn bot_echo_with_a_new_operation_id_replaces_an_attributed_manual_mirror()
     )
     .await
     .unwrap();
-    let GatewayBanWrite::Recorded { row_id: old_id } = manual else {
+    let GatewayBanWrite::Recorded { row_id: manual_id } = manual else {
         panic!("manual ban must insert, got {manual:?}");
     };
     attribute_enrolled_ban(
         &f.db,
         Some(scope.clone()),
-        old_id,
+        manual_id,
         55,
         77,
         Some("mod"),
@@ -1584,10 +1584,7 @@ async fn bot_echo_with_a_new_operation_id_replaces_an_attributed_manual_mirror()
     )
     .await
     .unwrap();
-    let GatewayBanWrite::OwnedByBot { row_id: new_id } = echo else {
-        panic!("new bot attempt must store its own row, got {echo:?}");
-    };
-    assert_ne!(new_id, old_id);
+    assert_eq!(echo, GatewayBanWrite::Existing { row_id: manual_id });
     assert_eq!(
         member_ban_events(
             &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
@@ -2153,4 +2150,81 @@ async fn attributed_missed_unban_stale_mirror_records_a_new_gateway_ban() {
     let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
     assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
     assert_eq!(rows.iter().find(|row| row.active).unwrap().id, new_id);
+}
+
+#[tokio::test]
+async fn delayed_bot_echo_with_handler_timestamps_keeps_manual_gateway_ban() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let _stale = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        None,
+        true,
+        Some("old-attempt"),
+        true,
+    )
+    .await
+    .unwrap();
+    mark_enrolled_unbanned(&f.db, Some(scope.clone()), 55)
+        .await
+        .unwrap();
+    let manual = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        None,
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: manual_id } = manual else {
+        panic!("manual ban must insert, got {manual:?}");
+    };
+    attribute_enrolled_ban(
+        &f.db,
+        Some(scope.clone()),
+        manual_id,
+        55,
+        88,
+        Some("mod"),
+        "live reason",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let resumed = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        None,
+        true,
+        Some("old-attempt"),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed, GatewayBanWrite::Existing { row_id: manual_id });
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    let active = rows.iter().find(|row| row.active).unwrap();
+    assert_eq!(active.id, manual_id);
+    assert_eq!(active.moderator_id, Some(88));
+    assert_eq!(active.reason.as_deref(), Some("live reason"));
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        1
+    );
 }
