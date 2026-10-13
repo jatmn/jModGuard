@@ -2532,3 +2532,83 @@ async fn transient_log_channel_failure_is_retried_on_next_event() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
+
+async fn fixture_discord_http_error(status: u16, code: isize) -> serenity::Error {
+    let (http, _, server) = discord_status_proxy(status, code).await;
+    let err = ChannelId::new(1)
+        .send_message(&http, serenity::builder::CreateMessage::new().content("x"))
+        .await
+        .unwrap_err();
+    server.abort();
+    err
+}
+
+#[test]
+fn bulk_channel_delivery_forget_after_successful_fallback_clears_remembered() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-forget-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 1,
+        channel: 2,
+    };
+    let now = std::time::Instant::now();
+    app.remembered_discord_targets
+        .remember_permanent(target, now);
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    settle_bulk_channel_delivery(&app, target, true, None);
+    assert!(!app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[tokio::test]
+async fn bulk_channel_delivery_terminal_fallback_failure_is_remembered() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-remember-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 3,
+        channel: 4,
+    };
+    let now = std::time::Instant::now();
+    let error = fixture_discord_http_error(403, 50013).await;
+    settle_bulk_channel_delivery(&app, target, false, Some(&error));
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[tokio::test]
+async fn bulk_channel_delivery_clear_guild_unblocks_before_next_attempt() {
+    let path = std::env::temp_dir().join(format!(
+        "jmg-bulk-clear-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 7,
+        channel: 8,
+    };
+    let now = std::time::Instant::now();
+    let error = fixture_discord_http_error(403, 50013).await;
+    settle_bulk_channel_delivery(&app, target, false, Some(&error));
+    assert!(app.remembered_discord_targets.blocked(target, now));
+    app.remembered_discord_targets.clear_guild(7);
+    assert!(!app.remembered_discord_targets.blocked(target, now));
+    drop(app);
+    let _ = std::fs::remove_dir_all(&path);
+}

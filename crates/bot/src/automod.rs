@@ -399,32 +399,30 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn automod_rest_target(guild: u64, action: &str) -> Option<crate::discord::DiscordRestTarget> {
+fn automod_delete_target(
+    guild: u64,
+    channel: u64,
+    message: u64,
+) -> crate::discord::DiscordRestTarget {
+    crate::discord::DiscordRestTarget::AutomodDelete {
+        guild,
+        channel,
+        message,
+    }
+}
+
+fn automod_member_target(
+    guild: u64,
+    user: u64,
+    action: &str,
+) -> Option<crate::discord::DiscordRestTarget> {
     crate::discord::AutomodRestAction::from_action(action).map(|kind| {
-        crate::discord::DiscordRestTarget::AutomodAction {
+        crate::discord::DiscordRestTarget::AutomodMember {
             guild,
+            user,
             action: kind,
         }
     })
-}
-
-fn automod_discord_blocked(app: &BotState, guild: u64, action: &str) -> bool {
-    automod_rest_target(guild, action).is_some_and(|target| {
-        app.remembered_discord_targets
-            .blocked(target, Instant::now())
-    })
-}
-
-fn automod_remember_discord_failure(
-    app: &BotState,
-    guild: u64,
-    action: &str,
-    error: &serenity::Error,
-) {
-    if let Some(target) = automod_rest_target(guild, action) {
-        app.remembered_discord_targets
-            .observe_discord_error(error, target, Instant::now());
-    }
 }
 
 async fn automod_try_delete_message(
@@ -434,7 +432,11 @@ async fn automod_try_delete_message(
     channel: u64,
     message: u64,
 ) {
-    if automod_discord_blocked(app, guild_id, "delete") {
+    let target = automod_delete_target(guild_id, channel, message);
+    if app
+        .remembered_discord_targets
+        .blocked(target, Instant::now())
+    {
         return;
     }
     if let crate::discord::DiscordCall::Finished(Err(error)) = crate::discord::race_discord_call(
@@ -443,7 +445,28 @@ async fn automod_try_delete_message(
     )
     .await
     {
-        automod_remember_discord_failure(app, guild_id, "delete", &error);
+        app.remembered_discord_targets
+            .remember_rest_rejection(&error, target, Instant::now());
+    }
+}
+
+fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
+    automod_member_target(guild, user, action).is_some_and(|target| {
+        app.remembered_discord_targets
+            .blocked(target, Instant::now())
+    })
+}
+
+fn automod_remember_member_failure(
+    app: &BotState,
+    guild: u64,
+    user: u64,
+    action: &str,
+    error: &serenity::Error,
+) {
+    if let Some(target) = automod_member_target(guild, user, action) {
+        app.remembered_discord_targets
+            .remember_rest_rejection(error, target, Instant::now());
     }
 }
 
@@ -704,7 +727,7 @@ pub(crate) async fn execute_pending_with(
                     if !app.activation.may_record() {
                         return;
                     }
-                    if automod_discord_blocked(app, guild_id.get(), "timeout") {
+                    if automod_member_blocked(app, guild_id.get(), target.id.get(), "timeout") {
                         called = false;
                     } else {
                         match crate::discord::race_discord_call(
@@ -718,9 +741,10 @@ pub(crate) async fn execute_pending_with(
                             }
                             crate::discord::DiscordCall::Finished(result) => {
                                 if let Err(error) = &result {
-                                    automod_remember_discord_failure(
+                                    automod_remember_member_failure(
                                         app,
                                         guild_id.get(),
+                                        target.id.get(),
                                         "timeout",
                                         error,
                                     );
@@ -774,7 +798,7 @@ pub(crate) async fn execute_pending_with(
                 if !app.activation.may_record() {
                     return;
                 }
-                if automod_discord_blocked(app, guild_id.get(), "kick") {
+                if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
                     let discord_err = match crate::discord::race_discord_call(
@@ -788,9 +812,10 @@ pub(crate) async fn execute_pending_with(
                         }
                         crate::discord::DiscordCall::Finished(result) => {
                             if let Err(error) = &result {
-                                automod_remember_discord_failure(
+                                automod_remember_member_failure(
                                     app,
                                     guild_id.get(),
+                                    target.id.get(),
                                     "kick",
                                     error,
                                 );
@@ -934,7 +959,12 @@ pub(crate) async fn execute_pending_with(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
-                            let raced = if automod_discord_blocked(app, guild_id.get(), "ban") {
+                            let raced = if automod_member_blocked(
+                                app,
+                                guild_id.get(),
+                                target.id.get(),
+                                "ban",
+                            ) {
                                 None
                             } else {
                                 Some(
@@ -976,9 +1006,10 @@ pub(crate) async fn execute_pending_with(
                                 }
                                 Some(crate::discord::DiscordCall::Finished(discord)) => {
                                     if let Err(error) = &discord {
-                                        automod_remember_discord_failure(
+                                        automod_remember_member_failure(
                                             app,
                                             guild_id.get(),
+                                            target.id.get(),
                                             "ban",
                                             error,
                                         );

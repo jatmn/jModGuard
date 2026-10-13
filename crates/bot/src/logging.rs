@@ -885,7 +885,9 @@ async fn emit_to_observed_with_audit(
         .await
         {
             crate::discord::DiscordCall::Cancelled => return Ok(Delivery::Dropped),
-            crate::discord::DiscordCall::Finished(Ok(())) => {}
+            crate::discord::DiscordCall::Finished(Ok(())) => {
+                app.remembered_discord_targets.forget(rest_target);
+            }
             crate::discord::DiscordCall::Finished(Err(error)) => {
                 app.remembered_discord_targets.observe_anyhow_error(
                     &error,
@@ -1656,6 +1658,8 @@ pub(crate) async fn emit_retained_bulk(
     let body = transcript.finish();
     let message =
         log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
+    let mut delivered = false;
+    let mut terminal_error: Option<serenity::Error> = None;
     match tokio::time::timeout(
         deadline.saturating_sub(started.elapsed()),
         crate::discord::race_discord_call(
@@ -1665,13 +1669,8 @@ pub(crate) async fn emit_retained_bulk(
     )
     .await
     {
-        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {}
+        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => delivered = true,
         Ok(crate::discord::DiscordCall::Finished(Err(discord_err))) => {
-            app.remembered_discord_targets.observe_discord_error(
-                &discord_err,
-                rest_target,
-                Instant::now(),
-            );
             if matches!(
                 &discord_err,
                 serenity::Error::Http(http_error)
@@ -1679,33 +1678,62 @@ pub(crate) async fn emit_retained_bulk(
                         .status_code()
                         .is_some_and(|status| status.as_u16() == 403)
             ) {
-                // A definite permission response can mean Attach Files is absent.
-                // A timeout is ambiguous and never enters this fallback.
+                // Attach Files may be absent while Send Messages still works.
                 let parts = fallback_bulk_parts(template, &display, &transcript);
                 for details in parts {
                     let left = deadline.saturating_sub(started.elapsed());
-                    if left.is_zero()
-                        || !matches!(
-                            tokio::time::timeout(
-                                left,
-                                crate::discord::race_discord_call(
-                                    &app.activation,
-                                    destination.send_message(&ctx.http, log_message(&details)),
-                                ),
-                            )
-                            .await,
-                            Ok(crate::discord::DiscordCall::Finished(Ok(_)))
-                        )
-                    {
-                        record_delivery_failure(app);
+                    if left.is_zero() {
                         break;
+                    }
+                    match tokio::time::timeout(
+                        left,
+                        crate::discord::race_discord_call(
+                            &app.activation,
+                            destination.send_message(&ctx.http, log_message(&details)),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+                            delivered = true;
+                            break;
+                        }
+                        Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                            terminal_error = Some(error);
+                        }
+                        _ => break,
                     }
                 }
             } else {
-                record_delivery_failure(app);
+                terminal_error = Some(discord_err);
             }
         }
-        _ => record_delivery_failure(app),
+        _ => {
+            record_delivery_failure(app);
+            return;
+        }
+    }
+    if delivered {
+        app.remembered_discord_targets.forget(rest_target);
+    } else if let Some(error) = terminal_error.as_ref() {
+        app.remembered_discord_targets
+            .remember_rest_rejection(error, rest_target, Instant::now());
+        record_delivery_failure(app);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn settle_bulk_channel_delivery(
+    app: &BotState,
+    rest_target: crate::discord::DiscordRestTarget,
+    delivered: bool,
+    terminal_error: Option<&serenity::Error>,
+) {
+    if delivered {
+        app.remembered_discord_targets.forget(rest_target);
+    } else if let Some(error) = terminal_error {
+        app.remembered_discord_targets
+            .remember_rest_rejection(error, rest_target, Instant::now());
     }
 }
 

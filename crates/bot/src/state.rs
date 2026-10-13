@@ -1174,6 +1174,7 @@ impl BotState {
         };
         let config_changed = config_revision_changed || primary.config != previous_config;
         if config_changed {
+            self.remembered_discord_targets.clear_all();
             self.slash_retries.lock().clear();
             self.last_config_version
                 .store(primary.config, Ordering::SeqCst);

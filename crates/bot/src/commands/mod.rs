@@ -1059,7 +1059,10 @@ async fn raced_channel_say(
         return RacedWrite::Finished;
     }
     match crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await {
-        crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
+        crate::discord::DiscordCall::Finished(Ok(_)) => {
+            app.remembered_discord_targets.forget(target);
+            RacedWrite::Finished
+        }
         crate::discord::DiscordCall::Finished(Err(error)) => {
             app.remembered_discord_targets.observe_discord_error(
                 &error,

@@ -107,8 +107,14 @@ pub(crate) enum DiscordRestTarget {
         guild: u64,
         channel: u64,
     },
-    AutomodAction {
+    AutomodDelete {
         guild: u64,
+        channel: u64,
+        message: u64,
+    },
+    AutomodMember {
+        guild: u64,
+        user: u64,
         action: AutomodRestAction,
     },
 }
@@ -158,15 +164,28 @@ impl RememberedDiscordTargets {
         map.insert(target, now + REMEMBERED_REST_TARGET_TTL);
     }
 
+    pub(crate) fn forget(&self, target: DiscordRestTarget) {
+        self.expires.lock().remove(&target);
+    }
+
+    pub(crate) fn remember_rest_rejection(
+        &self,
+        error: &serenity::Error,
+        target: DiscordRestTarget,
+        now: Instant,
+    ) {
+        if should_remember_rest_rejection(error, target) {
+            self.remember_permanent(target, now);
+        }
+    }
+
     pub(crate) fn observe_discord_error(
         &self,
         error: &serenity::Error,
         target: DiscordRestTarget,
         now: Instant,
     ) {
-        if classify_retry(error) == RetryClass::Permanent {
-            self.remember_permanent(target, now);
-        }
+        self.remember_rest_rejection(error, target, now);
     }
 
     pub(crate) fn observe_anyhow_error(
@@ -175,7 +194,9 @@ impl RememberedDiscordTargets {
         target: DiscordRestTarget,
         now: Instant,
     ) {
-        if classify_retry_error(error) == RetryClass::Permanent {
+        if let Some(error) = error.downcast_ref::<serenity::Error>() {
+            self.remember_rest_rejection(error, target, now);
+        } else if classify_retry_error(error) == RetryClass::Permanent {
             self.remember_permanent(target, now);
         }
     }
@@ -183,12 +204,35 @@ impl RememberedDiscordTargets {
     pub(crate) fn clear_guild(&self, guild: u64) {
         self.expires.lock().retain(|target, _| match target {
             DiscordRestTarget::GuildChannel { guild: g, .. } => *g != guild,
-            DiscordRestTarget::AutomodAction { guild: g, .. } => *g != guild,
+            DiscordRestTarget::AutomodDelete { guild: g, .. } => *g != guild,
+            DiscordRestTarget::AutomodMember { guild: g, .. } => *g != guild,
         });
     }
 
     pub(crate) fn clear_all(&self) {
         self.expires.lock().clear();
+    }
+}
+
+/// Permanent errors that apply only to one message/member must not park unrelated work.
+pub(crate) fn should_remember_rest_rejection(
+    error: &serenity::Error,
+    target: DiscordRestTarget,
+) -> bool {
+    if classify_retry(error) != RetryClass::Permanent {
+        return false;
+    }
+    let code = http_error_response(error)
+        .map(|(_, code)| code)
+        .unwrap_or(0);
+    match target {
+        DiscordRestTarget::GuildChannel { .. } => !matches!(code, 10008),
+        DiscordRestTarget::AutomodDelete { .. } => {
+            !matches!(code, 10007 | 10008 | 10026 | 10029 | 50035)
+        }
+        DiscordRestTarget::AutomodMember { .. } => {
+            !matches!(code, 10007 | 10008 | 10026 | 10029 | 50035)
+        }
     }
 }
 
@@ -303,11 +347,71 @@ pub async fn validate_log_channel_guild(
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomodRestAction, DiscordRestTarget, NicknameFailureClass, REMEMBERED_REST_TARGET_TTL,
+        DiscordRestTarget, NicknameFailureClass, REMEMBERED_REST_TARGET_TTL,
         RememberedDiscordTargets, RetryClass, classify_nickname_failure,
         classify_nickname_response, classify_retry_response,
     };
+    use serenity::builder::CreateMessage;
+    use serenity::model::id::ChannelId;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    async fn fixture_discord_http_error(status: u16, code: isize) -> serenity::Error {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = format!(r#"{{"code":{code},"message":"fixture"}}"#);
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        let err = ChannelId::new(1)
+            .send_message(&http, CreateMessage::new().content("x"))
+            .await
+            .unwrap_err();
+        server.abort();
+        err
+    }
+
+    #[test]
+    fn forget_clears_remembered_target_before_ttl() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let channel = DiscordRestTarget::GuildChannel {
+            guild: 1,
+            channel: 2,
+        };
+        cache.remember_permanent(channel, now);
+        assert!(cache.blocked(channel, now));
+        cache.forget(channel);
+        assert!(!cache.blocked(channel, now));
+    }
 
     #[test]
     fn permanent_targets_block_until_ttl_and_transient_statuses_do_not() {
@@ -328,11 +432,36 @@ mod tests {
         assert_eq!(classify_retry_response(404, 10003), RetryClass::Permanent);
         assert_eq!(classify_retry_response(429, 0), RetryClass::Transient);
         assert_eq!(classify_retry_response(503, 0), RetryClass::Transient);
-        let automod = DiscordRestTarget::AutomodAction {
+        let delete = DiscordRestTarget::AutomodDelete {
             guild: 10,
-            action: AutomodRestAction::Delete,
+            channel: 1,
+            message: 2,
         };
-        assert!(!cache.blocked(automod, now));
+        assert!(!cache.blocked(delete, now));
+    }
+
+    #[tokio::test]
+    async fn resource_specific_automod_errors_are_not_remembered() {
+        use super::should_remember_rest_rejection;
+        let delete = DiscordRestTarget::AutomodDelete {
+            guild: 10,
+            channel: 1,
+            message: 2,
+        };
+        let other = DiscordRestTarget::AutomodDelete {
+            guild: 10,
+            channel: 1,
+            message: 3,
+        };
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let missing = fixture_discord_http_error(404, 10008).await;
+        cache.remember_rest_rejection(&missing, delete, now);
+        assert!(!cache.blocked(delete, now));
+        assert!(!cache.blocked(other, now));
+        assert!(!should_remember_rest_rejection(&missing, delete));
+        let denied = fixture_discord_http_error(403, 50013).await;
+        assert!(should_remember_rest_rejection(&denied, delete));
     }
 
     #[test]
@@ -354,6 +483,25 @@ mod tests {
         assert!(cache.blocked(b, now));
         cache.clear_all();
         assert!(!cache.blocked(b, now));
+    }
+
+    #[tokio::test]
+    async fn clear_guild_races_ahead_of_late_delivery_forget() {
+        use super::should_remember_rest_rejection;
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 5,
+            channel: 6,
+        };
+        let deny = fixture_discord_http_error(403, 50013).await;
+        assert!(should_remember_rest_rejection(&deny, target));
+        cache.remember_rest_rejection(&deny, target, now);
+        assert!(cache.blocked(target, now));
+        cache.clear_guild(5);
+        assert!(!cache.blocked(target, now));
+        cache.forget(target);
+        assert!(!cache.blocked(target, now));
     }
 
     #[test]

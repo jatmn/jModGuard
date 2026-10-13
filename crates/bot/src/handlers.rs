@@ -31,6 +31,27 @@ impl Handler {
     }
 }
 
+pub(crate) fn clear_remembered_if_bot_roles_changed(
+    app: &BotState,
+    guild_id: u64,
+    bot_user_id: serenity::model::id::UserId,
+    member_user_id: serenity::model::id::UserId,
+    old_roles: Option<&[RoleId]>,
+    new_roles: &[RoleId],
+) {
+    if member_user_id != bot_user_id {
+        return;
+    }
+    use std::collections::HashSet;
+    let old: HashSet<u64> = old_roles
+        .map(|roles| roles.iter().map(|role| role.get()).collect())
+        .unwrap_or_default();
+    let new_roles: HashSet<u64> = new_roles.iter().map(|role| role.get()).collect();
+    if old != new_roles {
+        app.remembered_discord_targets.clear_guild(guild_id);
+    }
+}
+
 async fn emit_activity(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1070,6 +1091,16 @@ impl EventHandler for Handler {
         .await;
         let Some(new) = new_if_available else { return };
         let guild_id = new.guild_id;
+        clear_remembered_if_bot_roles_changed(
+            &self.app,
+            guild_id.get(),
+            ctx.cache.current_user().id,
+            new.user.id,
+            old_if_available
+                .as_ref()
+                .map(|member| member.roles.as_slice()),
+            &new.roles,
+        );
         let old_to = old_if_available
             .as_ref()
             .and_then(|member| member.communication_disabled_until);
@@ -1256,6 +1287,19 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn channel_update(&self, _ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        if old.as_ref().map(|channel| &channel.permission_overwrites)
+            != Some(&new.permission_overwrites)
+        {
+            self.app
+                .remembered_discord_targets
+                .clear_guild(new.guild_id.get());
+        }
+    }
+
     async fn thread_create(&self, ctx: Context, thread: GuildChannel) {
         if !self.app.activation.allows_rule_trigger() {
             return;
@@ -1376,8 +1420,9 @@ mod tests {
     }
 
     use super::{
-        audit_case_action, departure_joined_at_ms, gateway_ban_row_to_attribute,
-        log_message_diagnostic, record_unresolved_gateway_observation, select_update_authors,
+        audit_case_action, clear_remembered_if_bot_roles_changed, departure_joined_at_ms,
+        gateway_ban_row_to_attribute, log_message_diagnostic,
+        record_unresolved_gateway_observation, select_update_authors,
     };
     use crate::{db::Db, logging, state::BotState};
     use serenity::model::channel::Message;
@@ -1389,6 +1434,38 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[test]
+    fn bot_role_change_clears_remembered_discord_targets_for_guild() {
+        use crate::discord::DiscordRestTarget;
+        use serenity::model::id::{RoleId, UserId};
+        use std::time::Instant;
+
+        let path = std::env::temp_dir().join(format!(
+            "jmg-bot-role-clear-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let now = Instant::now();
+        let guild = 42_u64;
+        let channel = DiscordRestTarget::GuildChannel { guild, channel: 99 };
+        app.remembered_discord_targets
+            .remember_permanent(channel, now);
+        assert!(app.remembered_discord_targets.blocked(channel, now));
+        let bot = UserId::new(1);
+        let other = UserId::new(2);
+        let role_a = RoleId::new(10);
+        let role_b = RoleId::new(11);
+        clear_remembered_if_bot_roles_changed(&app, guild, bot, other, Some(&[role_a]), &[role_a]);
+        assert!(app.remembered_discord_targets.blocked(channel, now));
+        clear_remembered_if_bot_roles_changed(&app, guild, bot, bot, Some(&[role_a]), &[role_b]);
+        assert!(!app.remembered_discord_targets.blocked(channel, now));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
