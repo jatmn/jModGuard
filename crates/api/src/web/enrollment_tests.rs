@@ -2530,7 +2530,7 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
         db::upsert_command(&f.app.db, guild, "fixture", &command)
             .await
             .unwrap();
-        db::upsert_log_channel(&f.app.db, guild, "fixture", 1329331947876479006 + guild)
+        db::upsert_log_channel(&f.app.db, guild, "fixture", 9_007_199_254_740_993 + guild)
             .await
             .unwrap();
         db::add_badword(&f.app.db, guild, label, None)
@@ -2558,14 +2558,14 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
     let (_, channels) = f.request("GET", "/api/guilds/10/logchannels", "").await;
     assert_eq!(
         channels,
-        serde_json::json!({"guild":[{"event":"fixture","channel_id":"1329331947876479016"}],"global":[]})
+        serde_json::json!({"guild":[{"event":"fixture","channel_id":"9007199254741003"}],"global":[]})
     );
     let (_, channel) = f
         .request("GET", "/api/guilds/10/logchannels/fixture", "")
         .await;
     assert_eq!(
         channel,
-        serde_json::json!({"effective":"1329331947876479016","guild_override":"1329331947876479016","global":null})
+        serde_json::json!({"effective":"9007199254741003","guild_override":"9007199254741003","global":null})
     );
     let (_, absent) = f
         .request("GET", "/api/guilds/10/logchannels/absent", "")

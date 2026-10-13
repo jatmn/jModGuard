@@ -1309,11 +1309,11 @@ mod tests {
 
     #[test]
     fn log_channels_wire_stringifies_snowflake_channel_ids() {
-        let snow = 1329331947876479006i64;
+        let snow = 9_007_199_254_740_993i64;
         let out = log_channels_wire(vec![("message_delete".into(), snow)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["event"], "message_delete");
-        assert_eq!(out[0]["channel_id"], "1329331947876479006");
+        assert_eq!(out[0]["channel_id"], "9007199254740993");
         assert!(out[0]["channel_id"].is_string());
     }
 

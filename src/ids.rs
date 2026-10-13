@@ -332,8 +332,8 @@ mod tests {
 
     #[test]
     fn accepts_string_and_integer_snowflakes() {
-        let s: Body = serde_json::from_str(r#"{"id":"1329331947876479006"}"#).unwrap();
-        assert_eq!(s.id, 1329331947876479006);
+        let s: Body = serde_json::from_str(r#"{"id":"9007199254740993"}"#).unwrap();
+        assert_eq!(s.id, 9007199254740993);
         // Integers that fit in JSON number still parse (legacy / same-origin tooling).
         let n: Body = serde_json::from_str(r#"{"id":12345}"#).unwrap();
         assert_eq!(n.id, 12345);
@@ -346,17 +346,17 @@ mod tests {
             #[serde(deserialize_with = "de_u64_vec")]
             roles: Vec<u64>,
         }
-        let w: W = serde_json::from_str(r#"{"roles":["1329331947876479006", 99]}"#).unwrap();
-        assert_eq!(w.roles, vec![1329331947876479006, 99]);
+        let w: W = serde_json::from_str(r#"{"roles":["9007199254740993", 99]}"#).unwrap();
+        assert_eq!(w.roles, vec![9007199254740993, 99]);
     }
 
     #[test]
     fn snowflake_roundtrips_as_string() {
-        let s = Snowflake(1329331947876479006);
+        let s = Snowflake(9007199254740993);
         let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#""1329331947876479006""#);
+        assert_eq!(json, r#""9007199254740993""#);
         let back: Snowflake = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.0, 1329331947876479006);
+        assert_eq!(back.0, 9007199254740993);
     }
 
     #[test]
@@ -374,13 +374,13 @@ mod tests {
         assert_eq!(none.id, None);
         let missing: W = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(missing.id, None);
-        let s: W = serde_json::from_str(r#"{"id":"1329331947876479006"}"#).unwrap();
-        assert_eq!(s.id, Some(1329331947876479006));
+        let s: W = serde_json::from_str(r#"{"id":"9007199254740993"}"#).unwrap();
+        assert_eq!(s.id, Some(9007199254740993));
         let n: W = serde_json::from_str(r#"{"id":99}"#).unwrap();
         assert_eq!(n.id, Some(99));
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"id":"1329331947876479006"}"#
+            r#"{"id":"9007199254740993"}"#
         );
     }
 
@@ -397,8 +397,8 @@ mod tests {
         assert_eq!(missing.user, None);
         let empty: W = serde_json::from_str(r#"{"user":""}"#).unwrap();
         assert_eq!(empty.user, None);
-        let s: W = serde_json::from_str(r#"{"user":"1329331947876479006"}"#).unwrap();
-        assert_eq!(s.user, Some(1329331947876479006));
+        let s: W = serde_json::from_str(r#"{"user":"9007199254740993"}"#).unwrap();
+        assert_eq!(s.user, Some(9007199254740993));
         let n: W = serde_json::from_str(r#"{"user":99}"#).unwrap();
         assert_eq!(n.user, Some(99));
     }
@@ -406,19 +406,19 @@ mod tests {
     #[test]
     fn stringify_js_unsafe_integers_rewrites_snowflakes_only() {
         let v = json!({
-            "channel_id": 1329331947876479006u64,
+            "channel_id": 9007199254740993u64,
             "message_id": 99,
-            "nested": { "id": 1329331947876479007u64 },
-            "list": [1, 1329331947876479008u64],
+            "nested": { "id": 9007199254740994u64 },
+            "list": [1, 9007199254740995u64],
             "name": "ok",
             "flag": true,
         });
         let out = stringify_js_unsafe_integers(&v);
-        assert_eq!(out["channel_id"], "1329331947876479006");
+        assert_eq!(out["channel_id"], "9007199254740993");
         assert_eq!(out["message_id"], 99);
-        assert_eq!(out["nested"]["id"], "1329331947876479007");
+        assert_eq!(out["nested"]["id"], "9007199254740994");
         assert_eq!(out["list"][0], 1);
-        assert_eq!(out["list"][1], "1329331947876479008");
+        assert_eq!(out["list"][1], "9007199254740995");
         assert_eq!(out["name"], "ok");
         assert_eq!(out["flag"], true);
     }

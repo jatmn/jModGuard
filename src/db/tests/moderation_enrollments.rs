@@ -86,7 +86,7 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
     f.db.with_conn(|conn| {
         let tx = conn.transaction_immediate()?;
         for i in 0..205i64 {
-            tx.execute_bounded("INSERT INTO events(guild_id,event_type,user_id,data,created_at) VALUES(10,'member_ban',?1,'{\"snowflake\":1329331947876479006}','now')", params![i], 64 * 1024 * 1024)?;
+            tx.execute_bounded("INSERT INTO events(guild_id,event_type,user_id,data,created_at) VALUES(10,'member_ban',?1,'{\"snowflake\":9007199254740993}','now')", params![i], 64 * 1024 * 1024)?;
             tx.execute_bounded("INSERT INTO bans(guild_id,user_id,reason,created_at,active) VALUES(10,?1,'fixture','now',?2)", params![i, i % 2], 64 * 1024 * 1024)?;
         }
         tx.commit()
@@ -119,7 +119,7 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
         assert_eq!(bans[0].user_id, 204);
         let data: serde_json::Value =
             serde_json::from_str(events[0].data.as_ref().unwrap()).unwrap();
-        assert_eq!(data["snowflake"], "1329331947876479006");
+        assert_eq!(data["snowflake"], "9007199254740993");
         assert_eq!(
             serde_json::to_value(events).unwrap(),
             serde_json::to_value(query_events(&f.db, 10, None, None, limit).await.unwrap())
@@ -179,29 +179,29 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
 async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let user_id = 1_726_972_779_646_156_581i64;
+    let user_id = 10_001i64;
     record_enrolled_ban_with_identity(
         &f.db,
         Some(scope.clone()),
         user_id,
-        Some("wavingwalker"),
-        Some("Wavingwalker"),
-        Some(1_800_882_749_273_538_599),
-        Some("ikaika44"),
+        Some("test-user-1"),
+        Some("Test-User-1"),
+        Some(10_002),
+        Some("test-mod-1"),
         "No reason provided",
-        Some("2026-09-22T23:16:28Z"),
+        Some("2020-01-01T12:00:00Z"),
     )
     .await
     .unwrap();
     let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].user_name.as_deref(), Some("wavingwalker"));
-    assert_eq!(rows[0].user_display_name.as_deref(), Some("Wavingwalker"));
-    assert_eq!(rows[0].moderator_name.as_deref(), Some("ikaika44"));
-    assert_eq!(rows[0].created_at, "2026-09-22T23:16:28Z");
+    assert_eq!(rows[0].user_name.as_deref(), Some("test-user-1"));
+    assert_eq!(rows[0].user_display_name.as_deref(), Some("Test-User-1"));
+    assert_eq!(rows[0].moderator_name.as_deref(), Some("test-mod-1"));
+    assert_eq!(rows[0].created_at, "2020-01-01T12:00:00Z");
     let json = serde_json::to_value(&rows[0]).unwrap();
     assert_eq!(json["user_id"], user_id.to_string());
-    assert_eq!(json["moderator_id"], "1800882749273538599");
+    assert_eq!(json["moderator_id"], "10002");
     assert_eq!(json["reason"], "No reason provided");
     let api = Db::open_with(DbOpenOptions {
         read_only: false,
@@ -218,7 +218,7 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
         list_bans(&api, 10, 10).await.unwrap()[0]
             .user_name
             .as_deref(),
-        Some("wavingwalker")
+        Some("test-user-1")
     );
     let later_id = record_enrolled_ban_with_identity(
         &f.db,
@@ -256,7 +256,7 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
     assert!(!later[0].active, "a late audit must not undo an unban");
     assert_eq!(later[0].moderator_name.as_deref(), Some("late-moderator"));
     assert_eq!(later[0].reason.as_deref(), Some("late audit reason"));
-    assert_eq!(later[1].moderator_name.as_deref(), Some("ikaika44"));
+    assert_eq!(later[1].moderator_name.as_deref(), Some("test-mod-1"));
     retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     enroll_guild(&f.db, 10, 101).await.unwrap();
     assert!(

@@ -1632,16 +1632,16 @@ fn slash_registry_version_bumps_only_on_command_writes() {
 fn event_row_snowflakes_serialize_as_strings() {
     let row = EventRow {
         id: 1,
-        guild_id: 1329331947876479006,
+        guild_id: 9007199254740993,
         event_type: "kick".into(),
-        user_id: Some(1329331947876479007),
+        user_id: Some(9007199254740994),
         actor_id: None,
         data: None,
         created_at: "t".into(),
     };
     let v = serde_json::to_value(&row).unwrap();
-    assert_eq!(v["guild_id"], "1329331947876479006");
-    assert_eq!(v["user_id"], "1329331947876479007");
+    assert_eq!(v["guild_id"], "9007199254740993");
+    assert_eq!(v["user_id"], "9007199254740994");
     assert!(v["actor_id"].is_null());
 }
 
@@ -1650,7 +1650,7 @@ fn insert_event_query_events_roundtrips_data_snowflakes_as_strings() {
     let tmp = tmp_db_path("event_data_sf");
     let db = Db::open(&tmp, 2).unwrap();
     let guild = 11i64;
-    let snow = 1329331947876479006u64;
+    let snow = 9007199254740993u64;
     tokio_test_block_on(crate::db::insert_event(
         &db,
         guild,
@@ -1668,12 +1668,12 @@ fn insert_event_query_events_roundtrips_data_snowflakes_as_strings() {
     let rows = tokio_test_block_on(crate::db::query_events(&db, guild, None, None, 10)).unwrap();
     assert_eq!(rows.len(), 1);
     let data: serde_json::Value = serde_json::from_str(rows[0].data.as_deref().unwrap()).unwrap();
-    assert_eq!(data["channel_id"], "1329331947876479006");
+    assert_eq!(data["channel_id"], "9007199254740993");
     assert_eq!(data["message_id"], 99);
-    assert_eq!(data["nested"]["id"], "1329331947876479007");
+    assert_eq!(data["nested"]["id"], "9007199254740994");
     // Top-level EventRow IDs are also strings on the wire.
     let wire = serde_json::to_value(&rows[0]).unwrap();
-    assert_eq!(wire["user_id"], "1329331947876479006");
+    assert_eq!(wire["user_id"], "9007199254740993");
     cleanup_db(&tmp);
 }
 
@@ -1681,7 +1681,7 @@ fn insert_event_query_events_roundtrips_data_snowflakes_as_strings() {
 fn query_events_heals_legacy_numeric_data_blobs() {
     let tmp = tmp_db_path("event_legacy");
     let db = Db::open(&tmp, 2).unwrap();
-    let snow = 1329331947876479006i64;
+    let snow = 9007199254740993i64;
     // Simulate a pre-fix row that stored snowflakes as JSON numbers.
     tokio_test_block_on(db.with_conn(move |conn| {
         conn.execute_bounded(
@@ -1695,7 +1695,7 @@ fn query_events_heals_legacy_numeric_data_blobs() {
     .unwrap();
     let rows = tokio_test_block_on(crate::db::query_events(&db, 1, None, None, 10)).unwrap();
     let data: serde_json::Value = serde_json::from_str(rows[0].data.as_deref().unwrap()).unwrap();
-    assert_eq!(data["channel_id"], "1329331947876479006");
+    assert_eq!(data["channel_id"], "9007199254740993");
     assert_eq!(data["message_id"], 1);
     cleanup_db(&tmp);
 }
@@ -2990,7 +2990,7 @@ fn nickname_validation_rejects_permanent_discord_failures_before_enqueue() {
 
 #[test]
 fn badword_view_stringifies_guild_snowflake() {
-    let snow = 1329331947876479006i64;
+    let snow = 9007199254740993i64;
     let view = Badword {
         id: 1,
         guild_id: snow,
@@ -2999,7 +2999,7 @@ fn badword_view_stringifies_guild_snowflake() {
     }
     .with_status();
     let json = serde_json::to_value(&view).unwrap();
-    assert_eq!(json["guild_id"], "1329331947876479006");
+    assert_eq!(json["guild_id"], "9007199254740993");
     assert!(json["guild_id"].is_string());
     let global = Badword {
         id: 2,
