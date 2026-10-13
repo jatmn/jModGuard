@@ -640,8 +640,9 @@ mod tests {
     }
 
     async fn wait_status(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut seen = 0;
-        for _ in 0..40 {
+        while tokio::time::Instant::now() < deadline {
             seen = http_status(addr, request).await;
             if seen == want {
                 return seen;
@@ -651,19 +652,126 @@ mod tests {
         seen
     }
 
-    async fn http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
-            return 0;
-        };
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap_or(0);
-        let text = String::from_utf8_lossy(&buf[..n]);
+    fn probe_request_with_close(request: &str) -> String {
+        if request.contains("Connection:") {
+            return request.to_owned();
+        }
+        request.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n")
+    }
+
+    fn parse_http_status(response: &[u8]) -> u16 {
+        let text = String::from_utf8_lossy(response);
         text.split_whitespace()
             .nth(1)
             .unwrap_or("0")
             .parse()
             .unwrap_or(0)
+    }
+
+    fn probe_io_error_is_transient(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+        )
+    }
+
+    async fn http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = probe_request_with_close(request);
+        // Under parallel test load the health accept loop can reset a just-opened
+        // connection (BrokenPipe/ConnectionReset) or refuse while saturated.
+        for attempt in 1..=3 {
+            let result: Result<u16, std::io::Error> = async {
+                let mut stream = tokio::net::TcpStream::connect(addr).await?;
+                stream.write_all(request.as_bytes()).await?;
+                let mut buf = vec![0u8; 1024];
+                let n = stream.read(&mut buf).await?;
+                Ok(parse_http_status(&buf[..n]))
+            }
+            .await;
+            match result {
+                Ok(status) => {
+                    if status != 0 {
+                        return status;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                Err(error) if attempt < 3 && probe_io_error_is_transient(&error) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(_) => return 0,
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn parse_http_status_reads_status_line() {
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+            503
+        );
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n\r\nok"), 200);
+        assert_eq!(parse_http_status(b""), 0);
+    }
+
+    #[test]
+    fn probe_io_error_is_transient_matches_reset_and_refused() {
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(!probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::InvalidData
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_status_retries_after_connection_reset() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let status = http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert_eq!(status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_status_waits_until_listener_is_bound() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let status =
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await;
+        assert_eq!(status, 200);
+        server.await.unwrap();
     }
 }
