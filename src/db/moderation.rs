@@ -951,21 +951,45 @@ fn gateway_manual_redelivery_within_window(
     Ok(incoming <= mirror + chrono::Duration::seconds(GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS))
 }
 
+fn gateway_audit_entry_id_known_for_user(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    audit_entry_id: i64,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+              AND json_valid(data)
+              AND CAST(json_extract(data, '$.audit_entry_id') AS TEXT) = CAST(?3 AS TEXT)
+         )",
+        params![guild_id, user_id, audit_entry_id],
+        |row| Ok(row.get::<i64>(0)? != 0),
+    )
+}
+
 /// Whether two manual gateway deliveries are the same Discord ban action.
 ///
-/// Identity comes from the audit-log entry id persisted on the mirror's `member_ban` event
-/// (or a repeat delivery that omits the id after the mirror already stored one). When ids are
-/// missing on one or both sides, a bounded delivery-time window is used as a fallback.
+/// Identity comes from the audit-log entry id persisted on the mirror's `member_ban` event.
+/// When either side lacks an id, a bounded delivery-time window is used as a fallback.
+/// A known audit id that already has a `member_ban` event is treated as a replay even when
+/// the active mirror belongs to a later ban.
 fn gateway_deliveries_are_same(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
     mirror_created_at: &str,
     incoming_at: &str,
     mirror_audit_entry_id: Option<i64>,
     incoming_audit_entry_id: Option<i64>,
 ) -> Result<bool> {
     match (incoming_audit_entry_id, mirror_audit_entry_id) {
-        (Some(incoming), Some(stored)) => Ok(incoming == stored),
-        (None, Some(_stored)) => Ok(true),
-        (Some(_), None) | (None, None) => {
+        (Some(incoming), Some(stored)) if incoming == stored => Ok(true),
+        (Some(incoming), Some(_stored)) => Ok(gateway_audit_entry_id_known_for_user(
+            conn, guild_id, user_id, incoming,
+        )?),
+        (None, Some(_)) | (Some(_), None) | (None, None) => {
             gateway_manual_redelivery_within_window(mirror_created_at, incoming_at)
         }
     }
@@ -991,6 +1015,9 @@ fn same_gateway_delivery_as_mirror(
     let mirror_audit_entry_id =
         gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
     gateway_deliveries_are_same(
+        conn,
+        guild_id,
+        user_id,
         mirror.created_at.as_str(),
         incoming_at,
         mirror_audit_entry_id,
@@ -1021,7 +1048,10 @@ fn replace_manual_gateway_mirror(
             let mirror_audit_entry_id =
                 gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
             if gateway_deliveries_are_same(
-                &mirror.created_at,
+                conn,
+                guild_id,
+                user_id,
+                mirror.created_at.as_str(),
                 incoming_at,
                 mirror_audit_entry_id,
                 incoming_audit_entry_id,
