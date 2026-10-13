@@ -2400,3 +2400,135 @@ fn automod_content_bound_stays_within_budget_across_sizes() {
         }
     }
 }
+
+async fn discord_status_proxy(
+    status: u16,
+    code: isize,
+) -> (
+    serenity::http::Http,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let body = format!(r#"{{"code":{code},"message":"fixture"}}"#);
+            let response = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, calls, server)
+}
+
+struct ProxyLogSink {
+    http: serenity::http::Http,
+}
+
+#[serenity::async_trait]
+impl LogDelivery for ProxyLogSink {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        channel.send_message(&self.http, message).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn permanent_log_channel_failure_skips_second_delivery_attempt() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = discord_status_proxy(404, 10003).await;
+    let sink = ProxyLogSink { http };
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Blocked
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    f.app.invalidate_configs();
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            BTreeMap::new(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn transient_log_channel_failure_is_retried_on_next_event() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = discord_status_proxy(503, 0).await;
+    let sink = ProxyLogSink { http };
+    for _ in 0..2 {
+        assert_eq!(
+            emit_to(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                "message_delete",
+                BTreeMap::new(),
+            )
+            .await,
+            Delivery::Failed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}

@@ -1,8 +1,11 @@
 //! Shared Discord REST helpers.
 
 use anyhow::{Result, anyhow};
+use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Bounds every reconciliation REST attempt so one half-open Discord request
 /// cannot stall durable work for every guild indefinitely.
@@ -83,12 +86,109 @@ pub fn classify_retry_error(error: &anyhow::Error) -> RetryClass {
         .map_or(RetryClass::Transient, classify_retry)
 }
 
-fn classify_retry_response(status: u16, code: isize) -> RetryClass {
+pub(crate) fn classify_retry_response(status: u16, code: isize) -> RetryClass {
     match status {
         401 => RetryClass::Unauthorized,
         _ if code == 50001 => RetryClass::Permanent,
         408 | 429 | 500..=599 => RetryClass::Transient,
         _ => RetryClass::Permanent,
+    }
+}
+
+/// How long a definite 403/404 (or similar permanent REST rejection) is remembered
+/// before another attempt is allowed without a config or role change.
+pub(crate) const REMEMBERED_REST_TARGET_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_REMEMBERED_REST_TARGETS: usize = 4096;
+
+/// A Discord REST destination that may be skipped after a permanent failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DiscordRestTarget {
+    GuildChannel {
+        guild: u64,
+        channel: u64,
+    },
+    AutomodAction {
+        guild: u64,
+        action: AutomodRestAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AutomodRestAction {
+    Delete,
+    Timeout,
+    Kick,
+    Ban,
+}
+
+impl AutomodRestAction {
+    pub(crate) fn from_action(action: &str) -> Option<Self> {
+        match action {
+            "delete" => Some(Self::Delete),
+            "timeout" => Some(Self::Timeout),
+            "kick" => Some(Self::Kick),
+            "ban" => Some(Self::Ban),
+            _ => None,
+        }
+    }
+}
+
+/// Process-local memory of permanent Discord REST rejections (invalid-request budget).
+#[derive(Default)]
+pub(crate) struct RememberedDiscordTargets {
+    expires: Mutex<HashMap<DiscordRestTarget, Instant>>,
+}
+
+impl RememberedDiscordTargets {
+    pub(crate) fn blocked(&self, target: DiscordRestTarget, now: Instant) -> bool {
+        let mut map = self.expires.lock();
+        map.retain(|_, until| *until > now);
+        map.get(&target).is_some_and(|until| *until > now)
+    }
+
+    pub(crate) fn remember_permanent(&self, target: DiscordRestTarget, now: Instant) {
+        let mut map = self.expires.lock();
+        map.retain(|_, until| *until > now);
+        if map.len() >= MAX_REMEMBERED_REST_TARGETS
+            && !map.contains_key(&target)
+            && let Some(oldest) = map.iter().min_by_key(|(_, until)| *until).map(|(k, _)| *k)
+        {
+            map.remove(&oldest);
+        }
+        map.insert(target, now + REMEMBERED_REST_TARGET_TTL);
+    }
+
+    pub(crate) fn observe_discord_error(
+        &self,
+        error: &serenity::Error,
+        target: DiscordRestTarget,
+        now: Instant,
+    ) {
+        if classify_retry(error) == RetryClass::Permanent {
+            self.remember_permanent(target, now);
+        }
+    }
+
+    pub(crate) fn observe_anyhow_error(
+        &self,
+        error: &anyhow::Error,
+        target: DiscordRestTarget,
+        now: Instant,
+    ) {
+        if classify_retry_error(error) == RetryClass::Permanent {
+            self.remember_permanent(target, now);
+        }
+    }
+
+    pub(crate) fn clear_guild(&self, guild: u64) {
+        self.expires.lock().retain(|target, _| match target {
+            DiscordRestTarget::GuildChannel { guild: g, .. } => *g != guild,
+            DiscordRestTarget::AutomodAction { guild: g, .. } => *g != guild,
+        });
+    }
+
+    pub(crate) fn clear_all(&self) {
+        self.expires.lock().clear();
     }
 }
 
@@ -202,7 +302,59 @@ pub async fn validate_log_channel_guild(
 
 #[cfg(test)]
 mod tests {
-    use super::{NicknameFailureClass, classify_nickname_failure, classify_nickname_response};
+    use super::{
+        AutomodRestAction, DiscordRestTarget, NicknameFailureClass, REMEMBERED_REST_TARGET_TTL,
+        RememberedDiscordTargets, RetryClass, classify_nickname_failure,
+        classify_nickname_response, classify_retry_response,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn permanent_targets_block_until_ttl_and_transient_statuses_do_not() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let channel = DiscordRestTarget::GuildChannel {
+            guild: 10,
+            channel: 20,
+        };
+        assert!(!cache.blocked(channel, now));
+        cache.remember_permanent(channel, now);
+        assert!(cache.blocked(channel, now));
+        assert!(!cache.blocked(
+            channel,
+            now + REMEMBERED_REST_TARGET_TTL + Duration::from_secs(1)
+        ));
+        assert_eq!(classify_retry_response(403, 50013), RetryClass::Permanent);
+        assert_eq!(classify_retry_response(404, 10003), RetryClass::Permanent);
+        assert_eq!(classify_retry_response(429, 0), RetryClass::Transient);
+        assert_eq!(classify_retry_response(503, 0), RetryClass::Transient);
+        let automod = DiscordRestTarget::AutomodAction {
+            guild: 10,
+            action: AutomodRestAction::Delete,
+        };
+        assert!(!cache.blocked(automod, now));
+    }
+
+    #[test]
+    fn remembered_targets_clear_per_guild_and_on_config_reset() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let a = DiscordRestTarget::GuildChannel {
+            guild: 1,
+            channel: 2,
+        };
+        let b = DiscordRestTarget::GuildChannel {
+            guild: 3,
+            channel: 4,
+        };
+        cache.remember_permanent(a, now);
+        cache.remember_permanent(b, now);
+        cache.clear_guild(1);
+        assert!(!cache.blocked(a, now));
+        assert!(cache.blocked(b, now));
+        cache.clear_all();
+        assert!(!cache.blocked(b, now));
+    }
 
     #[test]
     fn transient_deadlines_grow_with_jitter_and_stop_at_one_hour() {

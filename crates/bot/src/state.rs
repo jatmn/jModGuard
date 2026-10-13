@@ -546,6 +546,7 @@ pub struct BotState {
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
+    pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
 }
 
 impl BotState {
@@ -624,6 +625,7 @@ impl BotState {
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
+            remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
         }))
     }
 
@@ -1067,6 +1069,7 @@ impl BotState {
 
     /// Invalidates the config cache (call after any config write).
     pub fn invalidate_configs(&self) {
+        self.remembered_discord_targets.clear_all();
         self.configs.invalidate();
     }
 

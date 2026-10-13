@@ -283,6 +283,7 @@ impl EventHandler for Handler {
         }
         // Rejoin permits another attempt for a parked guild, never for a bad token.
         app.reset_slash_guild_retry(gid.get());
+        app.remembered_discord_targets.clear_guild(gid.get());
         // No guild_settings seed on join — global inheritance stays unblocked.
         if !commands::sync_slash_commands(&app, &ctx, gid).await {
             app.retry_slash_registry_version();
@@ -1211,6 +1212,9 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        self.app
+            .remembered_discord_targets
+            .clear_guild(new.guild_id.get());
         let new_view = crate::activity_log::RoleView::from_role(&new);
         let old_view = old_data_if_available
             .as_ref()
