@@ -608,6 +608,7 @@ pub struct BotState {
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
+    pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
     #[cfg(test)]
     gateway_ban_path_phases: Mutex<Vec<&'static str>>,
 }
@@ -689,6 +690,7 @@ impl BotState {
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
+            remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
             #[cfg(test)]
             gateway_ban_path_phases: Mutex::new(Vec::new()),
         }))
@@ -1187,6 +1189,7 @@ impl BotState {
 
     /// Invalidates the config cache (call after any config write).
     pub fn invalidate_configs(&self) {
+        self.remembered_discord_targets.clear_all();
         self.configs.invalidate();
     }
 
@@ -1291,6 +1294,7 @@ impl BotState {
         };
         let config_changed = config_revision_changed || primary.config != previous_config;
         if config_changed {
+            self.remembered_discord_targets.clear_all();
             self.slash_retries.lock().clear();
             self.last_config_version
                 .store(primary.config, Ordering::SeqCst);

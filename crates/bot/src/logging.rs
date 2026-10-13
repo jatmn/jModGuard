@@ -737,6 +737,8 @@ pub(crate) enum Delivery {
     Unconfigured,
     Dropped,
     Failed,
+    /// Skipped because this guild/channel was recently rejected with a permanent error.
+    Blocked,
 }
 
 #[derive(Clone, Copy)]
@@ -866,6 +868,19 @@ async fn emit_to_observed_with_audit(
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }
+        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+            guild: guild_id.get(),
+            channel: channel_id.get(),
+        };
+        if app
+            .remembered_discord_targets
+            .blocked(rest_target, Instant::now())
+        {
+            return Ok(Delivery::Blocked);
+        }
+        let recovery = app
+            .remembered_discord_targets
+            .capture_recovery_epoch(rest_target);
         match crate::discord::race_discord_call(
             &app.activation,
             sink.send(channel_id, log_message(&rendered)),
@@ -873,14 +888,25 @@ async fn emit_to_observed_with_audit(
         .await
         {
             crate::discord::DiscordCall::Cancelled => return Ok(Delivery::Dropped),
-            crate::discord::DiscordCall::Finished(result) => result?,
+            crate::discord::DiscordCall::Finished(Ok(())) => {
+                app.remembered_discord_targets.forget(rest_target);
+            }
+            crate::discord::DiscordCall::Finished(Err(error)) => {
+                app.remembered_discord_targets.observe_anyhow_error(
+                    recovery,
+                    &error,
+                    rest_target,
+                    Instant::now(),
+                );
+                return Err(error);
+            }
         }
         Ok::<_, anyhow::Error>(Delivery::Sent)
     })
     .await;
     let delivery = match result {
         Ok(Ok(delivery)) => delivery,
-        _ => {
+        Ok(Err(_)) | Err(_) => {
             record_delivery_failure(app);
             Delivery::Failed
         }
@@ -1518,6 +1544,54 @@ fn fallback_bulk_parts(
     parts
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn deliver_bulk_text_fallback_parts(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    destination: ChannelId,
+    rest_target: crate::discord::DiscordRestTarget,
+    template: &str,
+    display: &BTreeMap<String, String>,
+    transcript: &BulkTranscript,
+    deadline: Duration,
+    started: Instant,
+    mut failure_recovery: crate::discord::RecoveryEpoch,
+) -> (bool, Option<serenity::Error>, crate::discord::RecoveryEpoch) {
+    let parts = fallback_bulk_parts(template, display, transcript);
+    let part_count = parts.len();
+    let mut parts_sent = 0usize;
+    let mut terminal_error = None;
+    for details in parts {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        failure_recovery = app
+            .remembered_discord_targets
+            .capture_recovery_epoch(rest_target);
+        match tokio::time::timeout(
+            left,
+            crate::discord::race_discord_call(
+                &app.activation,
+                destination.send_message(http, log_message(&details)),
+            ),
+        )
+        .await
+        {
+            Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+                parts_sent += 1;
+            }
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                terminal_error = Some(error);
+                break;
+            }
+            _ => break,
+        }
+    }
+    let delivered = parts_sent == part_count && part_count > 0;
+    (delivered, terminal_error, failure_recovery)
+}
+
 pub(crate) async fn emit_retained_bulk(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1564,6 +1638,16 @@ pub(crate) async fn emit_retained_bulk(
     let Some(destination) = channel_for(&cfg, "message_bulk_delete") else {
         return;
     };
+    let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: guild.get(),
+        channel: destination.get(),
+    };
+    if app
+        .remembered_discord_targets
+        .blocked(rest_target, Instant::now())
+    {
+        return;
+    }
     if cfg
         .log_filters
         .get("message_bulk_delete")
@@ -1626,6 +1710,11 @@ pub(crate) async fn emit_retained_bulk(
     let body = transcript.finish();
     let message =
         log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
+    let mut delivered = false;
+    let mut terminal_error: Option<serenity::Error> = None;
+    let mut failure_recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
     match tokio::time::timeout(
         deadline.saturating_sub(started.elapsed()),
         crate::discord::race_discord_call(
@@ -1635,37 +1724,84 @@ pub(crate) async fn emit_retained_bulk(
     )
     .await
     {
-        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {}
-        Ok(crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(error))))
-            if error
-                .status_code()
-                .is_some_and(|status| status.as_u16() == 403) =>
-        {
-            // A definite permission response can mean Attach Files is absent.
-            // A timeout is ambiguous and never enters this fallback.
-            let parts = fallback_bulk_parts(template, &display, &transcript);
-            for details in parts {
-                let left = deadline.saturating_sub(started.elapsed());
-                if left.is_zero()
-                    || !matches!(
-                        tokio::time::timeout(
-                            left,
-                            crate::discord::race_discord_call(
-                                &app.activation,
-                                destination.send_message(&ctx.http, log_message(&details)),
-                            ),
-                        )
-                        .await,
-                        Ok(crate::discord::DiscordCall::Finished(Ok(_)))
+        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => delivered = true,
+        Ok(crate::discord::DiscordCall::Finished(Err(discord_err))) => {
+            if matches!(
+                &discord_err,
+                serenity::Error::Http(http_error)
+                    if http_error
+                        .status_code()
+                        .is_some_and(|status| status.as_u16() == 403)
+            ) {
+                // Attach Files may be absent while Send Messages still works.
+                let (all_parts_delivered, fallback_error, recovery) =
+                    deliver_bulk_text_fallback_parts(
+                        app,
+                        &ctx.http,
+                        destination,
+                        rest_target,
+                        template,
+                        &display,
+                        &transcript,
+                        deadline,
+                        started,
+                        failure_recovery,
                     )
-                {
-                    record_delivery_failure(app);
-                    break;
+                    .await;
+                failure_recovery = recovery;
+                if let Some(error) = fallback_error {
+                    terminal_error = Some(error);
                 }
+                delivered = all_parts_delivered;
+            } else {
+                terminal_error = Some(discord_err);
             }
         }
-        _ => record_delivery_failure(app),
+        _ => {
+            record_delivery_failure(app);
+            return;
+        }
     }
+    finish_bulk_channel_delivery(
+        app,
+        failure_recovery,
+        rest_target,
+        delivered,
+        terminal_error.as_ref(),
+    );
+}
+
+fn finish_bulk_channel_delivery(
+    app: &BotState,
+    recovery: crate::discord::RecoveryEpoch,
+    rest_target: crate::discord::DiscordRestTarget,
+    delivered: bool,
+    terminal_error: Option<&serenity::Error>,
+) {
+    if delivered {
+        app.remembered_discord_targets.forget(rest_target);
+        return;
+    }
+    if let Some(error) = terminal_error {
+        app.remembered_discord_targets.remember_rest_rejection(
+            recovery,
+            error,
+            rest_target,
+            Instant::now(),
+        );
+    }
+    record_delivery_failure(app);
+}
+
+#[cfg(test)]
+pub(crate) fn settle_bulk_channel_delivery(
+    app: &BotState,
+    recovery: crate::discord::RecoveryEpoch,
+    rest_target: crate::discord::DiscordRestTarget,
+    delivered: bool,
+    terminal_error: Option<&serenity::Error>,
+) {
+    finish_bulk_channel_delivery(app, recovery, rest_target, delivered, terminal_error);
 }
 
 fn take_utf16_prefix(text: &str, max_units: usize) -> (&str, &str) {
