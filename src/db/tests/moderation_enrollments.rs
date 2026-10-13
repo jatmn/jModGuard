@@ -2037,10 +2037,54 @@ async fn delayed_old_bot_echo_does_not_replace_an_attributed_manual_gateway_ban(
 }
 
 #[tokio::test]
-async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ban() {
+async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let first = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:00+00:00"),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id } = first else {
+        panic!("first delivery must insert, got {first:?}");
+    };
+    let again = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:03+00:00"),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, GatewayBanWrite::Existing { row_id });
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn distinct_manual_gateway_bans_within_sixty_seconds_use_audit_entry_ids() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2050,6 +2094,59 @@ async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ba
         false,
         None,
         false,
+        Some(10_001),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: old_id } = first else {
+        panic!("first manual ban must insert, got {first:?}");
+    };
+    let replacement = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        Some("2024-03-01T00:00:30+00:00"),
+        false,
+        None,
+        true,
+        Some(10_002),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: new_id } = replacement else {
+        panic!("distinct audit ids within 60s must insert, got {replacement:?}");
+    };
+    assert_ne!(new_id, old_id);
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        2
+    );
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    assert_eq!(rows.iter().find(|row| row.active).unwrap().id, new_id);
+}
+
+#[tokio::test]
+async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ban() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        Some("2024-03-01T00:00:00+00:00"),
+        false,
+        None,
+        false,
+        Some(20_001),
     )
     .await
     .unwrap();
@@ -2067,7 +2164,7 @@ async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ba
     )
     .await
     .unwrap();
-    let replacement = record_gateway_ban(
+    let replacement = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2077,6 +2174,7 @@ async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ba
         false,
         None,
         false,
+        Some(20_002),
     )
     .await
     .unwrap();
