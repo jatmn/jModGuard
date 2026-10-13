@@ -380,19 +380,21 @@ if ! PATH="${PATH#"$fixture/bin:"}" cargo test -p timed-runner-probe --no-run >/
   fail 'scoped cargo-args probe failed to prebuild'
 fi
 scoped_args_line="$(jmodguard_scoped_cargo_args lib:timed-runner-probe --workspace --locked --no-default-features \
-  --features ci_flag_probe --release --exclude timed-doctest-probe)"
+  --features ci_flag_probe --all-features --release --exclude timed-doctest-probe)"
 echo "$scoped_args_line" | grep -q -- '--no-default-features' \
   || fail 'scoped cargo-args: --no-default-features must survive rescoping'
 echo "$scoped_args_line" | grep -q -- '--features' \
   || fail 'scoped cargo-args: --features must survive rescoping'
 echo "$scoped_args_line" | grep -q -- 'ci_flag_probe' \
   || fail 'scoped cargo-args: feature value must survive rescoping'
+echo "$scoped_args_line" | grep -q -- '--all-features' \
+  || fail 'scoped cargo-args: --all-features must survive rescoping'
 echo "$scoped_args_line" | grep -q -- '--release' \
   || fail 'scoped cargo-args: --release must survive rescoping'
 echo "$scoped_args_line" | grep -q -- '--exclude' \
-  || fail 'scoped cargo-args: --exclude must survive rescoping'
+  && fail 'scoped cargo-args: --exclude must not be passed to per-scope cargo test'
 echo "$scoped_args_line" | grep -q -- 'timed-doctest-probe' \
-  || fail 'scoped cargo-args: --exclude value must survive rescoping'
+  && fail 'scoped cargo-args: excluded package must not appear in per-scope cargo args'
 echo "$scoped_args_line" | grep -q -- '-p' \
   || fail 'scoped cargo-args: package selector must be applied per scope'
 echo "$scoped_args_line" | grep -q -- 'timed-runner-probe' \
@@ -415,6 +417,18 @@ grep -q -- '--release' "$CARGO_INVOCATION_LOG" \
   || fail 'scoped cargo-args: timed runner must pass --release'
 grep -q -- '--no-run' "$CARGO_INVOCATION_LOG" \
   || fail 'scoped cargo-args: timed runner must invoke cargo test --no-run'
+
+: >"$CARGO_INVOCATION_LOG"
+exclude_scope_log="$fixture/exclude-scope.log"
+set +e
+run_timed_cargo_test_gnu --workspace --locked --exclude timed-doctest-probe -- >"$exclude_scope_log" 2>&1
+exclude_scope_rc=$?
+set -e
+[ "$exclude_scope_rc" -eq 0 ] || { cat "$exclude_scope_log" >&2; fail "exclude scope runner failed with $exclude_scope_rc"; }
+grep -Eq '(^| )-p timed-doctest-probe|(^| )--package timed-doctest-probe' "$CARGO_INVOCATION_LOG" \
+  && fail 'exclude scope: excluded package must not be targeted by per-scope cargo invocations'
+grep -Eq 'documented \(line |doctest-probe' "$exclude_scope_log" \
+  && fail 'exclude scope: excluded package doctest must not run'
 
 contract_log="$fixture/contract-no-target.log"
 set +e

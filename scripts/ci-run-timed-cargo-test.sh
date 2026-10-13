@@ -239,6 +239,34 @@ run_timed_cargo_test_has_target_scope() {
   return 1
 }
 
+# One package name per line from `--exclude` (workspace-only; not passed to per-scope cargo).
+jmodguard_cargo_exclude_names() {
+  local -a args=("$@")
+  local i=0 arg
+  while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      --exclude)
+        i=$((i + 1))
+        if [ "$i" -lt "${#args[@]}" ]; then
+          printf '%s\n' "${args[$i]}"
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+jmodguard_package_is_excluded() {
+  local pkg=$1
+  local ex
+  while IFS= read -r ex; do
+    [ -n "$ex" ] || continue
+    [ "$ex" = "$pkg" ] && return 0
+  done < <(jmodguard_cargo_exclude_names "$@")
+  return 1
+}
+
 # One scope per line: lib, or test:<binary-name>
 run_timed_cargo_test_list_scopes() {
   local -a cargo_args=("$@")
@@ -276,6 +304,9 @@ run_timed_cargo_test_list_scopes() {
   fi
   local p had_scope=0
   for p in "${packages[@]}"; do
+    if jmodguard_package_is_excluded "$p" "${cargo_args[@]}"; then
+      continue
+    fi
     had_scope=0
     if jq -e --arg p "$p" '
           .packages[]
@@ -328,6 +359,14 @@ jmodguard_cargo_args_without_targets() {
         continue
         ;;
       --lib|--bins|--examples|--tests|--benches)
+        i=$((i + 1))
+        continue
+        ;;
+      --exclude)
+        i=$((i + 2))
+        continue
+        ;;
+      --workspace|--all)
         i=$((i + 1))
         continue
         ;;
