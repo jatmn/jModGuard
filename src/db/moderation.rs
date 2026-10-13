@@ -696,9 +696,11 @@ pub async fn record_enrolled_ban_with_identity(
 /// A bot echo inserts the one active row when none exists, and does not insert a
 /// `member_ban` event. `operation_id` is saved on that row so only the same ban
 /// attempt can fill it. A manual delivery inserts one active row and one
-/// `member_ban` event in the same transaction, with no operation id. A later
-/// delivery for an active ban returns the existing row and does not change its
-/// actor or reason.
+/// `member_ban` event in the same transaction, with no operation id. A repeat
+/// delivery for the same ban returns the existing row. A stale active mirror from
+/// an earlier ban cycle is ended and replaced when `member_was_banned` is false,
+/// an intervening unban was observed, the row is already attributed to a prior
+/// manual ban, or a bot echo belongs to a different attempt.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_gateway_ban(
     db: &Db,
@@ -709,6 +711,7 @@ pub async fn record_gateway_ban(
     occurred_at: Option<&str>,
     owned_by_bot: bool,
     operation_id: Option<&str>,
+    member_was_banned: bool,
 ) -> Result<GatewayBanWrite> {
     let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
     let reason = GATEWAY_BAN_REASON.to_owned();
@@ -733,9 +736,225 @@ pub async fn record_gateway_ban(
             now,
             owned_by_bot,
             operation_id,
+            member_was_banned,
         )
     })
     .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveBanMirror {
+    id: i64,
+    reason: Option<String>,
+    /// Gateway placeholder text in storage with no moderator yet; distinct from a
+    /// moderator who literally chose the same display string.
+    gateway_reason_unset: bool,
+    moderator_id: Option<i64>,
+    operation_id: Option<String>,
+    created_at: String,
+}
+
+fn load_active_ban_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+) -> Result<Option<ActiveBanMirror>> {
+    conn.query_row(
+        "SELECT id, reason, moderator_id, operation_id, created_at
+         FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 ORDER BY id LIMIT 1",
+        params![guild_id, user_id],
+        |row| {
+            let reason: Option<String> = row.get(1)?;
+            let moderator_id: Option<i64> = row.get(2)?;
+            let operation_id: Option<String> = row.get(3)?;
+            let gateway_reason_unset =
+                reason.as_deref() == Some(GATEWAY_BAN_REASON) && moderator_id.is_none();
+            Ok(ActiveBanMirror {
+                id: row.get(0)?,
+                reason,
+                gateway_reason_unset,
+                moderator_id,
+                operation_id,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn unban_observed_after_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror_created_at: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE guild_id=?1 AND user_id=?2 AND event_type='member_unban'
+              AND created_at > ?3
+         )",
+        params![guild_id, user_id, mirror_created_at],
+        |row| Ok(row.get::<i64>(0)? != 0),
+    )
+}
+
+fn manual_member_ban_event_exists_for_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    row_id: i64,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+              AND json_valid(data) AND json_extract(data, '$.ban_id') = ?3
+         )",
+        params![guild_id, user_id, row_id],
+        |row| Ok(row.get::<i64>(0)? != 0),
+    )
+}
+
+fn gateway_placeholder_mirror(mirror: &ActiveBanMirror) -> bool {
+    mirror.gateway_reason_unset && mirror.operation_id.is_none()
+}
+
+fn bot_owned_mirror_without_manual_event(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror: &ActiveBanMirror,
+) -> Result<bool> {
+    if mirror.operation_id.is_none()
+        || mirror.moderator_id.is_some()
+        || !mirror.gateway_reason_unset
+    {
+        return Ok(false);
+    }
+    Ok(!manual_member_ban_event_exists_for_mirror(
+        conn, guild_id, user_id, mirror.id,
+    )?)
+}
+
+fn bot_echo_matches_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror: &ActiveBanMirror,
+    operation_id: &Option<String>,
+    observed_at: &str,
+) -> Result<bool> {
+    match operation_id {
+        Some(operation_id) if mirror.operation_id.as_deref() == Some(operation_id.as_str()) => {
+            Ok(true)
+        }
+        Some(_) => {
+            if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
+                return Ok(true);
+            }
+            if completed_bot_gateway_mirror(mirror) {
+                return Ok(true);
+            }
+            if mirror.operation_id.is_some() && mirror.created_at.as_str() > observed_at {
+                return Ok(true);
+            }
+            if mirror.created_at.as_str() >= observed_at {
+                return Ok(true);
+            }
+            Ok(mirror.operation_id.is_none()
+                && mirror.moderator_id.is_some()
+                && !mirror.gateway_reason_unset)
+        }
+        None if gateway_placeholder_mirror(mirror) => Ok(true),
+        None => Ok(mirror.operation_id.is_some() && mirror.moderator_id.is_some()),
+    }
+}
+
+/// Gateway ban redeliveries for the same Discord ban usually arrive soon after the row.
+const GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS: i64 = 60;
+
+fn gateway_manual_redelivery_within_window(
+    mirror_created_at: &str,
+    incoming_at: &str,
+) -> Result<bool> {
+    let mirror = chrono::DateTime::parse_from_rfc3339(mirror_created_at)
+        .map_err(|error| anyhow::anyhow!("mirror created_at: {error}"))?;
+    let incoming = chrono::DateTime::parse_from_rfc3339(incoming_at)
+        .map_err(|error| anyhow::anyhow!("incoming gateway time: {error}"))?;
+    Ok(incoming <= mirror + chrono::Duration::seconds(GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS))
+}
+
+fn completed_bot_gateway_mirror(mirror: &ActiveBanMirror) -> bool {
+    mirror.operation_id.is_some() && mirror.moderator_id.is_some()
+}
+
+fn same_gateway_delivery_as_mirror(
+    conn: &impl SqlExecutor,
+    mirror: &ActiveBanMirror,
+    guild_id: i64,
+    user_id: i64,
+    _member_was_banned: bool,
+    incoming_at: &str,
+) -> Result<bool> {
+    let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
+    let completed_bot = completed_bot_gateway_mirror(mirror);
+    if !manual && !completed_bot {
+        return Ok(false);
+    }
+    gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)
+}
+
+fn replace_manual_gateway_mirror(
+    conn: &impl SqlExecutor,
+    mirror: &ActiveBanMirror,
+    guild_id: i64,
+    user_id: i64,
+    member_was_banned: bool,
+    incoming_at: &str,
+) -> Result<bool> {
+    if bot_owned_mirror_without_manual_event(conn, guild_id, user_id, mirror)? {
+        if mirror.created_at.as_str() > incoming_at {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    if gateway_placeholder_mirror(mirror) {
+        if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
+            return Ok(true);
+        }
+        if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
+            if member_was_banned {
+                return Ok(false);
+            }
+            if gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)? {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        if !member_was_banned {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
+        return Ok(true);
+    }
+    if same_gateway_delivery_as_mirror(
+        conn,
+        mirror,
+        guild_id,
+        user_id,
+        member_was_banned,
+        incoming_at,
+    )? {
+        return Ok(false);
+    }
+    let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
+    if manual && member_was_banned {
+        return Ok(true);
+    }
+    Ok(!member_was_banned)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,15 +969,36 @@ fn record_gateway_ban_conn(
     now: String,
     owned_by_bot: bool,
     operation_id: Option<String>,
+    member_was_banned: bool,
 ) -> Result<GatewayBanWrite> {
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-    if let Some(row_id) = active_ban_id(&tx, guild_id, user_id)? {
-        tx.finish_read()?;
-        return Ok(GatewayBanWrite::Existing { row_id });
+    if let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
+        let keep = if owned_by_bot {
+            bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
+        } else {
+            !replace_manual_gateway_mirror(
+                &tx,
+                &mirror,
+                guild_id,
+                user_id,
+                member_was_banned,
+                &now,
+            )?
+        };
+        if keep {
+            tx.finish_read()?;
+            return Ok(GatewayBanWrite::Existing { row_id: mirror.id });
+        }
+        tx.ensure_mutation_receipt()?;
+        tx.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+            params![guild_id, user_id],
+        )?;
+    } else {
+        tx.ensure_mutation_receipt()?;
     }
-    tx.ensure_mutation_receipt()?;
     match tx.execute_rows(
         "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name, operation_id)
          VALUES (?1, ?2, NULL, ?3, ?4, 1, ?5, ?6, NULL, ?7)",
@@ -868,6 +1108,38 @@ pub async fn attribute_enrolled_ban(
                 enrollment.guild_id,
                 user_id
             ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+/// Records a gateway-observed unban in the moderation event log.
+pub async fn record_gateway_unban_event(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    occurred_at: Option<&str>,
+) -> Result<()> {
+    let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    let data = crate::ids::stringify_js_unsafe_integers(&serde_json::json!({
+        "source": "discord",
+    }))
+    .to_string();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        tx.ensure_mutation_receipt()?;
+        tx.query_row_write(
+            "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+             VALUES (?1, 'member_unban', ?2, NULL, ?3, ?4)
+             RETURNING id",
+            params![guild_id, user_id, data, now],
+            |row| Ok(row.get::<i64>(0)?),
         )?;
         tx.commit()?;
         Ok(())

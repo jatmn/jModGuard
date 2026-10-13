@@ -3306,6 +3306,7 @@ mod tests {
             None,
             owned_echo,
             echoed_operation.as_deref(),
+            true,
         )
         .await
         .unwrap();
