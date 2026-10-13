@@ -843,6 +843,12 @@ fn bot_echo_matches_mirror(
             if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
                 return Ok(true);
             }
+            if completed_bot_gateway_mirror(mirror) {
+                return Ok(true);
+            }
+            if mirror.operation_id.is_some() && mirror.created_at.as_str() > observed_at {
+                return Ok(true);
+            }
             if mirror.created_at.as_str() >= observed_at {
                 return Ok(true);
             }
@@ -903,6 +909,9 @@ fn replace_manual_gateway_mirror(
     incoming_at: &str,
 ) -> Result<bool> {
     if bot_owned_mirror_without_manual_event(conn, guild_id, user_id, mirror)? {
+        if mirror.created_at.as_str() > incoming_at {
+            return Ok(false);
+        }
         return Ok(true);
     }
     if gateway_placeholder_mirror(mirror) {
