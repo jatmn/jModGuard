@@ -361,6 +361,7 @@ mod tests {
         let tripped = Arc::new(AtomicBool::new(false));
         db::arm_writer_open_tripwire(Arc::clone(&tripped));
         let readiness_published = Arc::new(AtomicBool::new(false));
+        let (release_listener, hold_listener) = tokio::sync::oneshot::channel();
         let cfg_wait = cfg.clone();
         let readiness_published_task = Arc::clone(&readiness_published);
         let opened = tokio::spawn(async move {
@@ -368,7 +369,9 @@ mod tests {
                 let db = open_database(&cfg_wait).await?;
                 readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                hold_listener.await.map_err(|_| {
+                    anyhow::anyhow!("startup listener released before probes finished")
+                })?;
                 Ok::<_, anyhow::Error>(db)
             })
             .await
@@ -409,6 +412,9 @@ mod tests {
             200,
             "the API becomes ready after the schema is upgraded"
         );
+        release_listener
+            .send(())
+            .expect("release startup listener after readiness probe");
         let db = opened.await.unwrap().unwrap();
         assert!(db.is_read_only());
         assert_eq!(probe.immediate(), 0);
