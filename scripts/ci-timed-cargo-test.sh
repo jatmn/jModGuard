@@ -25,7 +25,7 @@ jmodguard_assert_per_scope_test_invocations() {
     case "$line" in
       test\ *)
         case "$line" in
-          *' --doc '*|*' --doc --'*) continue ;;
+          *' --doc '*) continue ;;
           *' -p '*|*' --package '*)
             case "$line" in
               *' --no-run'*|*' --list'*|*' --exact'*) ;;
@@ -132,7 +132,8 @@ if kill -0 "$child_pid" 2>/dev/null; then
 fi
 export JMODGUARD_TEST_TIMEOUT_SEC=180
 
-# Cancel path: TERM to runner must kill the setsid session (by pgid) and exit 143.
+# Both signals must kill descendants and run the caller's EXIT cleanup once.
+# Monitor mode gives background Bash children a trappable SIGINT disposition.
 cancel_slow="$fixture/cancel-slow.sh"
 cat >"$cancel_slow" <<'SH'
 #!/bin/bash
@@ -140,36 +141,45 @@ set -euo pipefail
 ( sleep 360 & echo "$!" >"$CANCEL_CHILD_PID_FILE" )
 sleep 999
 SH
-chmod +x "$cancel_slow"
-export CANCEL_CHILD_PID_FILE="$fixture/cancel-child.pid"
 cancel_runner="$fixture/cancel-runner.sh"
-cat >"$cancel_runner" <<SH
+cat >"$cancel_runner" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=scripts/ci-run-timed-cargo-test.sh
-source "$root/scripts/ci-run-timed-cargo-test.sh"
+trap 'cleanup_rc=$?; echo "$cleanup_rc" >>"$CANCEL_CLEANUP_FILE"; exit "$cleanup_rc"' EXIT
+source "$1/scripts/ci-run-timed-cargo-test.sh"
 export JMODGUARD_TEST_TIMEOUT_SEC=180
-export CANCEL_CHILD_PID_FILE="$fixture/cancel-child.pid"
-run_with_test_timeout cancel-probe bash "$cancel_slow"
+run_with_test_timeout cancel-probe bash "$2"
 SH
-chmod +x "$cancel_runner"
-set +o errexit
-"$cancel_runner" &
-cancel_runner_pid=$!
-sleep 2
-kill -TERM "$cancel_runner_pid" 2>/dev/null || true
-wait "$cancel_runner_pid"
-cancel_rc=$?
-set -o errexit
-[ "$cancel_rc" -eq 143 ] || fail "cancel probe expected exit 143 after TERM, got $cancel_rc"
-[ -f "$CANCEL_CHILD_PID_FILE" ] || fail 'cancel probe: missing child pid file'
-cancel_child_pid="$(cat "$CANCEL_CHILD_PID_FILE")"
-if kill -0 "$cancel_child_pid" 2>/dev/null; then
-  fail "cancel probe: child $cancel_child_pid still alive after TERM"
-fi
-if kill -0 "$cancel_runner_pid" 2>/dev/null; then
-  fail "cancel probe: runner $cancel_runner_pid still alive"
-fi
+for cancel_signal in INT TERM; do
+  export CANCEL_CHILD_PID_FILE="$fixture/cancel-$cancel_signal-child.pid"
+  export CANCEL_CLEANUP_FILE="$fixture/cancel-$cancel_signal-cleanup"
+  set -m
+  bash "$cancel_runner" "$root" "$cancel_slow" &
+  cancel_runner_pid=$!
+  set +m
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [ -s "$CANCEL_CHILD_PID_FILE" ] && break
+    sleep 0.05
+  done
+  cancel_ready=0
+  [ -s "$CANCEL_CHILD_PID_FILE" ] && cancel_ready=1
+  kill -s "$cancel_signal" "$cancel_runner_pid" 2>/dev/null || true
+  cancel_rc=0
+  wait "$cancel_runner_pid" || cancel_rc=$?
+  [ "$cancel_ready" -eq 1 ] || fail "$cancel_signal: missing child readiness"
+  expected_rc=130
+  [ "$cancel_signal" = TERM ] && expected_rc=143
+  [ "$cancel_rc" -eq "$expected_rc" ] || fail "$cancel_signal: expected $expected_rc, got $cancel_rc"
+  cancel_child_pid="$(cat "$CANCEL_CHILD_PID_FILE")"
+  if kill -0 "$cancel_child_pid" 2>/dev/null; then
+    fail "$cancel_signal: child still alive"
+  fi
+  if kill -0 "$cancel_runner_pid" 2>/dev/null; then
+    fail "$cancel_signal: runner still alive"
+  fi
+  [ -f "$CANCEL_CLEANUP_FILE" ] || fail "$cancel_signal: caller EXIT cleanup did not run"
+  [ "$(cat "$CANCEL_CLEANUP_FILE")" = "$expected_rc" ] || fail "$cancel_signal: caller EXIT cleanup must see the signal status exactly once"
+done
 
 ws="$fixture/ws"
 mkdir -p "$ws/probe/src" "$ws/doctest-probe/src" "$ws/buildrs-probe/src"
@@ -234,9 +244,20 @@ edition = "2021"
 EOF
 cat >"$ws/doctest-probe/src/lib.rs" <<'RS'
 /// ```
-/// assert_eq!(2 + 2, 4);
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     std::fs::write(std::path::Path::new(&dir).join("normal"), "ran").unwrap();
+/// }
+/// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("normal"));
 /// ```
 pub fn documented() {}
+
+/// ```ignore
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     std::fs::write(std::path::Path::new(&dir).join("ignored"), "ran").unwrap();
+/// }
+/// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("ignored"));
+/// ```
+pub fn ignored_documented() {}
 RS
 cat >"$ws/buildrs-probe/Cargo.toml" <<'EOF'
 [package]
@@ -364,6 +385,52 @@ run_timed_cargo_test_gnu -p timed-doctest-probe -- >"$doctest_log" 2>&1
 doctest_rc=$?
 set -e
 [ "$doctest_rc" -eq 0 ] || { cat "$doctest_log" >&2; fail "doctest probe failed with $doctest_rc"; }
+
+# Compare actual doctest execution and failure status with native Cargo. No unit
+# tests exist in this package, so an ignored-only failure can only be a doctest.
+for doc_mode in default ignored include-ignored; do
+  doc_flags=()
+  [ "$doc_mode" = default ] || doc_flags+=("--$doc_mode")
+  for doc_failure in none ignored normal; do
+    export TIMED_DOC_FAIL="$doc_failure"
+    for doc_runner in native timed; do
+      export TIMED_DOC_MARKERS="$fixture/doc-$doc_mode-$doc_failure-$doc_runner"
+      mkdir -p "$TIMED_DOC_MARKERS"
+      doc_rc=0
+      if [ "$doc_runner" = native ]; then
+        cargo test -p timed-doctest-probe -- "${doc_flags[@]}" \
+          >"$fixture/doc-native.log" 2>&1 || doc_rc=$?
+        native_doc_rc=$doc_rc
+      else
+        # A subshell preserves the production errexit behavior on doctest failure.
+        set +e
+        (run_timed_cargo_test_gnu -p timed-doctest-probe -- "${doc_flags[@]}") \
+          >"$fixture/doc-timed.log" 2>&1
+        doc_rc=$?
+        set -e
+        [ "$doc_rc" -eq "$native_doc_rc" ] \
+          || fail "doctest $doc_mode/$doc_failure: native=$native_doc_rc, timed=$doc_rc"
+      fi
+      # A failure can stop the timed phase before its second doctest; compare
+      # the complete selection on success and require the failing one otherwise.
+      if [ "$doc_rc" -eq 0 ]; then
+        if [ "$doc_mode" = ignored ]; then
+          [ ! -e "$TIMED_DOC_MARKERS/normal" ] || fail "$doc_runner: --ignored ran a normal doctest"
+        else
+          [ -e "$TIMED_DOC_MARKERS/normal" ] || fail "$doc_runner: normal doctest missing"
+        fi
+        if [ "$doc_mode" = default ]; then
+          [ ! -e "$TIMED_DOC_MARKERS/ignored" ] || fail "$doc_runner: default ran an ignored doctest"
+        else
+          [ -e "$TIMED_DOC_MARKERS/ignored" ] || fail "$doc_runner: ignored doctest missing"
+        fi
+      else
+        [ -e "$TIMED_DOC_MARKERS/$doc_failure" ] || fail "$doc_runner: failure did not reach doctest assertion"
+      fi
+    done
+  done
+done
+unset TIMED_DOC_MARKERS TIMED_DOC_FAIL
 
 if ! command -v jq >/dev/null 2>&1; then
   fail 'jq is required for timed-cargo contract tests'
@@ -503,17 +570,30 @@ grep -q -- '--release' "$CARGO_INVOCATION_LOG" \
 grep -q -- '--no-run' "$CARGO_INVOCATION_LOG" \
   || fail 'scoped cargo-args: timed runner must invoke cargo test --no-run'
 
-: >"$CARGO_INVOCATION_LOG"
-exclude_scope_log="$fixture/exclude-scope.log"
-set +e
-run_timed_cargo_test_gnu --workspace --locked --exclude timed-doctest-probe -- >"$exclude_scope_log" 2>&1
-exclude_scope_rc=$?
-set -e
-[ "$exclude_scope_rc" -eq 0 ] || { cat "$exclude_scope_log" >&2; fail "exclude scope runner failed with $exclude_scope_rc"; }
-grep -Eq '(^| )-p timed-doctest-probe|(^| )--package timed-doctest-probe' "$CARGO_INVOCATION_LOG" \
-  && fail 'exclude scope: excluded package must not be targeted by per-scope cargo invocations'
-grep -Eq 'documented \(line |doctest-probe' "$exclude_scope_log" \
-  && fail 'exclude scope: excluded package doctest must not run'
+# Exact names and each Cargo glob operator, in both CLI spellings. Multiple
+# exclusions leave only the normal probe; unexpected package execution is fatal.
+for exclude_spec in timed-doctest-probe 'timed-doctest-*' 'timed-doctest-prob?' 'timed-doctest-prob[de]'; do
+  for exclude_form in separate equals; do
+    exclude_args=(--workspace --locked --exclude 'timed-collision-*'
+      --exclude timed-buildrs-probe --exclude timed-bin-only-probe --exclude timed-harness-probe)
+    if [ "$exclude_form" = separate ]; then
+      exclude_args+=(--exclude "$exclude_spec")
+    else
+      exclude_args+=("--exclude=$exclude_spec")
+    fi
+    : >"$CARGO_INVOCATION_LOG"
+    exclude_scope_log="$fixture/exclude-scope.log"
+    exclude_scope_rc=0
+    (run_timed_cargo_test_gnu "${exclude_args[@]}" --) >"$exclude_scope_log" 2>&1 || exclude_scope_rc=$?
+    [ "$exclude_scope_rc" -eq 0 ] || fail "exclude $exclude_form/$exclude_spec: runner failed ($exclude_scope_rc)"
+    grep -Eq '(^| )(-p|--package) timed-(doctest|collision|buildrs|bin-only|harness)' "$CARGO_INVOCATION_LOG" \
+      && fail "exclude $exclude_form/$exclude_spec: excluded package was targeted"
+    grep -q 'reads_package_relative_file ... ok' "$exclude_scope_log" \
+      || fail "exclude $exclude_form/$exclude_spec: retained package did not run"
+    grep -q 'documented (line ' "$exclude_scope_log" \
+      && fail "exclude $exclude_form/$exclude_spec: excluded doctest ran"
+  done
+done
 
 contract_log="$fixture/contract-no-target.log"
 set +e
