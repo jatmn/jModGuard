@@ -886,16 +886,13 @@ fn same_gateway_delivery_as_mirror(
     mirror: &ActiveBanMirror,
     guild_id: i64,
     user_id: i64,
-    member_was_banned: bool,
+    _member_was_banned: bool,
     incoming_at: &str,
 ) -> Result<bool> {
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
     let completed_bot = completed_bot_gateway_mirror(mirror);
     if !manual && !completed_bot {
         return Ok(false);
-    }
-    if !member_was_banned {
-        return Ok(true);
     }
     gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)
 }
@@ -919,7 +916,13 @@ fn replace_manual_gateway_mirror(
             return Ok(true);
         }
         if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
-            return Ok(false);
+            if member_was_banned {
+                return Ok(false);
+            }
+            if gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)? {
+                return Ok(false);
+            }
+            return Ok(true);
         }
         if !member_was_banned {
             return Ok(true);

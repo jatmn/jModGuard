@@ -2330,3 +2330,113 @@ async fn manual_gateway_ban_does_not_replace_a_newer_bot_owned_mirror() {
         0
     );
 }
+
+#[tokio::test]
+async fn confirmed_directory_absence_records_a_later_attributed_manual_gateway_ban() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        Some("2024-01-01T00:00:00+00:00"),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: old_id } = first else {
+        panic!("first manual ban must insert, got {first:?}");
+    };
+    attribute_enrolled_ban(
+        &f.db,
+        Some(scope.clone()),
+        old_id,
+        55,
+        77,
+        Some("mod"),
+        "first reason",
+    )
+    .await
+    .unwrap();
+    let replacement = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        Some("member"),
+        None,
+        Some("2024-06-01T00:00:00+00:00"),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: new_id } = replacement else {
+        panic!("confirmed directory absence must allow a distinct manual ban, got {replacement:?}");
+    };
+    assert_ne!(new_id, old_id);
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        2
+    );
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    assert_eq!(rows.iter().find(|row| row.active).unwrap().id, new_id);
+}
+
+#[tokio::test]
+async fn confirmed_directory_absence_records_a_later_manual_gateway_placeholder_ban() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-01-01T00:00:00+00:00"),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: old_id } = first else {
+        panic!("first manual ban must insert, got {first:?}");
+    };
+    let replacement = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-06-01T00:00:00+00:00"),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: new_id } = replacement else {
+        panic!(
+            "confirmed directory absence must allow a distinct placeholder ban, got {replacement:?}"
+        );
+    };
+    assert_ne!(new_id, old_id);
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        2
+    );
+}
