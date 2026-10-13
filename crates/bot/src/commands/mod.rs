@@ -2450,6 +2450,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_prefix_reply_does_not_block_valid_follow_up() {
+        use std::sync::atomic::Ordering;
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        raced_channel_say(&app, ChannelId::new(40), &http, 10, "x".repeat(2001)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        raced_channel_say(&app, ChannelId::new(40), &http, 10, "hello".into()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "payload validation failures must not park the channel"
+        );
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
     async fn handle_prefix_unknown_command_uses_raced_channel_say() {
         use crate::state::CachedGuildConfig;
         use crate::types::GuildSettings;

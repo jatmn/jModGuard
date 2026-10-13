@@ -92,6 +92,10 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
         long.push(MessageId::new(id), None);
     }
     let bounded = fallback_bulk_parts("{details}", &display, &long);
+    assert!(
+        bounded.len() > 1,
+        "large transcripts must split across messages"
+    );
     let shown: usize = bounded
         .iter()
         .map(|part| part.matches(" | retained content unavailable").count())
@@ -2620,4 +2624,104 @@ async fn bulk_channel_delivery_clear_guild_unblocks_before_next_attempt() {
     assert!(!app.remembered_discord_targets.blocked(target, now));
     drop(app);
     let _ = std::fs::remove_dir_all(&path);
+}
+
+const CREATED_MESSAGE_JSON: &str = r#"{"id":"1","channel_id":"456","author":{"id":"1","username":"fixture","discriminator":"0"},"content":"","timestamp":"2016-01-01T00:00:00.000000+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"mention_channels":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#;
+
+async fn discord_bulk_attachment_forbidden_proxy() -> (
+    serenity::http::Http,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let attachment = request
+                .windows("deleted-messages.txt".len())
+                .any(|w| w == b"deleted-messages.txt");
+            let (status, body) = if attachment {
+                ("403 Forbidden", r#"{"code":50013,"message":"fixture"}"#)
+            } else {
+                ("200 OK", CREATED_MESSAGE_JSON)
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, calls, server)
+}
+
+#[tokio::test]
+async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let f = Fixture::with_timeout(30);
+    let mut transcript = BulkTranscript::new(200);
+    for id in 1..=200 {
+        transcript.push(MessageId::new(id), None);
+    }
+    let display = BTreeMap::from([
+        ("channel".into(), "<#456>".into()),
+        ("details".into(), "transcript attached".into()),
+    ]);
+    let parts = fallback_bulk_parts("{details}", &display, &transcript);
+    assert!(parts.len() > 1);
+    let (http, calls, server) = discord_bulk_attachment_forbidden_proxy().await;
+    let destination = ChannelId::new(456);
+    let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 789,
+        channel: 456,
+    };
+    let recovery = f
+        .app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
+    let started = Instant::now();
+    let (delivered, error, _) = deliver_bulk_text_fallback_parts(
+        &f.app,
+        &http,
+        destination,
+        rest_target,
+        "{details}",
+        &display,
+        &transcript,
+        Duration::from_secs(30),
+        started,
+        recovery,
+    )
+    .await;
+    assert!(error.is_none(), "unexpected discord error: {:?}", error);
+    assert!(delivered, "expected every fallback part to succeed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        parts.len(),
+        "every text fallback part must reach Discord"
+    );
+    server.abort();
 }

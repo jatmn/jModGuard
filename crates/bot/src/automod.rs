@@ -399,16 +399,8 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn automod_delete_target(
-    guild: u64,
-    channel: u64,
-    message: u64,
-) -> crate::discord::DiscordRestTarget {
-    crate::discord::DiscordRestTarget::AutomodDelete {
-        guild,
-        channel,
-        message,
-    }
+fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
+    crate::discord::DiscordRestTarget::AutomodDelete { guild, channel }
 }
 
 fn automod_member_target(
@@ -432,7 +424,7 @@ async fn automod_try_delete_message(
     channel: u64,
     message: u64,
 ) {
-    let target = automod_delete_target(guild_id, channel, message);
+    let target = automod_delete_target(guild_id, channel);
     if app
         .remembered_discord_targets
         .blocked(target, Instant::now())

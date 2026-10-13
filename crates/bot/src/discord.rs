@@ -110,7 +110,6 @@ pub(crate) enum DiscordRestTarget {
     AutomodDelete {
         guild: u64,
         channel: u64,
-        message: u64,
     },
     AutomodMember {
         guild: u64,
@@ -170,30 +169,21 @@ pub(crate) struct RememberedDiscordTargets {
 }
 
 impl RememberedDiscordTargets {
-    pub(crate) fn capture_recovery_epoch(&self, target: DiscordRestTarget) -> RecoveryEpoch {
+    fn recovery_epoch_matches(
+        state: &RememberedDiscordState,
+        target: DiscordRestTarget,
+        epoch: RecoveryEpoch,
+    ) -> bool {
         let guild = target.guild_id();
-        let state = self.state.lock();
-        RecoveryEpoch {
-            global: state.global_recovery,
-            guild: state.guild_recovery.get(&guild).copied().unwrap_or(0),
-        }
-    }
-
-    fn recovery_epoch_unchanged(&self, target: DiscordRestTarget, epoch: RecoveryEpoch) -> bool {
-        let guild = target.guild_id();
-        let state = self.state.lock();
         state.global_recovery == epoch.global
             && state.guild_recovery.get(&guild).copied().unwrap_or(0) == epoch.guild
     }
 
-    pub(crate) fn blocked(&self, target: DiscordRestTarget, now: Instant) -> bool {
-        let mut state = self.state.lock();
-        state.expires.retain(|_, until| *until > now);
-        state.expires.get(&target).is_some_and(|until| *until > now)
-    }
-
-    fn remember_permanent(&self, target: DiscordRestTarget, now: Instant) {
-        let mut state = self.state.lock();
+    fn insert_permanent(
+        state: &mut RememberedDiscordState,
+        target: DiscordRestTarget,
+        now: Instant,
+    ) {
         state.expires.retain(|_, until| *until > now);
         if state.expires.len() >= MAX_REMEMBERED_REST_TARGETS
             && !state.expires.contains_key(&target)
@@ -210,6 +200,35 @@ impl RememberedDiscordTargets {
             .insert(target, now + REMEMBERED_REST_TARGET_TTL);
     }
 
+    pub(crate) fn try_remember_permanent(
+        &self,
+        since: RecoveryEpoch,
+        target: DiscordRestTarget,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if !Self::recovery_epoch_matches(&state, target, since) {
+            return false;
+        }
+        Self::insert_permanent(&mut state, target, now);
+        true
+    }
+
+    pub(crate) fn capture_recovery_epoch(&self, target: DiscordRestTarget) -> RecoveryEpoch {
+        let guild = target.guild_id();
+        let state = self.state.lock();
+        RecoveryEpoch {
+            global: state.global_recovery,
+            guild: state.guild_recovery.get(&guild).copied().unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn blocked(&self, target: DiscordRestTarget, now: Instant) -> bool {
+        let mut state = self.state.lock();
+        state.expires.retain(|_, until| *until > now);
+        state.expires.get(&target).is_some_and(|until| *until > now)
+    }
+
     pub(crate) fn forget(&self, target: DiscordRestTarget) {
         self.state.lock().expires.remove(&target);
     }
@@ -221,11 +240,8 @@ impl RememberedDiscordTargets {
         target: DiscordRestTarget,
         now: Instant,
     ) {
-        if !self.recovery_epoch_unchanged(target, since) {
-            return;
-        }
         if should_remember_rest_rejection(error, target) {
-            self.remember_permanent(target, now);
+            self.try_remember_permanent(since, target, now);
         }
     }
 
@@ -246,15 +262,14 @@ impl RememberedDiscordTargets {
         target: DiscordRestTarget,
         now: Instant,
     ) {
-        if !self.recovery_epoch_unchanged(target, since) {
-            return;
-        }
-        if let Some(error) = error.downcast_ref::<serenity::Error>() {
-            if should_remember_rest_rejection(error, target) {
-                self.remember_permanent(target, now);
-            }
-        } else if classify_retry_error(error) == RetryClass::Permanent {
-            self.remember_permanent(target, now);
+        let remember = if let Some(error) = error.downcast_ref::<serenity::Error>() {
+            should_remember_rest_rejection(error, target)
+        } else {
+            classify_retry_error(error) == RetryClass::Permanent
+                && matches!(target, DiscordRestTarget::AutomodMember { .. })
+        };
+        if remember {
+            self.try_remember_permanent(since, target, now);
         }
     }
 
@@ -277,8 +292,62 @@ impl RememberedDiscordTargets {
 
     #[cfg(test)]
     pub(crate) fn remember_permanent_for_test(&self, target: DiscordRestTarget, now: Instant) {
-        self.remember_permanent(target, now);
+        let mut state = self.state.lock();
+        Self::insert_permanent(&mut state, target, now);
     }
+
+    #[cfg(test)]
+    pub(crate) fn try_remember_permanent_with_recheck_after_gap(
+        &self,
+        since: RecoveryEpoch,
+        target: DiscordRestTarget,
+        now: Instant,
+        during_gap: impl FnOnce(&Self),
+    ) -> bool {
+        {
+            let state = self.state.lock();
+            if !Self::recovery_epoch_matches(&state, target, since) {
+                return false;
+            }
+        }
+        during_gap(self);
+        let mut state = self.state.lock();
+        if !Self::recovery_epoch_matches(&state, target, since) {
+            return false;
+        }
+        Self::insert_permanent(&mut state, target, now);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_permanent_after_stale_epoch_check_for_test(
+        &self,
+        since: RecoveryEpoch,
+        target: DiscordRestTarget,
+        now: Instant,
+        during_gap: impl FnOnce(&Self),
+    ) {
+        {
+            let state = self.state.lock();
+            if !Self::recovery_epoch_matches(&state, target, since) {
+                return;
+            }
+        }
+        during_gap(self);
+        let mut state = self.state.lock();
+        Self::insert_permanent(&mut state, target, now);
+    }
+}
+
+fn destination_level_channel_failure(error: &serenity::Error) -> bool {
+    if matches!(error, serenity::Error::Model(_)) {
+        return false;
+    }
+    http_error_response(error).is_some_and(|(_, code)| matches!(code, 50001 | 50013 | 10003))
+}
+
+fn destination_level_automod_delete_failure(error: &serenity::Error) -> bool {
+    http_error_response(error).is_some_and(|(_, code)| matches!(code, 50001 | 50013 | 10003))
 }
 
 /// Permanent errors that apply only to one message/member must not park unrelated work.
@@ -289,15 +358,13 @@ pub(crate) fn should_remember_rest_rejection(
     if classify_retry(error) != RetryClass::Permanent {
         return false;
     }
-    let code = http_error_response(error)
-        .map(|(_, code)| code)
-        .unwrap_or(0);
     match target {
-        DiscordRestTarget::GuildChannel { .. } => !matches!(code, 10008),
-        DiscordRestTarget::AutomodDelete { .. } => {
-            !matches!(code, 10007 | 10008 | 10026 | 10029 | 50035)
-        }
+        DiscordRestTarget::GuildChannel { .. } => destination_level_channel_failure(error),
+        DiscordRestTarget::AutomodDelete { .. } => destination_level_automod_delete_failure(error),
         DiscordRestTarget::AutomodMember { .. } => {
+            let code = http_error_response(error)
+                .map(|(_, code)| code)
+                .unwrap_or(0);
             !matches!(code, 10007 | 10008 | 10026 | 10029 | 50035)
         }
     }
@@ -502,7 +569,6 @@ mod tests {
         let delete = DiscordRestTarget::AutomodDelete {
             guild: 10,
             channel: 1,
-            message: 2,
         };
         assert!(!cache.blocked(delete, now));
     }
@@ -513,12 +579,10 @@ mod tests {
         let delete = DiscordRestTarget::AutomodDelete {
             guild: 10,
             channel: 1,
-            message: 2,
         };
-        let other = DiscordRestTarget::AutomodDelete {
+        let other_channel = DiscordRestTarget::AutomodDelete {
             guild: 10,
-            channel: 1,
-            message: 3,
+            channel: 9,
         };
         let cache = RememberedDiscordTargets::default();
         let now = Instant::now();
@@ -526,10 +590,45 @@ mod tests {
         let epoch = cache.capture_recovery_epoch(delete);
         cache.remember_rest_rejection(epoch, &missing, delete, now);
         assert!(!cache.blocked(delete, now));
-        assert!(!cache.blocked(other, now));
+        assert!(!cache.blocked(other_channel, now));
         assert!(!should_remember_rest_rejection(&missing, delete));
         let denied = fixture_discord_http_error(403, 50013).await;
         assert!(should_remember_rest_rejection(&denied, delete));
+    }
+
+    #[tokio::test]
+    async fn automod_delete_permission_failure_blocks_the_whole_channel() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let channel = DiscordRestTarget::AutomodDelete {
+            guild: 10,
+            channel: 20,
+        };
+        let other_channel = DiscordRestTarget::AutomodDelete {
+            guild: 10,
+            channel: 21,
+        };
+        let denied = fixture_discord_http_error(403, 50013).await;
+        let epoch = cache.capture_recovery_epoch(channel);
+        cache.remember_rest_rejection(epoch, &denied, channel, now);
+        assert!(cache.blocked(channel, now));
+        assert!(!cache.blocked(other_channel, now));
+    }
+
+    #[tokio::test]
+    async fn invalid_form_body_does_not_block_guild_channel() {
+        use super::should_remember_rest_rejection;
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 90,
+            channel: 91,
+        };
+        let invalid = fixture_discord_http_error(400, 50035).await;
+        assert!(!should_remember_rest_rejection(&invalid, target));
+        let epoch = cache.capture_recovery_epoch(target);
+        cache.remember_rest_rejection(epoch, &invalid, target, now);
+        assert!(!cache.blocked(target, now));
     }
 
     #[test]
@@ -651,6 +750,51 @@ mod tests {
         cache.clear_guild(51);
         cache.remember_rest_rejection(epoch, &deny, target, now);
         assert!(!cache.blocked(target, now));
+    }
+
+    #[test]
+    fn atomic_try_remember_holds_lock_between_epoch_check_and_insert() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 61,
+            channel: 62,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        assert!(cache.try_remember_permanent(epoch, target, now));
+        assert!(cache.blocked(target, now));
+    }
+
+    #[test]
+    fn clear_between_epoch_check_and_insert_does_not_remember_with_atomic_path() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 71,
+            channel: 72,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        let inserted =
+            cache.try_remember_permanent_with_recheck_after_gap(epoch, target, now, |cache| {
+                cache.clear_guild(71)
+            });
+        assert!(!inserted);
+        assert!(!cache.blocked(target, now));
+    }
+
+    #[test]
+    fn clear_between_epoch_check_and_insert_would_remember_without_recheck() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let target = DiscordRestTarget::GuildChannel {
+            guild: 81,
+            channel: 82,
+        };
+        let epoch = cache.capture_recovery_epoch(target);
+        cache.insert_permanent_after_stale_epoch_check_for_test(epoch, target, now, |cache| {
+            cache.clear_guild(81)
+        });
+        assert!(cache.blocked(target, now));
     }
 
     #[test]

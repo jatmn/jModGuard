@@ -1544,6 +1544,54 @@ fn fallback_bulk_parts(
     parts
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn deliver_bulk_text_fallback_parts(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    destination: ChannelId,
+    rest_target: crate::discord::DiscordRestTarget,
+    template: &str,
+    display: &BTreeMap<String, String>,
+    transcript: &BulkTranscript,
+    deadline: Duration,
+    started: Instant,
+    mut failure_recovery: crate::discord::RecoveryEpoch,
+) -> (bool, Option<serenity::Error>, crate::discord::RecoveryEpoch) {
+    let parts = fallback_bulk_parts(template, display, transcript);
+    let part_count = parts.len();
+    let mut parts_sent = 0usize;
+    let mut terminal_error = None;
+    for details in parts {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        failure_recovery = app
+            .remembered_discord_targets
+            .capture_recovery_epoch(rest_target);
+        match tokio::time::timeout(
+            left,
+            crate::discord::race_discord_call(
+                &app.activation,
+                destination.send_message(http, log_message(&details)),
+            ),
+        )
+        .await
+        {
+            Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+                parts_sent += 1;
+            }
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                terminal_error = Some(error);
+                break;
+            }
+            _ => break,
+        }
+    }
+    let delivered = parts_sent == part_count && part_count > 0;
+    (delivered, terminal_error, failure_recovery)
+}
+
 pub(crate) async fn emit_retained_bulk(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1686,34 +1734,25 @@ pub(crate) async fn emit_retained_bulk(
                         .is_some_and(|status| status.as_u16() == 403)
             ) {
                 // Attach Files may be absent while Send Messages still works.
-                let parts = fallback_bulk_parts(template, &display, &transcript);
-                for details in parts {
-                    let left = deadline.saturating_sub(started.elapsed());
-                    if left.is_zero() {
-                        break;
-                    }
-                    failure_recovery = app
-                        .remembered_discord_targets
-                        .capture_recovery_epoch(rest_target);
-                    match tokio::time::timeout(
-                        left,
-                        crate::discord::race_discord_call(
-                            &app.activation,
-                            destination.send_message(&ctx.http, log_message(&details)),
-                        ),
+                let (all_parts_delivered, fallback_error, recovery) =
+                    deliver_bulk_text_fallback_parts(
+                        app,
+                        &ctx.http,
+                        destination,
+                        rest_target,
+                        template,
+                        &display,
+                        &transcript,
+                        deadline,
+                        started,
+                        failure_recovery,
                     )
-                    .await
-                    {
-                        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
-                            delivered = true;
-                            break;
-                        }
-                        Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                            terminal_error = Some(error);
-                        }
-                        _ => break,
-                    }
+                    .await;
+                failure_recovery = recovery;
+                if let Some(error) = fallback_error {
+                    terminal_error = Some(error);
                 }
+                delivered = all_parts_delivered;
             } else {
                 terminal_error = Some(discord_err);
             }
