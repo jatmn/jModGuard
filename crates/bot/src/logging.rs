@@ -1762,17 +1762,35 @@ pub(crate) async fn emit_retained_bulk(
             return;
         }
     }
+    finish_bulk_channel_delivery(
+        app,
+        failure_recovery,
+        rest_target,
+        delivered,
+        terminal_error.as_ref(),
+    );
+}
+
+fn finish_bulk_channel_delivery(
+    app: &BotState,
+    recovery: crate::discord::RecoveryEpoch,
+    rest_target: crate::discord::DiscordRestTarget,
+    delivered: bool,
+    terminal_error: Option<&serenity::Error>,
+) {
     if delivered {
         app.remembered_discord_targets.forget(rest_target);
-    } else if let Some(error) = terminal_error.as_ref() {
+        return;
+    }
+    if let Some(error) = terminal_error {
         app.remembered_discord_targets.remember_rest_rejection(
-            failure_recovery,
+            recovery,
             error,
             rest_target,
             Instant::now(),
         );
-        record_delivery_failure(app);
     }
+    record_delivery_failure(app);
 }
 
 #[cfg(test)]
@@ -1783,16 +1801,7 @@ pub(crate) fn settle_bulk_channel_delivery(
     delivered: bool,
     terminal_error: Option<&serenity::Error>,
 ) {
-    if delivered {
-        app.remembered_discord_targets.forget(rest_target);
-    } else if let Some(error) = terminal_error {
-        app.remembered_discord_targets.remember_rest_rejection(
-            recovery,
-            error,
-            rest_target,
-            Instant::now(),
-        );
-    }
+    finish_bulk_channel_delivery(app, recovery, rest_target, delivered, terminal_error);
 }
 
 fn take_utf16_prefix(text: &str, max_units: usize) -> (&str, &str) {

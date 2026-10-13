@@ -2548,6 +2548,32 @@ async fn fixture_discord_http_error(status: u16, code: isize) -> serenity::Error
 }
 
 #[test]
+fn incomplete_bulk_fallback_without_rest_error_counts_delivery_failure() {
+    let f = Fixture::new();
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 1,
+        channel: 2,
+    };
+    let recovery = f
+        .app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    assert_eq!(
+        f.app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    settle_bulk_channel_delivery(&f.app, recovery, target, false, None);
+    assert_eq!(
+        f.app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
 fn bulk_channel_delivery_forget_after_successful_fallback_clears_remembered() {
     let path = std::env::temp_dir().join(format!(
         "jmg-bulk-forget-{}",

@@ -52,6 +52,22 @@ pub(crate) fn clear_remembered_if_bot_roles_changed(
     }
 }
 
+pub(crate) fn clear_remembered_if_subject_roles_changed(
+    app: &BotState,
+    guild_id: u64,
+    user_id: u64,
+    old_roles: &[RoleId],
+    new_roles: &[RoleId],
+) {
+    use std::collections::HashSet;
+    let old: HashSet<u64> = old_roles.iter().map(|role| role.get()).collect();
+    let new_roles: HashSet<u64> = new_roles.iter().map(|role| role.get()).collect();
+    if old != new_roles {
+        app.remembered_discord_targets
+            .clear_member_moderation_rejections(guild_id, user_id);
+    }
+}
+
 async fn emit_activity(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1101,6 +1117,15 @@ impl EventHandler for Handler {
                 .map(|member| member.roles.as_slice()),
             &new.roles,
         );
+        if let Some(old) = old_if_available.as_ref() {
+            clear_remembered_if_subject_roles_changed(
+                &self.app,
+                guild_id.get(),
+                new.user.id.get(),
+                &old.roles,
+                &new.roles,
+            );
+        }
         let old_to = old_if_available
             .as_ref()
             .and_then(|member| member.communication_disabled_until);
@@ -1420,7 +1445,8 @@ mod tests {
     }
 
     use super::{
-        audit_case_action, clear_remembered_if_bot_roles_changed, departure_joined_at_ms,
+        audit_case_action, clear_remembered_if_bot_roles_changed,
+        clear_remembered_if_subject_roles_changed, departure_joined_at_ms,
         gateway_ban_row_to_attribute, log_message_diagnostic,
         record_unresolved_gateway_observation, select_update_authors,
     };
@@ -1464,6 +1490,58 @@ mod tests {
         assert!(app.remembered_discord_targets.blocked(channel, now));
         clear_remembered_if_bot_roles_changed(&app, guild, bot, bot, Some(&[role_a]), &[role_b]);
         assert!(!app.remembered_discord_targets.blocked(channel, now));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn subject_role_change_clears_remembered_kick_ban_and_timeout_only() {
+        use crate::discord::{AutomodRestAction, DiscordRestTarget};
+        use serenity::model::id::RoleId;
+        use std::time::Instant;
+
+        let path = std::env::temp_dir().join(format!(
+            "jmg-subject-role-clear-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let now = Instant::now();
+        let guild = 42_u64;
+        let user = 99_u64;
+        let kick = DiscordRestTarget::AutomodMember {
+            guild,
+            user,
+            action: AutomodRestAction::Kick,
+        };
+        let ban = DiscordRestTarget::AutomodMember {
+            guild,
+            user,
+            action: AutomodRestAction::Ban,
+        };
+        let timeout = DiscordRestTarget::AutomodMember {
+            guild,
+            user,
+            action: AutomodRestAction::Timeout,
+        };
+        let delete = DiscordRestTarget::AutomodDelete { guild, channel: 5 };
+        for target in [kick, ban, timeout, delete] {
+            app.remembered_discord_targets
+                .remember_permanent_for_test(target, now);
+        }
+        let role_a = RoleId::new(10);
+        let role_b = RoleId::new(11);
+        clear_remembered_if_subject_roles_changed(&app, guild, user, &[role_a], &[role_a]);
+        assert!(app.remembered_discord_targets.blocked(kick, now));
+        assert!(app.remembered_discord_targets.blocked(ban, now));
+        assert!(app.remembered_discord_targets.blocked(timeout, now));
+        clear_remembered_if_subject_roles_changed(&app, guild, user, &[role_a], &[role_a, role_b]);
+        assert!(!app.remembered_discord_targets.blocked(kick, now));
+        assert!(!app.remembered_discord_targets.blocked(ban, now));
+        assert!(!app.remembered_discord_targets.blocked(timeout, now));
+        assert!(app.remembered_discord_targets.blocked(delete, now));
         drop(app);
         let _ = std::fs::remove_dir_all(&path);
     }

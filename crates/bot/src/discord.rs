@@ -233,6 +233,23 @@ impl RememberedDiscordTargets {
         self.state.lock().expires.remove(&target);
     }
 
+    /// Role or permission changes can unblock kick, ban, or timeout for a member.
+    pub(crate) fn clear_member_moderation_rejections(&self, guild: u64, user: u64) {
+        let mut state = self.state.lock();
+        state.expires.retain(|target, _| {
+            !matches!(
+                target,
+                DiscordRestTarget::AutomodMember {
+                    guild: g,
+                    user: u,
+                    action: AutomodRestAction::Kick
+                        | AutomodRestAction::Ban
+                        | AutomodRestAction::Timeout,
+                } if *g == guild && *u == user
+            )
+        });
+    }
+
     pub(crate) fn remember_rest_rejection(
         &self,
         since: RecoveryEpoch,
