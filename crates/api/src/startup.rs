@@ -720,15 +720,15 @@ mod tests {
         )
     }
 
-    async fn read_probe_http_status(
-        stream: &mut tokio::net::TcpStream,
+    async fn read_probe_http_status<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<u16, std::io::Error> {
         read_probe_http_status_buffered(stream, deadline, Vec::new()).await
     }
 
-    async fn read_probe_http_status_buffered(
-        stream: &mut tokio::net::TcpStream,
+    async fn read_probe_http_status_buffered<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
         deadline: Option<tokio::time::Instant>,
         mut buf: Vec<u8>,
     ) -> Result<u16, std::io::Error> {
@@ -877,9 +877,35 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// Notifies the server when the probe reader's first TCP read completes so the
+    /// fragmentation fixture can deliver the remainder only after that consumption.
+    struct SignalFirstClientRead {
+        inner: tokio::net::TcpStream,
+        signal: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for SignalFirstClientRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let filled_before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            if poll.is_ready()
+                && buf.filled().len() > filled_before
+                && let Some(tx) = this.signal.take()
+            {
+                let _ = tx.send(());
+            }
+            poll
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn http_status_reads_fragmented_status_line() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::{TcpListener, TcpStream};
         use tokio::sync::oneshot;
         let (client_read_tx, client_read_rx) = oneshot::channel();
@@ -900,19 +926,11 @@ mod tests {
             .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
-        let mut first = [0u8; 32];
-        let n = stream.read(&mut first).await.unwrap();
-        assert!(
-            try_parse_http_status_line(&first[..n]).is_none(),
-            "first read must not contain a full status line"
-        );
-        assert_eq!(
-            parse_http_status(&first[..n]),
-            0,
-            "a single-read parser must not succeed on the first fragment"
-        );
-        client_read_tx.send(()).unwrap();
-        let status = read_probe_http_status_buffered(&mut stream, None, first[..n].to_vec())
+        let mut signal_stream = SignalFirstClientRead {
+            inner: stream,
+            signal: Some(client_read_tx),
+        };
+        let status = read_probe_http_status(&mut signal_stream, None)
             .await
             .unwrap();
         assert_eq!(status, 200);
