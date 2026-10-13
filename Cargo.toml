@@ -56,6 +56,5 @@ hyper = { version = "0.14", default-features = false, features = ["server"] }
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
 
 [patch.crates-io]
-libsql = { path = "vendor/libsql" }
 libsql-sqlite3-parser = { git = "https://github.com/jatmn/jModGuard", rev = "f2391d613c4bb8018873964e779341f50ce05447" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite" }
