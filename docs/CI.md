@@ -154,3 +154,5 @@ node scripts/ci-workflow-test.mjs
 
 Publisher tests simulate Docker/registry responses and never publish images.
 They do not prove live GHCR access, a GitHub-hosted run, or provider rollout.
+
+<!-- Temporary documentation-only routing verification; this draft will be closed without merging. -->
