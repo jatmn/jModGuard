@@ -90,6 +90,25 @@ case $- in
   *) fail 'errexit must be on after a failed run_with_test_timeout' ;;
 esac
 
+# Leader that exits at the deadline must not be reported as exit 124 (deterministic hook).
+export JMODGUARD_TEST_TIMEOUT_SEC=0
+export JMODGUARD_TIMEOUT_NOW_SEC=105
+export JMODGUARD_TEST_KILL0_SEQUENCE='1,0'
+deadline_exit="$fixture/deadline-exit.sh"
+cat >"$deadline_exit" <<'SH'
+#!/bin/bash
+set -euo pipefail
+exit 0
+SH
+chmod +x "$deadline_exit"
+set +o errexit
+run_with_test_timeout deadline-race-probe bash "$deadline_exit" || deadline_rc=$?
+deadline_rc=${deadline_rc:-0}
+set -o errexit
+unset JMODGUARD_TEST_KILL0_SEQUENCE JMODGUARD_TIMEOUT_NOW_SEC
+export JMODGUARD_TEST_TIMEOUT_SEC=180
+[ "$deadline_rc" -eq 0 ] || fail "deadline race probe expected exit 0, got $deadline_rc"
+
 # Slow session leader: timeout must kill the child by pid, not the runner's process group.
 slow_pgid_script="$fixture/slow-pgid.sh"
 cat >"$slow_pgid_script" <<'SH'
