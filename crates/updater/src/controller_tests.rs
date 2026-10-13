@@ -3365,6 +3365,106 @@ async fn independent_non_auth_exit_before_readiness_still_rolls_back() {
 }
 
 #[tokio::test]
+async fn independent_ready_update_clears_standby_before_later_exit() {
+    let root =
+        std::env::temp_dir().join(format!("independent-ready-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let installed = executable(&root, "installed-bot").await;
+    let desired = executable(&root, "desired-bot").await;
+    let mut objects = HashMap::new();
+    let mut releases = Vec::new();
+    for path in [installed, desired] {
+        let mut release = image(&mut objects, "bot", &tokio::fs::read(path).await.unwrap());
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+        releases.push(release);
+    }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    let installed_release = releases[0].clone();
+    control
+        .checked(
+            "bot",
+            "latest",
+            Some(installed_release.clone()),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &installed_release.digest, now())
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    let candidate = releases[1].clone();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("events"), "").await.unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert!(
+        bot.standby.is_none(),
+        "a ready independent update must retire the prior standby build"
+    );
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    bot.running.as_mut().unwrap().child.start_kill().unwrap();
+    let _ = bot.running.as_mut().unwrap().child.wait().await;
+    assert!(
+        bot.tick().await.is_err(),
+        "an unexpected child exit should surface as a tick error, not a standby rollback"
+    );
+    assert!(
+        bot.running.is_none(),
+        "a later exit must not restart the retired standby"
+    );
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        ["desired-bot.start"],
+        "must not roll back to the prior build after activation"
+    );
+    bot.end_idle().await.unwrap();
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
 async fn independent_rejected_token_cleared_selection_restores_installed() {
     let (root, db, mut bot, candidate, server) =
         independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;

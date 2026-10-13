@@ -781,6 +781,7 @@ impl Supervisor {
             };
             match saved {
                 Ok(()) => {
+                    self.standby = None;
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
