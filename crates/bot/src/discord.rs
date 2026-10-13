@@ -168,6 +168,8 @@ struct RememberedDiscordState {
     global_recovery: u64,
     guild_recovery: HashMap<u64, RecoverySlot>,
     member_moderation_recovery: HashMap<(u64, u64), RecoverySlot>,
+    /// Monotonic per-member generation; retained across slot eviction and TTL pruning.
+    member_moderation_epoch_seq: HashMap<(u64, u64), u64>,
 }
 
 /// Process-local memory of permanent Discord REST rejections (invalid-request budget).
@@ -215,10 +217,28 @@ impl RememberedDiscordTargets {
             .unwrap_or(0)
     }
 
+    fn record_member_epoch_floor(
+        state: &mut RememberedDiscordState,
+        key: (u64, u64),
+        generation: u64,
+    ) {
+        let seq = state.member_moderation_epoch_seq.entry(key).or_insert(0);
+        *seq = (*seq).max(generation);
+    }
+
     fn prune_recovery_metadata(state: &mut RememberedDiscordState, now: Instant) {
         state
             .guild_recovery
             .retain(|_, slot| slot.touched + REMEMBERED_REST_TARGET_TTL > now);
+        let expired_members: Vec<_> = state
+            .member_moderation_recovery
+            .iter()
+            .filter(|(_, slot)| slot.touched + REMEMBERED_REST_TARGET_TTL <= now)
+            .map(|(key, slot)| (*key, slot.generation))
+            .collect();
+        for (key, generation) in expired_members {
+            Self::record_member_epoch_floor(state, key, generation);
+        }
         state
             .member_moderation_recovery
             .retain(|_, slot| slot.touched + REMEMBERED_REST_TARGET_TTL > now);
@@ -233,6 +253,19 @@ impl RememberedDiscordTargets {
             .map(|(key, _)| *key)
         {
             map.remove(&key);
+        }
+    }
+
+    fn evict_oldest_member_recovery_slot(state: &mut RememberedDiscordState) {
+        let key = state
+            .member_moderation_recovery
+            .iter()
+            .min_by_key(|(_, slot)| slot.touched)
+            .map(|(key, _)| *key);
+        if let Some(key) = key
+            && let Some(slot) = state.member_moderation_recovery.remove(&key)
+        {
+            Self::record_member_epoch_floor(state, key, slot.generation);
         }
     }
 
@@ -254,6 +287,28 @@ impl RememberedDiscordTargets {
         );
     }
 
+    fn insert_member_recovery_slot(
+        state: &mut RememberedDiscordState,
+        guild: u64,
+        user: u64,
+        generation: u64,
+        now: Instant,
+    ) {
+        let key = (guild, user);
+        if state.member_moderation_recovery.len() >= MAX_REMEMBERED_REST_TARGETS
+            && !state.member_moderation_recovery.contains_key(&key)
+        {
+            Self::evict_oldest_member_recovery_slot(state);
+        }
+        state.member_moderation_recovery.insert(
+            key,
+            RecoverySlot {
+                generation,
+                touched: now,
+            },
+        );
+    }
+
     fn bump_guild_recovery(state: &mut RememberedDiscordState, guild: u64, now: Instant) {
         Self::prune_recovery_metadata(state, now);
         let next = Self::guild_generation(state, guild) + 1;
@@ -267,13 +322,11 @@ impl RememberedDiscordTargets {
         now: Instant,
     ) {
         Self::prune_recovery_metadata(state, now);
-        let next = Self::member_moderation_generation(state, guild, user) + 1;
-        Self::insert_recovery_slot(
-            &mut state.member_moderation_recovery,
-            (guild, user),
-            next,
-            now,
-        );
+        let key = (guild, user);
+        let seq = state.member_moderation_epoch_seq.entry(key).or_insert(0);
+        *seq += 1;
+        let next = *seq;
+        Self::insert_member_recovery_slot(state, guild, user, next, now);
     }
 
     fn touch_member_moderation_slot(
@@ -283,17 +336,17 @@ impl RememberedDiscordTargets {
         now: Instant,
     ) {
         Self::prune_recovery_metadata(state, now);
-        if let Some(slot) = state.member_moderation_recovery.get_mut(&(guild, user)) {
+        let key = (guild, user);
+        if let Some(slot) = state.member_moderation_recovery.get_mut(&key) {
             slot.touched = now;
             return;
         }
-        let generation = Self::member_moderation_generation(state, guild, user);
-        Self::insert_recovery_slot(
-            &mut state.member_moderation_recovery,
-            (guild, user),
-            generation,
-            now,
-        );
+        let generation = state
+            .member_moderation_epoch_seq
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        Self::insert_member_recovery_slot(state, guild, user, generation, now);
     }
 
     fn insert_permanent(
@@ -319,8 +372,7 @@ impl RememberedDiscordTargets {
         if let DiscordRestTarget::AutomodMember {
             guild,
             user,
-            action:
-                AutomodRestAction::Kick | AutomodRestAction::Ban | AutomodRestAction::Timeout,
+            action: AutomodRestAction::Kick | AutomodRestAction::Ban | AutomodRestAction::Timeout,
         } = target
         {
             Self::touch_member_moderation_slot(state, guild, user, now);
@@ -376,12 +428,8 @@ impl RememberedDiscordTargets {
         let now = Instant::now();
         let mut state = self.state.lock();
         Self::prune_recovery_metadata(&mut state, now);
-        let had_slot = state
-            .member_moderation_recovery
-            .contains_key(&(guild, user));
-        let mut removed = false;
         state.expires.retain(|target, _| {
-            let drop = matches!(
+            !matches!(
                 target,
                 DiscordRestTarget::AutomodMember {
                     guild: g,
@@ -390,15 +438,9 @@ impl RememberedDiscordTargets {
                         | AutomodRestAction::Ban
                         | AutomodRestAction::Timeout,
                 } if *g == guild && *u == user
-            );
-            if drop {
-                removed = true;
-            }
-            !drop
+            )
         });
-        if removed || had_slot {
-            Self::bump_member_moderation_recovery(&mut state, guild, user, now);
-        }
+        Self::bump_member_moderation_recovery(&mut state, guild, user, now);
     }
 
     pub(crate) fn remember_rest_rejection(
@@ -448,6 +490,9 @@ impl RememberedDiscordTargets {
         state
             .member_moderation_recovery
             .retain(|(g, _), _| *g != guild);
+        state
+            .member_moderation_epoch_seq
+            .retain(|(g, _), _| *g != guild);
         state.expires.retain(|target, _| match target {
             DiscordRestTarget::GuildChannel { guild: g, .. } => *g != guild,
             DiscordRestTarget::AutomodDelete { guild: g, .. } => *g != guild,
@@ -460,6 +505,7 @@ impl RememberedDiscordTargets {
         state.global_recovery += 1;
         state.guild_recovery.clear();
         state.member_moderation_recovery.clear();
+        state.member_moderation_epoch_seq.clear();
         state.expires.clear();
     }
 
@@ -481,18 +527,22 @@ impl RememberedDiscordTargets {
     #[cfg(test)]
     fn seed_member_recovery_slot(&self, guild: u64, user: u64, generation: u64, touched: Instant) {
         let mut state = self.state.lock();
-        Self::insert_recovery_slot(
-            &mut state.member_moderation_recovery,
-            (guild, user),
-            generation,
-            touched,
-        );
+        Self::record_member_epoch_floor(&mut state, (guild, user), generation);
+        Self::insert_member_recovery_slot(&mut state, guild, user, generation, touched);
     }
 
     #[cfg(test)]
     fn prune_recovery_metadata_for_test(&self, now: Instant) {
         let mut state = self.state.lock();
         Self::prune_recovery_metadata(&mut state, now);
+    }
+
+    #[cfg(test)]
+    fn member_recovery_slot_present(&self, guild: u64, user: u64) -> bool {
+        self.state
+            .lock()
+            .member_moderation_recovery
+            .contains_key(&(guild, user))
     }
 
     #[cfg(test)]
@@ -916,23 +966,35 @@ mod tests {
             user: 8,
             action: AutomodRestAction::Kick,
         };
-        let deny = fixture_discord_http_error(403, 50013).await;
-        let initial = cache.capture_recovery_epoch(target);
-        cache.remember_rest_rejection(initial, &deny, target, now);
-        assert!(cache.blocked(target, now));
         let epoch = cache.capture_recovery_epoch(target);
+        let deny = fixture_discord_http_error(403, 50013).await;
         cache.clear_member_moderation_rejections(9, 8);
         cache.remember_rest_rejection(epoch, &deny, target, now);
         assert!(!cache.blocked(target, now));
     }
 
-    #[test]
-    fn role_recovery_without_rejection_does_not_allocate_member_metadata() {
+    #[tokio::test]
+    async fn evicted_member_recovery_slot_does_not_restore_stale_generation() {
+        const CAP: usize = 4096;
         let cache = RememberedDiscordTargets::default();
-        for user in 0..128u64 {
-            cache.clear_member_moderation_rejections(1, user);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(3600);
+        let victim = DiscordRestTarget::AutomodMember {
+            guild: 3,
+            user: 1,
+            action: AutomodRestAction::Kick,
+        };
+        cache.seed_member_recovery_slot(3, 1, 4, stale);
+        let epoch = cache.capture_recovery_epoch(victim);
+        assert_eq!(epoch.member, 4);
+        for user in 2..(CAP + 2) {
+            cache.seed_member_recovery_slot(3, user as u64, 1, now);
         }
-        assert_eq!(cache.recovery_metadata_counts(), (0, 0));
+        assert!(!cache.member_recovery_slot_present(3, 1));
+        let deny = fixture_discord_http_error(403, 50013).await;
+        cache.clear_member_moderation_rejections(3, 1);
+        cache.remember_rest_rejection(epoch, &deny, victim, now);
+        assert!(!cache.blocked(victim, now));
     }
 
     #[tokio::test]
