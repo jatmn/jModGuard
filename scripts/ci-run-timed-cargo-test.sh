@@ -234,38 +234,92 @@ test_list_name() {
   printf '%s\n' "$name"
 }
 
-doctest_run_token() {
+# rustdoc splits each --test-args value on whitespace, so a full name with
+# spaces cannot be passed to --exact. Use literal tokens and exclude every
+# competing name from the unfiltered listing; never fall back to a batch run.
+doctest_run_selector() {
   local name=$1
   shift
-  local candidate best="" best_len=0 count n item
-  local -a parts=()
-  read -r -a parts <<<"$name"
-  for candidate in "${parts[@]}"; do
-    case "$candidate" in
-      ''|-) continue ;;
-      -*) continue ;;
-    esac
-    count=0
-    for n in "$@"; do
-      case "$n" in
-        *"$candidate"*) count=$((count + 1)) ;;
-      esac
-    done
-    if [ "$count" -eq 1 ] && [ "${#candidate}" -gt "$best_len" ]; then
-      best=$candidate
-      best_len=${#candidate}
-    fi
-  done
-  if [ -n "$best" ]; then
-    printf '%s\n' "$best"
+  local token="" candidate other skip unique
+  local -a parts=() other_parts=() selector=()
+  if [[ "$name" != *[[:space:]]* ]]; then
+    printf '%s\n' --exact "$name"
     return 0
   fi
-  item="${name#* - }"
-  item="${item%% \(line *}"
-  case "$item" in
-    ''|*' '*|-*) return 1 ;;
-  esac
-  printf '%s\n' "$item"
+  read -r -a parts <<<"$name"
+  for candidate in "${parts[@]}"; do
+    [[ "$candidate" == -* ]] && continue
+    unique=1
+    for other in "$@"; do
+      if [ "$other" != "$name" ] && [[ "$other" == *"$candidate"* ]]; then
+        unique=0
+        break
+      fi
+    done
+    if [ "$unique" -eq 1 ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    [ "${#candidate}" -le "${#token}" ] || token=$candidate
+  done
+  [ -n "$token" ] || return 1
+  selector=("$token")
+  for other in "$@"; do
+    [ "$other" != "$name" ] || continue
+    [[ "$other" == *"$token"* ]] || continue
+    skip=""
+    read -r -a other_parts <<<"$other"
+    for candidate in "${other_parts[@]}"; do
+      if [[ "$name" != *"$candidate"* ]]; then
+        skip=$candidate
+        break
+      fi
+    done
+    [ -n "$skip" ] || return 1
+    selector+=("--skip=$skip")
+  done
+  printf '%s\n' "${selector[@]}"
+}
+
+# Cargo's positional TESTNAME is a discovery filter, not a build option.
+# Preserve separate option values as well as attached/equals forms.
+jmodguard_cargo_args_without_test_filter() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p|--package|--exclude|--test|--bin|--example|--bench|-F|--features|\
+      -j|--jobs|--profile|--target|--target-dir|--manifest-path|--message-format|\
+      --color|--config|-Z|--lockfile-path)
+        printf '%s\n' "$1" "$2"
+        shift 2
+        ;;
+      -*) printf '%s\n' "$1"; shift ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# Discovery has already applied all name filters, --exact and --skip. Retain
+# execution options and their values, using rustdoc's whitespace splitting.
+jmodguard_doctest_run_harness() {
+  local arg
+  local -a words=() args=()
+  for arg in "$@"; do
+    read -r -a words <<<"$arg"
+    args+=("${words[@]}")
+  done
+  set -- "${args[@]}"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --skip) shift 2 ;;
+      --exact|--skip=*) shift ;;
+      --format|--color|--test-threads|--logfile|--shuffle-seed|-Z)
+        printf '%s\n' "$1" "$2"
+        shift 2
+        ;;
+      -*) printf '%s\n' "$1"; shift ;;
+      *) shift ;;
+    esac
+  done
 }
 
 run_timed_cargo_test_skip_doctests() {
@@ -629,9 +683,9 @@ run_timed_cargo_test_doctests() {
     cargo test "${cargo_args[@]}" --doc -- "${harness[@]}"
     return $?
   fi
-  local list_out list_rc ignored_out ignored_rc name token rc
-  local -a doc_names=()
-  local -A ignored_names=() covered=()
+  local list_out list_rc ignored_out ignored_rc name selector rc line
+  local -a doc_names=() all_names=() run_cargo=() run_harness=() selector_args=()
+  local -A ignored_names=()
   set +e
   list_out="$(cargo test "${cargo_args[@]}" --doc -- --list --format terse "${harness[@]}")"
   list_rc=$?
@@ -654,24 +708,36 @@ run_timed_cargo_test_doctests() {
     name="$(test_list_name "$line")" || continue
     ignored_names["$name"]=1
   done <<<"$ignored_out"
+  [ "${#doc_names[@]}" -gt 0 ] || return 0
+  while IFS= read -r line; do
+    run_cargo+=("$line")
+  done < <(jmodguard_cargo_args_without_test_filter "${cargo_args[@]}")
+  while IFS= read -r line; do
+    run_harness+=("$line")
+  done < <(jmodguard_doctest_run_harness "${harness[@]}")
+  # Include names excluded by caller filters: a token unique in the selected
+  # set may otherwise run another doctest when those filters are removed.
+  list_out="$(cargo test "${run_cargo[@]}" --doc -- --list --format terse "${run_harness[@]}")" || return $?
+  while IFS= read -r line; do
+    name="$(test_list_name "$line")" || continue
+    all_names+=("$name")
+  done <<<"$list_out"
   for name in "${doc_names[@]}"; do
-    [ -n "${covered[$name]+x}" ] && continue
     if [ "$run_ignored" -eq 0 ] && [ -n "${ignored_names[$name]+x}" ]; then
       continue
     fi
-    token="$(doctest_run_token "$name" "${doc_names[@]}")" || token=""
-    if [ -z "$token" ]; then
-      run_cargo_test_doc_timed "$name" "${cargo_args[@]}" --doc -- --test-threads=1 "${harness[@]}"
-      return $?
+    if ! selector="$(doctest_run_selector "$name" "${all_names[@]}")"; then
+      echo "ci-preflight: cannot isolate doctest: $name" >&2
+      return 1
     fi
+    selector_args=()
+    while IFS= read -r line; do
+      selector_args+=("$line")
+    done <<<"$selector"
     rc=0
-    run_cargo_test_doc_timed "$name" "${cargo_args[@]}" --doc -- "$token" --test-threads=1 "${harness[@]}" || rc=$?
+    run_cargo_test_doc_timed "$name" "${run_cargo[@]}" --doc -- \
+      "${selector_args[@]}" --test-threads=1 "${run_harness[@]}" || rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
-    for n in "${doc_names[@]}"; do
-      case "$n" in
-        *"$token"*) covered["$n"]=1 ;;
-      esac
-    done
   done
 }
 

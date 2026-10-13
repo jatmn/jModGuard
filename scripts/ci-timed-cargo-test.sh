@@ -264,7 +264,9 @@ EOF
 cat >"$ws/doctest-probe/src/lib.rs" <<'RS'
 /// ```
 /// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
-///     std::fs::write(std::path::Path::new(&dir).join("normal"), "ran").unwrap();
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("normal")).unwrap(), "ran").unwrap();
 /// }
 /// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("normal"));
 /// ```
@@ -272,11 +274,46 @@ pub fn documented() {}
 
 /// ```ignore
 /// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
-///     std::fs::write(std::path::Path::new(&dir).join("ignored"), "ran").unwrap();
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("ignored")).unwrap(), "ran").unwrap();
 /// }
 /// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("ignored"));
 /// ```
 pub fn ignored_documented() {}
+
+
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("second")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+pub fn second_documented() {}
+
+#[path = "doc [probe]+.rs"]
+pub mod spaced;
+RS
+# Multiple examples for the same item, with a path containing spaces and regex
+# characters, exercise literal selection and the old non-unique-token fallback.
+cat >"$ws/doctest-probe/src/doc [probe]+.rs" <<'RS'
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("spaced_first")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+///
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("spaced_second")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+pub fn spaced_documented() {}
 RS
 cat >"$ws/buildrs-probe/Cargo.toml" <<'EOF'
 [package]
@@ -465,6 +502,74 @@ exec "$real_cargo" "\$@"
 SH
 chmod +x "$fixture/bin/cargo"
 PATH="$fixture/bin:$PATH"
+
+# Compare execution counts with native Cargo, including zero-match selections.
+# The shim records invocations; append-only markers also catch repeated execution
+# within a single invocation, independently of how the runner chooses its filter.
+for filter_case in multiple substring before mixed skip skip-equals skip-multiple \
+  exact exact-name exact-skip zero ignored include-ignored ignored-zero literal spaces \
+  option-values exclude exclude-equals; do
+  filter_cargo=(-p timed-doctest-probe)
+  filter_harness=()
+  case "$filter_case" in
+    substring) filter_harness=(documented) ;;
+    before) filter_cargo+=(documented) ;;
+    multiple) filter_harness=(second_documented spaced_documented) ;;
+    mixed) filter_cargo+=(second_documented); filter_harness=(spaced_documented) ;;
+    skip) filter_harness=(documented --skip second_documented) ;;
+    skip-equals) filter_harness=(documented --skip=second_documented) ;;
+    skip-multiple) filter_harness=(documented --skip second_documented --skip spaced_documented) ;;
+    exact) filter_harness=(documented --exact) ;;
+    exact-name) filter_harness=('src/lib.rs - documented (line 1)' --exact) ;;
+    exact-skip) filter_harness=(--exact --skip documented) ;;
+    zero) filter_harness=(no_such_doctest) ;;
+    ignored) filter_harness=(documented --ignored) ;;
+    include-ignored) filter_harness=(documented --include-ignored --skip second_documented) ;;
+    ignored-zero) filter_harness=(second_documented --ignored) ;;
+    literal) filter_harness=('[probe]+') ;;
+    spaces) filter_harness=('spaced_documented (line') ;;
+    option-values) filter_harness=(documented --color never --nocapture) ;;
+    exclude|exclude-equals)
+      filter_cargo=(--workspace --exclude 'timed-collision-*' --exclude timed-buildrs-probe
+        --exclude timed-bin-only-probe --exclude timed-harness-probe documented)
+      if [ "$filter_case" = exclude ]; then
+        filter_cargo+=(--exclude timed-runner-probe)
+      else
+        filter_cargo+=(--exclude=timed-runner-probe)
+      fi
+      filter_harness=(--include-ignored --skip second_documented)
+      ;;
+  esac
+  for filter_runner in native timed; do
+    export TIMED_DOC_MARKERS="$fixture/filter-$filter_case-$filter_runner"
+    mkdir -p "$TIMED_DOC_MARKERS"
+    : >"$CARGO_INVOCATION_LOG"
+    filter_rc=0
+    if [ "$filter_runner" = native ]; then
+      cargo test "${filter_cargo[@]}" --doc -- "${filter_harness[@]}" \
+        >"$fixture/filter-native.log" 2>&1 || filter_rc=$?
+    else
+      (run_timed_cargo_test_gnu "${filter_cargo[@]}" -- "${filter_harness[@]}") \
+        >"$fixture/filter-timed.log" 2>&1 || filter_rc=$?
+    fi
+    [ "$filter_rc" -eq 0 ] || { cat "$fixture/filter-$filter_runner.log" >&2; fail "$filter_case/$filter_runner failed ($filter_rc)"; }
+  done
+  expected_runs=0
+  for marker in normal ignored second spaced_first spaced_second; do
+    native_count=0 timed_count=0
+    native_marker="$fixture/filter-$filter_case-native/$marker"
+    timed_marker="$fixture/filter-$filter_case-timed/$marker"
+    [ ! -f "$native_marker" ] || native_count=$(wc -l <"$native_marker")
+    [ ! -f "$timed_marker" ] || timed_count=$(wc -l <"$timed_marker")
+    [ "$timed_count" -eq "$native_count" ] \
+      || fail "$filter_case/$marker: native count=$native_count, timed count=$timed_count"
+    expected_runs=$((expected_runs + native_count))
+  done
+  actual_runs=$(grep ' --doc ' "$CARGO_INVOCATION_LOG" | grep -vc ' --list ' || true)
+  [ "$actual_runs" -eq "$expected_runs" ] \
+    || fail "$filter_case: expected $expected_runs isolated doctest invocations, got $actual_runs"
+done
+unset TIMED_DOC_MARKERS
 
 if ! cargo test -p timed-harness-probe --lib --no-run >/dev/null 2>&1; then
   fail 'harness probe crate failed to build'
