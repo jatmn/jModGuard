@@ -724,8 +724,15 @@ mod tests {
         stream: &mut tokio::net::TcpStream,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<u16, std::io::Error> {
+        read_probe_http_status_buffered(stream, deadline, Vec::new()).await
+    }
+
+    async fn read_probe_http_status_buffered(
+        stream: &mut tokio::net::TcpStream,
+        deadline: Option<tokio::time::Instant>,
+        mut buf: Vec<u8>,
+    ) -> Result<u16, std::io::Error> {
         use tokio::io::AsyncReadExt;
-        let mut buf = Vec::with_capacity(512);
         let mut chunk = [0u8; 256];
         loop {
             if let Some(status) = try_parse_http_status_line(&buf) {
@@ -747,6 +754,20 @@ mod tests {
                 return Ok(0);
             }
         }
+    }
+
+    async fn drain_probe_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        let mut seen = Vec::new();
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        Ok(())
     }
 
     async fn http_probe_once(
@@ -858,21 +879,42 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn http_status_reads_fragmented_status_line() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+        let (client_read_tx, client_read_rx) = oneshot::channel();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            drain_probe_request(&mut stream).await.unwrap();
             stream.write_all(b"HTTP/1.1 ").await.unwrap();
+            stream.flush().await.unwrap();
+            client_read_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
             stream.write_all(b"200 OK\r\n\r\nok").await.unwrap();
+            stream.flush().await.unwrap();
         });
-        let status = http_status(
-            addr,
-            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-            None,
-        )
-        .await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut first = [0u8; 32];
+        let n = stream.read(&mut first).await.unwrap();
+        assert!(
+            try_parse_http_status_line(&first[..n]).is_none(),
+            "first read must not contain a full status line"
+        );
+        assert_eq!(
+            parse_http_status(&first[..n]),
+            0,
+            "a single-read parser must not succeed on the first fragment"
+        );
+        client_read_tx.send(()).unwrap();
+        let status = read_probe_http_status_buffered(&mut stream, None, first[..n].to_vec())
+            .await
+            .unwrap();
         assert_eq!(status, 200);
         server.await.unwrap();
     }
