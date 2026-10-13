@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use serenity::model::id::ChannelId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +49,8 @@ pub(crate) enum GatewayCaseAction {
 }
 
 const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
+const GATEWAY_MANUAL_BAN_AUDIT_TTL: Duration = Duration::from_secs(120);
+const MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE: usize = 8;
 const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,49 @@ struct GatewayBanEchoEntry {
     expires: Instant,
     operation_id: Option<String>,
     released: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct GatewayManualBanAuditQueue {
+    entries: HashMap<(u64, u64), VecDeque<(i64, Instant)>>,
+}
+
+impl GatewayManualBanAuditQueue {
+    fn prune(&mut self, now: Instant) {
+        for deque in self.entries.values_mut() {
+            deque.retain(|(_, expires)| *expires > now);
+        }
+        self.entries.retain(|_, deque| !deque.is_empty());
+    }
+
+    fn queue(&mut self, guild: u64, user: u64, entry_id: i64) {
+        if entry_id <= 0 {
+            return;
+        }
+        let now = Instant::now();
+        self.prune(now);
+        let deque = self.entries.entry((guild, user)).or_default();
+        while deque.len() >= MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE {
+            deque.pop_front();
+        }
+        deque.push_back((entry_id, now + GATEWAY_MANUAL_BAN_AUDIT_TTL));
+    }
+
+    fn consume(&mut self, guild: u64, user: u64) -> Option<i64> {
+        let now = Instant::now();
+        self.prune(now);
+        let key = (guild, user);
+        let deque = self.entries.get_mut(&key)?;
+        let (entry_id, _) = deque.pop_front()?;
+        if deque.is_empty() {
+            self.entries.remove(&key);
+        }
+        Some(entry_id)
+    }
+
+    fn clear(&mut self, guild: u64, user: u64) {
+        self.entries.remove(&(guild, user));
+    }
 }
 
 #[derive(Default)]
@@ -529,6 +574,7 @@ pub struct BotState {
     slash_unauthorized: AtomicBool,
     slash_retries: Mutex<HashMap<u64, SlashRetry>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
+    gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
@@ -547,6 +593,8 @@ pub struct BotState {
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
     pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
+    #[cfg(test)]
+    gateway_ban_path_phases: Mutex<Vec<&'static str>>,
 }
 
 impl BotState {
@@ -615,6 +663,7 @@ impl BotState {
             slash_unauthorized: AtomicBool::new(false),
             slash_retries: Mutex::new(HashMap::new()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
+            gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
@@ -626,6 +675,8 @@ impl BotState {
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
             remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
+            #[cfg(test)]
+            gateway_ban_path_phases: Mutex::new(Vec::new()),
         }))
     }
 
@@ -970,6 +1021,48 @@ impl BotState {
 
     /// Returns whether another ban or unban callback for this user is already
     /// inside its handler. Local start time is not Gateway order.
+    pub(crate) fn queue_gateway_manual_ban_audit_entry(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        entry_id: i64,
+    ) {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .queue(guild_id, user_id, entry_id);
+    }
+
+    pub(crate) fn consume_gateway_manual_ban_audit_entry(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+    ) -> Option<i64> {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .consume(guild_id, user_id)
+    }
+
+    pub(crate) fn clear_gateway_manual_ban_audit_entries(&self, guild_id: u64, user_id: u64) {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .clear(guild_id, user_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_gateway_ban_path_test_phases(&self) {
+        self.gateway_ban_path_phases.lock().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_gateway_ban_path_test_phase(&self, phase: &'static str) {
+        self.gateway_ban_path_phases.lock().push(phase);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gateway_ban_path_test_phases(&self) -> Vec<&'static str> {
+        self.gateway_ban_path_phases.lock().clone()
+    }
+
     pub(crate) fn begin_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
         let mut observations = self.ban_observations.lock();
         let owners = observations.entry((guild_id, user_id)).or_default();
@@ -1860,6 +1953,26 @@ mod tests {
             .unwrap();
         assert_ne!(later.link.case_id, first_id);
         assert_eq!(later.entry_id, 124);
+    }
+
+    #[test]
+    fn gateway_unban_clears_queued_manual_ban_audit_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "gateway_manual_ban_audit_clear_{:032x}",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, 100);
+        app.queue_gateway_manual_ban_audit_entry(10, 55, 101);
+        app.clear_gateway_manual_ban_audit_entries(10, 55);
+        assert_eq!(app.consume_gateway_manual_ban_audit_entry(10, 55), None);
+        app.queue_gateway_manual_ban_audit_entry(10, 56, 102);
+        app.clear_gateway_manual_ban_audit_entries(10, 55);
+        assert_eq!(
+            app.consume_gateway_manual_ban_audit_entry(10, 56),
+            Some(102)
+        );
     }
 
     #[test]
