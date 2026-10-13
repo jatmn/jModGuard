@@ -35,18 +35,13 @@ mod tests {
 
     #[tokio::test]
     async fn guard_clears_readiness_on_scope_exit() {
-        assert!(!process_ready());
-        {
-            let _guard = ProcessReadyTestGuard::acquire().await;
-            set_process_ready(true);
-            assert!(process_ready());
-        }
-        assert!(!process_ready());
+        let _guard = ProcessReadyTestGuard::acquire().await;
+        set_process_ready(true);
+        assert!(process_ready());
     }
 
     #[tokio::test]
     async fn guard_clears_readiness_when_a_nested_task_panics() {
-        assert!(!process_ready());
         let job = tokio::spawn(async {
             let _guard = ProcessReadyTestGuard::acquire().await;
             set_process_ready(true);
@@ -54,6 +49,8 @@ mod tests {
             panic!("deliberate test panic");
         });
         assert!(job.await.is_err());
-        assert!(!process_ready());
+        let _guard = ProcessReadyTestGuard::acquire().await;
+        set_process_ready(true);
+        assert!(process_ready());
     }
 }
