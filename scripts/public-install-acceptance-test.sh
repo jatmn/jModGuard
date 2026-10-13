@@ -28,9 +28,19 @@ require_absent() {
 }
 
 # test_license_is_apache_with_commons_clause
-require_contains LICENSE.md '"Commons Clause" License Condition v1.0'
-require_contains LICENSE.md "License: Apache License 2.0"
-require_contains LICENSE.md "Software: jModGuard"
+node --input-type=module - <<'JS'
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+// Pin the complete reviewed terms, not just their identifying headings.
+// Sources: https://www.apache.org/licenses/LICENSE-2.0.txt and https://commonsclause.com/
+// Review any intended license/attribution change before updating this fingerprint.
+// Ignore only whitespace so line wrapping and CRLF do not change the result.
+const text = fs.readFileSync("LICENSE.md", "utf8").replace(/\s+/g, " ").trim();
+assert.equal(createHash("sha256").update(text).digest("hex"),
+  "7747223dec9c5c4aaef09f2548bc21a38f9e8bfc0dedfac51d18c4dafe76de2f",
+  "LICENSE.md does not match the reviewed complete license");
+JS
 require_contains Cargo.toml "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 # test_install_guide_is_public_and_lists_deferred_checks
