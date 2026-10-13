@@ -169,7 +169,7 @@ changed_since_publication() {
   # on every service. Keep every manifest (resolution), but only linked source.
   local -a inputs=(
     "Dockerfile.${component}" "Dockerfile.${component}.dockerignore" .dockerignore
-    Cargo.toml Cargo.lock rust-toolchain.toml ':(glob)crates/*/Cargo.toml'
+    Cargo.toml Cargo.lock LICENSE.md rust-toolchain.toml ':(glob)crates/*/Cargo.toml'
     src migrations vendor crates/bot crates/api crates/runtime crates/updater
     .buildkite/publish-image.sh scripts/bootstrap-container.sh
     ':(exclude,glob)crates/*/tests/**'
@@ -177,7 +177,7 @@ changed_since_publication() {
     ':(exclude,glob)crates/*/examples/**'
   )
   if [[ "$component" == "webui" ]]; then
-    inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
+    inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore LICENSE.md
       frontend tools/webui scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then

@@ -9,7 +9,7 @@ they cannot be adopted by this baseline. See [database setup and recovery](docs/
 Owner Administration is available on the existing WebUI and API.
 See [public installation](docs/INSTALL.md). See [implementation status](docs/OVERHAUL.md).
 
-A **data-driven Discord moderation bot** written in Rust — open source, dual-process
+A **data-driven Discord moderation bot** written in Rust — source available, dual-process
 (bot + API/WebUI), libSQL-backed, multi-server.
 
 It can use a local SQLite file for single-host self-hosting or a remote libSQL
@@ -112,12 +112,23 @@ the command registry — the same data powers `docs/COMMANDS.md`.
 
 ## License
 
-Licensed under the **PolyForm Noncommercial License 1.0.0** — see
-[LICENSE.md](LICENSE.md). This license is **permanent**: there is no
-conversion clause. Anyone may use, study, and fork the software for any
-**non-commercial** purpose (with the notice retained), but **no one may sell
-it or use it commercially without a written license from the author** —
-commercial licensing is granted by the author only.
+jModGuard is **source available** under the **Apache License 2.0 with the
+Commons Clause License Condition v1.0**. You may use, study, modify, fork, and
+redistribute it under those terms, retaining the required license and attribution
+notices. Personal use, internal business use, and running it for a business's own
+free Discord community are allowed.
+
+Selling or reselling jModGuard, or charging for a product or service whose value
+derives entirely or substantially from jModGuard's functionality, requires a
+separate written license from **jatmn**. This includes paid bot hosting and
+consulting/support services covered by the Commons Clause definition of "Sell".
+The restriction is not a blanket ban on commercial use or every larger paid
+product that includes jModGuard.
+
+See [LICENSE.md](LICENSE.md) for the complete terms; this summary does not replace
+them. Because the license restricts selling, jModGuard is not OSI open source.
+Third-party dependencies and vendored code retain their own licenses. Previously
+released versions remain subject to the license supplied with those versions.
 
 ## Development
 

@@ -1,8 +1,13 @@
 # Public installation
 
 Install from **this public repository** without the private ops repo; private
-operator automation is not required. The license is **PolyForm Noncommercial 1.0.0**
-(`LICENSE.md`). Bunny.net remains the first-class cloud path.
+operator automation is not required. jModGuard is source available under the
+**Apache License 2.0 with Commons Clause 1.0**. Personal use, internal business use,
+and a business's own free Discord community are allowed. Resale and paid offerings
+whose value derives entirely or substantially from jModGuard require a separate
+written license from jatmn. See [LICENSE.md](../LICENSE.md) for the complete terms
+and the [license summary](../README.md#license). Bunny.net remains the first-class
+cloud path.
 
 ## Choose a topology
 

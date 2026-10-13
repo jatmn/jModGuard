@@ -8,14 +8,14 @@ default-members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/up
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 [package]
 name = "jmodguard"
 version = "0.1.0"
 edition = "2024"
 description = "Shared jModGuard configuration, data model and database access"
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 autobins = false
 rust-version = "1.96"
 
