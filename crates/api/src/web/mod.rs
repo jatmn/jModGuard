@@ -43,6 +43,10 @@ const AUTH_SESSION_IDLE_TTL: std::time::Duration =
 // 24-hour margin lets its renewed seven-day row expire before the tombstone,
 // provided that request finishes within the margin. There is no router-wide
 // request timeout; deliberately keep long service-upgrade applies unrestricted.
+//
+// The 24-hour margin is an intentional operational limit, not a provisional
+// value. If it is ever tightened or removed, change this constant and its
+// documentation together and re-check late-save coverage past day seven.
 const AUTH_SESSION_TOMBSTONE_TTL: std::time::Duration =
     std::time::Duration::from_secs(AUTH_SESSION_IDLE_TTL.as_secs() + 24 * 60 * 60);
 const AUTH_SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
