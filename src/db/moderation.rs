@@ -745,7 +745,7 @@ pub async fn record_gateway_ban(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveBanMirror {
     id: i64,
-    reason: String,
+    reason: Option<String>,
     moderator_id: Option<i64>,
     operation_id: Option<String>,
     created_at: String,
@@ -809,22 +809,47 @@ fn manual_member_ban_event_exists_for_mirror(
 
 fn gateway_placeholder_mirror(mirror: &ActiveBanMirror) -> bool {
     mirror.moderator_id.is_none()
-        && mirror.reason == GATEWAY_BAN_REASON
+        && mirror.reason.as_deref() == Some(GATEWAY_BAN_REASON)
         && mirror.operation_id.is_none()
 }
 
-fn bot_echo_matches_mirror(mirror: &ActiveBanMirror, operation_id: &Option<String>) -> bool {
+fn bot_owned_mirror_without_manual_event(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror: &ActiveBanMirror,
+) -> Result<bool> {
+    if mirror.operation_id.is_none() || mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON) {
+        return Ok(false);
+    }
+    Ok(!manual_member_ban_event_exists_for_mirror(
+        conn, guild_id, user_id, mirror.id,
+    )?)
+}
+
+fn bot_echo_matches_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror: &ActiveBanMirror,
+    operation_id: &Option<String>,
+    observed_at: &str,
+) -> Result<bool> {
     match operation_id {
         Some(operation_id) if mirror.operation_id.as_deref() == Some(operation_id.as_str()) => {
-            true
+            Ok(true)
         }
         Some(_) => {
-            mirror.operation_id.is_none()
+            if mirror.operation_id.is_some() && mirror.created_at.as_str() >= observed_at {
+                return Ok(true);
+            }
+            Ok(mirror.operation_id.is_none()
                 && mirror.moderator_id.is_some()
-                && mirror.reason != GATEWAY_BAN_REASON
+                && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON)
+                && !manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?)
         }
-        None if gateway_placeholder_mirror(mirror) => true,
-        None => mirror.operation_id.is_some() && mirror.moderator_id.is_some(),
+        None if gateway_placeholder_mirror(mirror) => Ok(true),
+        None => Ok(mirror.operation_id.is_some() && mirror.moderator_id.is_some()),
     }
 }
 
@@ -835,19 +860,25 @@ fn replace_manual_gateway_mirror(
     user_id: i64,
     member_was_banned: bool,
 ) -> Result<bool> {
+    if bot_owned_mirror_without_manual_event(conn, guild_id, user_id, mirror)? {
+        return Ok(true);
+    }
     if gateway_placeholder_mirror(mirror) {
+        if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
+            return Ok(true);
+        }
+        if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
+            return Ok(false);
+        }
         if !member_was_banned {
             return Ok(true);
         }
-        return unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at);
+        return Ok(false);
     }
     if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
         return Ok(true);
     }
-    if !member_was_banned {
-        return Ok(true);
-    }
-    manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)
+    Ok(!member_was_banned)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -869,7 +900,7 @@ fn record_gateway_ban_conn(
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
     if let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
         let keep = if owned_by_bot {
-            bot_echo_matches_mirror(&mirror, &operation_id)
+            bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
         } else {
             !replace_manual_gateway_mirror(&tx, &mirror, guild_id, user_id, member_was_banned)?
         };
@@ -994,6 +1025,38 @@ pub async fn attribute_enrolled_ban(
                 enrollment.guild_id,
                 user_id
             ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+/// Records a gateway-observed unban in the moderation event log.
+pub async fn record_gateway_unban_event(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    occurred_at: Option<&str>,
+) -> Result<()> {
+    let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    let data = crate::ids::stringify_js_unsafe_integers(&serde_json::json!({
+        "source": "discord",
+    }))
+    .to_string();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        tx.ensure_mutation_receipt()?;
+        tx.query_row_write(
+            "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+             VALUES (?1, 'member_unban', ?2, NULL, ?3, ?4)
+             RETURNING id",
+            params![guild_id, user_id, data, now],
+            |row| Ok(row.get::<i64>(0)?),
         )?;
         tx.commit()?;
         Ok(())

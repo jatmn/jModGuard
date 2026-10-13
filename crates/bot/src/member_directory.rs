@@ -576,12 +576,14 @@ pub(crate) async fn member_directory_shows_banned(
         "ban mirror precheck unavailable",
     )
     .await?;
-    store
-        .get_member(scope, user_id as i64)
-        .await
-        .ok()
-        .flatten()
-        .map(|member| member.is_banned)
+    match store.get_member(scope, user_id as i64).await {
+        Ok(Some(member)) => Some(member.is_banned),
+        Ok(None) => Some(false),
+        Err(error) => {
+            tracing::warn!(guild_id, user_id, "ban mirror precheck failed: {error:#}");
+            None
+        }
+    }
 }
 
 pub async fn observe_ban(

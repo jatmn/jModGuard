@@ -433,13 +433,23 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let member_was_banned = crate::member_directory::member_directory_shows_banned(
+        let member_was_banned = match crate::member_directory::member_directory_shows_banned(
             &app,
             guild_id.get(),
             banned_user.id.get(),
         )
         .await
-        .unwrap_or(true);
+        {
+            Some(was_banned) => was_banned,
+            None => {
+                tracing::warn!(
+                    guild_id = guild_id.get(),
+                    user_id = banned_user.id.get(),
+                    "ban mirror precheck unavailable; assuming still banned"
+                );
+                true
+            }
+        };
         crate::member_directory::observe_ban(
             &app,
             guild_id.get(),
@@ -594,6 +604,14 @@ impl EventHandler for Handler {
         let _ =
             db::mark_enrolled_unbanned(&app.db, enrollment.clone(), unbanned_user.id.get() as i64)
                 .await;
+        let observed_at = observed.to_rfc3339();
+        let _ = db::record_gateway_unban_event(
+            &app.db,
+            enrollment.clone(),
+            unbanned_user.id.get() as i64,
+            Some(&observed_at),
+        )
+        .await;
         let suppressed = app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Unban,
             guild_id.get(),
