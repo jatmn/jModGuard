@@ -205,8 +205,8 @@ its binary. The API's dev-only bot dependency keeps the HTTP-to-worker regressio
 Only existing shared read-floor/resolve/SQL-param interfaces needed across crates are exposed;
 claims and the full config loader adapter remain private. Database privileges are unchanged.
 
-Buildkite and Docker now select packages explicitly. Publication already tracks all crates;
-tests verify service-source changes still trigger image publication. Local API embedding uses
+GitHub Actions and Docker select packages explicitly. Publication tracks each service's production inputs;
+tests verify service-source changes trigger the corresponding image publication. Local API embedding uses
 the root frontend; Bunny API builds without embedding. Bare Cargo commands include the
 whole workspace; old root web-feature commands must switch to documented package commands.
 Binary names, environment/TOML, schema, API/browser contracts and one-bot/one-API topology
@@ -398,7 +398,7 @@ from the stable baseline and do not move `latest`; see [RELEASES.md](RELEASES.md
 
 Operators can install from this public repository without the private ops repo.
 See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
-Buildkite publishes the WebUI package but does not upload it to Bunny Storage.
+GitHub Actions publishes the WebUI package but does not upload it to Bunny Storage.
 The Guild WebUI loads daisyUI and Headless UI from a CDN at runtime; those libraries
 are not extra Storage objects. `scripts/public-install-acceptance-test.sh` checks
 public-source documentation. Local tests do not prove live Bunny, Discord or AWS readiness.

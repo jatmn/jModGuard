@@ -113,7 +113,7 @@ store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 16. 
 never reason-text equality. Keep tags out of case API JSON and human reasons. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write.
-Stable/Nightly image publication uses Release Please plus scheduled Buildkite Nightlies;
+Stable/Nightly image publication uses Release Please plus scheduled GitHub Actions Nightlies;
 see `docs/RELEASES.md`. Nightly IDs never enter the Release Please baseline and
 must not move `latest`.
 Library contracts for membership, cases, history, sources and evidence remain as
@@ -207,22 +207,21 @@ Generated assets and third-party source must not be committed. Local preflight
 and publication build these assets automatically.
 
 Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
-Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
-Do not add GitHub Actions CI workflows. Allowed workflow files are the
-owner-command Pullfrog workflow (`docs/PULLFROG.md`) and the Socket Security
-manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
-Actions; it is not CI, image publication, or a Buildkite job. Set the
+GitHub Actions runs affected check groups; see `docs/CI.md`.
+The Publish workflow calls the same checks before publishing verified images. Pullfrog
+retains its owner-command workflow (`docs/PULLFROG.md`); Socket Security remains
+a separate manifest scan (`.github/workflows/socket.yml`). Set the
 repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
 relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
-A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. The CI passed check remains the merge gate.
 After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 
 ```bash
 bash scripts/ci-preflight.sh
 # For a PR whose base is not main:
 # bash scripts/ci-preflight.sh --base origin/<base-branch>
-# Optional local git hooks (same full Buildkite test script; not GitHub Actions).
+# Optional local git hooks (the same full local preflight).
 # Worktree-local core.hooksPath (.githooks); does not chain previous hook dirs:
 # bash scripts/install-git-hooks.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
@@ -232,7 +231,7 @@ That script runs lockfile verification, `cargo fmt --check`,
 `bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
 general lints pinned in `dylint.toml`),
 whitespace `git diff --check`, the publisher/release contract tests
-(`bash .buildkite/publish-image-test.sh`), Clippy `-D warnings` on
+(`bash scripts/publish-image-test.sh`), Clippy `-D warnings` on
 `--all-targets` (plus API `--no-default-features --all-targets`), workspace and
 no-default-features API tests, service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
@@ -256,7 +255,7 @@ are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-h
 runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
 them after 24 hours. Do not register leftover Proxmox GHA runners or label
 any runner `dependabot`.
-Remote libSQL tests stay in the Buildkite `remote-database` job.
+Remote libSQL tests stay in the GitHub Actions `remote-database` job.
 
 ```bash
 # or: ./scripts/smoke-dual-process.sh
@@ -293,11 +292,11 @@ authorize live provider calls or require a Codex skill to contribute.
 
 ## Version pins (verified)
 
-- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` uses `/opt/jmodguard-ci/dylint-6.1.0` when `cargo install --list --root` shows 6.1.0 for both `cargo-dylint` and `dylint-link`, and prebuilt libs under `/opt/jmodguard-ci/dylint-libs/<KEY>` when the key matches and `cargo dylint --help` lists `--no-metadata`; otherwise it installs from source and builds from metadata, then runs `cargo check --all-targets` for the affected packages selected by Buildkite (the full workspace for local preflight and global changes) under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
-- Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
+- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. GitHub Actions sets `JMODGUARD_CI_PREFIX` to `$HOME/.cache/jmodguard-ci` in `scripts/ci-setup.sh` and caches that tree for pinned dylint, deny, and audit tools plus prebuilt lint libraries. `scripts/dylint.sh` uses `$JMODGUARD_CI_PREFIX/dylint-6.1.0` when `cargo install --list --root` shows 6.1.0 for both `cargo-dylint` and `dylint-link`, and prebuilt libs under `$JMODGUARD_CI_PREFIX/dylint-libs/<KEY>` when the key matches and `cargo dylint --help` lists `--no-metadata`; local preflight defaults the same prefix under `$HOME/.cache/jmodguard-ci` when unset. Otherwise it installs from source and builds from metadata, then runs `cargo check --all-targets` for the affected packages selected by GitHub Actions (the full workspace for local preflight and global changes) under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
+- Rust **1.96.0** — `rust-toolchain.toml`, the CI toolchain, and
   `Dockerfile.{bot,api}` (`rust:1.96-bookworm` linux/amd64 digest)
-  must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
-  Buildkite; see `docs/BUILDKITE.md`. Do not add GitHub Actions CI workflows.
+  must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the CI toolchain on `stable`. CI and image publishing use
+  GitHub Actions; see `docs/CI.md`. Keep CI workflow changes aligned with `docs/CI.md`.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).

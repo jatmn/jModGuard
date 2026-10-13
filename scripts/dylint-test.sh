@@ -8,7 +8,6 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/project/scripts" "$fixture/bin" "$fixture/external"
 git init -q "$fixture/project"
 cp "$root/scripts/dylint.sh" "$fixture/project/scripts/dylint.sh"
-cp "$root/scripts/ci-agent-setup.sh" "$fixture/ci-agent-setup.sh"
 cat > "$fixture/project/dylint.toml" <<'EOF'
 [[workspace.metadata.dylint.libraries]]
 tag = "v6.1.0"
@@ -70,6 +69,73 @@ fi
 SH
 chmod +x "$fixture/bin/cargo"
 
+cat > "$fixture/bin/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = ls-remote ]; then
+  printf '%s refs/tags/v6.1.0\n' '8aeea4b0c27722d46fcc8288330401418328e8fa'
+  exit 0
+fi
+exec /usr/bin/git "$@"
+SH
+chmod +x "$fixture/bin/git"
+
+cat > "$fixture/bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${DYLINT_TEST_CURL_FAIL:-0}" = 1 ]; then
+  echo "dylint test curl: network down" >&2
+  exit 1
+fi
+printf '%s\n' '[toolchain]' 'channel = "nightly-2026-08-20"' 'components = ["llvm-tools-preview", "rustc-dev"]'
+SH
+chmod +x "$fixture/bin/curl"
+
+cat > "$fixture/bin/rustc" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${DYLINT_TEST_RUSTC_FAIL:-0}" = 1 ]; then
+  exit 1
+fi
+if [ -n "${DYLINT_TEST_TOOLCHAIN_STATE:-}" ] && [ ! -f "$DYLINT_TEST_TOOLCHAIN_STATE" ]; then
+  echo 'dylint test rustc: toolchain is not installed (auto-install disabled)' >&2
+  exit 1
+fi
+if [ "${1:-}" = '+nightly-2026-08-20' ] && [ "${2:-}" = -vV ]; then
+  printf '%s\n' 'commit-hash: abcdefabcdefabcdefabcdefabcdefabcdefabcd' 'host: x86_64-unknown-linux-gnu'
+  exit 0
+fi
+echo "dylint test rustc: unexpected invocation: $*" >&2
+exit 1
+SH
+chmod +x "$fixture/bin/rustc"
+
+cat > "$fixture/bin/rustup" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  'component list --toolchain nightly-2026-08-20')
+    state="${DYLINT_TEST_TOOLCHAIN_STATE:-}"
+    [ -n "$state" ] && [ -f "$state" ] || exit 1
+    if [ "${DYLINT_TEST_PARTIAL_COMPONENTS:-0}" = 1 ]; then
+      printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)'
+      exit 0
+    fi
+    printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)' 'rustc-dev-x86_64-unknown-linux-gnu (installed)'
+    ;;
+  'toolchain install nightly-2026-08-20 --component llvm-tools-preview,rustc-dev')
+    if [ "${DYLINT_TEST_RUSTUP_FAIL:-0}" = 1 ]; then
+      echo 'dylint test rustup: install failed' >&2
+      exit 1
+    fi
+    echo installed >>"${DYLINT_TEST_TOOLCHAIN_STATE:?}"
+    ;;
+  *) echo "dylint test rustup: unexpected invocation: $*" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$fixture/bin/rustup"
+touch "$fixture/toolchain-ready"
+
 capture="$fixture/capture"
 install_capture="$fixture/install-capture"
 stdout_file="$fixture/stdout"
@@ -101,8 +167,9 @@ run_dylint() {
     PATH="$fixture/bin:$PATH" \
       DYLINT_TEST_CAPTURE="$capture" \
       DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
+      DYLINT_TEST_TOOLCHAIN_STATE="${DYLINT_TEST_TOOLCHAIN_STATE:-$fixture/toolchain-ready}" \
       TMPDIR="$tmpdir" \
-      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES "$@" bash scripts/dylint.sh >"$stdout_file"
+      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES -u DYLINT_CARGO_HOME "$@" bash scripts/dylint.sh >"$stdout_file" 2>&1
   )
 }
 
@@ -124,6 +191,10 @@ run_dylint "$fixture/external" \
   RUSTFLAGS='-C debuginfo=0' CARGO_ENCODED_RUSTFLAGS='-D warnings'
 expect "$capture" TMPDIR "$fixture/external"
 expect "$capture" CARGO_HOME "$fixture/external/cargo-home"
+
+# Hosted CI supplies a persistent cache; an explicit override still takes effect.
+run_dylint "$fixture/external" DYLINT_CARGO_HOME="$fixture/hosted-cache"
+expect "$capture" CARGO_HOME "$fixture/hosted-cache"
 
 # Caller flags may contain the policy flags before a later override. The
 # Dylint flags must be last so both lint levels retain their intended effect.
@@ -181,66 +252,8 @@ run_dylint "$fixture/external" \
 grep -Fq 'unavailable or not 6.1.0' "$stdout_file" || fail 'missing unavailable pinned tools message'
 expect "$install_capture" argv 'install cargo-dylint dylint-link --locked --version 6.1.0 --force'
 
-cat > "$fixture/bin/git" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ "${1:-}" = ls-remote ]; then
-  printf '%s refs/tags/v6.1.0\n' '8aeea4b0c27722d46fcc8288330401418328e8fa'
-  exit 0
-fi
-exec /usr/bin/git "$@"
-SH
-chmod +x "$fixture/bin/git"
-
-cat > "$fixture/bin/curl" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ "${DYLINT_TEST_CURL_FAIL:-0}" = 1 ]; then
-  echo "dylint test curl: network down" >&2
-  exit 1
-fi
-printf '%s\n' '[toolchain]' 'channel = "nightly-2026-08-20"' 'components = ["llvm-tools-preview", "rustc-dev"]'
-SH
-chmod +x "$fixture/bin/curl"
-
-cat > "$fixture/bin/rustc" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ "${DYLINT_TEST_RUSTC_FAIL:-0}" = 1 ]; then
-  exit 1
-fi
-if [ -n "${DYLINT_TEST_TOOLCHAIN_STATE:-}" ] && [ ! -f "$DYLINT_TEST_TOOLCHAIN_STATE" ]; then
-  echo 'dylint test rustc: toolchain is not installed (auto-install disabled)' >&2
-  exit 1
-fi
-if [ "${1:-}" = '+nightly-2026-08-20' ] && [ "${2:-}" = -vV ]; then
-  printf '%s\n' 'commit-hash: abcdefabcdefabcdefabcdefabcdefabcdefabcd' 'host: x86_64-unknown-linux-gnu'
-  exit 0
-fi
-echo "dylint test rustc: unexpected invocation: $*" >&2
-exit 1
-SH
-chmod +x "$fixture/bin/rustc"
-
-# Provisioning must explicitly install a missing nightly before querying its
-# compiler identity, including when rustup's automatic installation is disabled.
-cat > "$fixture/bin/rustup" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-case "$*" in
-  'component list --toolchain nightly-2026-08-20')
-    [ -f "$DYLINT_TEST_TOOLCHAIN_STATE" ] || exit 1
-    printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)' 'rustc-dev-x86_64-unknown-linux-gnu (installed)'
-    ;;
-  'toolchain install nightly-2026-08-20 --component llvm-tools-preview,rustc-dev')
-    echo installed >> "$DYLINT_TEST_TOOLCHAIN_STATE"
-    ;;
-  *) echo "dylint test rustup: unexpected invocation: $*" >&2; exit 1 ;;
-esac
-SH
-chmod +x "$fixture/bin/rustup"
-# Load the production functions without running the unrelated tool/library builds.
-sed '/^ensure_main_toolchain$/,$d' "$fixture/ci-agent-setup.sh" > "$fixture/setup-functions.sh"
+# Load shared dylint helpers without running the main dylint driver.
+sed '/^mapfile -t library_tags/,$d' "$fixture/project/scripts/dylint.sh" > "$fixture/setup-functions.sh"
 (
   cd "$fixture/project"
   export PATH="$fixture/bin:$PATH"
@@ -255,6 +268,19 @@ sed '/^ensure_main_toolchain$/,$d' "$fixture/ci-agent-setup.sh" > "$fixture/setu
   [ "$(wc -l < "$DYLINT_TEST_TOOLCHAIN_STATE")" -eq 1 ] \
     || fail 'provisioning reinstalled an already complete nightly'
 )
+
+partial_state="$fixture/partial-toolchain"
+touch "$partial_state"
+run_dylint "$fixture/external" \
+  DYLINT_TEST_TOOLCHAIN_STATE="$partial_state" DYLINT_TEST_PARTIAL_COMPONENTS=1
+grep -Fq 'toolchain-nightly-2026-08-20: installed' "$stdout_file" \
+  || fail 'missing toolchain install for partial components'
+[ "$(wc -l < "$partial_state")" -eq 1 ] || fail 'partial toolchain install did not record state'
+
+if run_dylint "$fixture/external" \
+  DYLINT_TEST_TOOLCHAIN_STATE="$fixture/missing-toolchain" DYLINT_TEST_RUSTUP_FAIL=1 >/dev/null 2>&1; then
+  fail 'rustup install failure must abort dylint'
+fi
 
 key_body_file="$fixture/key-body.txt"
 lib_key_dir="$prefix/dylint-libs"
@@ -306,15 +332,11 @@ run_dylint "$fixture/external" DYLINT_TEST_RUSTC_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message'
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 
-run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1
-grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message for curl'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
-
-setup_key="$(sed -n '/^# BEGIN dylint-lib-key$/,/^# END dylint-lib-key$/p' "$fixture/ci-agent-setup.sh")"
-dylint_key="$(sed -n '/^# BEGIN dylint-lib-key$/,/^# END dylint-lib-key$/p' "$fixture/project/scripts/dylint.sh")"
-if [ "$setup_key" != "$dylint_key" ]; then
-  fail 'dylint-lib-key regions differ between ci-agent-setup.sh and dylint.sh'
+if run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1 >/dev/null 2>&1; then
+  fail 'dylint toolchain lookup failure must abort'
 fi
+grep -Fq 'dylint toolchain lookup failed' "$stdout_file" \
+  || fail 'missing dylint toolchain lookup failed message for curl'
 
 while IFS= read -r line; do
   if [[ "$line" == *dylint-libs* ]]; then

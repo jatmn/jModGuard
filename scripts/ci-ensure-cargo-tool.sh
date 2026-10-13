@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Shared by scripts/ci-preflight.sh and scripts/ci-preflight-test.sh.
-JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
+  if [ -n "${HOME:-}" ]; then
+    JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
+  else
+    JMODGUARD_CI_PREFIX=/opt/jmodguard-ci
+  fi
+fi
 
 cargo_tool_version_last_field() {
   local tool="$1"
@@ -14,10 +20,10 @@ jmodguard_preflight_cargo_tool_root() {
     printf '%s\n' "$JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT"
     return 0
   fi
-  local root checkout="${BUILDKITE_BUILD_CHECKOUT_PATH:-$PWD}"
+  local root checkout="${GITHUB_WORKSPACE:-$PWD}"
   mkdir -p "$checkout/target"
-  if [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
-    root="$checkout/target/ci-preflight-tools-${BUILDKITE_BUILD_ID}"
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then
+    root="$checkout/target/ci-preflight-tools-${GITHUB_RUN_ID}"
   else
     root="$(mktemp -d "$checkout/target/ci-preflight-tools.XXXXXX")"
   fi
