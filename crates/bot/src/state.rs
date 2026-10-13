@@ -146,6 +146,22 @@ impl GatewayManualBanAuditQueue {
     fn clear(&mut self, guild: u64, user: u64) {
         self.entries.remove(&(guild, user));
     }
+
+    fn drop_entry(&mut self, guild: u64, user: u64, entry_id: i64) {
+        if entry_id <= 0 {
+            return;
+        }
+        let now = Instant::now();
+        self.prune(now);
+        let key = (guild, user);
+        let Some(deque) = self.entries.get_mut(&key) else {
+            return;
+        };
+        deque.retain(|(queued, _)| *queued != entry_id);
+        if deque.is_empty() {
+            self.entries.remove(&key);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1044,6 +1060,17 @@ impl BotState {
         self.gateway_manual_ban_audit_entries
             .lock()
             .clear(guild_id, user_id);
+    }
+
+    pub(crate) fn drop_gateway_manual_ban_audit_entry(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        entry_id: i64,
+    ) {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .drop_entry(guild_id, user_id, entry_id);
     }
 
     #[cfg(test)]

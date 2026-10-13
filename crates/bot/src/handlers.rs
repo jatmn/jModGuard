@@ -465,9 +465,26 @@ impl EventHandler for Handler {
             observed.timestamp_millis(),
         )
         .await;
-        let gateway_audit_entry_id = self
-            .app
-            .consume_gateway_manual_ban_audit_entry(guild_id.get(), banned_user.id.get());
+        let gateway_audit_entry_id = {
+            let consumed = self
+                .app
+                .consume_gateway_manual_ban_audit_entry(guild_id.get(), banned_user.id.get());
+            match consumed {
+                Some(entry_id) => {
+                    let known = crate::db::gateway_manual_ban_audit_entry_is_known(
+                        &app.db,
+                        enrollment.clone(),
+                        guild_id.get() as i64,
+                        banned_user.id.get() as i64,
+                        entry_id,
+                    )
+                    .await
+                    .unwrap_or(false);
+                    if known { None } else { Some(entry_id) }
+                }
+                None => None,
+            }
+        };
         let echo = echo.resolve();
         let observed_at = observed.to_rfc3339();
         // A bot echo is not a second ban and not a manual moderation record.
@@ -699,11 +716,51 @@ impl EventHandler for Handler {
             )
         {
             if matches!(action, crate::db::guild_data::CaseAction::Ban) {
-                self.app.queue_gateway_manual_ban_audit_entry(
-                    guild_id.get(),
-                    target.get(),
-                    entry_id,
-                );
+                let guild = guild_id.get();
+                let user = target.get();
+                let enrollment = crate::cases::capture(self.app(), guild).await;
+                let reconciled = if let Some(enrollment) = enrollment.clone() {
+                    crate::db::reconcile_gateway_manual_ban_audit_entry(
+                        &self.app.db,
+                        Some(enrollment),
+                        guild as i64,
+                        user as i64,
+                        entry_id,
+                    )
+                    .await
+                } else {
+                    Ok(false)
+                };
+                match reconciled {
+                    Ok(true) => {
+                        self.app
+                            .drop_gateway_manual_ban_audit_entry(guild, user, entry_id);
+                    }
+                    Ok(false) => {
+                        let known = if let Some(enrollment) = enrollment {
+                            crate::db::gateway_manual_ban_audit_entry_is_known(
+                                &self.app.db,
+                                Some(enrollment),
+                                guild as i64,
+                                user as i64,
+                                entry_id,
+                            )
+                            .await
+                            .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if !known {
+                            self.app
+                                .queue_gateway_manual_ban_audit_entry(guild, user, entry_id);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("gateway manual ban audit reconcile failed: {error:#}");
+                        self.app
+                            .queue_gateway_manual_ban_audit_entry(guild, user, entry_id);
+                    }
+                }
             }
             // The audit snowflake is the durable action identity. A repeat ban
             // or unban has a different ID; a replay of this entry is idempotent.
@@ -1406,6 +1463,100 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[tokio::test]
+    async fn gateway_ban_live_path_records_distinct_manual_bans_when_audit_arrives_late() {
+        use serenity::all::{User, UserId};
+
+        let directory = std::env::temp_dir().join(format!(
+            "gateway_ban_late_audit_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("core.db");
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = db_path.clone();
+        let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
+        app.reset_gateway_ban_path_test_phases();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+        store
+            .initialize_member_directory(scope.clone(), 42, 1_000)
+            .await
+            .unwrap();
+        drop(store);
+        let mut user = User::default();
+        user.id = UserId::new(55);
+        user.name = "member".into();
+
+        let precheck =
+            super::gateway_ban_directory_precheck_then_observe(&app, 10, &user, 5_000).await;
+        assert!(!precheck);
+        let first = crate::db::record_gateway_ban_with_audit(
+            &app.db,
+            Some(enrollment.clone()),
+            55,
+            Some("member"),
+            None,
+            Some("2024-03-01T00:00:00+00:00"),
+            false,
+            None,
+            precheck,
+            None,
+        )
+        .await
+        .unwrap();
+        let crate::db::GatewayBanWrite::Recorded { row_id: first_id } = first else {
+            panic!("first live-path ban must insert, got {first:?}");
+        };
+        assert!(
+            crate::db::reconcile_gateway_manual_ban_audit_entry(
+                &app.db,
+                Some(enrollment.clone()),
+                10,
+                55,
+                30_001,
+            )
+            .await
+            .unwrap()
+        );
+        app.drop_gateway_manual_ban_audit_entry(10, 55, 30_001);
+
+        let precheck =
+            super::gateway_ban_directory_precheck_then_observe(&app, 10, &user, 35_000).await;
+        assert!(precheck);
+        let consumed = app.consume_gateway_manual_ban_audit_entry(10, 55);
+        assert_eq!(consumed, None);
+        let second = crate::db::record_gateway_ban_with_audit(
+            &app.db,
+            Some(enrollment.clone()),
+            55,
+            Some("member"),
+            None,
+            Some("2024-03-01T00:00:30+00:00"),
+            false,
+            None,
+            precheck,
+            consumed,
+        )
+        .await
+        .unwrap();
+        let crate::db::GatewayBanWrite::Recorded { row_id: second_id } = second else {
+            panic!("second live-path ban must insert after late audit reconcile, got {second:?}");
+        };
+        assert_ne!(first_id, second_id);
+        let rows = crate::db::list_enrolled_bans(&app.db, enrollment, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+        assert_eq!(rows.iter().find(|row| row.active).unwrap().id, second_id);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
