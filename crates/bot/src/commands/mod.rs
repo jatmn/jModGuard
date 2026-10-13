@@ -492,9 +492,10 @@ pub async fn handle_prefix(
         // Give the user feedback instead of silence: reply only to short
         // inputs so stray characters can't trigger spam.
         prefix_unknown_command_reply(
-            &app.activation,
+            app,
             msg.channel_id,
             http,
+            guild_id.get(),
             name,
             prefix,
             raw_args,
@@ -526,7 +527,7 @@ pub async fn handle_prefix(
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, msg.channel_id) {
         let text = format!("{} — {reason}", member.display_name());
-        if raced_channel_say(&app.activation, msg.channel_id, http, text).await
+        if raced_channel_say(app, msg.channel_id, http, guild_id.get(), text).await
             == RacedWrite::Cutoff
         {
             tracing::warn!("enforcement denial reply suppressed after writer cutoff");
@@ -536,9 +537,10 @@ pub async fn handle_prefix(
 
     if !cooldown_check(app, guild_id, msg.author.id, &cmd) {
         if raced_channel_say(
-            &app.activation,
+            app,
             msg.channel_id,
             http,
+            guild_id.get(),
             "that command is on cooldown".into(),
         )
         .await
@@ -571,7 +573,8 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            send_prefix_command_error(&app.activation, msg.channel_id, http, &cmd.name, &e).await;
+            send_prefix_command_error(app, msg.channel_id, http, guild_id.get(), &cmd.name, &e)
+                .await;
             return Ok(true);
         }
     };
@@ -589,10 +592,12 @@ pub async fn handle_prefix(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prefix_unknown_command_reply(
-    activation: &crate::activation::Activation,
+    app: &Arc<BotState>,
     channel_id: serenity::model::id::ChannelId,
     http: &serenity::http::Http,
+    guild_id: u64,
     name: &str,
     prefix: &str,
     raw_args: &str,
@@ -600,7 +605,7 @@ async fn prefix_unknown_command_reply(
 ) {
     if raw_args.is_empty() && body.chars().count() <= 32 {
         let reply = format!("Unknown command `{name}`. Use `{prefix}help` to list commands.");
-        if raced_channel_say(activation, channel_id, http, reply).await == RacedWrite::Cutoff {
+        if raced_channel_say(app, channel_id, http, guild_id, reply).await == RacedWrite::Cutoff {
             tracing::warn!("unknown-command reply suppressed after writer cutoff");
         }
     }
@@ -948,14 +953,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
 }
 
 async fn send_prefix_command_error(
-    activation: &crate::activation::Activation,
+    app: &Arc<BotState>,
     channel_id: serenity::model::id::ChannelId,
     http: &serenity::http::Http,
+    guild_id: u64,
     command_name: &str,
     error: &anyhow::Error,
 ) {
     let reply = format!("error: {error:#}");
-    if raced_channel_say(activation, channel_id, http, reply).await == RacedWrite::Cutoff {
+    if raced_channel_say(app, channel_id, http, guild_id, reply).await == RacedWrite::Cutoff {
         tracing::warn!(
             "command `{command_name}` error reply suppressed after writer cutoff: {error:#}"
         );
@@ -1036,14 +1042,37 @@ fn raced_write_chain(first: RacedWrite, second: RacedWrite) -> RacedWrite {
 }
 
 async fn raced_channel_say(
-    activation: &crate::activation::Activation,
+    app: &Arc<BotState>,
     channel_id: ChannelId,
     http: &serenity::http::Http,
+    guild_id: u64,
     text: String,
 ) -> RacedWrite {
-    match crate::discord::race_discord_call(activation, channel_id.say(http, text)).await {
-        crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: guild_id,
+        channel: channel_id.get(),
+    };
+    if app
+        .remembered_discord_targets
+        .blocked(target, std::time::Instant::now())
+    {
+        return RacedWrite::Finished;
+    }
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    match crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await {
+        crate::discord::DiscordCall::Finished(Ok(_)) => {
+            app.remembered_discord_targets.forget(target);
+            RacedWrite::Finished
+        }
         crate::discord::DiscordCall::Finished(Err(error)) => {
+            app.remembered_discord_targets.observe_discord_error(
+                recovery,
+                &error,
+                target,
+                std::time::Instant::now(),
+            );
             tracing::warn!("failed to send channel message: {error}");
             RacedWrite::Finished
         }
@@ -1267,7 +1296,8 @@ async fn send_outcome(
     outcome: BehaviorOutcome,
 ) {
     if let Some(text) = prefix_response_text(cmd, &outcome)
-        && raced_channel_say(&app.activation, channel_id, http, text).await == RacedWrite::Cutoff
+        && raced_channel_say(app, channel_id, http, guild_id.get(), text).await
+            == RacedWrite::Cutoff
     {
         return;
     }
@@ -2165,17 +2195,19 @@ mod tests {
 
     #[tokio::test]
     async fn send_outcome_suppresses_reply_when_cutoff_wins_during_await() {
-        let activation = std::sync::Arc::new(crate::activation::Activation::new());
-        activation.mark_lock_held(true);
-        cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&activation)).await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&app.activation)).await;
         let http = serenity::http::HttpBuilder::new("fixture")
             .application_id(serenity::model::id::ApplicationId::new(1))
             .ratelimiter_disabled(true)
             .build();
         assert_eq!(
-            raced_channel_say(&activation, ChannelId::new(1), &http, "pong".into()).await,
+            raced_channel_say(&app, ChannelId::new(1), &http, 10, "pong".into()).await,
             RacedWrite::Cutoff
         );
+        drop(app);
+        remove_command_test_db(&path);
     }
 
     #[tokio::test]
@@ -2358,13 +2390,14 @@ mod tests {
         app.activation.mark_lock_held(true);
         let http = Arc::new(http);
         let task = tokio::spawn({
-            let activation = std::sync::Arc::clone(&app.activation);
+            let app = Arc::clone(&app);
             let http = Arc::clone(&http);
             async move {
                 prefix_unknown_command_reply(
-                    &activation,
+                    &app,
                     ChannelId::new(20),
                     http.as_ref(),
+                    10,
                     "nosuch",
                     "!",
                     "",
@@ -2385,6 +2418,51 @@ mod tests {
             .await
             .expect("cutoff must cancel the unknown-command reply without waiting for REST timeout")
             .unwrap();
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn raced_channel_say_skips_after_permanent_channel_failure() {
+        use std::sync::atomic::Ordering;
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "remembered 403 must not issue another REST call"
+        );
+        app.invalidate_configs();
+        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "config invalidation must clear remembered channel failures"
+        );
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn oversized_prefix_reply_does_not_block_valid_follow_up() {
+        use std::sync::atomic::Ordering;
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        raced_channel_say(&app, ChannelId::new(40), &http, 10, "x".repeat(2001)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        raced_channel_say(&app, ChannelId::new(40), &http, 10, "hello".into()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "payload validation failures must not park the channel"
+        );
         server.abort();
         drop(app);
         remove_command_test_db(&path);

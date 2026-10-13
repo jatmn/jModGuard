@@ -399,6 +399,81 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
+    crate::discord::DiscordRestTarget::AutomodDelete { guild, channel }
+}
+
+fn automod_member_target(
+    guild: u64,
+    user: u64,
+    action: &str,
+) -> Option<crate::discord::DiscordRestTarget> {
+    crate::discord::AutomodRestAction::from_action(action).map(|kind| {
+        crate::discord::DiscordRestTarget::AutomodMember {
+            guild,
+            user,
+            action: kind,
+        }
+    })
+}
+
+async fn automod_try_delete_message(
+    app: &BotState,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+) {
+    let target = automod_delete_target(guild_id, channel);
+    if app
+        .remembered_discord_targets
+        .blocked(target, Instant::now())
+    {
+        return;
+    }
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(target);
+    if let crate::discord::DiscordCall::Finished(Err(error)) = crate::discord::race_discord_call(
+        &app.activation,
+        http.delete_message(channel.into(), message.into(), None),
+    )
+    .await
+    {
+        app.remembered_discord_targets.remember_rest_rejection(
+            recovery,
+            &error,
+            target,
+            Instant::now(),
+        );
+    }
+}
+
+fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
+    automod_member_target(guild, user, action).is_some_and(|target| {
+        app.remembered_discord_targets
+            .blocked(target, Instant::now())
+    })
+}
+
+fn automod_remember_member_failure(
+    app: &BotState,
+    since: crate::discord::RecoveryEpoch,
+    guild: u64,
+    user: u64,
+    action: &str,
+    error: &serenity::Error,
+) {
+    if let Some(target) = automod_member_target(guild, user, action) {
+        app.remembered_discord_targets.remember_rest_rejection(
+            since,
+            error,
+            target,
+            Instant::now(),
+        );
+    }
+}
+
 /// Executes a decided automod action (or logs it in dry-run mode).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_pending(
@@ -573,11 +648,7 @@ pub(crate) async fn execute_pending_with(
             if !app.activation.may_record() {
                 return;
             }
-            let _ = crate::discord::race_discord_call(
-                &app.activation,
-                http.delete_message(ch.into(), id.into(), None),
-            )
-            .await;
+            automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
         }
         // This return precedes the ban handoff and operation identity creation.
         if log_automod {
@@ -603,11 +674,7 @@ pub(crate) async fn execute_pending_with(
                 if !app.activation.may_record() {
                     return;
                 }
-                let _ = crate::discord::race_discord_call(
-                    &app.activation,
-                    http.delete_message(ch.into(), id.into(), None),
-                )
-                .await;
+                automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
             }
         }
         "warn" => {
@@ -664,20 +731,41 @@ pub(crate) async fn execute_pending_with(
                     if !app.activation.may_record() {
                         return;
                     }
-                    match crate::discord::race_discord_call(
-                        &app.activation,
-                        member.disable_communication_until_datetime(http, until),
-                    )
-                    .await
-                    {
-                        crate::discord::DiscordCall::Cancelled => {
-                            discord_err = Some(crate::discord::cutoff_discord_error());
+                    if automod_member_blocked(app, guild_id.get(), target.id.get(), "timeout") {
+                        called = false;
+                    } else {
+                        let recovery =
+                            automod_member_target(guild_id.get(), target.id.get(), "timeout").map(
+                                |member_target| {
+                                    app.remembered_discord_targets
+                                        .capture_recovery_epoch(member_target)
+                                },
+                            );
+                        match crate::discord::race_discord_call(
+                            &app.activation,
+                            member.disable_communication_until_datetime(http, until),
+                        )
+                        .await
+                        {
+                            crate::discord::DiscordCall::Cancelled => {
+                                discord_err = Some(crate::discord::cutoff_discord_error());
+                            }
+                            crate::discord::DiscordCall::Finished(result) => {
+                                if let (Some(recovery), Err(error)) = (recovery, &result) {
+                                    automod_remember_member_failure(
+                                        app,
+                                        recovery,
+                                        guild_id.get(),
+                                        target.id.get(),
+                                        "timeout",
+                                        error,
+                                    );
+                                }
+                                discord_err = result.err();
+                            }
                         }
-                        crate::discord::DiscordCall::Finished(result) => {
-                            discord_err = result.err();
-                        }
+                        called = true;
                     }
-                    called = true;
                 } else {
                     tracing::warn!("automod timeout: could not build Discord timeout timestamp");
                 }
@@ -722,18 +810,39 @@ pub(crate) async fn execute_pending_with(
                 if !app.activation.may_record() {
                     return;
                 }
-                let discord_err = match crate::discord::race_discord_call(
-                    &app.activation,
-                    member.kick_with_reason(http, &reason),
-                )
-                .await
-                {
-                    crate::discord::DiscordCall::Cancelled => {
-                        Some(crate::discord::cutoff_discord_error())
-                    }
-                    crate::discord::DiscordCall::Finished(result) => result.err(),
-                };
-                (true, discord_err)
+                if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
+                    (false, None)
+                } else {
+                    let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
+                        .map(|member_target| {
+                            app.remembered_discord_targets
+                                .capture_recovery_epoch(member_target)
+                        });
+                    let discord_err = match crate::discord::race_discord_call(
+                        &app.activation,
+                        member.kick_with_reason(http, &reason),
+                    )
+                    .await
+                    {
+                        crate::discord::DiscordCall::Cancelled => {
+                            Some(crate::discord::cutoff_discord_error())
+                        }
+                        crate::discord::DiscordCall::Finished(result) => {
+                            if let (Some(recovery), Err(error)) = (recovery, &result) {
+                                automod_remember_member_failure(
+                                    app,
+                                    recovery,
+                                    guild_id.get(),
+                                    target.id.get(),
+                                    "kick",
+                                    error,
+                                );
+                            }
+                            result.err()
+                        }
+                    };
+                    (true, discord_err)
+                }
             } else {
                 tracing::warn!("automod kick: no guild member for {}", target.id);
                 (false, None)
@@ -868,24 +977,72 @@ pub(crate) async fn execute_pending_with(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
-                            let raced = crate::discord::race_discord_call(
-                                &app.activation,
-                                guild_id.ban_with_reason(
-                                    http,
-                                    target.id,
-                                    rule.delete_days,
-                                    &discord_reason,
-                                ),
-                            )
-                            .await;
+                            let raced = if automod_member_blocked(
+                                app,
+                                guild_id.get(),
+                                target.id.get(),
+                                "ban",
+                            ) {
+                                None
+                            } else {
+                                let recovery =
+                                    automod_member_target(guild_id.get(), target.id.get(), "ban")
+                                        .map(|member_target| {
+                                            app.remembered_discord_targets
+                                                .capture_recovery_epoch(member_target)
+                                        });
+                                Some((
+                                    recovery,
+                                    crate::discord::race_discord_call(
+                                        &app.activation,
+                                        guild_id.ban_with_reason(
+                                            http,
+                                            target.id,
+                                            rule.delete_days,
+                                            &discord_reason,
+                                        ),
+                                    )
+                                    .await,
+                                ))
+                            };
                             match raced {
-                                crate::discord::DiscordCall::Cancelled => {
+                                None => {
+                                    app.release_gateway_case_suppression(suppression);
+                                    if app.activation.may_record() {
+                                        if let Some(attempt) = attempted {
+                                            attempt
+                                                .finish(
+                                                    app,
+                                                    crate::db::guild_data::CaseOutcome::Failed,
+                                                )
+                                                .await;
+                                        }
+                                        pending_ban
+                                            .finish(app, crate::db::guild_data::CaseOutcome::Failed)
+                                            .await;
+                                    }
+                                    publish_report = false;
+                                }
+                                Some((_, crate::discord::DiscordCall::Cancelled)) => {
                                     pending_ban
                                         .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
                                         .await;
                                     publish_report = false;
                                 }
-                                crate::discord::DiscordCall::Finished(discord) => {
+                                Some((
+                                    recovery,
+                                    crate::discord::DiscordCall::Finished(discord),
+                                )) => {
+                                    if let (Some(recovery), Err(error)) = (recovery, &discord) {
+                                        automod_remember_member_failure(
+                                            app,
+                                            recovery,
+                                            guild_id.get(),
+                                            target.id.get(),
+                                            "ban",
+                                            error,
+                                        );
+                                    }
                                     let outcome =
                                         crate::cases::classify_discord(discord.err().as_ref());
                                     if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed)
