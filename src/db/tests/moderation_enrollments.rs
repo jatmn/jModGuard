@@ -3510,3 +3510,274 @@ async fn pending_new_ban_audit_does_not_attach_to_an_older_idless_ban() {
         );
     }
 }
+
+#[tokio::test]
+async fn late_audit_recovers_existing_observation_without_unban_after_reopen() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:00Z"),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("CREATE TRIGGER fail_observation BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'injected observation failure'); END;", 4096)?;
+        Ok(())
+    }).await.unwrap();
+    let error = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:30Z"),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("injected observation failure"));
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER fail_observation", 4096)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let second = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:30Z"),
+        false,
+        None,
+        true,
+        GatewayBanAuditEntries::Pending(vec![]),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id } = first else {
+        panic!("first ban missing")
+    };
+    assert_eq!(second, GatewayBanWrite::Existing { row_id });
+    assert_eq!(
+        list_enrolled_bans(&f.db, scope.clone(), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let reopened = Db::open(&f.path, 2).unwrap();
+    let audit = 1_212_912_311_992_320_001;
+    assert!(
+        reconcile_gateway_manual_ban_audit_entry(&reopened, Some(scope.clone()), 10, 55, audit)
+            .await
+            .unwrap()
+    );
+    assert!(
+        reconcile_gateway_manual_ban_audit_entry(&reopened, Some(scope.clone()), 10, 55, audit)
+            .await
+            .unwrap()
+    );
+    let rows = list_enrolled_bans(&reopened, scope.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().filter(|r| r.active).count(), 1);
+    assert!(!rows.iter().find(|r| r.id == row_id).unwrap().active);
+    let events = query_enrolled_events(&reopened, scope, Some("member_ban"), Some(55), 50)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| event_audit_id(e) == Some(audit.to_string()))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn existing_observation_retry_and_late_audit_do_not_reactivate_a_newer_ban() {
+    for newer_ban in [false, true] {
+        let f = Fixture::new();
+        let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+        for at in [
+            "2024-03-01T00:00:00Z",
+            "2024-03-01T00:00:30Z",
+            "2024-03-01T00:00:30Z",
+        ] {
+            record_gateway_ban(
+                &f.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some(at),
+                false,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            list_enrolled_bans(&f.db, scope.clone(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        mark_enrolled_unbanned(&f.db, Some(scope.clone()), 55)
+            .await
+            .unwrap();
+        if newer_ban {
+            record_gateway_ban(
+                &f.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some("2024-03-01T00:01:30Z"),
+                false,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        f.db.with_conn(|conn| {
+            conn.execute_batch_bounded("CREATE TRIGGER fail_late_event BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'injected late audit failure'); END;", 4096)?;
+            Ok(())
+        }).await.unwrap();
+        let audit = 1_212_912_311_992_320_001;
+        let error =
+            reconcile_gateway_manual_ban_audit_entry(&f.db, Some(scope.clone()), 10, 55, audit)
+                .await
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("injected late audit failure"));
+        assert_eq!(
+            list_enrolled_bans(&f.db, scope.clone(), 10)
+                .await
+                .unwrap()
+                .len(),
+            if newer_ban { 2 } else { 1 }
+        );
+        f.db.with_conn(|conn| {
+            conn.execute_batch_bounded("DROP TRIGGER fail_late_event", 4096)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            reconcile_gateway_manual_ban_audit_entry(&f.db, Some(scope.clone()), 10, 55, audit)
+                .await
+                .unwrap()
+        );
+        let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+        assert_eq!(rows.len(), if newer_ban { 3 } else { 2 });
+        assert_eq!(
+            rows.iter().filter(|r| r.active).count(),
+            usize::from(newer_ban)
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r.active)
+                .all(|r| r.created_at == "2024-03-01T00:01:30Z")
+        );
+    }
+}
+
+#[tokio::test]
+async fn existing_observations_are_bounded_and_lost_candidates_stay_ambiguous() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    for second in 0..20 {
+        let at = format!("2024-03-01T00:00:{second:02}Z");
+        record_gateway_ban(
+            &f.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&at),
+            false,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let events = query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(55), 50)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let data: serde_json::Value = serde_json::from_str(events[0].data.as_deref().unwrap()).unwrap();
+    assert_eq!(data["gateway_observations"].as_array().unwrap().len(), 8);
+    // The dropped observation at 10 seconds cannot leave its surviving
+    // neighbors looking uniquely attributable. Nor can the remaining cluster.
+    for second in [10, 14] {
+        let audit = 1_212_912_186_163_200_001 + ((second * 1000) << 22);
+        assert!(
+            !reconcile_gateway_manual_ban_audit_entry(&f.db, Some(scope.clone()), 10, 55, audit)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(list_enrolled_bans(&f.db, scope, 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn multiple_existing_observations_advance_active_ban_in_observation_order() {
+    for reverse in [false, true] {
+        let f = Fixture::new();
+        let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+        for second in [0, 20, 40] {
+            let at = format!("2024-03-01T00:00:{second:02}Z");
+            record_gateway_ban(
+                &f.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some(&at),
+                false,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            list_enrolled_bans(&f.db, scope.clone(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for second in if reverse { [40, 20] } else { [20, 40] } {
+            let audit = 1_212_912_186_163_200_001 + ((second * 1000) << 22);
+            assert!(
+                reconcile_gateway_manual_ban_audit_entry(&f.db, Some(scope.clone()), 10, 55, audit)
+                    .await
+                    .unwrap()
+            );
+        }
+        let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let active: Vec<_> = rows.iter().filter(|r| r.active).collect();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].created_at.starts_with("2024-03-01T00:00:40"));
+    }
+}

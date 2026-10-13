@@ -105,6 +105,50 @@ struct GatewayBanEchoEntry {
     released: Arc<AtomicBool>,
 }
 
+/// Fixed shards bound memory even with abandoned callbacks. Hash collisions
+/// only defer attribution; they cannot authorize a match for another subject.
+struct GatewayBanFlight {
+    active: usize,
+    uncertain_through_ms: i64,
+}
+
+pub(crate) struct GatewayBanObservation<'a> {
+    flight: &'a Mutex<GatewayBanFlight>,
+    pub(crate) observed: chrono::DateTime<chrono::Utc>,
+    saved: bool,
+}
+
+impl GatewayBanObservation<'_> {
+    pub(crate) fn audit_after_ms(&self) -> i64 {
+        let flight = self.flight.lock();
+        if flight.active > 1 {
+            flight
+                .uncertain_through_ms
+                .max(self.observed.timestamp_millis())
+        } else {
+            flight.uncertain_through_ms
+        }
+    }
+
+    pub(crate) fn finish(mut self, saved: bool) {
+        self.saved = saved;
+    }
+}
+
+impl Drop for GatewayBanObservation<'_> {
+    fn drop(&mut self) {
+        let mut flight = self.flight.lock();
+        if !self.saved {
+            // Failure or cancellation must not turn a younger row into the
+            // only candidate for this callback's audit, including late SQL.
+            flight.uncertain_through_ms = flight
+                .uncertain_through_ms
+                .max(self.observed.timestamp_millis());
+        }
+        flight.active -= 1;
+    }
+}
+
 #[derive(Default)]
 struct GatewayManualBanAuditQueue {
     entries: HashMap<(u64, u64), VecDeque<(i64, Instant)>>,
@@ -590,6 +634,7 @@ pub struct BotState {
     slash_retries: Mutex<HashMap<u64, SlashRetry>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
+    gateway_ban_flights: [Mutex<GatewayBanFlight>; 256],
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
@@ -679,6 +724,14 @@ impl BotState {
             slash_retries: Mutex::new(HashMap::new()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
+            gateway_ban_flights: std::array::from_fn(|_| {
+                Mutex::new(GatewayBanFlight {
+                    active: 0,
+                    // A restart lost earlier in-flight observations. New rows must
+                    // not claim audit actions from before this process started.
+                    uncertain_through_ms: chrono::Utc::now().timestamp_millis(),
+                })
+            }),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
@@ -1032,6 +1085,28 @@ impl BotState {
 
     pub(crate) fn acknowledge_member_gap(&self, gap: &PendingMemberGap) {
         self.pending_member_gaps.lock().acknowledge(gap);
+    }
+
+    pub(crate) fn begin_gateway_ban_observation(
+        &self,
+        guild: u64,
+        user: u64,
+    ) -> GatewayBanObservation<'_> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (guild, user).hash(&mut hasher);
+        let flight =
+            &self.gateway_ban_flights[hasher.finish() as usize % self.gateway_ban_flights.len()];
+        let mut state = flight.lock();
+        state.active += 1;
+        // Register before sampling time, and before the first await.
+        let observed = chrono::Utc::now();
+        drop(state);
+        GatewayBanObservation {
+            flight,
+            observed,
+            saved: false,
+        }
     }
 
     /// Retain audit identities until their own persisted ban can be reconciled.
@@ -1726,6 +1801,46 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ban_observation_failure_and_restart_keep_attribution_fences_bounded() {
+        let directory =
+            std::env::temp_dir().join(format!("ban_flight_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("core.db");
+        let before_start = chrono::Utc::now().timestamp_millis();
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let mut failed = app.begin_gateway_ban_observation(10, 55);
+        assert!(failed.audit_after_ms() >= before_start);
+        let failed_at = failed.observed.timestamp_millis() + 1000;
+        failed.observed = chrono::DateTime::from_timestamp_millis(failed_at).unwrap();
+        failed.finish(false);
+        let retry = app.begin_gateway_ban_observation(10, 55);
+        assert_eq!(retry.audit_after_ms(), failed_at);
+        retry.finish(true);
+        let mut cancelled = app.begin_gateway_ban_observation(10, 55);
+        cancelled.observed = chrono::DateTime::from_timestamp_millis(failed_at + 1).unwrap();
+        drop(cancelled);
+        let retry = app.begin_gateway_ban_observation(10, 55);
+        assert_eq!(retry.audit_after_ms(), failed_at + 1);
+        retry.finish(true);
+        // Distinct targets never allocate additional shards, and successful
+        // completion releases counts without discarding uncertainty cutoffs.
+        for user in 1..4096 {
+            app.begin_gateway_ban_observation(10, user).finish(true);
+        }
+        assert_eq!(app.gateway_ban_flights.len(), 256);
+        assert!(app.gateway_ban_flights.iter().all(|f| f.lock().active == 0));
+        drop(app);
+        let before_restart = chrono::Utc::now().timestamp_millis();
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let next = app.begin_gateway_ban_observation(10, 55);
+        assert!(next.audit_after_ms() >= before_restart);
+        next.finish(true);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     use crate::config::BotProcessConfig;
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
