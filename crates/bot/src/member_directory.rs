@@ -576,6 +576,8 @@ pub(crate) async fn member_directory_shows_banned(
         "ban mirror precheck unavailable",
     )
     .await?;
+    #[cfg(test)]
+    app.record_gateway_ban_path_test_phase("precheck");
     match store.get_member(scope, user_id as i64).await {
         Ok(Some(member)) => Some(member.is_banned),
         Ok(None) => Some(false),
@@ -592,6 +594,8 @@ pub async fn observe_ban(
     user: &User,
     observed_at_ms: i64,
 ) -> Option<bool> {
+    #[cfg(test)]
+    app.record_gateway_ban_path_test_phase("observe");
     let user_id = user.id.get();
     let contested = app.begin_ban_observation(guild_id, user_id);
     let _end = BanObservation::new(app, guild_id, user_id);

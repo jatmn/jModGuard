@@ -118,7 +118,7 @@ extract_handler guild_ban_addition | awk '
   /\.await/ && !first_await { first_await = NR }
   /\.await/ && !mirror { last_initial_await = NR }
   /let echo = echo\.resolve\(\);/ { resolved = NR }
-  /db::record_gateway_ban\(/ { mirror = NR }
+  /db::record_gateway_ban_with_audit\(/ { mirror = NR }
   /crate::cases::record\(/ { external_case = NR }
   /logging::lookup_member_audit\(/ { audit = NR }
   END { exit !(suppression && first_await && resolved && mirror && external_case && audit && suppression < first_await && last_initial_await < resolved && resolved < mirror && external_case < audit) }
