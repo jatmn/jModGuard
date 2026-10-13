@@ -8,6 +8,7 @@ source "$_run_timed_cargo_test_dir/ci-cargo-log.sh"
 JMODGUARD_TEST_TIMEOUT_SEC="${JMODGUARD_TEST_TIMEOUT_SEC:-180}"
 JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
 JMODGUARD_ACTIVE_TEST_LEADER_PID=""
+JMODGUARD_PRIOR_EXIT_TRAP=""
 
 jmodguard_kill_active_test_session() {
   local pgid leader
@@ -30,6 +31,9 @@ jmodguard_runner_trap_exit() {
   if [ -n "${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}" ] || [ -n "${JMODGUARD_ACTIVE_TEST_LEADER_PID:-}" ]; then
     jmodguard_kill_active_test_session
   fi
+  if [ -n "${JMODGUARD_PRIOR_EXIT_TRAP:-}" ]; then
+    eval "${JMODGUARD_PRIOR_EXIT_TRAP}"
+  fi
 }
 
 jmodguard_runner_trap_signal() {
@@ -45,11 +49,23 @@ jmodguard_runner_trap_signal() {
   exit 128
 }
 
+jmodguard_timed_cargo_capture_prior_exit_trap() {
+  local line
+  line="$(trap -p EXIT)"
+  case "$line" in
+    trap\ --\ \'*)
+      JMODGUARD_PRIOR_EXIT_TRAP="${line#trap -- \'}"
+      JMODGUARD_PRIOR_EXIT_TRAP="${JMODGUARD_PRIOR_EXIT_TRAP%\' EXIT}"
+      ;;
+  esac
+}
+
 jmodguard_timed_cargo_install_traps() {
   if [ -n "${JMODGUARD_TIMED_CARGO_TRAPS_INSTALLED:-}" ]; then
     return 0
   fi
   JMODGUARD_TIMED_CARGO_TRAPS_INSTALLED=1
+  jmodguard_timed_cargo_capture_prior_exit_trap
   trap 'jmodguard_runner_trap_exit' EXIT
   trap 'jmodguard_runner_trap_signal 2' INT
   trap 'jmodguard_runner_trap_signal 15' TERM
@@ -381,6 +397,23 @@ jmodguard_cargo_args_without_targets() {
   fi
 }
 
+jmodguard_cargo_uses_workspace_feature_graph() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --workspace|--all) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Full-workspace rescoping must stay per-package; narrow `--workspace -p pkg` needs unified features.
+jmodguard_timed_cargo_needs_workspace_feature_graph() {
+  jmodguard_cargo_uses_workspace_feature_graph "$@" || return 1
+  [ -n "$(run_timed_cargo_test_package_name "$@")" ] || return 1
+  return 0
+}
+
 # Workspace-wide flags confuse per-package `cargo test -- --list --ignored`.
 jmodguard_cargo_args_for_test_list() {
   local -a args=("$@")
@@ -424,6 +457,10 @@ jmodguard_scoped_cargo_args() {
     [ -n "$line" ] || continue
     scoped+=("$line")
   done < <(jmodguard_cargo_args_without_targets "${cargo_args[@]}")
+
+  if jmodguard_timed_cargo_needs_workspace_feature_graph "${cargo_args[@]}"; then
+    scoped=(--workspace "${scoped[@]}")
+  fi
 
   case "$scope" in
     lib:*)
@@ -587,14 +624,19 @@ run_timed_cargo_test_gnu_body() {
   local -n __jmg_cargo_args_ref=$1
   local -n __jmg_harness_ref=$2
   local name ignored_only=0 include_ignored=0 rc list_out ignored_out
-  local -a run_args=() harness_tail=() list_cargo_args=()
+  local -a run_args=() harness_tail=() list_cargo_args=() list_ignored_cargo_args=()
   local -A ignored_names=()
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    list_cargo_args+=("$line")
+    list_ignored_cargo_args+=("$line")
   done < <(jmodguard_cargo_args_for_test_list "${__jmg_cargo_args_ref[@]}")
-  if [ "${#list_cargo_args[@]}" -eq 0 ]; then
+  if [ "${#list_ignored_cargo_args[@]}" -eq 0 ]; then
+    list_ignored_cargo_args=("${__jmg_cargo_args_ref[@]}")
+  fi
+  if jmodguard_timed_cargo_needs_workspace_feature_graph "${__jmg_cargo_args_ref[@]}"; then
     list_cargo_args=("${__jmg_cargo_args_ref[@]}")
+  else
+    list_cargo_args=("${list_ignored_cargo_args[@]}")
   fi
   for arg in "${__jmg_harness_ref[@]}"; do
     case "$arg" in
@@ -611,7 +653,7 @@ run_timed_cargo_test_gnu_body() {
 
   if [ "$ignored_only" -eq 1 ]; then
     set +e
-    list_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+    list_out="$(cargo test "${list_ignored_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -636,7 +678,7 @@ run_timed_cargo_test_gnu_body() {
   fi
 
   set +e
-  ignored_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+  ignored_out="$(cargo test "${list_ignored_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
