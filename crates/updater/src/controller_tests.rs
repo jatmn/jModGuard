@@ -1458,7 +1458,7 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
     let (db, control) = open_launcher_db(&root).await;
     let mut objects = HashMap::new();
     let mut release = image(&mut objects, "bot", b"\x7fELFfixture");
-    release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION + 1;
+    release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION;
     store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -1479,6 +1479,7 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
         control.clone(),
         &root,
     );
+    bot.launcher_revision = db::LAUNCHER_REVISION - 1;
     let (selected, warnings) = with_contract_warnings(async {
         bot.launcher(&control.component("bot").await.unwrap()).await
     })
@@ -1492,6 +1493,10 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
         .desired_launcher
         .unwrap();
     assert_eq!(desired, release);
+    assert_eq!(
+        desired.launcher.as_ref().unwrap().revision,
+        db::LAUNCHER_REVISION
+    );
     let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
         .await
         .unwrap();
