@@ -2332,6 +2332,66 @@ async fn manual_gateway_ban_does_not_replace_a_newer_bot_owned_mirror() {
 }
 
 #[tokio::test]
+async fn late_gateway_echo_keeps_completed_bot_mirror_without_member_ban_event() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let echo = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-01-01T00:00:00+00:00"),
+        true,
+        Some("bot-attempt"),
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::OwnedByBot { row_id: _ } = echo else {
+        panic!("bot echo must store the mirror, got {echo:?}");
+    };
+    let bot_id = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        Some("bot"),
+        "bot reason",
+        Some("2024-01-01T00:00:01+00:00"),
+        BanRecord::Fresh,
+        Some("bot-attempt"),
+    )
+    .await
+    .unwrap()
+    .expect("command must fill the bot mirror");
+    let late = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-06-01T00:00:00+00:00"),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(late, GatewayBanWrite::Existing { row_id: bot_id });
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        0
+    );
+}
+
+#[tokio::test]
 async fn confirmed_directory_absence_records_a_later_attributed_manual_gateway_ban() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();

@@ -943,7 +943,7 @@ fn replace_manual_gateway_mirror(
         return Ok(false);
     }
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
-    if (manual || completed_bot_gateway_mirror(mirror)) && member_was_banned {
+    if manual && member_was_banned {
         return Ok(true);
     }
     Ok(!member_was_banned)
