@@ -152,15 +152,15 @@ async function runMemberPoll(h) {
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
   const h = harness(async () => response([
-    { user_id: '172697277964615681', user_name: 'wavingwalker', user_display_name: 'Wavingwalker', moderator_id: '1800882749273538599', moderator_name: 'ikaika44', active: true, reason: 'No reason provided', created_at: '2026-09-22T23:16:28Z' },
-    { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2026-09-22T07:43:34Z' },
+    { user_id: '10001', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '10002', moderator_name: 'test-mod-1', active: true, reason: 'No reason provided', created_at: '2020-01-01T12:00:00Z' },
+    { user_id: '10003', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2020-01-02T12:00:00Z' },
   ]));
   const panel = h.app.tabBans();
   await settle();
   const text = textOf(panel);
-  assert.match(text, /Wavingwalker \(wavingwalker, 172697277964615681\)/);
-  assert.match(text, /ikaika44 \(1800882749273538599\)/);
-  assert.match(text, /823826232020959242/);
+  assert.match(text, /Test-User-1 \(test-user-1, 10001\)/);
+  assert.match(text, /test-mod-1 \(10002\)/);
+  assert.match(text, /10003/);
   assert.match(text, /Unavailable/);
   assert.match(text, /Reason unavailable/);
 });
@@ -385,14 +385,14 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
     if (url.endsWith('/member-sync')) return response({ status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: '🌻 Willow', username: 'willow', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', username: 'test-member-1', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  assert.match(textOf(panel), /🌻 Willow/);
-  assert.match(textOf(panel), /1800882749273538599/);
+  assert.match(textOf(panel), /Test Member 1/);
+  assert.match(textOf(panel), /10002/);
   assert.match(textOf(panel), /Results are partial/);
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
@@ -403,7 +403,7 @@ test('Members separates current ban reason from an unresolved Gateway action', a
   const h = harness(async (url) => {
     if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
     if (url.includes('/history')) return response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'gateway_observation_unlinked', case_id: 'case-1' }], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -424,7 +424,7 @@ test('Members renders a dated unresolved Discord audit entry, then its exact cas
     if (url.includes('/history')) return response({ entries: [linked
       ? { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'application_audit_linked', case_id: 'case-linked', observation_id: null, moderator_id: '42', reason, outcome: 'succeeded' }
       : { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit_unresolved', case_id: null, observation_id: '123456789012345678', moderator_id: '42', reason, outcome: 'succeeded' }], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -460,7 +460,7 @@ test('Members labels verified state changes with unknown event time and separate
       { kind: 'ban_present_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
       { kind: 'membership_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
     ], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -929,7 +929,7 @@ test('Members rejects a pending old search result before the debounce fires', as
   search.value = 'New Query';
   fire(search, 'input');
   assert.equal(pending[0].opts.signal.aborted, true);
-  pending[0].resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Old Result' }] }));
+  pending[0].resolve(response({ members: [{ user_id: '10002', display_name: 'Old Result' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Old Result/);
   const debounce = [...h.timers].find(([, timer]) => timer.delay === 300);
@@ -938,7 +938,7 @@ test('Members rejects a pending old search result before the debounce fires', as
   debounce[1].fn();
   assert.equal(pending.length, 2);
   assert.match(pending[1].url, /q=New\+Query/);
-  pending[1].resolve(response({ members: [{ user_id: '1800882749273538600', display_name: 'New Result' }] }));
+  pending[1].resolve(response({ members: [{ user_id: '10006', display_name: 'New Result' }] }));
   await settle();
   assert.match(textOf(panel), /New Result/);
   assert.doesNotMatch(textOf(panel), /Old Result/);
@@ -950,7 +950,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   const h = harness((url, opts) => {
     if (url.endsWith('/member-sync')) return Promise.resolve(response({ status: 'complete', phase: 'complete' }));
     if (url.includes('/history')) return new Promise(resolve => pending.push({ type: 'history', url, opts, resolve }));
-    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow' }] }));
+    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '10002', display_name: 'Test Member 1' }] }));
     return new Promise(resolve => pending.push({ type: 'list', url, opts, resolve }));
   });
   h.app.state.tab = 'members';
@@ -973,7 +973,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   date.value = '2026-09-01';
   fire(date, 'input');
   assert.equal(oldList.opts.signal.aborted, true);
-  oldList.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong Filter' }] }));
+  oldList.resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong Filter' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong Filter/);
   const sort = findNode(panel, n => n.localName === 'select' && n.getAttribute('aria-label') === 'Join date order');
@@ -983,7 +983,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   const newList = pending.filter(item => item.type === 'list').at(-1);
   assert.match(newList.url, /joined_from=2026-09-01/);
   assert.match(newList.url, /sort=joined_oldest/);
-  newList.resolve(response({ members: [{ user_id: '1800882749273538601', display_name: 'Right Filter' }] }));
+  newList.resolve(response({ members: [{ user_id: '10007', display_name: 'Right Filter' }] }));
   await settle();
   assert.match(textOf(panel), /Right Filter/);
 });
@@ -996,7 +996,7 @@ test('Members drops responses from a previous server and page enrollment', async
   const panel = h.app.tabMembers();
   h.app.state.config = { enrollment_id: 'replacement-enrollment' };
   pending.find(item => item.url.endsWith('/member-sync')).resolve(response({ status: 'complete', phase: 'complete', progress_revision: 100, processed: 1 }));
-  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong server' }] }));
+  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong server' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong server/);
   assert.doesNotMatch(textOf(panel), /Initial member import/);
@@ -2203,7 +2203,7 @@ test('moderation and member reads send the loaded page membership including quer
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=willow', 'members/1800882749273538599/history', 'member-sync']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=test-member-1', 'members/10002/history', 'member-sync']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -2633,15 +2633,15 @@ test('private downloads share preview authentication-loss handling', async () =>
 
 test('parseSnowflake keeps IDs as digit strings', () => {
   const h = harness();
-  assert.equal(h.app.parseSnowflake('1329331947876479006'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('<#1329331947876479006>'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('https://discord.com/channels/10/1329331947876479006'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('9007199254740993'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('<#9007199254740993>'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('https://discord.com/channels/10/9007199254740993'), '9007199254740993');
   assert.equal(h.app.parseSnowflake('general'), '');
-  assert.equal(h.app.parseSnowflake('<@&1329331947876479006>'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('<@!1329331947876479006>'), '1329331947876479006');
-  const roles = h.app.splitIds('<@&1329331947876479006>, 11');
+  assert.equal(h.app.parseSnowflake('<@&9007199254740993>'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('<@!9007199254740993>'), '9007199254740993');
+  const roles = h.app.splitIds('<@&9007199254740993>, 11');
   assert.equal(roles.length, 2);
-  assert.equal(roles[0], '1329331947876479006');
+  assert.equal(roles[0], '9007199254740993');
   assert.equal(roles[1], '11');
   const empty = h.app.splitIds('');
   assert.equal(empty.length, 0);

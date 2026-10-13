@@ -108,7 +108,7 @@ async fn configuration_layers_preserve_global_guild_order_and_exact_key_semantic
             .await
             .unwrap();
         add_badword(&f.db, guild, label, Some(label)).await.unwrap();
-        upsert_log_channel(&f.db, guild, "fixture", 1329331947876479006 + guild)
+        upsert_log_channel(&f.db, guild, "fixture", 9_007_199_254_740_993 + guild)
             .await
             .unwrap();
     }
@@ -169,7 +169,7 @@ async fn configuration_layers_preserve_global_guild_order_and_exact_key_semantic
         assert_eq!(channels, list_log_channels(&f.db, guild).await.unwrap());
         assert_eq!(
             channels.iter().find(|(e, _)| e == "fixture").unwrap().1,
-            1329331947876479006 + guild
+            9_007_199_254_740_993 + guild
         );
     }
     let missing = get_enrolled_command(&f.db, scope.clone(), "' OR 1=1 --")
