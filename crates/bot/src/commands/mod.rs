@@ -554,10 +554,8 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            let reply = format!("error: {e:#}");
-            if let Err(say_err) = msg.channel_id.say(&ctx.http, reply).await {
-                tracing::warn!("failed to send error reply: {say_err}");
-            }
+            send_prefix_command_error(&app.activation, msg.channel_id, &ctx.http, &cmd.name, &e)
+                .await;
             return Ok(true);
         }
     };
@@ -687,17 +685,17 @@ async fn set_slash_commands(
         target,
         "syncing Discord slash commands"
     );
-    match tokio::time::timeout(
+    let sync = tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild_id.set_commands(http.as_ref(), commands),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
+    );
+    match crate::discord::race_discord_call(&app.activation, sync).await {
+        crate::discord::DiscordCall::Cancelled => false,
+        crate::discord::DiscordCall::Finished(Ok(Ok(_))) => {
             app.reset_slash_guild_retry(guild_id.get());
             true
         }
-        Ok(Err(e)) => {
+        crate::discord::DiscordCall::Finished(Ok(Err(e))) => {
             let class = crate::discord::classify_retry(&e);
             app.slash_sync_failed(
                 guild_id.get(),
@@ -711,7 +709,7 @@ async fn set_slash_commands(
             }
             false
         }
-        Err(_) => {
+        crate::discord::DiscordCall::Finished(Err(_)) => {
             app.slash_sync_failed(
                 guild_id.get(),
                 target,
@@ -822,7 +820,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("interaction: config load failed: {e:#}");
-            respond(&slash, ctx, deferred, "internal error").await;
+            respond(&app.activation, &slash, ctx, deferred, "internal error").await;
             return;
         }
     };
@@ -832,7 +830,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             "no slash command matched `{}` in guild {guild_id}",
             slash.name
         );
-        respond(&slash, ctx, deferred, "unknown command").await;
+        respond(&app.activation, &slash, ctx, deferred, "unknown command").await;
         return;
     };
     let cmd = cmd.clone();
@@ -850,6 +848,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     let snapshot = guild_snapshot(ctx, guild_id, slash.member.clone(), actor_id).await;
     let Some((guild_roles, member)) = snapshot else {
         respond(
+            &app.activation,
             &slash,
             ctx,
             deferred,
@@ -861,11 +860,18 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, slash.channel_id)
     {
-        respond(&slash, ctx, deferred, &reason.to_string()).await;
+        respond(&app.activation, &slash, ctx, deferred, &reason.to_string()).await;
         return;
     }
     if !cooldown_check(app, guild_id, actor_id, &cmd) {
-        respond(&slash, ctx, deferred, "that command is on cooldown").await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            "that command is on cooldown",
+        )
+        .await;
         return;
     }
 
@@ -883,6 +889,9 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     };
     match run_command(env).await {
         Ok(outcome) => {
+            if !app.activation.may_record() {
+                return;
+            }
             let answer = slash_answer(&cmd, &outcome);
             if deferred {
                 match answer {
@@ -924,8 +933,25 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         }
         Err(e) => {
             let text = format!("error: {e:#}");
-            respond(&slash, ctx, deferred, &text).await;
+            respond(&app.activation, &slash, ctx, deferred, &text).await;
         }
+    }
+}
+
+async fn send_prefix_command_error(
+    activation: &crate::activation::Activation,
+    channel_id: serenity::model::id::ChannelId,
+    http: &serenity::http::Http,
+    command_name: &str,
+    error: &anyhow::Error,
+) {
+    if !activation.may_record() {
+        tracing::warn!("command `{command_name}` failed after writer cutoff: {error:#}");
+        return;
+    }
+    let reply = format!("error: {error:#}");
+    if let Err(say_err) = channel_id.say(http, reply).await {
+        tracing::warn!("failed to send error reply: {say_err}");
     }
 }
 
@@ -957,7 +983,20 @@ fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String
     out
 }
 
-async fn respond(slash: &SlashCtx, ctx: &Context, deferred: bool, text: &str) {
+async fn respond(
+    activation: &crate::activation::Activation,
+    slash: &SlashCtx,
+    ctx: &Context,
+    deferred: bool,
+    text: &str,
+) {
+    if !activation.may_record() {
+        tracing::warn!(
+            "slash response for `{name}` suppressed after writer cutoff",
+            name = slash.name
+        );
+        return;
+    }
     if deferred {
         let _ = EditInteractionResponse::new()
             .content(text)
@@ -1080,6 +1119,9 @@ async fn send_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
+    if !app.activation.may_record() {
+        return;
+    }
     if let Some(text) = prefix_response_text(cmd, &outcome)
         && let Err(e) = channel_id.say(&ctx.http, text).await
     {
@@ -1881,5 +1923,61 @@ mod tests {
             slash_answer(&say_cmd(""), &outcome(Some("hi"), false)),
             SlashAnswer::Public
         );
+    }
+
+    #[tokio::test]
+    async fn prefix_command_error_reply_suppressed_after_writer_cutoff() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"id":"1","type":0}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let path =
+            std::env::temp_dir().join(format!("prefix_cutoff_{:032x}", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(Default::default(), db).unwrap();
+        app.activation.mark_lock_held(true);
+        app.activation.note_lease_lost();
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        let error = anyhow::anyhow!("writer lease is not held");
+        send_prefix_command_error(&app.activation, ChannelId::new(1), &http, "say", &error).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cutoff must fence prefix error replies during lease release"
+        );
+        server.abort();
+        std::fs::remove_file(path).ok();
     }
 }
