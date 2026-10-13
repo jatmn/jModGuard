@@ -125,22 +125,21 @@ impl GatewayManualBanAuditQueue {
         let now = Instant::now();
         self.prune(now);
         let deque = self.entries.entry((guild, user)).or_default();
+        if deque.iter().any(|(queued, _)| *queued == entry_id) {
+            return;
+        }
         while deque.len() >= MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE {
             deque.pop_front();
         }
         deque.push_back((entry_id, now + GATEWAY_MANUAL_BAN_AUDIT_TTL));
     }
 
-    fn consume(&mut self, guild: u64, user: u64) -> Option<i64> {
-        let now = Instant::now();
-        self.prune(now);
-        let key = (guild, user);
-        let deque = self.entries.get_mut(&key)?;
-        let (entry_id, _) = deque.pop_front()?;
-        if deque.is_empty() {
-            self.entries.remove(&key);
-        }
-        Some(entry_id)
+    fn pending(&mut self, guild: u64, user: u64) -> Vec<i64> {
+        self.prune(Instant::now());
+        self.entries
+            .get(&(guild, user))
+            .map(|entries| entries.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default()
     }
 
     fn clear(&mut self, guild: u64, user: u64) {
@@ -1035,8 +1034,7 @@ impl BotState {
         self.pending_member_gaps.lock().acknowledge(gap);
     }
 
-    /// Returns whether another ban or unban callback for this user is already
-    /// inside its handler. Local start time is not Gateway order.
+    /// Retain audit identities until their own persisted ban can be reconciled.
     pub(crate) fn queue_gateway_manual_ban_audit_entry(
         &self,
         guild_id: u64,
@@ -1048,14 +1046,14 @@ impl BotState {
             .queue(guild_id, user_id, entry_id);
     }
 
-    pub(crate) fn consume_gateway_manual_ban_audit_entry(
+    pub(crate) fn pending_gateway_manual_ban_audit_entries(
         &self,
         guild_id: u64,
         user_id: u64,
-    ) -> Option<i64> {
+    ) -> Vec<i64> {
         self.gateway_manual_ban_audit_entries
             .lock()
-            .consume(guild_id, user_id)
+            .pending(guild_id, user_id)
     }
 
     pub(crate) fn clear_gateway_manual_ban_audit_entries(&self, guild_id: u64, user_id: u64) {
@@ -1993,12 +1991,15 @@ mod tests {
         app.queue_gateway_manual_ban_audit_entry(10, 55, 100);
         app.queue_gateway_manual_ban_audit_entry(10, 55, 101);
         app.clear_gateway_manual_ban_audit_entries(10, 55);
-        assert_eq!(app.consume_gateway_manual_ban_audit_entry(10, 55), None);
+        assert!(
+            app.pending_gateway_manual_ban_audit_entries(10, 55)
+                .is_empty()
+        );
         app.queue_gateway_manual_ban_audit_entry(10, 56, 102);
         app.clear_gateway_manual_ban_audit_entries(10, 55);
         assert_eq!(
-            app.consume_gateway_manual_ban_audit_entry(10, 56),
-            Some(102)
+            app.pending_gateway_manual_ban_audit_entries(10, 56),
+            vec![102]
         );
     }
 

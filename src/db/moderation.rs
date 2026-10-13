@@ -728,6 +728,20 @@ pub async fn record_gateway_ban(
     .await
 }
 
+/// Known identities are supplied by callers that already own the action match.
+/// Pending audit deliveries may distinguish a newer ban, but are attached only
+/// by reconciliation against persisted observations.
+pub enum GatewayBanAuditEntries {
+    Known(Option<i64>),
+    Pending(Vec<i64>),
+}
+
+impl From<Option<i64>> for GatewayBanAuditEntries {
+    fn from(entry: Option<i64>) -> Self {
+        Self::Known(entry)
+    }
+}
+
 /// Like [`record_gateway_ban`], but accepts the Discord audit-log entry id for this delivery when known.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_gateway_ban_with_audit(
@@ -740,8 +754,12 @@ pub async fn record_gateway_ban_with_audit(
     owned_by_bot: bool,
     operation_id: Option<&str>,
     member_was_banned: bool,
-    gateway_audit_entry_id: Option<i64>,
+    audit_entries: impl Into<GatewayBanAuditEntries>,
 ) -> Result<GatewayBanWrite> {
+    let (gateway_audit_entry_id, pending_audit_entries) = match audit_entries.into() {
+        GatewayBanAuditEntries::Known(entry) => (entry, Vec::new()),
+        GatewayBanAuditEntries::Pending(entries) => (None, entries),
+    };
     let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
     let reason = GATEWAY_BAN_REASON.to_owned();
     let user_name = user_name.map(str::to_owned);
@@ -767,6 +785,7 @@ pub async fn record_gateway_ban_with_audit(
             operation_id,
             member_was_banned,
             gateway_audit_entry_id,
+            pending_audit_entries,
         )
     })
     .await
@@ -991,34 +1010,26 @@ fn gateway_audit_entry_id_known_for_user(
 /// Whether two manual gateway deliveries are the same Discord ban action.
 ///
 /// Identity comes from the audit-log entry id persisted on the mirror's `member_ban` event.
-/// When both sides lack an id, a bounded delivery-time window is used as a fallback.
-/// A mirror with a stored id and an id-less delivery while the member was already banned
-/// are never the same action; otherwise the bounded window applies.
+/// When the incoming delivery lacks an id, a bounded delivery-time window is used
+/// as a fallback even if the mirror has already received its audit identity.
 /// A known audit id that already has a `member_ban` event is treated as a replay even when
 /// the active mirror belongs to a later ban.
 fn gateway_deliveries_are_same(
     conn: &impl SqlExecutor,
     guild_id: i64,
     user_id: i64,
-    mirror_created_at: &str,
+    mirror: &ActiveBanMirror,
     incoming_at: &str,
-    mirror_audit_entry_id: Option<i64>,
     incoming_audit_entry_id: Option<i64>,
-    member_was_banned: bool,
 ) -> Result<bool> {
+    let mirror_audit_entry_id =
+        gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
     match (incoming_audit_entry_id, mirror_audit_entry_id) {
         (Some(incoming), Some(stored)) if incoming == stored => Ok(true),
         (Some(incoming), Some(_stored)) => Ok(gateway_audit_entry_id_known_for_user(
             conn, guild_id, user_id, incoming,
         )?),
-        (None, Some(_)) => {
-            if member_was_banned {
-                Ok(false)
-            } else {
-                gateway_manual_redelivery_within_window(mirror_created_at, incoming_at)
-            }
-        }
-        (None, None) => gateway_manual_redelivery_within_window(mirror_created_at, incoming_at),
+        (None, _) => gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at),
         (Some(incoming), None) => {
             if gateway_audit_entry_id_known_for_user(conn, guild_id, user_id, incoming)? {
                 Ok(true)
@@ -1040,24 +1051,19 @@ fn same_gateway_delivery_as_mirror(
     user_id: i64,
     incoming_at: &str,
     incoming_audit_entry_id: Option<i64>,
-    member_was_banned: bool,
 ) -> Result<bool> {
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
     let completed_bot = completed_bot_gateway_mirror(mirror);
     if !manual && !completed_bot {
         return Ok(false);
     }
-    let mirror_audit_entry_id =
-        gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
     gateway_deliveries_are_same(
         conn,
         guild_id,
         user_id,
-        mirror.created_at.as_str(),
+        mirror,
         incoming_at,
-        mirror_audit_entry_id,
         incoming_audit_entry_id,
-        member_was_banned,
     )
 }
 
@@ -1081,17 +1087,13 @@ fn replace_manual_gateway_mirror(
             return Ok(true);
         }
         if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
-            let mirror_audit_entry_id =
-                gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
             if gateway_deliveries_are_same(
                 conn,
                 guild_id,
                 user_id,
-                mirror.created_at.as_str(),
+                mirror,
                 incoming_at,
-                mirror_audit_entry_id,
                 incoming_audit_entry_id,
-                member_was_banned,
             )? {
                 return Ok(false);
             }
@@ -1112,7 +1114,6 @@ fn replace_manual_gateway_mirror(
         user_id,
         incoming_at,
         incoming_audit_entry_id,
-        member_was_banned,
     )? {
         return Ok(false);
     }
@@ -1151,6 +1152,9 @@ fn reconcile_gateway_manual_ban_audit_entry_conn(
     user_id: i64,
     audit_entry_id: i64,
 ) -> Result<bool> {
+    if enrollment.guild_id != guild_id {
+        return Err(EnrollmentChanged.into());
+    }
     if audit_entry_id <= 0 {
         return Ok(false);
     }
@@ -1161,30 +1165,36 @@ fn reconcile_gateway_manual_ban_audit_entry_conn(
         tx.finish_read()?;
         return Ok(true);
     }
-    let pending = tx
-        .query_row(
+    // A subject can have several id-less ban cycles. The snowflake gives the
+    // audit action's time, not its delivery time. Only reconcile one nearby
+    // gateway observation after that action; ambiguity (including an attributed neighbor)
+    // must leave the identity unresolved rather than select the oldest row.
+    let audit_at_ms = (audit_entry_id >> 22) + 1_420_070_400_000;
+    let pending = {
+        let mut statement = tx.prepare(
             "SELECT id, data FROM events
              WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
                AND json_valid(data)
                AND json_extract(data, '$.ban_id') IS NOT NULL
-               AND (
-                 json_extract(data, '$.audit_entry_id') IS NULL
-                 OR TRIM(CAST(json_extract(data, '$.audit_entry_id') AS TEXT)) = ''
-               )
-             ORDER BY id ASC LIMIT 1",
-            params![guild_id, user_id],
-            |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)),
-        )
-        .optional()?;
-    let Some((event_id, data)) = pending else {
+               AND CAST(ROUND((julianday(created_at) - 2440587.5) * 86400000) AS INTEGER)
+                   BETWEEN ?3 AND ?3 + 5000
+             LIMIT 2",
+        )?;
+        statement
+            .query_map(params![guild_id, user_id, audit_at_ms], |row| {
+                Ok((row.get::<i64>(0)?, row.get::<String>(1)?))
+            })?
+            .collect::<Result<Vec<_>>>()?
+    };
+    let [(event_id, data)] = pending.as_slice() else {
         tx.finish_read()?;
         return Ok(false);
     };
-    if !member_ban_event_json_lacks_audit_entry_id(&data) {
+    if !member_ban_event_json_lacks_audit_entry_id(data) {
         tx.finish_read()?;
         return Ok(false);
     }
-    let mut event = serde_json::from_str::<serde_json::Value>(&data)
+    let mut event = serde_json::from_str::<serde_json::Value>(data)
         .map_err(|error| anyhow::anyhow!("member_ban event json: {error}"))?;
     event["audit_entry_id"] = serde_json::json!(audit_entry_id);
     let data = crate::ids::stringify_js_unsafe_integers(&event).to_string();
@@ -1197,8 +1207,9 @@ fn reconcile_gateway_manual_ban_audit_entry_conn(
     Ok(true)
 }
 
-/// Attach a late manual-ban audit entry id to the oldest gateway `member_ban` event
-/// that still lacks one. Returns true when the id is already known or was reconciled.
+/// Reconcile a manual-ban audit ID with a unique gateway ban for the same guild
+/// and target in the five seconds following its snowflake timestamp. Ambiguous or old
+/// observations stay unresolved. Returns true for an already known or attached ID.
 pub async fn reconcile_gateway_manual_ban_audit_entry(
     db: &Db,
     enrollment: Option<GuildEnrollment>,
@@ -1228,6 +1239,9 @@ pub async fn gateway_manual_ban_audit_entry_is_known(
     audit_entry_id: i64,
 ) -> Result<bool> {
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    if enrollment.guild_id != guild_id {
+        return Err(EnrollmentChanged.into());
+    }
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
@@ -1253,6 +1267,7 @@ fn record_gateway_ban_conn(
     operation_id: Option<String>,
     member_was_banned: bool,
     gateway_audit_entry_id: Option<i64>,
+    pending_audit_entries: Vec<i64>,
 ) -> Result<GatewayBanWrite> {
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
@@ -1275,15 +1290,36 @@ fn record_gateway_ban_conn(
         let keep = if owned_by_bot {
             bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
         } else {
-            !replace_manual_gateway_mirror(
-                &tx,
-                &mirror,
-                guild_id,
-                user_id,
-                member_was_banned,
-                &now,
-                gateway_audit_entry_id,
-            )?
+            // A new audit action after the saved observation defeats the
+            // id-less redelivery fallback, even if the older ban never got its
+            // audit. Do not attach this pending ID until after the row exists.
+            let mut newer_audit = false;
+            if !pending_audit_entries.is_empty() {
+                let mirror_at =
+                    chrono::DateTime::parse_from_rfc3339(&mirror.created_at)?.timestamp_millis();
+                let observed_at = chrono::DateTime::parse_from_rfc3339(&now)?.timestamp_millis();
+                for entry in &pending_audit_entries {
+                    let audit_at = (*entry >> 22) + 1_420_070_400_000;
+                    if *entry > 0
+                        && audit_at > mirror_at
+                        && (0..=5000).contains(&(observed_at - audit_at))
+                        && !gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, *entry)?
+                    {
+                        newer_audit = true;
+                        break;
+                    }
+                }
+            }
+            !newer_audit
+                && !replace_manual_gateway_mirror(
+                    &tx,
+                    &mirror,
+                    guild_id,
+                    user_id,
+                    member_was_banned,
+                    &now,
+                    gateway_audit_entry_id,
+                )?
         };
         if keep {
             tx.finish_read()?;
