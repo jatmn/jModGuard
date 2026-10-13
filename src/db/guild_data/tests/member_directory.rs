@@ -5804,6 +5804,7 @@ async fn ready_with_probe(
 
 #[tokio::test]
 async fn coverage_gap_mark_batches_writes_for_remote_transport() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
     let (_f, mut store, scope) = ready_with_probe(&probe).await;
     complete_for_checks(&store, &scope).await;
@@ -5832,6 +5833,7 @@ async fn coverage_gap_mark_batches_writes_for_remote_transport() {
 
 #[tokio::test]
 async fn coverage_gap_mark_skips_audit_recovery_until_initial_completion() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     store
         .initialize_member_directory(scope.clone(), 42, 1_000)
@@ -5867,6 +5869,7 @@ async fn coverage_gap_mark_skips_audit_recovery_until_initial_completion() {
 
 #[tokio::test]
 async fn coverage_gap_mark_rejects_closed_membership() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     store.close_membership(scope.clone()).await.unwrap();
@@ -5896,6 +5899,7 @@ async fn coverage_gap_mark_rejects_closed_membership() {
 
 #[tokio::test]
 async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let store_for_close = store.clone();
@@ -5934,6 +5938,7 @@ async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
 
 #[tokio::test]
 async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let store_for_bump = store.clone();
@@ -5984,6 +5989,7 @@ async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
 
 #[tokio::test]
 async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let store_for_bump = store.clone();
@@ -6034,6 +6040,7 @@ async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
 
 #[tokio::test]
 async fn coverage_gap_mark_rejects_nul_reason() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let error = store
@@ -6045,6 +6052,7 @@ async fn coverage_gap_mark_rejects_nul_reason() {
 
 #[tokio::test]
 async fn coverage_gap_mark_is_idempotent_across_retries() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     store

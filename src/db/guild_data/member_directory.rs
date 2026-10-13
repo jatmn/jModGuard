@@ -20,6 +20,14 @@ static COVERAGE_GAP_AFTER_REVISION_SNAPSHOT: Mutex<Option<Box<dyn Fn() + Send + 
     Mutex::new(None);
 
 #[cfg(test)]
+static COVERAGE_GAP_HOOK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) async fn test_coverage_gap_hook_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    COVERAGE_GAP_HOOK_MUTEX.lock().await
+}
+
+#[cfg(test)]
 pub(crate) fn test_set_coverage_gap_after_scope_verify(hook: Option<Box<dyn Fn() + Send + Sync>>) {
     *COVERAGE_GAP_AFTER_SCOPE_VERIFY.lock().unwrap() = hook;
 }
