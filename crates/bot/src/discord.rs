@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bounds every reconciliation REST attempt so one half-open Discord request
@@ -168,14 +169,22 @@ struct RememberedDiscordState {
     global_recovery: u64,
     guild_recovery: HashMap<u64, RecoverySlot>,
     member_moderation_recovery: HashMap<(u64, u64), RecoverySlot>,
-    /// Monotonic per-member generation; retained across slot eviction and TTL pruning.
-    member_moderation_epoch_seq: HashMap<(u64, u64), u64>,
 }
 
 /// Process-local memory of permanent Discord REST rejections (invalid-request budget).
-#[derive(Default)]
 pub(crate) struct RememberedDiscordTargets {
     state: Mutex<RememberedDiscordState>,
+    /// Monotonic member generation assigned on role recovery; never reused after eviction.
+    member_moderation_generation: AtomicU64,
+}
+
+impl Default for RememberedDiscordTargets {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RememberedDiscordState::default()),
+            member_moderation_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 impl RememberedDiscordTargets {
@@ -217,28 +226,10 @@ impl RememberedDiscordTargets {
             .unwrap_or(0)
     }
 
-    fn record_member_epoch_floor(
-        state: &mut RememberedDiscordState,
-        key: (u64, u64),
-        generation: u64,
-    ) {
-        let seq = state.member_moderation_epoch_seq.entry(key).or_insert(0);
-        *seq = (*seq).max(generation);
-    }
-
     fn prune_recovery_metadata(state: &mut RememberedDiscordState, now: Instant) {
         state
             .guild_recovery
             .retain(|_, slot| slot.touched + REMEMBERED_REST_TARGET_TTL > now);
-        let expired_members: Vec<_> = state
-            .member_moderation_recovery
-            .iter()
-            .filter(|(_, slot)| slot.touched + REMEMBERED_REST_TARGET_TTL <= now)
-            .map(|(key, slot)| (*key, slot.generation))
-            .collect();
-        for (key, generation) in expired_members {
-            Self::record_member_epoch_floor(state, key, generation);
-        }
         state
             .member_moderation_recovery
             .retain(|_, slot| slot.touched + REMEMBERED_REST_TARGET_TTL > now);
@@ -257,15 +248,13 @@ impl RememberedDiscordTargets {
     }
 
     fn evict_oldest_member_recovery_slot(state: &mut RememberedDiscordState) {
-        let key = state
+        if let Some(key) = state
             .member_moderation_recovery
             .iter()
             .min_by_key(|(_, slot)| slot.touched)
-            .map(|(key, _)| *key);
-        if let Some(key) = key
-            && let Some(slot) = state.member_moderation_recovery.remove(&key)
+            .map(|(key, _)| *key)
         {
-            Self::record_member_epoch_floor(state, key, slot.generation);
+            state.member_moderation_recovery.remove(&key);
         }
     }
 
@@ -316,16 +305,17 @@ impl RememberedDiscordTargets {
     }
 
     fn bump_member_moderation_recovery(
+        &self,
         state: &mut RememberedDiscordState,
         guild: u64,
         user: u64,
         now: Instant,
     ) {
         Self::prune_recovery_metadata(state, now);
-        let key = (guild, user);
-        let seq = state.member_moderation_epoch_seq.entry(key).or_insert(0);
-        *seq += 1;
-        let next = *seq;
+        let next = self
+            .member_moderation_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         Self::insert_member_recovery_slot(state, guild, user, next, now);
     }
 
@@ -341,12 +331,7 @@ impl RememberedDiscordTargets {
             slot.touched = now;
             return;
         }
-        let generation = state
-            .member_moderation_epoch_seq
-            .get(&key)
-            .copied()
-            .unwrap_or(0);
-        Self::insert_member_recovery_slot(state, guild, user, generation, now);
+        Self::insert_member_recovery_slot(state, guild, user, 0, now);
     }
 
     fn insert_permanent(
@@ -440,7 +425,7 @@ impl RememberedDiscordTargets {
                 } if *g == guild && *u == user
             )
         });
-        Self::bump_member_moderation_recovery(&mut state, guild, user, now);
+        self.bump_member_moderation_recovery(&mut state, guild, user, now);
     }
 
     pub(crate) fn remember_rest_rejection(
@@ -490,9 +475,6 @@ impl RememberedDiscordTargets {
         state
             .member_moderation_recovery
             .retain(|(g, _), _| *g != guild);
-        state
-            .member_moderation_epoch_seq
-            .retain(|(g, _), _| *g != guild);
         state.expires.retain(|target, _| match target {
             DiscordRestTarget::GuildChannel { guild: g, .. } => *g != guild,
             DiscordRestTarget::AutomodDelete { guild: g, .. } => *g != guild,
@@ -505,7 +487,6 @@ impl RememberedDiscordTargets {
         state.global_recovery += 1;
         state.guild_recovery.clear();
         state.member_moderation_recovery.clear();
-        state.member_moderation_epoch_seq.clear();
         state.expires.clear();
     }
 
@@ -527,7 +508,6 @@ impl RememberedDiscordTargets {
     #[cfg(test)]
     fn seed_member_recovery_slot(&self, guild: u64, user: u64, generation: u64, touched: Instant) {
         let mut state = self.state.lock();
-        Self::record_member_epoch_floor(&mut state, (guild, user), generation);
         Self::insert_member_recovery_slot(&mut state, guild, user, generation, touched);
     }
 
@@ -1029,6 +1009,18 @@ mod tests {
         cache.seed_member_recovery_slot(8, 9, 2, touched);
         cache.prune_recovery_metadata_for_test(Instant::now());
         assert_eq!(cache.recovery_metadata_counts(), (0, 0));
+    }
+
+    #[test]
+    fn many_distinct_member_role_clears_keep_recovery_maps_bounded() {
+        const CAP: usize = 4096;
+        let cache = RememberedDiscordTargets::default();
+        for user in 0..10_000u64 {
+            cache.clear_member_moderation_rejections(1, user);
+        }
+        let (guilds, members) = cache.recovery_metadata_counts();
+        assert!(guilds <= CAP);
+        assert!(members <= CAP);
     }
 
     #[test]
