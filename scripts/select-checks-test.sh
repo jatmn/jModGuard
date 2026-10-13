@@ -52,6 +52,10 @@ expect "contracts fmt dylint runtime boundaries core integration supply-chain" c
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
 expect "contracts supply-chain" scripts/ci-ensure-cargo-tool.sh scripts/ci-preflight-test.sh
+expect "contracts supply-chain" \
+  scripts/ci-cargo-log.sh \
+  scripts/ci-run-timed-cargo-test.sh \
+  scripts/ci-timed-cargo-test.sh
 # Core consumers need coverage, but independent packages and shell fixtures do not.
 core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
 # all_rust groups shared src/migrations skip on purpose. A new rust group must
