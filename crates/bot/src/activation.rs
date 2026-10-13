@@ -43,6 +43,10 @@ pub struct Activation {
     #[cfg(test)]
     renewal_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    renewal_stopped_for_authority: AtomicBool,
+    #[cfg(test)]
+    renewal_loop_stopped_at: Mutex<Option<Instant>>,
+    #[cfg(test)]
     renewal_stall: AtomicBool,
     #[cfg(test)]
     lease_ttl: Mutex<Duration>,
@@ -106,6 +110,10 @@ impl Activation {
             #[cfg(test)]
             renewal_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            renewal_stopped_for_authority: AtomicBool::new(false),
+            #[cfg(test)]
+            renewal_loop_stopped_at: Mutex::new(None),
+            #[cfg(test)]
             renewal_stall: AtomicBool::new(false),
             #[cfg(test)]
             lease_ttl: Mutex::new(Duration::from_millis(
@@ -132,6 +140,19 @@ impl Activation {
     #[cfg(test)]
     pub fn stall_next_renewal(&self) {
         self.renewal_stall.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn renewal_stopped_for_authority(&self) -> bool {
+        self.renewal_stopped_for_authority.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn renewal_loop_stopped_at(&self) -> Option<Instant> {
+        *self
+            .renewal_loop_stopped_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(test)]
@@ -475,6 +496,12 @@ fn spawn_renewal_every(
                             || remaining <= backoff
                             || db::is_database_operation_timeout(&error)
                         {
+                            if remaining <= backoff && !activation.is_shutting_down() {
+                                #[cfg(test)]
+                                activation
+                                    .renewal_stopped_for_authority
+                                    .store(true, Ordering::Release);
+                            }
                             loss_reason = if remaining <= backoff || db::is_database_operation_timeout(&error) {
                                 "active-bot lease renewal exhausted its authority window"
                             } else {
@@ -525,6 +552,13 @@ fn spawn_renewal_every(
             if !settle_renewal(&activation, &result) {
                 break;
             }
+        }
+        #[cfg(test)]
+        {
+            *activation
+                .renewal_loop_stopped_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
         }
         if !activation.is_shutting_down() {
             // Cut off Discord work before exiting, even if the task ended after
@@ -1013,7 +1047,6 @@ mod tests {
             Duration::from_millis(20),
         );
         let finished = tokio::time::timeout(window + Duration::from_secs(1), renewal).await;
-        let finished_at = Instant::now();
         faults.abort();
         let _ = faults.await;
         finished.unwrap().unwrap();
@@ -1023,15 +1056,18 @@ mod tests {
             "250ms to 1s backoff: {attempts} attempts"
         );
         assert!(
-            finished_at < deadline,
-            "must stop before sleeping across deadline"
+            activation.renewal_stopped_for_authority(),
+            "must stop retrying once remaining authority cannot fit the next backoff"
         );
+        let stopped_at = activation
+            .renewal_loop_stopped_at()
+            .expect("renewal loop records when it exits");
         assert!(
-            began.elapsed() >= window - Duration::from_secs(2),
+            stopped_at.duration_since(began) >= window - Duration::from_secs(2),
             "renewal should run until authority nears expiry"
         );
         assert!(!activation.may_record());
-        eprintln!("instant bot errors: {attempts} attempts; stopped before deadline");
+        eprintln!("instant bot errors: {attempts} attempts; authority backoff exhausted");
         drop(db);
         cleanup(&path);
     }
