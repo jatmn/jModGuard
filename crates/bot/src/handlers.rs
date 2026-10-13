@@ -56,13 +56,19 @@ pub(crate) fn clear_remembered_if_subject_roles_changed(
     app: &BotState,
     guild_id: u64,
     user_id: u64,
-    old_roles: &[RoleId],
+    old_roles: Option<&[RoleId]>,
     new_roles: &[RoleId],
 ) {
     use std::collections::HashSet;
-    let old: HashSet<u64> = old_roles.iter().map(|role| role.get()).collect();
-    let new_roles: HashSet<u64> = new_roles.iter().map(|role| role.get()).collect();
-    if old != new_roles {
+    let roles_changed = match old_roles {
+        None => true,
+        Some(old_roles) => {
+            let old: HashSet<u64> = old_roles.iter().map(|role| role.get()).collect();
+            let new_roles: HashSet<u64> = new_roles.iter().map(|role| role.get()).collect();
+            old != new_roles
+        }
+    };
+    if roles_changed {
         app.remembered_discord_targets
             .clear_member_moderation_rejections(guild_id, user_id);
     }
@@ -1117,15 +1123,15 @@ impl EventHandler for Handler {
                 .map(|member| member.roles.as_slice()),
             &new.roles,
         );
-        if let Some(old) = old_if_available.as_ref() {
-            clear_remembered_if_subject_roles_changed(
-                &self.app,
-                guild_id.get(),
-                new.user.id.get(),
-                &old.roles,
-                &new.roles,
-            );
-        }
+        clear_remembered_if_subject_roles_changed(
+            &self.app,
+            guild_id.get(),
+            new.user.id.get(),
+            old_if_available
+                .as_ref()
+                .map(|member| member.roles.as_slice()),
+            &new.roles,
+        );
         let old_to = old_if_available
             .as_ref()
             .and_then(|member| member.communication_disabled_until);
@@ -1533,15 +1539,53 @@ mod tests {
         }
         let role_a = RoleId::new(10);
         let role_b = RoleId::new(11);
-        clear_remembered_if_subject_roles_changed(&app, guild, user, &[role_a], &[role_a]);
+        clear_remembered_if_subject_roles_changed(&app, guild, user, Some(&[role_a]), &[role_a]);
         assert!(app.remembered_discord_targets.blocked(kick, now));
         assert!(app.remembered_discord_targets.blocked(ban, now));
         assert!(app.remembered_discord_targets.blocked(timeout, now));
-        clear_remembered_if_subject_roles_changed(&app, guild, user, &[role_a], &[role_a, role_b]);
+        clear_remembered_if_subject_roles_changed(
+            &app,
+            guild,
+            user,
+            Some(&[role_a]),
+            &[role_a, role_b],
+        );
         assert!(!app.remembered_discord_targets.blocked(kick, now));
         assert!(!app.remembered_discord_targets.blocked(ban, now));
         assert!(!app.remembered_discord_targets.blocked(timeout, now));
         assert!(app.remembered_discord_targets.blocked(delete, now));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn subject_role_cache_miss_clears_remembered_moderation_actions() {
+        use crate::discord::{AutomodRestAction, DiscordRestTarget};
+        use serenity::model::id::RoleId;
+        use std::time::Instant;
+
+        let path = std::env::temp_dir().join(format!(
+            "jmg-subject-role-miss-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let now = Instant::now();
+        let guild = 42_u64;
+        let user = 99_u64;
+        let kick = DiscordRestTarget::AutomodMember {
+            guild,
+            user,
+            action: AutomodRestAction::Kick,
+        };
+        app.remembered_discord_targets
+            .remember_permanent_for_test(kick, now);
+        assert!(app.remembered_discord_targets.blocked(kick, now));
+        let role_a = RoleId::new(10);
+        clear_remembered_if_subject_roles_changed(&app, guild, user, None, &[role_a]);
+        assert!(!app.remembered_discord_targets.blocked(kick, now));
         drop(app);
         let _ = std::fs::remove_dir_all(&path);
     }
