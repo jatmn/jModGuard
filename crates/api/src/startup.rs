@@ -192,6 +192,7 @@ mod tests {
     use jmodguard::db::{self, Db};
     use jmodguard::tenant::TenantRuntime;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn temp_db(label: &str) -> PathBuf {
@@ -357,12 +358,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let probe = Arc::new(db::StartupProbe::default());
         let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
-        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tripped = Arc::new(AtomicBool::new(false));
         db::arm_writer_open_tripwire(Arc::clone(&tripped));
+        let readiness_published = Arc::new(AtomicBool::new(false));
         let cfg_wait = cfg.clone();
+        let readiness_published_task = Arc::clone(&readiness_published);
         let opened = tokio::spawn(async move {
             crate::health::serve_while(&listener, async move {
                 let db = open_database(&cfg_wait).await?;
+                readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 Ok::<_, anyhow::Error>(db)
@@ -374,11 +378,11 @@ mod tests {
             200
         );
         assert_eq!(
-            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert_eq!(
-            wait_status(
+            probe_status_strict(
                 addr,
                 "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
                 503
@@ -396,6 +400,10 @@ mod tests {
         })
         .join()
         .unwrap();
+        assert!(
+            wait_until_flag(&readiness_published).await,
+            "startup callback must publish readiness after the schema upgrade"
+        );
         assert_eq!(
             wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
             200,
@@ -660,6 +668,33 @@ mod tests {
                 return seen;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    async fn wait_until_flag(flag: &AtomicBool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Retries only transient probe failures (`0`). Any other status is returned
+    /// immediately so a brief wrong readiness code cannot be masked by polling.
+    async fn probe_status_strict(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
+            match seen {
+                0 => tokio::time::sleep(Duration::from_millis(50)).await,
+                status if status == want => return status,
+                status => return status,
+            }
         }
         seen
     }
