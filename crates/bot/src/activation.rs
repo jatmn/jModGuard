@@ -1013,6 +1013,7 @@ mod tests {
             Duration::from_millis(20),
         );
         let finished = tokio::time::timeout(window + Duration::from_secs(1), renewal).await;
+        let finished_at = Instant::now();
         faults.abort();
         let _ = faults.await;
         finished.unwrap().unwrap();
@@ -1022,10 +1023,13 @@ mod tests {
             "250ms to 1s backoff: {attempts} attempts"
         );
         assert!(
-            Instant::now() < deadline,
+            finished_at < deadline,
             "must stop before sleeping across deadline"
         );
-        assert!(began.elapsed() >= Duration::from_secs(8));
+        assert!(
+            began.elapsed() >= window - Duration::from_secs(2),
+            "renewal should run until authority nears expiry"
+        );
         assert!(!activation.may_record());
         eprintln!("instant bot errors: {attempts} attempts; stopped before deadline");
         drop(db);
