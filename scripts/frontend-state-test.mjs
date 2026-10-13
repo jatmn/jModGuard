@@ -152,15 +152,15 @@ async function runMemberPoll(h) {
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
   const h = harness(async () => response([
-    { user_id: '10001', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '10002', moderator_name: 'test-mod-1', active: true, reason: 'No reason provided', created_at: '2020-01-01T12:00:00Z' },
-    { user_id: '10003', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2020-01-02T12:00:00Z' },
+    { user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: 'No reason provided', created_at: '2020-01-01T12:00:00Z' },
+    { user_id: '9007199254740997', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2020-01-02T12:00:00Z' },
   ]));
   const panel = h.app.tabBans();
   await settle();
   const text = textOf(panel);
-  assert.match(text, /Test-User-1 \(test-user-1, 10001\)/);
-  assert.match(text, /test-mod-1 \(10002\)/);
-  assert.match(text, /10003/);
+  assert.match(text, /Test-User-1 \(test-user-1, 9007199254740993\)/);
+  assert.match(text, /test-mod-1 \(9007199254740995\)/);
+  assert.match(text, /9007199254740997/);
   assert.match(text, /Unavailable/);
   assert.match(text, /Reason unavailable/);
 });
@@ -385,14 +385,14 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
     if (url.endsWith('/member-sync')) return response({ status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
-    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', username: 'test-member-1', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
+    return response({ members: [{ user_id: '9007199254740993', display_name: 'Test Member 1', username: 'test-member-1', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
   assert.match(textOf(panel), /Test Member 1/);
-  assert.match(textOf(panel), /10002/);
+  assert.match(textOf(panel), /9007199254740993/);
   assert.match(textOf(panel), /Results are partial/);
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
