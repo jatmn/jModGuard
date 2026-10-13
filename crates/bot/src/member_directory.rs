@@ -563,25 +563,6 @@ pub async fn observe_departure(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod gateway_ban_path_test {
-    use std::sync::Mutex;
-
-    static PHASES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-
-    pub fn reset() {
-        PHASES.lock().unwrap().clear();
-    }
-
-    pub fn record(phase: &'static str) {
-        PHASES.lock().unwrap().push(phase);
-    }
-
-    pub fn phases() -> Vec<&'static str> {
-        PHASES.lock().unwrap().clone()
-    }
-}
-
 /// Whether the live member directory already shows this user as banned.
 pub(crate) async fn member_directory_shows_banned(
     app: &BotState,
@@ -596,7 +577,7 @@ pub(crate) async fn member_directory_shows_banned(
     )
     .await?;
     #[cfg(test)]
-    gateway_ban_path_test::record("precheck");
+    app.record_gateway_ban_path_test_phase("precheck");
     match store.get_member(scope, user_id as i64).await {
         Ok(Some(member)) => Some(member.is_banned),
         Ok(None) => Some(false),
@@ -614,7 +595,7 @@ pub async fn observe_ban(
     observed_at_ms: i64,
 ) -> Option<bool> {
     #[cfg(test)]
-    gateway_ban_path_test::record("observe");
+    app.record_gateway_ban_path_test_phase("observe");
     let user_id = user.id.get();
     let contested = app.begin_ban_observation(guild_id, user_id);
     let _end = BanObservation::new(app, guild_id, user_id);

@@ -142,6 +142,10 @@ impl GatewayManualBanAuditQueue {
         }
         Some(entry_id)
     }
+
+    fn clear(&mut self, guild: u64, user: u64) {
+        self.entries.remove(&(guild, user));
+    }
 }
 
 #[derive(Default)]
@@ -588,6 +592,8 @@ pub struct BotState {
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
+    #[cfg(test)]
+    gateway_ban_path_phases: Mutex<Vec<&'static str>>,
 }
 
 impl BotState {
@@ -667,6 +673,8 @@ impl BotState {
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
+            #[cfg(test)]
+            gateway_ban_path_phases: Mutex::new(Vec::new()),
         }))
     }
 
@@ -1030,6 +1038,27 @@ impl BotState {
         self.gateway_manual_ban_audit_entries
             .lock()
             .consume(guild_id, user_id)
+    }
+
+    pub(crate) fn clear_gateway_manual_ban_audit_entries(&self, guild_id: u64, user_id: u64) {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .clear(guild_id, user_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_gateway_ban_path_test_phases(&self) {
+        self.gateway_ban_path_phases.lock().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_gateway_ban_path_test_phase(&self, phase: &'static str) {
+        self.gateway_ban_path_phases.lock().push(phase);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gateway_ban_path_test_phases(&self) -> Vec<&'static str> {
+        self.gateway_ban_path_phases.lock().clone()
     }
 
     pub(crate) fn begin_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
@@ -1920,6 +1949,26 @@ mod tests {
             .unwrap();
         assert_ne!(later.link.case_id, first_id);
         assert_eq!(later.entry_id, 124);
+    }
+
+    #[test]
+    fn gateway_unban_clears_queued_manual_ban_audit_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "gateway_manual_ban_audit_clear_{:032x}",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, 100);
+        app.queue_gateway_manual_ban_audit_entry(10, 55, 101);
+        app.clear_gateway_manual_ban_audit_entries(10, 55);
+        assert_eq!(app.consume_gateway_manual_ban_audit_entry(10, 55), None);
+        app.queue_gateway_manual_ban_audit_entry(10, 56, 102);
+        app.clear_gateway_manual_ban_audit_entries(10, 55);
+        assert_eq!(
+            app.consume_gateway_manual_ban_audit_entry(10, 56),
+            Some(102)
+        );
     }
 
     #[test]

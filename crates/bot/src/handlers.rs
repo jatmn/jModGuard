@@ -596,6 +596,8 @@ impl EventHandler for Handler {
         // A ban after this unban is a new ban, even inside the echo window.
         self.app
             .clear_gateway_ban_echo(guild_id.get(), unbanned_user.id.get());
+        self.app
+            .clear_gateway_manual_ban_audit_entries(guild_id.get(), unbanned_user.id.get());
         let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
@@ -1410,7 +1412,6 @@ mod tests {
     async fn gateway_ban_live_path_records_distinct_manual_bans_within_sixty_seconds() {
         use serenity::all::{User, UserId};
 
-        crate::member_directory::gateway_ban_path_test::reset();
         let directory = std::env::temp_dir().join(format!(
             "gateway_ban_distinct_{:032x}",
             rand::random::<u128>()
@@ -1420,6 +1421,7 @@ mod tests {
         let mut cfg = crate::config::BotProcessConfig::default();
         cfg.db.path = db_path.clone();
         let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
+        app.reset_gateway_ban_path_test_phases();
         let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
             .await
             .unwrap()
@@ -1499,7 +1501,6 @@ mod tests {
     async fn gateway_ban_live_path_precheck_runs_before_observe_ban() {
         use serenity::all::{User, UserId};
 
-        crate::member_directory::gateway_ban_path_test::reset();
         let directory = std::env::temp_dir().join(format!(
             "gateway_ban_precheck_order_{:032x}",
             rand::random::<u128>()
@@ -1509,6 +1510,7 @@ mod tests {
         let mut cfg = crate::config::BotProcessConfig::default();
         cfg.db.path = db_path.clone();
         let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
+        app.reset_gateway_ban_path_test_phases();
         let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
             .await
             .unwrap()
@@ -1524,10 +1526,7 @@ mod tests {
         user.id = UserId::new(55);
         user.name = "member".into();
         super::gateway_ban_directory_precheck_then_observe(&app, 10, &user, 5_000).await;
-        assert_eq!(
-            crate::member_directory::gateway_ban_path_test::phases(),
-            ["precheck", "observe"]
-        );
+        assert_eq!(app.gateway_ban_path_test_phases(), ["precheck", "observe"]);
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }

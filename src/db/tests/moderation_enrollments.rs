@@ -2293,6 +2293,54 @@ async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ba
 }
 
 #[tokio::test]
+async fn stringified_snowflake_audit_entry_id_dedupes_redelivery() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let audit_entry_id = 9007199254740993_i64;
+    let at = "2024-03-01T00:00:00+00:00";
+    let first = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(at),
+        false,
+        None,
+        true,
+        Some(audit_entry_id),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id } = first else {
+        panic!("first delivery must insert, got {first:?}");
+    };
+    let again = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-03-01T00:00:01+00:00"),
+        false,
+        None,
+        true,
+        Some(audit_entry_id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, GatewayBanWrite::Existing { row_id });
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+}
+
+#[tokio::test]
 async fn concurrent_false_precheck_after_attribution_stays_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();

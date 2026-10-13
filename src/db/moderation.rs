@@ -901,40 +901,73 @@ fn bot_echo_matches_mirror(
     }
 }
 
+fn parse_gateway_audit_entry_id_text(raw: Option<String>) -> Result<Option<i64>> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let digits = raw.trim().trim_matches('"');
+    if digits.is_empty() {
+        return Ok(None);
+    }
+    let parsed = digits
+        .parse::<u64>()
+        .map_err(|error| anyhow::anyhow!("audit_entry_id: {error}"))?;
+    Ok(Some(i64::try_from(parsed).map_err(|_| {
+        anyhow::anyhow!("audit_entry_id out of range")
+    })?))
+}
+
 fn gateway_audit_entry_id_for_mirror(
     conn: &impl SqlExecutor,
     guild_id: i64,
     user_id: i64,
     row_id: i64,
 ) -> Result<Option<i64>> {
-    Ok(conn
+    let raw = conn
         .query_row(
-            "SELECT json_extract(data, '$.audit_entry_id')
+            "SELECT CAST(json_extract(data, '$.audit_entry_id') AS TEXT)
          FROM events
          WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
            AND json_valid(data) AND json_extract(data, '$.ban_id') = ?3
          ORDER BY id DESC LIMIT 1",
             params![guild_id, user_id, row_id],
-            |row| Ok(row.get::<Option<i64>>(0)?),
+            |row| Ok(row.get::<Option<String>>(0)?),
         )
-        .optional()?
-        .flatten())
+        .optional()?;
+    parse_gateway_audit_entry_id_text(raw.flatten())
+}
+
+/// Gateway ban redeliveries for the same Discord ban usually arrive soon after the row.
+const GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS: i64 = 60;
+
+fn gateway_manual_redelivery_within_window(
+    mirror_created_at: &str,
+    incoming_at: &str,
+) -> Result<bool> {
+    let mirror = chrono::DateTime::parse_from_rfc3339(mirror_created_at)
+        .map_err(|error| anyhow::anyhow!("mirror created_at: {error}"))?;
+    let incoming = chrono::DateTime::parse_from_rfc3339(incoming_at)
+        .map_err(|error| anyhow::anyhow!("incoming gateway time: {error}"))?;
+    Ok(incoming <= mirror + chrono::Duration::seconds(GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS))
 }
 
 /// Whether two manual gateway deliveries are the same Discord ban action.
 ///
 /// Identity comes from the audit-log entry id persisted on the mirror's `member_ban` event
-/// (or a repeat delivery that omits the id after the mirror already stored one). A real
-/// second ban carries a different audit id, or the mirror cycle was ended by an observed
-/// `member_unban` before replacement. Delivery timestamps are not compared here.
+/// (or a repeat delivery that omits the id after the mirror already stored one). When ids are
+/// missing on one or both sides, a bounded delivery-time window is used as a fallback.
 fn gateway_deliveries_are_same(
+    mirror_created_at: &str,
+    incoming_at: &str,
     mirror_audit_entry_id: Option<i64>,
     incoming_audit_entry_id: Option<i64>,
-) -> bool {
+) -> Result<bool> {
     match (incoming_audit_entry_id, mirror_audit_entry_id) {
-        (Some(incoming), Some(stored)) => incoming == stored,
-        (None, Some(_stored)) => true,
-        _ => false,
+        (Some(incoming), Some(stored)) => Ok(incoming == stored),
+        (None, Some(_stored)) => Ok(true),
+        (Some(_), None) | (None, None) => {
+            gateway_manual_redelivery_within_window(mirror_created_at, incoming_at)
+        }
     }
 }
 
@@ -947,7 +980,7 @@ fn same_gateway_delivery_as_mirror(
     mirror: &ActiveBanMirror,
     guild_id: i64,
     user_id: i64,
-    _incoming_at: &str,
+    incoming_at: &str,
     incoming_audit_entry_id: Option<i64>,
 ) -> Result<bool> {
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
@@ -957,10 +990,12 @@ fn same_gateway_delivery_as_mirror(
     }
     let mirror_audit_entry_id =
         gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
-    Ok(gateway_deliveries_are_same(
+    gateway_deliveries_are_same(
+        mirror.created_at.as_str(),
+        incoming_at,
         mirror_audit_entry_id,
         incoming_audit_entry_id,
-    ))
+    )
 }
 
 fn replace_manual_gateway_mirror(
@@ -985,7 +1020,12 @@ fn replace_manual_gateway_mirror(
         if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
             let mirror_audit_entry_id =
                 gateway_audit_entry_id_for_mirror(conn, guild_id, user_id, mirror.id)?;
-            if gateway_deliveries_are_same(mirror_audit_entry_id, incoming_audit_entry_id) {
+            if gateway_deliveries_are_same(
+                &mirror.created_at,
+                incoming_at,
+                mirror_audit_entry_id,
+                incoming_audit_entry_id,
+            )? {
                 return Ok(false);
             }
             return Ok(true);
