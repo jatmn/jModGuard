@@ -279,6 +279,8 @@ fi
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
+ensure_dylint_toolchain
+
 use_prebuilt=0
 lib_dir=""
 if [ ! -d "$JMODGUARD_CI_PREFIX/dylint-libs" ]; then

@@ -118,7 +118,7 @@ classify() {
       all_rust
       return
       ;;
-    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
+    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh|scripts/ci-agent-setup.sh)
       dylint_full=1
       add dylint
       return
