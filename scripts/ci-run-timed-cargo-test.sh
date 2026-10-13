@@ -97,6 +97,43 @@ jmodguard_leader_session_pgid() {
   return 1
 }
 
+jmodguard_timeout_epoch_now() {
+  if [ -n "${JMODGUARD_TIMEOUT_NOW_SEC:-}" ]; then
+    printf '%s\n' "$JMODGUARD_TIMEOUT_NOW_SEC"
+    return 0
+  fi
+  date +%s
+}
+
+jmodguard_timeout_poll_sleep() {
+  sleep 0.2
+}
+
+# Test hook: JMODGUARD_TEST_KILL0_SEQUENCE is comma-separated 1/0 answers for leader liveness.
+jmodguard_test_leader_alive_answer() {
+  local next
+  [ -n "${JMODGUARD_TEST_KILL0_SEQUENCE:-}" ] || return 2
+  next="${JMODGUARD_TEST_KILL0_SEQUENCE%%,*}"
+  if [ "$next" = "$JMODGUARD_TEST_KILL0_SEQUENCE" ]; then
+    JMODGUARD_TEST_KILL0_SEQUENCE=""
+  else
+    JMODGUARD_TEST_KILL0_SEQUENCE="${JMODGUARD_TEST_KILL0_SEQUENCE#*,}"
+  fi
+  if [ "$next" = 1 ]; then
+    return 0
+  fi
+  return 1
+}
+
+jmodguard_leader_alive() {
+  local leader=$1
+  if [ -n "${JMODGUARD_TEST_KILL0_SEQUENCE:-}" ]; then
+    jmodguard_test_leader_alive_answer
+    return $?
+  fi
+  kill -0 "$leader" 2>/dev/null
+}
+
 # Run a single test invocation under timeout. Uses setsid so descendant processes
 # (smoke services, fixtures) share a session and are terminated on timeout.
 run_with_test_timeout() {
@@ -114,15 +151,19 @@ run_with_test_timeout() {
     session_pgid="$(jmodguard_leader_session_pgid "$leader")" || session_pgid=""
     JMODGUARD_ACTIVE_TEST_SESSION_PGID="$session_pgid"
     # Poll so INT/TERM traps are not deferred behind a long-running external `timeout`.
-    deadline=$(( $(date +%s) + duration_sec ))
-    while kill -0 "$leader" 2>/dev/null; do
-      now=$(date +%s)
+    deadline=$(( $(jmodguard_timeout_epoch_now) + duration_sec ))
+    while jmodguard_leader_alive "$leader"; do
+      now=$(jmodguard_timeout_epoch_now)
       if [ "$now" -ge "$deadline" ]; then
-        rc=124
-        jmodguard_kill_active_test_session
+        if jmodguard_leader_alive "$leader"; then
+          rc=124
+          jmodguard_kill_active_test_session
+          wait "$leader" 2>/dev/null || true
+          JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+        fi
         break
       fi
-      sleep 0.2
+      jmodguard_timeout_poll_sleep
     done
     if [ "$rc" -eq 0 ]; then
       wait "$leader"
