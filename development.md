@@ -17,8 +17,8 @@ bash scripts/ci-preflight.sh
 # or: ./scripts/smoke-dual-process.sh
 ```
 
-Local hooks run that full script. Buildkite selects groups from the diff
-(`bash .buildkite/select-checks.sh`) and runs `ci-preflight.sh --only <group>`.
+Local hooks run that full script. GitHub Actions selects groups from the diff
+(`bash scripts/select-checks.sh`) and runs `ci-preflight.sh --only <group>`.
 Remote libSQL containers stay in the `remote-database` group, which is
 skipped for docs-only, WebUI-only, and API-only diffs. Optional local hooks:
 
@@ -32,13 +32,13 @@ That sets worktree-local `core.hooksPath` to `.githooks` so `pre-commit` and
 `pre-push` run the full `bash scripts/ci-preflight.sh` suite (commit then
 push runs it twice). Git then uses only `.githooks` in this worktree; previous
 hook directories are not chained. Linked worktrees are unaffected unless you run
-install there too. It does not add GitHub Actions.
+install there too. The hooks are local; GitHub Actions runs the selected CI groups.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.
 
-CI and image publication run on self-hosted Buildkite agents. Setup and manual
-builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
+CI and image publication run on standard GitHub-hosted runners. Setup and manual
+builds: **[docs/CI.md](docs/CI.md)**.
 
 ## Dependency updates
 
@@ -46,7 +46,7 @@ builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
 npm updates for the host-only ESLint pin under `tools/eslint` after they are
 merged to `main`. Cargo and npm minor and patch version updates are grouped;
 major updates remain separate. Dependabot permits up to
-five open version-update PRs per ecosystem (Cargo and npm each). Review and run the Buildkite checks before
+five open version-update PRs per ecosystem (Cargo and npm each). Review and run the GitHub Actions checks before
 merging dependency updates.
 
 The `libsql-sqlite3-parser` Git patch is excluded from automatic updates:
@@ -54,14 +54,14 @@ maintain its reviewed revision and security regression test manually.
 The vendored `tokio-tungstenite` compatibility patch also requires manual
 maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
-and the Buildkite agents. `Dockerfile.{bot,api}` pin
+and the CI toolchain. `Dockerfile.{bot,api}` pin
 `rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
 
 Dependabot version updates are supported on this private GitHub.com
 repository. GitHub enqueues those jobs as **Actions → Dependabot Updates**
 dynamic workflows (`dynamic/dependabot/dependabot-updates`). They are not
-`.github/workflows` files, they do not replace Buildkite, and on standard
+`.github/workflows` files, they do not replace application CI, and on standard
 GitHub-hosted runners they do not consume included Actions minutes. A
 missing Insights update log does not mean the weekly schedule is idle: if
 the job stays **queued** on a `dependabot` label and then **cancelled** at
@@ -69,13 +69,13 @@ the job stays **queued** on a `dependabot` label and then **cancelled** at
 
 Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
 **disabled** so GitHub-hosted standard runners can execute the job. This
-repository has no GitHub Actions self-hosted runners; CI is Buildkite.
+repository has no GitHub Actions self-hosted runners; CI uses standard GitHub-hosted runners.
 The Socket Security manifest scan is `.github/workflows/socket.yml` on GitHub
 Actions. It is not CI. Set the repository Actions secret
 `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on the scan.
 A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
-A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. The CI passed check remains the merge gate.
 After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 Do not register leftover Proxmox GHA runners or label any runner
 `dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
@@ -88,11 +88,11 @@ starts and then reports private Git authentication failures, inspect that
 run's Actions log. Do not put tokens in YAML. The separate GitHub Packages
 feature requires granting the consuming repository Read access under the
 package's **Manage Actions access** settings; it does not provide
-credentials to Buildkite.
+Git fetch authentication.
 
 Dependabot alerts and security updates are separate repository settings.
 Keep both enabled under **Settings → Advanced Security → Dependabot**;
 the weekly schedule controls version updates, not the timing of security
 fixes. After a job **starts**, check **Actions → Dependabot Updates** and
 **Insights → Dependency graph → Dependabot**. These jobs generate PRs;
-application CI and image publication remain on Buildkite.
+application CI and image publication remain on GitHub Actions.

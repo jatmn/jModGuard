@@ -1,6 +1,6 @@
 # jModGuard
 
-[![Build status](https://badge.buildkite.com/38ea07d60d3ab8cf765aa025cb56cbdb65d3e17d437b5f0c98.svg)](https://buildkite.com/jatmn/jmodguard)
+[![CI](https://github.com/jatmn/jModGuard/actions/workflows/ci.yml/badge.svg)](https://github.com/jatmn/jModGuard/actions/workflows/ci.yml)
 
 **Database compatibility:** this release requires a fresh database or the recognized
 `jmodguard-core-1` family. Earlier databases/backups require their matching old release;
@@ -133,7 +133,7 @@ released versions remain subject to the license supplied with those versions.
 ## Development
 
 Owner-only, on-demand Pullfrog commands and diagnostics are documented in [docs/PULLFROG.md](docs/PULLFROG.md).
-It does not replace Buildkite CI.
+It does not replace GitHub Actions CI.
 
 ```bash
 bash scripts/ci-preflight.sh

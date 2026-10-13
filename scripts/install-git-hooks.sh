@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Point this worktree at .githooks so commits and pushes run ci-preflight.sh.
-# GitHub Actions is not involved; CI remains Buildkite.
+# These hooks run locally; hosted CI uses the same gates.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"

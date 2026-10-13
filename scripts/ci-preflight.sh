@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Single source of truth for Buildkite check groups and the full local suite.
+# Shared selected GitHub Actions check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
-# GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
-# Allowed workflow files are the owner-command Pullfrog workflow and the
-# Socket Security manifest scan. CI runs on Buildkite.
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
@@ -18,13 +15,13 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
 
-Run the Buildkite test gates locally or on a Buildkite linux agent.
+Run the CI gates locally or on an ephemeral GitHub-hosted Linux runner.
 With no --only, run the full suite (local hooks and a complete check).
-Buildkite uploads one step per selected group. Known groups: contracts,
+GitHub Actions groups affected checks into jobs. Known groups: contracts,
 frontend, fmt, dylint, api, bot, runtime, updater, core, integration,
 boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
 By default the whitespace diff base is origin/main. Pass --base origin/<branch>
-for a PR whose base is not main. Scheduled Buildkite builds set
+for a PR whose base is not main. Scheduled builds set
 JMODGUARD_AUDIT_FAIL_CLOSED=1 so cargo-audit fails the job.
 EOF
 }
@@ -70,14 +67,7 @@ should_run() {
 }
 
 if should_run contracts; then
-  if ! grep -Fq 'bash .buildkite/select-checks.sh upload' "$root/.buildkite/pipeline.yml"; then
-    echo 'ci-preflight: .buildkite/pipeline.yml must invoke bash .buildkite/select-checks.sh upload' >&2
-    exit 1
-  fi
-  if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.steps.yml"; then
-    echo 'ci-preflight: .buildkite/pipeline.steps.yml must invoke bash scripts/ci-preflight.sh' >&2
-    exit 1
-  fi
+  node scripts/ci-workflow-test.mjs
 fi
 
 if should_run contracts; then
@@ -172,7 +162,7 @@ JS
   fi
 
   if [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" = "1" ]; then
-    echo "ci-preflight: cargo audit failed closed (scheduled Buildkite; ${advisory_count} advisories)" >&2
+    echo "ci-preflight: cargo audit failed closed (scheduled CI; ${advisory_count} advisories)" >&2
     rm -f "$audit_out" "$audit_err"
     return 1
   fi
@@ -184,18 +174,21 @@ JS
 
 whitespace_check() {
   local merge_base
-  if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
-    local pr_base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
-    git fetch --no-tags origin "$pr_base"
-    echo "ci-preflight: git diff --check origin/${pr_base}...HEAD"
-    git diff --check "origin/${pr_base}...HEAD"
+  if [[ "${JMODGUARD_DIFF_BASE:-}" =~ ^[0-9a-f]{40}$ && "${JMODGUARD_DIFF_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] \
+      && git cat-file -e "${JMODGUARD_DIFF_BASE}^{commit}" 2>/dev/null \
+      && git cat-file -e "${JMODGUARD_DIFF_HEAD}^{commit}" 2>/dev/null; then
+    local range_base="$JMODGUARD_DIFF_BASE"
+    if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
+      range_base="$(git merge-base "$range_base" "$JMODGUARD_DIFF_HEAD")"
+    fi
+    git diff --check "$range_base" "$JMODGUARD_DIFF_HEAD"
     return 0
   fi
   if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
     if ! merge_base="$(git merge-base "$base_ref" HEAD)"; then
       merge_base="$base_ref"
     fi
-    # Buildkite main checkouts have origin/main == HEAD, so merge-base vs the
+    # Main checkouts have origin/main == HEAD, so merge-base vs the
     # working tree is empty. Compare the first-parent patch in that case.
     if [ "$(git rev-parse "$merge_base")" = "$(git rev-parse HEAD)" ]; then
       if git rev-parse --verify --quiet HEAD^ >/dev/null; then
@@ -242,7 +235,7 @@ if should_run dylint; then
   bash scripts/dylint-test.sh
   echo 'ci-preflight: bash scripts/dylint.sh'
   if [ -z "${only_names}" ]; then
-    # Full local gates must not inherit an affected-only Buildkite scope.
+    # Full local gates must not inherit an affected-only CI scope.
     env JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
   else
     bash scripts/dylint.sh
@@ -251,13 +244,14 @@ fi
 
 if should_run contracts; then
   whitespace_check
-  echo 'ci-preflight: bash .buildkite/select-checks-test.sh'
-  bash .buildkite/select-checks-test.sh
+  echo 'ci-preflight: bash scripts/select-checks-test.sh'
+  bash scripts/select-checks-test.sh
 fi
 
 if should_run publish-tests; then
-  echo 'ci-preflight: bash .buildkite/publish-image-test.sh'
-  bash .buildkite/publish-image-test.sh
+  echo 'ci-preflight: bash scripts/publish-image-test.sh'
+  bash scripts/publish-image-test.sh
+  bash scripts/prepare-publication-test.sh
 fi
 
 if should_run bootstrap; then
@@ -410,4 +404,4 @@ if should_run supply-chain; then
   run_cargo_audit_gate
 fi
 
-echo 'ci-preflight: Buildkite test gates passed'
+echo 'ci-preflight: CI test gates passed'

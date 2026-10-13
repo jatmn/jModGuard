@@ -1,4 +1,4 @@
-# Socket Security manifest scan. CI and image publication stay on Buildkite.
+# Socket Security manifest scan. CI and image publication stay on GitHub Actions.
 name: socket-security-workflow
 run-name: Socket Security
 

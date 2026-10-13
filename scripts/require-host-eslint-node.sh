@@ -29,5 +29,5 @@ if (!supported) {
   process.exit(1);
 }
 '; then
-  fail "upgrade Node.js on this host (see tools/eslint/package.json engines and docs/BUILDKITE.md)"
+  fail "upgrade Node.js on this host (see tools/eslint/package.json engines and docs/CI.md)"
 fi

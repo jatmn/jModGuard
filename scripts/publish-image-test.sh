@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline publication contract tests; never log in, push, or contact Buildkite.
+# Offline publication contract tests; never log in, push, or contact GitHub Actions.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,24 +11,24 @@ fail() {
 }
 
 # shellcheck disable=SC1091
-JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
+JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
 
 HEAD_SHA="$(printf 'a%.0s' {1..40})"
 BASE_SHA="$(printf 'b%.0s' {1..40})"
 
 with_main() {
-  BUILDKITE=true
-  BUILDKITE_SOURCE=webhook
-  BUILDKITE_BRANCH=main
-  BUILDKITE_COMMIT="$HEAD_SHA"
-  BUILDKITE_PULL_REQUEST=false
-  BUILDKITE_RETRY_COUNT=0
-  BUILDKITE_TAG=""
-  BUILDKITE_GITHUB_EVENT=push
+  GITHUB_ACTIONS=true
+  GITHUB_REPOSITORY=jatmn/jModGuard
+  GITHUB_EVENT_NAME=push
+  GITHUB_REF=refs/heads/main
+  GITHUB_SHA="$HEAD_SHA"
+  GITHUB_RUN_ATTEMPT=1
+  GITHUB_ACTOR=jatmn
+  GITHUB_TRIGGERING_ACTOR=jatmn
+  GITHUB_ACTOR_ID=12479882
   JMODGUARD_PUBLISH_SOURCE=""
-  export BUILDKITE BUILDKITE_SOURCE BUILDKITE_BRANCH BUILDKITE_COMMIT \
-    BUILDKITE_PULL_REQUEST BUILDKITE_RETRY_COUNT BUILDKITE_TAG BUILDKITE_GITHUB_EVENT \
-    JMODGUARD_PUBLISH_SOURCE
+  export GITHUB_ACTIONS GITHUB_REPOSITORY GITHUB_EVENT_NAME GITHUB_REF GITHUB_SHA \
+    GITHUB_RUN_ATTEMPT GITHUB_ACTOR GITHUB_TRIGGERING_ACTOR GITHUB_ACTOR_ID JMODGUARD_PUBLISH_SOURCE
 }
 
 assert_eq() {
@@ -56,74 +56,42 @@ JS
 
 with_main
 assert_request $'main\t'
-BUILDKITE_TAG=v1 BUILDKITE_BRANCH=v1 assert_request $'tag\trefs/tags/v1'
-
-BUILDKITE_PULL_REQUEST=7 assert_request skip
-BUILDKITE_PULL_REQUEST=false
-BUILDKITE_BRANCH=feature assert_request skip
-BUILDKITE_BRANCH=main
-BUILDKITE_SOURCE=ui assert_request skip
-BUILDKITE_SOURCE=webhook
-BUILDKITE_GITHUB_EVENT=pull_request assert_request skip
-BUILDKITE_GITHUB_EVENT=release assert_request skip
-BUILDKITE_GITHUB_EVENT=push
-BUILDKITE_SOURCE=schedule assert_request $'nightly\t'
-BUILDKITE_SOURCE=webhook
-JMODGUARD_PUBLISH_SOURCE="$HEAD_SHA" assert_request $'main\t'
-BUILDKITE_TAG=v1 BUILDKITE_BRANCH=v1 JMODGUARD_PUBLISH_SOURCE="$HEAD_SHA" \
-  assert_request $'tag\trefs/tags/v1'
-unset BUILDKITE
-if ( publish_request ) >/dev/null 2>&1; then
-  fail 'missing BUILDKITE must fail'
-fi
+GITHUB_REF=refs/tags/v1 assert_request $'tag\trefs/tags/v1'
+for event in pull_request pull_request_target merge_group release issue_comment; do
+  GITHUB_EVENT_NAME="$event" assert_request skip
+done
+GITHUB_REPOSITORY=outsider/jModGuard assert_request skip
+GITHUB_REF=refs/heads/feature assert_request skip
+GITHUB_EVENT_NAME=schedule assert_request $'nightly\t'
+GITHUB_EVENT_NAME=workflow_dispatch assert_request skip
+unset GITHUB_ACTIONS
+if (publish_request) >/dev/null 2>&1; then fail 'non-Actions publication must fail'; fi
 with_main
-
-BUILDKITE_SOURCE=ui
+GITHUB_EVENT_NAME=workflow_dispatch
 JMODGUARD_PUBLISH_SOURCE="$HEAD_SHA" assert_request $'manual\t'"$HEAD_SHA"
-JMODGUARD_PUBLISH_SOURCE='refs/tags/v1' assert_request $'manual\trefs/tags/v1'
 JMODGUARD_PUBLISH_SOURCE='refs/tags/release/v1+meta' assert_request $'manual\trefs/tags/release/v1+meta'
 for ref in main HEAD abc123 refs/heads/main v1 -oops; do
-  JMODGUARD_PUBLISH_SOURCE="$ref"
-  if ( publish_request ) >/dev/null 2>&1; then
-    fail "manual source $ref must fail"
-  fi
+  if (JMODGUARD_PUBLISH_SOURCE="$ref" publish_request) >/dev/null 2>&1; then fail "manual source $ref must fail"; fi
 done
 JMODGUARD_PUBLISH_SOURCE="$HEAD_SHA"
-BUILDKITE_BRANCH=feature
-if ( publish_request ) >/dev/null 2>&1; then
-  fail 'manual off main must fail'
-fi
+for actor in GITHUB_ACTOR GITHUB_TRIGGERING_ACTOR GITHUB_ACTOR_ID; do
+  if (export "$actor=outsider"; publish_request) >/dev/null 2>&1; then fail "$actor must be owner-only"; fi
+done
+if (GITHUB_REF=refs/heads/feature publish_request) >/dev/null 2>&1; then fail 'manual publication must use main'; fi
 with_main
 
-grep -Eq 'eval |bash -c|python3|shell=True' "$root/.buildkite/publish-image.sh" \
+# Preserve the publisher's argv-only execution contract.
+grep -Eq 'eval |bash -c|python3|shell=True' "$root/scripts/publish-image.sh" \
   && fail 'publisher must not eval, invoke python, or use bash -c'
-grep -Fq 'run_git() { git "$@" || publish_fail "git failed: $*"; }' "$root/.buildkite/publish-image.sh" \
+grep -Fq 'run_git() { git "$@" || publish_fail "git failed: $*"; }' "$root/scripts/publish-image.sh" \
   || fail 'publisher must invoke git as an argv list'
-grep -Fq 'run_docker() { docker "$@" || publish_fail "docker failed: $*"; }' "$root/.buildkite/publish-image.sh" \
+grep -Fq 'run_docker() { docker "$@" || publish_fail "docker failed: $*"; }' "$root/scripts/publish-image.sh" \
   || fail 'publisher must invoke docker as an argv list'
-grep -Fq 'run_bk() { buildkite-agent "$@" || publish_fail "buildkite-agent failed: $*"; }' "$root/.buildkite/publish-image.sh" \
-  || fail 'publisher must invoke buildkite-agent as an argv list'
 
-commands=0
-run_git() { commands=$((commands + 1)); fail "unexpected git $*"; }
-run_docker() { commands=$((commands + 1)); fail "unexpected docker $*"; }
-run_bk() { commands=$((commands + 1)); fail "unexpected buildkite $*"; }
-BUILDKITE_PULL_REQUEST=1
-prepare
-publish_component bot
-BUILDKITE_PULL_REQUEST=false
-BUILDKITE_SOURCE=ui
-JMODGUARD_PUBLISH_SOURCE=""
-prepare
-publish_component bot
-assert_eq "$commands" "0"
-with_main
-
-# Restore real helpers after the skip test.
-# shellcheck disable=SC1091
-JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
-
-log=()
+# Real file-backed plan survives retries without resolving a moved tag again.
+plan_scratch="$(mktemp -d)"
+JMODGUARD_PUBLICATION_PLAN_FILE="$plan_scratch/plan.json"
+export JMODGUARD_PUBLICATION_PLAN_FILE
 run_git() {
   case "$1 $2" in
     'rev-parse HEAD') printf '%s\n' "$HEAD_SHA" ;;
@@ -131,68 +99,34 @@ run_git() {
     *) fail "unexpected git $*" ;;
   esac
 }
-run_bk() {
-  log+=("$*")
-  case "$1 $2 $3" in
-    'meta-data exists image-publication') return 100 ;;
-    'meta-data set image-publication') return 0 ;;
-    *) fail "unexpected buildkite $*" ;;
-  esac
-}
-bk_meta_exists() { return 100; }
-resolve_source() {
-  assert_eq "$1" manual
-  assert_eq "$2" refs/tags/v1
-  assert_eq "$3" "$HEAD_SHA"
-  printf '%s\t%s\n' "$BASE_SHA" v1
-}
-BUILDKITE_SOURCE=ui
-JMODGUARD_PUBLISH_SOURCE='refs/tags/v1'
-prepare
-[[ "${log[0]:-}" == meta-data\ set\ image-publication\ * ]] || fail "prepare must write the plan: ${log[*]:-}"
-plan="${log[0]#meta-data set image-publication }"
-node --input-type=commonjs - <<JS
-const plan = ${plan};
-if (plan.mode !== "manual" || plan.ref !== "refs/tags/v1" || plan.commit !== "${HEAD_SHA}"
-    || plan.sha !== "${BASE_SHA}" || plan.tag !== "v1") {
-  process.exit(1);
-}
-JS
+resolve_source() { printf '%s\t%s\n' "$BASE_SHA" v1; }
+GITHUB_EVENT_NAME=workflow_dispatch JMODGUARD_PUBLISH_SOURCE=refs/tags/v1 prepare
+JMODGUARD_PUBLISH_SOURCE=refs/tags/v1 GITHUB_EVENT_NAME=workflow_dispatch read_plan manual refs/tags/v1 "$HEAD_SHA" >"$plan_scratch/resolved"
+assert_eq "$(cat "$plan_scratch/resolved")" "$(printf '%s\t%s' "$BASE_SHA" v1)"
+resolve_source() { fail 'retry must not resolve the source again'; }
+GITHUB_EVENT_NAME=workflow_dispatch JMODGUARD_PUBLISH_SOURCE=refs/tags/v1 prepare
+rm -rf "$plan_scratch"
+unset JMODGUARD_PUBLICATION_PLAN_FILE
 
-# shellcheck disable=SC1091
-JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
-run_bk() {
-  case "$1 $2" in
-    'meta-data exists') return 0 ;;
-    *) fail "retry must not resolve again: $*" ;;
-  esac
-}
-bk_meta_exists() { return 0; }
-read_plan() {
-  printf '%s\t%s\n' "$BASE_SHA" v1
-}
-resolve_source() { fail 'retry must not resolve_source'; }
-checked_request() { printf 'manual\t%s\t%s\n' 'refs/tags/v1' "$HEAD_SHA"; }
-prepare
-
-# shellcheck disable=SC1091
-JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
+JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
+# Untrusted events must stop before reading plans, obtaining credentials or using Git/Docker.
+run_git() { fail "unexpected git $*"; }
+run_docker() { fail "unexpected docker $*"; }
+read_publication_plan() { fail 'untrusted event read publication plan'; }
+GITHUB_EVENT_NAME=pull_request prepare
+GITHUB_EVENT_NAME=pull_request publish_component bot
+with_main
+JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
 run_git() {
-  if [[ "$1" == rev-parse ]]; then
-    printf '%s\n' "$BASE_SHA"
-    return
-  fi
-  if [[ "$1" == status ]]; then
-    printf ' M src/lib.rs\n'
-    return
-  fi
-  fail "unexpected git $*"
+  case "$1" in
+    rev-parse) printf '%s\n' "$HEAD_SHA" ;;
+    status) printf ' M src/lib.rs\n' ;;
+    *) fail "unexpected git $*" ;;
+  esac
 }
-run_docker() { fail 'bad checkout must not touch docker'; }
-run_bk() { fail 'bad checkout must not touch buildkite'; }
-if ( publish_component bot ) >/dev/null 2>&1; then
-  fail 'dirty checkout must fail'
-fi
+if (publish_component bot) >/dev/null 2>&1; then fail 'dirty checkout must fail'; fi
+# Verify the actual runner masking protocol, including control characters.
+assert_eq "$(redact_tokens 'a%b' $'c\nd')" $'::add-mask::a%25b\n::add-mask::c%0Ad'
 
 contains_arg() {
   local needle="$1"
@@ -287,7 +221,7 @@ rm -rf "$schema_source"
 
 reload_publisher() {
   # shellcheck disable=SC1091
-  JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
+  JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
 }
 
 plan_json() {
@@ -394,14 +328,13 @@ mock_publish_helpers() {
     fi
     return 0
   }
-  run_bk() {
-    printf 'buildkite-agent %s\n' "$*" >>"$TRACE_FILE"
-    case "$1 $2" in
-      'meta-data get') printf '%s\n' "$PLAN_JSON" ;;
-      'redactor add') cat >"${TRACE_FILE}.redactor"; return 0 ;;
-      'secret get') fail 'skip path must not read secrets' ;;
-      *) fail "unexpected buildkite $*" ;;
-    esac
+  read_publication_plan() {
+    printf 'plan get\n' >>"$TRACE_FILE"
+    printf '%s\n' "$PLAN_JSON"
+  }
+  redact_tokens() {
+    printf 'mask tokens\n' >>"$TRACE_FILE"
+    GHCR_TOKEN="$1" SOURCE_TOKEN="$2" node -e 'process.stdout.write(JSON.stringify({GHCR_TOKEN:process.env.GHCR_TOKEN,GITHUB_TOKEN:process.env.SOURCE_TOKEN}))' >"${TRACE_FILE}.redactor"
   }
 }
 
@@ -439,9 +372,9 @@ exercise_publish() {
   if [[ "$mode" == manual ]]; then
     ref="${9:-refs/tags/v1}"
     sha="$BASE_SHA"
-    BUILDKITE_SOURCE=ui
+    GITHUB_EVENT_NAME=workflow_dispatch
     JMODGUARD_PUBLISH_SOURCE="$ref"
-    export BUILDKITE_SOURCE JMODGUARD_PUBLISH_SOURCE
+    export GITHUB_EVENT_NAME JMODGUARD_PUBLISH_SOURCE
   fi
   if [[ -n "$plan" ]]; then
     PLAN_JSON="$plan"
@@ -488,7 +421,7 @@ printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' && fail 'unchanged m
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree' && fail 'unchanged main must not use a worktree'
 printf '%s\n' "${CALLS[@]}" | grep -q 'secret get' && fail 'unchanged main must not read secrets'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker login' && fail 'unchanged main must not log in'
-printf '%s\n' "${CALLS[@]}" | grep -q 'redactor add' && fail 'unchanged main must not redact'
+printf '%s\n' "${CALLS[@]}" | grep -q 'mask tokens' && fail 'unchanged main must not redact'
 
 with_main
 unset GHCR_USERNAME GHCR_TOKEN || true
@@ -501,9 +434,9 @@ mock_publish_helpers
 changed_since_publication() { return 1; }
 publish_component api
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q 'buildkite-agent meta-data get' \
+printf '%s\n' "${CALLS[@]}" | grep -q 'plan get' \
   || fail 'skip without credentials must still read the plan'
-printf '%s\n' "${CALLS[@]}" | grep -qE 'docker |secret get|redactor' \
+printf '%s\n' "${CALLS[@]}" | grep -qE 'docker |secret get|mask tokens' \
   && fail "skip without credentials must not touch docker or secrets: ${CALLS[*]}"
 
 exercise_publish 1
@@ -583,13 +516,8 @@ run_docker() {
   fi
   fail "unexpected docker $*"
 }
-run_bk() {
-  case "$1 $2" in
-    'meta-data get') printf '%s\n' "$PLAN_JSON" ;;
-    'redactor add') cat >/dev/null; return 0 ;;
-    *) fail "unexpected buildkite $*" ;;
-  esac
-}
+read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
+redact_tokens() { :; }
 changed_since_publication() { return 0; }
 if ( publish_component api ) >/dev/null 2>&1; then
   fail 'worktree failure must abort publish'
@@ -693,7 +621,7 @@ run_docker() { fail 'invalid plan must not touch docker'; }
 with_main
 for plan in '[]' '{}' "$(plan_json main "" "$HEAD_SHA" "$BASE_SHA" "")"; do
   PLAN_JSON="$plan"
-  run_bk() { printf '%s\n' "$PLAN_JSON"; }
+  read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
   if ( read_plan main "" "$HEAD_SHA" ) >/dev/null 2>&1; then
     fail "invalid plan must be rejected: $plan"
   fi
@@ -811,8 +739,8 @@ while IFS='|' read -r path affected; do
     [[ "$actual" == "$expected" ]] || fail "$component after $path: expected $expected, got $actual"
   done
 done <<'CASES'
-crates/bot/src/main.rs|bot api
-crates/api/src/web/api.rs|bot api
+crates/bot/src/main.rs|bot
+crates/api/src/web/api.rs|api
 crates/integration-tests/tests/dual_process_smoke.rs|
 crates/api/tests/tokenless_startup.rs|
 crates/updater/tests/registry.rs|
@@ -829,6 +757,7 @@ crates/runtime/Cargo.toml|bot api
 Cargo.toml|bot api
 Cargo.lock|bot api
 rust-toolchain.toml|bot api
+LICENSE.md|bot api webui
 Dockerfile.bot|bot
 Dockerfile.api|api
 Dockerfile.webui|webui
@@ -838,9 +767,9 @@ frontend/style.css|webui
 scripts/package-webui.mjs|webui
 tools/webui/package-lock.json|webui
 tools/webui/build.mjs|webui
-.buildkite/publish-image.sh|bot api webui
-.buildkite/select-checks.sh|
-.buildkite/publish-image-test.sh|
+scripts/publish-image.sh|bot api webui
+scripts/select-checks.sh|
+scripts/publish-image-test.sh|
 docs/INSTALL.md|
 CASES
 
@@ -900,12 +829,12 @@ EXPORTS=0
 PLAN_JSON="$(plan_json main "" "$base" "$base" "")"
 export PLAN_JSON
 with_main
-BUILDKITE_COMMIT="$base"
+GITHUB_SHA="$base"
 HEAD_SHA="$base"
 GHCR_USERNAME=fixture
 GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
-export BUILDKITE_COMMIT GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
+export GITHUB_SHA GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
 registry_inspect() {
   local ref="$1"
   shift
@@ -931,13 +860,8 @@ run_git() {
     *) git "$@" ;;
   esac
 }
-run_bk() {
-  case "$1 $2" in
-    'meta-data get') printf '%s\n' "$PLAN_JSON" ;;
-    'redactor add') cat >/dev/null; return 0 ;;
-    *) fail "unexpected buildkite $*" ;;
-  esac
-}
+read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
+redact_tokens() { :; }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
   if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi
@@ -973,13 +897,13 @@ EXPORTS=0
 PLAN_JSON="$(plan_json main "" "$base" "$base" "")"
 export PLAN_JSON
 with_main
-BUILDKITE_COMMIT="$base"
-BUILDKITE_RETRY_COUNT=1
+GITHUB_SHA="$base"
+GITHUB_RUN_ATTEMPT=2
 HEAD_SHA="$base"
 GHCR_USERNAME=fixture
 GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
-export BUILDKITE_COMMIT BUILDKITE_RETRY_COUNT GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
+export GITHUB_SHA GITHUB_RUN_ATTEMPT GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
 registry_inspect() {
   local ref="$1"
   shift
@@ -1008,13 +932,8 @@ run_git() {
     *) git "$@" ;;
   esac
 }
-run_bk() {
-  case "$1 $2" in
-    'meta-data get') printf '%s\n' "$PLAN_JSON" ;;
-    'redactor add') cat >/dev/null; return 0 ;;
-    *) fail "unexpected buildkite $*" ;;
-  esac
-}
+read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
+redact_tokens() { :; }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
   if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi

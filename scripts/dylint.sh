@@ -115,9 +115,8 @@ fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-dylint}"
 
-# Buildkite runs many cargo steps in parallel on one agent. Give dylint its own
-# CARGO_HOME so `cargo fetch` for Trail of Bits lint libraries does not race
-# shared git checkouts under the agent default home.
+# Give lint-tool dependency resolution its own CARGO_HOME so it cannot race
+# ordinary Cargo dependency checkouts during local or hosted checks.
 scratch="${TMPDIR:-$root/.tmp/dylint}"
 mkdir -p "$scratch"
 export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"

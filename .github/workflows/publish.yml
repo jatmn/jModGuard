@@ -1,0 +1,144 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Optional publication source: full commit SHA or refs/tags/<tag>; empty runs checks only'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Keep waiting releases: cancel-in-progress:false alone retains only one pending run.
+concurrency:
+  group: publication
+  queue: max
+  cancel-in-progress: false
+
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: credential.helper
+  GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+
+jobs:
+  ci:
+    name: Validate
+    if: >-
+      (!github.event.repository.private || vars.JMODGUARD_ENABLE_PRIVATE_CI == 'true') &&
+      github.repository == 'jatmn/jModGuard' &&
+      (github.event_name != 'workflow_dispatch' ||
+       (github.ref == 'refs/heads/main' && github.actor == 'jatmn' &&
+        github.triggering_actor == 'jatmn' && github.actor_id == '12479882'))
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Stable release
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'jatmn/jModGuard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag_name }}
+      created: ${{ steps.release.outputs.release_created }}
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main
+
+  prepare-publication:
+    name: Pin publication source
+    needs: [ci, release]
+    if: >-
+      always() && needs.ci.result == 'success' &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
+      github.repository == 'jatmn/jModGuard' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+       (github.actor == 'jatmn' && github.triggering_actor == 'jatmn' && github.actor_id == '12479882' &&
+        ((github.event_name == 'push' && github.ref_type == 'tag') ||
+         (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.source != ''))))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      plan: ${{ steps.prepare.outputs.plan }}
+      release_tag: ${{ steps.prepare.outputs.release_tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      JMODGUARD_PUBLISH_SOURCE: ${{ inputs.source }}
+      JMODGUARD_RELEASE_TAG: ${{ needs.release.outputs.created == 'true' && needs.release.outputs.tag || '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Resolve or restore this run's publication plan
+        id: prepare
+        run: bash scripts/prepare-publication.sh
+      - name: Retain immutable plan for retries
+        if: steps.prepare.outputs.reused != 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: publication-plan
+          path: ${{ runner.temp }}/publication/plan.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish / ${{ matrix.component }}
+    needs: [ci, release, prepare-publication]
+    if: >-
+      always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
+      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [bot, api, webui]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: publish-${{ matrix.component }}
+      cancel-in-progress: false
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GHCR_TOKEN: ${{ github.token }}
+      GHCR_USERNAME: ${{ github.repository_owner }}
+      JMODGUARD_PUBLICATION_PLAN: ${{ needs.prepare-publication.outputs.plan }}
+      JMODGUARD_PUBLISH_SOURCE: ${{ inputs.source }}
+      JMODGUARD_RELEASE_TAG: ${{ needs.prepare-publication.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Publish changed component
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: bash scripts/publish-image.sh "$COMPONENT"
