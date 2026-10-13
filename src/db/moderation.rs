@@ -873,16 +873,53 @@ fn bot_echo_matches_mirror(
 
 /// Gateway ban redeliveries for the same Discord ban usually arrive soon after the row.
 const GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS: i64 = 60;
+/// Duplicate deliveries before the directory reflects the ban share a much tighter window.
+const GATEWAY_FALSE_PRECHECK_REDELIVERY_WINDOW_SECS: i64 = 2;
 
-fn gateway_manual_redelivery_within_window(
+fn gateway_redelivery_within_window(
     mirror_created_at: &str,
     incoming_at: &str,
+    window_secs: i64,
 ) -> Result<bool> {
     let mirror = chrono::DateTime::parse_from_rfc3339(mirror_created_at)
         .map_err(|error| anyhow::anyhow!("mirror created_at: {error}"))?;
     let incoming = chrono::DateTime::parse_from_rfc3339(incoming_at)
         .map_err(|error| anyhow::anyhow!("incoming gateway time: {error}"))?;
-    Ok(incoming <= mirror + chrono::Duration::seconds(GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS))
+    Ok(incoming <= mirror + chrono::Duration::seconds(window_secs))
+}
+
+fn gateway_manual_redelivery_within_window(
+    mirror_created_at: &str,
+    incoming_at: &str,
+) -> Result<bool> {
+    gateway_redelivery_within_window(
+        mirror_created_at,
+        incoming_at,
+        GATEWAY_MANUAL_REDELIVERY_WINDOW_SECS,
+    )
+}
+
+fn gateway_false_precheck_redelivery_within_window(
+    mirror_created_at: &str,
+    incoming_at: &str,
+) -> Result<bool> {
+    gateway_redelivery_within_window(
+        mirror_created_at,
+        incoming_at,
+        GATEWAY_FALSE_PRECHECK_REDELIVERY_WINDOW_SECS,
+    )
+}
+
+fn gateway_same_manual_delivery_as_mirror(
+    mirror_created_at: &str,
+    incoming_at: &str,
+    member_was_banned: bool,
+) -> Result<bool> {
+    if member_was_banned {
+        gateway_manual_redelivery_within_window(mirror_created_at, incoming_at)
+    } else {
+        gateway_false_precheck_redelivery_within_window(mirror_created_at, incoming_at)
+    }
 }
 
 fn completed_bot_gateway_mirror(mirror: &ActiveBanMirror) -> bool {
@@ -894,7 +931,7 @@ fn same_gateway_delivery_as_mirror(
     mirror: &ActiveBanMirror,
     guild_id: i64,
     user_id: i64,
-    _member_was_banned: bool,
+    member_was_banned: bool,
     incoming_at: &str,
 ) -> Result<bool> {
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
@@ -902,7 +939,7 @@ fn same_gateway_delivery_as_mirror(
     if !manual && !completed_bot {
         return Ok(false);
     }
-    gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)
+    gateway_same_manual_delivery_as_mirror(&mirror.created_at, incoming_at, member_was_banned)
 }
 
 fn replace_manual_gateway_mirror(
@@ -924,10 +961,11 @@ fn replace_manual_gateway_mirror(
             return Ok(true);
         }
         if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
-            if member_was_banned {
-                return Ok(false);
-            }
-            if gateway_manual_redelivery_within_window(&mirror.created_at, incoming_at)? {
+            if gateway_same_manual_delivery_as_mirror(
+                &mirror.created_at,
+                incoming_at,
+                member_was_banned,
+            )? {
                 return Ok(false);
             }
             return Ok(true);

@@ -88,6 +88,31 @@ fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
     }
 }
 
+/// Member-directory precheck for a gateway ban must finish before the ban observation write.
+pub(crate) async fn gateway_ban_directory_precheck_then_observe(
+    app: &Arc<BotState>,
+    guild_id: u64,
+    user: &User,
+    observed_at_ms: i64,
+) -> bool {
+    let member_was_banned =
+        match crate::member_directory::member_directory_shows_banned(app, guild_id, user.id.get())
+            .await
+        {
+            Some(was_banned) => was_banned,
+            None => {
+                tracing::warn!(
+                    guild_id,
+                    user_id = user.id.get(),
+                    "ban mirror precheck unavailable; assuming still banned"
+                );
+                true
+            }
+        };
+    crate::member_directory::observe_ban(app, guild_id, user, observed_at_ms).await;
+    member_was_banned
+}
+
 fn departure_joined_at_ms(
     decision: Option<&crate::db::guild_data::MemberDepartureDecision>,
     payload_joined_at_ms: Option<i64>,
@@ -433,24 +458,7 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let member_was_banned = match crate::member_directory::member_directory_shows_banned(
-            &app,
-            guild_id.get(),
-            banned_user.id.get(),
-        )
-        .await
-        {
-            Some(was_banned) => was_banned,
-            None => {
-                tracing::warn!(
-                    guild_id = guild_id.get(),
-                    user_id = banned_user.id.get(),
-                    "ban mirror precheck unavailable; assuming still banned"
-                );
-                true
-            }
-        };
-        crate::member_directory::observe_ban(
+        let member_was_banned = gateway_ban_directory_precheck_then_observe(
             &app,
             guild_id.get(),
             &banned_user,
@@ -1385,6 +1393,43 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[tokio::test]
+    async fn gateway_ban_live_path_precheck_runs_before_observe_ban() {
+        use serenity::all::{User, UserId};
+
+        crate::member_directory::gateway_ban_path_test::reset();
+        let directory = std::env::temp_dir().join(format!(
+            "gateway_ban_precheck_order_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("core.db");
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = db_path.clone();
+        let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        store
+            .initialize_member_directory(scope.clone(), 42, 1_000)
+            .await
+            .unwrap();
+        drop(store);
+        let mut user = User::default();
+        user.id = UserId::new(55);
+        user.name = "member".into();
+        super::gateway_ban_directory_precheck_then_observe(&app, 10, &user, 5_000).await;
+        assert_eq!(
+            crate::member_directory::gateway_ban_path_test::phases(),
+            ["precheck", "observe"]
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
