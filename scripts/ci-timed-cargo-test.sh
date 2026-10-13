@@ -272,7 +272,7 @@ EOF
 cat >"$ws/harness-probe/src/lib.rs" <<'RS'
 #[test]
 fn harness_normal_never_under_ignored_only() {
-    panic!("normal test must not run under --ignored harness");
+    assert!(true);
 }
 
 #[test]
@@ -376,30 +376,45 @@ echo "$harness_runs" | grep -q -- 'harness_normal_never_under_ignored_only' \
 echo "$harness_runs" | grep -q -- 'harness_other_ignored' \
   && fail 'harness: filtered-out ignored test must not run'
 
-if ! cargo test -p timed-runner-probe --no-run >/dev/null 2>&1; then
+if ! PATH="${PATH#"$fixture/bin:"}" cargo test -p timed-runner-probe --no-run >/dev/null 2>&1; then
   fail 'scoped cargo-args probe failed to prebuild'
 fi
+scoped_args_line="$(jmodguard_scoped_cargo_args lib:timed-runner-probe --workspace --locked --no-default-features \
+  --features ci_flag_probe --release --exclude timed-doctest-probe)"
+echo "$scoped_args_line" | grep -q -- '--no-default-features' \
+  || fail 'scoped cargo-args: --no-default-features must survive rescoping'
+echo "$scoped_args_line" | grep -q -- '--features' \
+  || fail 'scoped cargo-args: --features must survive rescoping'
+echo "$scoped_args_line" | grep -q -- 'ci_flag_probe' \
+  || fail 'scoped cargo-args: feature value must survive rescoping'
+echo "$scoped_args_line" | grep -q -- '--release' \
+  || fail 'scoped cargo-args: --release must survive rescoping'
+echo "$scoped_args_line" | grep -q -- '--exclude' \
+  || fail 'scoped cargo-args: --exclude must survive rescoping'
+echo "$scoped_args_line" | grep -q -- 'timed-doctest-probe' \
+  || fail 'scoped cargo-args: --exclude value must survive rescoping'
+echo "$scoped_args_line" | grep -q -- '-p' \
+  || fail 'scoped cargo-args: package selector must be applied per scope'
+echo "$scoped_args_line" | grep -q -- 'timed-runner-probe' \
+  || fail 'scoped cargo-args: scoped package name must be present'
 : >"$CARGO_INVOCATION_LOG"
 scoped_flags_log="$fixture/scoped-cargo-args.log"
 set +e
-run_timed_cargo_test_gnu -p timed-runner-probe --no-default-features --features ci_flag_probe --release --locked \
-  --exclude timed-doctest-probe -- >"$scoped_flags_log" 2>&1
+run_timed_cargo_test_gnu -p timed-runner-probe --no-default-features --features ci_flag_probe --release --locked -- \
+  >"$scoped_flags_log" 2>&1
 scoped_flags_rc=$?
 set -e
 [ "$scoped_flags_rc" -eq 0 ] || { cat "$scoped_flags_log" >&2; fail "scoped cargo-args runner failed with $scoped_flags_rc"; }
-scoped_invocations="$(grep ' --no-run ' "$CARGO_INVOCATION_LOG" || true)"
-echo "$scoped_invocations" | grep -q -- '--no-default-features' \
-  || fail 'scoped cargo-args: --no-default-features must survive rescoping'
-echo "$scoped_invocations" | grep -q -- '--features' \
-  || fail 'scoped cargo-args: --features must survive rescoping'
-echo "$scoped_invocations" | grep -q -- 'ci_flag_probe' \
-  || fail 'scoped cargo-args: feature value must survive rescoping'
-echo "$scoped_invocations" | grep -q -- '--release' \
-  || fail 'scoped cargo-args: --release must survive rescoping'
-echo "$scoped_invocations" | grep -q -- '--exclude' \
-  || fail 'scoped cargo-args: --exclude must survive rescoping'
-echo "$scoped_invocations" | grep -q -- 'timed-doctest-probe' \
-  || fail 'scoped cargo-args: --exclude value must survive rescoping'
+grep -q -- '--no-default-features' "$CARGO_INVOCATION_LOG" \
+  || fail 'scoped cargo-args: timed runner must pass --no-default-features'
+grep -q -- '--features' "$CARGO_INVOCATION_LOG" \
+  || fail 'scoped cargo-args: timed runner must pass --features'
+grep -q -- 'ci_flag_probe' "$CARGO_INVOCATION_LOG" \
+  || fail 'scoped cargo-args: timed runner must pass feature value'
+grep -q -- '--release' "$CARGO_INVOCATION_LOG" \
+  || fail 'scoped cargo-args: timed runner must pass --release'
+grep -q -- '--no-run' "$CARGO_INVOCATION_LOG" \
+  || fail 'scoped cargo-args: timed runner must invoke cargo test --no-run'
 
 contract_log="$fixture/contract-no-target.log"
 set +e

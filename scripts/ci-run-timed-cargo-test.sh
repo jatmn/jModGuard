@@ -342,6 +342,33 @@ jmodguard_cargo_args_without_targets() {
   fi
 }
 
+# Workspace-wide flags confuse per-package `cargo test -- --list --ignored`.
+jmodguard_cargo_args_for_test_list() {
+  local -a args=("$@")
+  local -a out=()
+  local i=0 arg
+  while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      --workspace|--all)
+        i=$((i + 1))
+        continue
+        ;;
+      --exclude)
+        i=$((i + 2))
+        continue
+        ;;
+      *)
+        out+=("$arg")
+        i=$((i + 1))
+        ;;
+    esac
+  done
+  if [ "${#out[@]}" -gt 0 ]; then
+    printf '%s\n' "${out[@]}"
+  fi
+}
+
 jmodguard_scoped_cargo_args() {
   local scope=$1
   shift
@@ -521,8 +548,15 @@ run_timed_cargo_test_gnu_body() {
   local -n __jmg_cargo_args_ref=$1
   local -n __jmg_harness_ref=$2
   local name ignored_only=0 include_ignored=0 rc list_out ignored_out
-  local -a run_args=() harness_tail=()
+  local -a run_args=() harness_tail=() list_cargo_args=()
   local -A ignored_names=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    list_cargo_args+=("$line")
+  done < <(jmodguard_cargo_args_for_test_list "${__jmg_cargo_args_ref[@]}")
+  if [ "${#list_cargo_args[@]}" -eq 0 ]; then
+    list_cargo_args=("${__jmg_cargo_args_ref[@]}")
+  fi
   for arg in "${__jmg_harness_ref[@]}"; do
     case "$arg" in
       --ignored) ignored_only=1 ;;
@@ -538,7 +572,7 @@ run_timed_cargo_test_gnu_body() {
 
   if [ "$ignored_only" -eq 1 ]; then
     set +e
-    list_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+    list_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -563,7 +597,7 @@ run_timed_cargo_test_gnu_body() {
   fi
 
   set +e
-  ignored_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+  ignored_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
@@ -575,7 +609,7 @@ run_timed_cargo_test_gnu_body() {
   done <<<"$ignored_out"
 
   set +e
-  list_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --format terse "${harness_tail[@]}")"
+  list_out="$(cargo test "${list_cargo_args[@]}" -- --list --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
