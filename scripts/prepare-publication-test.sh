@@ -98,8 +98,31 @@ JS
   grep -Fxq 'release_tag=v1.2.3' "$GITHUB_OUTPUT"
   grep -Fxq "release_sha=$release_sha" "$GITHUB_OUTPUT"
   cmp "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+  # Even stale/conflicting action outputs cannot replace a retained release.
+  export GITHUB_RUN_ATTEMPT=3 JMODGUARD_RELEASE_TAG=v9.9.9 JMODGUARD_RELEASE_SHA="$GITHUB_SHA"
+  : >"$GITHUB_OUTPUT"
+  bash scripts/prepare-publication.sh
+  grep -Fxq 'release_tag=v1.2.3' "$GITHUB_OUTPUT"
+  grep -Fxq "release_sha=$release_sha" "$GITHUB_OUTPUT"
+  cmp "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
   export JMODGUARD_RELEASE_TAG=v1.2.3
 done
+
+# A retained ordinary main plan also stays unchanged when a newer release exists.
+# ci-workflow-test checks that reruns skip Release Please before restoring it.
+unset JMODGUARD_RELEASE_TAG JMODGUARD_RELEASE_SHA
+export GITHUB_SHA="$base" GITHUB_RUN_ATTEMPT=1
+git checkout -q --detach "$base"
+rm -f "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+bash scripts/prepare-publication.sh
+cp "$RUNNER_TEMP/publication/plan.json" "$ARTIFACT_PLAN"
+export GITHUB_RUN_ATTEMPT=2 JMODGUARD_RELEASE_TAG=v9.9.9 JMODGUARD_RELEASE_SHA="$later"
+: >"$GITHUB_OUTPUT"
+bash scripts/prepare-publication.sh
+cmp "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+grep -Fxq 'release_tag=' "$GITHUB_OUTPUT"
+grep -Fxq 'release_sha=' "$GITHUB_OUTPUT"
+export JMODGUARD_RELEASE_TAG=v1.2.3
 
 # Invalid action identities and genuine tag-push drift must fail without a plan.
 rm -f "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"

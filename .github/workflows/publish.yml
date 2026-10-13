@@ -41,7 +41,8 @@ jobs:
   release:
     name: Stable release
     needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'jatmn/jModGuard'
+    # Retries restore their original plan; they must never create another release.
+    if: github.run_attempt == 1 && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'jatmn/jModGuard'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -107,12 +108,30 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  publish:
-    name: Publish / ${{ matrix.component }}
-    needs: [ci, release, prepare-publication]
+  # Release Please can select a different commit from the event already checked.
+  # The immutable plan owns this source, including on retries; validate all gates
+  # at that exact commit because the triggering event's diff does not cover it.
+  release-ci:
+    name: Validate release source
+    needs: [ci, prepare-publication]
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
-      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request'
+      needs.prepare-publication.outputs.release_sha != '' &&
+      needs.prepare-publication.outputs.release_sha != github.sha
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ needs.prepare-publication.outputs.release_sha }}
+
+  publish:
+    name: Publish / ${{ matrix.component }}
+    needs: [ci, release, prepare-publication, release-ci]
+    if: >-
+      always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
+      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request' &&
+      (needs.release-ci.result == 'success' ||
+       (needs.release-ci.result == 'skipped' &&
+        (needs.prepare-publication.outputs.release_sha == '' ||
+         needs.prepare-publication.outputs.release_sha == github.sha)))
     strategy:
       fail-fast: false
       matrix:

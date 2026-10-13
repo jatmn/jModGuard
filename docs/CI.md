@@ -86,9 +86,13 @@ layout and compatibility limitations.
 One preparation job resolves all components to the same source SHA. Its small
 `publication-plan` artifact is retained for 90 days and restored on retries of
 that run; a mutable tag is not resolved again. An expired, unreadable or missing
-retry plan fails rather than silently changing the source. If preparation failed
-before retaining a plan, start a new run. Start a new run for a deliberate new
-selection. The publisher verifies image contents before promoting moving tags.
+retry plan fails rather than silently changing the source. Release Please runs
+only on the first attempt; retries restore the plan without creating another release.
+If a release was created before the action, preparation, or artifact upload failed
+to retain its plan, start a fresh owner-dispatched **Publish** run on `main` with
+`source=refs/tags/<created-tag>`. An empty source runs checks only; a later ordinary
+main run cannot recreate the already-consumed release output. Start a new run for
+a deliberate new selection. The publisher verifies image contents before promoting moving tags.
 Nightly tags never move `latest`. An explicit rerun republishes its pinned source.
 
 Each component compares its actual production inputs against the source revision
@@ -117,8 +121,14 @@ new PR workflows: the owner must close/reopen the release PR to start CI before
 merging it. A release created by this action is published within the same trusted
 workflow, since tags created with `GITHUB_TOKEN` do not trigger another run.
 The plan binds the action's release tag to its reported source SHA, which can
-differ from the workflow's triggering commit. Retries restore both from the
-original plan even when Release Please no longer reports a newly created release.
+differ from the workflow's triggering commit. When it differs, the same reusable
+CI workflow checks out that exact pinned source and runs every check group before
+any component can publish; the triggering commit's affected diff is not reused.
+A failed, cancelled, or skipped source-validation gate blocks all three publishers.
+Same-source releases reuse the checks already passed. Retries skip Release Please,
+restore the original tag/source, and apply the same source-validation rule.
+Owner-selected historical/manual publication keeps its existing policy: validate
+the current workflow commit, then build and verify the selected historical source.
 See [RELEASES.md](RELEASES.md).
 
 ## Dependency tools

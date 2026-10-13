@@ -5,7 +5,7 @@ set -euo pipefail
   echo 'ci-setup requires a GitHub-hosted runner' >&2; exit 1;
 }
 case "${1:-false}" in true|false) ;; *) exit 2 ;; esac
-mkdir -p "$RUNNER_TEMP/jmodguard" "$HOME/.cache/jmodguard-ci"
+mkdir -p "$RUNNER_TEMP/jmodguard" "$HOME/.cache/jmodguard-ci/dylint-drivers"
 {
   echo "TMPDIR=$RUNNER_TEMP/jmodguard"
   echo "JMODGUARD_CI_PREFIX=$HOME/.cache/jmodguard-ci"
