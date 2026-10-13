@@ -7,19 +7,27 @@ source "$_run_timed_cargo_test_dir/ci-cargo-log.sh"
 
 JMODGUARD_TEST_TIMEOUT_SEC="${JMODGUARD_TEST_TIMEOUT_SEC:-180}"
 JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+JMODGUARD_ACTIVE_TEST_LEADER_PID=""
 
 jmodguard_kill_active_test_session() {
-  local pgid
+  local pgid leader
   pgid="${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}"
-  [ -n "$pgid" ] || return 0
-  kill -TERM "-$pgid" 2>/dev/null || true
-  sleep 1
-  kill -KILL "-$pgid" 2>/dev/null || true
+  leader="${JMODGUARD_ACTIVE_TEST_LEADER_PID:-}"
+  if [ -n "$pgid" ]; then
+    kill -TERM "-$pgid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "-$pgid" 2>/dev/null || true
+  elif [ -n "$leader" ]; then
+    kill -TERM "$leader" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$leader" 2>/dev/null || true
+  fi
   JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+  JMODGUARD_ACTIVE_TEST_LEADER_PID=""
 }
 
 jmodguard_runner_trap_exit() {
-  if [ -n "${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}" ]; then
+  if [ -n "${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}" ] || [ -n "${JMODGUARD_ACTIVE_TEST_LEADER_PID:-}" ]; then
     jmodguard_kill_active_test_session
   fi
 }
@@ -70,9 +78,7 @@ jmodguard_leader_session_pgid() {
     sleep 0.02
     tries=$((tries + 1))
   done
-  pgid="$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')" || pgid=""
-  [ -n "$pgid" ] || return 1
-  printf '%s\n' "$pgid"
+  return 1
 }
 
 # Run a single test invocation under timeout. Uses setsid so descendant processes
@@ -88,6 +94,7 @@ run_with_test_timeout() {
   if command -v setsid >/dev/null 2>&1; then
     setsid "$@" &
     leader=$!
+    JMODGUARD_ACTIVE_TEST_LEADER_PID="$leader"
     session_pgid="$(jmodguard_leader_session_pgid "$leader")" || session_pgid=""
     JMODGUARD_ACTIVE_TEST_SESSION_PGID="$session_pgid"
     # Poll so INT/TERM traps are not deferred behind a long-running external `timeout`.
@@ -105,9 +112,14 @@ run_with_test_timeout() {
       wait "$leader"
       leader_rc=$?
       JMODGUARD_ACTIVE_TEST_SESSION_PGID=""
+      JMODGUARD_ACTIVE_TEST_LEADER_PID=""
       if [ "$leader_rc" -ne 0 ]; then
         rc=$leader_rc
       fi
+    fi
+    if [ "$rc" -eq 124 ]; then
+      wait "$leader" 2>/dev/null || true
+      JMODGUARD_ACTIVE_TEST_LEADER_PID=""
     fi
   else
     timeout --kill-after="$kill_after" "${duration_sec}s" "$@"
@@ -215,6 +227,136 @@ run_timed_cargo_test_package_name() {
     i=$((i + 1))
   done
   printf '%s\n' "$pkg"
+}
+
+run_timed_cargo_test_has_target_scope() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --lib|--test|--bins|--examples|--tests|--benches) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# One scope per line: lib, or test:<binary-name>
+run_timed_cargo_test_list_scopes() {
+  local -a cargo_args=("$@")
+  local pkg meta meta_err
+  local -a packages=()
+  if run_timed_cargo_test_has_target_scope "${cargo_args[@]}"; then
+    printf '%s\n' single
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ci-preflight: jq is required to list per-target cargo tests" >&2
+    return 1
+  fi
+  meta="$(mktemp)"
+  meta_err="$(mktemp)"
+  if ! cargo metadata --no-deps --format-version 1 >"$meta" 2>"$meta_err"; then
+    echo "ci-preflight: cargo metadata failed; cannot list per-target tests" >&2
+    cat "$meta_err" >&2
+    rm -f "$meta" "$meta_err"
+    return 1
+  fi
+  pkg="$(run_timed_cargo_test_package_name "${cargo_args[@]}")"
+  if [ -n "$pkg" ]; then
+    packages+=("$pkg")
+  elif run_timed_cargo_test_is_workspace_doctest_scope "${cargo_args[@]}"; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      packages+=("$line")
+    done < <(jq -r '.workspace_members[] as $id | .packages[] | select(.id == $id) | .name' "$meta")
+  else
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      packages+=("$line")
+    done < <(jq -r '.packages[] | .name' "$meta")
+  fi
+  local p had_scope=0
+  for p in "${packages[@]}"; do
+    had_scope=0
+    if jq -e --arg p "$p" '
+          .packages[]
+          | select(.name == $p)
+          | .targets[]
+          | select(.kind | index("lib"))
+        ' "$meta" >/dev/null; then
+      printf 'lib:%s\n' "$p"
+      had_scope=1
+    fi
+    while IFS= read -r tname; do
+      [ -n "$tname" ] || continue
+      printf 'test:%s:%s\n' "$p" "$tname"
+      had_scope=1
+    done < <(jq -r --arg p "$p" '
+          .packages[]
+          | select(.name == $p)
+          | .targets[]
+          | select(.kind | index("test"))
+          | .name
+        ' "$meta")
+    while IFS= read -r bname; do
+      [ -n "$bname" ] || continue
+      printf 'bin:%s:%s\n' "$p" "$bname"
+      had_scope=1
+    done < <(jq -r --arg p "$p" '
+          .packages[]
+          | select(.name == $p)
+          | .targets[]
+          | select(.kind | index("bin"))
+          | .name
+        ' "$meta")
+    if [ "$had_scope" -eq 0 ]; then
+      printf 'single:%s\n' "$p"
+    fi
+  done
+  rm -f "$meta" "$meta_err"
+}
+
+jmodguard_scoped_cargo_args() {
+  local scope=$1
+  shift
+  local -a cargo_args=("$@")
+  local -a scoped=()
+  local arg locked=0
+  for arg in "${cargo_args[@]}"; do
+    [ "$arg" = --locked ] && locked=1
+  done
+  [ "$locked" -eq 1 ] && scoped+=(--locked)
+  if [ "$scope" = single ]; then
+    scoped+=("${cargo_args[@]}")
+    printf '%s\n' "${scoped[@]}"
+    return 0
+  fi
+  case "$scope" in
+    lib:*)
+      scoped+=(-p "${scope#lib:}" --lib)
+      ;;
+    test:*)
+      local rest pkg tname
+      rest="${scope#test:}"
+      pkg="${rest%%:*}"
+      tname="${rest#*:}"
+      scoped+=(-p "$pkg" --test "$tname")
+      ;;
+    bin:*)
+      local rest pkg bname
+      rest="${scope#bin:}"
+      pkg="${rest%%:*}"
+      bname="${rest#*:}"
+      scoped+=(-p "$pkg" --bin "$bname")
+      ;;
+    single:*)
+      scoped+=(-p "${scope#single:}")
+      ;;
+    *)
+      echo "ci-preflight: unknown timed test scope: $scope" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "${scoped[@]}"
 }
 
 run_timed_cargo_test_is_workspace_doctest_scope() {
@@ -345,22 +487,10 @@ run_timed_cargo_test_doctests() {
 
 # List and run each test through `cargo test` so cwd, CARGO_MANIFEST_DIR, and
 # dynamic-library paths match a normal `cargo test` invocation.
-run_timed_cargo_test_gnu() {
-  local cargo_args=()
-  local harness=()
-  local past_dd=0 arg
-  for arg in "$@"; do
-    if [ "$past_dd" -eq 1 ]; then
-      harness+=("$arg")
-      continue
-    fi
-    if [ "$arg" = -- ]; then
-      past_dd=1
-      continue
-    fi
-    cargo_args+=("$arg")
-  done
-
+run_timed_cargo_test_gnu_body() {
+  # shellcheck disable=SC2178,SC2124
+  local -n cargo_args=$1
+  local -n harness=$2
   local name ignored_only=0 include_ignored=0 rc list_out ignored_out
   local -a run_args=()
   local -A ignored_names=()
@@ -370,8 +500,6 @@ run_timed_cargo_test_gnu() {
       --include-ignored) include_ignored=1 ;;
     esac
   done
-
-  jmodguard_timed_cargo_install_traps
 
   if ! cargo test "${cargo_args[@]}" --no-run >/dev/null 2>&1; then
     cargo test "${cargo_args[@]}" --no-run
@@ -398,7 +526,6 @@ run_timed_cargo_test_gnu() {
         return "$rc"
       fi
     done <<<"$list_out"
-    run_timed_cargo_test_doctests "${cargo_args[@]}"
     return 0
   fi
 
@@ -441,6 +568,61 @@ run_timed_cargo_test_gnu() {
       return "$rc"
     fi
   done <<<"$list_out"
+}
 
-  run_timed_cargo_test_doctests "${cargo_args[@]}"
+run_timed_cargo_test_gnu() {
+  local cargo_args=()
+  local harness=()
+  local past_dd=0 arg
+  for arg in "$@"; do
+    if [ "$past_dd" -eq 1 ]; then
+      harness+=("$arg")
+      continue
+    fi
+    if [ "$arg" = -- ]; then
+      past_dd=1
+      continue
+    fi
+    cargo_args+=("$arg")
+  done
+
+  local -a scopes=()
+  local scope scoped_line
+  local -a scoped_args=()
+  local ignored_only=0
+
+  jmodguard_timed_cargo_install_traps
+
+  for arg in "${harness[@]}"; do
+    [ "$arg" = --ignored ] && ignored_only=1
+  done
+
+  while IFS= read -r scope; do
+    [ -n "$scope" ] || continue
+    scopes+=("$scope")
+  done < <(run_timed_cargo_test_list_scopes "${cargo_args[@]}")
+  if [ "${#scopes[@]}" -eq 0 ]; then
+    echo 'ci-preflight: no cargo test targets to run' >&2
+    return 1
+  fi
+
+  local rc=0
+  for scope in "${scopes[@]}"; do
+    scoped_args=()
+    while IFS= read -r scoped_line; do
+      [ -n "$scoped_line" ] || continue
+      scoped_args+=("$scoped_line")
+    done < <(jmodguard_scoped_cargo_args "$scope" "${cargo_args[@]}")
+    run_timed_cargo_test_gnu_body scoped_args harness
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      return "$rc"
+    fi
+  done
+
+  if [ "$ignored_only" -eq 0 ]; then
+    run_timed_cargo_test_doctests "${cargo_args[@]}"
+    return $?
+  fi
+  return 0
 }

@@ -65,6 +65,25 @@ case $- in
   *) fail 'errexit must be on after a failed run_with_test_timeout' ;;
 esac
 
+# Slow session leader: timeout must kill the child by pid, not the runner's process group.
+slow_pgid_script="$fixture/slow-pgid.sh"
+cat >"$slow_pgid_script" <<'SH'
+#!/bin/bash
+set -euo pipefail
+sleep 2
+exec sleep 999
+SH
+chmod +x "$slow_pgid_script"
+runner_pid=$$
+export JMODGUARD_TEST_TIMEOUT_SEC=1
+set +o errexit
+run_with_test_timeout slow-pgid-probe bash "$slow_pgid_script" || slow_pgid_rc=$?
+slow_pgid_rc=${slow_pgid_rc:-0}
+set -o errexit
+[ "$slow_pgid_rc" -eq 124 ] || fail "slow pgid probe expected exit 124, got $slow_pgid_rc"
+kill -0 "$runner_pid" 2>/dev/null || fail 'runner must survive timeout when session pgid is not ready'
+export JMODGUARD_TEST_TIMEOUT_SEC=180
+
 # Timed-out command must not leave a background child running.
 hang_script="$fixture/hang.sh"
 cat >"$hang_script" <<'SH'
@@ -132,7 +151,7 @@ mkdir -p "$ws/probe/src" "$ws/doctest-probe/src" "$ws/buildrs-probe/src"
 cat >"$ws/Cargo.toml" <<'EOF'
 [workspace]
 resolver = "2"
-members = ["probe", "doctest-probe", "buildrs-probe", "bin-only-probe"]
+members = ["probe", "doctest-probe", "buildrs-probe", "bin-only-probe", "collision-a", "collision-b"]
 EOF
 mkdir -p "$ws/bin-only-probe/src"
 cat >"$ws/bin-only-probe/Cargo.toml" <<'EOF'
@@ -203,6 +222,37 @@ fn build_rs_crate_passes() {
     assert!(true);
 }
 RS
+mkdir -p "$ws/collision-a/src" "$ws/collision-b/src"
+cat >"$ws/collision-a/Cargo.toml" <<'EOF'
+[package]
+name = "timed-collision-a"
+version = "0.1.0"
+edition = "2021"
+EOF
+cat >"$ws/collision-a/src/lib.rs" <<'RS'
+#[test]
+#[ignore]
+fn shared_test_name() {
+    panic!("ignored collision-a must not run");
+}
+
+#[test]
+fn collision_a_runs() {
+    assert!(true);
+}
+RS
+cat >"$ws/collision-b/Cargo.toml" <<'EOF'
+[package]
+name = "timed-collision-b"
+version = "0.1.0"
+edition = "2021"
+EOF
+cat >"$ws/collision-b/src/lib.rs" <<'RS'
+#[test]
+fn shared_test_name() {
+    assert!(true);
+}
+RS
 
 export CARGO_TARGET_DIR="$fixture/target"
 export RUSTFLAGS='-C prefer-dynamic'
@@ -235,6 +285,20 @@ if ci_cargo_log_has_compiling "$run_log"; then
   fail 'per-test cargo test runs must not recompile (same CARGO_TARGET_DIR/profile)'
 fi
 grep -q 'test result: ok' "$run_log" || fail 'expected passing test summary in run log'
+
+if ! cargo test -p timed-collision-a --lib --no-run >/dev/null 2>&1 \
+  || ! cargo test -p timed-collision-b --lib --no-run >/dev/null 2>&1; then
+  fail 'collision probe crates failed to build'
+fi
+collision_log="$fixture/collision-per-binary.log"
+set +e
+run_timed_cargo_test_gnu --workspace --locked -- >"$collision_log" 2>&1
+collision_rc=$?
+set -e
+[ "$collision_rc" -eq 0 ] || { cat "$collision_log" >&2; fail "collision workspace runner failed with $collision_rc"; }
+grep -q 'collision_a_runs' "$collision_log" || fail 'collision-a non-ignored test must run under --workspace'
+grep -Eq 'shared_test_name \.\.\. ok' "$collision_log" || fail 'collision-b shared_test_name must run despite ignored namesake in collision-a'
+grep -q 'ignored collision-a must not run' "$collision_log" && fail 'ignored collision-a test must not execute'
 
 doctest_log="$fixture/doctest-run.log"
 set +e
@@ -296,16 +360,14 @@ missing_pkg_rc=$?
 set -e
 [ "$missing_pkg_rc" -ge 2 ] || fail "missing -p must error (rc>=2), got $missing_pkg_rc"
 mkdir -p "$fixture/bin-no-jq"
-cat >"$fixture/bin-no-jq/command" <<'SH'
-#!/usr/bin/env bash
-if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
-  exit 1
-fi
-exec /usr/bin/command "$@"
+cat >"$fixture/bin-no-jq/jq" <<'SH'
+#!/bin/sh
+exit 1
 SH
-chmod +x "$fixture/bin-no-jq/command"
+chmod +x "$fixture/bin-no-jq/jq"
+cargo_bin_dir="$(dirname "$real_cargo")"
 set +e
-PATH="$fixture/bin-no-jq:/usr/bin:/bin" run_timed_cargo_test_may_run_doctests -p timed-doctest-probe
+PATH="$fixture/bin-no-jq:$cargo_bin_dir:/usr/bin:/bin" run_timed_cargo_test_may_run_doctests -p timed-doctest-probe
 no_jq_rc=$?
 set -e
 [ "$no_jq_rc" -eq 2 ] || fail "missing jq for -p must error (rc=2), got $no_jq_rc"
