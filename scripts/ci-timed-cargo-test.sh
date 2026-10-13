@@ -151,7 +151,7 @@ mkdir -p "$ws/probe/src" "$ws/doctest-probe/src" "$ws/buildrs-probe/src"
 cat >"$ws/Cargo.toml" <<'EOF'
 [workspace]
 resolver = "2"
-members = ["probe", "doctest-probe", "buildrs-probe", "bin-only-probe", "collision-a", "collision-b"]
+members = ["probe", "doctest-probe", "buildrs-probe", "bin-only-probe", "collision-a", "collision-b", "harness-probe"]
 EOF
 mkdir -p "$ws/bin-only-probe/src"
 cat >"$ws/bin-only-probe/Cargo.toml" <<'EOF'
@@ -174,9 +174,18 @@ cat >"$ws/probe/Cargo.toml" <<'EOF'
 name = "timed-runner-probe"
 version = "0.1.0"
 edition = "2021"
+
+[features]
+ci_flag_probe = []
 EOF
 cat >"$ws/probe/src/lib.rs" <<'RS'
 use std::path::PathBuf;
+
+#[test]
+#[cfg(feature = "ci_flag_probe")]
+fn ci_flag_scoped_runs() {
+    assert!(true);
+}
 
 #[test]
 fn cwd_is_manifest_dir() {
@@ -253,6 +262,31 @@ fn shared_test_name() {
     assert!(true);
 }
 RS
+mkdir -p "$ws/harness-probe/src"
+cat >"$ws/harness-probe/Cargo.toml" <<'EOF'
+[package]
+name = "timed-harness-probe"
+version = "0.1.0"
+edition = "2021"
+EOF
+cat >"$ws/harness-probe/src/lib.rs" <<'RS'
+#[test]
+fn harness_normal_never_under_ignored_only() {
+    panic!("normal test must not run under --ignored harness");
+}
+
+#[test]
+#[ignore]
+fn harness_other_ignored() {
+    panic!("filtered ignored test must not run");
+}
+
+#[test]
+#[ignore]
+fn harness_ignored_only_runs() {
+    assert!(true);
+}
+RS
 
 export CARGO_TARGET_DIR="$fixture/target"
 export RUSTFLAGS='-C prefer-dynamic'
@@ -321,6 +355,52 @@ exec "$real_cargo" "\$@"
 SH
 chmod +x "$fixture/bin/cargo"
 PATH="$fixture/bin:$PATH"
+
+if ! cargo test -p timed-harness-probe --lib --no-run >/dev/null 2>&1; then
+  fail 'harness probe crate failed to build'
+fi
+: >"$CARGO_INVOCATION_LOG"
+harness_log="$fixture/harness-ignored.log"
+set +e
+run_timed_cargo_test_gnu -p timed-harness-probe --lib -- --ignored --nocapture harness_ignored_only_runs \
+  >"$harness_log" 2>&1
+harness_rc=$?
+set -e
+[ "$harness_rc" -eq 0 ] || { cat "$harness_log" >&2; fail "harness ignored runner failed with $harness_rc"; }
+harness_runs="$(grep -v ' --list ' "$CARGO_INVOCATION_LOG" | grep ' -- ' || true)"
+echo "$harness_runs" | grep -q -- '--ignored' || fail 'harness: --ignored must reach libtest cargo invocations'
+echo "$harness_runs" | grep -q -- '--nocapture' || fail 'harness: --nocapture must reach libtest cargo invocations'
+echo "$harness_runs" | grep -q -- 'harness_ignored_only_runs' || fail 'harness: test name filter must reach libtest cargo invocations'
+echo "$harness_runs" | grep -q -- 'harness_normal_never_under_ignored_only' \
+  && fail 'harness: normal test must not run when --ignored is set'
+echo "$harness_runs" | grep -q -- 'harness_other_ignored' \
+  && fail 'harness: filtered-out ignored test must not run'
+
+if ! cargo test -p timed-runner-probe --no-run >/dev/null 2>&1; then
+  fail 'scoped cargo-args probe failed to prebuild'
+fi
+: >"$CARGO_INVOCATION_LOG"
+scoped_flags_log="$fixture/scoped-cargo-args.log"
+set +e
+run_timed_cargo_test_gnu -p timed-runner-probe --no-default-features --features ci_flag_probe --release --locked \
+  --exclude timed-doctest-probe -- >"$scoped_flags_log" 2>&1
+scoped_flags_rc=$?
+set -e
+[ "$scoped_flags_rc" -eq 0 ] || { cat "$scoped_flags_log" >&2; fail "scoped cargo-args runner failed with $scoped_flags_rc"; }
+scoped_invocations="$(grep ' --no-run ' "$CARGO_INVOCATION_LOG" || true)"
+echo "$scoped_invocations" | grep -q -- '--no-default-features' \
+  || fail 'scoped cargo-args: --no-default-features must survive rescoping'
+echo "$scoped_invocations" | grep -q -- '--features' \
+  || fail 'scoped cargo-args: --features must survive rescoping'
+echo "$scoped_invocations" | grep -q -- 'ci_flag_probe' \
+  || fail 'scoped cargo-args: feature value must survive rescoping'
+echo "$scoped_invocations" | grep -q -- '--release' \
+  || fail 'scoped cargo-args: --release must survive rescoping'
+echo "$scoped_invocations" | grep -q -- '--exclude' \
+  || fail 'scoped cargo-args: --exclude must survive rescoping'
+echo "$scoped_invocations" | grep -q -- 'timed-doctest-probe' \
+  || fail 'scoped cargo-args: --exclude value must survive rescoping'
+
 contract_log="$fixture/contract-no-target.log"
 set +e
 run_timed_cargo_test_gnu -p timed-doctest-probe -- >"$contract_log" 2>&1

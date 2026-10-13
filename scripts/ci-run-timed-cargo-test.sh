@@ -315,21 +315,50 @@ run_timed_cargo_test_list_scopes() {
   rm -f "$meta" "$meta_err"
 }
 
+# Drop per-target cargo test selectors so caller flags survive rescoping.
+jmodguard_cargo_args_without_targets() {
+  local -a args=("$@")
+  local -a out=()
+  local i=0 arg
+  while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      -p|--package|--test|--bin)
+        i=$((i + 2))
+        continue
+        ;;
+      --lib|--bins|--examples|--tests|--benches)
+        i=$((i + 1))
+        continue
+        ;;
+      *)
+        out+=("$arg")
+        i=$((i + 1))
+        ;;
+    esac
+  done
+  if [ "${#out[@]}" -gt 0 ]; then
+    printf '%s\n' "${out[@]}"
+  fi
+}
+
 jmodguard_scoped_cargo_args() {
   local scope=$1
   shift
   local -a cargo_args=("$@")
   local -a scoped=()
-  local arg locked=0
-  for arg in "${cargo_args[@]}"; do
-    [ "$arg" = --locked ] && locked=1
-  done
-  [ "$locked" -eq 1 ] && scoped+=(--locked)
+  local line
+
   if [ "$scope" = single ]; then
-    scoped+=("${cargo_args[@]}")
-    printf '%s\n' "${scoped[@]}"
+    printf '%s\n' "${cargo_args[@]}"
     return 0
   fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    scoped+=("$line")
+  done < <(jmodguard_cargo_args_without_targets "${cargo_args[@]}")
+
   case "$scope" in
     lib:*)
       scoped+=(-p "${scope#lib:}" --lib)
@@ -489,26 +518,27 @@ run_timed_cargo_test_doctests() {
 # dynamic-library paths match a normal `cargo test` invocation.
 run_timed_cargo_test_gnu_body() {
   # shellcheck disable=SC2178,SC2124
-  local -n cargo_args=$1
-  local -n harness=$2
+  local -n __jmg_cargo_args_ref=$1
+  local -n __jmg_harness_ref=$2
   local name ignored_only=0 include_ignored=0 rc list_out ignored_out
-  local -a run_args=()
+  local -a run_args=() harness_tail=()
   local -A ignored_names=()
-  for arg in "${harness[@]}"; do
+  for arg in "${__jmg_harness_ref[@]}"; do
     case "$arg" in
       --ignored) ignored_only=1 ;;
       --include-ignored) include_ignored=1 ;;
+      *) harness_tail+=("$arg") ;;
     esac
   done
 
-  if ! cargo test "${cargo_args[@]}" --no-run >/dev/null 2>&1; then
-    cargo test "${cargo_args[@]}" --no-run
+  if ! cargo test "${__jmg_cargo_args_ref[@]}" --no-run >/dev/null 2>&1; then
+    cargo test "${__jmg_cargo_args_ref[@]}" --no-run
     return 1
   fi
 
   if [ "$ignored_only" -eq 1 ]; then
     set +e
-    list_out="$(cargo test "${cargo_args[@]}" -- --list --ignored --format terse)"
+    list_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -517,10 +547,13 @@ run_timed_cargo_test_gnu_body() {
     while IFS= read -r tline; do
       name="$(test_list_name "$tline")" || continue
       run_args=(--exact "$name" --ignored --test-threads=1)
-      for arg in "${harness[@]}"; do
-        [ "$arg" = --nocapture ] && run_args+=(--nocapture)
+      for arg in "${__jmg_harness_ref[@]}"; do
+        case "$arg" in
+          --ignored) ;;
+          *) run_args+=("$arg") ;;
+        esac
       done
-      run_cargo_test_timed "$name" "${cargo_args[@]}" -- "${run_args[@]}"
+      run_cargo_test_timed "$name" "${__jmg_cargo_args_ref[@]}" -- "${run_args[@]}"
       rc=$?
       if [ "$rc" -ne 0 ]; then
         return "$rc"
@@ -530,7 +563,7 @@ run_timed_cargo_test_gnu_body() {
   fi
 
   set +e
-  ignored_out="$(cargo test "${cargo_args[@]}" -- --list --ignored --format terse)"
+  ignored_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
@@ -542,7 +575,7 @@ run_timed_cargo_test_gnu_body() {
   done <<<"$ignored_out"
 
   set +e
-  list_out="$(cargo test "${cargo_args[@]}" -- --list --format terse)"
+  list_out="$(cargo test "${__jmg_cargo_args_ref[@]}" -- --list --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
@@ -559,10 +592,13 @@ run_timed_cargo_test_gnu_body() {
     else
       run_args=(--exact "$name" --test-threads=1)
     fi
-    for arg in "${harness[@]}"; do
-      [ "$arg" = --nocapture ] && run_args+=(--nocapture)
+    for arg in "${__jmg_harness_ref[@]}"; do
+      case "$arg" in
+        --include-ignored) ;;
+        *) run_args+=("$arg") ;;
+      esac
     done
-    run_cargo_test_timed "$name" "${cargo_args[@]}" -- "${run_args[@]}"
+    run_cargo_test_timed "$name" "${__jmg_cargo_args_ref[@]}" -- "${run_args[@]}"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       return "$rc"
