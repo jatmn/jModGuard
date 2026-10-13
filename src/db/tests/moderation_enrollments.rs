@@ -2500,3 +2500,69 @@ async fn confirmed_directory_absence_records_a_later_manual_gateway_placeholder_
         2
     );
 }
+
+#[tokio::test]
+async fn delayed_gateway_echo_keeps_bot_mirror_when_reason_matches_placeholder_text() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let echo = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-01-01T00:00:00+00:00"),
+        true,
+        Some("bot-attempt"),
+        true,
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::OwnedByBot { row_id } = echo else {
+        panic!("bot echo must store the mirror, got {echo:?}");
+    };
+    let filled = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        Some("bot"),
+        GATEWAY_BAN_REASON,
+        Some("2024-01-01T00:00:01+00:00"),
+        BanRecord::Fresh,
+        Some("bot-attempt"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filled, Some(row_id));
+    let resumed = record_gateway_ban(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some("2024-02-01T00:00:00+00:00"),
+        true,
+        Some("stale-echo"),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed, GatewayBanWrite::Existing { row_id });
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    let active = rows.iter().find(|row| row.active).unwrap();
+    assert_eq!(active.id, row_id);
+    assert_eq!(active.moderator_id, Some(9));
+    assert_eq!(active.moderator_name.as_deref(), Some("bot"));
+    assert_eq!(active.reason.as_deref(), Some(GATEWAY_BAN_REASON));
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        0
+    );
+}

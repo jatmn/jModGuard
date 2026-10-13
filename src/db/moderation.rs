@@ -746,6 +746,9 @@ pub async fn record_gateway_ban(
 struct ActiveBanMirror {
     id: i64,
     reason: Option<String>,
+    /// Gateway placeholder text in storage with no moderator yet; distinct from a
+    /// moderator who literally chose the same display string.
+    gateway_reason_unset: bool,
     moderator_id: Option<i64>,
     operation_id: Option<String>,
     created_at: String,
@@ -761,11 +764,17 @@ fn load_active_ban_mirror(
          FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 ORDER BY id LIMIT 1",
         params![guild_id, user_id],
         |row| {
+            let reason: Option<String> = row.get(1)?;
+            let moderator_id: Option<i64> = row.get(2)?;
+            let operation_id: Option<String> = row.get(3)?;
+            let gateway_reason_unset =
+                reason.as_deref() == Some(GATEWAY_BAN_REASON) && moderator_id.is_none();
             Ok(ActiveBanMirror {
                 id: row.get(0)?,
-                reason: row.get(1)?,
-                moderator_id: row.get(2)?,
-                operation_id: row.get(3)?,
+                reason,
+                gateway_reason_unset,
+                moderator_id,
+                operation_id,
                 created_at: row.get(4)?,
             })
         },
@@ -808,9 +817,7 @@ fn manual_member_ban_event_exists_for_mirror(
 }
 
 fn gateway_placeholder_mirror(mirror: &ActiveBanMirror) -> bool {
-    mirror.moderator_id.is_none()
-        && mirror.reason.as_deref() == Some(GATEWAY_BAN_REASON)
-        && mirror.operation_id.is_none()
+    mirror.gateway_reason_unset && mirror.operation_id.is_none()
 }
 
 fn bot_owned_mirror_without_manual_event(
@@ -819,7 +826,10 @@ fn bot_owned_mirror_without_manual_event(
     user_id: i64,
     mirror: &ActiveBanMirror,
 ) -> Result<bool> {
-    if mirror.operation_id.is_none() || mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON) {
+    if mirror.operation_id.is_none()
+        || mirror.moderator_id.is_some()
+        || !mirror.gateway_reason_unset
+    {
         return Ok(false);
     }
     Ok(!manual_member_ban_event_exists_for_mirror(
@@ -854,7 +864,7 @@ fn bot_echo_matches_mirror(
             }
             Ok(mirror.operation_id.is_none()
                 && mirror.moderator_id.is_some()
-                && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON))
+                && !mirror.gateway_reason_unset)
         }
         None if gateway_placeholder_mirror(mirror) => Ok(true),
         None => Ok(mirror.operation_id.is_some() && mirror.moderator_id.is_some()),
@@ -876,9 +886,7 @@ fn gateway_manual_redelivery_within_window(
 }
 
 fn completed_bot_gateway_mirror(mirror: &ActiveBanMirror) -> bool {
-    mirror.operation_id.is_some()
-        && mirror.moderator_id.is_some()
-        && mirror.reason.as_deref() != Some(GATEWAY_BAN_REASON)
+    mirror.operation_id.is_some() && mirror.moderator_id.is_some()
 }
 
 fn same_gateway_delivery_as_mirror(
