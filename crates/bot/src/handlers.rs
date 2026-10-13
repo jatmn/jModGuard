@@ -848,7 +848,8 @@ impl EventHandler for Handler {
 
         if !stop_commands {
             let cfg_arc = Arc::clone(&cfg);
-            let _ = commands::handle_prefix(&app, &ctx, cfg_arc, &msg).await;
+            let _ = commands::handle_prefix(&app, &ctx.http, &ctx.cache, cfg_arc, &msg, Some(&ctx))
+                .await;
         }
     }
 
