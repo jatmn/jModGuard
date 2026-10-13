@@ -5819,8 +5819,7 @@ async fn coverage_gap_mark_batches_writes_for_remote_transport() {
         "coverage-gap mark must observe remote facade calls"
     );
     assert_eq!(
-        used,
-        14,
+        used, 14,
         "coverage-gap mark remote round-trips (scope, revision snapshot, write tx, receipt, seed update, batch, commit)"
     );
     let status = store
