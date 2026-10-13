@@ -374,14 +374,14 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert_eq!(
-            http_status(
+            wait_status(
                 addr,
                 "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                None
+                503
             )
             .await,
             503
@@ -396,16 +396,9 @@ mod tests {
         })
         .join()
         .unwrap();
-        let mut ready = 0;
-        for _ in 0..40 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await;
-            if ready == 200 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         assert_eq!(
-            ready, 200,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200,
             "the API becomes ready after the schema is upgraded"
         );
         let db = opened.await.unwrap().unwrap();
