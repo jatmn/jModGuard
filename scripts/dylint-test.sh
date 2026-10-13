@@ -8,7 +8,6 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/project/scripts" "$fixture/bin" "$fixture/external"
 git init -q "$fixture/project"
 cp "$root/scripts/dylint.sh" "$fixture/project/scripts/dylint.sh"
-cp "$root/scripts/ci-agent-setup.sh" "$fixture/ci-agent-setup.sh"
 cat > "$fixture/project/dylint.toml" <<'EOF'
 [[workspace.metadata.dylint.libraries]]
 tag = "v6.1.0"
@@ -243,8 +242,8 @@ case "$*" in
 esac
 SH
 chmod +x "$fixture/bin/rustup"
-# Load the production functions without running the unrelated tool/library builds.
-sed '/^ensure_main_toolchain$/,$d' "$fixture/ci-agent-setup.sh" > "$fixture/setup-functions.sh"
+# Load shared dylint helpers without running the main dylint driver.
+sed '/^mapfile -t library_tags/,$d' "$fixture/project/scripts/dylint.sh" > "$fixture/setup-functions.sh"
 (
   cd "$fixture/project"
   export PATH="$fixture/bin:$PATH"
@@ -313,12 +312,6 @@ expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-ta
 run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message for curl'
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
-
-setup_key="$(sed -n '/^# BEGIN dylint-lib-key$/,/^# END dylint-lib-key$/p' "$fixture/ci-agent-setup.sh")"
-dylint_key="$(sed -n '/^# BEGIN dylint-lib-key$/,/^# END dylint-lib-key$/p' "$fixture/project/scripts/dylint.sh")"
-if [ "$setup_key" != "$dylint_key" ]; then
-  fail 'dylint-lib-key regions differ between ci-agent-setup.sh and dylint.sh'
-fi
 
 while IFS= read -r line; do
   if [[ "$line" == *dylint-libs* ]]; then

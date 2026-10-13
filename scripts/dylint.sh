@@ -11,7 +11,13 @@ if [ -z "$root" ]; then
 fi
 cd "$root"
 
-JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
+  if [ -n "${HOME:-}" ]; then
+    JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
+  else
+    JMODGUARD_CI_PREFIX=/opt/jmodguard-ci
+  fi
+fi
 
 # BEGIN dylint-lib-key
 # Discovers source metadata without requiring the lint toolchain to be installed.
@@ -68,6 +74,37 @@ dylint_lib_names=(
   incorrect_matches_operation
   wrong_serialize_struct_arg
 )
+
+toolchain_components_installed() {
+  local channel="$1"
+  shift
+  local comp needle missing=0
+  for comp in "$@"; do
+    needle=$comp
+    if [ "$comp" = llvm-tools-preview ]; then
+      needle=llvm-tools
+    fi
+    if ! rustup component list --toolchain "$channel" | awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ]
+}
+
+ensure_dylint_toolchain() {
+  local metadata channel
+  if ! metadata=$(jmodguard_dylint_lib_metadata dylint.toml); then
+    echo "dylint: dylint toolchain lookup failed" >&2
+    exit 1
+  fi
+  channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
+  if toolchain_components_installed "$channel" llvm-tools-preview rustc-dev; then
+    echo "toolchain-${channel}: already-present"
+  else
+    rustup toolchain install "$channel" --component llvm-tools-preview,rustc-dev
+    echo "toolchain-${channel}: installed"
+  fi
+}
 
 read_library_tags() {
   awk '

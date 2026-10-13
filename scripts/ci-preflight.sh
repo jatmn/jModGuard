@@ -7,7 +7,13 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
-JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
+  if [ -n "${HOME:-}" ]; then
+    JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
+  else
+    JMODGUARD_CI_PREFIX=/opt/jmodguard-ci
+  fi
+fi
 # shellcheck source=scripts/ci-ensure-cargo-tool.sh
 source "$root/scripts/ci-ensure-cargo-tool.sh"
 
