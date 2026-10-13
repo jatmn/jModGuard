@@ -269,7 +269,6 @@ mod tests {
         );
 
         let queries = probe.queries();
-        jmodguard::set_process_ready(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let probe_check = async {
@@ -307,7 +306,6 @@ mod tests {
             queries,
             "repeated readiness checks must not query the database"
         );
-        jmodguard::set_process_ready(false);
         drop(app);
         cleanup(&path);
     }
