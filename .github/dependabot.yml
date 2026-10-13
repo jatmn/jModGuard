@@ -5,7 +5,7 @@
 #
 # Keep Settings → Advanced Security → Dependabot on self-hosted runners
 # disabled. This repository has no GitHub Actions self-hosted runners;
-# CI is Buildkite. Enabling that setting queues every cycle on a
+# CI is GitHub Actions. Enabling that setting queues every cycle on a
 # `dependabot` label until GitHub cancels it after 24 hours. Do not
 # register leftover Proxmox GHA runners or label any runner `dependabot`.
 #

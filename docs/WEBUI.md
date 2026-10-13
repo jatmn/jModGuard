@@ -29,7 +29,7 @@ npm run build --prefix tools/webui
 ```
 
 Rebuild after editing `frontend/` or `tools/webui/`. Output is in
-`dist/frontend/`, ignored by Git. Buildkite runs these steps before checks and
+`dist/frontend/`, ignored by Git. GitHub Actions runs these steps before checks and
 release packaging. The bot and API `--no-default-features` builds need no WebUI build.
 Do not upload the unbuilt `frontend/` sources.
 
@@ -43,7 +43,7 @@ The five generated files are:
 | `dist/frontend/administration/index.html` | owner Administration and Updates page |
 | `dist/frontend/administration.js` | update controls and version display |
 
-Buildkite also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
+GitHub Actions also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
 
 The dependency audit keeps the libraries that supply existing behavior:
@@ -133,7 +133,7 @@ serves them at `http://localhost:8080`.
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
 
-For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. Buildkite publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
+For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. GitHub Actions publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
 `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
 `BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see

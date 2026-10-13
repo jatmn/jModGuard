@@ -102,7 +102,7 @@ run_dylint() {
       DYLINT_TEST_CAPTURE="$capture" \
       DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
       TMPDIR="$tmpdir" \
-      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES "$@" bash scripts/dylint.sh >"$stdout_file"
+      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES -u DYLINT_CARGO_HOME "$@" bash scripts/dylint.sh >"$stdout_file"
   )
 }
 
@@ -124,6 +124,10 @@ run_dylint "$fixture/external" \
   RUSTFLAGS='-C debuginfo=0' CARGO_ENCODED_RUSTFLAGS='-D warnings'
 expect "$capture" TMPDIR "$fixture/external"
 expect "$capture" CARGO_HOME "$fixture/external/cargo-home"
+
+# Hosted CI supplies a persistent cache; an explicit override still takes effect.
+run_dylint "$fixture/external" DYLINT_CARGO_HOME="$fixture/hosted-cache"
+expect "$capture" CARGO_HOME "$fixture/hosted-cache"
 
 # Caller flags may contain the policy flags before a later override. The
 # Dylint flags must be last so both lint levels retain their intended effect.

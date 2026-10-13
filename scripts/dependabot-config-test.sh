@@ -44,7 +44,7 @@ require_absent() {
 
 yaml=".github/dependabot.yml"
 development="development.md"
-buildkite="docs/BUILDKITE.md"
+ci="docs/CI.md"
 deploy="docs/DEPLOY-BUNNY.md"
 agents="AGENTS.md"
 preflight="scripts/ci-preflight.sh"
@@ -75,15 +75,15 @@ require_absent "$yaml" "package-ecosystem: github-actions"
 require_absent "$yaml" "package-ecosystem: docker"
 require_absent "$yaml" '${{'
 if [ -d "$root/.github/workflows" ]; then
-  for required in pullfrog.yml socket.yml; do
+  for required in pullfrog.yml socket.yml ci.yml publish.yml; do
     if [ ! -f "$root/.github/workflows/$required" ]; then
       fail "missing .github/workflows/$required"
     fi
   done
   while IFS= read -r -d '' workflow; do
     case "$workflow" in
-      "$root/.github/workflows/pullfrog.yml"|"$root/.github/workflows/socket.yml") ;;
-      *) fail "only the Pullfrog and Socket Security workflows are allowed under .github/workflows" ;;
+      "$root/.github/workflows/pullfrog.yml"|"$root/.github/workflows/socket.yml"|"$root/.github/workflows/ci.yml"|"$root/.github/workflows/publish.yml") ;;
+      *) fail "only the reviewed CI, Pullfrog and Socket Security workflows are allowed under .github/workflows" ;;
     esac
   done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
 fi
@@ -115,7 +115,7 @@ require_contains "$socket_workflow" "cancel-in-progress: true"
 # The group is the branch or pull-request ref. Including github.sha gives every
 # commit its own group, so cancel-in-progress cannot stop the scan it replaces.
 require_absent "$socket_workflow" "github.sha"
-for doc in AGENTS.md development.md docs/BUILDKITE.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
+for doc in AGENTS.md development.md docs/CI.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
   require_contains "$doc" "SOCKET_SECURITY_API_KEY"
   require_contains "$doc" "not stored in git."
   require_contains "$doc" "uploads discovered Cargo and npm manifests outside ignored paths to Socket"
@@ -134,7 +134,7 @@ do
   require_contains "$yaml" "$needle"
 done
 
-for path in "$development" "$buildkite" "$deploy" "$agents"; do
+for path in "$development" "$ci" "$deploy" "$agents"; do
   require_contains "$path" "Dependabot"
 done
 
@@ -144,11 +144,11 @@ require_contains "$development" "24 hours"
 require_contains "$development" "idle"
 require_contains "$development" "no GitHub Actions self-hosted runners"
 require_contains "$development" "bash scripts/dependabot-config-test.sh"
-require_contains "$buildkite" "Actions → Dependabot Updates"
-require_contains "$buildkite" "Dependabot on self-hosted"
-require_contains "$buildkite" "no registered GitHub Actions self-hosted runners"
-require_absent "$buildkite" "No Actions jobs should start for this repo."
-require_contains "$deploy" "no GitHub Actions CI or"
+require_contains "$ci" "Actions → Dependabot Updates"
+require_contains "$ci" "Dependabot on self-hosted"
+require_contains "$ci" "no registered GitHub Actions self-hosted runners"
+require_absent "$ci" "No Actions jobs should start for this repo."
+require_contains "$deploy" "standard GitHub-hosted runners"
 require_contains "$deploy" "Dependabot on self-hosted runners"
 require_absent "$deploy" "still use GitHub-hosted"
 require_absent "$deploy" "This repository has no GitHub Actions jobs"
@@ -157,11 +157,11 @@ require_contains "$agents" "Dependabot on self-hosted runners"
 require_contains "$agents" "24 hours"
 require_contains "$agents" "no GitHub Actions self-hosted"
 require_contains "$preflight" "bash scripts/dependabot-config-test.sh"
-require_contains "$preflight" "GitHub Actions workflows and GitHub-hosted CI runners are forbidden"
+require_contains "$preflight" "Shared selected GitHub Actions check groups"
 require_contains "$preflight" "Dependabot Updates dynamic workflows are not CI"
 require_contains "$preflight" "npm audit --prefix tools/eslint --audit-level=high"
 require_contains "$agents" "npm audit --prefix tools/eslint --audit-level=high"
-require_contains "$buildkite" "npm audit --prefix tools/eslint --audit-level=high"
+require_contains "$ci" "npm audit --prefix tools/eslint --audit-level=high"
 require_contains "$development" "five open version-update PRs per ecosystem"
 
 echo 'dependabot-config-test: ok'
