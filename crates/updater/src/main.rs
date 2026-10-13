@@ -781,6 +781,7 @@ impl Supervisor {
             };
             match saved {
                 Ok(()) => {
+                    self.standby = None;
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
@@ -2248,7 +2249,7 @@ mod tests {
             .current_dir(&root)
             .args([
                 "-c",
-                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source .buildkite/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test .",
+                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source scripts/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test .",
             ])
             .output()
             .await

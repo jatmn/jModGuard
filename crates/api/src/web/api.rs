@@ -189,6 +189,7 @@ pub async fn guild_config(
         "nickname_reconcile": snapshot.nickname_reconcile,
         "rules": rules,
         "badwords": badwords,
+        "known_bad_images": snapshot.known_bad_images,
         "commands": commands,
         "templates": templates,
         "log_channels": log_channels,
@@ -289,6 +290,8 @@ pub async fn update_settings(
 pub struct RuleBody {
     scope: Option<String>,
     data: RuleDef,
+    #[serde(default)]
+    clear_guild_override: bool,
 }
 
 pub async fn get_rule(
@@ -351,6 +354,11 @@ pub async fn put_rule(
         jmodguard::custom_rules::validate_custom_rule_shape(scope, &rule_id, &body.data)
             .map_err(ApiError)?;
     }
+    if body.clear_guild_override && (scope != GLOBAL_SCOPE || guild_id == 0) {
+        return Err(ApiError(anyhow::anyhow!(
+            "override clearing requires a global rule save from a server"
+        )));
+    }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -360,6 +368,7 @@ pub async fn put_rule(
             target,
             id: rule_id.clone(),
             rule: body.data.clone(),
+            clear_guild_override: body.clear_guild_override,
         },
     )
     .await?;
@@ -370,6 +379,7 @@ pub async fn put_rule(
             "id": rule_id,
             "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
             "value": body.data,
+            "cleared_guild_override": body.clear_guild_override,
         }
     })))
 }
@@ -1217,14 +1227,11 @@ pub(super) async fn enqueue_action(
         })
         .await
         .map_err(|error| {
-            if error.is::<db::EnrollmentChanged>()
-                || error.to_string().contains("Server membership changed")
-            {
+            if error.is::<db::EnrollmentChanged>() {
                 return ApiError(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
             }
             if error.is::<db::EnrollmentUnverified>()
                 || error.is::<crate::bot_actions::RequestKeyError>()
-                || error.to_string().contains("could not be verified")
             {
                 return ApiError(error);
             }
@@ -1302,11 +1309,11 @@ mod tests {
 
     #[test]
     fn log_channels_wire_stringifies_snowflake_channel_ids() {
-        let snow = 1329331947876479006i64;
+        let snow = 9_007_199_254_740_993i64;
         let out = log_channels_wire(vec![("message_delete".into(), snow)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["event"], "message_delete");
-        assert_eq!(out[0]["channel_id"], "1329331947876479006");
+        assert_eq!(out[0]["channel_id"], "9007199254740993");
         assert!(out[0]["channel_id"].is_string());
     }
 
@@ -1344,4 +1351,62 @@ mod tests {
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownBadImageBody {
+    hash: String,
+    note: Option<String>,
+}
+
+pub async fn add_known_bad_image(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<KnownBadImageBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let hash = db::canonical_image_hash(&body.hash)?;
+    let note = db::safe_image_note(body.note)?;
+    let (_, result) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::AddKnownBadImage {
+                scope: scope.to_wire(),
+                hash,
+                note,
+            },
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "changed": result["changed"]}),
+    ))
+}
+
+pub async fn remove_known_bad_image(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, hash)): Path<(u64, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let hash = db::canonical_image_hash(&hash)?;
+    let (_, result) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::RemoveKnownBadImage {
+                scope: scope.to_wire(),
+                hash,
+            },
+        )
+        .await?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "changed": result["changed"]}),
+    ))
 }

@@ -11,13 +11,19 @@ if [ -z "$root" ]; then
 fi
 cd "$root"
 
-JMODGUARD_CI_PREFIX="${JMODGUARD_CI_PREFIX:-/opt/jmodguard-ci}"
+if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
+  if [ -n "${HOME:-}" ]; then
+    JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
+  else
+    JMODGUARD_CI_PREFIX=/opt/jmodguard-ci
+  fi
+fi
 
 # BEGIN dylint-lib-key
-# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
-jmodguard_dylint_lib_key() {
-  local toml=$1 out=$2 version lints_rev channel commit_hash toml_sha
-  local remote_lines peeled toolchain_toml vv
+# Discovers source metadata without requiring the lint toolchain to be installed.
+jmodguard_dylint_lib_metadata() {
+  local toml=$1 version lints_rev channel toml_sha
+  local remote_lines peeled toolchain_toml
   version=$(awk '
     /^\[\[workspace\.metadata\.dylint\.libraries\]\]/ { inlib = 1; next }
     inlib && /^\[/ { inlib = 0 }
@@ -43,14 +49,20 @@ jmodguard_dylint_lib_key() {
   toolchain_toml=$(curl -fsSL "https://raw.githubusercontent.com/trailofbits/dylint/${lints_rev}/examples/general/rust-toolchain.toml") || return 1
   channel=$(printf '%s\n' "$toolchain_toml" | awk -F'"' '/^channel = / {print $2; exit}')
   [ -n "$channel" ] || return 1
+  printf 'dylint_toml_sha256=%s\n' "$toml_sha"
+  printf 'lints_rev=%s\n' "$lints_rev"
+  printf 'toolchain=%s\n' "$channel"
+}
+
+# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
+jmodguard_dylint_lib_key() {
+  local metadata channel vv commit_hash
+  metadata=$(jmodguard_dylint_lib_metadata "$1") || return 1
+  channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
   vv=$(rustc "+${channel}" -vV) || return 1
   commit_hash=$(printf '%s\n' "$vv" | awk '/^commit-hash: / {print $2; exit}')
   [ -n "$commit_hash" ] || return 1
-  {
-    printf 'dylint_toml_sha256=%s\n' "$toml_sha"
-    printf 'lints_rev=%s\n' "$lints_rev"
-    printf 'toolchain=%s %s\n' "$channel" "$commit_hash"
-  } >"$out"
+  printf '%s %s\n' "$metadata" "$commit_hash" >"$2"
 }
 # END dylint-lib-key
 
@@ -62,6 +74,37 @@ dylint_lib_names=(
   incorrect_matches_operation
   wrong_serialize_struct_arg
 )
+
+toolchain_components_installed() {
+  local channel="$1"
+  shift
+  local comp needle missing=0
+  for comp in "$@"; do
+    needle=$comp
+    if [ "$comp" = llvm-tools-preview ]; then
+      needle=llvm-tools
+    fi
+    if ! rustup component list --toolchain "$channel" | awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ]
+}
+
+ensure_dylint_toolchain() {
+  local metadata channel
+  if ! metadata=$(jmodguard_dylint_lib_metadata dylint.toml); then
+    echo "dylint: dylint toolchain lookup failed" >&2
+    exit 1
+  fi
+  channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
+  if toolchain_components_installed "$channel" llvm-tools-preview rustc-dev; then
+    echo "toolchain-${channel}: already-present"
+  else
+    rustup toolchain install "$channel" --component llvm-tools-preview,rustc-dev
+    echo "toolchain-${channel}: installed"
+  fi
+}
 
 read_library_tags() {
   awk '
@@ -109,9 +152,8 @@ fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-dylint}"
 
-# Buildkite runs many cargo steps in parallel on one agent. Give dylint its own
-# CARGO_HOME so `cargo fetch` for Trail of Bits lint libraries does not race
-# shared git checkouts under the agent default home.
+# Give lint-tool dependency resolution its own CARGO_HOME so it cannot race
+# ordinary Cargo dependency checkouts during local or hosted checks.
 scratch="${TMPDIR:-$root/.tmp/dylint}"
 mkdir -p "$scratch"
 export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"
@@ -236,6 +278,8 @@ fi
 # Apply the gate's lint levels last: a caller may have an earlier copy of
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
+
+ensure_dylint_toolchain
 
 use_prebuilt=0
 lib_dir=""

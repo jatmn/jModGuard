@@ -449,6 +449,7 @@ mod tests {
             "scam!",
             "scam.",
             "(scam)",
+            "$scam",
             "scam$",
             "scam@",
             "SCAM!",

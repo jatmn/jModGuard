@@ -868,7 +868,7 @@ async fn copy_guild_config_inner(
                 let replacement = prepare_copied_rules(dst, rows)?;
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 insert_copied_rules(dst, &replacement, |sql, args, rows| {
-                    tx.execute_rows(sql, params_from_iter(args), rows)
+                    tx.execute_insert_batch(sql, params_from_iter(args), rows)
                 })?;
             } else {
                 for (id, rule) in &rows {
@@ -1007,6 +1007,7 @@ pub struct ConfigParts {
     pub log_channels: std::collections::HashMap<String, i64>,
     pub log_filters: std::collections::HashMap<String, LogFilter>,
     pub badwords: Vec<String>,
+    pub known_bad_images: Vec<KnownBadImage>,
 }
 
 /// Raw and effective data needed by one WebUI config response. Every field is
@@ -1019,6 +1020,7 @@ pub struct WebConfigSnapshot {
     pub guild_rules: std::collections::HashMap<String, RuleDef>,
     pub global_rules: std::collections::HashMap<String, RuleDef>,
     pub badwords: Vec<Badword>,
+    pub known_bad_images: Vec<KnownBadImage>,
     pub guild_commands: std::collections::HashMap<String, CommandDef>,
     pub global_commands: std::collections::HashMap<String, CommandDef>,
     pub guild_templates: std::collections::HashMap<String, String>,
@@ -1084,6 +1086,10 @@ SELECT
   (SELECT last_error FROM nickname_reconcile WHERE guild_id = ?1),
   (SELECT last_error_at FROM nickname_reconcile WHERE guild_id = ?1)
   ,(SELECT json_group_object(event_type, data) FROM log_filters WHERE guild_id = ?1)
+  ,(SELECT json_group_array(json_object('hash', hash, 'added_at', added_at,
+        'added_via', added_via, 'actor', actor, 'note', note))
+     FROM (SELECT hash, added_at, added_via, actor, note FROM known_bad_images
+           WHERE guild_id = ?1 ORDER BY hash LIMIT 1024))
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1100,6 +1106,7 @@ struct ConfigurationSnapshotRows {
     guild_log_channels: std::collections::HashMap<String, i64>,
     guild_log_filters: std::collections::HashMap<String, LogFilter>,
     badwords: Vec<Badword>,
+    known_bad_images: Vec<KnownBadImage>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
 }
 
@@ -1202,6 +1209,10 @@ fn load_configuration_snapshot_conn(
                 guild_log_channels: parse_json_map(row.get(13)?, "log_channels")?,
                 guild_log_filters: parse_json_encoded_map(row.get(21)?, "log_filters")?,
                 badwords: parse_json_vec(row.get(14)?, "badwords")?,
+                known_bad_images: safe_known_bad_rows(parse_json_vec(
+                    row.get(22)?,
+                    "known_bad_images",
+                )?),
                 nickname_reconcile,
             })
         },
@@ -1238,6 +1249,7 @@ impl ConfigurationSnapshotRows {
             guild_rules: self.guild_rules,
             global_rules: self.global_rules,
             badwords: self.badwords,
+            known_bad_images: self.known_bad_images,
             guild_commands: self.guild_commands,
             global_commands: self.global_commands,
             guild_templates: self.guild_templates,
@@ -1327,6 +1339,7 @@ impl ConfigurationSnapshotRows {
                 log_channels,
                 log_filters: self.guild_log_filters,
                 badwords,
+                known_bad_images: self.known_bad_images,
             },
         )
     }
@@ -1476,6 +1489,48 @@ pub async fn upsert_enrolled_rule(
         false,
         Some(scope),
     )
+    .await
+}
+
+/// The global rule editor's save and override clear are one captured mutation.
+pub async fn upsert_global_rule_and_clear_enrolled_override(
+    db: &Db,
+    request: ConfigurationScope,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    anyhow::ensure!(
+        request.guild_id() > 0,
+        "override clearing requires a server"
+    );
+    anyhow::ensure!(
+        crate::custom_rules::known_rule_id(id) && !crate::custom_rules::is_custom_id(id),
+        "global rule must be built-in"
+    );
+    crate::image_spam::validate_rule(id, rule)?;
+    let global = ConfigurationWriteScope::new(request.clone(), ConfigurationScope::Global)?;
+    let guild = ConfigurationWriteScope::new(request.clone(), request)?;
+    let id = id.to_owned();
+    let json = serde_json::to_string(rule)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        global.verify_conn(&tx)?;
+        // The global target's check alone does not cover the guild write fence.
+        guild.verify_conn(&tx)?;
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, ?1, ?2)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![id.as_str(), json],
+            1,
+        )?;
+        tx.execute_reclaim(
+            "DELETE FROM rules WHERE guild_id = ?1 AND rule_id = ?2",
+            params![guild.guild_id(), id.as_str()],
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
     .await
 }
 

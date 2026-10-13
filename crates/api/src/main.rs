@@ -41,10 +41,6 @@ async fn main() -> Result<()> {
     }
 
     jmodguard::cgroup::spawn_container_usage_sampler();
-    jmodguard::read_link::spawn_container_read_listener(
-        &cfg.bot.read_bind,
-        cfg.bot.control_secret.as_str(),
-    );
 
     if offline_write {
         jmodguard_api::startup::write_shared_config(cfg).await?;
@@ -70,6 +66,13 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind API on {web_bind}"))?;
     tracing::info!("API liveness on http://{web_bind}/health");
+
+    // Reserve the web socket first: an overlapping private read bind should
+    // disable container readings, not prevent the API from starting.
+    jmodguard::read_link::spawn_container_read_listener(
+        &cfg.bot.read_bind,
+        cfg.bot.control_secret.as_str(),
+    );
 
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.

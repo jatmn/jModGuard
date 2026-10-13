@@ -17,6 +17,9 @@ const RENEW_START_MARGIN: Duration = Duration::from_millis(100);
 const LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 /// In-flight rule work must finish inside the observed shutdown grace.
 pub const HANDOFF_DEADLINE: Duration = Duration::from_secs(8);
+/// Lost-lease exits release the row before terminating so a replacement need not
+/// wait for TTL expiry.
+const LEASE_RELEASE_BEFORE_EXIT: Duration = Duration::from_secs(2);
 
 pub struct Activation {
     instance: String,
@@ -528,6 +531,11 @@ fn spawn_renewal_every(
             // an already-observed cutoff. A running, unleased bot is unhealthy.
             activation.note_lease_lost();
             set_process_ready(false);
+            let instance = activation.instance();
+            release_held_active_bot_before_exit(&db, instance).await;
+            if activation.is_shutting_down() {
+                return;
+            }
             tracing::error!(
                 reason = loss_reason,
                 last_error = last_error.as_deref().unwrap_or("none"),
@@ -566,6 +574,17 @@ async fn wait_for_renewal_tick(
 fn lose_lease(activation: &Activation) {
     activation.note_lease_lost();
     set_process_ready(false);
+}
+
+async fn release_held_active_bot_before_exit(db: &Db, instance: &str) {
+    let release = db::release_active_bot(db, instance);
+    match tokio::time::timeout(LEASE_RELEASE_BEFORE_EXIT, release).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("active-bot lease release before exit failed: {error:#}");
+        }
+        Err(_) => tracing::warn!("active-bot lease release before exit timed out"),
+    }
 }
 
 /// One path for a lost lease. `true` means keep renewing.
@@ -1341,10 +1360,98 @@ mod tests {
                 "lease loss must not double-log: {text}"
             );
             assert!(text.contains("renewal matched no row: another instance holds it, it expired, or a restore is in progress"));
+            if expired {
+                let stored = db
+                    .with_conn(|conn| db::meta_string_conn(conn, "active_bot_lease"))
+                    .await
+                    .unwrap();
+                assert!(
+                    stored.is_none(),
+                    "lost-lease exit must release the row before terminating"
+                );
+            }
             drop(writer);
             drop(db);
             cleanup(&path);
         }
+    }
+
+    #[tokio::test]
+    async fn lost_lease_exit_releases_row_so_replacement_can_claim_immediately() {
+        static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        static LEASE_CHECK_DB: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+        fn lost_lease_exit_hook(code: i32) {
+            EXIT_CODE.store(code, Ordering::Release);
+            let path = LEASE_CHECK_DB
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("lease check path")
+                .clone();
+            let check_db = Db::open(&path, 2).expect("lease check db");
+            let stored = check_db
+                .with_conn_sync(|conn| db::meta_string_conn(conn, "active_bot_lease"))
+                .expect("lease read in exit hook");
+            assert!(
+                stored.is_none(),
+                "lease row must be released before the fatal exit hook runs"
+            );
+        }
+        let (path, db) = temp_db("lease-release-exit");
+        *LEASE_CHECK_DB.lock().unwrap() = Some(path.clone());
+        let mut activation = Activation::new();
+        activation.set_lease_window(Duration::from_secs(4), Duration::from_secs(1));
+        Arc::get_mut(&mut activation).unwrap().exit_hook = lost_lease_exit_hook;
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let claim_at = chrono::Utc::now().timestamp_millis();
+        let live = db
+            .with_conn(|conn| db::meta_string_conn(conn, "active_bot_lease"))
+            .await
+            .unwrap()
+            .expect("holder lease row");
+        let expires = live
+            .rsplit_once(' ')
+            .map(|(_, expiry)| expiry.parse::<i64>().unwrap())
+            .unwrap();
+        assert!(expires > claim_at, "fixture must hold a live lease row");
+        let challenger = Activation::new();
+        assert!(
+            !db::claim_active_bot(
+                &db,
+                challenger.instance(),
+                claim_at,
+                challenger.refuse_flag()
+            )
+            .await
+            .unwrap(),
+            "a live lease must block the replacement before the holder releases it"
+        );
+        activation.renewal_stall.store(true, Ordering::Release);
+        let renewal = spawn_renewal_every(
+            db.clone(),
+            Arc::clone(&activation),
+            None,
+            Duration::from_millis(20),
+        );
+        tokio::time::timeout(Duration::from_secs(5), renewal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(EXIT_CODE.load(Ordering::Acquire), 1);
+        assert!(
+            db::claim_active_bot(
+                &db,
+                challenger.instance(),
+                claim_at,
+                challenger.refuse_flag()
+            )
+            .await
+            .unwrap(),
+            "replacement must claim as soon as the lost holder releases its row"
+        );
+        *LEASE_CHECK_DB.lock().unwrap() = None;
+        drop(db);
+        cleanup(&path);
     }
 
     async fn hold_core_writer(db: Db, hold: Duration) -> tokio::task::JoinHandle<()> {
@@ -1426,15 +1533,6 @@ mod tests {
         activation.set_lease_window(Duration::from_secs(4), Duration::from_secs(1));
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let before = activation.authority_deadline().unwrap();
-        fn expiry(conn: &impl db::SqlExecutor) -> anyhow::Result<i64> {
-            Ok(db::meta_string_conn(conn, "active_bot_lease")?
-                .unwrap()
-                .rsplit_once(' ')
-                .unwrap()
-                .1
-                .parse::<i64>()?)
-        }
-        let before_expiry = db.with_conn_sync(|conn| expiry(conn)).unwrap();
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let gate = Arc::clone(&release);
         let began = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1481,10 +1579,6 @@ mod tests {
             .unwrap()
             .unwrap();
         writer.await.unwrap();
-        assert!(
-            db.with_conn_sync(|conn| expiry(conn)).unwrap() > before_expiry,
-            "real CAS committed before reply acceptance"
-        );
         assert_eq!(activation.authority_deadline(), Some(before));
         assert!(!activation.may_record());
         assert!(activation.cut_off.load(Ordering::Acquire));
@@ -1499,6 +1593,12 @@ mod tests {
         assert_eq!(
             text.lines().filter(|line| line.contains("ERROR")).count(),
             1
+        );
+        assert!(
+            db.with_conn_sync(|conn| db::meta_string_conn(conn, "active_bot_lease"))
+                .unwrap()
+                .is_none(),
+            "lost-lease exit must release the activation row"
         );
         drop(db);
         cleanup(&path);

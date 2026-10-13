@@ -450,6 +450,7 @@ async fn execute_inner(
         if let (Some(enrollment), Some(operation_id)) = (enrollment, operation_id) {
             let case_outcome = unban_case_outcome(&outcome);
             let data = crate::db::guild_data::CaseData {
+                ban_attempt_tag: None,
                 source: crate::db::guild_data::CaseSource::Application { operation_id },
                 action: crate::db::guild_data::CaseAction::Unban,
                 outcome: case_outcome,

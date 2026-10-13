@@ -8,7 +8,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 7;
+pub const LAUNCHER_REVISION: u32 = 9;
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
@@ -759,11 +759,11 @@ impl UpdateControl {
             Ok(ControlReply::Waiting) => Err(receipt_not_saved("waiting")),
             Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
             Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
-            Ok(ControlReply::Failed { message }) if transient_receipt(&message) => {
+            Ok(ControlReply::Failed { message, .. }) if transient_receipt(&message) => {
                 tracing::warn!("API launcher receipt was not recorded: {message}");
                 Err(receipt_not_saved(message))
             }
-            Ok(ControlReply::Failed { message }) => {
+            Ok(ControlReply::Failed { message, .. }) => {
                 tracing::warn!("API launcher receipt was not recorded: {message}");
                 anyhow::bail!("{message}")
             }

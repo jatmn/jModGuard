@@ -246,6 +246,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     let case_id = CaseId::new();
     let limits = CaseLimits::default();
     let facts = CaseData {
+        ban_attempt_tag: None,
         source: CaseSource::DiscordAudit { entry_id: 123 },
         action: CaseAction::Ban,
         outcome: CaseOutcome::Uncertain,
@@ -616,6 +617,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .unwrap()
     );
     let alias_facts = CaseData {
+        ban_attempt_tag: None,
         source: app_source.clone(),
         ..facts.clone()
     };
@@ -634,6 +636,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     );
     let live_case = CaseId::new();
     let live_facts = CaseData {
+        ban_attempt_tag: None,
         source: CaseSource::DiscordAudit { entry_id: 124 },
         ..facts.clone()
     };
@@ -661,6 +664,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             scoped.clone(),
             late_id.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: late_source.clone(),
                 ..facts.clone()
             },

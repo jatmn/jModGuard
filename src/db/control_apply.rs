@@ -54,11 +54,22 @@ pub enum ControlOp {
         target: ScopeWire,
         id: String,
         rule: RuleDef,
+        #[serde(default)]
+        clear_guild_override: bool,
     },
     DeleteRule {
         request: ScopeWire,
         target: ScopeWire,
         id: String,
+    },
+    AddKnownBadImage {
+        scope: ScopeWire,
+        hash: String,
+        note: Option<String>,
+    },
+    RemoveKnownBadImage {
+        scope: ScopeWire,
+        hash: String,
     },
     AddBadword {
         request: ScopeWire,
@@ -287,12 +298,20 @@ pub enum ControlOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControlReply {
-    Saved { body: serde_json::Value },
-    Unchanged { body: serde_json::Value },
+    Saved {
+        body: serde_json::Value,
+    },
+    Unchanged {
+        body: serde_json::Value,
+    },
     Waiting,
     Busy,
     StillWaiting,
-    Failed { message: String },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +333,9 @@ const ADMINISTRATOR_BIT: u64 = 1 << 3;
 
 pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
     match op {
-        ControlOp::PatchSettings { scope, .. } => scope_actor_need(scope),
+        ControlOp::PatchSettings { scope, .. }
+        | ControlOp::AddKnownBadImage { scope, .. }
+        | ControlOp::RemoveKnownBadImage { scope, .. } => scope_actor_need(scope),
         ControlOp::UpsertRule { target, .. }
         | ControlOp::DeleteRule { target, .. }
         | ControlOp::AddBadword { target, .. }
@@ -535,8 +556,18 @@ async fn apply_control_inner(
             target,
             id,
             rule,
+            clear_guild_override,
         } => {
-            upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?;
+            if clear_guild_override {
+                anyhow::ensure!(
+                    target.global,
+                    "override clearing requires a global rule target"
+                );
+                upsert_global_rule_and_clear_enrolled_override(db, scope_of(request)?, &id, &rule)
+                    .await?;
+            } else {
+                upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?;
+            }
             saved_null()
         }
         ControlOp::DeleteRule {
@@ -546,6 +577,37 @@ async fn apply_control_inner(
         } => {
             delete_enrolled_rule(db, write_scope(request, target)?, &id).await?;
             saved_null()
+        }
+        ControlOp::AddKnownBadImage { scope, hash, note } => {
+            let scope = scope_of(scope)?;
+            let changed = add_enrolled_known_bad_image(
+                db,
+                ConfigurationWriteScope::new(scope.clone(), scope)?,
+                &hash,
+                note,
+            )
+            .await?;
+            let body = serde_json::json!({"changed": changed});
+            Ok(if changed {
+                ControlReply::Saved { body }
+            } else {
+                ControlReply::Unchanged { body }
+            })
+        }
+        ControlOp::RemoveKnownBadImage { scope, hash } => {
+            let scope = scope_of(scope)?;
+            let changed = remove_enrolled_known_bad_image(
+                db,
+                ConfigurationWriteScope::new(scope.clone(), scope)?,
+                &hash,
+            )
+            .await?;
+            let body = serde_json::json!({"changed": changed});
+            Ok(if changed {
+                ControlReply::Saved { body }
+            } else {
+                ControlReply::Unchanged { body }
+            })
         }
         ControlOp::AddBadword {
             request,
@@ -687,6 +749,7 @@ async fn apply_control_inner(
             saved_null()
         }
         ControlOp::LookupResult => Ok(ControlReply::Failed {
+            code: None,
             message: crate::control::OUTCOME_UNKNOWN.into(),
         }),
         ControlOp::RecordComponentFailure {

@@ -101,6 +101,18 @@ fn main() {{
     }};
     if !maintenance {{
         event("start");
+        let _health = if root.join("bind-health-{name}").exists() {{
+            let bind = std::fs::read_to_string(root.join("bind-health-{name}")).unwrap();
+            let listener = std::net::TcpListener::bind(&bind).unwrap();
+            let bound = root.join("health-bound-{name}");
+            let pending = bound.with_extension("tmp");
+            std::fs::write(&pending, listener.local_addr().unwrap().to_string()).unwrap();
+            std::fs::rename(pending, bound).unwrap();
+            while !root.join("exit-code-{name}").exists() && !STOP.load(Ordering::SeqCst) {{
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }}
+            Some(listener)
+        }} else {{ None }};
         if let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
             std::process::exit(code.trim().parse().unwrap());
         }}
@@ -1446,7 +1458,7 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
     let (db, control) = open_launcher_db(&root).await;
     let mut objects = HashMap::new();
     let mut release = image(&mut objects, "bot", b"\x7fELFfixture");
-    release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION + 1;
+    release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION;
     store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -1467,6 +1479,7 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
         control.clone(),
         &root,
     );
+    bot.launcher_revision = db::LAUNCHER_REVISION - 1;
     let (selected, warnings) = with_contract_warnings(async {
         bot.launcher(&control.component("bot").await.unwrap()).await
     })
@@ -1480,6 +1493,10 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
         .desired_launcher
         .unwrap();
     assert_eq!(desired, release);
+    assert_eq!(
+        desired.launcher.as_ref().unwrap().revision,
+        db::LAUNCHER_REVISION
+    );
     let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
         .await
         .unwrap();
@@ -2546,7 +2563,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
             tx.execute_batch_bounded(
-                "DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
+                "DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
                  DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
                  DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
                  PRAGMA user_version=16;",
@@ -2624,7 +2641,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                 .baked_compatibility(role, &bot.base_sha, true)
                 .await
                 .unwrap();
-            assert_eq!(contract.core, 18);
+            assert_eq!(contract.core, db::CORE_SCHEMA_VERSION);
             assert_eq!(contract.source_sha, bot.base_sha);
             if role == "bot" {
                 bot.baked_compatibility = contract;
@@ -2653,10 +2670,13 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             "baked migrator must start from core16"
         );
         assert!(bot.running.as_ref().unwrap().release.is_none());
-        // Real application bootstrap applies migrations 17-18 and the readiness
+        // Real application bootstrap applies the remaining migrations and the readiness
         // marker. The ELF child itself deliberately does no DB/application work.
         let migrated = Db::open(&path, 2).unwrap();
-        assert_eq!(control.schema_version().await.unwrap(), 18);
+        assert_eq!(
+            control.schema_version().await.unwrap(),
+            db::CORE_SCHEMA_VERSION
+        );
         tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
             .await
             .unwrap();
@@ -2671,7 +2691,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         assert_eq!(after.candidate, before.candidate);
         assert!(after.installed.is_none() && after.previous.is_none());
         assert_eq!(after.state, "queued");
-        assert_eq!(after.observed.unwrap().min_schema, 18);
+        assert_eq!(after.observed.unwrap().min_schema, db::CORE_SCHEMA_VERSION);
         api.restore(&control.component("api").await.unwrap())
             .await
             .unwrap();
@@ -2683,22 +2703,272 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
     }
 }
 
+/// Historical desired rows omit `upgrade`. Migration keeps them queued; the
+/// next updater pass must refuse each one and later passes must leave it.
+#[tokio::test]
+async fn stale_schema_selections_without_upgrade_are_refused_once_after_migration() {
+    let root = std::env::temp_dir().join(format!(
+        "stale-schema-selection-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let next_bot = executable(&root, "next-bot").await;
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
+    db.with_conn({
+        let fixture = fixture.clone();
+        move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
+                 DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
+                 DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
+                 PRAGMA user_version=16;",
+                1024 * 1024,
+            )?;
+            for row in fixture["component_updates"].as_array().unwrap() {
+                for (column, value) in row.as_object().unwrap() {
+                    if column == "component" {
+                        continue;
+                    }
+                    let sql =
+                        format!("UPDATE component_updates SET {column}=?1 WHERE component=?2");
+                    let value = match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(value) => Some(value.clone()),
+                        value => Some(value.to_string()),
+                    };
+                    tx.execute_bounded(
+                        &sql,
+                        params![value, row["component"].as_str().unwrap()],
+                        64 * 1024,
+                    )?;
+                }
+            }
+            for (key, value) in fixture["meta"].as_object().unwrap() {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                db::write_meta_string_conn(&tx, key, &value)?;
+            }
+            tx.commit()
+        }
+    })
+    .await
+    .unwrap();
+    let raw_desired = db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let mut rows = Vec::new();
+            for role in ["bot", "api"] {
+                let raw: String = tx.query_row(
+                    "SELECT desired FROM component_updates WHERE component=?1",
+                    params![role],
+                    |row| Ok(row.get(0)?),
+                )?;
+                rows.push(raw);
+            }
+            tx.finish_read()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    for raw in &raw_desired {
+        let parsed: ComponentRelease = serde_json::from_str(raw).unwrap();
+        assert_ne!(serde_json::to_string(&parsed).unwrap(), *raw);
+        assert!(parsed.upgrade.is_none(), "{raw}");
+        assert_eq!(parsed.max_schema, 15, "{raw}");
+    }
+    drop(db);
+    let opts = DbOpenOptions {
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        read_only: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    assert_eq!(control.schema_version().await.unwrap(), 16);
+    let mut bot = controller(
+        "bot",
+        baked.clone(),
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    for role in ["bot", "api"] {
+        let contract = control
+            .baked_compatibility(role, &bot.base_sha, true)
+            .await
+            .unwrap();
+        assert_eq!(contract.core, db::CORE_SCHEMA_VERSION);
+        if role == "bot" {
+            bot.baked_compatibility = contract;
+        }
+    }
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    tokio::fs::write(root.join("hold-baked-bot-ready"), "")
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    assert!(bot.running.is_some());
+    let migrated = Db::open(&path, 2).unwrap();
+    assert_eq!(
+        control.schema_version().await.unwrap(),
+        db::CORE_SCHEMA_VERSION
+    );
+    api.tick().await.unwrap();
+    assert!(api.running.is_some());
+    tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bot.reported || !api.reported {
+        assert!(Instant::now() < deadline);
+        bot.report_ready().await.unwrap();
+        api.report_ready().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for role in ["bot", "api"] {
+        let queued = control.component(role).await.unwrap();
+        assert!(
+            queued.desired.is_some(),
+            "{role} queue cleared during migration"
+        );
+        assert_eq!(queued.state, "queued", "{role}");
+        assert!(queued.installed.is_none(), "{role}");
+    }
+    assert!(!bot.tick().await.unwrap());
+    assert!(!api.tick().await.unwrap());
+    let mut refused_at = Vec::new();
+    for role in ["bot", "api"] {
+        let row = control.component(role).await.unwrap();
+        assert!(
+            row.desired.is_none(),
+            "{role} selection was rechecked without settling"
+        );
+        assert_eq!(row.state, "failed", "{role}");
+        let error = row.last_error.unwrap();
+        assert!(
+            error.contains("candidate cannot open current database schema"),
+            "{role}: {error}"
+        );
+        refused_at.push(error);
+        assert!(row.installed.is_none(), "{role}");
+    }
+    let bot_pid = bot.running.as_ref().unwrap().child.id();
+    let api_pid = api.running.as_ref().unwrap().child.id();
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert!(api.running.as_ref().unwrap().release.is_none());
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(!api.tick().await.unwrap());
+    }
+    assert_eq!(bot.running.as_ref().unwrap().child.id(), bot_pid);
+    assert_eq!(api.running.as_ref().unwrap().child.id(), api_pid);
+    for (role, error) in ["bot", "api"].into_iter().zip(refused_at) {
+        let row = control.component(role).await.unwrap();
+        assert!(row.desired.is_none(), "{role}");
+        assert_eq!(row.state, "failed", "{role}");
+        assert_eq!(row.last_error.as_deref(), Some(error.as_str()), "{role}");
+    }
+
+    let mut objects = HashMap::new();
+    let bytes = tokio::fs::read(&next_bot).await.unwrap();
+    let mut release = image(&mut objects, "bot", &bytes);
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    bot.registry = registry;
+    control
+        .checked("bot", "latest", Some(release.clone()), None, now())
+        .await
+        .unwrap();
+    let install_db = Db::open(&path, 2).unwrap();
+    db::request_component_install(&install_db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    let apply_deadline = Instant::now() + Duration::from_secs(10);
+    while control
+        .component("bot")
+        .await
+        .unwrap()
+        .installed
+        .as_ref()
+        .map(|installed| &installed.digest)
+        != Some(&release.digest)
+    {
+        assert!(
+            Instant::now() < apply_deadline,
+            "compatible selection did not apply"
+        );
+        assert!(!bot.tick().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let applied = control.component("bot").await.unwrap();
+    assert_eq!(applied.state, "running");
+    assert_eq!(applied.installed.unwrap().digest, release.digest);
+    assert_eq!(applied.desired.unwrap().digest, release.digest);
+    assert!(applied.last_error.is_none());
+    assert_ne!(bot.running.as_ref().unwrap().child.id(), bot_pid);
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        release.digest
+    );
+    assert_eq!(api.running.as_ref().unwrap().child.id(), api_pid);
+    assert!(control.component("api").await.unwrap().desired.is_none());
+    bot.stop_application().await.unwrap();
+    api.stop_application().await.unwrap();
+    server.abort();
+    drop((api, bot, control, migrated, install_db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
 #[tokio::test]
 async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let root = std::env::temp_dir().join(format!("token-hold-{:032x}", rand::random::<u128>()));
+    // Exercise direct executable launch with characters that require shell quoting.
+    let root = std::env::temp_dir().join(format!(
+        "token-hold-quoted ' path-{:032x}",
+        rand::random::<u128>()
+    ));
     tokio::fs::create_dir_all(&root).await.unwrap();
-    let script = root.join("rejected-bot");
-    tokio::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nexit {}\n",
-            jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE
-        ),
-    )
-    .await
-    .unwrap();
-    tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+    // Let the child allocate and retain its socket, avoiding a reserve/drop/bind
+    // race before the handoff. Its published address configures both processes.
+    let child = executable(&root, "health-bot").await;
+    let bind_request = root.join("bind-health-health-bot");
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
         .await
         .unwrap();
     let opts = DbOpenOptions {
@@ -2714,26 +2984,72 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     let db = Db::open_with(opts.clone()).unwrap();
     let control = UpdateControl::open(&opts).unwrap().unwrap();
     let mut bot = offline_controller("bot", control, &root);
-    bot.baked = script.clone();
+    bot.baked = child.clone();
     bot.enabled = false;
-    // Reserve an ephemeral health socket; production uses the configured 8081.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-bot");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !bound.exists() {
+            assert!(
+                bot.running
+                    .as_mut()
+                    .unwrap()
+                    .child
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+                "child exited before binding the configured health address"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound the configured health address");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
     bot.health_bind = Some(addr.to_string());
-    bot.start(&script, &"b".repeat(40), None).await.unwrap();
-    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    // Retries must use the same concrete address, too.
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    bot.idle().await.unwrap();
+    assert!(
+        bot.health.is_none(),
+        "launcher must not listen while the child runs"
+    );
+    // Publish the complete code before its path releases the waiting child.
+    let exit_code = root.join("exit-code-health-bot");
+    let pending_exit = exit_code.with_extension("tmp");
+    tokio::fs::write(
+        &pending_exit,
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::rename(pending_exit, exit_code).await.unwrap();
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        bot.running.as_mut().unwrap().child.wait(),
+    )
+    .await
+    .expect("child did not exit after token rejection")
+    .unwrap();
+    assert_eq!(status.code(), Some(78));
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
-    assert!(
-        bot.report_ready().await.is_ok(),
-        "token rejection must hold rather than surface a restart error"
-    );
+    // Exactly one production poll must reap the child and bind the same socket.
+    assert!(!bot.tick().await.unwrap());
     assert!(bot.running.is_none());
-    for _ in 0..3 {
-        assert!(!bot.tick().await.unwrap());
-        assert!(bot.running.is_none(), "held bot must never be restored");
-    }
     for (path, expected) in [("/health", "HTTP/1.1 200"), ("/ready", "HTTP/1.1 503")] {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
@@ -2752,6 +3068,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         if path == "/ready" {
             assert!(response.contains("discord token rejected"), "{response}");
         }
+    }
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(bot.running.is_none(), "held bot must never be restored");
     }
     assert_eq!(
         *logs.lock().unwrap(),
@@ -2781,12 +3101,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         ]
     );
     // A ready retry child resumes normal behavior and resets the auth interval.
-    tokio::fs::write(
-        &script,
-        "#!/bin/sh\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 60\n",
-    )
-    .await
-    .unwrap();
+    tokio::fs::remove_file(bind_request).await.unwrap();
+    tokio::fs::remove_file(root.join("exit-code-health-bot"))
+        .await
+        .unwrap();
     bot.restart.auth_retry_at = Some(Instant::now());
     assert!(!bot.tick().await.unwrap());
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -3045,6 +3363,106 @@ async fn independent_non_auth_exit_before_readiness_still_rolls_back() {
         ["desired-bot.start", "installed-bot.start"]
     );
     bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_ready_update_clears_standby_before_later_exit() {
+    let root =
+        std::env::temp_dir().join(format!("independent-ready-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let installed = executable(&root, "installed-bot").await;
+    let desired = executable(&root, "desired-bot").await;
+    let mut objects = HashMap::new();
+    let mut releases = Vec::new();
+    for path in [installed, desired] {
+        let mut release = image(&mut objects, "bot", &tokio::fs::read(path).await.unwrap());
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+        releases.push(release);
+    }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    let installed_release = releases[0].clone();
+    control
+        .checked(
+            "bot",
+            "latest",
+            Some(installed_release.clone()),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &installed_release.digest, now())
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    let candidate = releases[1].clone();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("events"), "").await.unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert!(
+        bot.standby.is_none(),
+        "a ready independent update must retire the prior standby build"
+    );
+    assert_eq!(
+        bot.running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    bot.running.as_mut().unwrap().child.start_kill().unwrap();
+    let _ = bot.running.as_mut().unwrap().child.wait().await;
+    assert!(
+        bot.tick().await.is_err(),
+        "an unexpected child exit should surface as a tick error, not a standby rollback"
+    );
+    assert!(
+        bot.running.is_none(),
+        "a later exit must not restart the retired standby"
+    );
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        ["desired-bot.start"],
+        "must not roll back to the prior build after activation"
+    );
     bot.end_idle().await.unwrap();
     server.abort();
     drop((bot, db));

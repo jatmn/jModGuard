@@ -529,6 +529,11 @@ pub async fn record_baked_component_running(
     }).await
 }
 
+/// Compare the parsed release, then update the original stored text.
+/// Rows saved before upgrade metadata omit a null `upgrade`, which this
+/// serializer writes. An absent or different selection is already settled,
+/// including a clear saved before a lost reply. Database and JSON failures
+/// still surface.
 pub async fn record_component_failure(
     db: &Db,
     component: &str,
@@ -538,13 +543,30 @@ pub async fn record_component_failure(
     validate_component(component)?;
     anyhow::ensure!(failed.component == component, "failed component mismatch");
     let component = component.to_owned();
-    let failed = serde_json::to_string(failed)?;
+    let failed = failed.clone();
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute_rows(
-            "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?3 WHERE component=?1 AND desired=?2",
-            params![component, failed, error], 1,
+        let tx = conn.transaction_immediate()?;
+        let stored: Option<String> = tx.query_row(
+            "SELECT desired FROM component_updates WHERE component=?1",
+            params![component.clone()],
+            |row| Ok(row.get(0)?),
         )?;
+        let Some(stored) = stored else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let parsed: ComponentRelease = serde_json::from_str(&stored)?;
+        if parsed != failed {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_rows(
+            "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?3 WHERE component=?1 AND desired=?2",
+            params![component, stored, error],
+            1,
+        )?;
+        tx.commit()?;
         Ok(())
     })
     .await

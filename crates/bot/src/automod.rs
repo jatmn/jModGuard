@@ -451,7 +451,8 @@ pub(crate) async fn execute_pending_with(
     vars.insert("action".into(), rule.action.clone());
     vars.insert("strikes".into(), pending.strikes.to_string());
     vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
-    let reason = crate::templates::render(&rule.reason, &vars);
+    let rendered_reason = crate::templates::render(&rule.reason, &vars);
+    let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
     vars.insert("reason".into(), reason.clone());
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
@@ -858,6 +859,8 @@ pub(crate) async fn execute_pending_with(
                             } else {
                                 None
                             };
+                            let discord_reason =
+                                crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                             let operation_id = pending_ban.operation_id().to_owned();
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
@@ -871,7 +874,7 @@ pub(crate) async fn execute_pending_with(
                                     http,
                                     target.id,
                                     rule.delete_days,
-                                    &reason,
+                                    &discord_reason,
                                 ),
                             )
                             .await;
@@ -1040,6 +1043,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -1084,6 +1088,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: patterns.clone(),
@@ -1625,6 +1630,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -1888,6 +1894,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -2096,6 +2103,7 @@ mod tests {
         http: serenity::http::Http,
         cache: serenity::cache::Cache,
         lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ban_reasons: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         server: Option<std::thread::JoinHandle<()>>,
     }
@@ -2120,7 +2128,7 @@ mod tests {
             use std::sync::Arc;
             use std::sync::atomic::{AtomicBool, Ordering};
 
-            fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+            fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .ok()?;
@@ -2145,10 +2153,18 @@ mod tests {
                 let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
                 let header = String::from_utf8_lossy(&buf[..header_end]);
                 let mut parts = header.lines().next()?.split_whitespace();
-                Some((parts.next()?.to_string(), parts.next()?.to_string()))
+                let reason = header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case("x-audit-log-reason"))
+                    .map(|(_, value)| value.trim().to_owned())
+                    .unwrap_or_default();
+                Some((parts.next()?.to_string(), parts.next()?.to_string(), reason))
             }
 
             let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ban_reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let server_reasons = Arc::clone(&ban_reasons);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
@@ -2160,9 +2176,12 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nonblocking(false);
-                            let Some((method, path)) = read_request(&mut stream) else {
+                            let Some((method, path, reason)) = read_request(&mut stream) else {
                                 continue;
                             };
+                            if method == "PUT" && path.contains("/bans/") {
+                                server_reasons.lock().unwrap().push(reason);
+                            }
                             server_lines
                                 .lock()
                                 .unwrap()
@@ -2192,6 +2211,7 @@ mod tests {
                 http,
                 cache,
                 lines,
+                ban_reasons,
                 stop,
                 server: Some(server),
             }
@@ -2903,6 +2923,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -3073,6 +3094,9 @@ mod tests {
         app.tenant.activate(enrollment.clone()).await.unwrap();
         let mut rule = dry_run_word_ban();
         rule.dry_run = false;
+        rule.open_case = true;
+        let copied_tag = "0123456789abcdef0123";
+        rule.actions[0].reason = format!("[jmg:{copied_tag}] {}", "{username}".repeat(16));
         crate::db::upsert_rule(&app.db, 10, ID, &rule)
             .await
             .unwrap();
@@ -3086,7 +3110,7 @@ mod tests {
         assert_eq!(pending.action.action, "ban");
         let mut user = User::default();
         user.id = UserId::new(99);
-        user.name = "member".into();
+        user.name = "r".repeat(32);
         let stub = DiscordStub::start();
         execute_pending_with(
             &app,
@@ -3101,7 +3125,33 @@ mod tests {
             &pending,
         )
         .await;
+        let sent_reasons = stub.ban_reasons.clone();
         let seen = stub.finish();
+        let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let case = store
+            .case(scope, ids[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        let tag = case
+            .ban_attempt_tag
+            .as_ref()
+            .expect("persisted attempt identity");
+        assert_ne!(tag.as_str(), copied_tag);
+        assert_eq!(case.reason.as_deref(), Some("r".repeat(512).as_str()));
+        {
+            let sent = sent_reasons.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0],
+                format!("%5Bjmg%3A{}%5D%20{}", tag.as_str(), "r".repeat(485))
+            );
+        }
         assert!(
             seen.iter().any(|line| line.contains("/bans/")),
             "the custom-rule ban must be sent: {seen:?}"
@@ -3139,6 +3189,10 @@ mod tests {
             "the bot reason must be stored before the echo: {reason}"
         );
 
+        assert!(
+            !reason.contains("[jmg:"),
+            "core mirror must hide tags: {reason}"
+        );
         let suppressed =
             app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Ban, 10, 99);
         let echo_operation = app.gateway_ban_echo_operation(10, 99);
@@ -3155,6 +3209,7 @@ mod tests {
             None,
             owned_echo,
             echoed_operation.as_deref(),
+            true,
         )
         .await
         .unwrap();

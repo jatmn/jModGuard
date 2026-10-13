@@ -49,6 +49,11 @@ test("WebUI package has immutable references and both entry pages", () => {
     const css = fs.readFileSync(path.join(out, "assets", "releases", sha, "style.css"), "utf8");
     assert.doesNotMatch(css, /@import\b/);
     assert.match(css, /daisyUI/);
+    const projectLicense = fs.readFileSync(path.join(repo, "LICENSE.md"), "utf8");
+    for (const name of ["app.js", "administration.js", "style.css"]) {
+      const asset = fs.readFileSync(path.join(out, "assets", "releases", sha, name), "utf8");
+      assert.ok(asset.includes(projectLicense), name + " must include the complete project license");
+    }
     assert.throws(() => packageWebui(scratch, "bad"));
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });

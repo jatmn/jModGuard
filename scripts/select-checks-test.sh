@@ -4,7 +4,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
-selector="$root/.buildkite/select-checks.sh"
+selector="$root/scripts/select-checks.sh"
 
 fail() {
   echo "select-checks-test: $*" >&2
@@ -51,10 +51,9 @@ expect "contracts fmt api updater boundaries integration bootstrap publish-tests
 expect "contracts fmt dylint runtime boundaries core integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
+expect "contracts supply-chain" scripts/ci-ensure-cargo-tool.sh scripts/ci-preflight-test.sh
 expect "contracts supply-chain" \
   scripts/ci-cargo-log.sh \
-  scripts/ci-ensure-cargo-tool.sh \
-  scripts/ci-preflight-test.sh \
   scripts/ci-run-timed-cargo-test.sh \
   scripts/ci-timed-cargo-test.sh
 # Core consumers need coverage, but independent packages and shell fixtures do not.
@@ -82,13 +81,14 @@ for group in $core_omits; do
 done
 expect "$rust" vendor/tokio-tungstenite/src/lib.rs
 expect "$rust" Cargo.lock
-expect "$all" .buildkite/pipeline.yml
+expect "$all" .github/workflows/ci.yml
+expect "$all" .github/workflows/publish.yml
+expect "contracts frontend publish-tests supply-chain" LICENSE.md
 expect "$all" mystery.bin
-expect "contracts publish-tests supply-chain" .buildkite/publish-image.sh
+expect "contracts publish-tests supply-chain" scripts/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 
-# Exercise diff discovery and the generated pipeline with real local Git history.
-# A frontend commit followed by a core edit on one PR must select the union.
+# Exercise actual Git ranges, deletions/renames, and job selection.
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 git init -q --initial-branch=main "$scratch/repo"
@@ -96,115 +96,53 @@ git init -q --initial-branch=main "$scratch/repo"
   cd "$scratch/repo"
   git config user.name 'Selector test'
   git config user.email 'selector@example.invalid'
-  mkdir -p .buildkite src frontend
-  cp "$root/.buildkite/pipeline.steps.yml" .buildkite/
+  mkdir -p src frontend docs
   echo base >src/config.rs
   git add .
   git commit -qm base
-  git remote add origin .
+  base="$(git rev-parse HEAD)"
   git switch -qc test-pr
   echo frontend >frontend/app.js
   git add .
   git commit -qm frontend
   echo change >>src/config.rs
   git commit -qam core
-  BUILDKITE=false BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
-    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
-    bash "$selector" upload >"$scratch/pipeline.yml" 2>"$scratch/selection.log"
+  head="$(git rev-parse HEAD)"
+  # A later docs-only commit must not hide earlier code changes in the PR/push.
+  echo notes >docs/new.md
+  git add .
+  git commit -qm docs
+  export JMODGUARD_DIFF_BASE="$base" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)"
+  for event in pull_request push; do
+    GITHUB_EVENT_NAME="$event" GITHUB_REF_TYPE=branch bash "$selector" plan >"$scratch/$event"
+  done
+  # A deletion and rename must select both affected surfaces.
+  git rm -q frontend/app.js
+  git mv src/config.rs docs/moved.md
+  git commit -qm rename
+  JMODGUARD_DIFF_BASE="$head" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)" \
+    GITHUB_EVENT_NAME=pull_request bash "$selector" plan >"$scratch/rename"
+  # Proven empty PR changes are cheap; unavailable history is a full plan.
+  JMODGUARD_DIFF_BASE="$base" JMODGUARD_DIFF_HEAD="$base" GITHUB_EVENT_NAME=pull_request \
+    bash "$selector" plan >"$scratch/empty"
+  JMODGUARD_DIFF_BASE=0000000000000000000000000000000000000000 GITHUB_EVENT_NAME=push \
+    bash "$selector" plan >"$scratch/missing"
 )
-# Extract only enabled check keys, not the unchanged publication expressions.
-actual="$(awk '/^    key:/ { key = $2 } /^    if: "true"$/ { print key }' "$scratch/pipeline.yml" | sort)"
 expected="$(printf '%s\n' $core frontend | sort)"
-[ "$actual" = "$expected" ] || fail "PR upload selected unexpected check steps: $actual"
-grep -Fq 'PR diff origin/main...HEAD' "$scratch/selection.log" || fail 'missing diff diagnostic'
-grep -Fq 'select-checks: selected:' "$scratch/selection.log" || fail 'missing selected-group diagnostic'
-# Skipped keys must remain available to unchanged publication dependencies.
-for group in runtime bootstrap publish-tests; do
-  awk -v wanted="$group" '
-    /^    key:/ { key = $2 }
-    /^    if: "false"$/ && key == wanted { found = 1 }
-    END { exit !found }
-  ' "$scratch/pipeline.yml" || fail "$group not uploaded as skipped"
+for event in pull_request push rename; do
+  [[ "$(sort "$scratch/$event")" == "$expected" ]] || fail "$event omitted touched consumers"
 done
-sed -n '/  # group: publish$/,$p' "$root/.buildkite/pipeline.steps.yml" | sed '/^  # group: /d' >"$scratch/publish.expected"
-sed -n '/  - label: "prepare image publication"/,$p' "$scratch/pipeline.yml" >"$scratch/publish.actual"
-cmp "$scratch/publish.expected" "$scratch/publish.actual" || fail 'publication steps changed'
+[[ "$(cat "$scratch/empty")" == contracts ]] || fail 'proven empty diff should run contracts only'
+[[ "$(sort "$scratch/missing")" == "$(printf '%s\n' $all | sort)" ]] || fail 'missing history must run all'
+for event in schedule workflow_dispatch; do
+  [[ "$(GITHUB_EVENT_NAME="$event" bash "$selector" plan | sort)" == "$(printf '%s\n' $all | sort)" ]] || fail "$event must run all"
+done
+[[ "$(GITHUB_EVENT_NAME=push GITHUB_REF_TYPE=tag bash "$selector" plan | sort)" == "$(printf '%s\n' $all | sort)" ]] || fail 'tags must run all'
 
-schedule="$(BUILDKITE_SOURCE=schedule bash "$selector" plan)"
-if [ "$(printf '%s\n' "$schedule" | sort)" != "$(printf '%s\n' $all | sort)" ]; then
-  fail "schedule did not select every group"
-fi
-
-if ! bash "$selector" plan --files docs/INSTALL.md | grep -qx contracts; then
-  fail "docs plan was not only contracts"
-fi
-if bash "$selector" plan --files docs/INSTALL.md | grep -qx remote-database; then
-  fail "docs plan included remote-database"
-fi
-if bash "$selector" plan --files frontend/app.js | grep -Eq '^(bot|remote-database)$'; then
-  fail "frontend plan included an unrelated rust group"
-fi
-if ! bash "$selector" plan --files frontend/app.js | grep -qx api; then
-  fail "root frontend plan omitted api (embed-ui include_str)"
-fi
-if bash "$selector" plan --files crates/api/src/lib.rs | grep -Eq '^(frontend|bot|remote-database)$'; then
-  fail "api plan included an unrelated group"
-fi
-
-if ! grep -Fq 'bash .buildkite/select-checks-test.sh' "$root/scripts/ci-preflight.sh"; then
-  fail "ci-preflight does not run select-checks-test.sh"
-fi
-
-if ! grep -Fq 'BUILDKITE_STEP_KEY' "$root/.buildkite/with-cargo-auth.sh"; then
-  fail "with-cargo-auth must isolate CARGO_TARGET_DIR per Buildkite step"
-fi
-if ! grep -Fq "'\$GITHUB_TOKEN'" "$root/.buildkite/with-cargo-auth.sh"; then
-  fail "with-cargo-auth must treat the literal \$GITHUB_TOKEN placeholder as unset"
-fi
-if grep -Fq "'\$\$GITHUB_TOKEN'" "$root/.buildkite/with-cargo-auth.sh"; then
-  fail "with-cargo-auth must not match only the YAML-escaped placeholder"
-fi
-
-fetch_log="$(mktemp)"
-fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan 2>"$fetch_log" | wc -l)"
-if [ "$fetch_fail_count" -ne 16 ]; then
-  fail "fetch failure did not select every group (got ${fetch_fail_count})"
-fi
-grep -Fq 'select-checks: all groups: full validation requested or diff unavailable' "$fetch_log" \
-  || fail 'missing diff-unavailable reason'
-
-reason_log="$(mktemp)"
-bash "$selector" plan --files mystery.bin >/dev/null 2>"$reason_log"
-grep -Fq 'select-checks: all groups: unclassified path: mystery.bin' "$reason_log" \
-  || fail 'missing unclassified-path reason'
-bash "$selector" plan --files .buildkite/pipeline.yml >/dev/null 2>"$reason_log"
-grep -Fq 'select-checks: all groups: CI control changed: .buildkite/pipeline.yml' "$reason_log" \
-  || fail 'missing CI-control reason'
-
-git init -q --initial-branch=main "$scratch/empty"
-(
-  cd "$scratch/empty"
-  git config user.name 'Selector test'
-  git config user.email 'selector@example.invalid'
-  git commit -q --allow-empty -m base
-  git remote add origin .
-  git switch -qc empty-pr
-  git commit -q --allow-empty -m empty
-  BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
-    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
-    bash "$selector" plan >"$scratch/empty-plan" 2>"$scratch/empty.log"
-)
-grep -Fq 'select-checks: all groups: empty diff' "$scratch/empty.log" || fail 'missing empty-diff reason'
-empty_count="$(wc -l <"$scratch/empty-plan")"
-if [ "$empty_count" -ne 16 ]; then
-  fail "empty diff did not select every group (got ${empty_count})"
-fi
-
-# Scope the expensive lint compilation to selected Rust targets/consumers.
 expect_lint_packages() {
   local expected="$1" actual
   shift
-  actual="$(BUILDKITE=false bash "$selector" upload --files "$@" | sed -n 's/^      JMODGUARD_DYLINT_PACKAGES: "\(.*\)"$/\1/p')"
+  actual="$(bash "$selector" matrix --files "$@" | node -e '''let s="";process.stdin.on("data",x=>s+=x).on("end",()=>console.log(JSON.parse(s).include.find(j=>j.lane==="dylint")?.dylint_packages ?? ""))''')"
   [[ "$actual" == "$expected" ]] || fail "lint scope for $*: expected [$expected], got [$actual]"
 }
 expect_lint_packages 'jmodguard-api jmodguard-integration-tests' crates/api/src/lib.rs
@@ -215,4 +153,19 @@ expect_lint_packages 'jmodguard jmodguard-integration-tests' crates/integration-
 expect_lint_packages '' Cargo.lock
 expect_lint_packages '' dylint.toml crates/api/src/lib.rs
 expect_lint_packages '' mystery.bin
+bash "$selector" matrix --files docs/INSTALL.md >"$scratch/docs.json"
+bash "$selector" matrix --files src/db.rs >"$scratch/core.json"
+node --input-type=module - "$scratch" <<'JS'
+import fs from "node:fs";
+import assert from "node:assert/strict";
+const read = name => JSON.parse(fs.readFileSync(`${process.argv[2]}/${name}.json`));
+const docs = read("docs").include;
+assert.equal(docs.length, 1);
+assert.equal(docs[0].groups, "contracts");
+assert.equal(docs[0].rust, false);
+const core = read("core").include;
+assert.equal(core.filter(j => j.lane === "rust").length, 1);
+assert.equal(core.find(j => j.lane === "rust").groups, "api bot updater core integration boundaries");
+assert.equal(new Set(core.flatMap(j => j.groups.split(" "))).size, core.flatMap(j => j.groups.split(" ")).length);
+JS
 echo 'select-checks-test: ok'

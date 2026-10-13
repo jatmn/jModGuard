@@ -415,6 +415,8 @@ fn initialize_store(
         if version < 15 {
             tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
         }
+        // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
+        // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }

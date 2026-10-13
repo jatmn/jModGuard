@@ -193,6 +193,7 @@ async fn apply_control_rejects_live_create_without_row() {
         joined_at_ns: enrollment.joined_at_ns,
     };
     let op = ControlOp::UpsertRule {
+        clear_guild_override: false,
         request: wire.clone(),
         target: wire,
         id: id.clone(),
@@ -266,6 +267,8 @@ async fn full_custom_rule_copy_batches_inserts_and_preserves_replacement() {
     for i in 0..MAX_CUSTOM_RULES_PER_GUILD {
         let id = custom_id(i);
         let mut rule = custom_rule(true, &format!("scam{i}"));
+        // Large, valid allowlists expose a batch payload charged once per row.
+        rule.whitelist_users = (0..2_048).map(|n| 1_000_000_000_000_000_000 + n).collect();
         upsert_enrolled_rule(&f.db, write_scope(&source), &id, &rule)
             .await
             .unwrap();
@@ -322,7 +325,7 @@ async fn full_custom_rule_copy_batches_inserts_and_preserves_replacement() {
                 &replacement,
                 |sql, args, rows| {
                     inserts += 1;
-                    tx.execute_rows(sql, params_from_iter(args), rows)
+                    tx.execute_insert_batch(sql, params_from_iter(args), rows)
                 },
             )?;
             let stored: i64 =

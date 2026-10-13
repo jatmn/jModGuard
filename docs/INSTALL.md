@@ -1,8 +1,13 @@
 # Public installation
 
 Install from **this public repository** without the private ops repo; private
-operator automation is not required. The license is **PolyForm Noncommercial 1.0.0**
-(`LICENSE.md`). Bunny.net remains the first-class cloud path.
+operator automation is not required. jModGuard is source available under the
+**Apache License 2.0 with Commons Clause 1.0**. Personal use, internal business use,
+and a business's own free Discord community are allowed. Resale and paid offerings
+whose value derives entirely or substantially from jModGuard require a separate
+written license from jatmn. See [LICENSE.md](../LICENSE.md) for the complete terms
+and the [license summary](../README.md#license). Bunny.net remains the first-class
+cloud path.
 
 ## Choose a topology
 
@@ -22,10 +27,10 @@ Use a source commit or verified image digest:
 - WebUI files: `dist/frontend/index.html`, `dist/frontend/app.js`, `dist/frontend/style.css`,
   `dist/frontend/administration/index.html`, `dist/frontend/administration.js`
 
-Buildkite publishes changed images on main. Manual commit-SHA builds publish all
+GitHub Actions publishes changed images on main. Manual commit-SHA builds publish all
 eligible components; WebUI is skipped for source revisions predating that package.
 Stable tags and scheduled Nightlies use the image channels in [RELEASES.md](RELEASES.md).
-Buildkite does not upload WebUI files to Bunny Storage. Publish from source or the
+GitHub Actions does not upload WebUI files to Bunny Storage. Publish from source or the
 WebUI image using the [WebUI guide](WEBUI.md). Build the source assets with the locked npm dependencies first; daisyUI and
 Headless UI are bundled into the existing CSS/JS files, with no runtime CDN dependency.
 

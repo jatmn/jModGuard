@@ -249,6 +249,13 @@ pub(crate) struct ApplicationAttempt {
     enrollment: db::GuildEnrollment,
 }
 
+pub(crate) fn ban_dispatch_reason(reason: &str, attempt: Option<&ApplicationAttempt>) -> String {
+    jmodguard::ban_reason::discord_reason(
+        reason,
+        attempt.and_then(|a| a.data.ban_attempt_tag.as_ref()),
+    )
+}
+
 impl ApplicationAttempt {
     /// Record the original payload if the pre-ban insert was not confirmed, then settle it.
     pub(crate) async fn finish(self, app: &BotState, outcome: CaseOutcome) -> Option<CaseId> {
@@ -296,6 +303,8 @@ pub(crate) async fn begin_application_attempt(
         return None;
     }
     let data = CaseData {
+        ban_attempt_tag: (action == CaseAction::Ban)
+            .then(jmodguard::ban_reason::BanAttemptTag::new),
         source: CaseSource::Application { operation_id },
         action,
         outcome: CaseOutcome::Attempted,
@@ -304,7 +313,7 @@ pub(crate) async fn begin_application_attempt(
             .and_then(|id| i64::try_from(id).ok())
             .filter(|id| *id > 0),
         occurred_at_ms,
-        reason,
+        reason: reason.map(|reason| jmodguard::ban_reason::without_tag(&reason).to_owned()),
         evidence,
     };
     let recorded = tokio::time::timeout(
@@ -359,7 +368,7 @@ pub(crate) async fn settle_application_attempt(
 }
 
 /// Settle the one attempted application ban that matches the ban Discord shows.
-/// No reason match leaves every attempt attempted.
+/// No tag match leaves every attempt attempted.
 pub(crate) async fn settle_present_application_ban(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
@@ -374,7 +383,7 @@ pub(crate) async fn settle_present_application_ban(
         tracing::warn!(
             guild_id = enrollment.guild_id,
             subject,
-            "present ban reason does not match an attempted application case"
+            "present ban tag does not match an attempted application case"
         );
         return;
     };
@@ -390,7 +399,7 @@ pub(crate) async fn settle_present_application_ban(
             tracing::warn!(
                 guild_id = enrollment.guild_id,
                 subject,
-                "present ban reason does not match an attempted application case"
+                "present ban tag does not match an attempted application case"
             );
         }
         Ok(settled) => {
@@ -459,6 +468,7 @@ pub async fn record(
         return None;
     }
     let data = CaseData {
+        ban_attempt_tag: None,
         source,
         action,
         outcome,
@@ -794,6 +804,7 @@ mod tests {
         await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 77).await;
         let operation_id = CaseId::new();
         let data = CaseData {
+            ban_attempt_tag: None,
             source: CaseSource::Application {
                 operation_id: operation_id.clone(),
             },
@@ -906,6 +917,7 @@ mod tests {
         await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 77).await;
         let operation_id = CaseId::new();
         let data = CaseData {
+            ban_attempt_tag: None,
             source: CaseSource::Application {
                 operation_id: operation_id.clone(),
             },
@@ -1240,7 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn command_record_only_settles_the_attempted_ban_after_the_lease_moves() {
         let (path, original, successor, enrollment) = open_pair().await;
-        let case_id = begin_application_attempt(
+        let attempt = begin_application_attempt(
             &original,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -1251,9 +1263,9 @@ mod tests {
             CaseId::new(),
         )
         .await
-        .unwrap()
-        .case_id
         .unwrap();
+        let discord_reason = super::ban_dispatch_reason("raid", Some(&attempt));
+        let case_id = attempt.case_id.unwrap();
         claim(
             &successor,
             jmodguard::control::now_ms().saturating_add(21_000),
@@ -1284,7 +1296,7 @@ mod tests {
                 42,
                 "mod",
                 "raid",
-                Some("raid"),
+                Some(&discord_reason),
             )
             .await
             .unwrap()
@@ -1312,7 +1324,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000,
             text: "buy this".into(),
         }]);
-        let case_id = begin_application_attempt(
+        let attempt = begin_application_attempt(
             &original,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -1323,9 +1335,9 @@ mod tests {
             CaseId::new(),
         )
         .await
-        .unwrap()
-        .case_id
         .unwrap();
+        let discord_reason = super::ban_dispatch_reason("spam wave", Some(&attempt));
+        let case_id = attempt.case_id.unwrap();
         claim(
             &successor,
             jmodguard::control::now_ms().saturating_add(21_000),
@@ -1348,7 +1360,7 @@ mod tests {
                 99,
                 "image-spam",
                 "spam wave",
-                Some("spam wave"),
+                Some(&discord_reason),
             )
             .await
         );
@@ -1373,7 +1385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_discord_reason_settles_only_the_dispatched_attempt() {
+    async fn matching_tag_settles_only_its_attempt_even_when_reason_and_observation_repeat() {
         let path =
             std::env::temp_dir().join(format!("ban_match_{:032x}.db", rand::random::<u128>()));
         let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
@@ -1388,14 +1400,14 @@ mod tests {
             CaseAction::Ban,
             99,
             Some(42),
-            Some("abandoned before dispatch".into()),
+            Some("raid wave".into()),
             CaseEvidence::Unavailable,
             abandoned.clone(),
         )
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        begin_application_attempt(
+        let attempt = begin_application_attempt(
             &app,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -1407,7 +1419,11 @@ mod tests {
         )
         .await
         .unwrap();
-        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some("raid wave")).await;
+        let discord_reason = super::ban_dispatch_reason("raid wave", Some(&attempt));
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some(&discord_reason))
+            .await;
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some(&discord_reason))
+            .await;
         let cases = stored_cases(&app, enrollment).await;
         assert_eq!(cases.len(), 2);
         let older = cases
@@ -1447,6 +1463,18 @@ mod tests {
         .unwrap();
         settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some("manual ban"))
             .await;
+        settle_present_application_ban(
+            &app,
+            Some(enrollment.clone()),
+            99,
+            Some("abandoned before dispatch"),
+        )
+        .await;
+        let unmatched = jmodguard::ban_reason::discord_reason(
+            "abandoned before dispatch",
+            Some(&jmodguard::ban_reason::BanAttemptTag::new()),
+        );
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some(&unmatched)).await;
         settle_present_application_ban(&app, Some(enrollment.clone()), 99, None).await;
         let cases = stored_cases(&app, enrollment).await;
         assert_eq!(cases.len(), 1);
@@ -1463,7 +1491,7 @@ mod tests {
     async fn already_finished_successor_settles_the_attempt_without_a_second_mirror() {
         let (path, original, successor, enrollment) = open_pair().await;
         let operation = CaseId::new();
-        begin_application_attempt(
+        let attempt = begin_application_attempt(
             &original,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -1475,6 +1503,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let discord_reason = super::ban_dispatch_reason("spam wave", Some(&attempt));
         assert!(
             db::record_enrolled_ban_if_absent(
                 &original.db,
@@ -1499,8 +1528,13 @@ mod tests {
             jmodguard::control::now_ms().saturating_add(21_000),
         )
         .await;
-        settle_present_application_ban(&successor, Some(enrollment.clone()), 99, Some("spam wave"))
-            .await;
+        settle_present_application_ban(
+            &successor,
+            Some(enrollment.clone()),
+            99,
+            Some(&discord_reason),
+        )
+        .await;
         let cases = stored_cases(&successor, enrollment.clone()).await;
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].outcome, CaseOutcome::Succeeded);

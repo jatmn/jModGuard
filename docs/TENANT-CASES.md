@@ -102,7 +102,7 @@ it to6, preserving placement, settings and cases. Version4 adds owned history; v
 source mappings with original-key backfill. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
 applies all six steps.
 `open` requires 9. Older guild-store binaries reject 9; rollback needs matching pre-upgrade
-backups and binaries. Core is at migration 0018. Bot and API open these stores through
+backups and binaries. Core is at migration 0019. Bot and API open these stores through
 [tenant runtime](TENANT-RUNTIME.md).
 
 Local regressions cover scoped persistence/paging, source conflicts/concurrent retries,
@@ -112,3 +112,19 @@ libSQL tests cover lost responses for record/removal/purge and cross-handle visi
 No live Bunny/Discord tests or measured RSS/billing is supplied. Runtime routing, selected
 case recording, authorized serving and live guild erasure are described in
 [tenant runtime](TENANT-RUNTIME.md).
+
+## Ban attempt recovery (guild schema 16)
+
+Before a bot ban, the bounded attempted-case save includes a random 80-bit tag
+independent of the case and operation IDs. The existing no-edit trigger protects
+that tag with the original facts. Discord receives `[jmg:<tag>] reason`, truncated
+to 512 characters including the prefix. Recovery matches only the tag and subject
+in the captured membership; repeated observations cannot settle older attempts
+with the same human reason. Legacy cases without tags remain unsettled.
+
+Tags are storage-only metadata, omitted from case API JSON. Discord imports and
+logs strip these prefixes, and copied-back reasons are stripped before a fresh
+attempt is encoded. A timed-out case save still follows the existing ban-first
+policy: any late insert or post-dispatch retry keeps the same original tag.
+Version 16 changes case payload compatibility only, with no table change or rewrite
+of old cases. Update bot and API images together; older readers reject this version.

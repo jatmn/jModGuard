@@ -39,7 +39,7 @@ async fn control_value<T: serde::de::DeserializeOwned>(
         crate::db::ControlReply::Saved { body } | crate::db::ControlReply::Unchanged { body } => {
             body
         }
-        crate::db::ControlReply::Failed { message } => anyhow::bail!(message),
+        crate::db::ControlReply::Failed { message, .. } => anyhow::bail!(message),
         crate::db::ControlReply::Waiting => anyhow::bail!(jmodguard::control::NOT_THE_WRITER),
         crate::db::ControlReply::Busy => {
             anyhow::bail!(jmodguard::control::CONTROL_LINK_UNAVAILABLE)

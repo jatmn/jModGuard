@@ -29,7 +29,7 @@ npm run build --prefix tools/webui
 ```
 
 Rebuild after editing `frontend/` or `tools/webui/`. Output is in
-`dist/frontend/`, ignored by Git. Buildkite runs these steps before checks and
+`dist/frontend/`, ignored by Git. GitHub Actions runs these steps before checks and
 release packaging. The bot and API `--no-default-features` builds need no WebUI build.
 Do not upload the unbuilt `frontend/` sources.
 
@@ -43,7 +43,7 @@ The five generated files are:
 | `dist/frontend/administration/index.html` | owner Administration and Updates page |
 | `dist/frontend/administration.js` | update controls and version display |
 
-Buildkite also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
+GitHub Actions also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
 
 The dependency audit keeps the libraries that supply existing behavior:
@@ -133,7 +133,7 @@ serves them at `http://localhost:8080`.
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
 
-For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. Buildkite publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
+For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. GitHub Actions publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
 `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
 `BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
@@ -205,10 +205,10 @@ receipt automatically; the queued badge does not claim bot validation has comple
 Drafts remain in memory only and are discarded when
 you confirm leaving the workspace.
 
-A Global rule save writes the global rule before clearing the current server's
-override. If that second request fails, the workspace refreshes the saved state
-and reports the partial result; if the refresh also fails, use **Retry**. Closing
-the editor does not undo an acknowledged global write.
+A Global rule save writes the global rule and clears the current server's override
+in one transaction. Retrying an unresolved save retrieves its acknowledgement;
+the workspace then refreshes current configuration. If that refresh fails, use
+**Retry**. Closing the editor does not undo an acknowledged global write.
 
 ## Tabs
 
@@ -352,6 +352,14 @@ bot owner).
   publicly only behind HTTPS (see SETUP.md §8). On Bunny, API-path edge
   rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
   see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+
+### Known-bad images
+
+Known-bad images are managed per server under **Known-bad images**. Search by
+hash or note; add a confirmed SHA-256 digest and optional safe label, or remove it.
+Saves require Manage Server permission and an online bot writer. See
+[exact-image detection](IMAGE-SPAM.md#known-bad-image-management) for first-post
+matching, dry-run/enforcement behavior and hash-only retention.
 
 ### Appearance
 

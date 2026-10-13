@@ -863,6 +863,18 @@ pub trait SqlExecutor {
 
     fn record_config_version(&self, version: u64);
 
+    /// Shared identity memo for this executor's connection.
+    ///
+    /// The memo type is available through the public database facade:
+    ///
+    /// ```
+    /// use jmodguard::db::{SchemaVerification, SqlExecutor};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// fn verification_slot(executor: &impl SqlExecutor) -> Arc<Mutex<Option<SchemaVerification>>> {
+    ///     executor.schema_verification_slot()
+    /// }
+    /// ```
     fn schema_verification_slot(&self) -> Arc<Mutex<Option<SchemaVerification>>>;
 }
 
@@ -995,6 +1007,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_enrollments"
                     | "guild_store_catalog"
                     | "log_filters"
+                    | "known_bad_images"
                     | "guild_case_evidence"
                     | "guild_case_history"
                     | "guild_case_sources"

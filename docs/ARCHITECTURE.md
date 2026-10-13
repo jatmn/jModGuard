@@ -177,13 +177,13 @@ Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for im
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
 batch cleanup. Bot and API now record selected outcomes and serve authorized case/evidence
 administration; see [tenant runtime](TENANT-RUNTIME.md). The bot captures proving
-Discord attachments for selected image-spam enforcement through that runtime; the API
-serves authorized journal-available objects and does not perform that Discord re-fetch.
+Exact-image spam retains hash-only evidence; the API serves authorized journal-available
+objects and does not perform that Discord re-fetch.
 
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0018. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0019. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
@@ -195,7 +195,8 @@ stores component-update coordination. Migration 0016 adds the per-bot shared
 [member-sync request gate](MEMBERS.md), preserving minimum request intervals and
 rate-limit delays across guilds and worker restarts. Migration 0017 adds indexes for
 ordered guild event/ban pages and expiring bot actions. Migration 0018 keeps
-one active ban row per guild and user. Bot/API startup
+one active ban row per guild and user. Migration 0019 stores guild-local
+known-bad image digests. Bot/API startup
 opens [tenant runtime](TENANT-RUNTIME.md) against that catalog. Unban/log-channel WebUI
 operations now use API admission and bot dispatch.
 
@@ -233,7 +234,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness and /ready readiness (in-memory; bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless bundled at build time, not vendored)
-migrations/                0001_init through 0018_one_active_ban
+migrations/                0001_init through 0019_known_bad_images
 Dockerfile.bot
 Dockerfile.api
 ```

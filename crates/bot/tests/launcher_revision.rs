@@ -90,7 +90,7 @@ fn get(addr: &str, path: &str) -> String {
     use std::io::{ErrorKind, Write};
     // Under parallel test load the health listener can reset or close a
     // just-accepted connection (BrokenPipe on write, ConnectionReset), as in
-    // Buildkite 697/715. Retry only those two errors, at most 3 attempts.
+    // CI runs 697/715. Retry only those two errors, at most 3 attempts.
     // Anything else (connection refused, other I/O errors) panics at once and
     // any response, even an empty one, is returned unchanged, so a child that
     // really died still fails the test.
@@ -104,7 +104,7 @@ fn get(addr: &str, path: &str) -> String {
                 "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
             )?;
             let mut body = String::new();
-            let _ = stream.read_to_string(&mut body);
+            stream.read_to_string(&mut body)?;
             Ok(body)
         })();
         match result {

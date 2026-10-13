@@ -63,6 +63,24 @@ pub(super) trait BoundedWrites: SqlExecutor {
         self.execute_bounded(sql, params, growth)
     }
 
+    /// Audited INSERT VALUES batches use each bound value once, across all rows.
+    /// Keep the ordinary per-row overhead without repeating the batch payload.
+    fn execute_insert_batch(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send,
+        rows: u64,
+    ) -> Result<usize> {
+        let params = params.into_params()?;
+        let mut growth = core_row_bound(self, sql, &params, 1)?;
+        if rows > 1 {
+            growth = growth
+                .checked_add(core_row_bound(self, "", &Params::None, rows - 1)?)
+                .ok_or_else(|| anyhow::anyhow!("database growth bound overflow"))?;
+        }
+        self.execute_bounded(sql, params, growth)
+    }
+
     fn query_row_write<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
     where
         T: Send,

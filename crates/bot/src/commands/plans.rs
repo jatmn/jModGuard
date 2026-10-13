@@ -393,6 +393,8 @@ async fn run_step(
                         }
                         Err(_) => None,
                     };
+                    let discord_reason =
+                        crate::cases::ban_dispatch_reason("custom command", attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
@@ -406,7 +408,7 @@ async fn run_step(
                             &env.ctx.http,
                             target,
                             *delete_days,
-                            "custom command",
+                            &discord_reason,
                         ),
                     )
                     .await

@@ -325,6 +325,83 @@ impl Fixture {
             path,
         }
     }
+    async fn attach_save_writer(&mut self) -> Arc<jmodguard_bot::state::BotState> {
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = self.path.clone();
+        cfg.bot.owner_id = 42;
+        cfg.bot.control_bind = "127.0.0.1:0".into();
+        cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+        let bot = jmodguard_bot::state::BotState::new(cfg, self.app.db.clone()).unwrap();
+        bot.install_control_actor_lookup(|actor, _| {
+            (actor == 42).then_some(db::CachedGuildActor {
+                guild_owner_id: 42,
+                permissions: 1 << 5,
+            })
+        });
+        bot.activation.mark_lock_held(true);
+        assert!(
+            db::claim_active_bot(
+                &bot.db,
+                bot.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        let target = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+            .unwrap()
+            .unwrap();
+        self.use_writer_link(target);
+        bot
+    }
+    async fn request_save(
+        &self,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+        save: (&str, bool),
+        enrollment: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("cookie", &self.cookie)
+                    .header("content-type", "application/json")
+                    .header("x-jmodguard-enrollment", enrollment)
+                    .header("x-jmodguard-save", save.0)
+                    .header("x-jmodguard-save-lookup", if save.1 { "1" } else { "0" })
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn use_writer_link(&mut self, target: std::net::SocketAddr) {
+        let mut cfg = (*self.app.cfg).clone();
+        cfg.db.path = self.path.clone();
+        cfg.bot.control_target = target.to_string();
+        cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+        let db = db::Db::open_with(cfg.db_open_options()).unwrap();
+        assert!(db.is_read_only());
+        let mut app = ApiState::new(cfg, db).unwrap();
+        let oauth = Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth).unwrap();
+        oauth.guilds_endpoint = self.app.oauth.guilds_endpoint.clone();
+        oauth.token_endpoint = self.app.oauth.token_endpoint.clone();
+        oauth.me_endpoint = self.app.oauth.me_endpoint.clone();
+        tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
+        self.router = router_with_store(Arc::clone(&app), self.store.clone());
+        self.app = app;
+    }
     async fn request(
         &self,
         method: &str,
@@ -1982,6 +2059,321 @@ async fn action_requests_require_ids_reject_forged_authority_and_report_expiry()
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn action_key_errors_survive_the_bot_control_link() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let mut cfg = crate::config::BotProcessConfig::default();
+    cfg.db.path = f.path.clone();
+    cfg.bot.control_bind = "127.0.0.1:0".into();
+    cfg.bot.control_secret = crate::config::ControlSecret::new("x".repeat(32));
+    let bot = jmodguard_bot::state::BotState::new(cfg, f.app.db.clone()).unwrap();
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let target = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .unwrap();
+    f.use_writer_link(target);
+    for (key, status, code) in [
+        (
+            format!("{}_old", chrono::Utc::now().timestamp() - 10 * 86400),
+            StatusCode::GONE,
+            "action_request_expired",
+        ),
+        (
+            "invalid".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "action_request_invalid",
+        ),
+    ] {
+        let (actual, body) = f
+            .request(
+                "POST",
+                "/api/guilds/10/unban",
+                &serde_json::json!({"request_id":key,"user_id":"99"}).to_string(),
+            )
+            .await;
+        assert_eq!(actual, status, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+    }
+    assert!(
+        db::recent_bot_actions(&bot.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_global_rule_save_cannot_clear_a_newer_override() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    let rule: crate::types::RuleDef = serde_json::from_value(
+        serde_json::json!({"name":"original", "description":"", "enabled":false}),
+    )
+    .unwrap();
+    db::upsert_rule(&bot.db, 10, "mention_spam", &rule)
+        .await
+        .unwrap();
+    let path = "/api/guilds/10/rules/mention_spam";
+    let id = "b".repeat(64);
+    let body = serde_json::json!({"scope":"global", "data":rule, "clear_guild_override":true});
+    let (status, saved) = f
+        .request_save("PUT", path, &body, (&id, false), &enrollment.id)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert!(
+        db::get_rule(&bot.db, 10, "mention_spam")
+            .await
+            .unwrap()
+            .is_none(),
+        "the complete save clears the original override"
+    );
+    assert_eq!(
+        db::get_rule(&bot.db, 0, "mention_spam")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "original"
+    );
+    let mut newer = rule.clone();
+    newer.name = "newer override".into();
+    newer.enabled = true;
+    db::upsert_rule(&bot.db, 10, "mention_spam", &newer)
+        .await
+        .unwrap();
+    // Discarding the first acknowledgement models the browser losing it.
+    let (status, recovered) = f
+        .request_save("PUT", path, &body, (&id, true), &enrollment.id)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recovered, saved);
+    assert_eq!(
+        db::get_rule(&bot.db, 10, "mention_spam")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "newer override"
+    );
+    // Legacy global-only PUT must preserve that override too.
+    let legacy = serde_json::json!({"scope":"global", "data":rule});
+    assert_eq!(
+        f.request_save(
+            "PUT",
+            path,
+            &legacy,
+            (&"c".repeat(64), false),
+            &enrollment.id
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        db::get_rule(&bot.db, 10, "mention_spam")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "newer override"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_save_receipt_permits_a_fresh_explicit_attempt() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    let hold = bot.activation.hold_rule();
+    let id = "d".repeat(64);
+    let body = serde_json::json!({"scope":"guild", "pattern":"after-expiry"});
+    let path = "/api/guilds/10/badwords";
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        f.request_save("POST", path, &body, (&id, false), &enrollment.id)
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::sleep_until(
+        started
+            + std::time::Duration::from_millis(
+                jmodguard::control::CONTROL_REQUEST_LIFETIME_MS as u64 + 100,
+            ),
+    )
+    .await;
+    drop(hold);
+    let (status, rejection) = loop {
+        let reply = f
+            .request_save("POST", path, &body, (&id, true), &enrollment.id)
+            .await;
+        if reply.0 != StatusCode::ACCEPTED {
+            break reply;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(18));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(status, StatusCode::CONFLICT, "{rejection}");
+    assert_eq!(rejection["code"], "save_expired");
+    assert!(db::list_badwords(&bot.db, 10).await.unwrap().is_empty());
+    assert_eq!(
+        f.request_save("POST", path, &body, (&id, true), &enrollment.id)
+            .await
+            .1,
+        rejection
+    );
+    assert_eq!(
+        f.request_save(
+            "POST",
+            path,
+            &body,
+            (&"e".repeat(64), false),
+            &enrollment.id
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(db::list_badwords(&bot.db, 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_save_is_pending_then_retrievable_without_another_insert() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    let id = "a".repeat(64);
+    let request = |lookup: bool, pattern: &str| {
+        f.router.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/guilds/10/badwords")
+                .header("cookie", &f.cookie)
+                .header("content-type", "application/json")
+                .header("x-jmodguard-enrollment", &enrollment.id)
+                .header("x-jmodguard-save", &id)
+                .header("x-jmodguard-save-lookup", if lookup { "1" } else { "0" })
+                .body(Body::from(
+                    serde_json::json!({"scope":"guild","pattern":pattern}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let hold = bot.activation.hold_rule();
+    let pending = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        request(false, "retry-once"),
+    )
+    .await;
+    drop(hold);
+    let pending = pending
+        .expect("accepted save must return pending before moderation completes")
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(pending.into_body(), 4096)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(pending["code"], "save_pending");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let saved = loop {
+        let response = request(true, "retry-once").await.unwrap();
+        if response.status() != StatusCode::ACCEPTED {
+            break response;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(saved.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(saved.into_body(), 4096).await.unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // A lost final response can be fetched again with the same identity.
+    let replay = request(true, "retry-once").await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(replay.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        saved
+    );
+    let changed = request(true, "different-payload").await.unwrap();
+    assert_eq!(changed.status(), StatusCode::CONFLICT);
+    let words = db::list_badwords(&bot.db, 10).await.unwrap();
+    assert_eq!(words.len(), 1);
+    assert_eq!(words[0].pattern, "retry-once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_errors_from_legacy_or_future_control_peers_stay_generic() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.use_writer_link(listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        for code in [None, Some("future_action_error")] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap();
+            let mut request = vec![0; length as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            let (op, _, _, _) = jmodguard::control::open_frame(
+                &"x".repeat(32).into_bytes(),
+                &request,
+                &std::sync::Mutex::new(jmodguard::control::NonceWindow::new()),
+            )
+            .unwrap();
+            assert!(matches!(op, db::ControlOp::EnqueueBotAction { .. }));
+            // This is the old wire shape, not serialization of the new reply type.
+            // Recognizable text must not substitute for a known error code.
+            let mut reply = serde_json::json!({
+                "status":"failed",
+                "message":"Server membership changed. Reload before making a new request.",
+            });
+            if let Some(code) = code {
+                reply["code"] = code.into();
+            }
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    for _ in 0..2 {
+        let (status, body) = f
+            .request(
+                "POST",
+                "/api/guilds/10/unban",
+                &serde_json::json!({"request_id":action_key("compat"),"user_id":"99"}).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.get("code").is_none(), "{body}");
+        assert_eq!(
+            body["error"],
+            "Could not queue action. Check pending actions and retry using the same request ID."
+        );
+    }
+    peer.await.unwrap();
+}
+
 #[tokio::test]
 async fn moderation_pages_require_loaded_membership_and_current_permissions() {
     let f = Fixture::new(true).await;
@@ -2138,7 +2530,7 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
         db::upsert_command(&f.app.db, guild, "fixture", &command)
             .await
             .unwrap();
-        db::upsert_log_channel(&f.app.db, guild, "fixture", 1329331947876479006 + guild)
+        db::upsert_log_channel(&f.app.db, guild, "fixture", 9_007_199_254_740_993 + guild)
             .await
             .unwrap();
         db::add_badword(&f.app.db, guild, label, None)
@@ -2166,14 +2558,14 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
     let (_, channels) = f.request("GET", "/api/guilds/10/logchannels", "").await;
     assert_eq!(
         channels,
-        serde_json::json!({"guild":[{"event":"fixture","channel_id":"1329331947876479016"}],"global":[]})
+        serde_json::json!({"guild":[{"event":"fixture","channel_id":"9007199254741003"}],"global":[]})
     );
     let (_, channel) = f
         .request("GET", "/api/guilds/10/logchannels/fixture", "")
         .await;
     assert_eq!(
         channel,
-        serde_json::json!({"effective":"1329331947876479016","guild_override":"1329331947876479016","global":null})
+        serde_json::json!({"effective":"9007199254741003","guild_override":"9007199254741003","global":null})
     );
     let (_, absent) = f
         .request("GET", "/api/guilds/10/logchannels/absent", "")
@@ -2263,15 +2655,17 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     let right = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
     f.app.tenant.activate(left.clone()).await.unwrap().unwrap();
     f.app.tenant.activate(right.clone()).await.unwrap().unwrap();
+    let tag = jmodguard::ban_reason::BanAttemptTag::new();
     f.app
         .tenant
         .record_selected_case(
             left.clone(),
             CaseData {
+                ban_attempt_tag: Some(tag.clone()),
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
-                action: CaseAction::Warning,
+                action: CaseAction::Ban,
                 outcome: CaseOutcome::Succeeded,
                 subject_id: 1,
                 actor_id: None,
@@ -2291,6 +2685,13 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(status, StatusCode::OK, "{other}");
     assert!(other["cases"].as_array().unwrap().is_empty());
     let id = ids[0].as_str().unwrap();
+    let (status, detail) = f
+        .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["case"]["reason"], "secret");
+    assert!(detail["case"].get("ban_attempt_tag").is_none());
+    assert!(!detail.to_string().contains(tag.as_str()));
     let note_url = format!("/api/guilds/10/cases/{id}/history");
     let note = serde_json::json!({"entry_id":"a".repeat(32),"text":"one intent"}).to_string();
     let (status, first) = f.request("POST", &note_url, &note).await;
@@ -2337,6 +2738,7 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
         .record_selected_case(
             enrollment.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -2419,6 +2821,7 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
         .record_selected_case(
             enrollment.clone(),
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -2529,6 +2932,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .record_selected_case(
             e,
             CaseData {
+                ban_attempt_tag: None,
                 source: CaseSource::Application {
                     operation_id: CaseId::new(),
                 },
@@ -3520,12 +3924,12 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     // Refresh holds this exact mutex across token recovery. A sweep must not
     // replace its owner, even when its recorded activity has expired.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     drop(refreshing);
     // A loaded request queued on this Arc must also retain the same owner.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(Arc::ptr_eq(
         f.app.auth_sessions.get(&id).unwrap().value(),
         &entry
@@ -3533,7 +3937,7 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     let old_owner = Arc::downgrade(&entry);
     drop(entry);
     // The preceding sweep is rate-limited, even though the entry is now idle.
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     allow_coordinator_sweep(&f.app);
     // Exercise the production sweep trigger, then recreate from the live store.
@@ -3556,7 +3960,7 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     drop(entry);
     session.delete().await.unwrap();
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.is_empty());
 }
 
@@ -3590,7 +3994,7 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     assert_coordinator_payload_released(&entry).await;
     drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.contains_key(&id));
     let calls = f.discord.token_calls.load(Ordering::SeqCst);
     assert!(
@@ -3610,24 +4014,23 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     );
     drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(std::time::Instant::now());
     assert!(f.app.auth_sessions.is_empty());
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     // Tombstone retirement metadata is independent of the 30-second payload marker.
-    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL - std::time::Duration::from_secs(1))
-        .unwrap();
+    // Advance the sweep time instead of subtracting days from Instant::now():
+    // a host with short uptime may not represent those past instants.
+    let retired_at = *f.app.retired_auth_sessions.get(&id).unwrap();
+    let expires_at = retired_at + AUTH_SESSION_TOMBSTONE_TTL;
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app
+        .sweep_auth_sessions(expires_at - std::time::Duration::from_secs(1));
     assert!(f.app.retired_auth_sessions.contains_key(&id));
-    *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-        .checked_sub(AUTH_SESSION_TOMBSTONE_TTL)
-        .unwrap();
     // Rate limiting applies to the tombstone sweep too.
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(expires_at);
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions();
+    f.app.sweep_auth_sessions(expires_at);
     assert!(!f.app.retired_auth_sessions.contains_key(&id));
 }
 
@@ -3871,7 +4274,7 @@ async fn retired_delayed_response_save_cannot_restore_authority() {
             );
             drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions();
+            f.app.sweep_auth_sessions(std::time::Instant::now());
         } else {
             let mut headers = HeaderMap::new();
             let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
@@ -4060,7 +4463,7 @@ async fn recovery_rejects_late_save(definitive_refusal: bool) {
             );
             drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions();
+            f.app.sweep_auth_sessions(std::time::Instant::now());
         } else {
             assert_eq!(
                 blocker_request(&f, "POST", "/logout", "").await.0,
@@ -4227,17 +4630,18 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
         assert!(
             revived.expiry_date >= retirement + CookieDuration::seconds(SESSION_INACTIVITY_SECS)
         );
-        // Advance both clocks consistently: retirement was seven days + one
-        // second ago; the late response saved two minutes after retirement.
+        // Sweep seven days + one second after retirement without subtracting
+        // days from the host clock. Model the matching store lifetime with 119
+        // seconds left from a response saved two minutes after retirement.
         // No request observes the restored row before the production sweep.
-        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1))
-            .unwrap();
+        let retired_at = *f.app.retired_auth_sessions.get(&id).unwrap();
+        let after_inactivity =
+            retired_at + AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(1);
         revived.expiry_date =
             tower_sessions::cookie::time::OffsetDateTime::now_utc() + CookieDuration::seconds(119);
         f.store.save(&revived).await.unwrap();
         allow_coordinator_sweep(&f.app);
-        f.app.sweep_auth_sessions();
+        f.app.sweep_auth_sessions(after_inactivity);
         let calls = (
             f.discord.calls.load(Ordering::SeqCst),
             f.discord.token_calls.load(Ordering::SeqCst),
@@ -4266,11 +4670,10 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
         revived.expiry_date =
             tower_sessions::cookie::time::OffsetDateTime::now_utc() - CookieDuration::seconds(1);
         f.store.save(&revived).await.unwrap();
-        *f.app.retired_auth_sessions.get_mut(&id).unwrap() = std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL + std::time::Duration::from_secs(24 * 60 * 60 + 1))
-            .unwrap();
         allow_coordinator_sweep(&f.app);
-        f.app.sweep_auth_sessions();
+        f.app.sweep_auth_sessions(
+            retired_at + AUTH_SESSION_TOMBSTONE_TTL + std::time::Duration::from_secs(1),
+        );
         assert!(!f.app.retired_auth_sessions.contains_key(&id));
         assert!(f.store.load(&id).await.unwrap().is_none());
         let (status, body) = f.request("GET", "/api/service-upgrade", "").await;
@@ -4290,4 +4693,155 @@ async fn tombstone_margin_rejects_unseen_late_save_past_inactivity() {
             )
         );
     }
+}
+
+#[tokio::test]
+async fn known_bad_image_routes_require_current_page_and_live_permission() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body = serde_json::json!({"hash": hash, "note": null}).to_string();
+    let old = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let (status, _) = f
+        .request_token("POST", "/api/guilds/10/known-bad-images", &body, None)
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    db::retire_guild_enrollment(&f.app.db, 10, 100)
+        .await
+        .unwrap();
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    let (status, error) = f
+        .request_token(
+            "POST",
+            "/api/guilds/10/known-bad-images",
+            &body,
+            Some(&old.id),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(error["code"], "guild_enrollment_changed");
+    assert!(
+        db::load_config_parts(&f.app.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .is_empty()
+    );
+    assert_ne!(
+        f.request("POST", "/api/guilds/0/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    f.discord.guilds.lock().unwrap().clear();
+    assert_ne!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_ne!(
+        f.request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            ""
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body =
+        serde_json::json!({"hash": hash.to_uppercase(), "note": "confirmed spam"}).to_string();
+    let (status, saved) = f
+        .request("POST", "/api/guilds/10/known-bad-images", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["changed"], true);
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = config["known_bad_images"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["hash"], hash);
+    assert_eq!(rows[0]["actor"], "unknown");
+    assert_eq!(rows[0]["added_via"], "webui");
+    assert_eq!(rows[0].as_object().unwrap().len(), 5);
+    for invalid in [
+        serde_json::json!({"hash": "unknown"}),
+        serde_json::json!({"note": "missing digest"}),
+        serde_json::json!({"hash": hash, "payload": "unsupported"}),
+    ] {
+        assert_ne!(
+            f.request(
+                "POST",
+                "/api/guilds/10/known-bad-images",
+                &invalid.to_string()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .1["changed"],
+        false
+    );
+    assert_eq!(
+        f.request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            ""
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        f.request("POST", "/api/guilds/10/config", "").await.1["known_bad_images"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn known_bad_image_delete_rate_limit_leaves_row_intact() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let hash = "ab".repeat(32);
+    let body = serde_json::json!({"hash": hash, "note": null}).to_string();
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/known-bad-images", &body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f
+        .request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{hash}"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(
+        db::load_config_parts(&f.app.db, 10)
+            .await
+            .unwrap()
+            .known_bad_images
+            .len(),
+        1
+    );
 }

@@ -454,11 +454,13 @@ pub struct BehaviorOutcome {
 
 pub async fn handle_prefix(
     app: &Arc<BotState>,
-    ctx: &Context,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
     cfg: Arc<CachedGuildConfig>,
     msg: &serenity::model::channel::Message,
+    ctx: Option<&Context>,
 ) -> Result<bool> {
-    if msg.author.bot || msg.author.id.get() == ctx.cache.current_user().id.get() {
+    if msg.author.bot || msg.author.id.get() == cache.current_user().id.get() {
         return Ok(false);
     }
     let Some(guild_id) = msg.guild_id else {
@@ -489,15 +491,21 @@ pub async fn handle_prefix(
         );
         // Give the user feedback instead of silence: reply only to short
         // inputs so stray characters can't trigger spam.
-        if raw_args.is_empty() && body.chars().count() <= 32 {
-            let reply = format!("Unknown command `{name}`. Use `{prefix}help` to list commands.");
-            if let Err(e) = msg.channel_id.say(&ctx.http, reply).await {
-                tracing::warn!("failed to send unknown-command reply: {e}");
-            }
-        }
+        prefix_unknown_command_reply(
+            &app.activation,
+            msg.channel_id,
+            http,
+            name,
+            prefix,
+            raw_args,
+            body,
+        )
+        .await;
         return Ok(false);
     };
     let cmd = cmd.clone();
+    let ctx =
+        ctx.ok_or_else(|| anyhow::anyhow!("prefix command dispatch requires gateway context"))?;
 
     // Resolve the caller's member data and the guild's roles. The cache is
     // preferred; if the guild is not cached (e.g. still flagged unavailable),
@@ -517,18 +525,27 @@ pub async fn handle_prefix(
     };
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, msg.channel_id) {
-        let _ = msg
-            .channel_id
-            .say(&ctx.http, format!("{} — {reason}", member.display_name()))
-            .await;
+        let text = format!("{} — {reason}", member.display_name());
+        if raced_channel_say(&app.activation, msg.channel_id, http, text).await
+            == RacedWrite::Cutoff
+        {
+            tracing::warn!("enforcement denial reply suppressed after writer cutoff");
+        }
         return Ok(true);
     }
 
     if !cooldown_check(app, guild_id, msg.author.id, &cmd) {
-        let _ = msg
-            .channel_id
-            .say(&ctx.http, "that command is on cooldown")
-            .await;
+        if raced_channel_say(
+            &app.activation,
+            msg.channel_id,
+            http,
+            "that command is on cooldown".into(),
+        )
+        .await
+            == RacedWrite::Cutoff
+        {
+            tracing::warn!("cooldown reply suppressed after writer cutoff");
+        }
         return Ok(true);
     }
 
@@ -554,16 +571,14 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            let reply = format!("error: {e:#}");
-            if let Err(say_err) = msg.channel_id.say(&ctx.http, reply).await {
-                tracing::warn!("failed to send error reply: {say_err}");
-            }
+            send_prefix_command_error(&app.activation, msg.channel_id, http, &cmd.name, &e).await;
             return Ok(true);
         }
     };
     send_outcome(
         app,
-        ctx,
+        http,
+        cache,
         &cmd,
         guild_id,
         msg.channel_id,
@@ -572,6 +587,23 @@ pub async fn handle_prefix(
     )
     .await;
     Ok(true)
+}
+
+async fn prefix_unknown_command_reply(
+    activation: &crate::activation::Activation,
+    channel_id: serenity::model::id::ChannelId,
+    http: &serenity::http::Http,
+    name: &str,
+    prefix: &str,
+    raw_args: &str,
+    body: &str,
+) {
+    if raw_args.is_empty() && body.chars().count() <= 32 {
+        let reply = format!("Unknown command `{name}`. Use `{prefix}help` to list commands.");
+        if raced_channel_say(activation, channel_id, http, reply).await == RacedWrite::Cutoff {
+            tracing::warn!("unknown-command reply suppressed after writer cutoff");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,17 +719,17 @@ async fn set_slash_commands(
         target,
         "syncing Discord slash commands"
     );
-    match tokio::time::timeout(
+    let sync = tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild_id.set_commands(http.as_ref(), commands),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
+    );
+    match crate::discord::race_discord_call(&app.activation, sync).await {
+        crate::discord::DiscordCall::Cancelled => false,
+        crate::discord::DiscordCall::Finished(Ok(Ok(_))) => {
             app.reset_slash_guild_retry(guild_id.get());
             true
         }
-        Ok(Err(e)) => {
+        crate::discord::DiscordCall::Finished(Ok(Err(e))) => {
             let class = crate::discord::classify_retry(&e);
             app.slash_sync_failed(
                 guild_id.get(),
@@ -711,7 +743,7 @@ async fn set_slash_commands(
             }
             false
         }
-        Err(_) => {
+        crate::discord::DiscordCall::Finished(Err(_)) => {
             app.slash_sync_failed(
                 guild_id.get(),
                 target,
@@ -822,7 +854,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("interaction: config load failed: {e:#}");
-            respond(&slash, ctx, deferred, "internal error").await;
+            respond(&app.activation, &slash, ctx, deferred, "internal error").await;
             return;
         }
     };
@@ -832,7 +864,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             "no slash command matched `{}` in guild {guild_id}",
             slash.name
         );
-        respond(&slash, ctx, deferred, "unknown command").await;
+        respond(&app.activation, &slash, ctx, deferred, "unknown command").await;
         return;
     };
     let cmd = cmd.clone();
@@ -850,6 +882,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     let snapshot = guild_snapshot(ctx, guild_id, slash.member.clone(), actor_id).await;
     let Some((guild_roles, member)) = snapshot else {
         respond(
+            &app.activation,
             &slash,
             ctx,
             deferred,
@@ -861,11 +894,18 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, slash.channel_id)
     {
-        respond(&slash, ctx, deferred, &reason.to_string()).await;
+        respond(&app.activation, &slash, ctx, deferred, &reason.to_string()).await;
         return;
     }
     if !cooldown_check(app, guild_id, actor_id, &cmd) {
-        respond(&slash, ctx, deferred, "that command is on cooldown").await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            "that command is on cooldown",
+        )
+        .await;
         return;
     }
 
@@ -883,49 +923,42 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     };
     match run_command(env).await {
         Ok(outcome) => {
-            let answer = slash_answer(&cmd, &outcome);
-            if deferred {
-                match answer {
-                    SlashAnswer::Withdraw => {
-                        withdraw_deferred_slash_answer(ctx, &slash.token, &cmd.name).await;
-                    }
-                    // Ephemeral is fixed at the initial response; a deferred
-                    // answer is already public and can only be edited.
-                    SlashAnswer::Public | SlashAnswer::Ephemeral => {
-                        let _ = EditInteractionResponse::new()
-                            .content(render_outcome(&cmd, &outcome))
-                            .execute(&ctx.http, slash.token.as_str())
-                            .await;
-                    }
-                }
-            } else {
-                // The defer failed, so there is no deferred answer to
-                // withdraw; an interaction must still be answered, and a
-                // suppressed confirmation must not become a public message.
-                let ephemeral = answer != SlashAnswer::Public;
-                let _ = serenity::builder::CreateInteractionResponse::Message(
-                    serenity::builder::CreateInteractionResponseMessage::new()
-                        .content(render_outcome(&cmd, &outcome))
-                        .ephemeral(ephemeral),
+            if deliver_slash_success(&app.activation, &ctx.http, &slash, deferred, &cmd, &outcome)
+                .await
+                != RacedWrite::Cutoff
+            {
+                log_outcome(
+                    app,
+                    &ctx.http,
+                    &ctx.cache,
+                    &cmd,
+                    guild_id,
+                    slash.channel_id,
+                    actor_id,
+                    outcome,
                 )
-                .execute(&ctx.http, (slash.id, slash.token.as_str()))
                 .await;
             }
-            log_outcome(
-                app,
-                ctx,
-                &cmd,
-                guild_id,
-                slash.channel_id,
-                actor_id,
-                outcome,
-            )
-            .await;
         }
         Err(e) => {
             let text = format!("error: {e:#}");
-            respond(&slash, ctx, deferred, &text).await;
+            respond(&app.activation, &slash, ctx, deferred, &text).await;
         }
+    }
+}
+
+async fn send_prefix_command_error(
+    activation: &crate::activation::Activation,
+    channel_id: serenity::model::id::ChannelId,
+    http: &serenity::http::Http,
+    command_name: &str,
+    error: &anyhow::Error,
+) {
+    let reply = format!("error: {error:#}");
+    if raced_channel_say(activation, channel_id, http, reply).await == RacedWrite::Cutoff {
+        tracing::warn!(
+            "command `{command_name}` error reply suppressed after writer cutoff: {error:#}"
+        );
     }
 }
 
@@ -957,20 +990,160 @@ fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String
     out
 }
 
-async fn respond(slash: &SlashCtx, ctx: &Context, deferred: bool, text: &str) {
-    if deferred {
-        let _ = EditInteractionResponse::new()
-            .content(text)
-            .execute(&ctx.http, slash.token.as_str())
-            .await;
+async fn respond(
+    activation: &crate::activation::Activation,
+    slash: &SlashCtx,
+    ctx: &Context,
+    deferred: bool,
+    text: &str,
+) {
+    let delivered = if deferred {
+        raced_slash_edit(activation, &ctx.http, slash.token.as_str(), text).await
     } else {
-        let _ = serenity::builder::CreateInteractionResponse::Message(
-            serenity::builder::CreateInteractionResponseMessage::new()
-                .content(text)
-                .ephemeral(true),
+        raced_slash_create_message(
+            activation,
+            &ctx.http,
+            slash.id,
+            slash.token.as_str(),
+            text,
+            true,
         )
-        .execute(&ctx.http, (slash.id, slash.token.as_str()))
-        .await;
+        .await
+    };
+    if delivered == RacedWrite::Cutoff {
+        tracing::warn!(
+            "slash response for `{name}` suppressed after writer cutoff",
+            name = slash.name
+        );
+    }
+}
+
+/// Outcome of a cutoff-raced Discord write attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RacedWrite {
+    /// Writer cutoff won before the call finished.
+    Cutoff,
+    /// The call finished (success or ordinary Discord error).
+    Finished,
+}
+
+fn raced_write_chain(first: RacedWrite, second: RacedWrite) -> RacedWrite {
+    if first == RacedWrite::Cutoff || second == RacedWrite::Cutoff {
+        RacedWrite::Cutoff
+    } else {
+        RacedWrite::Finished
+    }
+}
+
+async fn raced_channel_say(
+    activation: &crate::activation::Activation,
+    channel_id: ChannelId,
+    http: &serenity::http::Http,
+    text: String,
+) -> RacedWrite {
+    match crate::discord::race_discord_call(activation, channel_id.say(http, text)).await {
+        crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            tracing::warn!("failed to send channel message: {error}");
+            RacedWrite::Finished
+        }
+        crate::discord::DiscordCall::Cancelled => RacedWrite::Cutoff,
+    }
+}
+
+async fn raced_slash_edit(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    token: &str,
+    content: &str,
+) -> RacedWrite {
+    match crate::discord::race_discord_call(
+        activation,
+        EditInteractionResponse::new()
+            .content(content)
+            .execute(http, token),
+    )
+    .await
+    {
+        crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            tracing::warn!("failed to edit slash response: {error}");
+            RacedWrite::Finished
+        }
+        crate::discord::DiscordCall::Cancelled => RacedWrite::Cutoff,
+    }
+}
+
+async fn raced_slash_create_message(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    id: serenity::model::id::InteractionId,
+    token: &str,
+    content: &str,
+    ephemeral: bool,
+) -> RacedWrite {
+    match crate::discord::race_discord_call(
+        activation,
+        serenity::builder::CreateInteractionResponse::Message(
+            serenity::builder::CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(ephemeral),
+        )
+        .execute(http, (id, token)),
+    )
+    .await
+    {
+        crate::discord::DiscordCall::Finished(Ok(())) => RacedWrite::Finished,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            tracing::warn!("failed to answer slash interaction: {error}");
+            RacedWrite::Finished
+        }
+        crate::discord::DiscordCall::Cancelled => RacedWrite::Cutoff,
+    }
+}
+
+async fn deliver_slash_success(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    slash: &SlashCtx,
+    deferred: bool,
+    cmd: &CommandDef,
+    outcome: &BehaviorOutcome,
+) -> RacedWrite {
+    let answer = slash_answer(cmd, outcome);
+    let text = render_outcome(cmd, outcome);
+    match answer {
+        SlashAnswer::Withdraw => {
+            if deferred {
+                withdraw_deferred_slash_answer(activation, http, slash.token.as_str(), &cmd.name)
+                    .await
+            } else {
+                raced_slash_create_message(
+                    activation,
+                    http,
+                    slash.id,
+                    slash.token.as_str(),
+                    &text,
+                    true,
+                )
+                .await
+            }
+        }
+        SlashAnswer::Public | SlashAnswer::Ephemeral => {
+            if deferred {
+                raced_slash_edit(activation, http, slash.token.as_str(), &text).await
+            } else {
+                raced_slash_create_message(
+                    activation,
+                    http,
+                    slash.id,
+                    slash.token.as_str(),
+                    &text,
+                    answer != SlashAnswer::Public,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -1054,26 +1227,39 @@ const WITHDRAW_DEFERRED_FALLBACK_CONTENT: &str = "\u{200b}";
 
 /// Remove the public deferred interaction placeholder after a suppressed
 /// confirmation. Prefer delete; on failure log and edit to minimal content.
-async fn withdraw_deferred_slash_answer(ctx: &Context, token: &str, command_name: &str) {
-    if let Err(e) = ctx.http.delete_original_interaction_response(token).await {
-        tracing::warn!(
-            "failed to delete deferred slash answer for `{command_name}`: {e:#}; editing to minimal content"
-        );
-        if let Err(edit_err) = EditInteractionResponse::new()
-            .content(WITHDRAW_DEFERRED_FALLBACK_CONTENT)
-            .execute(&ctx.http, token)
-            .await
-        {
+/// `true` when the withdraw finished without cutoff.
+async fn withdraw_deferred_slash_answer(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    token: &str,
+    command_name: &str,
+) -> RacedWrite {
+    let delete = match crate::discord::race_discord_call(
+        activation,
+        http.delete_original_interaction_response(token),
+    )
+    .await
+    {
+        crate::discord::DiscordCall::Cancelled => return RacedWrite::Cutoff,
+        crate::discord::DiscordCall::Finished(Ok(())) => return RacedWrite::Finished,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
             tracing::warn!(
-                "failed to edit deferred slash answer for `{command_name}` after delete failure: {edit_err:#}"
+                "failed to delete deferred slash answer for `{command_name}`: {error:#}; editing to minimal content"
             );
+            RacedWrite::Finished
         }
-    }
+    };
+    raced_write_chain(
+        delete,
+        raced_slash_edit(activation, http, token, WITHDRAW_DEFERRED_FALLBACK_CONTENT).await,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_outcome(
     app: &Arc<BotState>,
-    ctx: &Context,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
     cmd: &CommandDef,
     guild_id: GuildId,
     channel_id: serenity::model::id::ChannelId,
@@ -1081,19 +1267,21 @@ async fn send_outcome(
     outcome: BehaviorOutcome,
 ) {
     if let Some(text) = prefix_response_text(cmd, &outcome)
-        && let Err(e) = channel_id.say(&ctx.http, text).await
+        && raced_channel_say(&app.activation, channel_id, http, text).await == RacedWrite::Cutoff
     {
-        tracing::warn!(
-            "failed to send response for `{}` in {channel_id} (missing Send Messages permission?): {e}",
-            cmd.name
-        );
+        return;
     }
-    log_outcome(app, ctx, cmd, guild_id, channel_id, actor_id, outcome).await;
+    log_outcome(
+        app, http, cache, cmd, guild_id, channel_id, actor_id, outcome,
+    )
+    .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_outcome(
     app: &Arc<BotState>,
-    ctx: &Context,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
     cmd: &CommandDef,
     guild_id: GuildId,
     source_channel_id: ChannelId,
@@ -1105,15 +1293,14 @@ async fn log_outcome(
     }
     let mut vars = outcome.vars.clone();
     vars.insert("command".into(), cmd.name.clone());
-    let actor_name = ctx
-        .cache
+    let actor_name = cache
         .user(actor_id)
         .map(|u| u.name.clone())
         .unwrap_or_else(|| actor_id.to_string());
     vars.insert("actor".into(), format!("{actor_name} (<@{actor_id}>)"));
     vars.insert("actor_id".into(), actor_id.to_string());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
-    logging::emit(app, ctx, guild_id, &cmd.log_event, vars).await;
+    logging::emit_to(app, http, guild_id, &cmd.log_event, vars).await;
 }
 
 fn cooldown_check(
@@ -1700,6 +1887,7 @@ mod tests {
             commands: HashMap::new(),
             templates: HashMap::new(),
             log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -1880,5 +2068,379 @@ mod tests {
             slash_answer(&say_cmd(""), &outcome(Some("hi"), false)),
             SlashAnswer::Public
         );
+    }
+
+    struct StuckDiscordWrite {
+        polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl StuckDiscordWrite {
+        fn new() -> Self {
+            Self {
+                polled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl std::future::Future for StuckDiscordWrite {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            self.polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_waiters();
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for StuckDiscordWrite {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn cutoff_cancels_pending_discord_write(
+        activation: std::sync::Arc<crate::activation::Activation>,
+    ) {
+        let stuck = StuckDiscordWrite::new();
+        let polled = std::sync::Arc::clone(&stuck.polled);
+        let dropped = std::sync::Arc::clone(&stuck.dropped);
+        let started = std::sync::Arc::clone(&stuck.started);
+        let notified = started.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let race_activation = std::sync::Arc::clone(&activation);
+        let task = tokio::spawn(async move {
+            crate::discord::race_discord_call(&race_activation, stuck).await
+        });
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("the discord future must be polled while it is still pending");
+            }
+            _ = &mut notified => {}
+        }
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        activation.cut_off();
+        let raced = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cutoff must cancel the discord future")
+            .unwrap();
+        assert!(matches!(raced, crate::discord::DiscordCall::Cancelled));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping the future is the cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_suppresses_reply_when_cutoff_wins_during_await() {
+        let activation = std::sync::Arc::new(crate::activation::Activation::new());
+        activation.mark_lock_held(true);
+        cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&activation)).await;
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        assert_eq!(
+            raced_slash_create_message(
+                &activation,
+                &http,
+                serenity::model::id::InteractionId::new(1),
+                "token",
+                "error: writer lease is not held",
+                true,
+            )
+            .await,
+            RacedWrite::Cutoff
+        );
+    }
+
+    #[tokio::test]
+    async fn send_outcome_suppresses_reply_when_cutoff_wins_during_await() {
+        let activation = std::sync::Arc::new(crate::activation::Activation::new());
+        activation.mark_lock_held(true);
+        cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&activation)).await;
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        assert_eq!(
+            raced_channel_say(&activation, ChannelId::new(1), &http, "pong".into()).await,
+            RacedWrite::Cutoff
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_success_suppresses_reply_when_cutoff_wins_during_await() {
+        let activation = std::sync::Arc::new(crate::activation::Activation::new());
+        activation.mark_lock_held(true);
+        cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&activation)).await;
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        assert_eq!(
+            raced_slash_edit(&activation, &http, "token", "pong").await,
+            RacedWrite::Cutoff,
+            "deferred slash success edits must be cancellable at cutoff"
+        );
+    }
+
+    async fn discord_rejecting_proxy() -> (
+        serenity::http::Http,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"code":50013,"message":"fixture"}"#;
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        (http, calls, server)
+    }
+
+    fn temp_command_test_db() -> (Arc<BotState>, std::path::PathBuf) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("cmd_test_{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        (BotState::new(Default::default(), db).unwrap(), path)
+    }
+
+    fn remove_command_test_db(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        crate::tenant::remove_sidecars(path);
+    }
+
+    #[tokio::test]
+    async fn send_outcome_still_logs_when_confirmation_send_fails() {
+        use std::sync::atomic::Ordering;
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        db::upsert_log_channel(&app.db, 1, "mod_action", 99)
+            .await
+            .unwrap();
+        let cache = serenity::cache::Cache::default();
+        let http = Arc::new(http);
+        let mut cmd = say_cmd("ok");
+        cmd.log_event = "mod_action".into();
+        send_outcome(
+            &app,
+            http.as_ref(),
+            &cache,
+            &cmd,
+            GuildId::new(1),
+            ChannelId::new(2),
+            UserId::new(3),
+            outcome(None, false),
+        )
+        .await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "a failed confirmation must not skip the configured command log"
+        );
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn slash_success_still_logs_when_confirmation_edit_fails() {
+        use std::sync::atomic::Ordering;
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        db::upsert_log_channel(&app.db, 1, "mod_action", 99)
+            .await
+            .unwrap();
+        let cache = serenity::cache::Cache::default();
+        let http = Arc::new(http);
+        let mut cmd = say_cmd("ok");
+        cmd.log_event = "mod_action".into();
+        let slash = SlashCtx {
+            id: serenity::model::id::InteractionId::new(1),
+            token: "token".into(),
+            channel_id: ChannelId::new(2),
+            guild_id: GuildId::new(1),
+            actor: UserId::new(3),
+            member: None,
+            name: "say".into(),
+            options: Vec::new(),
+        };
+        let outcome = outcome(None, false);
+        let write =
+            deliver_slash_success(&app.activation, http.as_ref(), &slash, true, &cmd, &outcome)
+                .await;
+        assert_ne!(write, RacedWrite::Cutoff);
+        if write != RacedWrite::Cutoff {
+            log_outcome(
+                &app,
+                http.as_ref(),
+                &cache,
+                &cmd,
+                slash.guild_id,
+                slash.channel_id,
+                slash.actor,
+                outcome,
+            )
+            .await;
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "a failed slash confirmation must not skip the configured command log"
+        );
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_unknown_command_reply_suppressed_when_cutoff_wins_during_await() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connected = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&connected);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                flag.store(true, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        let http = Arc::new(http);
+        let task = tokio::spawn({
+            let activation = std::sync::Arc::clone(&app.activation);
+            let http = Arc::clone(&http);
+            async move {
+                prefix_unknown_command_reply(
+                    &activation,
+                    ChannelId::new(20),
+                    http.as_ref(),
+                    "nosuch",
+                    "!",
+                    "",
+                    "nosuch",
+                )
+                .await
+            }
+        });
+        for _ in 0..500 {
+            if connected.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(connected.load(Ordering::SeqCst));
+        app.activation.cut_off();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cutoff must cancel the unknown-command reply without waiting for REST timeout")
+            .unwrap();
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_unknown_command_uses_raced_channel_say() {
+        use crate::state::CachedGuildConfig;
+        use crate::types::GuildSettings;
+        use serenity::model::channel::Message;
+        use serenity::model::user::User;
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        let (http, calls, server) = discord_rejecting_proxy().await;
+        let (app, path) = temp_command_test_db();
+        app.activation.mark_lock_held(true);
+        let cache = serenity::cache::Cache::default();
+        let settings = GuildSettings {
+            prefix: "!".into(),
+            ..Default::default()
+        };
+        let cfg = Arc::new(CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings,
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            known_bad_hashes: Default::default(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        });
+        let mut author = User::default();
+        author.id = UserId::new(2);
+        let mut msg = Message::default();
+        msg.content = "!nosuch".into();
+        msg.guild_id = Some(GuildId::new(10));
+        msg.channel_id = ChannelId::new(20);
+        msg.author = author;
+        let http = Arc::new(http);
+        let result = handle_prefix(&app, http.as_ref(), &cache, cfg, &msg, None)
+            .await
+            .expect("prefix dispatch should complete");
+        assert!(!result);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unknown-command feedback must attempt exactly one raced channel send"
+        );
+        server.abort();
+        drop(app);
+        remove_command_test_db(&path);
     }
 }

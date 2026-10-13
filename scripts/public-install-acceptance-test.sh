@@ -27,9 +27,21 @@ require_absent() {
   fi
 }
 
-# test_license_is_polyform_noncommercial
-require_contains LICENSE.md "PolyForm Noncommercial License 1.0.0"
-require_contains Cargo.toml "LicenseRef-PolyForm-Noncommercial-1.0.0"
+# test_license_is_apache_with_commons_clause
+node --input-type=module - <<'JS'
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+// Pin the complete reviewed terms, not just their identifying headings.
+// Sources: https://www.apache.org/licenses/LICENSE-2.0.txt and https://commonsclause.com/
+// Review any intended license/attribution change before updating this fingerprint.
+// Ignore only whitespace so line wrapping and CRLF do not change the result.
+const text = fs.readFileSync("LICENSE.md", "utf8").replace(/\s+/g, " ").trim();
+assert.equal(createHash("sha256").update(text).digest("hex"),
+  "7747223dec9c5c4aaef09f2548bc21a38f9e8bfc0dedfac51d18c4dafe76de2f",
+  "LICENSE.md does not match the reviewed complete license");
+JS
+require_contains Cargo.toml "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 # test_install_guide_is_public_and_lists_deferred_checks
 require_contains docs/INSTALL.md "without the private"
@@ -49,11 +61,11 @@ if grep -Fiq "create an RDS instance" "$root/docs/DEPLOY-AWS.md"; then
 fi
 
 # test_public_artifact_wording_matches_install
-require_contains docs/INSTALL.md "Buildkite does not upload"
-require_absent docs/DEPLOY-BUNNY.md "Buildkite frontend artifact"
-require_absent docs/WEBUI.md "matching Buildkite artifact"
+require_contains docs/INSTALL.md "GitHub Actions does not upload"
+require_absent docs/DEPLOY-BUNNY.md "GitHub Actions frontend artifact"
+require_absent docs/WEBUI.md "matching GitHub Actions artifact"
 require_contains docs/WEBUI.md "does not upload a separate frontend"
-require_absent docs/OVERHAUL.md "or Buildkite artifacts is the required path"
+require_absent docs/OVERHAUL.md "or GitHub Actions artifacts is the required path"
 require_contains docs/OVERHAUL.md "does not upload it to Bunny Storage"
 
 # test_bunny_and_webui_do_not_require_private_ops
@@ -165,7 +177,7 @@ for relative in \
   docs/WEBUI.md \
   docs/OVERHAUL.md \
   docs/UPGRADE.md \
-  docs/BUILDKITE.md \
+  docs/CI.md \
   AGENTS.md \
   README.md \
   scripts/ci-preflight.sh \
@@ -213,28 +225,24 @@ require_absent scripts/ci-preflight.sh "public-install-acceptance-test.py"
 # Remaining CI/tooling must not require Python.
 for py in \
   scripts/check-service-boundaries.py \
-  .buildkite/publish-image.py \
-  .buildkite/publish-image-test.py \
-  .buildkite/release.py \
-  .buildkite/release-test.py \
-  .buildkite/release-please.py
+  scripts/publish-image.py \
+  scripts/publish-image-test.py
 do
   [[ ! -e "$root/$py" ]] || fail "$py must not exist"
 done
 require_absent scripts/ci-preflight.sh "python3"
-require_absent .buildkite/pipeline.yml "python3"
-require_absent .buildkite/pipeline.steps.yml "python3"
-require_absent docs/BUILDKITE.md "Python 3"
+require_absent .github/workflows/ci.yml "python3"
+require_absent docs/CI.md "Python 3"
 require_absent docs/RELEASES.md "release-please.py"
 require_absent docs/RELEASES.md "Python CI"
 require_contains scripts/ci-preflight.sh "bash scripts/check-service-boundaries.sh"
-require_contains scripts/ci-preflight.sh "bash .buildkite/publish-image-test.sh"
-require_contains .buildkite/pipeline.yml "bash .buildkite/select-checks.sh upload"
-require_contains .buildkite/pipeline.steps.yml "bash .buildkite/publish-image.sh"
-require_contains .buildkite/pipeline.steps.yml "bash .buildkite/release-please.sh"
-require_contains .buildkite/pipeline.steps.yml "bash scripts/ci-preflight.sh"
-require_contains docs/RELEASES.md "release-please.sh"
-require_contains docs/BUILDKITE.md "bash .buildkite/publish-image-test.sh"
+require_contains scripts/ci-preflight.sh "bash scripts/publish-image-test.sh"
+require_contains .github/workflows/ci.yml "bash scripts/select-checks.sh matrix"
+require_contains .github/workflows/publish.yml "bash scripts/publish-image.sh"
+require_contains .github/workflows/publish.yml "googleapis/release-please-action@"
+require_contains .github/workflows/ci.yml "bash scripts/ci-preflight.sh"
+require_contains docs/RELEASES.md "Release Please action"
+require_contains docs/CI.md "bash scripts/publish-image-test.sh"
 require_contains AGENTS.md "bash scripts/check-service-boundaries.sh"
 
 echo 'public-install-acceptance-test: ok'

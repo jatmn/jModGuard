@@ -88,7 +88,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -98,7 +98,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -152,15 +152,15 @@ async function runMemberPoll(h) {
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
   const h = harness(async () => response([
-    { user_id: '172697277964615681', user_name: 'wavingwalker', user_display_name: 'Wavingwalker', moderator_id: '1800882749273538599', moderator_name: 'ikaika44', active: true, reason: 'No reason provided', created_at: '2026-09-22T23:16:28Z' },
-    { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2026-09-22T07:43:34Z' },
+    { user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: 'No reason provided', created_at: '2020-01-01T12:00:00Z' },
+    { user_id: '9007199254740997', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2020-01-02T12:00:00Z' },
   ]));
   const panel = h.app.tabBans();
   await settle();
   const text = textOf(panel);
-  assert.match(text, /Wavingwalker \(wavingwalker, 172697277964615681\)/);
-  assert.match(text, /ikaika44 \(1800882749273538599\)/);
-  assert.match(text, /823826232020959242/);
+  assert.match(text, /Test-User-1 \(test-user-1, 9007199254740993\)/);
+  assert.match(text, /test-mod-1 \(9007199254740995\)/);
+  assert.match(text, /9007199254740997/);
   assert.match(text, /Unavailable/);
   assert.match(text, /Reason unavailable/);
 });
@@ -385,14 +385,14 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
     if (url.endsWith('/member-sync')) return response({ status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: '🌻 Willow', username: 'willow', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
+    return response({ members: [{ user_id: '9007199254740993', display_name: 'Test Member 1', username: 'test-member-1', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  assert.match(textOf(panel), /🌻 Willow/);
-  assert.match(textOf(panel), /1800882749273538599/);
+  assert.match(textOf(panel), /Test Member 1/);
+  assert.match(textOf(panel), /9007199254740993/);
   assert.match(textOf(panel), /Results are partial/);
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
@@ -403,7 +403,7 @@ test('Members separates current ban reason from an unresolved Gateway action', a
   const h = harness(async (url) => {
     if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
     if (url.includes('/history')) return response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'gateway_observation_unlinked', case_id: 'case-1' }], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -424,7 +424,7 @@ test('Members renders a dated unresolved Discord audit entry, then its exact cas
     if (url.includes('/history')) return response({ entries: [linked
       ? { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'application_audit_linked', case_id: 'case-linked', observation_id: null, moderator_id: '42', reason, outcome: 'succeeded' }
       : { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit_unresolved', case_id: null, observation_id: '123456789012345678', moderator_id: '42', reason, outcome: 'succeeded' }], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -460,7 +460,7 @@ test('Members labels verified state changes with unknown event time and separate
       { kind: 'ban_present_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
       { kind: 'membership_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
     ], next_cursor: null });
-    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -929,7 +929,7 @@ test('Members rejects a pending old search result before the debounce fires', as
   search.value = 'New Query';
   fire(search, 'input');
   assert.equal(pending[0].opts.signal.aborted, true);
-  pending[0].resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Old Result' }] }));
+  pending[0].resolve(response({ members: [{ user_id: '10002', display_name: 'Old Result' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Old Result/);
   const debounce = [...h.timers].find(([, timer]) => timer.delay === 300);
@@ -938,7 +938,7 @@ test('Members rejects a pending old search result before the debounce fires', as
   debounce[1].fn();
   assert.equal(pending.length, 2);
   assert.match(pending[1].url, /q=New\+Query/);
-  pending[1].resolve(response({ members: [{ user_id: '1800882749273538600', display_name: 'New Result' }] }));
+  pending[1].resolve(response({ members: [{ user_id: '10006', display_name: 'New Result' }] }));
   await settle();
   assert.match(textOf(panel), /New Result/);
   assert.doesNotMatch(textOf(panel), /Old Result/);
@@ -950,7 +950,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   const h = harness((url, opts) => {
     if (url.endsWith('/member-sync')) return Promise.resolve(response({ status: 'complete', phase: 'complete' }));
     if (url.includes('/history')) return new Promise(resolve => pending.push({ type: 'history', url, opts, resolve }));
-    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow' }] }));
+    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '10002', display_name: 'Test Member 1' }] }));
     return new Promise(resolve => pending.push({ type: 'list', url, opts, resolve }));
   });
   h.app.state.tab = 'members';
@@ -973,7 +973,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   date.value = '2026-09-01';
   fire(date, 'input');
   assert.equal(oldList.opts.signal.aborted, true);
-  oldList.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong Filter' }] }));
+  oldList.resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong Filter' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong Filter/);
   const sort = findNode(panel, n => n.localName === 'select' && n.getAttribute('aria-label') === 'Join date order');
@@ -983,7 +983,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   const newList = pending.filter(item => item.type === 'list').at(-1);
   assert.match(newList.url, /joined_from=2026-09-01/);
   assert.match(newList.url, /sort=joined_oldest/);
-  newList.resolve(response({ members: [{ user_id: '1800882749273538601', display_name: 'Right Filter' }] }));
+  newList.resolve(response({ members: [{ user_id: '10007', display_name: 'Right Filter' }] }));
   await settle();
   assert.match(textOf(panel), /Right Filter/);
 });
@@ -996,7 +996,7 @@ test('Members drops responses from a previous server and page enrollment', async
   const panel = h.app.tabMembers();
   h.app.state.config = { enrollment_id: 'replacement-enrollment' };
   pending.find(item => item.url.endsWith('/member-sync')).resolve(response({ status: 'complete', phase: 'complete', progress_revision: 100, processed: 1 }));
-  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong server' }] }));
+  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong server' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong server/);
   assert.doesNotMatch(textOf(panel), /Initial member import/);
@@ -1267,6 +1267,115 @@ test('log channel ignore editor saves user and channel IDs as strings', async ()
   assert.equal(calls.length, 1, 'names must be rejected before calling the API');
 });
 
+for (const failRead of [false, true]) {
+  test(`recovered ignore save reads current values and retains failed reconciliation (${failRead})`, async () => {
+    const calls = [];
+    const oldUser = '9007199254740993', currentUser = '9007199254740995';
+    const cfg = {
+      enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+      settings: { prefix: '!', bot_name: '' },
+      log_channels: [{ event: 'message_edit', effective: '111', guild_override: '111', global: null, ignore: { users: [], channels: [] } }],
+    };
+    let writes = 0, reads = 0, unavailable = failRead;
+    const h = harness(async (url, opts) => {
+      calls.push({ url, opts });
+      if (opts.method === 'PUT') {
+        if (opts.headers['x-jmodguard-save-lookup'] === '0') {
+          writes++;
+          throw new Error('acknowledgement lost');
+        }
+        return response({ ignore: { users: [oldUser], channels: [] } });
+      }
+      assert.ok(url.endsWith('/config'));
+      reads++;
+      if (unavailable) throw new Error('current configuration unavailable');
+      return response({ ...cfg, log_channels: [{ ...cfg.log_channels[0], ignore: { users: [currentUser], channels: [] } }] });
+    });
+    h.app.state.config = cfg;
+    h.app.state.tab = 'logchannels';
+    h.app.renderTab();
+    const userField = () => h.elements.find(n => n.localName === 'textarea');
+    const save = () => h.elements.find(n => n.localName === 'button' && n.textContent === 'Save ignores');
+    userField().value = oldUser;
+    await fire(userField(), 'input');
+    await fire(save(), 'click');
+    await fire(save(), 'click');
+    const puts = () => calls.filter(c => c.opts.method === 'PUT');
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[0].opts.headers['x-jmodguard-save'], puts()[1].opts.headers['x-jmodguard-save']);
+    assert.equal(reads, 1, 'recovery must read current ignores');
+    if (failRead) {
+      assert.equal(userField().value, oldUser);
+      assert.equal(h.app.isDirty(), true);
+      assert.match(h.nodes.get('#toast').textContent, /current configuration unavailable/);
+      assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 1);
+      unavailable = false;
+      await fire(save(), 'click');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save-lookup'], '1');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    }
+    assert.equal(writes, 1, 'reconciliation must never submit a new mutation');
+    assert.equal(userField().value, currentUser);
+    assert.equal(h.app.state.config.log_channels[0].ignore.users[0], currentUser);
+    assert.equal(h.app.isDirty(), false);
+    assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 0);
+  });
+
+  test(`recovered role save reads current roles and revision before settling (${failRead})`, async () => {
+    const calls = [];
+    let reads = 0, writes = 0, unavailable = failRead;
+    const h = harness(async (url, opts) => {
+      assert.ok(url.endsWith('/case-delete-roles'));
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ opts, body });
+      if (opts.method === 'POST') {
+        reads++;
+        if (reads === 1) return response({ roles: ['1'], revision: 'revision-1' });
+        if (unavailable) throw new Error('current roles unavailable');
+        return response({ roles: ['3'], revision: 'revision-3' });
+      }
+      if (opts.headers['x-jmodguard-save-lookup'] === '1') return response({ revision: 'revision-2' });
+      writes++;
+      if (writes === 1) throw new Error('acknowledgement lost');
+      assert.equal(body.revision, 'revision-3', 'next mutation must use the reconciled revision');
+      return response({ revision: 'revision-4' });
+    });
+    h.app.state.config = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+    h.app.state.tab = 'settings';
+    h.app.renderTab();
+    await settle();
+    const input = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute('placeholder') || ''));
+    const save = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
+    input.value = '2';
+    await fire(input, 'input');
+    await fire(save, 'click');
+    await fire(save, 'click');
+    const puts = () => calls.filter(c => c.opts.method === 'PUT');
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[0].opts.headers['x-jmodguard-save'], puts()[1].opts.headers['x-jmodguard-save']);
+    assert.equal(reads, 2, 'recovery must reread roles and their revision');
+    if (failRead) {
+      assert.equal(input.value, '2');
+      assert.equal(h.app.isDirty(), true);
+      assert.match(h.nodes.get('#toast').textContent, /current roles unavailable/);
+      assert.equal([...h.session.keys()].filter(k => k.includes(':save:')).length, 1);
+      unavailable = false;
+      await fire(save, 'click');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save-lookup'], '1');
+      assert.equal(puts()[2].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    }
+    assert.equal(writes, 1);
+    assert.equal(input.value, '3');
+    assert.equal(h.app.isDirty(), false);
+    input.value = '4';
+    await fire(input, 'input');
+    await fire(save, 'click');
+    assert.equal(writes, 2);
+    assert.equal(puts().at(-1).body.revision, 'revision-3');
+    assert.equal(h.app.isDirty(), false);
+  });
+}
+
 test('queued log-channel receipts reconcile without a configuration refresh', async () => {
   const pending = {
     id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
@@ -1531,41 +1640,6 @@ test('case-delete-role save rejects invalid IDs instead of clearing roles', asyn
   assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
 });
 
-test('late case-delete-role load cannot overwrite an acknowledged save', async () => {
-  const calls = [];
-  let resolveInitialRoles;
-  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
-  const h = harness(async (url, options) => {
-    const body = options.body ? JSON.parse(options.body) : null;
-    calls.push({ url, method: options.method, body });
-    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
-      return new Promise(resolve => { resolveInitialRoles = resolve; });
-    }
-    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
-      return response({ revision: calls.filter(c => c.method === 'PUT').length === 1 ? 'revision-2' : 'revision-3' });
-    }
-    return response(cfg);
-  });
-  h.app.state.config = cfg;
-  h.app.state.tab = 'settings';
-  h.app.tabSettings();
-
-  const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
-  const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
-  roleInput.value = '2';
-  await fire(roleInput, 'input');
-  await fire(saveRoles, 'click', {});
-
-  resolveInitialRoles(response({ roles: ['1'], revision: 'revision-1' }));
-  await settle();
-  assert.equal(roleInput.value, '2');
-
-  await fire(saveRoles, 'click', {});
-  const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
-  assert.equal(puts.length, 2);
-  assert.equal(puts[1].body.revision, 'revision-2');
-});
-
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
@@ -1661,8 +1735,9 @@ for (const kind of ['rule', 'command']) {
 
 async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const calls = [];
-  const failures = { put: false, delete: false, refresh: false };
-  let globalRule = { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] };
+  const failures = { put: false, lost: false, refresh: false };
+  let receipt;
+  let globalRule = { name: 'Mention spam', description: '', enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 0, reason: '' }], whitelist_roles: [], whitelist_channels: [], whitelist_users: [], skip_moderators: false, include_channels: [], log_automod: true, open_case: true };
   let guildRule = override ? structuredClone(globalRule) : null;
   const snapshot = () => ({ rules: [{
     rule_id: 'mention_spam', name: 'Mention spam', global: globalRule,
@@ -1670,14 +1745,17 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   }] });
   const h = harness(async (url, options) => {
     const body = options.body && JSON.parse(options.body);
-    calls.push({ url, method: options.method, body });
+    calls.push({ url, method: options.method, body, headers: options.headers });
     if (options.method === 'PUT') {
+      if (options.headers['x-jmodguard-save-lookup'] === '1' && receipt) return response(receipt);
       if (failures.put) throw new Error('write refused');
       if (body.scope === 'global') globalRule = body.data;
       else guildRule = body.data;
-      return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data } });
+      if (body.clear_guild_override) guildRule = null;
+      receipt = { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
+      if (failures.lost) throw new Error('lost acknowledgement');
+      return response(receipt);
     } else if (options.method === 'DELETE') {
-      if (failures.delete) throw new Error('cleanup unavailable');
       guildRule = null;
       return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: 'guild', value: null } });
     } else {
@@ -1696,46 +1774,42 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   const enabled = findNode(modal, (n) => n.getAttribute("type") === 'checkbox');
   const save = findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save');
   const cancel = findNode(modal, (n) => n.textContent === 'Cancel');
-  return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot };
+  return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot, replaceOverride: rule => { guildRule = rule; } };
 }
 
-test('global rule partial success reconciles the committed value before navigation', async () => {
-  const h = await ruleSaveHarness();
-  h.failures.delete = true;
+test('recovered global rule save preserves a newer guild override without another mutation', async () => {
+  const h = await ruleSaveHarness({override: true});
+  h.failures.lost = true;
   await fire(h.enabled, 'change', { target: { checked: false } });
-  await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
-  assert.equal(h.snapshot().rules[0].effective.enabled, false);
-  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
-  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
-  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
-  assert.match(h.nodes.get('#toast').className, /error/);
-  await fire(h.cancel, 'click', {});
-  h.app.navigate('rules');
-  assert.match(textOf(h.content), /disabled/);
+  await fire(h.save, 'click');
+  assert.equal(h.modal.isConnected, true);
+  const newer = {...h.snapshot().rules[0].global, enabled: true, name: 'newer override'};
+  h.replaceOverride(newer);
+  await fire(h.save, 'click');
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST']);
+  assert.equal(h.calls[1].headers['x-jmodguard-save-lookup'], '1');
+  assert.equal(h.calls[1].headers['x-jmodguard-save'], h.calls[0].headers['x-jmodguard-save']);
+  assert.equal(h.app.state.config.rules[0].guild_override.name, 'newer override');
+  assert.equal(h.app.state.config.rules[0].effective.enabled, true);
   assert.equal(h.app.isBusy(), false);
 });
 
-test('global rule partial success with failed reconciliation stays unavailable through Retry', async () => {
+test('recovered global rule save with failed reconciliation stays unavailable through Retry', async () => {
   const h = await ruleSaveHarness();
-  h.failures.delete = h.failures.refresh = true;
+  h.failures.lost = h.failures.refresh = true;
   await fire(h.enabled, 'change', { target: { checked: false } });
-  await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
+  await fire(h.save, 'click');
+  await fire(h.save, 'click');
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST']);
   assert.equal(h.app.state.config, null);
   assert.match(textOf(h.content), /Configuration unavailable/);
-  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
-  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
-  assert.match(h.nodes.get('#toast').textContent, /Retry/);
   assert.equal(h.app.isBusy(), false);
-  assert.equal(h.modal.isConnected, false);
-  assertAccessible(findNode(h.content, n => n.textContent === 'Retry'));
   h.failures.refresh = false;
-  const retry = findNode(h.content, (n) => n.textContent === 'Retry');
-  await fire(retry, 'click', {});
+  const retry = findNode(h.content, n => n.textContent === 'Retry');
+  assertAccessible(retry);
+  await fire(retry, 'click');
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
-  assert.match(textOf(h.content), /disabled/);
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST', 'POST']);
+  assert.deepEqual(h.calls.map(c => c.method), ['PUT', 'PUT', 'POST', 'POST']);
 });
 
 test('a refused rule PUT retains the checkbox draft and never deletes an override', async () => {
@@ -1755,13 +1829,13 @@ test('a refused rule PUT retains the checkbox draft and never deletes an overrid
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
 });
 
-test('a successful global rule save applies both acknowledgments without a config reload', async () => {
+test('a successful global rule save acknowledges both atomic effects without a config reload', async () => {
   const h = await ruleSaveHarness({ override: true });
   await fire(h.enabled, 'change', { target: { checked: false } });
   await fire(h.save, 'click', {});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
   assert.equal(h.calls[0].body.scope, 'global');
-  assert.equal(h.calls[1].body.scope, 'guild');
+  assert.equal(h.calls[0].body.clear_guild_override, true);
   assert.equal(h.app.state.config.rules[0].guild_override, null);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.equal(h.modal.isConnected, false);
@@ -1817,7 +1891,8 @@ test('configuration mutations retain the loaded membership without refreshing or
   app.state.config = { enrollment_id: 'old-membership' };
   for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy'], ['PUT', 'case-delete-roles'], ['DELETE', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']]) {
     const count = calls.length;
-    await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, {}), /Membership changed/);
+    const body = suffix === 'case-delete-roles' ? {roles: [], revision: '1'.repeat(32)} : {};
+    await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, body), /Membership changed/);
     assert.equal(calls.length, count + 1);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'old-membership');
   }
@@ -1893,6 +1968,129 @@ function queuedAction(state = 'pending') {
   return { id: 'job', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'membership', state, action: {kind:'unban',user_id:'99'} };
 }
 const actionPath = '/api/guilds/987654321098765432/unban';
+
+test('lost save acknowledgement retains identity across reload and only looks up the original save', async () => {
+  const calls = [], session = new Map();
+  const path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async (_, opts) => { calls.push(opts); throw new Error('lost response'); }, new Map(), session);
+  first.app.state.config = { enrollment_id: 'membership' };
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once', scope: 'guild'}), /lost response/);
+  assert.equal(session.size, 1);
+  const next = harness(async (_, opts) => { calls.push(opts); return response({ok: true, id: 7}); }, new Map(), session);
+  next.app.state.config = { enrollment_id: 'membership' };
+  const saved = await next.app.api(path, 'POST', {scope: 'guild', pattern: 'once'});
+  assert.equal(saved.id, 7);
+  assert.match(calls[0].headers['x-jmodguard-save'], /^[0-9a-f]{64}$/);
+  assert.equal(calls[1].headers['x-jmodguard-save'], calls[0].headers['x-jmodguard-save']);
+  assert.equal(calls[0].headers['x-jmodguard-save-lookup'], '0');
+  assert.equal(calls[1].headers['x-jmodguard-save-lookup'], '1');
+  assert.equal(session.size, 0);
+});
+
+test('pending save preserves the draft and retry queries the result', async () => {
+  const calls = [];
+  const word = {id: 8, guild_id: '987654321098765432', pattern: 'pending', note: null};
+  const config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], log_channels: [], badwords: []};
+  const h = harness(async (url, opts) => {
+    if (url.endsWith('/config')) return response({...config, badwords: [word]});
+    calls.push(opts);
+    return calls.length === 1
+      ? {ok: true, status: 202, headers: {get: () => null}, text: async () => JSON.stringify({code: 'save_pending', error: 'Save accepted and still pending. Retry to check its result.'})}
+      : response({ok: true, id: 8});
+  });
+  h.app.state.config = config;
+  h.app.state.tab = 'badwords';
+  h.app.renderTab();
+  const pattern = h.document.querySelector('input');
+  pattern.value = 'pending'; await fire(pattern, 'input');
+  const add = () => [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
+  await fire(add(), 'click');
+  assert.equal(h.document.querySelector('input').value, 'pending');
+  assert.equal(h.app.isDirty(), true);
+  assert.match(h.nodes.get('#toast').textContent, /accepted and still pending/);
+  assert.doesNotMatch(h.nodes.get('#toast').textContent, /added|failed/i);
+  assert.equal(h.session.size, 1);
+  await fire(add(), 'click');
+  assert.equal(h.app.state.config.badwords.length, 1);
+  assert.equal(h.app.state.config.badwords[0].id, 8);
+  assert.equal(calls[1].headers['x-jmodguard-save-lookup'], '1');
+});
+
+test('retrieved save refreshes configuration instead of appending its old patch again', async () => {
+  const session = new Map(), path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async () => {throw new Error('lost');}, new Map(), session);
+  first.app.state.config = {enrollment_id: 'membership'};
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once', scope: 'guild', note: null}));
+  const word = {id: 7, guild_id: '987654321098765432', pattern: 'once', note: null};
+  const config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], log_channels: [], badwords: [word]};
+  let reads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/config')) {reads++; return response(config);}
+    return response({ok: true, id: 7, config_patch: {kind: 'badword', operation: 'add', value: word}});
+  }, new Map(), session);
+  h.app.state.config = structuredClone(config);
+  h.app.state.tab = 'badwords';
+  h.app.renderTab();
+  const pattern = h.document.querySelector('input');
+  pattern.value = 'once'; await fire(pattern, 'input');
+  const add = [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
+  await fire(add, 'click');
+  await settle();
+  assert.equal(reads, 1, 'a historical acknowledgement must refresh the current configuration');
+  assert.equal(h.app.state.config.badwords.length, 1);
+  assert.equal(h.app.state.config.badwords[0].id, 7);
+});
+
+test('retrieved pre-apply expiry settles the save identity but uncertain failures retain it', async () => {
+  const calls = [], path = '/api/guilds/987654321098765432/badwords';
+  const h = harness(async (_, opts) => {
+    calls.push(opts);
+    if (calls.length === 1) throw new Error('lost acknowledgement');
+    if (calls.length === 2) return {ok: false, status: 409, headers: {get: () => null}, text: async () => JSON.stringify({code: 'save_expired', error: 'Save expired before it was applied.'})};
+    return response({ok: true, id: 9});
+  });
+  h.app.state.config = {enrollment_id: 'membership'};
+  const save = () => h.app.api(path, 'POST', {scope: 'guild', pattern: 'once'});
+  await assert.rejects(save(), /lost acknowledgement/);
+  assert.equal(h.session.size, 1);
+  await assert.rejects(save(), /expired/);
+  assert.equal(h.session.size, 0, 'the definitive non-applied result settles the identity');
+  await save();
+  assert.deepEqual(calls.map(c => c.headers['x-jmodguard-save-lookup']), ['0', '1', '0']);
+  assert.equal(calls[0].headers['x-jmodguard-save'], calls[1].headers['x-jmodguard-save']);
+  assert.notEqual(calls[1].headers['x-jmodguard-save'], calls[2].headers['x-jmodguard-save']);
+});
+
+test('an unclassified save failure retains identity even when its message says expired', async () => {
+  const calls = [];
+  const h = harness(async (_, opts) => {
+    calls.push(opts);
+    return {ok: false, status: 400, headers: {get: () => null}, text: async () => JSON.stringify({error: 'request expired'})};
+  });
+  const save = () => h.app.api('/api/guilds/987654321098765432/badwords', 'POST', {pattern: 'once'});
+  await assert.rejects(save(), /expired/);
+  await assert.rejects(save(), /expired/);
+  assert.equal(h.session.size, 1);
+  assert.deepEqual(calls.map(c => c.headers['x-jmodguard-save-lookup']), ['0', '1']);
+  assert.equal(calls[0].headers['x-jmodguard-save'], calls[1].headers['x-jmodguard-save']);
+});
+
+test('save identity cannot move to a replacement membership or dispatch without storage', async () => {
+  const session = new Map();
+  const path = '/api/guilds/987654321098765432/badwords';
+  const first = harness(async () => {throw new Error('lost');}, new Map(), session);
+  first.app.state.config = {enrollment_id: 'old'};
+  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once'}));
+  let calls = 0;
+  const next = harness(async () => {calls++;}, new Map(), session, () => false);
+  next.app.state.config = {enrollment_id: 'replacement'};
+  await assert.rejects(next.app.api(path, 'POST', {pattern: 'once'}), /not submitted/);
+  assert.equal(calls, 0);
+  const blocked = harness(async () => {calls++;}, new Map(), {get() {throw new Error('disabled');}});
+  blocked.app.state.config = {enrollment_id: 'membership'};
+  await assert.rejects(blocked.app.api(path, 'POST', {pattern: 'once'}), /session storage/);
+  assert.equal(calls, 0);
+});
 
 test('lost action acknowledgment reuses request and membership across reload', async () => {
   const calls = [], session = new Map();
@@ -2005,7 +2203,7 @@ test('moderation and member reads send the loaded page membership including quer
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=willow', 'members/1800882749273538599/history', 'member-sync']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=test-member-1', 'members/10002/history', 'member-sync']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -2435,15 +2633,15 @@ test('private downloads share preview authentication-loss handling', async () =>
 
 test('parseSnowflake keeps IDs as digit strings', () => {
   const h = harness();
-  assert.equal(h.app.parseSnowflake('1329331947876479006'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('<#1329331947876479006>'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('https://discord.com/channels/10/1329331947876479006'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('9007199254740993'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('<#9007199254740993>'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('https://discord.com/channels/10/9007199254740993'), '9007199254740993');
   assert.equal(h.app.parseSnowflake('general'), '');
-  assert.equal(h.app.parseSnowflake('<@&1329331947876479006>'), '1329331947876479006');
-  assert.equal(h.app.parseSnowflake('<@!1329331947876479006>'), '1329331947876479006');
-  const roles = h.app.splitIds('<@&1329331947876479006>, 11');
+  assert.equal(h.app.parseSnowflake('<@&9007199254740993>'), '9007199254740993');
+  assert.equal(h.app.parseSnowflake('<@!9007199254740993>'), '9007199254740993');
+  const roles = h.app.splitIds('<@&9007199254740993>, 11');
   assert.equal(roles.length, 2);
-  assert.equal(roles[0], '1329331947876479006');
+  assert.equal(roles[0], '9007199254740993');
   assert.equal(roles[1], '11');
   const empty = h.app.splitIds('');
   assert.equal(empty.length, 0);
@@ -2790,6 +2988,47 @@ test('appearance retains the session choice across startup and workspace when st
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });
 
+test('custom rule rename updates the card heading after save without reloading', async () => {
+  const id = 'custom:0123456789abcdef';
+  const calls = [];
+  let acknowledge;
+  const h = harness(async (url, options) => {
+    calls.push({ url, method: options.method, body: JSON.parse(options.body) });
+    assert.equal(options.method, 'PUT');
+    assert.ok(url.endsWith(`/rules/${id}`));
+    return new Promise(resolve => { acknowledge = resolve; });
+  });
+  const rule = {
+    name: 'Original name', enabled: true, dry_run: true,
+    params: { kind: 'pattern', pattern: 'scam' },
+    actions: [{ at: 1, action: 'delete', duration_minutes: 0, delete_days: 0, reason: '' }],
+  };
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    rules: [{ rule_id: id, name: rule.name, effective: rule, guild_override: rule, global: null }],
+  };
+  h.app.navigate('rules');
+  const heading = () => h.document.querySelector('#content .rule-heading h3').textContent;
+  assert.equal(heading(), 'Original name');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  const modal = h.document.querySelector('.modal-overlay');
+  const nameField = [...modal.querySelectorAll('.field')].find(n => n.querySelector('label')?.textContent === 'Name');
+  const name = nameField.querySelector('input');
+  name.value = 'Renamed rule';
+  await fire(name, 'input');
+  assert.equal(heading(), 'Original name');
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(calls[0].body.data.name, 'Renamed rule');
+  assert.equal(heading(), 'Original name');
+  acknowledge(response({ ok: true, config_patch: { kind: 'rule', id, scope: 'guild', value: calls[0].body.data } }));
+  await settle();
+  assert.equal(h.document.querySelector('.modal-overlay'), null);
+  assert.equal(heading(), 'Renamed rule');
+  assert.equal(calls.length, 1, 'the acknowledged patch must not need a configuration reload');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  assert.equal(h.document.querySelector('.modal-overlay h3').textContent, 'Edit custom rule: Renamed rule');
+});
+
 test('honeypot switch shows the kick action that save submits', async () => {
   const calls = [];
   const h = harness(async (_url, options) => {
@@ -2880,4 +3119,413 @@ test('transient Discord errors leave Members polling and sign-in state unchanged
   }
   assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
   assert.ok(h.app.state.me);
+});
+
+test('known-bad images renders hash-only metadata and searches without re-fetching', async () => {
+  const requests = [];
+  const h = harness(async (url, options) => { requests.push({url, options}); return response({}); });
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_bad_images: [
+    {hash: 'ab'.repeat(32), added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'confirmed spam'},
+    {hash: 'cd'.repeat(32), added_at: '2026-01-02T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'other'},
+  ] };
+  const panel = h.app.tabKnownBadImages();
+  assert.match(textOf(panel), /confirmed spam/);
+  assert.match(textOf(panel), /unknown/);
+  const search = panel.querySelector('input');
+  search.value = 'confirmed'; await fire(search, 'input');
+  assert.match(textOf(panel), /confirmed spam/);
+  assert.doesNotMatch(textOf(panel), /cdcdcdcd/);
+  assert.equal(requests.length, 0);
+  const add = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash');
+  assert.equal(add.disabled, true);
+  const digest = panel.querySelectorAll('input')[1];
+  digest.value = 'ab'.repeat(32); await fire(digest, 'input');
+  assert.equal(add.disabled, false);
+});
+
+test('known-bad image writes retain the loaded page membership and send only metadata', async () => {
+  const requests = [];
+  const h = harness(async (url, options) => { requests.push({url, options}); return response({ok: true}); });
+  h.app.state.config = {enrollment_id: 'fixture-membership', known_bad_images: []};
+  const hash = 'ab'.repeat(32);
+  const base = `/api/guilds/${h.app.state.guildId}/known-bad-images`;
+  await h.app.api(base, 'POST', {hash, note: 'confirmed spam'});
+  await h.app.api(`${base}/${hash}`, 'DELETE');
+  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert.equal(requests[1].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert.deepEqual(JSON.parse(requests[0].options.body), {hash, note: 'confirmed spam'});
+});
+
+
+test('known-bad image add and remove buttons save then reload the coherent list', async () => {
+  const requests = [], hash = 'ab'.repeat(32);
+  let rows = [];
+  const config = () => ({enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: []});
+  const h = harness(async (url, options) => {
+    requests.push({url, options});
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body);
+      assert.deepEqual(payload, {hash, note: 'confirmed spam'});
+      rows = [{hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note}];
+    } else if (options.method === 'DELETE') rows = [];
+    return response({ok: true, changed: true});
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = hash; await fire(inputs[1], 'input');
+  inputs[2].value = 'confirmed spam'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  panel = h.app.tabKnownBadImages();
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+  const removal = requests.find(r => r.options.method === 'DELETE');
+  assert.equal(removal.options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  assert(removal.url.endsWith(hash));
+});
+
+test('known-bad image remove keeps unrelated add drafts', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  let rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') rows = [];
+    return response({ ok: true, changed: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  assert.equal(h.app.isDirty(), true);
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, draftHash);
+  assert.equal(after[2].value, 'draft note');
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+});
+
+test('known-bad image add clears only its draft fields', async () => {
+  const hash = 'ab'.repeat(32);
+  let rows = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body);
+      rows = [{ hash: payload.hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note }];
+    }
+    return response({ ok: true, changed: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = hash; await fire(inputs[1], 'input');
+  inputs[2].value = 'saved note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const cleared = panel.querySelectorAll('input');
+  assert.equal(cleared[1].value, '');
+  assert.equal(cleared[2].value, '');
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('known-bad image delete 429 keeps draft and listed row', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  const rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
+    return response({ ok: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('known-bad image delete succeeds after 429 without losing unrelated draft', async () => {
+  const listed = 'ab'.repeat(32);
+  const draftHash = 'cd'.repeat(32);
+  let rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
+  let deleteCalls = 0;
+  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'DELETE') {
+      deleteCalls += 1;
+      if (deleteCalls === 1) return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
+      rows = [];
+      return response({ ok: true, changed: true });
+    }
+    return response({ ok: true });
+  });
+  h.app.state.config = config();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = draftHash; await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 0);
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, draftHash);
+  assert.equal(after[2].value, 'draft note');
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('known-bad drafts do not restore after enrollment replacement', async () => {
+  const h = harness(async url => response(url.endsWith('/config') ? { enrollment_id: 'replacement', known_bad_images: [], log_channels: [] } : {}));
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_bad_images: [], log_channels: [] };
+  h.app.state.tab = 'known-bad-images';
+  h.app.renderTab();
+  await settle();
+  let panel = h.app.tabKnownBadImages();
+  await settle();
+  const inputs = panel.querySelectorAll('input');
+  inputs[1].value = 'cd'.repeat(32); await fire(inputs[1], 'input');
+  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
+  await h.app.handleEvent(async () => {
+    h.app.state.config = { ...h.app.state.config, enrollment_id: 'replacement' };
+    h.app.renderTab();
+  }, {});
+  await settle();
+  panel = h.app.tabKnownBadImages();
+  await settle();
+  const after = panel.querySelectorAll('input');
+  assert.equal(after[1].value, '');
+  assert.equal(after[2].value, '');
+  assert.equal(h.app.isDirty(), false);
+});
+
+for (const reload of [false, true]) test(`role retry preserves its captured revision after ${reload ? 'reload' : 'a sibling save remount'}`, async () => {
+  const calls = [];
+  let revision = '11111111111111111111111111111111', roles = ['1'], roleWrites = 0;
+  const config = {enrollment_id:'abcdef0123456789abcdef0123456789', settings:{prefix:'!',bot_name:''}, settings_override:{}, global_settings:{prefix:'/'}, rules:[], commands:[], badwords:[], log_channels:[]};
+  const session = new Map();
+  const fetchRoles = async (url,opts) => {
+    const body=opts.body ? JSON.parse(opts.body):null;
+    calls.push({url,opts,body});
+    if(url.endsWith('/case-delete-roles') && opts.method==='POST') return response({roles,revision});
+    if(url.endsWith('/case-delete-roles') && opts.method==='PUT') {
+      if(opts.headers['x-jmodguard-save-lookup']==='1') {
+        assert.deepEqual(body, {roles:['2'],revision:'1'.repeat(32)}, 'lookup must hash the complete original operation');
+        return response({revision:'2'.repeat(32)});
+      }
+      assert.equal(body.revision, revision, 'fixture must enforce the current role revision just like production');
+      roleWrites++;
+      if(roleWrites===1) {roles=['2']; revision='22222222222222222222222222222222'; throw new Error('ack lost');}
+      roles=body.roles; revision='44444444444444444444444444444444'; return response({revision});
+    }
+    if(url.endsWith('/settings')) return response({config_patch:{kind:'settings',scope:'guild',settings:{prefix:'?',bot_name:''},prefix_present:true,prefix:'?'}});
+    throw new Error('unexpected '+url);
+  };
+  const make = () => {
+    const page = harness(fetchRoles, new Map(), session);
+    page.app.state.config = structuredClone(config); page.app.state.tab = 'settings'; page.app.renderTab();
+    return page;
+  };
+  let h = make();
+  h.app.state.config=config; h.app.state.tab='settings'; h.app.renderTab(); await settle();
+  const roleInput=()=>h.elements.find(n=>n.localName==='input' && /role id/i.test(n.getAttribute('placeholder')||''));
+  const roleSave=()=>h.elements.find(n=>n.localName==='button' && n.textContent==='Save case-removal roles');
+  roleInput().value='2'; await fire(roleInput(),'input'); await fire(roleSave(),'click');
+  // An independent administrator changed roles after the first save committed.
+  roles=['3']; revision='33333333333333333333333333333333';
+  if (reload) {
+    h = make(); await settle();
+    roleInput().value='2'; await fire(roleInput(),'input');
+  } else {
+    const prefix=h.elements.find(n=>n.localName==='input' && n.value==='!');
+    prefix.value='?'; await fire(prefix,'input');
+    await fire(h.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+    await settle();
+  }
+  assert.equal(roleInput().value,'2','unrelated prefix save preserves the unresolved role draft');
+  await fire(roleSave(),'click');
+  const puts=calls.filter(c=>c.url.endsWith('/case-delete-roles') && c.opts.method==='PUT');
+  assert.equal(puts[1].opts.headers['x-jmodguard-save-lookup'],'1','retry must retrieve accepted original identity');
+  assert.equal(puts[1].opts.headers['x-jmodguard-save'],puts[0].opts.headers['x-jmodguard-save']);
+  assert.equal(roleWrites,1,'retry may not replace newer roles');
+  assert.deepEqual(roles,['3']);
+  assert.equal(roleInput().value,'3','recovery displays current roles');
+  assert.equal(session.size,0);
+  roleInput().value='4'; await fire(roleInput(),'input'); await fire(roleSave(),'click');
+  const next = calls.filter(c=>c.url.endsWith('/case-delete-roles') && c.opts.method==='PUT')[2];
+  assert.equal(next.body.revision,'3'.repeat(32),'next edit uses reconciled revision');
+  assert.equal(next.opts.headers['x-jmodguard-save-lookup'],'0');
+  assert.notEqual(next.opts.headers['x-jmodguard-save'],puts[0].opts.headers['x-jmodguard-save']);
+  assert.equal(roleWrites,2);
+});
+
+for (const recovering of [false, true]) test(`role save with a pending initial read ${recovering ? 'recovers its accepted revision' : 'waits before capturing a new revision'}`, async () => {
+  const calls = [], session = new Map();
+  const originalRevision = '1'.repeat(32), currentRevision = '3'.repeat(32);
+  const config = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+  let resolveInitialRead, reads = 0, writes = 0, receipt;
+  const fetchRoles = async (url, opts) => {
+    assert.ok(url.endsWith('/case-delete-roles'));
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ opts, body });
+    if (opts.method === 'POST') {
+      reads++;
+      if (reads === 1) return new Promise(resolve => { resolveInitialRead = resolve; });
+      return response({ roles: ['3'], revision: currentRevision });
+    }
+    if (opts.headers['x-jmodguard-save-lookup'] === '1') {
+      assert.deepEqual(body, { roles: ['2'], revision: originalRevision });
+      return response(receipt);
+    }
+    const expectedRevision = recovering && writes > 0 ? currentRevision : originalRevision;
+    if (body.revision !== expectedRevision) {
+      return { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'tenant settings changed' }) };
+    }
+    writes++;
+    receipt = { revision: '2'.repeat(32) };
+    if (recovering && writes === 1) throw new Error('acknowledgement lost');
+    return response(receipt);
+  };
+  if (recovering) {
+    const original = harness(fetchRoles, new Map(), session);
+    original.app.state.config = structuredClone(config);
+    await assert.rejects(original.app.api(`/api/guilds/${original.app.state.guildId}/case-delete-roles`, 'PUT', {
+      roles: ['2'], revision: originalRevision,
+    }), /acknowledgement lost/);
+  }
+  const h = harness(fetchRoles, new Map(), session);
+  h.app.state.config = structuredClone(config);
+  h.app.state.tab = 'settings'; h.app.renderTab(); await settle();
+  const input = () => h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute('placeholder') || ''));
+  const save = () => h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
+  const puts = () => calls.filter(c => c.opts.method === 'PUT');
+  input().value = '2'; await fire(input(), 'input'); await fire(save(), 'click');
+  if (recovering) {
+    assert.deepEqual(puts().map(c => c.opts.headers['x-jmodguard-save-lookup']), ['0', '1']);
+    assert.equal(puts()[1].opts.headers['x-jmodguard-save'], puts()[0].opts.headers['x-jmodguard-save']);
+    assert.equal(writes, 1, 'recovery before the initial read completes must not mutate again');
+    assert.equal(input().value, '3');
+  } else {
+    assert.equal(puts().length, 0, 'a loading placeholder must not be submitted or retained as a save');
+    assert.equal(session.size, 0);
+    assert.equal(input().value, '2');
+    assert.equal(h.app.isDirty(), true);
+    assert.match(h.nodes.get('#toast').textContent, /roles.*load/i);
+  }
+  resolveInitialRead(response({ roles: ['1'], revision: originalRevision })); await settle();
+  if (recovering) {
+    assert.equal(input().value, '3', 'the late initial read must not replace reconciled roles');
+    input().value = '4'; await fire(input(), 'input');
+  }
+  await fire(save(), 'click');
+  const latest = puts().at(-1);
+  assert.equal(latest.opts.headers['x-jmodguard-save-lookup'], '0');
+  assert.equal(latest.body.revision, recovering ? currentRevision : originalRevision);
+  assert.deepEqual(latest.body.roles, recovering ? ['4'] : ['2']);
+  assert.equal(writes, recovering ? 2 : 1);
+  assert.equal(session.size, 0);
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('untouched rule reload recovers reordered nested parameters', async () => {
+  const wire = value => Array.isArray(value) ? value.map(wire) : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).sort().map(key=>[key,wire(value[key])])) : value;
+  const first = await ruleSaveHarness({scope:'guild', override:true});
+  const membership = 'abcdef0123456789abcdef0123456789';
+  first.app.state.config.enrollment_id = membership;
+  const initial = wire(first.app.state.config.rules[0]);
+  first.app.state.config.rules[0] = initial;
+  await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Cancel'),'click');
+  await first.app.editRule(initial);
+  first.failures.lost = true;
+  const params = first.document.querySelector('.modal-overlay textarea');
+  params.value = '{"z":1,"a":2}'; await fire(params,'input');
+  await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+  const original = first.calls.find(c=>c.method==='PUT');
+  assert.equal(first.session.size,1);
+  const current = wire(first.snapshot().rules[0]); // production /config builds serde_json::Value, ordered object maps
+  const nextConfig = {enrollment_id:membership,settings:{prefix:'!',bot_name:''},rules:[current],commands:[],badwords:[],templates:[],log_channels:[]};
+  const calls = [];
+  const next = harness(async (url,opts) => {
+    calls.push({url,opts,body:opts.body && JSON.parse(opts.body)});
+    if (opts.method === 'PUT') {
+      assert.equal(opts.headers['x-jmodguard-save-lookup'],'1','reloaded editor must query, never apply a second mutation');
+      return response({ok:true});
+    }
+    return response(nextConfig);
+  },new Map(),first.session);
+  next.app.state.me.is_bot_owner = true;
+  next.app.state.config = nextConfig;
+  next.app.state.tab = 'rules';
+  await next.app.editRule(current);
+  // No input, change or scope event occurs in this reloaded editor.
+  await fire(next.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
+  const retry = calls.find(c=>c.opts.method==='PUT');
+  assert.deepEqual(wire(original.body), wire(retry.body),'complete captured request has identical values');
+  assert.equal(retry.opts.headers['x-jmodguard-save-lookup'],'1','untouched reloaded request must recover the accepted identity');
+  assert.equal(retry.opts.headers['x-jmodguard-save'],original.headers['x-jmodguard-save']);
+});
+
+test('nested command matching preserves array order and changed values as new saves', async () => {
+  const calls = [], session = new Map(), path = '/api/guilds/987654321098765432/commands/test';
+  const h = harness(async (_, opts) => { calls.push(opts); throw new Error('lost'); }, new Map(), session);
+  h.app.state.config = {enrollment_id:'abcdef0123456789abcdef0123456789'};
+  const body = {scope:'guild',data:{name:'test',aliases:[],category:'',description:'',usage:'',enabled:true,permission:'everyone',roles:[],channels:[],cooldown_secs:0,response:'',log_event:'',behavior:{kind:'plan',params:{steps:[{type:'log',event:'join',template:'first'},{type:'reply',template:'second'}]}}}};
+  await assert.rejects(h.app.api(path,'PUT',body));
+  const reordered = structuredClone(body);
+  reordered.data.behavior.params.steps[0] = {template:'first',event:'join',type:'log'};
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  reordered.data.behavior.params.steps.reverse();
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  reordered.data.behavior.params.steps[0].template = 'changed';
+  await assert.rejects(h.app.api(path,'PUT',reordered));
+  assert.deepEqual(calls.map(c=>c.headers['x-jmodguard-save-lookup']),['0','1','0','0']);
+  assert.equal(calls[0].headers['x-jmodguard-save'],calls[1].headers['x-jmodguard-save']);
+  assert.notEqual(calls[1].headers['x-jmodguard-save'],calls[2].headers['x-jmodguard-save']);
+  assert.notEqual(calls[2].headers['x-jmodguard-save'],calls[3].headers['x-jmodguard-save']);
+});
+
+test('reordered global rule retry preserves a newer guild override', async () => {
+  const h = await ruleSaveHarness({scope:'global', override:true});
+  h.app.state.config.enrollment_id = 'abcdef0123456789abcdef0123456789';
+  h.failures.lost = true;
+  const params = h.document.querySelector('.modal-overlay textarea');
+  params.value = '{"z":1,"a":2}'; await fire(params,'input'); await fire(h.save,'click');
+  const first = h.calls.find(c=>c.method==='PUT');
+  assert.equal(first.body.scope,'global');
+  assert.equal(first.body.clear_guild_override,true);
+  h.replaceOverride({...h.snapshot().rules[0].global, name:'Newer override'});
+  h.failures.lost = false;
+  params.value = '{"a":2,"z":1}'; await fire(params,'input'); await fire(h.save,'click');
+  const retry = h.calls.filter(c=>c.method==='PUT')[1];
+  assert.deepEqual(retry.body,first.body,'JSON member order preserves complete payload values');
+  assert.equal(retry.headers['x-jmodguard-save-lookup'],'1');
+  assert.equal(retry.headers['x-jmodguard-save'],first.headers['x-jmodguard-save']);
+  assert.equal(h.snapshot().rules[0].guild_override.name,'Newer override');
 });

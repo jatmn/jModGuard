@@ -928,7 +928,9 @@ fn member_audit_vars(
             "reason".into(),
             entry
                 .reason
-                .clone()
+                .as_deref()
+                .map(jmodguard::ban_reason::without_tag)
+                .map(str::to_owned)
                 .filter(|reason| !reason.trim().is_empty())
                 .unwrap_or_else(|| "No reason provided".into()),
         ),

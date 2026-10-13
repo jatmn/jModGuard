@@ -17,7 +17,7 @@ contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
 Build and publish the five `dist/frontend/` files for an initial manual setup, including the
-Administration page. New trusted Buildkite publications also create an independent
+Administration page. New trusted GitHub Actions publications also create an independent
 WebUI GHCR package; the owner update path is described in
 [BUNNY-UPDATES.md](BUNNY-UPDATES.md). A private ops repository is not required.
 
@@ -165,35 +165,28 @@ these files.
 
 ## 3. Build and publish both images
 
-Buildkite's self-hosted `linux` queue runs the checks selected for that
-diff and publishes the bot/API images after those checks pass. Docs-only
-and other non-image diffs do not run the full Rust suite. Scheduled, tag,
-and manual publication builds still run every check. This repository has no GitHub Actions CI or
-image jobs or runner fallback. The Socket Security manifest scan is not a CI or image job. Set the repository
-Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on
-the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
-The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
-A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
-After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
-Dependabot version updates use GitHub-hosted
-dynamic workflows only while **Dependabot on self-hosted runners** stays
-disabled; they are not image publication. GitHub still displays the Buildkite status and a link to
-its build logs. See [Buildkite setup](BUILDKITE.md) for GHCR credentials,
-agent requirements, tag builds and manual publication.
+GitHub Actions selects affected checks and publishes the three packages after
+successful trusted checks. Documentation-only PRs skip Rust compilation. The
+workflow uses standard GitHub-hosted runners; there are no GitHub Actions self-hosted
+runners. See [CI and publishing](CI.md) for package access, source selection and
+retry behavior. Keep **Dependabot on self-hosted runners** disabled.
 
-- **Push to `main`**: each component compares its Docker inputs with its last
-  published source revision by inspecting public GHCR history before fetching GHCR push credentials. Unchanged inputs (including frontend-only changes)
-  skip the image build. Private packages still require registry access and may rebuild. Both Dockerfiles consume shared Rust source and migrations,
-  so those changes can rebuild both images, once each. Missing revision/history
-  information conservatively causes a rebuild.
-- **Tag build**: when Buildkite's **Build tags** setting is enabled, a pushed tag
-  publishes both images after tests. This replaces the GitHub Release trigger;
-  publishing a GitHub Release alone does not create an additional image build.
-- **Manual publication**: start a Buildkite build on current `main` with
-  `JMODGUARD_PUBLISH_SOURCE` set to a full lowercase 40-character commit SHA or
-  `refs/tags/<tag>`. A single preparation job resolves that source for both
-  images. Plain branch names and abbreviated SHAs are rejected. A manual build
-  without this variable runs tests only. PR builds never publish.
+Set the
+repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
+relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. The CI passed check remains the merge gate.
+After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
+
+- **Push to `main`**: publish components whose production inputs changed since
+  their last verified publication. Missing history conservatively rebuilds.
+- **Stable release**: Release Please creates a tag after the owner merges its
+  release PR; that successful workflow publishes the release's source SHA,
+  even if it differs from the triggering commit. Owner-pushed `v*`
+  tags also run validation and publication.
+- **Manual publication**: the owner runs **Publish → Run workflow** on `main` with
+  `source` set to a full commit SHA or `refs/tags/<tag>`. All images share one
+  resolved source. Empty `source` runs checks only. PR builds never publish.
 
 There is nothing for Magic Containers to pull until one of those publishes.
 Each run retags `:latest` for **that** package and retains older versions.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish one GHCR image from a trusted Buildkite build, without a GHA runner.
+# Publish a verified GHCR image from a trusted GitHub Actions run.
 set -euo pipefail
 
 REPOSITORY='https://github.com/jatmn/jModGuard'
@@ -13,55 +13,58 @@ publish_fail() {
 
 run_git() { git "$@" || publish_fail "git failed: $*"; }
 run_docker() { docker "$@" || publish_fail "docker failed: $*"; }
-run_bk() { buildkite-agent "$@" || publish_fail "buildkite-agent failed: $*"; }
+read_publication_plan() {
+  if [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" ]]; then
+    printf '%s\n' "$JMODGUARD_PUBLICATION_PLAN"
+  else
+    cat "${JMODGUARD_PUBLICATION_PLAN_FILE:?publication plan path is required}"
+  fi
+}
 
-bk_meta_exists() {
-  buildkite-agent meta-data exists image-publication >/dev/null
+publication_plan_exists() {
+  [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" || -f "${JMODGUARD_PUBLICATION_PLAN_FILE:-}" ]]
+}
+
+write_publication_plan() {
+  local file="${JMODGUARD_PUBLICATION_PLAN_FILE:?publication plan path is required}"
+  printf '%s\n' "$1" >"$file"
 }
 
 publish_request() {
-  if [[ "${BUILDKITE:-}" != "true" ]]; then
-    publish_fail 'Image publication must run in Buildkite'
-  fi
-  if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
-    echo skip
-    return 0
-  fi
-  local source="${BUILDKITE_SOURCE:-}"
-  local branch="${BUILDKITE_BRANCH:-}"
-  local tag="${BUILDKITE_TAG:-}"
+  [[ "${GITHUB_ACTIONS:-}" == true ]] || publish_fail 'Image publication must run in GitHub Actions'
+  [[ "${GITHUB_REPOSITORY:-}" == jatmn/jModGuard ]] || { echo skip; return; }
+  local event="${GITHUB_EVENT_NAME:-}" ref="${GITHUB_REF:-}"
   local manual="${JMODGUARD_PUBLISH_SOURCE:-}"
-  if [[ "$source" == "ui" || "$source" == "api" ]]; then
-    if [[ -z "$manual" ]]; then
-      echo skip
-      return 0
-    fi
-    if [[ "$branch" != "main" || -n "$tag" ]]; then
-      publish_fail 'Manual publication requires a UI/API build on main'
-    fi
-    if [[ ! "$manual" =~ $SHA_RE && "$manual" != refs/tags/* ]]; then
-      publish_fail 'JMODGUARD_PUBLISH_SOURCE must be a full lowercase SHA or refs/tags/<tag>'
-    fi
-    printf 'manual\t%s\n' "$manual"
-    return 0
-  fi
-  if [[ -n "$tag" && "$source" == "webhook" ]]; then
-    printf 'tag\t%s\n' "refs/tags/${tag}"
-    return 0
-  fi
-  if [[ "$source" == "schedule" && "$branch" == "main" && -z "$tag" ]]; then
-    printf 'nightly\t\n'
-    return 0
-  fi
-  if [[ "$source" == "webhook" && "$branch" == "main" && -z "$tag" ]]; then
-    if [[ "${BUILDKITE_GITHUB_EVENT:-push}" != "push" ]]; then
-      echo skip
-      return 0
-    fi
-    printf 'main\t\n'
-    return 0
-  fi
-  echo skip
+  case "$event" in
+    pull_request|pull_request_target|merge_group) echo skip; return ;;
+    workflow_dispatch)
+      [[ "$ref" == refs/heads/main ]] || publish_fail 'Manual publication requires main'
+      [[ "${GITHUB_ACTOR:-}" == jatmn && "${GITHUB_TRIGGERING_ACTOR:-}" == jatmn && "${GITHUB_ACTOR_ID:-}" == 12479882 ]] \
+        || publish_fail 'Manual publication requires the repository owner'
+      [[ -n "$manual" ]] || { echo skip; return; }
+      [[ "$manual" =~ $SHA_RE || "$manual" == refs/tags/* ]] \
+        || publish_fail 'JMODGUARD_PUBLISH_SOURCE must be a full lowercase SHA or refs/tags/<tag>'
+      printf 'manual\t%s\n' "$manual" ;;
+    push)
+      if [[ "$ref" == refs/heads/main ]]; then
+        if [[ -n "${JMODGUARD_RELEASE_TAG:-}" ]]; then
+          stable_tag "$JMODGUARD_RELEASE_TAG" || publish_fail 'Invalid Release Please tag'
+          [[ "${JMODGUARD_RELEASE_SHA:-}" =~ $SHA_RE ]] || publish_fail 'Invalid Release Please SHA'
+          printf 'release\trefs/tags/%s\n' "$JMODGUARD_RELEASE_TAG"
+        else
+          printf 'main\t\n'
+        fi
+      elif [[ "$ref" == refs/tags/* ]]; then
+        [[ "${GITHUB_ACTOR:-}" == jatmn && "${GITHUB_TRIGGERING_ACTOR:-}" == jatmn && "${GITHUB_ACTOR_ID:-}" == 12479882 ]] \
+          || publish_fail 'Tag publication requires the repository owner'
+        printf 'tag\t%s\n' "$ref"
+      else
+        echo skip
+      fi ;;
+    schedule)
+      [[ "$ref" == refs/heads/main ]] && printf 'nightly\t\n' || echo skip ;;
+    *) echo skip ;;
+  esac
 }
 
 stable_tag() {
@@ -76,7 +79,7 @@ channel_for() {
     echo nightly
     return 0
   fi
-  if [[ "$mode" == "tag" || "$mode" == "manual" ]] && stable_tag "$tag"; then
+  if [[ "$mode" == "tag" || "$mode" == "manual" || "$mode" == "release" ]] && stable_tag "$tag"; then
     echo stable
     return 0
   fi
@@ -110,7 +113,10 @@ resolve_source() {
       label=""
     fi
     if [[ "$mode" == "tag" && "$sha" != "$head" ]]; then
-      publish_fail 'Tag moved after the Buildkite checkout; create a new build'
+      publish_fail 'Tag moved after the workflow checkout; create a new build'
+    fi
+    if [[ "$mode" == "release" && "$sha" != "${JMODGUARD_RELEASE_SHA:-}" ]]; then
+      publish_fail 'Tag differs from the Release Please source SHA'
     fi
   else
     [[ "$ref" =~ $SHA_RE ]] || publish_fail 'Expected an immutable full commit SHA'
@@ -168,17 +174,17 @@ changed_since_publication() {
   # COPY crates/ supplies Cargo workspace layout, not a production dependency
   # on every service. Keep every manifest (resolution), but only linked source.
   local -a inputs=(
-    "Dockerfile.${component}" "Dockerfile.${component}.dockerignore" .dockerignore
+    "Dockerfile.${component}" "Dockerfile.${component}.dockerignore" .dockerignore LICENSE.md
     Cargo.toml Cargo.lock rust-toolchain.toml ':(glob)crates/*/Cargo.toml'
-    src migrations vendor crates/bot crates/api crates/runtime crates/updater
-    .buildkite/publish-image.sh scripts/bootstrap-container.sh
+    src migrations vendor "crates/${component}" crates/runtime crates/updater
+    scripts/publish-image.sh scripts/bootstrap-container.sh
     ':(exclude,glob)crates/*/tests/**'
     ':(exclude,glob)crates/*/benches/**'
     ':(exclude,glob)crates/*/examples/**'
   )
   if [[ "$component" == "webui" ]]; then
-    inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
-      frontend tools/webui scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
+    inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore LICENSE.md
+      frontend tools/webui scripts/package-webui.mjs scripts/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0
@@ -292,7 +298,7 @@ JS
 
 checked_request() {
   local selection mode ref head
-  selection="$(publish_request)"
+  selection="$(publish_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo skip
     return 0
@@ -300,8 +306,8 @@ checked_request() {
   mode="${selection%%$'\t'*}"
   ref="${selection#*$'\t'}"
   head="$(run_git rev-parse HEAD)"
-  [[ "$head" =~ $SHA_RE && "${BUILDKITE_COMMIT:-}" == "$head" ]] \
-    || publish_fail 'Buildkite commit does not match the checked-out full SHA'
+  [[ "$head" =~ $SHA_RE && "${GITHUB_SHA:-}" == "$head" ]] \
+    || publish_fail 'workflow commit does not match the checked-out full SHA'
   if [[ -n "$(run_git status --porcelain --untracked-files=no)" ]]; then
     publish_fail 'Refusing to publish a checkout with tracked modifications'
   fi
@@ -313,7 +319,7 @@ read_plan() {
   local ref="$2"
   local head="$3"
   local planned check sha label
-  planned="$(run_bk meta-data get image-publication)"
+  planned="$(read_publication_plan)"
   check="$(PLAN_JSON="$planned" PLAN_MODE="$mode" PLAN_REF="$ref" PLAN_HEAD="$head" node --input-type=commonjs - <<'JS'
 const planned = JSON.parse(process.env.PLAN_JSON);
 const mode = process.env.PLAN_MODE;
@@ -332,15 +338,18 @@ JS
 )" || publish_fail 'Invalid image publication plan'
   sha="${check%%$'\t'*}"
   label="${check#*$'\t'}"
-  if [[ "$mode" != "manual" && "$sha" != "$head" ]]; then
-    publish_fail 'Publication plan differs from the Buildkite commit'
+  if [[ "$mode" == "release" ]]; then
+    [[ "$sha" == "${JMODGUARD_RELEASE_SHA:-}" && "$label" == "${ref#refs/tags/}" ]] \
+      || publish_fail 'Publication plan differs from the Release Please source'
+  elif [[ "$mode" != "manual" && "$sha" != "$head" ]]; then
+    publish_fail 'Publication plan differs from the workflow commit'
   fi
   printf '%s\t%s\n' "$sha" "$label"
 }
 
 prepare() {
-  local selection mode ref head exists_rc sha label plan
-  selection="$(checked_request)"
+  local selection mode ref head exists_rc sha label plan resolved
+  selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
     return 0
@@ -350,7 +359,7 @@ prepare() {
   ref="${rest%%$'\t'*}"
   head="${rest#*$'\t'}"
   set +e
-  bk_meta_exists
+  publication_plan_exists
   exists_rc=$?
   set -e
   if [[ "$exists_rc" -eq 0 ]]; then
@@ -358,14 +367,16 @@ prepare() {
     echo 'Reusing the original immutable publication plan'
     return 0
   fi
-  if [[ "$exists_rc" -ne 100 ]]; then
+  if [[ "$exists_rc" -ne 1 ]]; then
     publish_fail 'Could not check existing publication plan'
   fi
   if [[ "$mode" == "nightly" ]]; then
-    IFS=$'\t' read -r sha label <<<"$(resolve_source main "$ref" "$head")"
+    resolved="$(resolve_source main "$ref" "$head")" || return $?
+    IFS=$'\t' read -r sha label <<<"$resolved"
     label="$(nightly_label "$sha")"
   else
-    IFS=$'\t' read -r sha label <<<"$(resolve_source "$mode" "$ref" "$head")"
+    resolved="$(resolve_source "$mode" "$ref" "$head")" || return $?
+    IFS=$'\t' read -r sha label <<<"$resolved"
   fi
   plan="$(MODE="$mode" REF="$ref" HEAD_SHA="$head" PLAN_SHA="$sha" PLAN_TAG="$label" node --input-type=commonjs - <<'JS'
 process.stdout.write(JSON.stringify({
@@ -377,7 +388,7 @@ process.stdout.write(JSON.stringify({
 }));
 JS
 )"
-  run_bk meta-data set image-publication "$plan"
+  write_publication_plan "$plan"
 }
 
 inspect_digest() {
@@ -452,13 +463,11 @@ verify_published_image() {
 }
 
 redact_tokens() {
-  local token="$1"
-  local source_token="$2"
-  GHCR_TOKEN="$token" GITHUB_TOKEN_VALUE="$source_token" node --input-type=commonjs - <<'JS' | run_bk redactor add --format json >/dev/null
-process.stdout.write(JSON.stringify({
-  GHCR_TOKEN: process.env.GHCR_TOKEN,
-  GITHUB_TOKEN: process.env.GITHUB_TOKEN_VALUE,
-}));
+  GHCR_TOKEN="$1" GITHUB_TOKEN_VALUE="$2" node --input-type=commonjs - <<'JS'
+for (const value of [process.env.GHCR_TOKEN, process.env.GITHUB_TOKEN_VALUE]) {
+  const escaped = value.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
+  process.stdout.write(`::add-mask::${escaped}\n`);
+}
 JS
 }
 
@@ -470,9 +479,9 @@ scratch_dir() {
 
 publish_component() {
   local component="$1"
-  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest
+  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest resolved
   local -a build_cmd
-  selection="$(checked_request)"
+  selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
     return 0
@@ -481,12 +490,13 @@ publish_component() {
   local rest="${selection#*$'\t'}"
   ref="${rest%%$'\t'*}"
   head="${rest#*$'\t'}"
-  IFS=$'\t' read -r sha label <<<"$(read_plan "$mode" "$ref" "$head")"
-  if [[ "$mode" == "manual" ]]; then
+  resolved="$(read_plan "$mode" "$ref" "$head")" || return $?
+  IFS=$'\t' read -r sha label <<<"$resolved"
+  if [[ "$mode" == "manual" || "$mode" == "release" ]]; then
     resolve_source manual "$sha" "$head" >/dev/null
   fi
   image="ghcr.io/jatmn/jmodguard-${component}"
-  if [[ "$mode" == "main" && "${BUILDKITE_RETRY_COUNT:-0}" == "0" ]] \
+  if [[ "$mode" == "main" && "${GITHUB_RUN_ATTEMPT:-1}" == "1" ]] \
       && ! changed_since_publication "$component" "$sha" "$image"; then
     echo "${component}: image inputs match the last publication; no rebuild"
     return 0
@@ -494,10 +504,7 @@ publish_component() {
   username="${GHCR_USERNAME:-}"
   [[ -n "$username" ]] || publish_fail 'Set GHCR_USERNAME to the GitHub account owning the GHCR credential'
   token="${GHCR_TOKEN:-}"
-  if [[ -z "$token" ]]; then
-    token="$(run_bk secret get GHCR_TOKEN)"
-  fi
-  [[ -n "$token" ]] || publish_fail 'Buildkite secret GHCR_TOKEN is empty'
+  [[ -n "$token" ]] || publish_fail 'GHCR_TOKEN is empty; provide the workflow package-write token'
   source_token="${GITHUB_TOKEN:-}"
   if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
     source_token="$token"
@@ -558,7 +565,7 @@ publish_image_main() {
     prepare) prepare ;;
     bot|api|webui) publish_component "$component" ;;
     *)
-      echo "usage: bash .buildkite/publish-image.sh prepare|bot|api|webui" >&2
+      echo "usage: bash scripts/publish-image.sh prepare|bot|api|webui" >&2
       exit 2
       ;;
   esac

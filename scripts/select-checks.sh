@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Choose Buildkite check steps from the diff, then upload only those steps.
+# Select affected checks for GitHub Actions or local inspection.
 # Unclassified paths and diffs that cannot be proven run every check.
 set -euo pipefail
 
@@ -8,13 +8,13 @@ cd "$root"
 
 usage() {
   cat <<'EOF'
-Usage: bash .buildkite/select-checks.sh plan [--files PATH]...
-       bash .buildkite/select-checks.sh upload
+Usage: bash scripts/select-checks.sh plan [--files PATH]...
+       bash scripts/select-checks.sh matrix [--files PATH]...
 
-plan prints one selected step group per line. upload rewrites
-.buildkite/pipeline.steps.yml with if: true or if: false and, on a
-Buildkite agent, uploads that pipeline. A missing diff selects every group.
-Selection reasons go to stderr; stdout remains the plan or generated YAML.
+plan prints selected check groups. matrix emits GitHub Actions job entries.
+PRs compare the event base/head with merge-base semantics. Pushes compare
+all commits in the event before/after range. Missing history selects all checks.
+Selection reasons go to stderr; stdout is machine-readable.
 EOF
 }
 
@@ -22,7 +22,7 @@ mode=""
 files=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    plan|upload) mode="$1"; shift ;;
+    plan|matrix) mode="$1"; shift ;;
     --files)
       shift
       [ "$#" -ge 1 ] || { usage >&2; exit 2; }
@@ -102,23 +102,23 @@ classify() {
   local path="$1"
   local top="${path%%/*}"
   case "$path" in
-    .buildkite/pipeline.yml|.buildkite/pipeline.steps.yml|.buildkite/select-checks.sh|.buildkite/select-checks-test.sh|.buildkite/with-cargo-auth.sh|scripts/ci-preflight.sh)
+    .github/workflows/ci.yml|.github/workflows/publish.yml|scripts/select-checks.sh|scripts/select-checks-test.sh|scripts/ci-workflow-test.mjs|scripts/ci-preflight.sh|scripts/ci-setup.sh)
       all_groups "CI control changed: $path"
       return
       ;;
-    .buildkite/publish-image.sh|.buildkite/publish-image-test.sh)
+    scripts/publish-image.sh|scripts/publish-image-test.sh|scripts/prepare-publication.sh|scripts/prepare-publication-test.sh)
       add publish-tests
       return
       ;;
-    .buildkite/*)
-      all_groups "CI control changed: $path"
+    LICENSE|LICENSE.md)
+      add frontend; add publish-tests
       return
       ;;
     Cargo.lock|rust-toolchain.toml|deny.toml|Cargo.toml)
       all_rust
       return
       ;;
-    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
+    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh|scripts/ci-agent-setup.sh)
       dylint_full=1
       add dylint
       return
@@ -168,6 +168,10 @@ classify() {
       ;;
     scripts/bootstrap-container.sh|scripts/bootstrap-container-test.sh)
       add bootstrap
+      return
+      ;;
+    scripts/ci-remote-database.sh)
+      add remote-database
       return
       ;;
     scripts/check-service-boundaries.sh)
@@ -234,62 +238,45 @@ classify() {
 }
 
 prove_diff() {
-  if [ "${#files[@]}" -gt 0 ]; then
-    echo "select-checks: explicit file list" >&2
-    printf '%s\n' "${files[@]}"
-    return 0
-  fi
-  if [ "${BUILDKITE_SOURCE:-}" = "schedule" ] || [ -n "${BUILDKITE_TAG:-}" ] || [ -n "${JMODGUARD_PUBLISH_SOURCE:-}" ]; then
-    echo "select-checks: scheduled, tag, or manual publication build" >&2
-    return 1
-  fi
-  if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
-    local base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
-    git fetch --no-tags origin "$base" || return 1
-    echo "select-checks: PR diff origin/${base}...HEAD" >&2
-    git diff --name-only "origin/${base}...HEAD" || return 1
-    return 0
-  fi
-  local branch="${BUILDKITE_BRANCH:-main}"
-  local remote="origin/${branch}"
-  local before="" after
-  after="$(git rev-parse "${BUILDKITE_COMMIT:-HEAD}")"
-  if git rev-parse --verify --quiet "$remote" >/dev/null; then
-    before="$(git rev-parse "$remote")"
-  fi
-  git fetch --no-tags origin "$branch" || return 1
-  if [ -n "$before" ] && [ "$before" != "$after" ]; then
-    case "$before" in
-      0000000000000000000000000000000000000000) return 1 ;;
-    esac
-    echo "select-checks: branch diff $before..$after" >&2
-    git diff --name-only "$before" "$after" || return 1
-    return 0
-  fi
-  if [ "${BUILDKITE_SOURCE:-}" = "webhook" ] \
-      && [ "$branch" = "main" ] \
-      && [ -z "${BUILDKITE_TAG:-}" ]; then
-    echo "select-checks: main push range unavailable" >&2
-    return 1
-  fi
-  if ! git rev-parse --verify --quiet "${after}^1" >/dev/null; then
-    return 1
-  fi
-  echo "select-checks: first-parent diff ${after}^1..${after}" >&2
-  git diff --name-only "${after}^1" "$after"
+  local base="${JMODGUARD_DIFF_BASE:-}" head="${JMODGUARD_DIFF_HEAD:-}"
+  case "${GITHUB_EVENT_NAME:-}" in
+    schedule|workflow_dispatch) return 1 ;;
+    push) [ "${GITHUB_REF_TYPE:-}" != tag ] || return 1 ;;
+  esac
+  [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git cat-file -e "${base}^{commit}" 2>/dev/null || return 1
+  git cat-file -e "${head}^{commit}" 2>/dev/null || return 1
+  case "${GITHUB_EVENT_NAME:-}" in
+    pull_request)
+      base="$(git merge-base "$base" "$head")" || return 1
+      echo "select-checks: full PR diff $base..$head" >&2 ;;
+    push|merge_group)
+      echo "select-checks: complete event diff $base..$head" >&2 ;;
+    *) return 1 ;;
+  esac
+  # Rename detection would hide the old path; treat a rename as delete + add.
+  # NUL separators also preserve unusual filenames without skipping a surface.
+  git diff --no-renames --name-only -z "$base" "$head"
 }
 
 add contracts
-if ! names="$(prove_diff)"; then
+names="$(mktemp)"
+trap 'rm -f "$names"' EXIT
+if [ "${#files[@]}" -gt 0 ]; then
+  printf '%s\0' "${files[@]}" >"$names"
+elif ! prove_diff >"$names"; then
   all_groups "full validation requested or diff unavailable"
-elif [ -z "${names}" ]; then
-  all_groups "empty diff"
-else
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    classify "$path"
-    [ "$full" -eq 1 ] && break
-  done <<<"$names"
+fi
+if [ "$full" -eq 0 ]; then
+  if [ ! -s "$names" ]; then
+    # A proven empty diff needs only the always-reported contracts gate.
+    echo 'select-checks: proven empty diff; contracts only' >&2
+  else
+    while IFS= read -r -d '' path; do
+      classify "$path"
+      [ "$full" -eq 1 ] && break
+    done <"$names"
+  fi
 fi
 
 # cargo deny / cargo audit stay on every plan that compiles or publishes Rust.
@@ -341,28 +328,25 @@ if [ "$dylint_full" -eq 0 ]; then
   done
 fi
 
-steps="$root/.buildkite/pipeline.steps.yml"
-generated="$(mktemp)"
-awk -v selected=" ${selected} " -v lint_packages="$dylint_packages" '
-  /^  # group: / { group = $3; next }
-  {
-    line = $0
-    if (line ~ /if: __SELECTED__/) {
-      if (index(selected, " " group " ") > 0) print "    if: \"true\""
-      else print "    if: \"false\""
-      if (group == "dylint") {
-        print "    env:"
-        print "      JMODGUARD_DYLINT_PACKAGES: \"" lint_packages "\""
-      }
-      next
-    }
-    print line
-  }
-' "$steps" >"$generated"
-
-if [ "${BUILDKITE:-}" = "true" ]; then
-  buildkite-agent pipeline upload "$generated"
-else
-  cat "$generated"
-fi
-rm -f "$generated"
+# Related Rust checks share one runner/target directory instead of compiling
+# the same dependency graph independently for every service.
+SELECTED="$selected" LINT_PACKAGES="$dylint_packages" node --input-type=module - <<'JS'
+const selected = new Set(process.env.SELECTED.trim().split(/\s+/));
+const lanes = {
+  quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog"],
+  frontend: ["frontend"],
+  rust: ["api", "bot", "runtime", "updater", "core", "integration", "boundaries"],
+  dylint: ["dylint"],
+  "supply-chain": ["supply-chain"],
+  "remote-database": ["remote-database"],
+};
+const include = Object.entries(lanes).flatMap(([lane, candidates]) => {
+  const groups = candidates.filter(group => selected.has(group));
+  if (!groups.length) return [];
+  const rust = groups.some(group => !["contracts", "frontend", "publish-tests", "bootstrap", "pullfrog"].includes(group));
+  return [{ lane, groups: groups.join(" "), rust,
+    timeout: lane === "dylint" || lane === "rust" ? 90 : lane === "remote-database" ? 45 : 30,
+    dylint_packages: lane === "dylint" ? process.env.LINT_PACKAGES : "" }];
+});
+console.log(JSON.stringify({ include }));
+JS

@@ -501,7 +501,7 @@ impl TenantRuntime {
         let subject = i64::try_from(subject).map_err(|_| anyhow!("invalid ban subject"))?;
         let (store, scope) = self.live(enrollment).await?;
         store
-            .settle_matching_application_ban(scope, subject, discord_reason, case_limits())
+            .settle_tagged_application_ban(scope, subject, discord_reason, case_limits())
             .await
     }
 

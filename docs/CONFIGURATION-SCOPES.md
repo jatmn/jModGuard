@@ -60,11 +60,12 @@ removing avoidable serial provider round trips from each save.
 No new dependency, connection pool, cache or per-message work is added. These checks are
 not a transaction spanning Discord and SQL. Shared/dedicated routing, selected cases and
 live guild erasure now run through [tenant runtime](TENANT-RUNTIME.md). The current
-core schema is `jmodguard-core-1`, migrations 0001–0018. Migration 0015 stores
+core schema is `jmodguard-core-1`, migrations 0001–0019. Migration 0015 stores
 component-update coordination; migration 0016 persists the shared per-bot
 [member-sync request gate](MEMBERS.md) across guilds and worker restarts. Migration 0017 adds event/ban page and action-expiry
-indexes. Migration 0018 keeps one active ban row per guild and user. Captured
-configuration operations add no migration of their own.
+indexes. Migration 0018 keeps one active ban row per guild and user. Migration
+0019 stores guild-local known-bad image digests. Known-bad image writes use that
+table instead of adding a separate captured-configuration migration.
 
 Local tests cover stale scopes before and after rejoin, empty patches, nickname re-sync,
 source/destination copy checks, global writes from a stale guild context, modified identity,
@@ -89,6 +90,39 @@ membership returns 409 `guild_enrollment_inactive`. Membership verification fail
 503 `guild_access_unverified` without DB details. The browser does not refresh tokens or
 retry a rejected read or mutation automatically. Reload configuration and review before resubmitting.
 Unsaved drafts may survive a failed refresh only within the same captured membership.
+
+Configuration POST/PUT saves retain a random `x-jmodguard-save` identity in browser
+session storage before dispatch. The first request sends `x-jmodguard-save-lookup: 0`;
+subsequent attempts send `1` and only query the bot's existing result cache. The
+control identity binds the actor and complete captured operation, including membership
+and payload. Every HTTP attempt still passes the route's current permission checks.
+Browser matching ignores JSON object member order at every depth, preserving array
+order and changed values. Unresolved role saves also retain their original revision:
+remounting or reloading the editor must not bind the same roles to a newer revision.
+HTTP 202 `save_pending` keeps the draft and displays a pending notice; retrying the
+same save retrieves its acknowledgement without applying another write. Successful
+acknowledgement clears the browser identity. HTTP 409 `save_expired` also settles it: the
+bot rejected this job before applying it, so the user can explicitly submit a new save
+with the unchanged draft. Transport errors and unclassified failures retain the identity;
+error text alone never proves that a write was not applied. Network failures retain it, including
+across page reloads. Recovered results are historical acknowledgements, not current
+configuration. Patch consumers refresh configuration; the ignore and case-removal-role
+editors read current values (and the current role revision) before clearing the identity
+or draft. A failed specialized read retains both for lookup-only recovery on the next
+attempt. DELETE and the separately queued bot actions keep their existing contracts.
+
+The global rule editor sends `clear_guild_override: true` on its PUT from a server
+page. The bot writes the global rule and clears that captured server's override in
+one transaction and under one save identity. Both permission checks, membership,
+the server write fence and the configuration version update remain part of this
+operation. It sends no follow-up DELETE when retrieving an acknowledgement. Other
+PUT callers default to global-only behavior when the flag is absent.
+
+Results remain bounded and in memory on the bot (currently up to 4096 entries and
+two minutes). Eviction, a writer restart, or an unmatched lookup returns HTTP 409
+`save_unknown`, never another mutation. The user must check the current configuration
+before explicitly clearing that request. This does not promise durable receipts across
+restarts. Deploy matching frontend, API and bot builds for this protocol.
 
 Copy selection loads the source configuration and retains its membership. The copy body
 must include `from_enrollment_id` with the existing `from_guild_id` and `sections`; the

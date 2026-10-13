@@ -30,6 +30,14 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
         let probe = db::current_startup_probe();
         let opened = tokio::task::spawn_blocking(move || {
             let _probe = db::enter_startup_probe(probe);
+            // Check before opening: the bot may create the file at any time.
+            // A post-error check could mistake creation for a fatal open error.
+            if !remote && opts.token.trim().is_empty() && local_database_is_missing(&opts.path) {
+                return Err(db::SchemaNotReady(
+                    "local database file is not yet created by the bot".into(),
+                )
+                .into());
+            }
             Db::open_with(opts)
         })
         .await
@@ -51,6 +59,28 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
             Err(error) => return Err(error),
         }
     }
+}
+
+// SQLite's open error also covers permissions and invalid paths. Retry only
+// confirmed absence of the final entry, not a dangling symlink or missing parent.
+fn local_database_is_missing(path: &Path) -> bool {
+    // Inspect the raw final component: Path::parent normalizes a trailing `/.`,
+    // but the filesystem still treats it as a directory, never a database file.
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .rsplit(|byte| std::path::is_separator(char::from(*byte)))
+        .next()
+        .is_some_and(|component| component.is_empty() || component == b".")
+    {
+        return false;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && parent.is_dir()
 }
 
 /// Prime API state. An older schema or a retryable read waits with a capped
@@ -148,7 +178,7 @@ pub fn prefix_shown_after_write(reply: &db::ControlReply) -> Result<String> {
             .and_then(|value| value.as_str())
             .map(str::to_owned)
             .context("write failed"),
-        db::ControlReply::Failed { message } => anyhow::bail!(message.clone()),
+        db::ControlReply::Failed { message, .. } => anyhow::bail!(message.clone()),
         db::ControlReply::Waiting | db::ControlReply::StillWaiting => anyhow::bail!("waiting"),
         db::ControlReply::Busy => anyhow::bail!("busy"),
     }
@@ -162,6 +192,7 @@ mod tests {
     use jmodguard::db::{self, Db};
     use jmodguard::tenant::TenantRuntime;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn temp_db(label: &str) -> PathBuf {
@@ -205,7 +236,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn api_startup_opens_no_write_transaction() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("no_write");
         let prepared = prepare_bot(&path);
         let before_defaults = prepared.read_terminal_defaults().unwrap();
@@ -238,7 +269,6 @@ mod tests {
         );
 
         let queries = probe.queries();
-        jmodguard::set_process_ready(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let probe_check = async {
@@ -276,7 +306,6 @@ mod tests {
             queries,
             "repeated readiness checks must not query the database"
         );
-        jmodguard::set_process_ready(false);
         drop(app);
         cleanup(&path);
     }
@@ -317,7 +346,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn older_schema_stays_live_then_becomes_ready_without_exiting() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("older");
         let prepared = prepare_bot(&path);
         drop(prepared);
@@ -327,14 +356,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let probe = Arc::new(db::StartupProbe::default());
         let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
-        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tripped = Arc::new(AtomicBool::new(false));
         db::arm_writer_open_tripwire(Arc::clone(&tripped));
+        let readiness_published = Arc::new(AtomicBool::new(false));
+        let (release_listener, hold_listener) = tokio::sync::oneshot::channel();
         let cfg_wait = cfg.clone();
+        let readiness_published_task = Arc::clone(&readiness_published);
         let opened = tokio::spawn(async move {
             crate::health::serve_while(&listener, async move {
                 let db = open_database(&cfg_wait).await?;
+                readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                hold_listener.await.map_err(|_| {
+                    anyhow::anyhow!("startup listener released before probes finished")
+                })?;
                 Ok::<_, anyhow::Error>(db)
             })
             .await
@@ -344,11 +379,16 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert_eq!(
-            http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            probe_status_strict(
+                addr,
+                "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                503
+            )
+            .await,
             503
         );
         assert!(
@@ -361,23 +401,22 @@ mod tests {
         })
         .join()
         .unwrap();
-        let mut ready = 0;
-        for _ in 0..40 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
-            if ready == 200 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        assert!(
+            wait_until_flag(&readiness_published).await,
+            "startup callback must publish readiness after the schema upgrade"
+        );
         assert_eq!(
-            ready, 200,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200,
             "the API becomes ready after the schema is upgraded"
         );
+        release_listener
+            .send(())
+            .expect("release startup listener after readiness probe");
         let db = opened.await.unwrap().unwrap();
         assert!(db.is_read_only());
         assert_eq!(probe.immediate(), 0);
-        assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
-        jmodguard::set_process_ready(false);
+        assert!(!tripped.load(Ordering::SeqCst));
         drop(db);
         cleanup(&path);
     }
@@ -392,6 +431,76 @@ mod tests {
         let opened = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
         assert!(opened.unwrap().is_err(), "a newer schema must exit");
         cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_local_database_paths_and_contents_do_not_retry() {
+        let root = temp_db("invalid_paths");
+        std::fs::create_dir(&root).unwrap();
+        let corrupt = root.join("corrupt.db");
+        std::fs::write(&corrupt, b"not a SQLite database").unwrap();
+        let foreign = root.join("foreign.db");
+        let foreign_db = libsql::Builder::new_local(&foreign).build().await.unwrap();
+        foreign_db
+            .connect()
+            .unwrap()
+            .execute("CREATE TABLE foreign_data (value TEXT)", ())
+            .await
+            .unwrap();
+        drop(foreign_db);
+        for path in [
+            root.join("absent_parent/app.db"),
+            corrupt.join("app.db"),
+            root.clone(),
+            root.join("absent.db/"),
+            root.join("absent.db/."),
+            corrupt,
+            foreign,
+        ] {
+            let cfg = api_config(&path);
+            let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg))
+                .await
+                .expect("invalid local databases must fail, not retry");
+            assert!(result.is_err(), "unexpectedly opened {}", path.display());
+        }
+        let mut cfg = api_config(&root.join("absent.db"));
+        cfg.db.token = "token-without-url".into();
+        let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg))
+            .await
+            .expect("invalid database configuration must fail, not retry");
+        assert!(result.err().unwrap().to_string().contains("db.url"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inaccessible_parent_and_dangling_database_symlink_do_not_retry() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = temp_db("denied_paths");
+        std::fs::create_dir(&root).unwrap();
+        let link = root.join("dangling.db");
+        symlink(root.join("absent.db"), &link).unwrap();
+        let cfg = api_config(&link);
+        let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
+        assert!(result.expect("dangling link must fail promptly").is_err());
+        let denied = root.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let path = denied.join("app.db");
+        // Root may bypass mode bits; only claim a permission failure when real.
+        if std::fs::metadata(&path).unwrap_err().kind() == std::io::ErrorKind::PermissionDenied {
+            let cfg = api_config(&path);
+            let result = tokio::time::timeout(Duration::from_secs(3), open_database(&cfg)).await;
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                result
+                    .expect("permission error must fail promptly")
+                    .is_err()
+            );
+        } else {
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn guild_path(core: &Path) -> PathBuf {
@@ -419,7 +528,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn older_guild_store_stays_live_then_becomes_ready_after_bot_migration() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("guild14");
         let core = Db::open(&path, 2).unwrap();
         assert_eq!(
@@ -440,11 +549,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let probe = Arc::new(db::StartupProbe::default());
         let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let readiness_published = Arc::new(AtomicBool::new(false));
+        let readiness_published_task = Arc::clone(&readiness_published);
         let cfg_wait = cfg.clone();
         let serving = tokio::spawn(async move {
             let router = crate::health::serve_while(&listener, async move {
                 let db = open_database(&cfg_wait).await?;
                 let state = build_state(cfg_wait, db).await?;
+                readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
                 Ok::<_, anyhow::Error>(crate::web::router(state))
             })
@@ -458,16 +570,15 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            probe_status_strict(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert!(
@@ -480,28 +591,28 @@ mod tests {
         })
         .join()
         .unwrap();
-        let mut ready = 0;
-        let mut app_route = 0;
-        for _ in 0..80 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
-            app_route =
-                http_status(addr, "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
-            if ready == 200 && app_route != 503 && app_route != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        assert!(
+            wait_until_flag(&readiness_published).await,
+            "startup callback must publish readiness after the guild store migration"
+        );
         assert_eq!(
-            ready, 200,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200,
             "the API becomes ready after the bot migrates the guild store"
         );
+        let app_route = wait_status_not(
+            addr,
+            "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            &[0, 503],
+        )
+        .await;
         assert_ne!(
             app_route, 503,
             "an application route must leave the startup page"
         );
         assert_ne!(app_route, 0);
         assert_eq!(
-            http_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await,
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
             200
         );
         assert!(
@@ -510,7 +621,6 @@ mod tests {
         );
         assert_eq!(probe.immediate(), 0);
         serving.abort();
-        jmodguard::set_process_ready(false);
         cleanup(&path);
     }
 
@@ -540,9 +650,10 @@ mod tests {
     }
 
     async fn wait_status(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut seen = 0;
-        for _ in 0..40 {
-            seen = http_status(addr, request).await;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
             if seen == want {
                 return seen;
             }
@@ -551,19 +662,340 @@ mod tests {
         seen
     }
 
-    async fn http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
-            return 0;
+    async fn wait_until_flag(flag: &AtomicBool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn wait_status_not(addr: std::net::SocketAddr, request: &str, avoid: &[u16]) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
+            if seen != 0 && !avoid.contains(&seen) {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    /// Retries only transient probe failures (`0`). Any other status is returned
+    /// immediately so a brief wrong readiness code cannot be masked by polling.
+    async fn probe_status_strict(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
+            match seen {
+                0 => tokio::time::sleep(Duration::from_millis(50)).await,
+                status if status == want => return status,
+                status => return status,
+            }
+        }
+        seen
+    }
+
+    fn probe_request_with_close(request: &str) -> String {
+        if request.contains("Connection:") {
+            return request.to_owned();
+        }
+        request.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n")
+    }
+
+    fn try_parse_http_status_line(response: &[u8]) -> Option<u16> {
+        let end = response.windows(2).position(|window| window == b"\r\n")?;
+        let text = String::from_utf8_lossy(&response[..end]);
+        text.split_whitespace().nth(1).unwrap_or("0").parse().ok()
+    }
+
+    fn parse_http_status(response: &[u8]) -> u16 {
+        try_parse_http_status_line(response).unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn abort_tcp_with_reset(stream: tokio::net::TcpStream) {
+        use std::os::unix::io::AsRawFd;
+        let std_stream = stream.into_std().unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
         };
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap_or(0);
-        let text = String::from_utf8_lossy(&buf[..n]);
-        text.split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0)
+        let result = unsafe {
+            libc::setsockopt(
+                std_stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "setsockopt(SO_LINGER) failed");
+        drop(std_stream);
+    }
+
+    fn probe_io_error_is_transient(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    async fn read_probe_http_status<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<u16, std::io::Error> {
+        read_probe_http_status_buffered(stream, deadline, Vec::new()).await
+    }
+
+    async fn read_probe_http_status_buffered<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        deadline: Option<tokio::time::Instant>,
+        mut buf: Vec<u8>,
+    ) -> Result<u16, std::io::Error> {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 256];
+        loop {
+            if let Some(status) = try_parse_http_status_line(&buf) {
+                return Ok(status);
+            }
+            let read_deadline =
+                deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(2));
+            if tokio::time::Instant::now() >= read_deadline {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            let n = tokio::time::timeout_at(read_deadline, stream.read(&mut chunk))
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+            if n == 0 {
+                return Ok(try_parse_http_status_line(&buf).unwrap_or(0));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 8192 {
+                return Ok(0);
+            }
+        }
+    }
+
+    async fn drain_probe_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        let mut seen = Vec::new();
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        Ok(())
+    }
+
+    async fn http_probe_once(
+        addr: std::net::SocketAddr,
+        request: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<u16, std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+        let work = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream.write_all(request.as_bytes()).await?;
+            read_probe_http_status(&mut stream, deadline).await
+        };
+        match deadline {
+            Some(end) => tokio::time::timeout_at(end, work)
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+            None => work.await,
+        }
+    }
+
+    async fn http_status(
+        addr: std::net::SocketAddr,
+        request: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> u16 {
+        let request = probe_request_with_close(request);
+        // Under parallel test load the health accept loop can reset a just-opened
+        // connection (BrokenPipe/ConnectionReset) or refuse while saturated.
+        for attempt in 1..=3 {
+            if matches!(deadline, Some(end) if tokio::time::Instant::now() >= end) {
+                return 0;
+            }
+            let result = http_probe_once(addr, &request, deadline).await;
+            match result {
+                Ok(status) => {
+                    if status != 0 {
+                        return status;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                Err(error) if attempt < 3 && probe_io_error_is_transient(&error) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(_) => return 0,
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn parse_http_status_reads_status_line() {
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+            503
+        );
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n\r\nok"), 200);
+        assert_eq!(parse_http_status(b""), 0);
+        assert_eq!(try_parse_http_status_line(b"HTTP/1.1 2"), None);
+        assert_eq!(
+            try_parse_http_status_line(b"HTTP/1.1 200 OK\r\n"),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn probe_io_error_is_transient_matches_reset_and_refused() {
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+        assert!(!probe_io_error_is_transient(&std::io::Error::from(
+            std::io::ErrorKind::InvalidData
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(not(unix), ignore = "needs SO_LINGER reset semantics")]
+    async fn http_status_retries_after_connection_reset() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            abort_tcp_with_reset(stream);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let status = http_status(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        server.await.unwrap();
+    }
+
+    /// Notifies the server when the probe reader's first TCP read completes so the
+    /// fragmentation fixture can deliver the remainder only after that consumption.
+    struct SignalFirstClientRead {
+        inner: tokio::net::TcpStream,
+        signal: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for SignalFirstClientRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let filled_before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            if poll.is_ready()
+                && buf.filled().len() > filled_before
+                && let Some(tx) = this.signal.take()
+            {
+                let _ = tx.send(());
+            }
+            poll
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_status_reads_fragmented_status_line() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+        let (client_read_tx, client_read_rx) = oneshot::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drain_probe_request(&mut stream).await.unwrap();
+            stream.write_all(b"HTTP/1.1 ").await.unwrap();
+            stream.flush().await.unwrap();
+            client_read_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"200 OK\r\n\r\nok").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut signal_stream = SignalFirstClientRead {
+            inner: stream,
+            signal: Some(client_read_tx),
+        };
+        let status = read_probe_http_status(&mut signal_stream, None)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_status_waits_until_listener_is_bound() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let listener = loop {
+                if tokio::time::Instant::now() >= bind_deadline {
+                    panic!("timed out rebinding delayed probe listener");
+                }
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+            };
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let status =
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await;
+        assert_eq!(status, 200);
+        server.await.unwrap();
     }
 }
