@@ -1181,6 +1181,7 @@ dependencies = [
  "jmodguard",
  "jmodguard-bot",
  "jmodguard-updater",
+ "libc",
  "libsql",
  "percent-encoding",
  "rand 0.10.3",
