@@ -192,6 +192,7 @@ mod tests {
     use jmodguard::db::{self, Db};
     use jmodguard::tenant::TenantRuntime;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn temp_db(label: &str) -> PathBuf {
@@ -235,7 +236,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn api_startup_opens_no_write_transaction() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("no_write");
         let prepared = prepare_bot(&path);
         let before_defaults = prepared.read_terminal_defaults().unwrap();
@@ -347,7 +348,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn older_schema_stays_live_then_becomes_ready_without_exiting() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("older");
         let prepared = prepare_bot(&path);
         drop(prepared);
@@ -357,14 +358,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let probe = Arc::new(db::StartupProbe::default());
         let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
-        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tripped = Arc::new(AtomicBool::new(false));
         db::arm_writer_open_tripwire(Arc::clone(&tripped));
+        let readiness_published = Arc::new(AtomicBool::new(false));
+        let (release_listener, hold_listener) = tokio::sync::oneshot::channel();
         let cfg_wait = cfg.clone();
+        let readiness_published_task = Arc::clone(&readiness_published);
         let opened = tokio::spawn(async move {
             crate::health::serve_while(&listener, async move {
                 let db = open_database(&cfg_wait).await?;
+                readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                hold_listener.await.map_err(|_| {
+                    anyhow::anyhow!("startup listener released before probes finished")
+                })?;
                 Ok::<_, anyhow::Error>(db)
             })
             .await
@@ -374,14 +381,14 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert_eq!(
-            http_status(
+            probe_status_strict(
                 addr,
                 "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                None
+                503
             )
             .await,
             503
@@ -396,23 +403,22 @@ mod tests {
         })
         .join()
         .unwrap();
-        let mut ready = 0;
-        for _ in 0..40 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await;
-            if ready == 200 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        assert!(
+            wait_until_flag(&readiness_published).await,
+            "startup callback must publish readiness after the schema upgrade"
+        );
         assert_eq!(
-            ready, 200,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200,
             "the API becomes ready after the schema is upgraded"
         );
+        release_listener
+            .send(())
+            .expect("release startup listener after readiness probe");
         let db = opened.await.unwrap().unwrap();
         assert!(db.is_read_only());
         assert_eq!(probe.immediate(), 0);
-        assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
-        jmodguard::set_process_ready(false);
+        assert!(!tripped.load(Ordering::SeqCst));
         drop(db);
         cleanup(&path);
     }
@@ -524,7 +530,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn older_guild_store_stays_live_then_becomes_ready_after_bot_migration() {
-        jmodguard::set_process_ready(false);
+        let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
         let path = temp_db("guild14");
         let core = Db::open(&path, 2).unwrap();
         assert_eq!(
@@ -545,11 +551,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let probe = Arc::new(db::StartupProbe::default());
         let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let readiness_published = Arc::new(AtomicBool::new(false));
+        let readiness_published_task = Arc::clone(&readiness_published);
         let cfg_wait = cfg.clone();
         let serving = tokio::spawn(async move {
             let router = crate::health::serve_while(&listener, async move {
                 let db = open_database(&cfg_wait).await?;
                 let state = build_state(cfg_wait, db).await?;
+                readiness_published_task.store(true, Ordering::SeqCst);
                 jmodguard::set_process_ready(true);
                 Ok::<_, anyhow::Error>(crate::web::router(state))
             })
@@ -563,21 +572,15 @@ mod tests {
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            http_status(
-                addr,
-                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                None
-            )
-            .await,
+            probe_status_strict(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
             200
         );
         assert_eq!(
-            http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await,
+            probe_status_strict(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 503).await,
             503
         );
         assert!(
@@ -590,37 +593,28 @@ mod tests {
         })
         .join()
         .unwrap();
-        let mut ready = 0;
-        let mut app_route = 0;
-        for _ in 0..80 {
-            ready = http_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", None).await;
-            app_route = http_status(
-                addr,
-                "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                None,
-            )
-            .await;
-            if ready == 200 && app_route != 503 && app_route != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        assert!(
+            wait_until_flag(&readiness_published).await,
+            "startup callback must publish readiness after the guild store migration"
+        );
         assert_eq!(
-            ready, 200,
+            wait_status(addr, "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
+            200,
             "the API becomes ready after the bot migrates the guild store"
         );
+        let app_route = wait_status_not(
+            addr,
+            "GET /api/guilds HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            &[0, 503],
+        )
+        .await;
         assert_ne!(
             app_route, 503,
             "an application route must leave the startup page"
         );
         assert_ne!(app_route, 0);
         assert_eq!(
-            http_status(
-                addr,
-                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-                None
-            )
-            .await,
+            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await,
             200
         );
         assert!(
@@ -629,7 +623,6 @@ mod tests {
         );
         assert_eq!(probe.immediate(), 0);
         serving.abort();
-        jmodguard::set_process_ready(false);
         cleanup(&path);
     }
 
@@ -667,6 +660,46 @@ mod tests {
                 return seen;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    async fn wait_until_flag(flag: &AtomicBool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn wait_status_not(addr: std::net::SocketAddr, request: &str, avoid: &[u16]) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
+            if seen != 0 && !avoid.contains(&seen) {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    /// Retries only transient probe failures (`0`). Any other status is returned
+    /// immediately so a brief wrong readiness code cannot be masked by polling.
+    async fn probe_status_strict(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = 0;
+        while tokio::time::Instant::now() < deadline {
+            seen = http_status(addr, request, Some(deadline)).await;
+            match seen {
+                0 => tokio::time::sleep(Duration::from_millis(50)).await,
+                status if status == want => return status,
+                status => return status,
+            }
         }
         seen
     }
