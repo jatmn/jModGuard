@@ -5814,9 +5814,14 @@ async fn coverage_gap_mark_batches_writes_for_remote_transport() {
         .await
         .unwrap();
     let used = probe.queries() - queries;
+    assert!(
+        used > 0,
+        "coverage-gap mark must observe remote facade calls"
+    );
     assert_eq!(
-        used, 12,
-        "coverage-gap mark remote round-trips (scope read, write tx, receipt, batch, post-check, commit)"
+        used,
+        14,
+        "coverage-gap mark remote round-trips (scope, revision snapshot, write tx, receipt, seed update, batch, commit)"
     );
     let status = store
         .member_sync_status(scope.clone(), 42, 122_001)
@@ -5926,6 +5931,106 @@ async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
         .await
         .unwrap();
     assert!(!reconciliation_needed);
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let store_for_bump = store.clone();
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(Some(Box::new(
+        move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.block_on(async {
+                    store_for_bump
+                        .db
+                        .with_conn(|conn| {
+                            let mut tx = conn.transaction_primary_read()?;
+                            tx.ensure_mutation_receipt()?;
+                            tx.member_execute(
+                                "UPDATE guild_member_seed SET directory_revision=directory_revision+1 WHERE guild_id=10",
+                                (),
+                            )?;
+                            tx.commit()?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                });
+            }
+        },
+    )));
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(None);
+    assert!(error.is::<TenantDataError>());
+    let reconciliation_needed: bool = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx.query_row(
+                "SELECT reconciliation_needed FROM guild_member_seed WHERE guild_id=10",
+                (),
+                |r| Ok(r.get::<bool>(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert!(!reconciliation_needed);
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let store_for_bump = store.clone();
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(Some(Box::new(
+        move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.block_on(async {
+                    store_for_bump
+                        .db
+                        .with_conn(|conn| {
+                            let mut tx = conn.transaction_primary_read()?;
+                            tx.ensure_mutation_receipt()?;
+                            tx.member_execute(
+                                "UPDATE guild_member_seed SET directory_revision=directory_revision+1,reconciliation_needed=1,reconciliation_reason='foreign_gap' WHERE guild_id=10",
+                                (),
+                            )?;
+                            tx.commit()?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                });
+            }
+        },
+    )));
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(None);
+    assert!(error.is::<TenantDataError>());
+    let reason: Option<String> = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx.query_row(
+                "SELECT reconciliation_reason FROM guild_member_seed WHERE guild_id=10",
+                (),
+                |r| Ok(r.get::<Option<String>>(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("foreign_gap"));
 }
 
 #[tokio::test]
