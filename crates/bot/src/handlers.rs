@@ -433,6 +433,23 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
+        let member_was_banned = match crate::member_directory::member_directory_shows_banned(
+            &app,
+            guild_id.get(),
+            banned_user.id.get(),
+        )
+        .await
+        {
+            Some(was_banned) => was_banned,
+            None => {
+                tracing::warn!(
+                    guild_id = guild_id.get(),
+                    user_id = banned_user.id.get(),
+                    "ban mirror precheck unavailable; assuming still banned"
+                );
+                true
+            }
+        };
         crate::member_directory::observe_ban(
             &app,
             guild_id.get(),
@@ -462,6 +479,7 @@ impl EventHandler for Handler {
                 Some(&observed_at),
                 echo.owned_by_bot,
                 echo.operation_id.as_deref(),
+                member_was_banned,
             )
             .await,
         );
@@ -586,11 +604,21 @@ impl EventHandler for Handler {
         let _ =
             db::mark_enrolled_unbanned(&app.db, enrollment.clone(), unbanned_user.id.get() as i64)
                 .await;
+        let observed_at = observed.to_rfc3339();
         let suppressed = app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Unban,
             guild_id.get(),
             unbanned_user.id.get(),
         );
+        if !suppressed {
+            let _ = db::record_gateway_unban_event(
+                &app.db,
+                enrollment.clone(),
+                unbanned_user.id.get() as i64,
+                Some(&observed_at),
+            )
+            .await;
+        }
         if record_unresolved_gateway_observation(suppressed) {
             let recorded = crate::cases::record(
                 &app,
@@ -1424,6 +1452,7 @@ mod tests {
             None,
             echo.owned_by_bot,
             echo.operation_id.as_deref(),
+            true,
         )
         .await
         .unwrap();
@@ -1543,6 +1572,7 @@ mod tests {
                 None,
                 delayed.owned_by_bot,
                 delayed.operation_id.as_deref(),
+                true,
             )
             .await
             .unwrap();
@@ -1587,6 +1617,7 @@ mod tests {
                 None,
                 next.owned_by_bot,
                 next.operation_id.as_deref(),
+                true,
             )
             .await
             .unwrap();
@@ -1856,5 +1887,81 @@ mod tests {
             None
         );
         assert_eq!(audit_case_action(Action::GuildUpdate), None);
+    }
+
+    #[tokio::test]
+    async fn dashboard_unban_echo_records_one_member_unban_with_dashboard_actor() {
+        use crate::db;
+        use crate::state::GatewayCaseAction;
+        use jmodguard::db::SqlExecutor;
+
+        let directory = std::env::temp_dir().join(format!(
+            "dashboard_unban_echo_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        app.activation.mark_lock_held(true);
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        db::record_enrolled_ban_with_identity(
+            &app.db,
+            Some(enrollment.clone()),
+            99,
+            Some("member"),
+            None,
+            Some(1),
+            Some("mod"),
+            "spam",
+            None,
+        )
+        .await
+        .unwrap();
+        let _token = app.suppress_next_gateway_case(GatewayCaseAction::Unban, 10, 99, None);
+        db::mark_enrolled_unbanned(&app.db, Some(enrollment.clone()), 99)
+            .await
+            .unwrap();
+        let suppressed = app.consume_gateway_case_suppression(GatewayCaseAction::Unban, 10, 99);
+        assert!(suppressed);
+        if !suppressed {
+            db::record_gateway_unban_event(&app.db, Some(enrollment.clone()), 99, None)
+                .await
+                .unwrap();
+        }
+        db::insert_event(
+            &app.db,
+            10,
+            "member_unban",
+            Some(99),
+            Some(42),
+            &serde_json::json!({"source": "dashboard"}),
+        )
+        .await
+        .unwrap();
+        let (count, actor): (i64, Option<i64>) = app
+            .db
+            .with_conn(|conn| {
+                let count = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE guild_id=10 AND event_type='member_unban'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                let actor = conn.query_row(
+                    "SELECT actor_id FROM events WHERE guild_id=10 AND event_type='member_unban' LIMIT 1",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                Ok((count, actor))
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(actor, Some(42));
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
