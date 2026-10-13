@@ -1361,7 +1361,7 @@ async fn same_attempt_echo_then_command_keeps_one_bot_row() {
 async fn attributed_manual_gateway_redelivery_stays_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let first = record_gateway_ban(
+    let first = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -1371,6 +1371,7 @@ async fn attributed_manual_gateway_redelivery_stays_idempotent() {
         false,
         None,
         true,
+        Some(3_001),
     )
     .await
     .unwrap();
@@ -1388,7 +1389,7 @@ async fn attributed_manual_gateway_redelivery_stays_idempotent() {
     )
     .await
     .unwrap();
-    let again = record_gateway_ban(
+    let again = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -1398,6 +1399,7 @@ async fn attributed_manual_gateway_redelivery_stays_idempotent() {
         false,
         None,
         true,
+        Some(3_001),
     )
     .await
     .unwrap();
@@ -1717,7 +1719,7 @@ async fn bot_owned_echo_keeps_the_same_attempt_and_replaces_a_stale_one() {
 async fn concurrent_placeholder_deliveries_with_false_precheck_stay_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let first = record_gateway_ban(
+    let first = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -1727,13 +1729,14 @@ async fn concurrent_placeholder_deliveries_with_false_precheck_stay_idempotent()
         false,
         None,
         false,
+        Some(4_001),
     )
     .await
     .unwrap();
     let GatewayBanWrite::Recorded { row_id } = first else {
         panic!("first delivery must insert, got {first:?}");
     };
-    let again = record_gateway_ban(
+    let again = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -1743,6 +1746,7 @@ async fn concurrent_placeholder_deliveries_with_false_precheck_stay_idempotent()
         false,
         None,
         false,
+        Some(4_001),
     )
     .await
     .unwrap();
@@ -2040,7 +2044,7 @@ async fn delayed_old_bot_echo_does_not_replace_an_attributed_manual_gateway_ban(
 async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let first = record_gateway_ban(
+    let first = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2050,13 +2054,14 @@ async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent(
         false,
         None,
         false,
+        Some(4_101),
     )
     .await
     .unwrap();
     let GatewayBanWrite::Recorded { row_id } = first else {
         panic!("first delivery must insert, got {first:?}");
     };
-    let again = record_gateway_ban(
+    let again = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2066,6 +2071,7 @@ async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent(
         false,
         None,
         false,
+        Some(4_101),
     )
     .await
     .unwrap();
@@ -2077,6 +2083,97 @@ async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent(
                 .unwrap()
         ),
         1
+    );
+}
+
+#[tokio::test]
+async fn same_timestamp_redelivery_and_distinct_reban_diverge_by_audit_entry_id() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let at = "2024-03-01T00:00:30+00:00";
+    let first = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(at),
+        false,
+        None,
+        false,
+        Some(5_501),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id } = first else {
+        panic!("first delivery must insert, got {first:?}");
+    };
+    let redelivery = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(at),
+        false,
+        None,
+        false,
+        Some(5_501),
+    )
+    .await
+    .unwrap();
+    assert_eq!(redelivery, GatewayBanWrite::Existing { row_id });
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(55), 50)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+
+    let first = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        56,
+        None,
+        None,
+        Some(at),
+        false,
+        None,
+        true,
+        Some(5_601),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: old_id } = first else {
+        panic!("first ban must insert, got {first:?}");
+    };
+    let second = record_gateway_ban_with_audit(
+        &f.db,
+        Some(scope.clone()),
+        56,
+        None,
+        None,
+        Some(at),
+        false,
+        None,
+        true,
+        Some(5_602),
+    )
+    .await
+    .unwrap();
+    let GatewayBanWrite::Recorded { row_id: new_id } = second else {
+        panic!("distinct audit id at the same timestamp must insert, got {second:?}");
+    };
+    assert_ne!(old_id, new_id);
+    assert_eq!(
+        member_ban_events(
+            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(56), 50)
+                .await
+                .unwrap()
+        ),
+        2
     );
 }
 
@@ -2199,7 +2296,7 @@ async fn sub_sixty_second_manual_reban_without_unban_records_distinct_gateway_ba
 async fn concurrent_false_precheck_after_attribution_stays_idempotent() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let first = record_gateway_ban(
+    let first = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2209,6 +2306,7 @@ async fn concurrent_false_precheck_after_attribution_stays_idempotent() {
         false,
         None,
         false,
+        Some(4_301),
     )
     .await
     .unwrap();
@@ -2226,7 +2324,7 @@ async fn concurrent_false_precheck_after_attribution_stays_idempotent() {
     )
     .await
     .unwrap();
-    let again = record_gateway_ban(
+    let again = record_gateway_ban_with_audit(
         &f.db,
         Some(scope.clone()),
         55,
@@ -2236,6 +2334,7 @@ async fn concurrent_false_precheck_after_attribution_stays_idempotent() {
         false,
         None,
         false,
+        Some(4_301),
     )
     .await
     .unwrap();
