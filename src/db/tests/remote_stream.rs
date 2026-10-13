@@ -738,15 +738,6 @@ fn backed_statement_result(request: &Json, state: &mut HranaState) -> Json {
         .unwrap_or_default();
     let (runtime, conn) = state.backing.as_ref().unwrap();
     runtime.block_on(async {
-        if sql.contains(';') {
-            conn.execute_batch(sql).await.unwrap();
-            return json!({
-                "cols": [],
-                "rows": [],
-                "affected_row_count": 0,
-                "last_insert_rowid": null
-            });
-        }
         let prepared = conn.prepare(sql).await.unwrap();
         let cols = prepared.columns().into_iter().map(|col| json!({"name": col.name(), "decltype": col.decl_type()})).collect::<Vec<_>>();
         let mut values = Vec::new();

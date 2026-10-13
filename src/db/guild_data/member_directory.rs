@@ -7,7 +7,28 @@ use crate::db::write_budget::MemberSqlWrites;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+#[cfg(test)]
+static COVERAGE_GAP_AFTER_SCOPE_VERIFY: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn test_set_coverage_gap_after_scope_verify(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *COVERAGE_GAP_AFTER_SCOPE_VERIFY.lock().unwrap() = hook;
+}
+
+#[cfg(test)]
+fn run_coverage_gap_after_scope_verify_hook() {
+    if let Some(hook) = COVERAGE_GAP_AFTER_SCOPE_VERIFY.lock().unwrap().as_ref() {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_coverage_gap_after_scope_verify_hook() {}
 
 /// Guild whose member-sync statements are being counted. Unset until a test asks.
 static MEMBER_SYNC_WATCHED_GUILD: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -479,7 +500,7 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-const COVERAGE_GAP_MARK_GROWTH: u64 = 256 * 1024;
+const COVERAGE_GAP_MARK_GROWTH: u64 = 32 * 1024 * 1024;
 
 fn ensure_seed_bot(
     conn: &impl SqlExecutor,
@@ -994,7 +1015,7 @@ impl GuildDataStore {
     ) -> Result<()> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(
-            !reason.is_empty() && reason.len() <= 160 && now_ms > 0,
+            !reason.is_empty() && reason.len() <= 160 && now_ms > 0 && !reason.contains('\0'),
             MemberSyncError::Invalid
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
@@ -1004,18 +1025,37 @@ impl GuildDataStore {
             // Membership and placement checks are autocommit reads so they do not
             // extend the remote interactive write transaction.
             verify_scope(conn, &expected, &scope, true)?;
+            run_coverage_gap_after_scope_verify_hook();
             let mut tx = conn.transaction_primary_read()?;
+            let revision_before: i64 = tx.query_row(
+                "SELECT directory_revision FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                params![scope.guild_id(), scope.enrollment.id.as_str()],
+                |r| Ok(r.get(0)?),
+            )?;
             tx.ensure_mutation_receipt()?;
             let guild_id = scope.guild_id();
             let enrollment = sql_literal(scope.enrollment.id.as_str());
             let reason_sql = sql_literal(&reason);
             let run_id = sql_literal(&random_id());
+            let joined_at_ns = scope.enrollment.joined_at_ns;
+            let active_membership = format!(
+                "EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns})"
+            );
+            let expected_revision = revision_before + 1;
             let batch = format!(
-                "UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment};
-INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
-UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.initial_completed_at_ms IS NOT NULL);"
+                "UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND {active_membership};
+INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
+UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision});"
             );
             tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH)?;
+            let revision_after: i64 = tx.query_row(
+                "SELECT directory_revision FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                params![scope.guild_id(), scope.enrollment.id.as_str()],
+                |r| Ok(r.get(0)?),
+            )?;
+            if revision_after != expected_revision {
+                return Err(TenantDataError::Membership.into());
+            }
             tx.commit()
         })
         .await

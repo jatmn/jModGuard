@@ -5777,22 +5777,46 @@ fn assert_member_statement_bound(kind: &str, members: u64, queries: u64) {
     );
 }
 
+async fn ready_with_probe(
+    probe: &std::sync::Arc<crate::db_compat::StartupProbe>,
+) -> (Fixture, GuildDataStore, GuildDataScope) {
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let placement = f.placement(&reg, 10).await;
+    store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    let scope = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    store.bind_initial_membership(scope.clone()).await.unwrap();
+    (f, store, scope)
+}
+
 #[tokio::test]
 async fn coverage_gap_mark_batches_writes_for_remote_transport() {
-    let (_f, mut store, scope) = ready().await;
-    complete_for_checks(&store, &scope).await;
     let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
-    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let (_f, mut store, scope) = ready_with_probe(&probe).await;
+    complete_for_checks(&store, &scope).await;
     crate::db::test_mark_connection_pool_remote(&mut store.db);
     let queries = probe.queries();
     store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
         .await
         .unwrap();
-    assert!(
-        probe.queries() - queries <= 8,
-        "coverage-gap mark used {} remote calls",
-        probe.queries() - queries
+    let used = probe.queries() - queries;
+    assert_eq!(
+        used, 12,
+        "coverage-gap mark remote round-trips (scope read, write tx, receipt, batch, post-check, commit)"
     );
     let status = store
         .member_sync_status(scope.clone(), 42, 122_001)
@@ -5835,6 +5859,84 @@ async fn coverage_gap_mark_skips_audit_recovery_until_initial_completion() {
         .await
         .unwrap();
     assert!(status.reconciliation_needed);
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rejects_closed_membership() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store.close_membership(scope.clone()).await.unwrap();
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap_err();
+    assert!(error.is::<TenantDataError>());
+    let audit: Option<i64> = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx
+                .query_row(
+                    "SELECT bot_id FROM guild_member_audit_recovery WHERE guild_id=10",
+                    (),
+                    |r| Ok(r.get(0)?),
+                )
+                .optional()?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert!(audit.is_none());
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let store_for_close = store.clone();
+    let scope_for_close = scope.clone();
+    super::super::member_directory::test_set_coverage_gap_after_scope_verify(Some(Box::new(
+        move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle
+                    .block_on(store_for_close.close_membership(scope_for_close.clone()))
+                    .unwrap();
+            }
+        },
+    )));
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_scope_verify(None);
+    assert!(error.is::<TenantDataError>());
+    let reconciliation_needed: bool = store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let row = tx.query_row(
+                "SELECT reconciliation_needed FROM guild_member_seed WHERE guild_id=10",
+                (),
+                |r| Ok(r.get::<bool>(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(row)
+        })
+        .await
+        .unwrap();
+    assert!(!reconciliation_needed);
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rejects_nul_reason() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gap\0reason", 122_000)
+        .await
+        .unwrap_err();
+    assert!(error.is::<MemberSyncError>());
 }
 
 #[tokio::test]
