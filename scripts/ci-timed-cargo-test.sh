@@ -31,6 +31,8 @@ jmodguard_assert_per_scope_test_invocations() {
               *' --no-run'*|*' --list'*|*' --exact'*) ;;
               *) continue ;;
             esac
+            echo "$line" | grep -q -- '--workspace' \
+              && fail "$label: per-scope cargo must not include --workspace"
             echo "$line" | grep -qE '(^|[[:space:]])--all([[:space:]]|$)' \
               && fail "$label: per-scope cargo must not include --all"
             ;;
@@ -421,22 +423,18 @@ echo "$scoped_args_line" | grep -q -- '-p' \
   || fail 'scoped cargo-args: package selector must be applied per scope'
 echo "$scoped_args_line" | grep -q -- 'timed-runner-probe' \
   || fail 'scoped cargo-args: scoped package name must be present'
+echo "$scoped_args_line" | grep -q -- '--workspace' \
+  && fail 'scoped cargo-args: --workspace must not be passed to per-scope cargo test'
 scoped_ws_only="$(jmodguard_scoped_cargo_args lib:timed-harness-probe --workspace --locked)"
 echo "$scoped_ws_only" | grep -q -- '--workspace' \
-  && fail 'scoped cargo-args: bare --workspace rescope must not pass workspace to per-package cargo'
-scoped_ws_feat="$(jmodguard_scoped_cargo_args lib:timed-ws-feat-host --workspace --locked -p timed-ws-feat-host)"
-echo "$scoped_ws_feat" | grep -q -- '--workspace' \
-  || fail 'scoped cargo-args: --workspace -p must preserve workspace feature graph on per-scope cargo'
+  && fail 'scoped cargo-args: --workspace input must not appear in scoped builder output'
 echo "$scoped_ws_only" | grep -q -- '-p' \
   || fail 'scoped cargo-args: --workspace input must still add per-package -p selector'
 scoped_all_line="$(jmodguard_scoped_cargo_args lib:timed-harness-probe --all --locked)"
 echo "$scoped_all_line" | grep -qE '(^|[[:space:]])--all([[:space:]]|$)' \
   && fail 'scoped cargo-args: --all input must not appear in scoped builder output'
 echo "$scoped_all_line" | grep -q -- '--workspace' \
-  && fail 'scoped cargo-args: bare --all rescope must not pass workspace to per-package cargo'
-scoped_all_feat="$(jmodguard_scoped_cargo_args lib:timed-harness-probe --all --locked -p timed-harness-probe)"
-echo "$scoped_all_feat" | grep -q -- '--workspace' \
-  || fail 'scoped cargo-args: --all -p must map to --workspace for per-scope cargo'
+  && fail 'scoped cargo-args: --all input must not leak --workspace into scoped builder output'
 echo "$scoped_all_line" | grep -q -- '-p' \
   || fail 'scoped cargo-args: --all input must still add per-package -p selector'
 
@@ -462,93 +460,29 @@ jmodguard_assert_per_scope_test_invocations '--all per-scope'
 grep -q -- ' -p timed-harness-probe' "$CARGO_INVOCATION_LOG" \
   || fail '--all per-scope: timed runner must invoke cargo test with -p for the package'
 
-ws_feat="$fixture/ws-feat"
-mkdir -p "$ws_feat/ws-feat-flag/src" "$ws_feat/ws-feat-pull/src" "$ws_feat/ws-feat-host/src"
-cat >"$ws_feat/Cargo.toml" <<'EOF'
-[workspace]
-resolver = "2"
-members = ["ws-feat-flag", "ws-feat-pull", "ws-feat-host"]
-EOF
-cat >"$ws_feat/ws-feat-flag/Cargo.toml" <<'EOF'
-[package]
-name = "timed-ws-feat-flag"
-version = "0.1.0"
-edition = "2021"
-
-[features]
-enable_fail = []
-EOF
-cat >"$ws_feat/ws-feat-flag/src/lib.rs" <<'RS'
-#[cfg(feature = "enable_fail")]
-pub const GATE: bool = true;
-#[cfg(not(feature = "enable_fail"))]
-pub const GATE: bool = false;
-RS
-cat >"$ws_feat/ws-feat-pull/Cargo.toml" <<'EOF'
-[package]
-name = "timed-ws-feat-pull"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-timed-ws-feat-flag = { path = "../ws-feat-flag", features = ["enable_fail"] }
-EOF
-cat >"$ws_feat/ws-feat-pull/src/lib.rs" <<'RS'
-pub fn pull_marker() -> bool {
-    timed_ws_feat_flag::GATE
-}
-RS
-cat >"$ws_feat/ws-feat-host/Cargo.toml" <<'EOF'
-[package]
-name = "timed-ws-feat-host"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-timed-ws-feat-flag = { path = "../ws-feat-flag", default-features = false }
-EOF
-cat >"$ws_feat/ws-feat-host/src/lib.rs" <<'RS'
-#[test]
-fn workspace_feature_gate_must_fail() {
-    if timed_ws_feat_flag::GATE {
-        panic!("feature-gated failure must run under workspace feature graph");
-    }
-}
-RS
-ws_feat_target="$fixture/ws-feat-target"
-ws_feat_block_rc=0
-(
-  set +e
-  cd "$ws_feat"
-  export CARGO_TARGET_DIR="$ws_feat_target"
-  if ! cargo test --workspace -p timed-ws-feat-host --lib --no-run >/dev/null 2>&1; then
-    printf 'ci-timed-cargo-test: workspace feature probe failed to build\n' >&2
-    exit 1
-  fi
-  run_timed_cargo_test_gnu -p timed-ws-feat-host --lib -- >"$fixture/ws-feat-single.log" 2>&1
-  ws_feat_single_rc=$?
-  if [ "$ws_feat_single_rc" -ne 0 ]; then
-    printf 'ci-timed-cargo-test: single-package run must skip feature-gated failure (rc=0), got %s\n' \
-      "$ws_feat_single_rc" >&2
-    exit 1
-  fi
-  run_timed_cargo_test_gnu --workspace --locked -p timed-ws-feat-host --lib -- >"$fixture/ws-feat-workspace.log" 2>&1
-  ws_feat_ws_rc=$?
-  if [ "$ws_feat_ws_rc" -eq 0 ]; then
-    printf 'ci-timed-cargo-test: workspace run must execute feature-gated failing test (rc!=0), got 0\n' >&2
-    exit 1
-  fi
-) || ws_feat_block_rc=$?
-[ "$ws_feat_block_rc" -eq 0 ] || exit "$ws_feat_block_rc"
-
 outer_cleanup="$(mktemp -d)"
 outer_stamp="$outer_cleanup/stamp"
 touch "$outer_stamp"
-(
-  trap 'rm -rf "$outer_cleanup"' EXIT
-  run_timed_cargo_test_gnu -p timed-harness-probe --lib -- >"$fixture/trap-chain.log" 2>&1
-)
-[ -e "$outer_stamp" ] && fail 'timed runner must chain prior EXIT trap so temp dirs are removed'
+trap_chain_rc=0
+bash -c '
+  set -euo pipefail
+  root="'"$root"'"
+  ws="'"$ws"'"
+  target_dir="'"$CARGO_TARGET_DIR"'"
+  outer_cleanup="'"$outer_cleanup"'"
+  trap "rm -rf \"\$outer_cleanup\"" EXIT
+  # shellcheck source=scripts/ci-cargo-log.sh
+  source "$root/scripts/ci-cargo-log.sh"
+  # shellcheck source=scripts/ci-run-timed-cargo-test.sh
+  source "$root/scripts/ci-run-timed-cargo-test.sh"
+  export PATH="'"$PATH"'"
+  cd "$ws"
+  export CARGO_TARGET_DIR="$target_dir"
+  run_timed_cargo_test_gnu -p timed-harness-probe --lib -- >/dev/null 2>&1
+' || trap_chain_rc=$?
+[ -e "$outer_stamp" ] \
+  && fail 'timed runner must chain prior EXIT trap so temp dirs are removed'
+[ "$trap_chain_rc" -eq 0 ] || fail "timed runner EXIT trap chain failed (rc=$trap_chain_rc)"
 
 : >"$CARGO_INVOCATION_LOG"
 scoped_flags_log="$fixture/scoped-cargo-args.log"

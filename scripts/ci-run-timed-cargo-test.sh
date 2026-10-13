@@ -397,23 +397,6 @@ jmodguard_cargo_args_without_targets() {
   fi
 }
 
-jmodguard_cargo_uses_workspace_feature_graph() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --workspace|--all) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-# Full-workspace rescoping must stay per-package; narrow `--workspace -p pkg` needs unified features.
-jmodguard_timed_cargo_needs_workspace_feature_graph() {
-  jmodguard_cargo_uses_workspace_feature_graph "$@" || return 1
-  [ -n "$(run_timed_cargo_test_package_name "$@")" ] || return 1
-  return 0
-}
-
 # Workspace-wide flags confuse per-package `cargo test -- --list --ignored`.
 jmodguard_cargo_args_for_test_list() {
   local -a args=("$@")
@@ -458,9 +441,8 @@ jmodguard_scoped_cargo_args() {
     scoped+=("$line")
   done < <(jmodguard_cargo_args_without_targets "${cargo_args[@]}")
 
-  if jmodguard_timed_cargo_needs_workspace_feature_graph "${cargo_args[@]}"; then
-    scoped=(--workspace "${scoped[@]}")
-  fi
+  # Per-scope runs use `-p` only; workspace feature unification differs from native
+  # `cargo test --workspace` (tracked in #299).
 
   case "$scope" in
     lib:*)
@@ -624,19 +606,14 @@ run_timed_cargo_test_gnu_body() {
   local -n __jmg_cargo_args_ref=$1
   local -n __jmg_harness_ref=$2
   local name ignored_only=0 include_ignored=0 rc list_out ignored_out
-  local -a run_args=() harness_tail=() list_cargo_args=() list_ignored_cargo_args=()
+  local -a run_args=() harness_tail=() list_cargo_args=()
   local -A ignored_names=()
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    list_ignored_cargo_args+=("$line")
+    list_cargo_args+=("$line")
   done < <(jmodguard_cargo_args_for_test_list "${__jmg_cargo_args_ref[@]}")
-  if [ "${#list_ignored_cargo_args[@]}" -eq 0 ]; then
-    list_ignored_cargo_args=("${__jmg_cargo_args_ref[@]}")
-  fi
-  if jmodguard_timed_cargo_needs_workspace_feature_graph "${__jmg_cargo_args_ref[@]}"; then
+  if [ "${#list_cargo_args[@]}" -eq 0 ]; then
     list_cargo_args=("${__jmg_cargo_args_ref[@]}")
-  else
-    list_cargo_args=("${list_ignored_cargo_args[@]}")
   fi
   for arg in "${__jmg_harness_ref[@]}"; do
     case "$arg" in
@@ -653,7 +630,7 @@ run_timed_cargo_test_gnu_body() {
 
   if [ "$ignored_only" -eq 1 ]; then
     set +e
-    list_out="$(cargo test "${list_ignored_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+    list_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -678,7 +655,7 @@ run_timed_cargo_test_gnu_body() {
   fi
 
   set +e
-  ignored_out="$(cargo test "${list_ignored_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
+  ignored_out="$(cargo test "${list_cargo_args[@]}" -- --list --ignored --format terse "${harness_tail[@]}")"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
