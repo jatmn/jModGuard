@@ -252,6 +252,9 @@ if should_run contracts; then
   whitespace_check
   echo 'ci-preflight: bash scripts/select-checks-test.sh'
   bash scripts/select-checks-test.sh
+
+  echo 'ci-preflight: bash scripts/ci-timed-cargo-test.sh'
+  bash scripts/ci-timed-cargo-test.sh
 fi
 
 if should_run publish-tests; then
