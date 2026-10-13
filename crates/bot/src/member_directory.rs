@@ -563,6 +563,27 @@ pub async fn observe_departure(
     }
 }
 
+/// Whether the live member directory already shows this user as banned.
+pub(crate) async fn member_directory_shows_banned(
+    app: &BotState,
+    guild_id: u64,
+    user_id: u64,
+) -> Option<bool> {
+    let (store, scope) = live_observation(
+        app,
+        guild_id,
+        Some(user_id as i64),
+        "ban mirror precheck unavailable",
+    )
+    .await?;
+    store
+        .get_member(scope, user_id as i64)
+        .await
+        .ok()
+        .flatten()
+        .map(|member| member.is_banned)
+}
+
 pub async fn observe_ban(
     app: &BotState,
     guild_id: u64,

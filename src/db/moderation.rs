@@ -696,9 +696,11 @@ pub async fn record_enrolled_ban_with_identity(
 /// A bot echo inserts the one active row when none exists, and does not insert a
 /// `member_ban` event. `operation_id` is saved on that row so only the same ban
 /// attempt can fill it. A manual delivery inserts one active row and one
-/// `member_ban` event in the same transaction, with no operation id. A later
-/// delivery for an active ban returns the existing row and does not change its
-/// actor or reason.
+/// `member_ban` event in the same transaction, with no operation id. A repeat
+/// delivery for the same ban returns the existing row. A stale active mirror from
+/// an earlier ban cycle is ended and replaced when `member_was_banned` is false,
+/// an intervening unban was observed, the row is already attributed to a prior
+/// manual ban, or a bot echo belongs to a different attempt.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_gateway_ban(
     db: &Db,
@@ -709,6 +711,7 @@ pub async fn record_gateway_ban(
     occurred_at: Option<&str>,
     owned_by_bot: bool,
     operation_id: Option<&str>,
+    member_was_banned: bool,
 ) -> Result<GatewayBanWrite> {
     let now = occurred_at.map(str::to_owned).unwrap_or_else(now_str);
     let reason = GATEWAY_BAN_REASON.to_owned();
@@ -733,9 +736,118 @@ pub async fn record_gateway_ban(
             now,
             owned_by_bot,
             operation_id,
+            member_was_banned,
         )
     })
     .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveBanMirror {
+    id: i64,
+    reason: String,
+    moderator_id: Option<i64>,
+    operation_id: Option<String>,
+    created_at: String,
+}
+
+fn load_active_ban_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+) -> Result<Option<ActiveBanMirror>> {
+    conn.query_row(
+        "SELECT id, reason, moderator_id, operation_id, created_at
+         FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 ORDER BY id LIMIT 1",
+        params![guild_id, user_id],
+        |row| {
+            Ok(ActiveBanMirror {
+                id: row.get(0)?,
+                reason: row.get(1)?,
+                moderator_id: row.get(2)?,
+                operation_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn unban_observed_after_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    mirror_created_at: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE guild_id=?1 AND user_id=?2 AND event_type='member_unban'
+              AND created_at > ?3
+         )",
+        params![guild_id, user_id, mirror_created_at],
+        |row| Ok(row.get::<i64>(0)? != 0),
+    )
+}
+
+fn manual_member_ban_event_exists_for_mirror(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    row_id: i64,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+              AND json_valid(data) AND json_extract(data, '$.ban_id') = ?3
+         )",
+        params![guild_id, user_id, row_id],
+        |row| Ok(row.get::<i64>(0)? != 0),
+    )
+}
+
+fn gateway_placeholder_mirror(mirror: &ActiveBanMirror) -> bool {
+    mirror.moderator_id.is_none()
+        && mirror.reason == GATEWAY_BAN_REASON
+        && mirror.operation_id.is_none()
+}
+
+fn bot_echo_matches_mirror(mirror: &ActiveBanMirror, operation_id: &Option<String>) -> bool {
+    match operation_id {
+        Some(operation_id) if mirror.operation_id.as_deref() == Some(operation_id.as_str()) => {
+            true
+        }
+        Some(_) => {
+            mirror.operation_id.is_none()
+                && mirror.moderator_id.is_some()
+                && mirror.reason != GATEWAY_BAN_REASON
+        }
+        None if gateway_placeholder_mirror(mirror) => true,
+        None => mirror.operation_id.is_some() && mirror.moderator_id.is_some(),
+    }
+}
+
+fn replace_manual_gateway_mirror(
+    conn: &impl SqlExecutor,
+    mirror: &ActiveBanMirror,
+    guild_id: i64,
+    user_id: i64,
+    member_was_banned: bool,
+) -> Result<bool> {
+    if gateway_placeholder_mirror(mirror) {
+        if !member_was_banned {
+            return Ok(true);
+        }
+        return unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at);
+    }
+    if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
+        return Ok(true);
+    }
+    if !member_was_banned {
+        return Ok(true);
+    }
+    manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,15 +862,29 @@ fn record_gateway_ban_conn(
     now: String,
     owned_by_bot: bool,
     operation_id: Option<String>,
+    member_was_banned: bool,
 ) -> Result<GatewayBanWrite> {
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-    if let Some(row_id) = active_ban_id(&tx, guild_id, user_id)? {
-        tx.finish_read()?;
-        return Ok(GatewayBanWrite::Existing { row_id });
+    if let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
+        let keep = if owned_by_bot {
+            bot_echo_matches_mirror(&mirror, &operation_id)
+        } else {
+            !replace_manual_gateway_mirror(&tx, &mirror, guild_id, user_id, member_was_banned)?
+        };
+        if keep {
+            tx.finish_read()?;
+            return Ok(GatewayBanWrite::Existing { row_id: mirror.id });
+        }
+        tx.ensure_mutation_receipt()?;
+        tx.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+            params![guild_id, user_id],
+        )?;
+    } else {
+        tx.ensure_mutation_receipt()?;
     }
-    tx.ensure_mutation_receipt()?;
     match tx.execute_rows(
         "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name, operation_id)
          VALUES (?1, ?2, NULL, ?3, ?4, 1, ?5, ?6, NULL, ?7)",

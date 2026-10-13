@@ -433,6 +433,13 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
+        let member_was_banned = crate::member_directory::member_directory_shows_banned(
+            &app,
+            guild_id.get(),
+            banned_user.id.get(),
+        )
+        .await
+        .unwrap_or(true);
         crate::member_directory::observe_ban(
             &app,
             guild_id.get(),
@@ -462,6 +469,7 @@ impl EventHandler for Handler {
                 Some(&observed_at),
                 echo.owned_by_bot,
                 echo.operation_id.as_deref(),
+                member_was_banned,
             )
             .await,
         );
@@ -1423,6 +1431,7 @@ mod tests {
             None,
             echo.owned_by_bot,
             echo.operation_id.as_deref(),
+            true,
         )
         .await
         .unwrap();
@@ -1542,6 +1551,7 @@ mod tests {
                 None,
                 delayed.owned_by_bot,
                 delayed.operation_id.as_deref(),
+                true,
             )
             .await
             .unwrap();
@@ -1586,6 +1596,7 @@ mod tests {
                 None,
                 next.owned_by_bot,
                 next.operation_id.as_deref(),
+                true,
             )
             .await
             .unwrap();
