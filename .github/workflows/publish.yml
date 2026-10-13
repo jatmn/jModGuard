@@ -49,6 +49,7 @@ jobs:
       pull-requests: write
     outputs:
       tag: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
       created: ${{ steps.release.outputs.release_created }}
     steps:
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
@@ -78,11 +79,13 @@ jobs:
     outputs:
       plan: ${{ steps.prepare.outputs.plan }}
       release_tag: ${{ steps.prepare.outputs.release_tag }}
+      release_sha: ${{ steps.prepare.outputs.release_sha }}
     env:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       JMODGUARD_PUBLISH_SOURCE: ${{ inputs.source }}
       JMODGUARD_RELEASE_TAG: ${{ needs.release.outputs.created == 'true' && needs.release.outputs.tag || '' }}
+      JMODGUARD_RELEASE_SHA: ${{ needs.release.outputs.created == 'true' && needs.release.outputs.sha || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -129,6 +132,7 @@ jobs:
       JMODGUARD_PUBLICATION_PLAN: ${{ needs.prepare-publication.outputs.plan }}
       JMODGUARD_PUBLISH_SOURCE: ${{ inputs.source }}
       JMODGUARD_RELEASE_TAG: ${{ needs.prepare-publication.outputs.release_tag }}
+      JMODGUARD_RELEASE_SHA: ${{ needs.prepare-publication.outputs.release_sha }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:

@@ -31,6 +31,10 @@ assert.match(jobs.get("publish"), /needs\.prepare-publication\.result == 'succes
 assert.match(jobs.get("publish"), /packages: write/);
 assert.doesNotMatch(jobs.get("publish"), /contents: write/);
 assert.match(jobs.get("release"), /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+assert.match(jobs.get("release"), /sha: \$\{\{ steps\.release\.outputs\.sha \}\}/);
+assert.match(jobs.get("prepare-publication"), /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.release\.outputs\.created == 'true' && needs\.release\.outputs\.sha \|\| '' \}\}/);
+assert.match(jobs.get("prepare-publication"), /release_sha: \$\{\{ steps\.prepare\.outputs\.release_sha \}\}/);
+assert.match(jobs.get("publish"), /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
 assert.doesNotMatch(combined, /gh pr merge|enablePullRequestAutoMerge|auto-merge/);
 for (const match of combined.matchAll(/^\s+(?:- )?uses: (\S+)/gm)) {
   if (match[1].startsWith("./")) continue;

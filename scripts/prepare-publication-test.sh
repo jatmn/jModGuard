@@ -68,21 +68,53 @@ if bash scripts/prepare-publication.sh >/dev/null 2>&1; then
 fi
 mv "$ARTIFACT_PLAN.saved" "$ARTIFACT_PLAN"
 
-# The first main run can create a Stable release; a rerun may report no new tag.
-# Restore the original tag from this run's plan, instead of switching to main mode.
+# Release Please can select a commit newer or older than the triggering event.
+# A retry must restore that release even with empty action outputs and a moved tag.
 export GITHUB_EVENT_NAME=push JMODGUARD_PUBLISH_SOURCE= JMODGUARD_RELEASE_TAG=v1.2.3
-export GITHUB_RUN_ATTEMPT=1
-git tag -f v1.2.3 "$base" >/dev/null
+for sources in "$base:$later" "$later:$base" "$base:$base"; do
+  export GITHUB_SHA="${sources%%:*}" JMODGUARD_RELEASE_SHA="${sources#*:}"
+  git checkout -q --detach "$GITHUB_SHA"
+  export GITHUB_RUN_ATTEMPT=1
+  git tag -f v1.2.3 "$JMODGUARD_RELEASE_SHA" >/dev/null
+  rm -f "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+  : >"$GITHUB_OUTPUT"
+  bash scripts/prepare-publication.sh
+  cp "$RUNNER_TEMP/publication/plan.json" "$ARTIFACT_PLAN"
+  PLAN="$ARTIFACT_PLAN" node - <<'JS'
+const a = require('node:assert/strict'), fs = require('node:fs');
+const p = JSON.parse(fs.readFileSync(process.env.PLAN));
+a.equal(p.sha, process.env.JMODGUARD_RELEASE_SHA, 'plan must select the release source');
+a.equal(p.commit, process.env.GITHUB_SHA, 'plan must retain the workflow identity');
+a.equal(p.mode, 'release');
+a.equal(p.tag, 'v1.2.3');
+JS
+  release_sha="$JMODGUARD_RELEASE_SHA"
+  unset JMODGUARD_RELEASE_TAG JMODGUARD_RELEASE_SHA
+  git tag -f v1.2.3 "$GITHUB_SHA" >/dev/null
+  export GITHUB_RUN_ATTEMPT=2
+  rm -rf "$RUNNER_TEMP/publication"
+  : >"$GITHUB_OUTPUT"
+  bash scripts/prepare-publication.sh
+  grep -Fxq 'release_tag=v1.2.3' "$GITHUB_OUTPUT"
+  grep -Fxq "release_sha=$release_sha" "$GITHUB_OUTPUT"
+  cmp "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+  export JMODGUARD_RELEASE_TAG=v1.2.3
+done
+
+# Invalid action identities and genuine tag-push drift must fail without a plan.
 rm -f "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
-: >"$GITHUB_OUTPUT"
-bash scripts/prepare-publication.sh
-cp "$RUNNER_TEMP/publication/plan.json" "$ARTIFACT_PLAN"
-unset JMODGUARD_RELEASE_TAG
-export GITHUB_RUN_ATTEMPT=2
-rm -rf "$RUNNER_TEMP/publication"
-: >"$GITHUB_OUTPUT"
-bash scripts/prepare-publication.sh
-grep -Fxq 'release_tag=v1.2.3' "$GITHUB_OUTPUT"
-cmp "$ARTIFACT_PLAN" "$RUNNER_TEMP/publication/plan.json"
+export GITHUB_RUN_ATTEMPT=1
+git tag -f v1.2.3 "$later" >/dev/null
+for release_sha in '' invalid "$base"; do
+  if JMODGUARD_RELEASE_SHA="$release_sha" bash scripts/prepare-publication.sh >"$scratch/rejected" 2>&1; then
+    echo 'prepare-publication-test: accepted missing, invalid or mismatched release SHA' >&2; exit 1
+  fi
+  test ! -f "$RUNNER_TEMP/publication/plan.json"
+done
+unset JMODGUARD_RELEASE_TAG JMODGUARD_RELEASE_SHA
+if GITHUB_REF=refs/tags/v1.2.3 bash scripts/prepare-publication.sh >"$scratch/rejected" 2>&1; then
+  echo 'prepare-publication-test: accepted tag-push drift' >&2; exit 1
+fi
+test ! -f "$RUNNER_TEMP/publication/plan.json"
 
 echo 'prepare-publication-test: ok'

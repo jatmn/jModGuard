@@ -27,8 +27,11 @@ with_main() {
   GITHUB_TRIGGERING_ACTOR=jatmn
   GITHUB_ACTOR_ID=12479882
   JMODGUARD_PUBLISH_SOURCE=""
+  JMODGUARD_RELEASE_TAG=""
+  JMODGUARD_RELEASE_SHA=""
   export GITHUB_ACTIONS GITHUB_REPOSITORY GITHUB_EVENT_NAME GITHUB_REF GITHUB_SHA \
-    GITHUB_RUN_ATTEMPT GITHUB_ACTOR GITHUB_TRIGGERING_ACTOR GITHUB_ACTOR_ID JMODGUARD_PUBLISH_SOURCE
+    GITHUB_RUN_ATTEMPT GITHUB_ACTOR GITHUB_TRIGGERING_ACTOR GITHUB_ACTOR_ID JMODGUARD_PUBLISH_SOURCE \
+    JMODGUARD_RELEASE_TAG JMODGUARD_RELEASE_SHA
 }
 
 assert_eq() {
@@ -56,6 +59,7 @@ JS
 
 with_main
 assert_request $'main\t'
+JMODGUARD_RELEASE_TAG=v1.2.3 JMODGUARD_RELEASE_SHA="$BASE_SHA" assert_request $'release\trefs/tags/v1.2.3'
 GITHUB_REF=refs/tags/v1 assert_request $'tag\trefs/tags/v1'
 for event in pull_request pull_request_target merge_group release issue_comment; do
   GITHUB_EVENT_NAME="$event" assert_request skip
@@ -375,6 +379,11 @@ exercise_publish() {
     GITHUB_EVENT_NAME=workflow_dispatch
     JMODGUARD_PUBLISH_SOURCE="$ref"
     export GITHUB_EVENT_NAME JMODGUARD_PUBLISH_SOURCE
+  elif [[ "$mode" == release ]]; then
+    ref=refs/tags/v1.2.3
+    sha="$BASE_SHA"
+    JMODGUARD_RELEASE_TAG=v1.2.3
+    JMODGUARD_RELEASE_SHA="$sha"
   fi
   if [[ -n "$plan" ]]; then
     PLAN_JSON="$plan"
@@ -394,7 +403,7 @@ exercise_publish() {
     [[ "$changed" == 1 ]]
   }
   resolve_source() {
-    [[ "$mode" == manual ]] || fail 'resolve_source only for manual'
+    [[ "$mode" == manual || "$mode" == release ]] || fail 'only selected-source publication fetches a pinned SHA'
     assert_eq "$1" manual
     assert_eq "$2" "$BASE_SHA"
     assert_eq "$3" "$HEAD_SHA"
@@ -485,6 +494,32 @@ latest_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmo
 stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' | head -1 | cut -d: -f1)"
 [[ -n "$verify_line" && -n "$latest_line" && -n "$stable_line" && "$verify_line" -lt "$latest_line" && "$verify_line" -lt "$stable_line" ]] \
   || fail 'Stable publication must promote both moving pointers after verification'
+
+# Automatic releases build R, not workflow commit H, for every eligible package.
+release_plan="$(plan_json release refs/tags/v1.2.3 "$HEAD_SHA" "$BASE_SHA" v1.2.3)"
+for component in bot api webui; do
+  exercise_publish 0 0 release '' "$release_plan" "$component"
+  [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:${BASE_SHA}"* ]] \
+    || fail "$component release must build the selected release SHA"
+  [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
+    || fail "$component release must retain its version tag"
+  verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^verify $component " | cut -d: -f1)"
+  stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:stable" | cut -d: -f1)"
+  [[ -n "$verify_line" && -n "$stable_line" && "$verify_line" -lt "$stable_line" ]] \
+    || fail "$component release must verify before promoting Stable"
+
+  # Reject mismatched source, workflow identity and version before registry login.
+  for bad_plan in \
+    "$(plan_json release refs/tags/v1.2.3 "$HEAD_SHA" "$HEAD_SHA" v1.2.3)" \
+    "$(plan_json release refs/tags/v1.2.3 "$BASE_SHA" "$BASE_SHA" v1.2.3)" \
+    "$(plan_json release refs/tags/v1.2.3 "$HEAD_SHA" "$BASE_SHA" v9.9.9)"; do
+    : >"$TRACE_FILE"
+    if (PLAN_JSON="$bad_plan" publish_component "$component") >/dev/null 2>&1; then
+      fail "$component accepted a mismatched release plan"
+    fi
+    grep -q '^docker ' "$TRACE_FILE" && fail 'invalid release plan reached Docker'
+  done
+done
 
 reload_publisher
 saved_publish_tmp="${TMPDIR:-/tmp}"

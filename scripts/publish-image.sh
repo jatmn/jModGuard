@@ -49,7 +49,8 @@ publish_request() {
       if [[ "$ref" == refs/heads/main ]]; then
         if [[ -n "${JMODGUARD_RELEASE_TAG:-}" ]]; then
           stable_tag "$JMODGUARD_RELEASE_TAG" || publish_fail 'Invalid Release Please tag'
-          printf 'tag\trefs/tags/%s\n' "$JMODGUARD_RELEASE_TAG"
+          [[ "${JMODGUARD_RELEASE_SHA:-}" =~ $SHA_RE ]] || publish_fail 'Invalid Release Please SHA'
+          printf 'release\trefs/tags/%s\n' "$JMODGUARD_RELEASE_TAG"
         else
           printf 'main\t\n'
         fi
@@ -78,7 +79,7 @@ channel_for() {
     echo nightly
     return 0
   fi
-  if [[ "$mode" == "tag" || "$mode" == "manual" ]] && stable_tag "$tag"; then
+  if [[ "$mode" == "tag" || "$mode" == "manual" || "$mode" == "release" ]] && stable_tag "$tag"; then
     echo stable
     return 0
   fi
@@ -113,6 +114,9 @@ resolve_source() {
     fi
     if [[ "$mode" == "tag" && "$sha" != "$head" ]]; then
       publish_fail 'Tag moved after the workflow checkout; create a new build'
+    fi
+    if [[ "$mode" == "release" && "$sha" != "${JMODGUARD_RELEASE_SHA:-}" ]]; then
+      publish_fail 'Tag differs from the Release Please source SHA'
     fi
   else
     [[ "$ref" =~ $SHA_RE ]] || publish_fail 'Expected an immutable full commit SHA'
@@ -294,7 +298,7 @@ JS
 
 checked_request() {
   local selection mode ref head
-  selection="$(publish_request)"
+  selection="$(publish_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo skip
     return 0
@@ -334,15 +338,18 @@ JS
 )" || publish_fail 'Invalid image publication plan'
   sha="${check%%$'\t'*}"
   label="${check#*$'\t'}"
-  if [[ "$mode" != "manual" && "$sha" != "$head" ]]; then
+  if [[ "$mode" == "release" ]]; then
+    [[ "$sha" == "${JMODGUARD_RELEASE_SHA:-}" && "$label" == "${ref#refs/tags/}" ]] \
+      || publish_fail 'Publication plan differs from the Release Please source'
+  elif [[ "$mode" != "manual" && "$sha" != "$head" ]]; then
     publish_fail 'Publication plan differs from the workflow commit'
   fi
   printf '%s\t%s\n' "$sha" "$label"
 }
 
 prepare() {
-  local selection mode ref head exists_rc sha label plan
-  selection="$(checked_request)"
+  local selection mode ref head exists_rc sha label plan resolved
+  selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
     return 0
@@ -364,10 +371,12 @@ prepare() {
     publish_fail 'Could not check existing publication plan'
   fi
   if [[ "$mode" == "nightly" ]]; then
-    IFS=$'\t' read -r sha label <<<"$(resolve_source main "$ref" "$head")"
+    resolved="$(resolve_source main "$ref" "$head")" || return $?
+    IFS=$'\t' read -r sha label <<<"$resolved"
     label="$(nightly_label "$sha")"
   else
-    IFS=$'\t' read -r sha label <<<"$(resolve_source "$mode" "$ref" "$head")"
+    resolved="$(resolve_source "$mode" "$ref" "$head")" || return $?
+    IFS=$'\t' read -r sha label <<<"$resolved"
   fi
   plan="$(MODE="$mode" REF="$ref" HEAD_SHA="$head" PLAN_SHA="$sha" PLAN_TAG="$label" node --input-type=commonjs - <<'JS'
 process.stdout.write(JSON.stringify({
@@ -470,9 +479,9 @@ scratch_dir() {
 
 publish_component() {
   local component="$1"
-  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest
+  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest resolved
   local -a build_cmd
-  selection="$(checked_request)"
+  selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
     return 0
@@ -481,8 +490,9 @@ publish_component() {
   local rest="${selection#*$'\t'}"
   ref="${rest%%$'\t'*}"
   head="${rest#*$'\t'}"
-  IFS=$'\t' read -r sha label <<<"$(read_plan "$mode" "$ref" "$head")"
-  if [[ "$mode" == "manual" ]]; then
+  resolved="$(read_plan "$mode" "$ref" "$head")" || return $?
+  IFS=$'\t' read -r sha label <<<"$resolved"
+  if [[ "$mode" == "manual" || "$mode" == "release" ]]; then
     resolve_source manual "$sha" "$head" >/dev/null
   fi
   image="ghcr.io/jatmn/jmodguard-${component}"

@@ -20,7 +20,9 @@ publish all eligible components; sources predating the WebUI package skip that i
 
 GitHub Actions runs the pinned Release Please action after trusted main checks.
 It opens/updates release PRs; the owner merges them. The resulting release tag
-is published in the same workflow. Owner-pushed `v*` tags also publish after
+is published in the same workflow using the release's reported source SHA,
+which need not equal the workflow's triggering commit. The retained plan preserves
+that tag and source on retries. Owner-pushed `v*` tags also publish after
 checks. Creating a GitHub Release manually does not start a separate build;
 select its tag as `source` in an owner-dispatched CI run on `main`.
 

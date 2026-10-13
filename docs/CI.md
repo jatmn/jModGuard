@@ -116,6 +116,9 @@ the default token. PRs created with `GITHUB_TOKEN` do not automatically trigger
 new PR workflows: the owner must close/reopen the release PR to start CI before
 merging it. A release created by this action is published within the same trusted
 workflow, since tags created with `GITHUB_TOKEN` do not trigger another run.
+The plan binds the action's release tag to its reported source SHA, which can
+differ from the workflow's triggering commit. Retries restore both from the
+original plan even when Release Please no longer reports a newly created release.
 See [RELEASES.md](RELEASES.md).
 
 ## Dependency tools

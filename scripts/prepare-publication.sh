@@ -15,8 +15,10 @@ if [[ -n "$artifacts" ]]; then
   # Release Please may have already created the release on the first attempt.
   # Keep that original tag even if the retried action now reports no new release.
   if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]]; then
-    JMODGUARD_RELEASE_TAG="$(node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.env.JMODGUARD_PUBLICATION_PLAN_FILE)); console.log(p.mode === "tag" ? p.ref.replace(/^refs\/tags\//, "") : "")')"
-    export JMODGUARD_RELEASE_TAG
+    release="$(node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.env.JMODGUARD_PUBLICATION_PLAN_FILE)); console.log(p.mode === "release" ? `${p.ref.replace(/^refs\/tags\//, "")}\t${p.sha}` : "\t")')"
+    JMODGUARD_RELEASE_TAG="${release%%$'\t'*}"
+    JMODGUARD_RELEASE_SHA="${release#*$'\t'}"
+    export JMODGUARD_RELEASE_TAG JMODGUARD_RELEASE_SHA
   fi
 elif [[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 ]]; then
   echo 'Publication plan is missing on a rerun; start a new run explicitly' >&2
@@ -30,4 +32,5 @@ plan="$(PLAN_JSON="$plan" node -e 'console.log(JSON.stringify(JSON.parse(process
   echo "plan=$plan"
   echo "reused=$reused"
   echo "release_tag=${JMODGUARD_RELEASE_TAG:-}"
+  echo "release_sha=${JMODGUARD_RELEASE_SHA:-}"
 } >>"$GITHUB_OUTPUT"

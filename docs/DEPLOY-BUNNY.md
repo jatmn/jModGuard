@@ -181,7 +181,8 @@ After enabling the key, let a scan run on `main` before relying on pull request 
 - **Push to `main`**: publish components whose production inputs changed since
   their last verified publication. Missing history conservatively rebuilds.
 - **Stable release**: Release Please creates a tag after the owner merges its
-  release PR; that successful workflow publishes the release. Owner-pushed `v*`
+  release PR; that successful workflow publishes the release's source SHA,
+  even if it differs from the triggering commit. Owner-pushed `v*`
   tags also run validation and publication.
 - **Manual publication**: the owner runs **Publish → Run workflow** on `main` with
   `source` set to a full commit SHA or `refs/tags/<tag>`. All images share one
