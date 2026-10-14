@@ -4121,6 +4121,7 @@ async fn refresh_server_waits_are_capped_without_overflow() {
         (false, "3600".to_owned(), None),
         (false, u64::MAX.to_string(), None),
         (false, f64::MAX.to_string(), None),
+        (true, "3600".to_owned(), None),
         (true, u64::MAX.to_string(), None),
         (true, String::new(), Some(f64::MAX)),
     ] {
@@ -4156,16 +4157,28 @@ async fn refresh_server_waits_are_capped_without_overflow() {
             state.lock().await.refresh_hold.unwrap().0,
             oauth::Cooldown::Until(_)
         ));
-        // Shared cooldowns also feed the hold; their larger remaining wait
-        // must not reintroduce a process-lifetime session hold.
+        // Shared cooldowns outlive the session hold without retrying rejected
+        // credentials or introducing a process-lifetime session hold.
         if rate_limited {
             expire_refresh_hold(&f).await;
-            assert_eq!(
-                f.request("POST", "/api/me", "").await.0,
-                StatusCode::TOO_MANY_REQUESTS
-            );
-            assert_refresh_wait(&f, REFRESH_RETRY_MAX).await;
-            assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+            let guild_calls = f.discord.calls.load(Ordering::SeqCst);
+            let profile_calls = f.discord.me_calls.load(Ordering::SeqCst);
+            for (method, path) in [("POST", "/api/me"), ("GET", "/api/guilds/10/config")] {
+                let (status, body) = f.request(method, path, "").await;
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+                assert_eq!(body["code"], "discord_rate_limited");
+                assert_eq!(f.discord.calls.load(Ordering::SeqCst), guild_calls);
+                assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), profile_calls);
+                assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+            }
+            assert_refresh_session_kept(&f).await;
+            // Clearing the shared gate permits recovery without another session hold.
+            clear_oauth_budget(&f);
+            f.discord
+                .refresh_rate_limited
+                .store(false, Ordering::SeqCst);
+            assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
+            assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 2);
         }
     }
 }
