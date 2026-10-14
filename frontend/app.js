@@ -523,6 +523,7 @@ let state = {
 let configRequest = 0;
 
 const pendingLogChannelActions = new Map();
+const logChannelPolls = new Map();
 const authLossCleanups = new Set();
 
 const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 80000, 120000, 150000];
@@ -925,7 +926,7 @@ async function apiRequest(path, method = "GET", body = null, signal, headers = {
     } catch (_) {
       data = text;
     }
-    if (!res.ok || data?.code === "save_pending") throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
+    if (!res.ok || data?.code === "save_pending") throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), Number.MAX_SAFE_INTEGER / 1000));
     return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
@@ -1063,8 +1064,13 @@ function logChannelActionKey(job) {
 
 function clearPendingLogChannelEntry(key) {
   const entry = pendingLogChannelActions.get(key);
-  if (entry?.timer !== null) clearTimeout(entry.timer);
   pendingLogChannelActions.delete(key);
+  if (!entry) return;
+  const groupKey = logChannelPollKey(entry.job);
+  if (![...pendingLogChannelActions.values()].some(item => logChannelPollKey(item.job) === groupKey)) {
+    clearTimeout(logChannelPolls.get(groupKey)?.timer);
+    logChannelPolls.delete(groupKey);
+  }
 }
 
 function overlayPendingLogChannels(config, guildId) {
@@ -1115,7 +1121,6 @@ function applyQueuedLogChannel(job) {
     // newer request has become this row's active owner. Keep watching newer.
     return true;
   }
-  if (existing && existing.job.id !== job.id && existing.timer !== null) clearTimeout(existing.timer);
   const previous = existing?.previous ||
     row.pending_action?.previous || {
       effective: row.effective ?? null,
@@ -1132,10 +1137,13 @@ function applyQueuedLogChannel(job) {
       job,
       requested,
       previous,
-      attempt: existing?.job.id === job.id ? existing.attempt : 0,
-      timer: existing?.job.id === job.id ? existing.timer : null,
     };
     pendingLogChannelActions.set(key, entry);
+    const poll = logChannelPolls.get(logChannelPollKey(job));
+    if (poll && existing?.job.id !== job.id && poll.attempt >= actionReconcileDelays.length) {
+      poll.attempt = 0;
+      poll.dueAt = Math.max(poll.dueAt, Date.now() + actionReconcileDelays[0]);
+    }
     row.pending_action = { id: job.id, state: job.state, previous };
   }
   // A snapshot started before this acknowledged request must not replace its
@@ -1146,32 +1154,84 @@ function applyQueuedLogChannel(job) {
   return true;
 }
 
-function scheduleLogChannelReconcile(job, attempt = 0) {
-  const key = logChannelActionKey(job);
-  const entry = pendingLogChannelActions.get(key);
-  if (!entry || entry.job.id !== job.id || entry.timer !== null) return;
-  if (attempt >= actionReconcileDelays.length) {
-    toast(
-      "Log-channel validation is still pending. Its requested value remains marked queued; see Bot actions for details.",
-      "info",
-    );
-    return;
-  }
-  entry.attempt = attempt;
-  entry.timer = setTimeout(() => {
-    const current = pendingLogChannelActions.get(key);
-    if (!current || current.job.id !== job.id) return;
-    current.timer = null;
-    reconcileQueuedLogChannel(job, attempt).catch((error) => {
-      if (!isUnauthenticated(error)) {
-        if (attempt + 1 < actionReconcileDelays.length) scheduleLogChannelReconcile(job, attempt + 1);
-        else toast("Could not confirm the log-channel result. See Bot actions for details.", "error");
-      }
-    });
-  }, actionReconcileDelays[attempt]);
+function logChannelPollKey(job) {
+  return `${job.guild_id}:${job.enrollment_id}`;
 }
 
-async function reconcileQueuedLogChannel(original, attempt = 0) {
+function logChannelPollVisible(job) {
+  return document.visibilityState === "visible" && state.tab === "logchannels" &&
+    state.guildId === job.guild_id && state.config?.enrollment_id === job.enrollment_id;
+}
+
+function pauseLogChannelPolls() {
+  for (const poll of logChannelPolls.values()) {
+    clearTimeout(poll.timer);
+    poll.timer = null;
+  }
+}
+
+function resumeLogChannelPolls() {
+  for (const { job } of pendingLogChannelActions.values()) scheduleLogChannelReconcile(job);
+}
+
+function scheduleLogChannelReconcile(job) {
+  const key = logChannelPollKey(job);
+  let poll = logChannelPolls.get(key);
+  if (!poll) {
+    poll = { timer: null, dueAt: Date.now() + actionReconcileDelays[0], retryUntil: 0, attempt: 0, inFlight: null };
+    logChannelPolls.set(key, poll);
+  }
+  if (poll.timer !== null || poll.inFlight || !logChannelPollVisible(job) ||
+    poll.attempt >= actionReconcileDelays.length) return;
+  poll.timer = setTimeout(() => {
+    poll.timer = null;
+    if (!logChannelPollVisible(job)) return;
+    if (Date.now() < poll.dueAt) return scheduleLogChannelReconcile(job);
+    const current = [...pendingLogChannelActions.values()].find(item => logChannelPollKey(item.job) === key);
+    if (current) return reconcileQueuedLogChannel(current.job);
+  }, Math.min(Math.max(0, poll.dueAt - Date.now()), 2147483647));
+}
+
+async function reconcileQueuedLogChannel(original) {
+  const entry = pendingLogChannelActions.get(logChannelActionKey(original));
+  if (!entry || entry.job.id !== original.id || original.guild_id !== state.guildId ||
+    original.enrollment_id !== state.config?.enrollment_id || document.visibilityState !== "visible") return;
+  const key = logChannelPollKey(original);
+  scheduleLogChannelReconcile(original);
+  const poll = logChannelPolls.get(key);
+  if (poll.inFlight) return poll.inFlight;
+  if (Date.now() < poll.retryUntil || (poll.attempt > 0 && Date.now() < poll.dueAt)) return;
+  clearTimeout(poll.timer);
+  poll.timer = null;
+  poll.inFlight = (async () => {
+    let retryAfterMs = 0;
+    try {
+      const entries = [...pendingLogChannelActions.values()].filter(item => logChannelPollKey(item.job) === key);
+      const jobs = entries.some(item => ["pending", "claimed", "running"].includes(item.job.state))
+        ? await apiRead(`/api/guilds/${original.guild_id}/actions`) : [];
+      for (const item of entries) {
+        if (document.visibilityState !== "visible") break;
+        await reconcileLogChannelEntry(item.job, jobs);
+      }
+    } catch (error) {
+      if (isUnauthenticated(error)) return;
+      retryAfterMs = error.retryAfterMs || 0;
+    } finally {
+      poll.inFlight = null;
+      if (logChannelPolls.get(key) === poll) {
+        ++poll.attempt;
+        poll.retryUntil = Date.now() + retryAfterMs;
+        poll.dueAt = Date.now() + Math.max(actionReconcileDelays[poll.attempt] || 0, retryAfterMs);
+        if (poll.attempt >= actionReconcileDelays.length)
+          toast("Could not confirm the log-channel result. See Bot actions for details.", "info");
+        else scheduleLogChannelReconcile(original);
+      }
+    }
+  })();
+  return poll.inFlight;
+}
+
+async function reconcileLogChannelEntry(original, jobs) {
   const key = logChannelActionKey(original);
   let entry = pendingLogChannelActions.get(key);
   let row = logChannelRow(original.action.event);
@@ -1189,7 +1249,6 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   );
   let job = original;
   if (!originalTerminal) {
-    const jobs = await apiRead(`/api/guilds/${original.guild_id}/actions`);
     job = jobs.find((candidate) => candidate.id === original.id);
     entry = pendingLogChannelActions.get(key);
     row = logChannelRow(original.action.event);
@@ -1208,7 +1267,6 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
       entry.job = job;
       row.pending_action.state = job.state;
     }
-    scheduleLogChannelReconcile(original, attempt + 1);
     return;
   }
   // A newer request for this event owns the row now; never let an older
@@ -1232,8 +1290,7 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   } catch (error) {
     if (isUnauthenticated(error)) return;
     renderLogChannelsPreservingDrafts();
-    scheduleLogChannelReconcile(job, attempt + 1);
-    return;
+    throw error;
   }
   entry = pendingLogChannelActions.get(key);
   row = logChannelRow(original.action.event);
@@ -1317,9 +1374,7 @@ async function loadConfig() {
       toast("Bot membership changed. Configuration reloaded; review it before making changes.", "info");
     }
     state.config = config;
-    for (const { entry } of overlayPendingLogChannels(config, guildId)) {
-      if (entry.timer === null) scheduleLogChannelReconcile(entry.job, entry.attempt);
-    }
+    for (const { entry } of overlayPendingLogChannels(config, guildId)) scheduleLogChannelReconcile(entry.job);
     return true;
   } catch (e) {
     if (request !== configRequest || guildId !== state.guildId) return;
@@ -3039,6 +3094,18 @@ function TemplateCard({ record: t }) {
 }
 
 function tabLogChannels() {
+  useEffect(() => {
+    const visibility = () => {
+      pauseLogChannelPolls();
+      resumeLogChannelPolls();
+    };
+    document.addEventListener("visibilitychange", visibility);
+    resumeLogChannelPolls();
+    return () => {
+      document.removeEventListener("visibilitychange", visibility);
+      pauseLogChannelPolls();
+    };
+  }, [state.guildId, state.config?.enrollment_id]);
   return h(
     "div",
     {},
@@ -3336,6 +3403,7 @@ function tabMembers() {
       statusRetryNeeded = false,
       lastStatusError = null;
     let latestStatusReceivedAt = 0;
+    let pollAttempt = 0, pollDueAt = 0;
     let pendingSyncAction = null,
       syncActionOutcome = null;
     let emptyMembersCell = null;
@@ -3368,11 +3436,28 @@ function tabMembers() {
           (["queued", "running", "waiting"].includes(latestStatus.status) ||
             ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
       if (!active) return;
-      let delay = 10000;
-      if (isDiscordRateLimited(lastStatusError)) {
-        delay = Math.max(10000, Math.min(lastStatusError.retryAfterMs || 10000, 900000));
+      if (!pollDueAt) {
+        let delay = Math.min(10000 * 2 ** Math.min(pollAttempt, 5), 300000);
+        const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
+        const elapsed = Date.now() - latestStatusReceivedAt;
+        const attempts = [];
+        if (["queued", "running", "waiting"].includes(latestStatus?.status))
+          attempts.push(Number(latestStatus.next_attempt_at) || 0);
+        if (["queued", "running", "waiting"].includes(latestStatus?.audit_recovery_status))
+          attempts.push(Number(latestStatus.audit_recovery_next_attempt_at) || 0);
+        // A queued control can change the schedule before the worker's next page.
+        if (attempts.length && !pendingSyncAction)
+          delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);
+        delay = Math.max(delay, lastStatusError?.retryAfterMs || 0);
+        pollDueAt = Date.now() + delay;
       }
-      timer = setTimeout(loadStatus, delay);
+      timer = setTimeout(() => {
+        timer = null;
+        if (Date.now() < pollDueAt) return schedulePoll();
+        pollDueAt = 0;
+        ++pollAttempt;
+        loadStatus();
+      }, Math.min(Math.max(0, pollDueAt - Date.now()), 2147483647));
     };
     const asDate = (value) => memberTime(value);
     const renderStatus = (sync) => {
@@ -3731,6 +3816,9 @@ function tabMembers() {
       setSyncParts(parts);
     };
     const loadStatus = async () => {
+      if (!aliveHere()) return;
+      clearTimer();
+      pollDueAt = 0;
       // A succeeded receipt is durable before this primary status read starts.
       // Its effect (or a later state) must therefore be visible in the result.
       const succeededId = pendingSyncAction?.state === "succeeded" ? pendingSyncAction.id : null;
@@ -3746,6 +3834,10 @@ function tabMembers() {
             "Import status changed after a restore. Check Bot actions before repeating the requested control.";
           pendingSyncAction = null;
         }
+        if (latestStatus && (revision !== latestStatusRevision ||
+          sync.status !== latestStatus.status ||
+          sync.audit_recovery_status !== latestStatus.audit_recovery_status ||
+          sync.audit_recovery_processed !== latestStatus.audit_recovery_processed)) pollAttempt = 0;
         statusRetryNeeded = false;
         lastStatusError = null;
         if (succeededId && pendingSyncAction?.id === succeededId) pendingSyncAction = null;
@@ -4034,8 +4126,10 @@ function tabMembers() {
       },
     };
     const visibility = () => {
-      if (document.visibilityState === "visible" && aliveHere()) loadStatus();
-      else {
+      if (document.visibilityState === "visible" && aliveHere()) {
+        if (latestStatus) renderStatus(latestStatus);
+        schedulePoll();
+      } else {
         clearTimer();
         clearCountdown();
       }
@@ -4312,9 +4406,7 @@ function tabCases() {
             );
             continue;
           }
-          const payload = await apiRead(`/api/guilds/${guildId}/cases/${id}`);
-          if (disposed || current !== request || state.guildId !== guildId) return;
-          const c = payload.case || {};
+          const c = payload.summaries?.[id];
           rows.push(
             h(
               "tr",
@@ -4324,13 +4416,13 @@ function tabCases() {
                 {},
                 h(ActionButton, { className: "btn btn-sm", onClick: () => openCase(id) }, id.slice(0, 8)),
               ),
-              h("td", {}, c.action || ""),
-              h("td", {}, c.outcome || ""),
-              h("td", {}, String(c.subject_id || "")),
+              h("td", {}, c?.action || "Summary unavailable"),
+              h("td", {}, c?.outcome || ""),
+              h("td", {}, String(c?.subject_id || "")),
               h(
                 "td",
                 { className: "muted" },
-                c.occurred_at_ms ? new Date(Number(c.occurred_at_ms)).toLocaleString() : "",
+                c?.occurred_at_ms ? new Date(Number(c.occurred_at_ms)).toLocaleString() : "",
               ),
             ),
           );

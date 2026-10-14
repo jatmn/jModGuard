@@ -2685,6 +2685,18 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(status, StatusCode::OK, "{other}");
     assert!(other["cases"].as_array().unwrap().is_empty());
     let id = ids[0].as_str().unwrap();
+    assert_eq!(
+        body["summaries"][id],
+        serde_json::json!({
+            "action": "ban", "outcome": "succeeded", "subject_id": "1", "occurred_at_ms": 1
+        })
+    );
+    assert!(!body.to_string().contains(tag.as_str()));
+    assert!(!body.to_string().contains("secret"));
+    assert_eq!(other["summaries"], serde_json::json!({}));
+    let (status, posted) = f.request("POST", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    assert_eq!(posted["summaries"], body["summaries"]);
     let (status, detail) = f
         .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
         .await;
@@ -2981,6 +2993,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .request("GET", "/api/guilds/10/cases?removed=true", "")
         .await;
     assert_eq!(removed["cases"][0], id);
+    assert_eq!(removed["summaries"], serde_json::json!({}));
     let (_, active) = f.request("GET", "/api/guilds/10/cases", "").await;
     assert!(active["cases"].as_array().unwrap().is_empty());
     f.request("DELETE", &url, "").await;
