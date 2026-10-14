@@ -142,6 +142,19 @@ pub struct CaseData {
     pub evidence: CaseEvidence,
 }
 
+/// Private list fields only; reason, actor, source and evidence remain detail-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaseSummary {
+    pub action: CaseAction,
+    pub outcome: CaseOutcome,
+    #[serde(
+        serialize_with = "crate::ids::ser_i64_str",
+        deserialize_with = "crate::ids::de_i64"
+    )]
+    pub subject_id: i64,
+    pub occurred_at_ms: i64,
+}
+
 /// Trusted installation budgets, configurable by future operator settings. No age expiry.
 #[derive(Debug, Clone, Copy)]
 pub struct CaseLimits {
@@ -315,6 +328,60 @@ impl GuildDataStore {
             tx.finish_read()?;
             Ok(result)
         }).await
+    }
+
+    /// Read a bounded ID page's summaries in one scoped snapshot, including empty pages.
+    /// Removed/missing records are omitted without changing the caller's ID cursor.
+    pub async fn case_summaries(
+        &self,
+        scope: GuildDataScope,
+        ids: Vec<CaseId>,
+        limits: CaseLimits,
+    ) -> Result<std::collections::BTreeMap<String, CaseSummary>> {
+        self.check_target(&scope.placement)?;
+        limits.validate()?;
+        anyhow::ensure!(ids.len() <= limits.max_page_size as usize, CaseError::Limit);
+        let ids = serde_json::to_string(&ids)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let mut stmt = tx.prepare(
+                    "SELECT case_id, CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN
+                    json_object('action',json_extract(payload,'$.action'),
+                                'outcome',json_extract(payload,'$.outcome'),
+                                'subject_id',json_extract(payload,'$.subject_id'),
+                                'occurred_at_ms',json_extract(payload,'$.occurred_at_ms'))
+                    ELSE NULL END
+                 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0
+                    AND case_id IN (SELECT value FROM json_each(?3))",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        ids,
+                        limits.max_record_bytes as i64
+                    ],
+                    |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+                )?;
+                let mut summaries = std::collections::BTreeMap::new();
+                for row in rows {
+                    let (id, payload) = row?;
+                    let payload = payload.ok_or(CaseError::Limit)?;
+                    let summary: CaseSummary = serde_json::from_str(&payload)?;
+                    anyhow::ensure!(
+                        summary.subject_id > 0 && summary.occurred_at_ms > 0,
+                        CaseError::Invalid
+                    );
+                    summaries.insert(id, summary);
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(summaries)
+            })
+            .await
     }
 
     /// Keyset page in opaque ID order, not chronology. Never loads evidence payloads.
