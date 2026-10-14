@@ -3109,7 +3109,7 @@ mod schema;
 
 mod action_history;
 mod action_queue;
-mod remote_stream;
+pub(in crate::db) mod remote_stream;
 
 mod enrollments;
 

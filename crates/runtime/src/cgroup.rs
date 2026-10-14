@@ -579,17 +579,11 @@ fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
 fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.current")?;
     let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
-    let fallback = stat_value(&stat, "file")
-        .zip(stat_value(&stat, "active_file"))
-        .zip(stat_value(&stat, "shmem"))
-        // Shmem is included in file, but its pages are on anon LRU lists.
-        .map(|((file, active), shmem)| file.saturating_sub(active).saturating_sub(shmem));
-    memory_use(
-        current,
-        &stat,
-        read_memory_limit(dir, "memory.max")?,
-        fallback,
-    )
+    // Type-based file/shmem counters cannot reconstruct the inactive file list:
+    // file-backed unevictable pages are in file but not active/inactive_file,
+    // and the combined unevictable counter does not identify their share.
+    // Keep memory unavailable when the actual inactive_file counter is absent.
+    memory_use(current, &stat, read_memory_limit(dir, "memory.max")?, None)
 }
 
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
@@ -865,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_missing_inactive_file_excludes_shmem_from_file_cache() {
+    fn v2_missing_inactive_file_with_unevictable_pages_is_unavailable() {
         let tree = temp_tree();
         write_files(
             &tree.path,
@@ -873,29 +867,45 @@ mod tests {
                 ("memory.current", "1000\n"),
                 (
                     "memory.stat",
-                    "anon 600\nfile 400\nshmem 300\nactive_file 50\n",
+                    "anon 600\nfile 400\nshmem 300\nactive_file 50\nunevictable 50\ninactive_file 0\n",
                 ),
                 ("memory.max", "2048\n"),
+                ("cpu.stat", "usage_usec 5000\n"),
             ],
         );
         assert_eq!(
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
-                program_bytes: 950,
+                program_bytes: 1000,
                 limit: MemoryLimit::Bytes(2048)
             })
         );
+        // The 50 file-backed unevictable bytes are in file, but are neither
+        // active nor inactive file cache. Removing only the primary counter
+        // must not turn them into a cache deduction.
+        write_files(
+            &tree.path,
+            &[(
+                "memory.stat",
+                "anon 600\nfile 400\nshmem 300\nactive_file 50\nunevictable 50\n",
+            )],
+        );
+        let reading = read_cgroup(Some(&tree.path), Some(&tree.path));
+        assert_eq!(reading.memory, None);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
     }
 
     #[test]
     fn missing_inactive_file_does_not_pretend_current_is_program_use() {
         let tree = temp_tree();
-        // Neither missing nor partial fallback keys establish inactive memory.
+        // Neither partial nor complete type-based counters establish the list.
         for stat in [
             "anon 1000\n",
             "file 400\n",
             "active_file 150\n",
             "anon 600\nfile 400\nactive_file 50\n",
+            "anon 600\nfile 400\nactive_file 50\nshmem 300\n",
+            "anon 600\nfile 400\nactive_file 50\nshmem 300\nunevictable 0\n",
         ] {
             write_files(
                 &tree.path,
@@ -988,12 +998,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_inactive_file_fallback_saturates_all_subtractions() {
+    fn v2_inconsistent_file_counters_do_not_invent_memory_usage() {
         let tree = temp_tree();
-        for (stat, expected) in [
-            ("file 100\nactive_file 150\nshmem 0\n", 1000),
-            ("file 1500\nactive_file 100\nshmem 0\n", 0),
-            ("file 400\nactive_file 50\nshmem 500\n", 1000),
+        for stat in [
+            "file 100\nactive_file 150\nshmem 0\n",
+            "file 1500\nactive_file 100\nshmem 0\n",
+            "file 400\nactive_file 50\nshmem 500\n",
         ] {
             write_files(
                 &tree.path,
@@ -1003,13 +1013,7 @@ mod tests {
                     ("memory.max", "max\n"),
                 ],
             );
-            assert_eq!(
-                read_cgroup(Some(&tree.path), None)
-                    .memory
-                    .unwrap()
-                    .program_bytes,
-                expected
-            );
+            assert_eq!(read_cgroup(Some(&tree.path), None).memory, None, "{stat}");
         }
     }
 
