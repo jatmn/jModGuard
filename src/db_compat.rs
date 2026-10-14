@@ -715,7 +715,9 @@ fn active_caller_abandon() -> Option<Arc<AbandonWatch>> {
     CALLER_ABANDON.with(|slot| slot.borrow().clone())
 }
 
-pub(crate) const ACTIVE_BOT_LEASE_CAS: &str = "UPDATE meta SET value=?1 WHERE key='active_bot_lease' AND substr(value,1,33)=?2 AND CAST(substr(value,34) AS INTEGER) > ?3 AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
+// A delayed renewal or backward clock must not undo a later expiry. Keep a
+// matching no-op successful, but fence it to the term captured by the caller.
+pub(crate) const ACTIVE_BOT_LEASE_CAS: &str = "UPDATE meta SET value=?2 || max(CAST(substr(value,34) AS INTEGER), CAST(substr(?1,34) AS INTEGER)) WHERE key='active_bot_lease' AND substr(value,1,33)=?2 AND CAST(substr(value,34) AS INTEGER) > ?3 AND (SELECT value FROM meta WHERE key='active_bot_generation')=?4 AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
 pub(crate) const LAUNCHER_FENCE_CAS: &str = "UPDATE meta SET value=?1 WHERE key='launcher_lease' AND (substr(value,1,33)=?2 OR CAST(substr(value,34) AS INTEGER) <= ?3) AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
 
 pub struct Connection {

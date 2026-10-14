@@ -523,7 +523,12 @@ pub async fn claim_active_bot(
                     .checked_add(1)
                     .context("active bot generation overflow")?
             };
-            let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+            let mut expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+            if renewal {
+                // The unarmed renewal fallback must also preserve a later expiry.
+                let (_, previous) = current.as_deref().unwrap().rsplit_once(' ').unwrap();
+                expires = expires.max(previous.parse::<i64>()?);
+            }
             tx.ensure_mutation_receipt()?;
             write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
             if !renewal || stored == 0 {
@@ -554,13 +559,15 @@ pub async fn renew_active_bot(
         "active-bot lease authority window expired"
     );
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
-    if db.leased_owner().as_deref() != Some(instance)
-        || db
-            .leased_generation()
-            .is_none_or(|generation| generation <= 0)
-    {
+    let generation = {
+        let lease = db.lease_state.lock().unwrap_or_else(|e| e.into_inner());
+        lease
+            .generation
+            .filter(|generation| *generation > 0 && lease.owner.as_deref() == Some(instance))
+    };
+    let Some(generation) = generation else {
         return claim_active_bot(db, instance, now_ms, refuse).await;
-    }
+    };
     let instance = instance.to_owned();
     let renewed = db
         .with_lease_conn(move |conn| {
@@ -573,7 +580,8 @@ pub async fn renew_active_bot(
                 params![
                     format!("{instance} {expires}"),
                     format!("{instance} "),
-                    now_ms
+                    now_ms,
+                    generation.to_string()
                 ],
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )? == 1)
