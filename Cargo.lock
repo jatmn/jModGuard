@@ -1212,6 +1212,7 @@ dependencies = [
  "serde_json",
  "serenity",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

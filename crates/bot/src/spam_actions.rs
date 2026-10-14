@@ -56,18 +56,37 @@ impl MatchPolicy {
     }
 
     fn still_proving(&self, app: &BotState, found: &Match, now: Instant) -> bool {
+        self.still_proving_with_deletes(app, found, now, &[])
+    }
+
+    fn still_proving_with_deletes(
+        &self,
+        app: &BotState,
+        found: &Match,
+        now: Instant,
+        own_deletes: &[crate::image_spam::OwnDelete],
+    ) -> bool {
         match self {
-            Self::Image(policy) => app.image_spam.match_still_proving(
-                found.guild,
-                found.author,
-                crate::image_spam::MatchProof {
+            Self::Image(policy) => {
+                let proof = crate::image_spam::MatchProof {
                     token: found.token,
                     messages: &found.messages,
                     evidence: &found.excerpts,
                     policy,
                     now,
-                },
-            ),
+                };
+                if own_deletes.is_empty() {
+                    app.image_spam
+                        .match_still_proving(found.guild, found.author, proof)
+                } else {
+                    app.image_spam.enforcement_still_proving(
+                        found.guild,
+                        found.author,
+                        proof,
+                        own_deletes,
+                    )
+                }
+            }
             Self::Text(policy) => app.text_spam.match_still_proving(
                 found.guild,
                 found.author,
@@ -311,7 +330,11 @@ pub(crate) async fn enforce(
 
 // Member lookup, earlier deletes, and ban preparation can all outlive the
 // admitted configuration or image window. Revalidate at each dispatch boundary.
-async fn image_match_still_current(app: &BotState, found: &Match) -> bool {
+async fn image_match_still_current(
+    app: &BotState,
+    found: &Match,
+    own_deletes: &[crate::image_spam::OwnDelete],
+) -> bool {
     if found.kind != Kind::Image {
         return true;
     }
@@ -322,7 +345,9 @@ async fn image_match_still_current(app: &BotState, found: &Match) -> bool {
         return false;
     };
     (cfg.version, cfg.durable_version) == found.token
-        && found.policy.still_proving(app, found, Instant::now())
+        && found
+            .policy
+            .still_proving_with_deletes(app, found, Instant::now(), own_deletes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,11 +459,12 @@ async fn punish_proven_match(
     }
     let now = Instant::now();
     let mut delete_notes = Vec::new();
+    let mut own_deletes = Vec::new();
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
             break;
         }
-        if !image_match_still_current(app, &found).await {
+        if !image_match_still_current(app, &found, &own_deletes).await {
             return ReportDisposition::Consumed;
         }
         if !app
@@ -448,6 +474,30 @@ async fn punish_proven_match(
             delete_notes.push(format!("{channel}/{message} already handled this window"));
             continue;
         }
+        // Register before awaiting HTTP: Gateway may deliver the echo before
+        // REST completes. Only a successful response makes this proof usable.
+        let own_delete = if found.kind == Kind::Image {
+            let Some(deleted) = app.image_spam.begin_delete(
+                found.guild,
+                found.author,
+                found.token,
+                *channel,
+                *message,
+            ) else {
+                app.spam_gate.finish_delete(
+                    found.guild,
+                    found.author,
+                    *channel,
+                    *message,
+                    now,
+                    false,
+                );
+                return ReportDisposition::Consumed;
+            };
+            Some(deleted)
+        } else {
+            None
+        };
         let outcome = match tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
@@ -465,6 +515,10 @@ async fn punish_proven_match(
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
+        if let Some(mut deleted) = own_delete {
+            deleted.finish(matches!(outcome, CaseOutcome::Succeeded));
+            own_deletes.push(deleted);
+        }
         app.spam_gate.finish_delete(
             found.guild,
             found.author,
@@ -557,7 +611,7 @@ async fn punish_proven_match(
                             }
                             Err(_) => None,
                         };
-                        if !image_match_still_current(app, &found).await {
+                        if !image_match_still_current(app, &found, &own_deletes).await {
                             app.spam_gate
                                 .finish_ban(found.guild, found.author, now, false);
                             pending_ban.finish(app, CaseOutcome::Failed).await;

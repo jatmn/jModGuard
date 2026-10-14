@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 tracing = "0.1"
 
 [dev-dependencies]
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 jmodguard = { path = "../..", features = ["test-support"] }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }

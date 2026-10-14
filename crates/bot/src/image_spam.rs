@@ -9,7 +9,10 @@ use serenity::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -43,6 +46,22 @@ struct Post {
     cost: usize,
     revision: u64,
     edited_ms: i64,
+    /// Weak, per-dispatch receipt; never keeps enforcement alive in the detector.
+    own_delete: Weak<AtomicBool>,
+}
+
+/// Bounded proof owned by one enforcement, usable only after a successful delete
+/// and its Gateway echo. The live observation is still retired normally.
+pub(crate) struct OwnDelete {
+    post: Post,
+    echoed: Arc<AtomicBool>,
+    succeeded: bool,
+}
+
+impl OwnDelete {
+    pub(crate) fn finish(&mut self, succeeded: bool) {
+        self.succeeded = succeeded;
+    }
 }
 #[derive(Debug, PartialEq)]
 struct ImageMatch {
@@ -367,27 +386,43 @@ impl Detector {
         author: u64,
         proof: MatchProof<'_>,
     ) -> bool {
+        self.enforcement_still_proving(guild, author, proof, &[])
+    }
+
+    pub(crate) fn enforcement_still_proving(
+        &self,
+        guild: u64,
+        author: u64,
+        proof: MatchProof<'_>,
+        own_deletes: &[OwnDelete],
+    ) -> bool {
         let state = self.state.lock();
-        let Some(b) = state
+        let bucket = state
             .guilds
             .get(&guild)
-            .and_then(|g| g.authors.get(&author))
-        else {
-            return false;
-        };
-        if b.token != proof.token {
+            .and_then(|g| g.authors.get(&author));
+        if bucket.is_some_and(|b| b.token != proof.token) {
             return false;
         }
         let posts: Vec<_> = proof
             .messages
             .iter()
             .filter_map(|(channel, message)| {
-                if state.index.get(&(guild, *channel, *message)) != Some(&author) {
-                    return None;
+                if state.index.get(&(guild, *channel, *message)) == Some(&author) {
+                    return bucket?
+                        .posts
+                        .iter()
+                        .find(|p| p.channel == *channel && p.id == *message);
                 }
-                b.posts
+                own_deletes
                     .iter()
-                    .find(|p| p.channel == *channel && p.id == *message)
+                    .find(|deleted| {
+                        deleted.post.channel == *channel
+                            && deleted.post.id == *message
+                            && deleted.succeeded
+                            && deleted.echoed.load(Ordering::Acquire)
+                    })
+                    .map(|deleted| &deleted.post)
             })
             .collect();
         if posts.len() != proof.messages.len()
@@ -420,7 +455,44 @@ impl Detector {
                 .all(|message| image_match.messages.contains(message))
     }
 
+    pub(crate) fn begin_delete(
+        &self,
+        guild: u64,
+        author: u64,
+        token: (u64, u64),
+        channel: u64,
+        message: u64,
+    ) -> Option<OwnDelete> {
+        let mut state = self.state.lock();
+        if state.index.get(&(guild, channel, message)) != Some(&author) {
+            return None;
+        }
+        let bucket = state.guilds.get_mut(&guild)?.authors.get_mut(&author)?;
+        if bucket.token != token {
+            return None;
+        }
+        let post = bucket
+            .posts
+            .iter_mut()
+            .find(|p| p.channel == channel && p.id == message)?;
+        let deleted = OwnDelete {
+            post: post.clone(),
+            echoed: Arc::new(AtomicBool::new(false)),
+            succeeded: false,
+        };
+        post.own_delete = Arc::downgrade(&deleted.echoed);
+        Some(deleted)
+    }
+
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
+        self.invalidate_message(guild, channel, message, false);
+    }
+
+    pub(crate) fn deleted(&self, guild: u64, channel: u64, message: u64) {
+        self.invalidate_message(guild, channel, message, true);
+    }
+
+    fn invalidate_message(&self, guild: u64, channel: u64, message: u64, delete_echo: bool) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
         let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
@@ -432,7 +504,15 @@ impl Detector {
             guild,
             author,
             self.limits.max_authors_per_guild,
-            |p| p.id == message && p.channel == channel,
+            |p| {
+                if p.id != message || p.channel != channel {
+                    return false;
+                }
+                if delete_echo && let Some(echoed) = p.own_delete.upgrade() {
+                    echoed.store(true, Ordering::Release);
+                }
+                true
+            },
         );
     }
     pub fn invalidate_author(&self, guild: u64, author: u64) {
@@ -828,6 +908,7 @@ fn replace_existing(
     old.edited_ms = post.edited_ms;
     old.revision = post.revision;
     old.valid = true;
+    old.own_delete = Weak::new();
     old.cost = 256
         + post
             .files
@@ -1113,6 +1194,7 @@ pub fn observe(
             files,
             hashes: None,
             valid: true,
+            own_delete: Weak::new(),
             cost: 0,
             revision,
             edited_ms: msg.timestamp.timestamp_millis(),
@@ -1245,6 +1327,7 @@ pub(crate) fn observe_update(
             files,
             hashes: None,
             valid: true,
+            own_delete: Weak::new(),
             cost: 0,
             revision,
             edited_ms,
@@ -1520,6 +1603,7 @@ mod tests {
             serial: 0,
             at,
             valid: true,
+            own_delete: Weak::new(),
             cost: 0,
             revision: 0,
             files: values
@@ -2527,6 +2611,82 @@ mod tests {
         RemoveHash,
         Invalidate,
         Expire,
+        OwnDeleteEcho,
+        OwnEchoAndExternalDelete,
+        OwnEchoAndExternalBulkDelete,
+        OwnEchoAndRemoveHash,
+        LateOwnDeleteEcho,
+    }
+
+    // Serenity exposes Context construction through a shard runner. Connect only
+    // a local handshake fixture; no Gateway runner or Discord connection is started.
+    async fn delete_context(http: Arc<serenity::http::Http>) -> Context {
+        use serenity::gateway::{
+            Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
+            ShardRunnerOptions,
+        };
+        use serenity::model::gateway::{GatewayIntents, ShardInfo};
+        use serenity::model::id::ShardId;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Arc::new(tokio::sync::Mutex::new(format!(
+            "ws://{}",
+            listener.local_addr().unwrap()
+        )));
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let intents = GatewayIntents::empty();
+        let shard = Shard::new(
+            Arc::clone(&url),
+            "fixture",
+            ShardInfo {
+                id: ShardId(0),
+                total: 1,
+            },
+            intents,
+            None,
+        )
+        .await
+        .unwrap();
+        let socket = accept.await.unwrap();
+        let data = Arc::default();
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let (manager, _) = ShardManager::new(ShardManagerOptions {
+            data: Arc::clone(&data),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            shard_index: 0,
+            shard_init: 0,
+            shard_total: 1,
+            ws_url: url,
+            cache: Arc::clone(&cache),
+            http: Arc::clone(&http),
+            intents,
+            presence: None,
+        });
+        let runner = ShardRunner::new(ShardRunnerOptions {
+            data: Arc::clone(&data),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            manager: Arc::clone(&manager),
+            shard,
+            cache: Arc::clone(&cache),
+            http: Arc::clone(&http),
+        });
+        let ctx = Context {
+            data,
+            shard: ShardMessenger::new(&runner),
+            shard_id: ShardId(0),
+            http,
+            cache,
+        };
+        manager.shutdown_all().await;
+        drop(runner);
+        drop(socket);
+        ctx
     }
 
     async fn image_dispatch_race(
@@ -2558,6 +2718,8 @@ mod tests {
             .unwrap()
         );
         app.activation.mark_lock_held(true);
+        app.activation.note_discord_connected();
+        assert!(app.activation.allows_rule_trigger());
         let enrollment = crate::db::enroll_guild(&app.db, 1, 1)
             .await
             .unwrap()
@@ -2635,6 +2797,13 @@ mod tests {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
         let stop = Arc::new(AtomicBool::new(false));
         struct Server(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
         impl Drop for Server {
@@ -2658,6 +2827,35 @@ mod tests {
                     server_lines,
                     server_stop,
                     |method, path| {
+                        use serenity::client::EventHandler;
+                        use serenity::model::id::{ChannelId, MessageId};
+                        let handler = crate::handlers::Handler {
+                            app: Arc::clone(&server_app),
+                        };
+                        if method == "DELETE"
+                            && matches!(
+                                change,
+                                DispatchChange::OwnDeleteEcho
+                                    | DispatchChange::OwnEchoAndExternalDelete
+                                    | DispatchChange::OwnEchoAndExternalBulkDelete
+                                    | DispatchChange::OwnEchoAndRemoveHash
+                            )
+                        {
+                            let parts: Vec<_> = path.split('/').collect();
+                            let message = parts.last().unwrap().parse::<u64>().unwrap();
+                            let channel = parts[parts.len() - 3].parse::<u64>().unwrap();
+                            runtime.block_on(handler.message_delete(
+                                ctx.clone(),
+                                ChannelId::new(channel),
+                                MessageId::new(message),
+                                Some(GuildId::new(1)),
+                            ));
+                            assert_eq!(
+                                server_app.image_spam.author_of(1, channel, message),
+                                None,
+                                "own echoes must remove the live observation"
+                            );
+                        }
                         if method != trigger.0
                             || !path.ends_with(&trigger.1)
                             || server_changed.swap(true, Ordering::SeqCst)
@@ -2665,8 +2863,38 @@ mod tests {
                             return;
                         }
                         match change {
-                            DispatchChange::None => {}
-                            DispatchChange::RemoveHash => {
+                            DispatchChange::None | DispatchChange::OwnDeleteEcho => {}
+                            DispatchChange::OwnEchoAndExternalDelete => {
+                                runtime.block_on(handler.message_delete(
+                                    ctx.clone(),
+                                    ChannelId::new(102),
+                                    MessageId::new(12),
+                                    Some(GuildId::new(1)),
+                                ));
+                            }
+                            DispatchChange::OwnEchoAndExternalBulkDelete => {
+                                runtime.block_on(handler.message_delete_bulk(
+                                    ctx.clone(),
+                                    ChannelId::new(102),
+                                    vec![MessageId::new(12)],
+                                    Some(GuildId::new(1)),
+                                ));
+                            }
+                            DispatchChange::LateOwnDeleteEcho => {
+                                for i in 0..if known_bad { 1 } else { 3 } {
+                                    runtime.block_on(handler.message_delete(
+                                        ctx.clone(),
+                                        ChannelId::new(100 + i),
+                                        MessageId::new(10 + i),
+                                        Some(GuildId::new(1)),
+                                    ));
+                                    assert_eq!(
+                                        server_app.image_spam.author_of(1, 100 + i, 10 + i),
+                                        None
+                                    );
+                                }
+                            }
+                            DispatchChange::RemoveHash | DispatchChange::OwnEchoAndRemoveHash => {
                                 runtime.block_on(async {
                                     let reply = crate::db::apply_control(
                                         &server_app.db,
@@ -2705,10 +2933,6 @@ mod tests {
                 );
             })),
         );
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
         let disposition = crate::spam_actions::enforce(
             &app,
             &http,
@@ -2739,6 +2963,27 @@ mod tests {
             expected_bans,
             "unexpected bans: {seen:?}"
         );
+        for i in 0..expected_deletes as u64 {
+            assert!(
+                seen.iter().any(|line| line
+                    == &format!("DELETE /api/v10/channels/{}/messages/{}", 100 + i, 10 + i)),
+                "every expected matched message must be deleted: {seen:?}"
+            );
+            if matches!(
+                change,
+                DispatchChange::OwnDeleteEcho
+                    | DispatchChange::OwnEchoAndExternalDelete
+                    | DispatchChange::OwnEchoAndExternalBulkDelete
+                    | DispatchChange::OwnEchoAndRemoveHash
+                    | DispatchChange::LateOwnDeleteEcho
+            ) {
+                assert_eq!(
+                    app.image_spam.author_of(1, 100 + i, 10 + i),
+                    None,
+                    "enforcement must not resurrect deleted observations"
+                );
+            }
+        }
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         for id in store
             .case_ids(scope.clone(), None, 20, crate::tenant::case_limits())
@@ -2828,6 +3073,201 @@ mod tests {
     #[tokio::test]
     async fn repeated_image_still_present_dispatches_deletes_and_ban() {
         image_dispatch_race(false, DispatchChange::None, "GET", "/members/99", 3, 1).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_delete_echoes_preserve_remaining_deletes_and_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnDeleteEcho,
+            "DELETE",
+            "/messages/10",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_own_delete_echo_preserves_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::OwnDeleteEcho,
+            "DELETE",
+            "/messages/10",
+            1,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_echo_then_external_delete_cancels_remaining_actions() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnEchoAndExternalDelete,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_external_delete_during_later_dispatch_cancels_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnEchoAndExternalDelete,
+            "DELETE",
+            "/messages/11",
+            2,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_removal_after_own_echo_still_skips_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::OwnEchoAndRemoveHash,
+            "GET",
+            "/bans/99",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_own_echo_after_rest_success_preserves_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::LateOwnDeleteEcho,
+            "GET",
+            "/bans/99",
+            1,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_echoes_after_rest_success_preserve_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::LateOwnDeleteEcho,
+            "GET",
+            "/bans/99",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_echo_then_external_bulk_delete_cancels_remaining_actions() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnEchoAndExternalBulkDelete,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[test]
+    fn own_delete_proof_requires_success_and_expires_at_original_time() {
+        let detector = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let mut policy = policy();
+        policy.known_bad_hashes.insert([1; 32]);
+        detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
+        let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
+        detector.deleted(1, 100, 10);
+        let messages = [(100, 10)];
+        let evidence = evidence(&messages, 2, &[1]);
+        let proof = |at| MatchProof {
+            token: (0, 0),
+            messages: &messages,
+            evidence: &evidence,
+            policy: &policy,
+            now: at,
+        };
+        assert!(
+            !detector.enforcement_still_proving(1, 2, proof(now), std::slice::from_ref(&deleted)),
+            "a Gateway echo alone cannot establish our delete succeeded"
+        );
+        deleted.finish(false);
+        assert!(!detector.enforcement_still_proving(
+            1,
+            2,
+            proof(now),
+            std::slice::from_ref(&deleted)
+        ));
+        deleted.finish(true);
+        assert!(detector.enforcement_still_proving(
+            1,
+            2,
+            proof(now),
+            std::slice::from_ref(&deleted)
+        ));
+        assert!(
+            !detector.enforcement_still_proving(
+                1,
+                2,
+                proof(now + Duration::from_secs(policy.window_secs)),
+                std::slice::from_ref(&deleted)
+            ),
+            "own deletion must not extend the original observation window"
+        );
+        assert_eq!(detector.author_of(1, 100, 10), None);
+        assert!(
+            !detector.match_still_proving(1, 2, proof(now)),
+            "the live detector must stay empty"
+        );
+    }
+
+    #[test]
+    fn own_delete_echo_cannot_revive_an_edited_observation() {
+        let detector = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let mut policy = policy();
+        policy.known_bad_hashes.insert([1; 32]);
+        detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
+        let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
+        assert!(matches!(
+            detector.admit(
+                1,
+                2,
+                post(10, 100, now, &[2, 3]),
+                (0, 0),
+                &policy,
+                now,
+                true
+            ),
+            AdmitOutcome::Matched(_)
+        ));
+        detector.deleted(1, 100, 10);
+        deleted.finish(true);
+        assert!(
+            !detector.enforcement_still_proving(
+                1,
+                2,
+                MatchProof {
+                    token: (0, 0),
+                    messages: &[(100, 10)],
+                    evidence: &evidence(&[(100, 10)], 2, &[1]),
+                    policy: &policy,
+                    now,
+                },
+                &[deleted]
+            ),
+            "an attachment edit before the echo must revoke the original proof"
+        );
     }
 
     #[test]
