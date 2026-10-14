@@ -2983,6 +2983,156 @@ async fn assert_launcher_health(addr: std::net::SocketAddr, reason: &str) {
     }
 }
 
+#[tokio::test]
+async fn exited_bot_serves_health_while_tick_database_is_stalled() {
+    let root = std::env::temp_dir().join(format!("health-stall-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, "health-child").await;
+    let bind_request = root.join("bind-health-health-child");
+    tokio::fs::write(
+        &bind_request,
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string(),
+    )
+    .await
+    .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-child");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none(), "live child owns health");
+    let exit = root.join("exit-code-health-child");
+    tokio::fs::write(&exit, "1").await.unwrap();
+    tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Occupy both real database connections. The production tick cannot finish
+    // its first control read until these channels are released, even on panic.
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::time::timeout(POLL, async {
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_launcher_health(addr, "not ready").await;
+    })
+    .await
+    .expect("health remained unbound behind the stalled database step");
+    tokio::time::sleep(POLL).await;
+    assert!(!tick.is_finished(), "database step must still be stalled");
+    assert_launcher_health(addr, "not ready").await;
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("application exited")
+    );
+    assert_launcher_health(addr, "not ready").await;
+
+    // Failed binds return to the poll loop without losing the next retry.
+    bot.end_idle().await.unwrap();
+    let occupied = tokio::net::TcpListener::bind(addr).await.unwrap();
+    for _ in 0..2 {
+        let error = tokio::time::timeout(POLL, bot.tick())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(bot.health.is_none());
+    }
+    drop(occupied);
+    // Once restart backoff expires, a control error must also retain health.
+    bot.restart.not_before = None;
+    db.with_conn_sync(|conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute_bounded(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('component_upgrade_v1','invalid')",
+            (),
+            64 * 1024,
+        )?;
+        tx.commit()
+    })
+    .unwrap();
+    let error = bot.tick().await.unwrap_err();
+    assert!(error.to_string().contains("expected value"), "{error:#}");
+    assert_launcher_health(addr, "not ready").await;
+
+    // A replacement must acquire the same socket after the launcher task exits.
+    tokio::fs::remove_file(exit).await.unwrap();
+    tokio::fs::remove_file(&bound).await.unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    assert!(bot.health.is_none());
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement never acquired health");
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    bot.stop_application().await.unwrap();
+    assert_launcher_health(addr, "not ready").await;
+    bot.end_idle().await.unwrap();
+    let released = tokio::net::TcpListener::bind(addr).await.unwrap();
+    drop((released, bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 async fn held_launcher_health(
     restart: &mut RestartPolicy,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>) {
@@ -3180,6 +3330,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     .expect("child did not exit after token rejection")
     .unwrap();
     assert_eq!(status.code(), Some(78));
+    // If exit races the tick's initial check, generic idle must not capture
+    // the ordinary readiness reason before the auth hold is established.
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none());
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
     // Exactly one production poll must reap the child and bind the same socket.
