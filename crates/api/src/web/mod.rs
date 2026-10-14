@@ -77,6 +77,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if self.0.is::<SessionStoreUnavailable>() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": SessionStoreUnavailable.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<AuthLost>() {
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "discord authorization failed", "code": "auth_lost"}))).into_response();
         }
@@ -233,7 +240,10 @@ async fn reject_retired_session(app: &ApiState, session: &Session) -> ApiResult<
     {
         // A late response can restore a deleted record. Clear this handle as
         // well as the store row so response middleware cannot save it again.
-        session.flush().await.map_err(anyhow::Error::from)?;
+        session
+            .flush()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         return Err(AuthLost.into());
     }
     Ok(())
@@ -248,7 +258,11 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
             "global config requires the configured bot owner (bot.owner_id)"
         )));
     }
-    let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
+    let Some(user_id) = session
+        .get::<u64>(SESSION_USER)
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?
+    else {
         return Err(ApiError(anyhow::Error::new(NotAuthenticated)));
     };
     reject_retired_session(app, session).await?;
@@ -261,7 +275,10 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
         let mut auth = auth.lock().await;
         reject_retired_session(app, session).await?;
         if auth.dead {
-            session.flush().await.map_err(anyhow::Error::from)?;
+            session
+                .flush()
+                .await
+                .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
             return Err(AuthLost.into());
         }
         auth.last_used = Some(std::time::Instant::now());
@@ -397,6 +414,18 @@ impl SessionAuth {
         ));
     }
 }
+
+/// Session backend failures are availability errors, never authorization denials.
+#[derive(Debug)]
+pub struct SessionStoreUnavailable;
+
+impl std::fmt::Display for SessionStoreUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session store unavailable")
+    }
+}
+
+impl std::error::Error for SessionStoreUnavailable {}
 
 #[derive(Debug)]
 pub struct NotAuthenticated;
