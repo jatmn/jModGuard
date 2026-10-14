@@ -2521,6 +2521,315 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum DispatchChange {
+        None,
+        RemoveHash,
+        Invalidate,
+        Expire,
+    }
+
+    async fn image_dispatch_race(
+        known_bad: bool,
+        change: DispatchChange,
+        trigger_method: &str,
+        trigger_path: &str,
+        expected_deletes: usize,
+        expected_bans: usize,
+    ) {
+        use crate::spam_actions::{Kind, Match, MatchPolicy, ReportDisposition};
+        let _serial = crate::spam_actions::tests::IMAGE_ENFORCEMENT_TEST_LOCK
+            .lock()
+            .await;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path =
+            std::env::temp_dir().join(format!("image_dispatch_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 1, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let scope = crate::db::ScopeWire {
+            global: false,
+            guild_id: 1,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
+        let mut rule = crate::defaults::default_rules().remove(1);
+        rule.enabled = true;
+        rule.skip_moderators = false;
+        rule.dry_run = false;
+        rule.params["mode"] = "exact_image".into();
+        rule.actions = serde_json::from_value(serde_json::json!([
+            {"action": "delete"}, {"action": "ban"}
+        ]))
+        .unwrap();
+        crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        if known_bad {
+            crate::db::apply_control(
+                &app.db,
+                None,
+                crate::db::ControlOp::AddKnownBadImage {
+                    scope: scope.clone(),
+                    hash: "01".repeat(32),
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        assert!(policy.enforce);
+        let token = (cfg.version, cfg.durable_version);
+        let now = Instant::now();
+        let mut matched = None;
+        for i in 0..if known_bad { 1 } else { 3 } {
+            if let AdmitOutcome::Matched(job) = app.image_spam.admit(
+                1,
+                99,
+                post(10 + i, 100 + i, now, &[1, 2]),
+                token,
+                &policy,
+                now,
+                false,
+            ) {
+                matched = app.image_spam.complete(job, &policy, false, now);
+            }
+        }
+        let Some(Report::Verified(matched)) = matched else {
+            panic!("the real detector must prove the admitted image match");
+        };
+        assert_eq!(matched.known_bad, known_bad);
+        let found = Match {
+            kind: Kind::Image,
+            guild: 1,
+            author: 99,
+            channel: 100,
+            token,
+            excerpts: evidence(&matched.messages, 99, &[1, 2]),
+            reason: match_reason(&matched, &policy),
+            policy: MatchPolicy::Image(policy.clone()),
+            messages: matched.messages,
+            proving_hashes: matched.proving,
+            attachments: Vec::new(),
+        };
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        struct Server(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+                self.1.take().unwrap().join().unwrap();
+            }
+        }
+        let changed = Arc::new(AtomicBool::new(false));
+        let server_app = Arc::clone(&app);
+        let server_changed = Arc::clone(&changed);
+        let server_lines = Arc::clone(&lines);
+        let server_stop = Arc::clone(&stop);
+        let trigger = (trigger_method.to_owned(), trigger_path.to_owned());
+        let runtime = tokio::runtime::Handle::current();
+        let server = Server(
+            stop,
+            Some(std::thread::spawn(move || {
+                crate::spam_actions::tests::serve_discord_stub(
+                    listener,
+                    server_lines,
+                    server_stop,
+                    |method, path| {
+                        if method != trigger.0
+                            || !path.ends_with(&trigger.1)
+                            || server_changed.swap(true, Ordering::SeqCst)
+                        {
+                            return;
+                        }
+                        match change {
+                            DispatchChange::None => {}
+                            DispatchChange::RemoveHash => {
+                                runtime.block_on(async {
+                                    let reply = crate::db::apply_control(
+                                        &server_app.db,
+                                        None,
+                                        crate::db::ControlOp::RemoveKnownBadImage {
+                                            scope: scope.clone(),
+                                            hash: "01".repeat(32),
+                                        },
+                                        None,
+                                    )
+                                    .await
+                                    .unwrap();
+                                    assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
+                                    // Do not refresh the cache: dispatch must observe the durable write.
+                                });
+                            }
+                            DispatchChange::Invalidate => {
+                                server_app.image_spam.invalidate(1, 102, 12)
+                            }
+                            DispatchChange::Expire => {
+                                server_app
+                                    .image_spam
+                                    .state
+                                    .lock()
+                                    .guilds
+                                    .get_mut(&1)
+                                    .unwrap()
+                                    .authors
+                                    .get_mut(&99)
+                                    .unwrap()
+                                    .posts[0]
+                                    .at = Instant::now() - Duration::from_secs(policy.window_secs);
+                            }
+                        }
+                    },
+                );
+            })),
+        );
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let disposition = crate::spam_actions::enforce(
+            &app,
+            &http,
+            &serenity::cache::Cache::new(),
+            found,
+            "attachment_flood",
+            "Exact image spam",
+        )
+        .await;
+        drop(server);
+        assert_eq!(disposition, ReportDisposition::Consumed);
+        assert!(
+            changed.load(Ordering::SeqCst),
+            "race trigger must be reached"
+        );
+        let seen = lines.lock().clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|line| line.starts_with("DELETE "))
+                .count(),
+            expected_deletes,
+            "unexpected message deletes: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|line| line.starts_with("PUT ") && line.contains("/bans/"))
+                .count(),
+            expected_bans,
+            "unexpected bans: {seen:?}"
+        );
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        for id in store
+            .case_ids(scope.clone(), None, 20, crate::tenant::case_limits())
+            .await
+            .unwrap()
+        {
+            let case = store
+                .case(scope.clone(), id, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                case.outcome,
+                crate::db::guild_data::CaseOutcome::Attempted,
+                "a skipped ban must settle its prepared case"
+            );
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn known_bad_removal_during_member_lookup_skips_delete_and_ban() {
+        image_dispatch_race(true, DispatchChange::RemoveHash, "GET", "/members/99", 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_removal_after_delete_skips_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::RemoveHash,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_removal_during_ban_lookup_skips_ban() {
+        image_dispatch_race(true, DispatchChange::RemoveHash, "GET", "/bans/99", 1, 0).await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_still_listed_dispatches_delete_and_ban() {
+        image_dispatch_race(true, DispatchChange::None, "GET", "/members/99", 1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_invalidation_after_delete_skips_remaining_actions() {
+        image_dispatch_race(
+            false,
+            DispatchChange::Invalidate,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_expiry_after_delete_skips_remaining_actions() {
+        image_dispatch_race(
+            false,
+            DispatchChange::Expire,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_invalidation_during_ban_lookup_skips_ban() {
+        image_dispatch_race(false, DispatchChange::Invalidate, "GET", "/bans/99", 3, 0).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_expiry_during_ban_lookup_skips_ban() {
+        image_dispatch_race(false, DispatchChange::Expire, "GET", "/bans/99", 3, 0).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_still_present_dispatches_deletes_and_ban() {
+        image_dispatch_race(false, DispatchChange::None, "GET", "/members/99", 3, 1).await;
+    }
+
     #[test]
     fn known_bad_hashes_never_match_missing_or_different_data() {
         let now = Instant::now();

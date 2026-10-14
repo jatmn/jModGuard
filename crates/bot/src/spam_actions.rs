@@ -309,6 +309,22 @@ pub(crate) async fn enforce(
     punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
 }
 
+// Member lookup, earlier deletes, and ban preparation can all outlive the
+// admitted configuration or image window. Revalidate at each dispatch boundary.
+async fn image_match_still_current(app: &BotState, found: &Match) -> bool {
+    if found.kind != Kind::Image {
+        return true;
+    }
+    if app.poll_config_version().await.is_err() {
+        return false;
+    }
+    let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
+        return false;
+    };
+    (cfg.version, cfg.durable_version) == found.token
+        && found.policy.still_proving(app, found, Instant::now())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn punish_proven_match(
     app: &Arc<BotState>,
@@ -421,6 +437,9 @@ async fn punish_proven_match(
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
             break;
+        }
+        if !image_match_still_current(app, &found).await {
+            return ReportDisposition::Consumed;
         }
         if !app
             .spam_gate
@@ -538,6 +557,15 @@ async fn punish_proven_match(
                             }
                             Err(_) => None,
                         };
+                        if !image_match_still_current(app, &found).await {
+                            app.spam_gate
+                                .finish_ban(found.guild, found.author, now, false);
+                            pending_ban.finish(app, CaseOutcome::Failed).await;
+                            if let Some(attempt) = attempted {
+                                attempt.finish(app, CaseOutcome::Failed).await;
+                            }
+                            return ReportDisposition::Consumed;
+                        }
                         let discord_reason =
                             crate::cases::ban_dispatch_reason(&found.reason, attempted.as_ref());
                         if let Some(outcome) = dispatch_spam_ban(
@@ -926,8 +954,11 @@ fn scope_blocks_enforcement(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) static IMAGE_ENFORCEMENT_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[test]
     fn image_notice_evidence_uses_hash_and_locations_without_a_url() {
@@ -1018,6 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_ban_future_finishes_before_capture_starts() {
+        let _serial = IMAGE_ENFORCEMENT_TEST_LOCK.lock().await;
         use std::sync::atomic::Ordering;
         struct ReleaseHold;
         impl Drop for ReleaseHold {
@@ -1238,10 +1270,11 @@ mod tests {
         Some((method, path))
     }
 
-    fn serve_discord_stub(
+    pub(crate) fn serve_discord_stub(
         listener: std::net::TcpListener,
         lines: Arc<Mutex<Vec<String>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        mut before_response: impl FnMut(&str, &str),
     ) {
         use std::io::Write;
         listener.set_nonblocking(true).unwrap();
@@ -1253,12 +1286,15 @@ mod tests {
                         continue;
                     };
                     lines.lock().push(format!("{method} {path}"));
+                    before_response(&method, &path);
                     let body = if method == "GET" && path.contains("/members/") {
                         MEMBER_JSON
                     } else {
                         ""
                     };
-                    let status = if body.is_empty() {
+                    let status = if method == "GET" && path.contains("/bans/") {
+                        "404 Not Found"
+                    } else if body.is_empty() {
                         "204 No Content"
                     } else {
                         "200 OK"
@@ -1309,8 +1345,9 @@ mod tests {
         let stop_guard = Stop(Arc::clone(&stop));
         let server_lines = Arc::clone(&lines);
         let server_stop = Arc::clone(&stop);
-        let server =
-            std::thread::spawn(move || serve_discord_stub(listener, server_lines, server_stop));
+        let server = std::thread::spawn(move || {
+            serve_discord_stub(listener, server_lines, server_stop, |_, _| {})
+        });
 
         let path = std::env::temp_dir().join(format!(
             "spam_unknown_mod_{:032x}.db",
