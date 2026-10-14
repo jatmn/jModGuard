@@ -528,11 +528,26 @@ fn read_memory(dir: &Path) -> Option<MemoryUse> {
     if v2_path.exists() {
         return memory_input(None, "memory.current");
     }
-    let text = memory_input(
-        read_limited(&dir.join("memory.usage_in_bytes")),
-        "memory.usage_in_bytes",
-    )?;
+    let v1_path = dir.join("memory.usage_in_bytes");
+    let name = missing_memory_usage_name(
+        v1_path.exists(),
+        dir.join("memory.stat").exists(),
+        dir.join("cgroup.controllers").exists(),
+    );
+    let text = memory_input(read_limited(&v1_path), name)?;
     parse_v1_memory(dir, &text)
+}
+
+fn missing_memory_usage_name(
+    has_v1_usage: bool,
+    has_stat: bool,
+    has_controllers: bool,
+) -> &'static str {
+    if has_controllers || (has_stat && !has_v1_usage) {
+        "memory.current"
+    } else {
+        "memory.usage_in_bytes"
+    }
 }
 
 // Report only a fixed file/key name, never the resolved cgroup path or contents.
@@ -566,7 +581,9 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
     let fallback = stat_value(&stat, "file")
         .zip(stat_value(&stat, "active_file"))
-        .map(|(file, active)| file.saturating_sub(active));
+        .zip(stat_value(&stat, "shmem"))
+        // Shmem is included in file, but its pages are on anon LRU lists.
+        .map(|((file, active), shmem)| file.saturating_sub(active).saturating_sub(shmem));
     memory_use(
         current,
         &stat,
@@ -848,20 +865,23 @@ mod tests {
     }
 
     #[test]
-    fn v2_missing_inactive_file_uses_file_minus_active_file() {
+    fn v2_missing_inactive_file_excludes_shmem_from_file_cache() {
         let tree = temp_tree();
         write_files(
             &tree.path,
             &[
                 ("memory.current", "1000\n"),
-                ("memory.stat", "anon 600\nfile 400\nactive_file 150\n"),
+                (
+                    "memory.stat",
+                    "anon 600\nfile 400\nshmem 300\nactive_file 50\n",
+                ),
                 ("memory.max", "2048\n"),
             ],
         );
         assert_eq!(
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
-                program_bytes: 750,
+                program_bytes: 950,
                 limit: MemoryLimit::Bytes(2048)
             })
         );
@@ -871,7 +891,12 @@ mod tests {
     fn missing_inactive_file_does_not_pretend_current_is_program_use() {
         let tree = temp_tree();
         // Neither missing nor partial fallback keys establish inactive memory.
-        for stat in ["anon 1000\n", "file 400\n", "active_file 150\n"] {
+        for stat in [
+            "anon 1000\n",
+            "file 400\n",
+            "active_file 150\n",
+            "anon 600\nfile 400\nactive_file 50\n",
+        ] {
             write_files(
                 &tree.path,
                 &[
@@ -883,6 +908,23 @@ mod tests {
             assert!(
                 read_cgroup(Some(&tree.path), None).memory.is_none(),
                 "{stat}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_memory_usage_diagnostic_matches_layout() {
+        for (has_v1_usage, has_stat, has_controllers, expected) in [
+            (false, true, false, "memory.current"),
+            (false, false, true, "memory.current"),
+            (false, true, true, "memory.current"),
+            (true, true, false, "memory.usage_in_bytes"),
+            (true, false, false, "memory.usage_in_bytes"),
+            (false, false, false, "memory.usage_in_bytes"),
+        ] {
+            assert_eq!(
+                missing_memory_usage_name(has_v1_usage, has_stat, has_controllers),
+                expected
             );
         }
     }
@@ -946,11 +988,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_inactive_file_fallback_saturates_both_subtractions() {
+    fn v2_inactive_file_fallback_saturates_all_subtractions() {
         let tree = temp_tree();
         for (stat, expected) in [
-            ("file 100\nactive_file 150\n", 1000),
-            ("file 1500\nactive_file 100\n", 0),
+            ("file 100\nactive_file 150\nshmem 0\n", 1000),
+            ("file 1500\nactive_file 100\nshmem 0\n", 0),
+            ("file 400\nactive_file 50\nshmem 500\n", 1000),
         ] {
             write_files(
                 &tree.path,
@@ -966,6 +1009,25 @@ mod tests {
                     .unwrap()
                     .program_bytes,
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn v2_primary_inactive_file_ignores_shmem() {
+        let tree = temp_tree();
+        for shmem in ["", "shmem 300\n", "shmem 500\n"] {
+            let stat = format!("file 400\nactive_file 50\ninactive_file 100\n{shmem}");
+            write_files(
+                &tree.path,
+                &[("memory.current", "1000\n"), ("memory.stat", &stat)],
+            );
+            assert_eq!(
+                read_cgroup(Some(&tree.path), None)
+                    .memory
+                    .unwrap()
+                    .program_bytes,
+                900
             );
         }
     }
