@@ -460,12 +460,14 @@ async fn punish_proven_match(
     let now = Instant::now();
     let mut delete_notes = Vec::new();
     let mut own_deletes = Vec::new();
+    let mut proof_stale = false;
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
             break;
         }
         if !image_match_still_current(app, &found, &own_deletes).await {
-            return ReportDisposition::Consumed;
+            proof_stale = true;
+            break;
         }
         if !app
             .spam_gate
@@ -492,13 +494,14 @@ async fn punish_proven_match(
                     now,
                     false,
                 );
-                return ReportDisposition::Consumed;
+                proof_stale = true;
+                break;
             };
             Some(deleted)
         } else {
             None
         };
-        let outcome = match tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
                 &app.activation,
@@ -509,16 +512,21 @@ async fn punish_proven_match(
                 ),
             ),
         )
-        .await
-        {
+        .await;
+        if let Some(mut deleted) = own_delete {
+            // An already-gone 404 is idempotent for reporting, but does not
+            // prove this enforcement performed the deletion.
+            deleted.finish(matches!(
+                &result,
+                Ok(crate::discord::DiscordCall::Finished(Ok(())))
+            ));
+            own_deletes.push(deleted);
+        }
+        let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
-        if let Some(mut deleted) = own_delete {
-            deleted.finish(matches!(outcome, CaseOutcome::Succeeded));
-            own_deletes.push(deleted);
-        }
         app.spam_gate.finish_delete(
             found.guild,
             found.author,
@@ -553,7 +561,7 @@ async fn punish_proven_match(
             "{}",
             jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
         );
-    } else if app.spam_gate.claim_ban(found.guild, found.author, now) {
+    } else if !proof_stale && app.spam_gate.claim_ban(found.guild, found.author, now) {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
             http,
@@ -618,35 +626,40 @@ async fn punish_proven_match(
                             if let Some(attempt) = attempted {
                                 attempt.finish(app, CaseOutcome::Failed).await;
                             }
-                            return ReportDisposition::Consumed;
-                        }
-                        let discord_reason =
-                            crate::cases::ban_dispatch_reason(&found.reason, attempted.as_ref());
-                        if let Some(outcome) = dispatch_spam_ban(
-                            app,
-                            enrollment.clone(),
-                            &found,
-                            rule,
-                            now,
-                            pending_ban,
-                            attempted,
-                            GuildId::new(found.guild).ban_with_reason(
-                                http,
-                                UserId::new(found.author),
-                                0,
-                                &discord_reason,
-                            ),
-                        )
-                        .await
-                        {
-                            ban_outcome = Some(outcome);
+                            proof_stale = true;
+                        } else {
+                            let discord_reason = crate::cases::ban_dispatch_reason(
+                                &found.reason,
+                                attempted.as_ref(),
+                            );
+                            if let Some(outcome) = dispatch_spam_ban(
+                                app,
+                                enrollment.clone(),
+                                &found,
+                                rule,
+                                now,
+                                pending_ban,
+                                attempted,
+                                GuildId::new(found.guild).ban_with_reason(
+                                    http,
+                                    UserId::new(found.author),
+                                    0,
+                                    &discord_reason,
+                                ),
+                            )
+                            .await
+                            {
+                                ban_outcome = Some(outcome);
+                            }
                         }
                     }
                 }
             }
         }
     }
-    let action = if withhold_ban {
+    let action = if proof_stale {
+        "remaining actions skipped; image proof or configuration is no longer current".into()
+    } else if withhold_ban {
         format!(
             "delete matched messages; {}",
             jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
@@ -1295,7 +1308,7 @@ pub(crate) mod tests {
         "avatar_decoration_data": null
     }"#;
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
         use std::io::Read;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         let mut buf = Vec::new();
@@ -1321,14 +1334,31 @@ pub(crate) mod tests {
         let mut parts = header.lines().next()?.split_whitespace();
         let method = parts.next()?.to_string();
         let path = parts.next()?.to_string();
-        Some((method, path))
+        let length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + 4 + length {
+            let n = stream.read(&mut tmp).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body = String::from_utf8(buf[header_end + 4..header_end + 4 + length].to_vec()).ok()?;
+        Some((method, path, body))
     }
 
     pub(crate) fn serve_discord_stub(
         listener: std::net::TcpListener,
         lines: Arc<Mutex<Vec<String>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
-        mut before_response: impl FnMut(&str, &str),
+        mut before_response: impl FnMut(&str, &str, &str) -> Option<&'static str>,
     ) {
         use std::io::Write;
         listener.set_nonblocking(true).unwrap();
@@ -1336,17 +1366,21 @@ pub(crate) mod tests {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    let Some((method, path)) = read_http_request(&mut stream) else {
+                    let Some((method, path, request_body)) = read_http_request(&mut stream) else {
                         continue;
                     };
                     lines.lock().push(format!("{method} {path}"));
-                    before_response(&method, &path);
+                    let status_override = before_response(&method, &path, &request_body);
                     let body = if method == "GET" && path.contains("/members/") {
                         MEMBER_JSON
+                    } else if method == "POST" && path.ends_with("/messages") {
+                        r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0001","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#
                     } else {
                         ""
                     };
-                    let status = if method == "GET" && path.contains("/bans/") {
+                    let status = if let Some(status) = status_override {
+                        status
+                    } else if method == "GET" && path.contains("/bans/") {
                         "404 Not Found"
                     } else if body.is_empty() {
                         "204 No Content"
@@ -1400,7 +1434,7 @@ pub(crate) mod tests {
         let server_lines = Arc::clone(&lines);
         let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            serve_discord_stub(listener, server_lines, server_stop, |_, _| {})
+            serve_discord_stub(listener, server_lines, server_stop, |_, _, _| None)
         });
 
         let path = std::env::temp_dir().join(format!(

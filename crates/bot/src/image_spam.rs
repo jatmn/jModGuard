@@ -2651,6 +2651,7 @@ mod tests {
         Invalidate,
         Expire,
         OwnDeleteEcho,
+        ExternalDeleteDuringRequest,
         OwnEchoAndExternalDelete,
         OwnEchoAndExternalBulkDelete,
         OwnEchoAndRemoveHash,
@@ -2799,6 +2800,9 @@ mod tests {
             .await
             .unwrap();
         }
+        crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
+            .await
+            .unwrap();
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
@@ -2858,6 +2862,8 @@ mod tests {
         let server_app = Arc::clone(&app);
         let server_changed = Arc::clone(&changed);
         let server_lines = Arc::clone(&lines);
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let server_reports = Arc::clone(&reports);
         let server_stop = Arc::clone(&stop);
         let trigger = (trigger_method.to_owned(), trigger_path.to_owned());
         let runtime = tokio::runtime::Handle::current();
@@ -2868,7 +2874,15 @@ mod tests {
                     listener,
                     server_lines,
                     server_stop,
-                    |method, path| {
+                    |method, path, body| {
+                        if method == "POST" && path.ends_with("/channels/999/messages") {
+                            server_reports
+                                .lock()
+                                .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                        }
+                        let status = (method == "DELETE"
+                            && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
+                        .then_some("404 Not Found");
                         use serenity::client::EventHandler;
                         use serenity::model::id::{ChannelId, MessageId};
                         let handler = crate::handlers::Handler {
@@ -2878,6 +2892,7 @@ mod tests {
                             && matches!(
                                 change,
                                 DispatchChange::OwnDeleteEcho
+                                    | DispatchChange::ExternalDeleteDuringRequest
                                     | DispatchChange::OwnEchoAndExternalDelete
                                     | DispatchChange::OwnEchoAndExternalBulkDelete
                                     | DispatchChange::OwnEchoAndRemoveHash
@@ -2904,10 +2919,12 @@ mod tests {
                             || !path.ends_with(&trigger.1)
                             || server_changed.swap(true, Ordering::SeqCst)
                         {
-                            return;
+                            return status;
                         }
                         match change {
-                            DispatchChange::None | DispatchChange::OwnDeleteEcho => {}
+                            DispatchChange::None
+                            | DispatchChange::OwnDeleteEcho
+                            | DispatchChange::ExternalDeleteDuringRequest => {}
                             DispatchChange::OwnEchoAndWhitelistRole => {
                                 let event = serde_json::from_value(serde_json::json!({
                                     "guild_id": "1",
@@ -2998,6 +3015,7 @@ mod tests {
                                     .at = Instant::now() - Duration::from_secs(policy.window_secs);
                             }
                         }
+                        status
                     },
                 );
             })),
@@ -3041,6 +3059,7 @@ mod tests {
             if matches!(
                 change,
                 DispatchChange::OwnDeleteEcho
+                    | DispatchChange::ExternalDeleteDuringRequest
                     | DispatchChange::OwnEchoAndExternalDelete
                     | DispatchChange::OwnEchoAndExternalBulkDelete
                     | DispatchChange::OwnEchoAndRemoveHash
@@ -3055,7 +3074,24 @@ mod tests {
                 );
             }
         }
+        let reports = reports.lock().clone();
+        if expected_deletes > 0 {
+            assert_eq!(
+                reports.len(),
+                1,
+                "partial and completed enforcement must report its outcome"
+            );
+            let report = reports[0]["content"].as_str().unwrap();
+            if expected_bans == 0 {
+                assert!(report.contains("remaining actions skipped"), "{report}");
+                assert!(
+                    report.contains("100/10 Succeeded"),
+                    "completed deletions must be reported: {report}"
+                );
+            }
+        }
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let mut already_gone_cases = 0;
         for id in store
             .case_ids(scope.clone(), None, 20, crate::tenant::case_limits())
             .await
@@ -3066,11 +3102,24 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            if matches!(change, DispatchChange::ExternalDeleteDuringRequest)
+                && case.action == crate::db::guild_data::CaseAction::Delete
+            {
+                already_gone_cases += 1;
+                assert_eq!(
+                    case.outcome,
+                    crate::db::guild_data::CaseOutcome::Succeeded,
+                    "already-gone deletions must retain idempotent case reporting"
+                );
+            }
             assert_ne!(
                 case.outcome,
                 crate::db::guild_data::CaseOutcome::Attempted,
                 "a skipped ban must settle its prepared case"
             );
+        }
+        if matches!(change, DispatchChange::ExternalDeleteDuringRequest) {
+            assert_eq!(already_gone_cases, 1, "the 404 must produce a delete case");
         }
         drop(app);
         let _ = std::fs::remove_file(&path);
@@ -3144,6 +3193,32 @@ mod tests {
     #[tokio::test]
     async fn repeated_image_still_present_dispatches_deletes_and_ban() {
         image_dispatch_race(false, DispatchChange::None, "GET", "/members/99", 3, 1).await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_external_delete_during_request_skips_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::ExternalDeleteDuringRequest,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_external_delete_during_request_skips_remaining_actions() {
+        image_dispatch_race(
+            false,
+            DispatchChange::ExternalDeleteDuringRequest,
+            "DELETE",
+            "/messages/10",
+            1,
+            0,
+        )
+        .await;
     }
 
     #[tokio::test]
