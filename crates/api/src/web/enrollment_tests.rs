@@ -3367,25 +3367,26 @@ async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
 
 #[tokio::test]
 async fn recovery_routes_require_an_authenticated_owner() {
+    let routes = [
+        ("GET", "/api/service-upgrade", ""),
+        (
+            "POST",
+            "/api/service-upgrade/check",
+            r#"{"channel":"stable"}"#,
+        ),
+        (
+            "POST",
+            "/api/service-upgrade",
+            r#"{"bot_digest":"","api_digest":"","confirmed":true}"#,
+        ),
+        ("POST", "/api/service-upgrade/cancel", r#"{"id":"missing"}"#),
+    ];
     let mut f = Fixture::new(false).await;
     for authenticated in [true, false] {
         if !authenticated {
             f.cookie.clear();
         }
-        for (method, route, input) in [
-            ("GET", "/api/service-upgrade", ""),
-            (
-                "POST",
-                "/api/service-upgrade/check",
-                r#"{"channel":"stable"}"#,
-            ),
-            (
-                "POST",
-                "/api/service-upgrade",
-                r#"{"bot_digest":"","api_digest":"","confirmed":true}"#,
-            ),
-            ("POST", "/api/service-upgrade/cancel", r#"{"id":"missing"}"#),
-        ] {
+        for (method, route, input) in routes {
             let (status, body) = f.request(method, route, input).await;
             let (expected_status, expected_message) = if authenticated {
                 (
@@ -3401,6 +3402,31 @@ async fn recovery_routes_require_an_authenticated_owner() {
             assert_eq!(status, expected_status, "{method} {route}: {body}");
             assert_eq!(body, serde_json::json!({"error": expected_message}));
         }
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+    let f = Fixture::new(true).await;
+    let token = "synthetic-preview";
+    f.app.preview.insert(
+        token.into(),
+        preview::PreviewGrant {
+            token: token.into(),
+            actor_id: 42,
+            guild_id: 10,
+            profile: preview::PreviewProfile::Administrator,
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        },
+    );
+    for (method, route, input) in routes {
+        let (status, body) = f.request_preview(method, route, input, token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {route}: {body}");
+        let expected = if method == "GET" {
+            serde_json::json!({"error":"only the configured owner can manage upgrades"})
+        } else {
+            serde_json::json!({"error":"preview is read-only", "code":"preview_read_only"})
+        };
+        assert_eq!(body, expected);
     }
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);

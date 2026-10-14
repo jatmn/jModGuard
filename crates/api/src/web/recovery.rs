@@ -58,6 +58,9 @@ fn problem(status: StatusCode, message: impl ToString) -> (StatusCode, Json<Valu
 
 fn owner_error(failure: ApiError) -> (StatusCode, Json<Value>) {
     match failure {
+        failure if failure.0.is::<SessionStoreUnavailable>() => {
+            problem(StatusCode::SERVICE_UNAVAILABLE, SessionStoreUnavailable)
+        }
         failure if failure.0.is::<AuthLost>() => (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
@@ -85,7 +88,7 @@ async fn owner(state: &RecoveryState, session: &Session) -> Result<(), (StatusCo
     let uid = session
         .get::<u64>(SESSION_USER)
         .await
-        .map_err(|_| problem(StatusCode::UNAUTHORIZED, "sign in again"))?;
+        .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, SessionStoreUnavailable))?;
     if uid.is_none() {
         return Err(problem(
             StatusCode::UNAUTHORIZED,
@@ -395,6 +398,223 @@ mod tests {
         session.insert(SESSION_USER, uid).await.unwrap();
         session.save().await.unwrap();
         format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap())
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FailingStore {
+        inner: MemoryStore,
+        fail_load: Arc<std::sync::atomic::AtomicBool>,
+        fail_delete: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl tower_sessions::SessionStore for FailingStore {
+        async fn create(
+            &self,
+            record: &mut tower_sessions::session::Record,
+        ) -> tower_sessions::session_store::Result<()> {
+            self.inner.create(record).await
+        }
+
+        async fn save(
+            &self,
+            record: &tower_sessions::session::Record,
+        ) -> tower_sessions::session_store::Result<()> {
+            self.inner.save(record).await
+        }
+
+        async fn load(
+            &self,
+            id: &tower_sessions::session::Id,
+        ) -> tower_sessions::session_store::Result<Option<tower_sessions::session::Record>>
+        {
+            if self.fail_load.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(tower_sessions::session_store::Error::Backend(
+                    "private backend detail: not authenticated".into(),
+                ));
+            }
+            self.inner.load(id).await
+        }
+
+        async fn delete(
+            &self,
+            id: &tower_sessions::session::Id,
+        ) -> tower_sessions::session_store::Result<()> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(tower_sessions::session_store::Error::Backend(
+                    "private backend detail: delete failed".into(),
+                ));
+            }
+            self.inner.delete(id).await
+        }
+    }
+
+    async fn request(
+        router: &Router,
+        method: &str,
+        route: &str,
+        cookie: &str,
+        input: &str,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header("cookie", cookie)
+                    .header("origin", "https://api.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(input.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn recovery_session_store_errors_are_generic_and_retryable() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path =
+            std::env::temp_dir().join(format!("recovery-store-{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let mut cfg = ApiProcessConfig::default();
+        cfg.bot.owner_id = 123;
+        cfg.web.base_url = "https://api.example.test".into();
+        let app = ApiState::new(cfg, db.clone()).unwrap();
+        for maintenance in [false, true] {
+            let state = Arc::new(RecoveryState {
+                cfg: app.cfg.clone(),
+                oauth: app.oauth.clone(),
+                control: UpdateControl::from_application(&db),
+                apply_enabled: false,
+                api: (!maintenance).then(|| app.clone()),
+                writer: None,
+            });
+            for scenario in ["missing", "nonowner", "load", "retired", "dead"] {
+                if maintenance && matches!(scenario, "retired" | "dead") {
+                    continue;
+                }
+                for (method, route, input) in [
+                    ("GET", "/api/service-upgrade", ""),
+                    (
+                        "POST",
+                        "/api/service-upgrade",
+                        r#"{"bot_digest":"","api_digest":"","confirmed":false}"#,
+                    ),
+                    (
+                        "POST",
+                        "/api/service-upgrade/check",
+                        r#"{"channel":"invalid"}"#,
+                    ),
+                    ("POST", "/api/service-upgrade/cancel", r#"{"id":""}"#),
+                    // These consumers must preserve the same store-error contract.
+                    ("GET", "/test/updates", ""),
+                    ("GET", "/test/usage", ""),
+                    ("GET", "/test/global", ""),
+                ] {
+                    if (maintenance || matches!(scenario, "missing" | "nonowner"))
+                        && route.starts_with("/test/")
+                    {
+                        continue;
+                    }
+                    let store = FailingStore::default();
+                    let mut cookie =
+                        cookie(&store.inner, if scenario == "nonowner" { 456 } else { 123 }).await;
+                    let id = cookie.split_once('=').unwrap().1.parse().unwrap();
+                    match scenario {
+                        "missing" => cookie.clear(),
+                        "nonowner" => {}
+                        "load" => store.fail_load.store(true, SeqCst),
+                        "retired" => {
+                            app.retired_auth_sessions
+                                .insert(id, std::time::Instant::now());
+                            store.fail_delete.store(true, SeqCst);
+                        }
+                        "dead" => {
+                            app.auth_sessions.insert(
+                                id,
+                                Arc::new(tokio::sync::Mutex::new(SessionAuth {
+                                    dead: true,
+                                    ..Default::default()
+                                })),
+                            );
+                            store.fail_delete.store(true, SeqCst);
+                        }
+                        _ => unreachable!(),
+                    }
+                    let consumers = Router::new()
+                        .route("/test/updates", get(updates::status))
+                        .route("/test/usage", get(usage::overview))
+                        .route(
+                            "/test/global",
+                            get(
+                                |State(app): State<Arc<ApiState>>, session: Session| async move {
+                                    guild_scope(&app, &session, 0)
+                                        .await
+                                        .map(|_| Json(json!({"ok":true})))
+                                },
+                            ),
+                        )
+                        .with_state(app.clone());
+                    let router = routes(state.clone()).merge(consumers).layer(
+                        SessionManagerLayer::new(store.clone()).with_name(SESSION_COOKIE_NAME),
+                    );
+                    let (status, body) = request(&router, method, route, &cookie, input).await;
+                    if matches!(scenario, "missing" | "nonowner") {
+                        let (expected_status, message) = if scenario == "missing" {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                "sign in to manage service upgrades",
+                            )
+                        } else {
+                            (
+                                StatusCode::FORBIDDEN,
+                                "only the configured owner can manage upgrades",
+                            )
+                        };
+                        assert_eq!(
+                            status, expected_status,
+                            "{maintenance} {method} {route}: {body}"
+                        );
+                        assert_eq!(body, json!({"error":message}));
+                        continue;
+                    }
+                    assert_eq!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "{maintenance} {scenario} {method} {route}: {body}"
+                    );
+                    assert_eq!(body, json!({"error":"session store unavailable"}));
+                    // A transient backend failure must not destroy the stored identity
+                    // or bypass a retirement/dead-session rejection when retried.
+                    store.fail_load.store(false, SeqCst);
+                    store.fail_delete.store(false, SeqCst);
+                    let (status, body) = if scenario == "load" {
+                        request(&router, "GET", "/api/service-upgrade", &cookie, "").await
+                    } else {
+                        request(&router, method, route, &cookie, input).await
+                    };
+                    if scenario == "load" {
+                        assert_eq!(status, StatusCode::OK, "{body}");
+                    } else {
+                        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                        assert_eq!(
+                            body,
+                            json!({"error":"discord authorization failed", "code":"auth_lost"})
+                        );
+                    }
+                }
+            }
+        }
+        drop((app, db));
+        std::fs::remove_file(&path).unwrap();
+        crate::tenant::remove_sidecars(&path);
     }
 
     #[test]

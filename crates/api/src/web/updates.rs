@@ -172,6 +172,10 @@ async fn release_any(
 async fn owner(app: &Arc<ApiState>, session: &Session) -> Result<(), (StatusCode, Json<Value>)> {
     match session_owner(app, session).await {
         Ok(_) => Ok(()),
+        Err(failure) if failure.0.is::<super::SessionStoreUnavailable>() => Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session store unavailable",
+        )),
         Err(failure) if failure.0.is::<super::AuthLost>() => Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
