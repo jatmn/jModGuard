@@ -58,6 +58,12 @@ async fn authorize(
 ) -> Result<(), (StatusCode, Json<Value>)> {
     match session_owner(app, session).await {
         Ok(_) => {}
+        Err(failure) if failure.0.is::<super::SessionStoreUnavailable>() => {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session store unavailable",
+            ));
+        }
         Err(failure) if failure.0.is::<super::AuthLost>() => {
             return Err((
                 StatusCode::UNAUTHORIZED,
