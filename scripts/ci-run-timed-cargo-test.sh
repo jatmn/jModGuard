@@ -28,18 +28,26 @@ jmodguard_kill_active_test_session() {
 }
 
 jmodguard_runner_trap_exit() {
+  local exit_rc=$?
   if [ -n "${JMODGUARD_ACTIVE_TEST_SESSION_PGID:-}" ] || [ -n "${JMODGUARD_ACTIVE_TEST_LEADER_PID:-}" ]; then
     jmodguard_kill_active_test_session
   fi
   if [ -n "${JMODGUARD_PRIOR_EXIT_TRAP:-}" ]; then
-    eval "${JMODGUARD_PRIOR_EXIT_TRAP}"
+    # Restore the incoming status for cleanups that save $? and exit with it.
+    # The conditional keeps a nonzero status from triggering errexit first.
+    if (exit "$exit_rc"); then
+      eval "${JMODGUARD_PRIOR_EXIT_TRAP}"
+    else
+      eval "${JMODGUARD_PRIOR_EXIT_TRAP}"
+    fi
   fi
 }
 
 jmodguard_runner_trap_signal() {
   local sig=$1
   jmodguard_kill_active_test_session
-  trap - INT TERM EXIT
+  # Leave EXIT installed so the caller cleanup runs exactly once on exit.
+  trap - INT TERM
   if [ "$sig" -eq 2 ]; then
     exit 130
   fi
@@ -226,38 +234,92 @@ test_list_name() {
   printf '%s\n' "$name"
 }
 
-doctest_run_token() {
+# rustdoc splits each --test-args value on whitespace, so a full name with
+# spaces cannot be passed to --exact. Use literal tokens and exclude every
+# competing name from the unfiltered listing; never fall back to a batch run.
+doctest_run_selector() {
   local name=$1
   shift
-  local candidate best="" best_len=0 count n item
-  local -a parts=()
-  read -r -a parts <<<"$name"
-  for candidate in "${parts[@]}"; do
-    case "$candidate" in
-      ''|-) continue ;;
-      -*) continue ;;
-    esac
-    count=0
-    for n in "$@"; do
-      case "$n" in
-        *"$candidate"*) count=$((count + 1)) ;;
-      esac
-    done
-    if [ "$count" -eq 1 ] && [ "${#candidate}" -gt "$best_len" ]; then
-      best=$candidate
-      best_len=${#candidate}
-    fi
-  done
-  if [ -n "$best" ]; then
-    printf '%s\n' "$best"
+  local token="" candidate other skip unique
+  local -a parts=() other_parts=() selector=()
+  if [[ "$name" != *[[:space:]]* ]]; then
+    printf '%s\n' --exact "$name"
     return 0
   fi
-  item="${name#* - }"
-  item="${item%% \(line *}"
-  case "$item" in
-    ''|*' '*|-*) return 1 ;;
-  esac
-  printf '%s\n' "$item"
+  read -r -a parts <<<"$name"
+  for candidate in "${parts[@]}"; do
+    [[ "$candidate" == -* ]] && continue
+    unique=1
+    for other in "$@"; do
+      if [ "$other" != "$name" ] && [[ "$other" == *"$candidate"* ]]; then
+        unique=0
+        break
+      fi
+    done
+    if [ "$unique" -eq 1 ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    [ "${#candidate}" -le "${#token}" ] || token=$candidate
+  done
+  [ -n "$token" ] || return 1
+  selector=("$token")
+  for other in "$@"; do
+    [ "$other" != "$name" ] || continue
+    [[ "$other" == *"$token"* ]] || continue
+    skip=""
+    read -r -a other_parts <<<"$other"
+    for candidate in "${other_parts[@]}"; do
+      if [[ "$name" != *"$candidate"* ]]; then
+        skip=$candidate
+        break
+      fi
+    done
+    [ -n "$skip" ] || return 1
+    selector+=("--skip=$skip")
+  done
+  printf '%s\n' "${selector[@]}"
+}
+
+# Cargo's positional TESTNAME is a discovery filter, not a build option.
+# Preserve separate option values as well as attached/equals forms.
+jmodguard_cargo_args_without_test_filter() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p|--package|--exclude|--test|--bin|--example|--bench|-F|--features|\
+      -j|--jobs|--profile|--target|--target-dir|--manifest-path|--message-format|\
+      --color|--config|-Z|--lockfile-path)
+        printf '%s\n' "$1" "$2"
+        shift 2
+        ;;
+      -*) printf '%s\n' "$1"; shift ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# Discovery has already applied all name filters, --exact and --skip. Retain
+# execution options and their values, using rustdoc's whitespace splitting.
+jmodguard_doctest_run_harness() {
+  local arg
+  local -a words=() args=()
+  for arg in "$@"; do
+    read -r -a words <<<"$arg"
+    args+=("${words[@]}")
+  done
+  set -- "${args[@]}"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --skip) shift 2 ;;
+      --exact|--skip=*) shift ;;
+      --format|--color|--test-threads|--logfile|--shuffle-seed|-Z)
+        printf '%s\n' "$1" "$2"
+        shift 2
+        ;;
+      -*) printf '%s\n' "$1"; shift ;;
+      *) shift ;;
+    esac
+  done
 }
 
 run_timed_cargo_test_skip_doctests() {
@@ -296,7 +358,7 @@ run_timed_cargo_test_has_target_scope() {
   return 1
 }
 
-# One package name per line from `--exclude` (workspace-only; not passed to per-scope cargo).
+# One package pattern per line (workspace-only; not passed to per-scope cargo).
 jmodguard_cargo_exclude_names() {
   local -a args=("$@")
   local i=0 arg
@@ -309,19 +371,99 @@ jmodguard_cargo_exclude_names() {
           printf '%s\n' "${args[$i]}"
         fi
         ;;
+      --exclude=*) printf '%s\n' "${arg#--exclude=}" ;;
     esac
     i=$((i + 1))
   done
 }
 
+# Translate glob::Pattern tokens, not shell syntax. Package names have no '/':
+# a nonterminal **/ can only match zero components; a terminal ** matches all.
+# Return 2 for invalid patterns so rescoping cannot silently discard Cargo errors.
+jmodguard_cargo_glob_matches() (
+  local pkg=$1 glob=$2 pattern='' class neg lo hi ch
+  local i=0 j start count never=0
+  local LC_COLLATE=C
+  shopt -u nocasematch
+  while [ "$i" -lt "${#glob}" ]; do
+    ch=${glob:i:1}
+    case "$ch" in
+      '?') pattern+='?'; i=$((i + 1)) ;;
+      '*')
+        start=$i
+        while [ "${glob:i:1}" = '*' ]; do i=$((i + 1)); done
+        count=$((i - start))
+        [ "$count" -le 2 ] || return 2
+        if [ "$count" -eq 2 ]; then
+          [ "$start" -eq 0 ] || [ "${glob:start-1:1}" = / ] || return 2
+          if [ "$i" -lt "${#glob}" ]; then
+            [ "${glob:i:1}" = / ] || return 2
+            i=$((i + 1))
+          fi
+          [ "$i" -eq "${#glob}" ] || continue
+        fi
+        pattern+='*'
+        ;;
+      '[')
+        i=$((i + 1))
+        neg=''
+        if [ "${glob:i:1}" = '!' ]; then neg='!'; i=$((i + 1)); fi
+        # The first member (including ']') is always literal.
+        j=$((i + 1))
+        while [ "$j" -lt "${#glob}" ] && [ "${glob:j:1}" != ']' ]; do j=$((j + 1)); done
+        [ "$j" -lt "${#glob}" ] || return 2
+        class=''
+        while [ "$i" -lt "$j" ]; do
+          lo=${glob:i:1}
+          if [ "$((i + 2))" -lt "$j" ] && [ "${glob:i+1:1}" = '-' ]; then
+            hi=${glob:i+2:1}
+            # glob accepts reversed ranges, but they match nothing.
+            [[ "$lo" > "$hi" ]] || class+="\\$lo-\\$hi"
+            i=$((i + 3))
+          else
+            class+="\\$lo"
+            i=$((i + 1))
+          fi
+        done
+        if [ -n "$class" ]; then
+          pattern+="[$neg$class]"
+        elif [ -n "$neg" ]; then
+          pattern+='?'
+        else
+          never=1
+        fi
+        i=$((j + 1))
+        ;;
+      *) pattern+="\\$ch"; i=$((i + 1)) ;;
+    esac
+  done
+  # Only the translated tokens may act as Bash pattern syntax.
+  # shellcheck disable=SC2053
+  [ "$never" -eq 0 ] && [[ $pkg == $pattern ]]
+)
+
 jmodguard_package_is_excluded() {
   local pkg=$1
-  local ex
+  shift
+  local ex rc matched=1
   while IFS= read -r ex; do
     [ -n "$ex" ] || continue
-    [ "$ex" = "$pkg" ] && return 0
+    # Cargo's is_glob_pattern includes ']' too. Plain names use equality;
+    # backslashes and Bash extglob operators never escape or expand them.
+    case "$ex" in
+      *\**|*\?*|*\[*|*\]*)
+        rc=0
+        jmodguard_cargo_glob_matches "$pkg" "$ex" || rc=$?
+        if [ "$rc" -eq 2 ]; then
+          printf 'ci-preflight: invalid Cargo exclusion pattern: %s\n' "$ex" >&2
+          return 2
+        fi
+        [ "$rc" -ne 0 ] || matched=0
+        ;;
+      *) [ "$pkg" != "$ex" ] || matched=0 ;;
+    esac
   done < <(jmodguard_cargo_exclude_names "$@")
-  return 1
+  return "$matched"
 }
 
 # One scope per line: lib, or test:<binary-name>
@@ -359,10 +501,16 @@ run_timed_cargo_test_list_scopes() {
       packages+=("$line")
     done < <(jq -r '.packages[] | .name' "$meta")
   fi
-  local p had_scope=0
+  local p had_scope=0 exclude_rc
   for p in "${packages[@]}"; do
     if jmodguard_package_is_excluded "$p" "${cargo_args[@]}"; then
       continue
+    else
+      exclude_rc=$?
+      if [ "$exclude_rc" -ne 1 ]; then
+        rm -f "$meta" "$meta_err"
+        return "$exclude_rc"
+      fi
     fi
     had_scope=0
     if jq -e --arg p "$p" '
@@ -423,7 +571,7 @@ jmodguard_cargo_args_without_targets() {
         i=$((i + 2))
         continue
         ;;
-      --workspace|--all)
+      --exclude=*|--workspace|--all)
         i=$((i + 1))
         continue
         ;;
@@ -446,7 +594,7 @@ jmodguard_cargo_args_for_test_list() {
   while [ "$i" -lt "${#args[@]}" ]; do
     arg="${args[$i]}"
     case "$arg" in
-      --workspace|--all)
+      --exclude=*|--workspace|--all)
         i=$((i + 1))
         continue
         ;;
@@ -482,8 +630,14 @@ jmodguard_scoped_cargo_args() {
     scoped+=("$line")
   done < <(jmodguard_cargo_args_without_targets "${cargo_args[@]}")
 
-  # Per-scope runs use `-p` only; workspace feature unification differs from native
-  # `cargo test --workspace` (tracked in #299).
+  # Limitation (#299): separate -p builds do not preserve native workspace
+  # feature unification. Keeping --workspace makes Cargo ignore -p; selecting
+  # every package together loses per-target isolation (including test names).
+  # A flat --features union is not proven equivalent: resolver 2's feature
+  # graph depends on dependency kind (build/dev/normal) and target, and
+  # transitive dependency features need not be exposed by workspace members.
+  # Preserve this behavior until we can reuse native build artifacts/units
+  # without reconstructing Cargo's resolver or changing the test context.
 
   case "$scope" in
     lib:*)
@@ -579,11 +733,26 @@ run_cargo_test_doc_timed() {
 }
 
 run_timed_cargo_test_doctests() {
-  if run_timed_cargo_test_skip_doctests "$@"; then
+  local -a cargo_args=() harness=() harness_tail=()
+  local past_dd=0 run_ignored=0 arg
+  for arg in "$@"; do
+    if [ "$past_dd" -eq 1 ]; then
+      harness+=("$arg")
+      case "$arg" in
+        --ignored|--include-ignored) run_ignored=1 ;;
+        *) harness_tail+=("$arg") ;;
+      esac
+    elif [ "$arg" = -- ]; then
+      past_dd=1
+    else
+      cargo_args+=("$arg")
+    fi
+  done
+  if run_timed_cargo_test_skip_doctests "${cargo_args[@]}"; then
     return 0
   fi
   set +e
-  run_timed_cargo_test_may_run_doctests "$@"
+  run_timed_cargo_test_may_run_doctests "${cargo_args[@]}"
   local doctest_gate_rc=$?
   set -e
   if [ "$doctest_gate_rc" -eq 1 ]; then
@@ -593,14 +762,14 @@ run_timed_cargo_test_doctests() {
     return "$doctest_gate_rc"
   fi
   if ! command -v timeout >/dev/null 2>&1; then
-    cargo test "$@" --doc
+    cargo test "${cargo_args[@]}" --doc -- "${harness[@]}"
     return $?
   fi
-  local list_out list_rc ignored_out ignored_rc name token rc
-  local -a doc_names=()
-  local -A ignored_names=() covered=()
+  local list_out list_rc ignored_out ignored_rc name selector rc line
+  local -a doc_names=() all_names=() run_cargo=() run_harness=() selector_args=()
+  local -A ignored_names=()
   set +e
-  list_out="$(cargo test "$@" --doc -- --list --format terse)"
+  list_out="$(cargo test "${cargo_args[@]}" --doc -- --list --format terse "${harness[@]}")"
   list_rc=$?
   set -e
   if [ "$list_rc" -ne 0 ]; then
@@ -611,7 +780,7 @@ run_timed_cargo_test_doctests() {
     doc_names+=("$name")
   done <<<"$list_out"
   set +e
-  ignored_out="$(cargo test "$@" --doc -- --list --ignored --format terse)"
+  ignored_out="$(cargo test "${cargo_args[@]}" --doc -- --list --ignored --format terse "${harness_tail[@]}")"
   ignored_rc=$?
   set -e
   if [ "$ignored_rc" -ne 0 ]; then
@@ -621,22 +790,36 @@ run_timed_cargo_test_doctests() {
     name="$(test_list_name "$line")" || continue
     ignored_names["$name"]=1
   done <<<"$ignored_out"
+  [ "${#doc_names[@]}" -gt 0 ] || return 0
+  while IFS= read -r line; do
+    run_cargo+=("$line")
+  done < <(jmodguard_cargo_args_without_test_filter "${cargo_args[@]}")
+  while IFS= read -r line; do
+    run_harness+=("$line")
+  done < <(jmodguard_doctest_run_harness "${harness[@]}")
+  # Include names excluded by caller filters: a token unique in the selected
+  # set may otherwise run another doctest when those filters are removed.
+  list_out="$(cargo test "${run_cargo[@]}" --doc -- --list --format terse "${run_harness[@]}")" || return $?
+  while IFS= read -r line; do
+    name="$(test_list_name "$line")" || continue
+    all_names+=("$name")
+  done <<<"$list_out"
   for name in "${doc_names[@]}"; do
-    [ -n "${covered[$name]+x}" ] && continue
-    [ -n "${ignored_names[$name]+x}" ] && continue
-    token="$(doctest_run_token "$name" "${doc_names[@]}")" || token=""
-    if [ -z "$token" ]; then
-      run_cargo_test_doc_timed "$name" "$@" --doc -- --test-threads=1
-      return $?
+    if [ "$run_ignored" -eq 0 ] && [ -n "${ignored_names[$name]+x}" ]; then
+      continue
     fi
-    run_cargo_test_doc_timed "$name" "$@" --doc -- "$token" --test-threads=1
-    rc=$?
+    if ! selector="$(doctest_run_selector "$name" "${all_names[@]}")"; then
+      echo "ci-preflight: cannot isolate doctest: $name" >&2
+      return 1
+    fi
+    selector_args=()
+    while IFS= read -r line; do
+      selector_args+=("$line")
+    done <<<"$selector"
+    rc=0
+    run_cargo_test_doc_timed "$name" "${run_cargo[@]}" --doc -- \
+      "${selector_args[@]}" --test-threads=1 "${run_harness[@]}" || rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
-    for n in "${doc_names[@]}"; do
-      case "$n" in
-        *"$token"*) covered["$n"]=1 ;;
-      esac
-    done
   done
 }
 
@@ -756,20 +939,16 @@ run_timed_cargo_test_gnu() {
   done
 
   local -a scopes=()
-  local scope scoped_line
+  local scope scoped_line scope_lines
   local -a scoped_args=()
-  local ignored_only=0
 
   jmodguard_timed_cargo_install_traps
 
-  for arg in "${harness[@]}"; do
-    [ "$arg" = --ignored ] && ignored_only=1
-  done
-
+  scope_lines="$(run_timed_cargo_test_list_scopes "${cargo_args[@]}")" || return "$?"
   while IFS= read -r scope; do
     [ -n "$scope" ] || continue
     scopes+=("$scope")
-  done < <(run_timed_cargo_test_list_scopes "${cargo_args[@]}")
+  done <<<"$scope_lines"
   if [ "${#scopes[@]}" -eq 0 ]; then
     echo 'ci-preflight: no cargo test targets to run' >&2
     return 1
@@ -789,9 +968,6 @@ run_timed_cargo_test_gnu() {
     fi
   done
 
-  if [ "$ignored_only" -eq 0 ]; then
-    run_timed_cargo_test_doctests "${cargo_args[@]}"
-    return $?
-  fi
-  return 0
+  run_timed_cargo_test_doctests "${cargo_args[@]}" -- "${harness[@]}"
+  return $?
 }

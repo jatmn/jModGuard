@@ -17,6 +17,44 @@ fail() {
   exit 1
 }
 
+# Cargo/glob semantics, including literal characters illegal in package names
+# so escaping errors cannot hide behind Cargo's package-name validation.
+while IFS='|' read -r exclude_pattern excluded retained; do
+  jmodguard_package_is_excluded "$excluded" --exclude "$exclude_pattern" \
+    || fail "matcher $exclude_pattern: must exclude $excluded"
+  if jmodguard_package_is_excluded "$retained" "--exclude=$exclude_pattern"; then
+    fail "matcher $exclude_pattern: must retain $retained"
+  fi
+done <<'EOF'
+review-[^a]|review-a|review-b
+review-[^a]|review-^|review-b
+review-[!a]|review-b|review-a
+review-\a|review-\a|review-a
+review-\?|review-\a|review-a
+review-[\a]|review-\|review-b
+review-[]a]|review-]|review-b
+review-[]\a]|review-\|review-b
+review-[!]]|review-a|review-]
+review-[a-c]|review-b|review-d
+review-[z-aq]|review-q|review-a
+review-[!z-a]|review-a|other
+review-[-a]|review--|review-b
+review-[a-c-e]|review--|review-d
+review-[[:alpha:]]|review-a]|review-b
+review-@(a)|review-@(a)|review-a
+review-?(a)|review-x(a)|review-a
+review-*?|review-ab|review-
+**/review-a|review-a|review-b
+**/**/review-a|review-a|review-b
+EOF
+for exclude_pattern in 'review-[' 'review-[]' 'review-[!]' 'review-**' '**a' '***'; do
+  matcher_rc=0
+  # An earlier match must not conceal an invalid later exclusion.
+  jmodguard_package_is_excluded review-a --exclude review-a --exclude "$exclude_pattern" \
+    2>"$fixture/matcher-error.log" || matcher_rc=$?
+  [ "$matcher_rc" -eq 2 ] || fail "matcher $exclude_pattern: expected invalid pattern (2), got $matcher_rc"
+done
+
 # Cargo shim lines for per-package timed runs must use -p, not workspace-wide selectors.
 jmodguard_assert_per_scope_test_invocations() {
   local label=$1
@@ -25,7 +63,7 @@ jmodguard_assert_per_scope_test_invocations() {
     case "$line" in
       test\ *)
         case "$line" in
-          *' --doc '*|*' --doc --'*) continue ;;
+          *' --doc '*) continue ;;
           *' -p '*|*' --package '*)
             case "$line" in
               *' --no-run'*|*' --list'*|*' --exact'*) ;;
@@ -151,7 +189,8 @@ if kill -0 "$child_pid" 2>/dev/null; then
 fi
 export JMODGUARD_TEST_TIMEOUT_SEC=180
 
-# Cancel path: TERM to runner must kill the setsid session (by pgid) and exit 143.
+# Both signals must kill descendants and run the caller's EXIT cleanup once.
+# Monitor mode gives background Bash children a trappable SIGINT disposition.
 cancel_slow="$fixture/cancel-slow.sh"
 cat >"$cancel_slow" <<'SH'
 #!/bin/bash
@@ -159,36 +198,45 @@ set -euo pipefail
 ( sleep 360 & echo "$!" >"$CANCEL_CHILD_PID_FILE" )
 sleep 999
 SH
-chmod +x "$cancel_slow"
-export CANCEL_CHILD_PID_FILE="$fixture/cancel-child.pid"
 cancel_runner="$fixture/cancel-runner.sh"
-cat >"$cancel_runner" <<SH
+cat >"$cancel_runner" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=scripts/ci-run-timed-cargo-test.sh
-source "$root/scripts/ci-run-timed-cargo-test.sh"
+trap 'cleanup_rc=$?; echo "$cleanup_rc" >>"$CANCEL_CLEANUP_FILE"; exit "$cleanup_rc"' EXIT
+source "$1/scripts/ci-run-timed-cargo-test.sh"
 export JMODGUARD_TEST_TIMEOUT_SEC=180
-export CANCEL_CHILD_PID_FILE="$fixture/cancel-child.pid"
-run_with_test_timeout cancel-probe bash "$cancel_slow"
+run_with_test_timeout cancel-probe bash "$2"
 SH
-chmod +x "$cancel_runner"
-set +o errexit
-"$cancel_runner" &
-cancel_runner_pid=$!
-sleep 2
-kill -TERM "$cancel_runner_pid" 2>/dev/null || true
-wait "$cancel_runner_pid"
-cancel_rc=$?
-set -o errexit
-[ "$cancel_rc" -eq 143 ] || fail "cancel probe expected exit 143 after TERM, got $cancel_rc"
-[ -f "$CANCEL_CHILD_PID_FILE" ] || fail 'cancel probe: missing child pid file'
-cancel_child_pid="$(cat "$CANCEL_CHILD_PID_FILE")"
-if kill -0 "$cancel_child_pid" 2>/dev/null; then
-  fail "cancel probe: child $cancel_child_pid still alive after TERM"
-fi
-if kill -0 "$cancel_runner_pid" 2>/dev/null; then
-  fail "cancel probe: runner $cancel_runner_pid still alive"
-fi
+for cancel_signal in INT TERM; do
+  export CANCEL_CHILD_PID_FILE="$fixture/cancel-$cancel_signal-child.pid"
+  export CANCEL_CLEANUP_FILE="$fixture/cancel-$cancel_signal-cleanup"
+  set -m
+  bash "$cancel_runner" "$root" "$cancel_slow" &
+  cancel_runner_pid=$!
+  set +m
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [ -s "$CANCEL_CHILD_PID_FILE" ] && break
+    sleep 0.05
+  done
+  cancel_ready=0
+  [ -s "$CANCEL_CHILD_PID_FILE" ] && cancel_ready=1
+  kill -s "$cancel_signal" "$cancel_runner_pid" 2>/dev/null || true
+  cancel_rc=0
+  wait "$cancel_runner_pid" || cancel_rc=$?
+  [ "$cancel_ready" -eq 1 ] || fail "$cancel_signal: missing child readiness"
+  expected_rc=130
+  [ "$cancel_signal" = TERM ] && expected_rc=143
+  [ "$cancel_rc" -eq "$expected_rc" ] || fail "$cancel_signal: expected $expected_rc, got $cancel_rc"
+  cancel_child_pid="$(cat "$CANCEL_CHILD_PID_FILE")"
+  if kill -0 "$cancel_child_pid" 2>/dev/null; then
+    fail "$cancel_signal: child still alive"
+  fi
+  if kill -0 "$cancel_runner_pid" 2>/dev/null; then
+    fail "$cancel_signal: runner still alive"
+  fi
+  [ -f "$CANCEL_CLEANUP_FILE" ] || fail "$cancel_signal: caller EXIT cleanup did not run"
+  [ "$(cat "$CANCEL_CLEANUP_FILE")" = "$expected_rc" ] || fail "$cancel_signal: caller EXIT cleanup must see the signal status exactly once"
+done
 
 ws="$fixture/ws"
 mkdir -p "$ws/probe/src" "$ws/doctest-probe/src" "$ws/buildrs-probe/src"
@@ -253,9 +301,57 @@ edition = "2021"
 EOF
 cat >"$ws/doctest-probe/src/lib.rs" <<'RS'
 /// ```
-/// assert_eq!(2 + 2, 4);
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("normal")).unwrap(), "ran").unwrap();
+/// }
+/// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("normal"));
 /// ```
 pub fn documented() {}
+
+/// ```ignore
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("ignored")).unwrap(), "ran").unwrap();
+/// }
+/// assert_ne!(std::env::var("TIMED_DOC_FAIL").as_deref(), Ok("ignored"));
+/// ```
+pub fn ignored_documented() {}
+
+
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("second")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+pub fn second_documented() {}
+
+#[path = "doc [probe]+.rs"]
+pub mod spaced;
+RS
+# Multiple examples for the same item, with a path containing spaces and regex
+# characters, exercise literal selection and the old non-unique-token fallback.
+cat >"$ws/doctest-probe/src/doc [probe]+.rs" <<'RS'
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("spaced_first")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+///
+/// ```
+/// if let Ok(dir) = std::env::var("TIMED_DOC_MARKERS") {
+///     use std::io::Write;
+///     writeln!(std::fs::OpenOptions::new().create(true).append(true)
+///         .open(std::path::Path::new(&dir).join("spaced_second")).unwrap(), "ran").unwrap();
+/// }
+/// ```
+pub fn spaced_documented() {}
 RS
 cat >"$ws/buildrs-probe/Cargo.toml" <<'EOF'
 [package]
@@ -384,6 +480,52 @@ doctest_rc=$?
 set -e
 [ "$doctest_rc" -eq 0 ] || { cat "$doctest_log" >&2; fail "doctest probe failed with $doctest_rc"; }
 
+# Compare actual doctest execution and failure status with native Cargo. No unit
+# tests exist in this package, so an ignored-only failure can only be a doctest.
+for doc_mode in default ignored include-ignored; do
+  doc_flags=()
+  [ "$doc_mode" = default ] || doc_flags+=("--$doc_mode")
+  for doc_failure in none ignored normal; do
+    export TIMED_DOC_FAIL="$doc_failure"
+    for doc_runner in native timed; do
+      export TIMED_DOC_MARKERS="$fixture/doc-$doc_mode-$doc_failure-$doc_runner"
+      mkdir -p "$TIMED_DOC_MARKERS"
+      doc_rc=0
+      if [ "$doc_runner" = native ]; then
+        cargo test -p timed-doctest-probe -- "${doc_flags[@]}" \
+          >"$fixture/doc-native.log" 2>&1 || doc_rc=$?
+        native_doc_rc=$doc_rc
+      else
+        # A subshell preserves the production errexit behavior on doctest failure.
+        set +e
+        (run_timed_cargo_test_gnu -p timed-doctest-probe -- "${doc_flags[@]}") \
+          >"$fixture/doc-timed.log" 2>&1
+        doc_rc=$?
+        set -e
+        [ "$doc_rc" -eq "$native_doc_rc" ] \
+          || fail "doctest $doc_mode/$doc_failure: native=$native_doc_rc, timed=$doc_rc"
+      fi
+      # A failure can stop the timed phase before its second doctest; compare
+      # the complete selection on success and require the failing one otherwise.
+      if [ "$doc_rc" -eq 0 ]; then
+        if [ "$doc_mode" = ignored ]; then
+          [ ! -e "$TIMED_DOC_MARKERS/normal" ] || fail "$doc_runner: --ignored ran a normal doctest"
+        else
+          [ -e "$TIMED_DOC_MARKERS/normal" ] || fail "$doc_runner: normal doctest missing"
+        fi
+        if [ "$doc_mode" = default ]; then
+          [ ! -e "$TIMED_DOC_MARKERS/ignored" ] || fail "$doc_runner: default ran an ignored doctest"
+        else
+          [ -e "$TIMED_DOC_MARKERS/ignored" ] || fail "$doc_runner: ignored doctest missing"
+        fi
+      else
+        [ -e "$TIMED_DOC_MARKERS/$doc_failure" ] || fail "$doc_runner: failure did not reach doctest assertion"
+      fi
+    done
+  done
+done
+unset TIMED_DOC_MARKERS TIMED_DOC_FAIL
+
 if ! command -v jq >/dev/null 2>&1; then
   fail 'jq is required for timed-cargo contract tests'
 fi
@@ -398,6 +540,74 @@ exec "$real_cargo" "\$@"
 SH
 chmod +x "$fixture/bin/cargo"
 PATH="$fixture/bin:$PATH"
+
+# Compare execution counts with native Cargo, including zero-match selections.
+# The shim records invocations; append-only markers also catch repeated execution
+# within a single invocation, independently of how the runner chooses its filter.
+for filter_case in multiple substring before mixed skip skip-equals skip-multiple \
+  exact exact-name exact-skip zero ignored include-ignored ignored-zero literal spaces \
+  option-values exclude exclude-equals; do
+  filter_cargo=(-p timed-doctest-probe)
+  filter_harness=()
+  case "$filter_case" in
+    substring) filter_harness=(documented) ;;
+    before) filter_cargo+=(documented) ;;
+    multiple) filter_harness=(second_documented spaced_documented) ;;
+    mixed) filter_cargo+=(second_documented); filter_harness=(spaced_documented) ;;
+    skip) filter_harness=(documented --skip second_documented) ;;
+    skip-equals) filter_harness=(documented --skip=second_documented) ;;
+    skip-multiple) filter_harness=(documented --skip second_documented --skip spaced_documented) ;;
+    exact) filter_harness=(documented --exact) ;;
+    exact-name) filter_harness=('src/lib.rs - documented (line 1)' --exact) ;;
+    exact-skip) filter_harness=(--exact --skip documented) ;;
+    zero) filter_harness=(no_such_doctest) ;;
+    ignored) filter_harness=(documented --ignored) ;;
+    include-ignored) filter_harness=(documented --include-ignored --skip second_documented) ;;
+    ignored-zero) filter_harness=(second_documented --ignored) ;;
+    literal) filter_harness=('[probe]+') ;;
+    spaces) filter_harness=('spaced_documented (line') ;;
+    option-values) filter_harness=(documented --color never --nocapture) ;;
+    exclude|exclude-equals)
+      filter_cargo=(--workspace --exclude 'timed-collision-*' --exclude timed-buildrs-probe
+        --exclude timed-bin-only-probe --exclude timed-harness-probe documented)
+      if [ "$filter_case" = exclude ]; then
+        filter_cargo+=(--exclude timed-runner-probe)
+      else
+        filter_cargo+=(--exclude=timed-runner-probe)
+      fi
+      filter_harness=(--include-ignored --skip second_documented)
+      ;;
+  esac
+  for filter_runner in native timed; do
+    export TIMED_DOC_MARKERS="$fixture/filter-$filter_case-$filter_runner"
+    mkdir -p "$TIMED_DOC_MARKERS"
+    : >"$CARGO_INVOCATION_LOG"
+    filter_rc=0
+    if [ "$filter_runner" = native ]; then
+      cargo test "${filter_cargo[@]}" --doc -- "${filter_harness[@]}" \
+        >"$fixture/filter-native.log" 2>&1 || filter_rc=$?
+    else
+      (run_timed_cargo_test_gnu "${filter_cargo[@]}" -- "${filter_harness[@]}") \
+        >"$fixture/filter-timed.log" 2>&1 || filter_rc=$?
+    fi
+    [ "$filter_rc" -eq 0 ] || { cat "$fixture/filter-$filter_runner.log" >&2; fail "$filter_case/$filter_runner failed ($filter_rc)"; }
+  done
+  expected_runs=0
+  for marker in normal ignored second spaced_first spaced_second; do
+    native_count=0 timed_count=0
+    native_marker="$fixture/filter-$filter_case-native/$marker"
+    timed_marker="$fixture/filter-$filter_case-timed/$marker"
+    [ ! -f "$native_marker" ] || native_count=$(wc -l <"$native_marker")
+    [ ! -f "$timed_marker" ] || timed_count=$(wc -l <"$timed_marker")
+    [ "$timed_count" -eq "$native_count" ] \
+      || fail "$filter_case/$marker: native count=$native_count, timed count=$timed_count"
+    expected_runs=$((expected_runs + native_count))
+  done
+  actual_runs=$(grep ' --doc ' "$CARGO_INVOCATION_LOG" | grep -vc ' --list ' || true)
+  [ "$actual_runs" -eq "$expected_runs" ] \
+    || fail "$filter_case: expected $expected_runs isolated doctest invocations, got $actual_runs"
+done
+unset TIMED_DOC_MARKERS
 
 if ! cargo test -p timed-harness-probe --lib --no-run >/dev/null 2>&1; then
   fail 'harness probe crate failed to build'
@@ -522,17 +732,93 @@ grep -q -- '--release' "$CARGO_INVOCATION_LOG" \
 grep -q -- '--no-run' "$CARGO_INVOCATION_LOG" \
   || fail 'scoped cargo-args: timed runner must invoke cargo test --no-run'
 
-: >"$CARGO_INVOCATION_LOG"
-exclude_scope_log="$fixture/exclude-scope.log"
-set +e
-run_timed_cargo_test_gnu --workspace --locked --exclude timed-doctest-probe -- >"$exclude_scope_log" 2>&1
-exclude_scope_rc=$?
-set -e
-[ "$exclude_scope_rc" -eq 0 ] || { cat "$exclude_scope_log" >&2; fail "exclude scope runner failed with $exclude_scope_rc"; }
-grep -Eq '(^| )-p timed-doctest-probe|(^| )--package timed-doctest-probe' "$CARGO_INVOCATION_LOG" \
-  && fail 'exclude scope: excluded package must not be targeted by per-scope cargo invocations'
-grep -Eq 'documented \(line |doctest-probe' "$exclude_scope_log" \
-  && fail 'exclude scope: excluded package doctest must not run'
+# Exact names and each Cargo glob operator, in both CLI spellings. Multiple
+# exclusions leave only the normal probe; unexpected package execution is fatal.
+for exclude_spec in timed-doctest-probe 'timed-doctest-*' 'timed-doctest-prob?' 'timed-doctest-prob[de]'; do
+  for exclude_form in separate equals; do
+    exclude_args=(--workspace --locked --exclude 'timed-collision-*'
+      --exclude timed-buildrs-probe --exclude timed-bin-only-probe --exclude timed-harness-probe)
+    if [ "$exclude_form" = separate ]; then
+      exclude_args+=(--exclude "$exclude_spec")
+    else
+      exclude_args+=("--exclude=$exclude_spec")
+    fi
+    : >"$CARGO_INVOCATION_LOG"
+    exclude_scope_log="$fixture/exclude-scope.log"
+    exclude_scope_rc=0
+    (run_timed_cargo_test_gnu "${exclude_args[@]}" --) >"$exclude_scope_log" 2>&1 || exclude_scope_rc=$?
+    [ "$exclude_scope_rc" -eq 0 ] || fail "exclude $exclude_form/$exclude_spec: runner failed ($exclude_scope_rc)"
+    grep -Eq '(^| )(-p|--package) timed-(doctest|collision|buildrs|bin-only|harness)' "$CARGO_INVOCATION_LOG" \
+      && fail "exclude $exclude_form/$exclude_spec: excluded package was targeted"
+    grep -q 'reads_package_relative_file ... ok' "$exclude_scope_log" \
+      || fail "exclude $exclude_form/$exclude_spec: retained package did not run"
+    grep -q 'documented (line ' "$exclude_scope_log" \
+      && fail "exclude $exclude_form/$exclude_spec: excluded doctest ran"
+  done
+done
+
+# Compare exclusions with native Cargo using observable package execution and a
+# retained failing unit test. The caret is a class member, not negation.
+exclude_ws="$fixture/exclude-ws"
+mkdir -p "$exclude_ws/review-a/src" "$exclude_ws/review-b/src"
+cat >"$exclude_ws/Cargo.toml" <<'EOF'
+[workspace]
+resolver = "2"
+members = ["review-a", "review-b"]
+EOF
+for review_pkg in review-a review-b; do
+  cat >"$exclude_ws/$review_pkg/Cargo.toml" <<EOF
+[package]
+name = "$review_pkg"
+version = "0.1.0"
+edition = "2021"
+EOF
+  cat >"$exclude_ws/$review_pkg/src/lib.rs" <<'RS'
+#[test]
+fn selected_package() {
+    let package = env!("CARGO_PKG_NAME");
+    std::fs::write(std::path::Path::new(&std::env::var("EXCLUDE_MARKERS").unwrap()).join(package), "ran").unwrap();
+    assert_ne!(package, "review-b", "retained package failure");
+}
+RS
+done
+for exclude_form in separate equals; do
+  exclude_args=(--workspace)
+  if [ "$exclude_form" = separate ]; then
+    exclude_args+=(--exclude 'review-[^a]')
+  else
+    exclude_args+=('--exclude=review-[^a]')
+  fi
+  for exclude_runner in native timed; do
+    export EXCLUDE_MARKERS="$fixture/exclude-$exclude_form-$exclude_runner"
+    mkdir -p "$EXCLUDE_MARKERS"
+    exclude_rc=0
+    (
+      cd "$exclude_ws"
+      if [ "$exclude_runner" = native ]; then
+        cargo test "${exclude_args[@]}"
+      else
+        run_timed_cargo_test_gnu "${exclude_args[@]}"
+      fi
+    ) >"$fixture/exclude-$exclude_runner.log" 2>&1 || exclude_rc=$?
+    [ ! -e "$EXCLUDE_MARKERS/review-a" ] \
+      || fail "exclude $exclude_form/$exclude_runner: excluded review-a ran"
+    [ -e "$EXCLUDE_MARKERS/review-b" ] \
+      || fail "exclude $exclude_form/$exclude_runner: retained review-b did not run"
+    [ "$exclude_rc" -eq 101 ] \
+      || fail "exclude $exclude_form/$exclude_runner: expected retained failure (101), got $exclude_rc"
+  done
+done
+unset EXCLUDE_MARKERS
+
+# Invalid glob syntax must fail before any per-package execution, even when a
+# previous exclusion matched. Cargo must not be handed a stripped valid subset.
+invalid_exclude_rc=0
+(cd "$exclude_ws"; run_timed_cargo_test_gnu --workspace --exclude review-a --exclude 'review-**') \
+  >"$fixture/invalid-exclude.log" 2>&1 || invalid_exclude_rc=$?
+[ "$invalid_exclude_rc" -ne 0 ] || fail 'invalid exclusion: runner must fail'
+grep -q 'invalid Cargo exclusion pattern' "$fixture/invalid-exclude.log" \
+  || fail 'invalid exclusion: must fail during selection'
 
 contract_log="$fixture/contract-no-target.log"
 set +e
