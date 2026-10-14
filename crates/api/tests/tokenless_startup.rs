@@ -96,7 +96,7 @@ async fn api_process_waits_for_first_boot_with_overlapping_read_bind_without_a_b
             "API exited before serving without a bot token"
         );
         if let Ok(response) = client.get(format!("http://{address}/api/me")).send().await
-            && response.status() == reqwest::StatusCode::BAD_REQUEST
+            && response.status() == reqwest::StatusCode::UNAUTHORIZED
         {
             let body = response.text().await.unwrap();
             assert!(body.contains("not authenticated"), "{body}");

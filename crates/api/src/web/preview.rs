@@ -253,7 +253,7 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
         return Ok(());
     };
     if auth.discord_user_id() != preview.actor_id {
-        return Err(ApiError(anyhow!("not authenticated")));
+        return Err(ApiError(anyhow::Error::new(super::NotAuthenticated)));
     }
     let selected = preview.guild_id.to_string();
     let mut guild = auth

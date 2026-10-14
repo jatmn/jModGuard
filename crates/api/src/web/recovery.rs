@@ -617,6 +617,86 @@ mod tests {
         crate::tenant::remove_sidecars(&path);
     }
 
+    #[tokio::test]
+    async fn require_auth_session_failures_are_generic_and_retryable() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path =
+            std::env::temp_dir().join(format!("auth-store-{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let app = ApiState::new(ApiProcessConfig::default(), db).unwrap();
+        for scenario in ["load", "dead", "retired", "missing", "token", "refresh"] {
+            let store = FailingStore::default();
+            let session = Session::new(None, Arc::new(store.clone()), None);
+            session.insert(SESSION_USER, 123_u64).await.unwrap();
+            session.insert(SESSION_TOKEN, "token").await.unwrap();
+            if matches!(scenario, "token" | "refresh") {
+                // A malformed stored value must not be mistaken for an absent credential.
+                let key = if scenario == "token" {
+                    SESSION_TOKEN
+                } else {
+                    SESSION_REFRESH
+                };
+                session.insert(key, 123_u64).await.unwrap();
+            }
+            session.save().await.unwrap();
+            let id = session.id().unwrap();
+            let cookie = if scenario == "missing" {
+                String::new()
+            } else {
+                format!("{SESSION_COOKIE_NAME}={id}")
+            };
+            match scenario {
+                "load" => store.fail_load.store(true, SeqCst),
+                "dead" => {
+                    app.auth_sessions.insert(
+                        id,
+                        Arc::new(tokio::sync::Mutex::new(SessionAuth {
+                            dead: true,
+                            ..Default::default()
+                        })),
+                    );
+                    store.fail_delete.store(true, SeqCst);
+                }
+                "retired" => {
+                    app.retired_auth_sessions
+                        .insert(id, std::time::Instant::now());
+                    store.fail_delete.store(true, SeqCst);
+                }
+                _ => {}
+            }
+            let router = Router::new()
+                .route("/test/auth", get(api_me))
+                .with_state(app.clone())
+                .layer(SessionManagerLayer::new(store.clone()).with_name(SESSION_COOKIE_NAME));
+            let (status, body) = request(&router, "GET", "/test/auth", &cookie, "").await;
+            if scenario == "missing" {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                assert_eq!(body, json!({"error":"not authenticated"}));
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{scenario}: {body}"
+            );
+            assert_eq!(body, json!({"error":"session store unavailable"}));
+            store.fail_load.store(false, SeqCst);
+            store.fail_delete.store(false, SeqCst);
+            if matches!(scenario, "dead" | "retired") {
+                let (status, body) = request(&router, "GET", "/test/auth", &cookie, "").await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                assert_eq!(body["code"], "auth_lost");
+            } else {
+                // Read failures preserve the stored identity for a retry.
+                let retry = Session::new(Some(id), Arc::new(store), None);
+                assert_eq!(retry.get::<u64>(SESSION_USER).await.unwrap(), Some(123));
+            }
+        }
+        drop(app);
+        std::fs::remove_file(&path).unwrap();
+        crate::tenant::remove_sidecars(&path);
+    }
+
     #[test]
     fn owner_error_uses_error_types_not_message_text() {
         assert_eq!(NotAuthenticated.to_string(), "not authenticated");
