@@ -94,6 +94,7 @@ struct ProviderModel {
     delay: Duration,
     limit: Duration,
     timeouts: AtomicUsize,
+    committed_durations: Mutex<Vec<Duration>>,
 }
 
 impl ProviderModel {
@@ -105,6 +106,7 @@ impl ProviderModel {
             delay,
             limit,
             timeouts: AtomicUsize::new(0),
+            committed_durations: Mutex::new(Vec::new()),
         })
     }
 }
@@ -201,34 +203,82 @@ async fn provider_response(
         } else {
             Some(Arc::clone(&model.writer).acquire_owned().await.unwrap())
         };
-        let result = {
+        let (results, errors) = {
             let mut state = state.lock().unwrap();
             state.in_transaction = owns;
             state.write_locked = owns;
-            backed_statement_result(request, &mut state)
+            let single = vec![request.clone()];
+            let steps = request["batch"]["steps"].as_array().unwrap_or(&single);
+            let mut results = Vec::<Json>::new();
+            let mut errors = Vec::new();
+            for (index, step) in steps.iter().enumerate() {
+                // libSQL execute_batch chains each statement to the preceding
+                // successful step. Preserve that condition and real SQL errors.
+                if !step["condition"].is_null() {
+                    assert!(index > 0);
+                    assert_eq!(step["condition"], json!({"type":"ok","step":index - 1}));
+                    if results[index - 1].is_null() {
+                        results.push(Json::Null);
+                        errors.push(Json::Null);
+                        continue;
+                    }
+                }
+                match try_backed_statement_result(step, &mut state) {
+                    Ok(result) => {
+                        results.push(result);
+                        errors.push(Json::Null);
+                    }
+                    Err(error) => {
+                        results.push(Json::Null);
+                        errors.push(json!({"message":error.to_string(),"code":"SQLITE_ERROR"}));
+                    }
+                }
+            }
+            (results, errors)
         };
-        if sql.starts_with("BEGIN") {
+        if sql.starts_with("BEGIN") && !results[0].is_null() {
             state.lock().unwrap().begin_sql.push(sql.clone());
             model
                 .transactions
                 .lock()
                 .unwrap()
                 .insert(baton.clone(), (permit.unwrap(), std::time::Instant::now()));
-        } else if sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") {
-            model.transactions.lock().unwrap().remove(&baton);
+        } else if (sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK"))
+            && !results[0].is_null()
+        {
+            let owned = model.transactions.lock().unwrap().remove(&baton);
+            if sql.starts_with("COMMIT") {
+                let (_, start) = owned.as_ref().expect("COMMIT must own a transaction");
+                model
+                    .committed_durations
+                    .lock()
+                    .unwrap()
+                    .push(start.elapsed());
+            }
         }
         if path == "/v3/cursor" {
-            let mut lines = vec![
-                json!({"baton":baton}).to_string(),
-                json!({"type":"step_begin","step":0,"cols":result["cols"]}).to_string(),
-            ];
-            for row in result["rows"].as_array().unwrap() {
-                lines.push(json!({"type":"row","row":row}).to_string());
+            let mut lines = vec![json!({"baton":baton}).to_string()];
+            for (index, result) in results.iter().enumerate() {
+                if !errors[index].is_null() {
+                    lines.push(
+                        json!({"type":"step_error","step":index,"error":errors[index]}).to_string(),
+                    );
+                    continue;
+                }
+                if result.is_null() {
+                    continue;
+                }
+                lines.push(
+                    json!({"type":"step_begin","step":index,"cols":result["cols"]}).to_string(),
+                );
+                for row in result["rows"].as_array().unwrap() {
+                    lines.push(json!({"type":"row","row":row}).to_string());
+                }
+                lines.push(json!({"type":"step_end","step":index,"affected_row_count":result["affected_row_count"]}).to_string());
             }
-            lines.push(json!({"type":"step_end","step":0,"affected_row_count":result["affected_row_count"]}).to_string());
             return body(StatusCode::OK, format!("{}\n", lines.join("\n")));
         }
-        responses.push(json!({"type":"ok","response":{"type":"batch","result":{"step_results":[result],"step_errors":[null]}}}));
+        responses.push(json!({"type":"ok","response":{"type":"batch","result":{"step_errors":errors,"step_results":results}}}));
     }
     body(
         StatusCode::OK,
@@ -236,7 +286,7 @@ async fn provider_response(
     )
 }
 
-struct HranaFixture {
+pub(in crate::db) struct HranaFixture {
     address: std::net::SocketAddr,
     state: Arc<Mutex<HranaState>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -282,6 +332,43 @@ impl HranaFixture {
             address,
             state,
             shutdown: Some(shutdown),
+        }
+    }
+
+    pub(in crate::db) async fn delayed_database(
+        path: &std::path::Path,
+        delay: Duration,
+        limit: Duration,
+    ) -> (Self, Db) {
+        let fixture = Self::start().await;
+        let runtime = DbRuntime::new().unwrap();
+        let backing = runtime
+            .block_on(libsql::Builder::new_local(path).build())
+            .unwrap()
+            .connect()
+            .unwrap();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.backing = Some((runtime, backing));
+            state.provider = Some(ProviderModel::new(delay, limit));
+        }
+        let db = fixture.db();
+        (fixture, db)
+    }
+
+    pub(in crate::db) fn assert_committed_within_lifetime(&self, expected: usize) {
+        let state = self.state.lock().unwrap();
+        let model = state.provider.as_ref().unwrap();
+        assert_eq!(model.timeouts.load(Ordering::SeqCst), 0);
+        assert!(model.transactions.lock().unwrap().is_empty());
+        let durations = model.committed_durations.lock().unwrap();
+        assert_eq!(durations.len(), expected);
+        for duration in durations.iter() {
+            assert!(
+                *duration >= model.delay,
+                "latency must actually be injected"
+            );
+            assert!(*duration < model.limit, "transaction took {duration:?}");
         }
     }
 
@@ -714,6 +801,10 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
 
 // Use actual SQL for copy tests while retaining synthetic lifecycle fault fixtures.
 fn backed_statement_result(request: &Json, state: &mut HranaState) -> Json {
+    try_backed_statement_result(request, state).unwrap()
+}
+
+fn try_backed_statement_result(request: &Json, state: &mut HranaState) -> libsql::Result<Json> {
     let stmt = request["batch"]["steps"]
         .as_array()
         .and_then(|steps| steps.first())
@@ -738,12 +829,12 @@ fn backed_statement_result(request: &Json, state: &mut HranaState) -> Json {
         .unwrap_or_default();
     let (runtime, conn) = state.backing.as_ref().unwrap();
     runtime.block_on(async {
-        let prepared = conn.prepare(sql).await.unwrap();
+        let prepared = conn.prepare(sql).await?;
         let cols = prepared.columns().into_iter().map(|col| json!({"name": col.name(), "decltype": col.decl_type()})).collect::<Vec<_>>();
         let mut values = Vec::new();
         let affected = if prepared.column_count() > 0 {
-            let mut rows = prepared.query(args).await.unwrap();
-            while let Some(row) = rows.next().await.unwrap() {
+            let mut rows = prepared.query(args).await?;
+            while let Some(row) = rows.next().await? {
                 values.push((0..row.column_count()).map(|i| match row.get_value(i).unwrap() {
                     libsql::Value::Integer(n) => json!({"type": "integer", "value": n.to_string()}),
                     libsql::Value::Text(value) => json!({"type": "text", "value": value}),
@@ -753,9 +844,9 @@ fn backed_statement_result(request: &Json, state: &mut HranaState) -> Json {
             }
             0
         } else {
-            prepared.execute(args).await.unwrap()
+            prepared.execute(args).await?
         };
-        json!({"cols": cols, "rows": values, "affected_row_count": affected, "last_insert_rowid": null})
+        Ok(json!({"cols": cols, "rows": values, "affected_row_count": affected, "last_insert_rowid": null}))
     })
 }
 
