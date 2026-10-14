@@ -642,7 +642,16 @@ impl Supervisor {
     }
 
     async fn idle(&mut self) -> Result<()> {
-        if self.running.is_some() {
+        // Retain an exited bot's identity for readiness/rollback handling, but
+        // take over its health socket without waiting for control reads.
+        // Token rejection must establish its hold reason before binding.
+        if let Some(child) = self.running.as_mut()
+            && (self.role == "api"
+                || child.child.try_wait()?.is_none_or(|status| {
+                    status.code()
+                        == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+                }))
+        {
             return Ok(());
         }
         if self.role == "api" {
@@ -1489,6 +1498,9 @@ impl Supervisor {
             self.idle().await?;
             return Ok(false);
         }
+        if self.role == "bot" {
+            self.idle().await?;
+        }
         self.flush_startup_receipts().await?;
         if self.flush_pending_failure().await? {
             return Ok(false);
@@ -1944,7 +1956,15 @@ async fn main() -> Result<()> {
             result = supervisor.tick() => match result {
                 Ok(true) => std::process::exit(77),
                 Ok(false) => {},
-                Err(error) => { tracing::warn!("update controller: {error:#}"); supervisor.idle().await?; },
+                Err(error) => {
+                    tracing::warn!("update controller: {error:#}");
+                    match supervisor.idle().await {
+                        Err(error) if supervisor.role == "bot" => {
+                            tracing::warn!("launcher idle: {error:#}");
+                        }
+                        result => result?,
+                    }
+                },
             },
         }
         tokio::select! { _ = jmodguard::shutdown_signal() => break, _ = tokio::time::sleep(POLL) => {} }
