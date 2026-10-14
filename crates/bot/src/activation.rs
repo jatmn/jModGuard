@@ -452,7 +452,19 @@ fn spawn_renewal_every(
                 break;
             }
             let mut backoff = Duration::from_millis(250);
+            let started_at = Instant::now();
+            let deadline = activation.authority_deadline().unwrap_or(started_at);
+            // A hung stream must leave room for a fresh CAS. Keep this cap
+            // fixed across retries, including windows shorter than six seconds;
+            // the confirmed deadline still bounds their combined budget.
+            let attempt_budget = deadline.saturating_duration_since(started_at) / 2;
             let (requested_at, result) = loop {
+                let requested_at = Instant::now();
+                if requested_at >= deadline {
+                    loss_reason = "active-bot lease renewal exhausted its authority window";
+                    break (requested_at, Err(anyhow::anyhow!(loss_reason)));
+                }
+                let attempt_deadline = (requested_at + attempt_budget).min(deadline);
                 #[cfg(test)]
                 activation.renewal_attempts.fetch_add(1, Ordering::AcqRel);
                 #[cfg(test)]
@@ -463,8 +475,6 @@ fn spawn_renewal_every(
                 let stall = activation.renewal_stall.swap(false, Ordering::AcqRel);
                 #[cfg(not(test))]
                 let stall = false;
-                let requested_at = Instant::now();
-                let deadline = activation.authority_deadline().unwrap_or(requested_at);
                 let claim = async {
                     if fault {
                         #[cfg(test)]
@@ -487,7 +497,7 @@ fn spawn_renewal_every(
                     }
                 };
                 let result = match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline), claim,
+                    tokio::time::Instant::from_std(attempt_deadline), claim,
                 ).await {
                     Ok(result) => result,
                     Err(_) => Err(anyhow::anyhow!("active-bot lease renewal timed out")),
@@ -1046,6 +1056,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn black_holed_first_renewal_retries_and_extends_the_stored_lease() {
+        for window in [Duration::from_secs(15), Duration::from_secs(3)] {
+            let (path, db) = temp_db("renew-black-hole");
+            let activation = Activation::new();
+            activation.set_lease_window(window + Duration::from_secs(1), Duration::from_secs(1));
+            assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+            let before = activation.authority_deadline().unwrap();
+            let read_lease = || {
+                db.with_conn_sync(|conn| db::meta_string_conn(conn, "active_bot_lease"))
+                    .unwrap()
+                    .unwrap()
+            };
+            let before_row = read_lease();
+            // The existing fault hook leaves the first CAS pending indefinitely.
+            // Only the real renewal loop's timeout can reach the SQLite retry.
+            activation.stall_next_renewal();
+            let renewal = spawn_renewal_every(
+                db.clone(),
+                Arc::clone(&activation),
+                None,
+                Duration::from_secs(1),
+            );
+            let observed = tokio::time::timeout_at(tokio::time::Instant::from_std(before), async {
+                while activation.authority_deadline() == Some(before)
+                    && !activation.cut_off.load(Ordering::Acquire)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            renewal.abort();
+            let _ = renewal.await;
+            assert!(observed.is_ok(), "hung CAS must leave time for a retry");
+            // A missed interval tick may run again before this observer wakes.
+            assert!(activation.renewal_attempts.load(Ordering::Acquire) >= 2);
+            assert!(activation.authority_deadline().unwrap() > before);
+            assert!(activation.may_record());
+            assert!(!activation.cut_off.load(Ordering::Acquire));
+            let after_row = read_lease();
+            let expires = |row: &str| row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+            assert!(expires(&after_row) > expires(&before_row));
+            drop(db);
+            cleanup(&path);
+        }
+    }
+
+    #[tokio::test]
     async fn slow_renewal_error_retries_through_the_activation_loop() {
         // Scale 1:1: 20s TTL, 5s margin and 5s tick leave a 10s window.
         let (path, db) = temp_db("renew-slow-error");
@@ -1519,6 +1576,7 @@ mod tests {
         Arc::get_mut(&mut activation).unwrap().exit_hook = lost_lease_exit_hook;
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let claim_at = chrono::Utc::now().timestamp_millis();
+        let deadline = activation.authority_deadline().unwrap();
         let live = db
             .with_conn(|conn| db::meta_string_conn(conn, "active_bot_lease"))
             .await
@@ -1541,17 +1599,32 @@ mod tests {
             .unwrap(),
             "a live lease must block the replacement before the holder releases it"
         );
-        activation.renewal_stall.store(true, Ordering::Release);
+        activation.stall_next_renewal();
         let renewal = spawn_renewal_every(
             db.clone(),
             Arc::clone(&activation),
             None,
             Duration::from_millis(20),
         );
+        // Stall both attempts. After the first cap and backoff, the second
+        // has less than a full attempt budget left before authority expires.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while activation.renewal_attempts.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        activation.stall_next_renewal();
         tokio::time::timeout(Duration::from_secs(5), renewal)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(activation.renewal_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(activation.authority_deadline(), Some(deadline));
+        let stopped_at = activation.renewal_loop_stopped_at().unwrap();
+        assert!(stopped_at >= deadline);
+        assert!(stopped_at < deadline + Duration::from_millis(150));
         assert_eq!(EXIT_CODE.load(Ordering::Acquire), 1);
         assert!(
             db::claim_active_bot(
