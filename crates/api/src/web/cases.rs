@@ -89,15 +89,25 @@ pub async fn list_cases(
             )));
         }
         store
-            .removed_case_ids(scope, after, limit, tenant::case_limits())
+            .removed_case_ids(scope.clone(), after, limit, tenant::case_limits())
             .await?
     } else {
         store
-            .case_ids(scope, after, limit, tenant::case_limits())
+            .case_ids(scope.clone(), after, limit, tenant::case_limits())
+            .await?
+    };
+    // Keep the ID page (including its cursor) stable if a case is removed
+    // between these scoped reads. Missing summaries do not trigger client reads.
+    let summaries = if page.removed {
+        std::collections::BTreeMap::new()
+    } else {
+        store
+            .case_summaries(scope, ids.clone(), tenant::case_limits())
             .await?
     };
     Ok(Json(serde_json::json!({
         "cases": ids.into_iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
+        "summaries": summaries,
         "can_delete": can_delete_cases(&auth, guild_id),
     })))
 }

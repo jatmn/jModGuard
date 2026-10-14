@@ -396,6 +396,12 @@ async fn wrong_captured_membership_and_changed_identity_deny_empty_case_paths() 
     for s in [wrong] {
         assert!(
             store
+                .case_summaries(s.clone(), vec![], CaseLimits::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
                 .case_ids(s.clone(), None, 1, CaseLimits::default())
                 .await
                 .is_err()
@@ -418,6 +424,12 @@ async fn wrong_captured_membership_and_changed_identity_deny_empty_case_paths() 
     assert!(
         store
             .case_ids(a.clone(), None, 1, CaseLimits::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .case_summaries(a.clone(), vec![], CaseLimits::default())
             .await
             .is_err()
     );
@@ -544,4 +556,106 @@ async fn tagged_attempt_survives_reopen_and_cannot_be_retagged_or_exposed() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let a = scope(&f, &store, &reg, 10).await;
+    let b = scope(&f, &store, &reg, 20).await;
+    let limits = CaseLimits::default();
+    for n in 1..=50 {
+        store
+            .record_case(a.clone(), CaseId::new(), data(n), limits)
+            .await
+            .unwrap();
+    }
+    let ids = store.case_ids(a.clone(), None, 50, limits).await.unwrap();
+    let mut baseline = None;
+    for count in [0, 1, 50] {
+        let queries = probe.queries();
+        let transactions = probe.transactions();
+        let immediate = probe.immediate();
+        let summaries = store
+            .case_summaries(a.clone(), ids[..count].to_vec(), limits)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), count);
+        assert_eq!(probe.transactions() - transactions, 1);
+        assert_eq!(probe.immediate() - immediate, 0);
+        let calls = probe.queries() - queries;
+        assert!(calls > 0);
+        assert_eq!(
+            calls,
+            *baseline.get_or_insert(calls),
+            "calls must not grow with page size"
+        );
+        for summary in summaries.values() {
+            assert_eq!(
+                serde_json::to_value(summary).unwrap(),
+                serde_json::json!({
+                    "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(), "occurred_at_ms": 1000
+                })
+            );
+        }
+    }
+    assert!(
+        store
+            .case_summaries(a.clone(), vec![ids[0].clone(); 101], limits)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .case_summaries(b.clone(), ids.clone(), limits)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .record_case(b.clone(), ids[0].clone(), data(99), limits)
+        .await
+        .unwrap();
+    store.remove_case(a.clone(), ids[0].clone()).await.unwrap();
+    let mut page = ids.clone();
+    page.push(CaseId::new());
+    let summaries = store.case_summaries(a.clone(), page, limits).await.unwrap();
+    assert_eq!(summaries.len(), 49);
+    assert!(!summaries.contains_key(ids[0].as_str()));
+    assert_eq!(
+        store
+            .case_summaries(b, vec![ids[0].clone()], limits)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .case_ids(a.clone(), Some(ids[49].clone()), 50, limits)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let tiny = CaseLimits {
+        max_record_bytes: 1,
+        ..limits
+    };
+    assert!(
+        store
+            .case_summaries(a.clone(), ids.clone(), tiny)
+            .await
+            .is_err()
+    );
+    store.close_membership(a.clone()).await.unwrap();
+    for page in [vec![], ids] {
+        assert!(
+            store.case_summaries(a.clone(), page, limits).await.is_err(),
+            "even an empty page must check membership"
+        );
+    }
 }
