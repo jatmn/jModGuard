@@ -110,6 +110,7 @@ struct GatewayBanEchoEntry {
 struct GatewayBanFlight {
     active: usize,
     uncertain_through_ms: i64,
+    failed_through_ms: i64,
 }
 
 pub(crate) struct GatewayBanObservation<'a> {
@@ -143,6 +144,9 @@ impl Drop for GatewayBanObservation<'_> {
             // only candidate for this callback's audit, including late SQL.
             flight.uncertain_through_ms = flight
                 .uncertain_through_ms
+                .max(self.observed.timestamp_millis());
+            flight.failed_through_ms = flight
+                .failed_through_ms
                 .max(self.observed.timestamp_millis());
         }
         flight.active -= 1;
@@ -637,7 +641,7 @@ pub struct BotState {
     pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
-    gateway_ban_flights: [Mutex<GatewayBanFlight>; 256],
+    gateway_ban_flights: [Arc<Mutex<GatewayBanFlight>>; 256],
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
@@ -729,12 +733,15 @@ impl BotState {
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
             gateway_ban_flights: std::array::from_fn(|_| {
-                Mutex::new(GatewayBanFlight {
+                Arc::new(Mutex::new(GatewayBanFlight {
                     active: 0,
+                    // Unlike the startup fence for new rows, live failures must
+                    // not prevent replay against observations saved before restart.
+                    failed_through_ms: 0,
                     // A restart lost earlier in-flight observations. New rows must
                     // not claim audit actions from before this process started.
                     uncertain_through_ms: chrono::Utc::now().timestamp_millis(),
-                })
+                }))
             }),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
@@ -1096,11 +1103,7 @@ impl BotState {
         guild: u64,
         user: u64,
     ) -> GatewayBanObservation<'_> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (guild, user).hash(&mut hasher);
-        let flight =
-            &self.gateway_ban_flights[hasher.finish() as usize % self.gateway_ban_flights.len()];
+        let flight = self.gateway_ban_flight(guild, user);
         let mut state = flight.lock();
         state.active += 1;
         // Register before sampling time, and before the first await.
@@ -1111,6 +1114,43 @@ impl BotState {
             observed,
             saved: false,
         }
+    }
+
+    fn gateway_ban_flight(&self, guild: u64, user: u64) -> &Arc<Mutex<GatewayBanFlight>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (guild, user).hash(&mut hasher);
+        &self.gateway_ban_flights[hasher.finish() as usize % self.gateway_ban_flights.len()]
+    }
+
+    pub(crate) async fn reconcile_gateway_manual_ban_audit_entry(
+        &self,
+        enrollment: Option<db::GuildEnrollment>,
+        guild: u64,
+        user: u64,
+        entry_id: i64,
+    ) -> Result<bool> {
+        let flight = Arc::clone(self.gateway_ban_flight(guild, user));
+        let enrollment = enrollment.ok_or(db::EnrollmentChanged)?;
+        self.db
+            .with_conn(move |conn| {
+                // Registration and the SQL decision share exclusion through commit.
+                // Keep the guard in the DB worker: cancellation of its async waiter
+                // must not release the fence while SQL is still running.
+                let flight = flight.lock();
+                let audit_at = (entry_id >> 22) + 1_420_070_400_000;
+                if flight.active != 0 || audit_at <= flight.failed_through_ms {
+                    return Ok(false);
+                }
+                db::reconcile_gateway_manual_ban_audit_entry_conn(
+                    conn,
+                    &enrollment,
+                    guild as i64,
+                    user as i64,
+                    entry_id,
+                )
+            })
+            .await
     }
 
     /// Retain audit identities until their own persisted ban can be reconciled.

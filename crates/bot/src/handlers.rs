@@ -136,13 +136,35 @@ async fn persist_gateway_ban_observation(
     enrollment: Option<db::GuildEnrollment>,
     guild: u64,
     user: u64,
+    in_flight: crate::state::GatewayBanObservation<'_>,
+    owned_by_bot: bool,
     write: impl std::future::Future<Output = anyhow::Result<db::GatewayBanWrite>>,
 ) -> anyhow::Result<db::GatewayBanWrite> {
+    let observed_at_ms = in_flight.observed.timestamp_millis();
     let result = write.await;
+    in_flight.finish(result.is_ok());
     // Audit delivery queues before looking in SQL. If it ran before this
     // commit, this pass sees its ID; if it runs later, it sees the saved row.
     // A failed write never consumes an ID either.
-    reconcile_pending_gateway_ban_audits(app, enrollment, guild, user).await;
+    reconcile_pending_gateway_ban_audits(app, enrollment.clone(), guild, user).await;
+    if !owned_by_bot && let Ok(db::GatewayBanWrite::Existing { row_id }) = result {
+        // Another audit callback may already have split and acknowledged this
+        // observation. Resolve persisted lineage/time, not the last queue entry
+        // or whichever ban happens to be active now.
+        match db::gateway_ban_split_for_observation(
+            &app.db,
+            enrollment,
+            user as i64,
+            row_id,
+            observed_at_ms,
+        )
+        .await
+        {
+            Ok(Some(row_id)) => return Ok(db::GatewayBanWrite::Recorded { row_id }),
+            Ok(None) => {}
+            Err(error) => tracing::warn!("gateway ban split lookup failed: {error:#}"),
+        }
+    }
     result
 }
 
@@ -155,14 +177,9 @@ async fn reconcile_pending_gateway_ban_audits(
     user: u64,
 ) {
     for entry_id in app.pending_gateway_manual_ban_audit_entries(guild, user) {
-        match db::reconcile_gateway_manual_ban_audit_entry(
-            &app.db,
-            enrollment.clone(),
-            guild as i64,
-            user as i64,
-            entry_id,
-        )
-        .await
+        match app
+            .reconcile_gateway_manual_ban_audit_entry(enrollment.clone(), guild, user, entry_id)
+            .await
         {
             Ok(true) => app.drop_gateway_manual_ban_audit_entry(guild, user, entry_id),
             Ok(false) => {}
@@ -570,6 +587,7 @@ impl EventHandler for Handler {
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. Id-less redeliveries retain bounded
         // observations; only a distinguishing late audit creates another row.
+        let audit_after_ms = in_flight.audit_after_ms();
         let ban_write = crate::logging::log_persistence_result(
             "gateway ban row",
             persist_gateway_ban_observation(
@@ -577,6 +595,8 @@ impl EventHandler for Handler {
                 enrollment.clone(),
                 guild_id.get(),
                 banned_user.id.get(),
+                in_flight,
+                echo.owned_by_bot,
                 db::record_gateway_ban_with_audit(
                     &app.db,
                     enrollment.clone(),
@@ -592,13 +612,12 @@ impl EventHandler for Handler {
                             guild_id.get(),
                             banned_user.id.get(),
                         ),
-                        audit_after_ms: in_flight.audit_after_ms(),
+                        audit_after_ms,
                     },
                 ),
             )
             .await,
         );
-        in_flight.finish(ban_write.is_some());
         let ban_row_id = ban_write.and_then(gateway_ban_row_to_attribute);
         // Every unsuppressed delivery is a distinct unresolved observation.
         // A matching saved status is not an action identity: an opposite event
@@ -1583,8 +1602,18 @@ mod tests {
             let pending = app.pending_gateway_manual_ban_audit_entries(10, 55);
             assert!(pending.is_empty());
             let audit = 1_212_912_311_992_320_001;
-            let result =
-                super::persist_gateway_ban_observation(&app, Some(scope.clone()), 10, 55, async {
+            let mut in_flight = app.begin_gateway_ban_observation(10, 55);
+            in_flight.observed = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:30Z")
+                .unwrap()
+                .to_utc();
+            let result = super::persist_gateway_ban_observation(
+                &app,
+                Some(scope.clone()),
+                10,
+                55,
+                in_flight,
+                false,
+                async {
                     if !after_write {
                         app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
                         super::reconcile_pending_gateway_ban_audits(
@@ -1612,13 +1641,30 @@ mod tests {
                         crate::db::GatewayBanAuditEntries::Pending(pending),
                     )
                     .await
-                })
+                },
+            )
+            .await
+            .unwrap();
+            if !after_write {
+                let row_id = gateway_ban_row_to_attribute(result)
+                    .expect("post-write split must hand its row to attribution");
+                crate::db::attribute_enrolled_ban(
+                    &app.db,
+                    Some(scope.clone()),
+                    row_id,
+                    55,
+                    77,
+                    Some("moderator"),
+                    "second ban reason",
+                )
                 .await
                 .unwrap();
-            assert!(matches!(
-                result,
-                crate::db::GatewayBanWrite::Existing { .. }
-            ));
+            } else {
+                assert!(matches!(
+                    result,
+                    crate::db::GatewayBanWrite::Existing { .. }
+                ));
+            }
             if after_write {
                 app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
                 super::reconcile_pending_gateway_ban_audits(&app, Some(scope.clone()), 10, 55)
@@ -1633,6 +1679,16 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows.iter().filter(|r| r.active).count(), 1);
+            if !after_write {
+                let active = rows.iter().find(|row| row.active).unwrap();
+                assert_eq!(active.moderator_id, Some(77));
+                assert_eq!(active.reason.as_deref(), Some("second ban reason"));
+                assert!(
+                    rows.iter()
+                        .filter(|row| !row.active)
+                        .all(|row| row.moderator_id.is_none())
+                );
+            }
             let events =
                 crate::db::query_enrolled_events(&app.db, scope, Some("member_ban"), Some(55), 50)
                     .await
@@ -1649,6 +1705,79 @@ mod tests {
                 .collect();
             assert_eq!(matched.len(), 1);
             assert!(matched[0].created_at.starts_with("2024-03-01T00:00:30"));
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_starting_after_fence_sample_keeps_its_audit_pending() {
+        for completion in ["active", "failed", "cancelled"] {
+            let directory =
+                std::env::temp_dir().join(format!("late_flight_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut first = app.begin_gateway_ban_observation(10, 55);
+            let at = first.observed + chrono::Duration::seconds(2);
+            first.observed = at;
+            // A has already sampled the fence for its asynchronous write.
+            let cutoff = first.audit_after_ms();
+            // B's action precedes A's delayed observation, but B's callback
+            // starts while A's write is outstanding and remains unpersisted.
+            let mut second = app.begin_gateway_ban_observation(10, 55);
+            second.observed = at + chrono::Duration::seconds(1);
+            let audit = (((at - chrono::Duration::seconds(1)).timestamp_millis()
+                - 1_420_070_400_000)
+                << 22)
+                + 1;
+            crate::db::record_gateway_ban_with_audit(
+                &app.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some(&at.to_rfc3339()),
+                false,
+                None,
+                false,
+                crate::db::GatewayBanAuditEntries::Observed {
+                    pending: vec![],
+                    audit_after_ms: cutoff,
+                },
+            )
+            .await
+            .unwrap();
+            first.finish(true);
+            let mut second = Some(second);
+            if completion == "failed" {
+                second.take().unwrap().finish(false);
+            } else if completion == "cancelled" {
+                drop(second.take());
+            }
+            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            super::reconcile_pending_gateway_ban_audits(&app, Some(scope.clone()), 10, 55).await;
+            assert_eq!(
+                app.pending_gateway_manual_ban_audit_entries(10, 55),
+                vec![audit],
+                "{completion}"
+            );
+            let events =
+                crate::db::query_enrolled_events(&app.db, scope, Some("member_ban"), Some(55), 50)
+                    .await
+                    .unwrap();
+            assert_eq!(events.len(), 1);
+            let data: serde_json::Value =
+                serde_json::from_str(events[0].data.as_deref().unwrap()).unwrap();
+            assert!(data.get("audit_entry_id").is_none(), "{completion}");
+            drop(second);
             drop(app);
             std::fs::remove_dir_all(directory).unwrap();
         }
@@ -1789,6 +1918,8 @@ mod tests {
                 Some(enrollment.clone()),
                 10,
                 55,
+                app.begin_gateway_ban_observation(10, 55),
+                false,
                 async {
                     if matches!(arrival, "before_commit" | "read_error") {
                         if arrival == "read_error" {
