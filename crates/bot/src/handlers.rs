@@ -410,7 +410,7 @@ impl EventHandler for Handler {
         let _rule_hold = self.app.activation.hold_rule();
         self.app.invalidate_member_sync_scope();
         if !incomplete.unavailable {
-            self.app.reset_slash_guild_retry(incomplete.id.get());
+            self.app.forget_slash_guild(incomplete.id.get()).await;
         }
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
