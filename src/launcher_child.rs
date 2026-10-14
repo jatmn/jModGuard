@@ -7,9 +7,21 @@
 use crate::db::REQUIRED_LAUNCHER_REVISION;
 
 /// Fatal Discord HTTP 401 at startup or gateway close 4004 uses this code.
-/// The launcher holds this child with a long fallback retry (30 minutes,
-/// doubling to six hours). Fixing the token and restarting resets the hold. Keep distinct from lost-lease/crash exit 1 and launcher handoff 77.
+/// Launchers at [`DISCORD_TOKEN_HOLD_LAUNCHER_REVISION`] or newer hold this child
+/// with a long fallback retry (30 minutes, doubling to six hours). Under older
+/// launchers application admission refuses startup. Fixing the token and restarting
+/// resets the hold. Standalone bots still exit with this code. Keep distinct from
+/// lost-lease/crash exit 1 and launcher handoff 77.
 pub const DISCORD_TOKEN_REJECTED_EXIT_CODE: i32 = 78;
+
+/// First launcher revision that holds fatal Discord authentication exits.
+pub const DISCORD_TOKEN_HOLD_LAUNCHER_REVISION: u32 = 7;
+
+/// Whether exiting on token rejection is safe from an old launcher's restart loop.
+/// Pass [`detected_launcher_revision`]'s result; standalone processes may exit too.
+pub fn launcher_holds_auth_exit(revision: Option<u32>) -> bool {
+    revision.is_none_or(|revision| revision >= DISCORD_TOKEN_HOLD_LAUNCHER_REVISION)
+}
 
 /// `None` when this process was not started by a launcher.
 /// A present value is the launcher revision to compare with
@@ -50,6 +62,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auth_exit_requires_revision_seven_or_no_launcher() {
+        for revision in 0..=6 {
+            assert!(!launcher_holds_auth_exit(Some(revision)));
+        }
+        for revision in [7, 8, u32::MAX] {
+            assert!(launcher_holds_auth_exit(Some(revision)));
+        }
+        assert!(launcher_holds_auth_exit(refusal_revision(None, false)));
+        assert!(!launcher_holds_auth_exit(refusal_revision(None, true)));
+        for raw in ["nope", "", "-1", "4294967296"] {
+            let revision = refusal_revision(Some(raw.into()), true);
+            assert_eq!(revision, Some(0));
+            assert!(!launcher_holds_auth_exit(revision));
+        }
+    }
+
+    #[test]
     fn revision_two_markers_without_a_revision_are_refused() {
         assert_eq!(refusal_revision(None, true), Some(2));
         let message = format!(
@@ -59,9 +88,15 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_and_a_standalone_process_are_not_refused() {
+    fn admitted_launchers_hold_auth_exits_and_standalone_is_not_refused() {
         assert_eq!(refusal_revision(Some("3".into()), true), Some(3));
-        assert!(refusal_message_for(Some(REQUIRED_LAUNCHER_REVISION)).is_none());
+        for revision in 0..7 {
+            assert!(refusal_message_for(Some(revision)).is_some());
+        }
+        for revision in 7..=crate::db::LAUNCHER_REVISION {
+            assert!(refusal_message_for(Some(revision)).is_none());
+            assert!(launcher_holds_auth_exit(Some(revision)));
+        }
         assert_eq!(refusal_revision(None, false), None);
         assert!(refusal_message_for(None).is_none());
         assert_eq!(refusal_revision(Some("nope".into()), true), Some(0));

@@ -1,5 +1,5 @@
-//! A child started by a revision-2 launcher idles with health up and never
-//! takes the writer lease. Revision 3 and a standalone start are not gated.
+//! Children of unsupported launchers idle with health up and never
+//! take the writer lease. Revision 7 and a standalone start are not gated.
 use jmodguard::db::SqlExecutor;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -160,41 +160,80 @@ fn lease_present(path: &Path) -> bool {
 }
 
 #[test]
-fn revision_two_launcher_child_stays_up_without_the_writer_lease() {
-    let root = temp_root("rev2");
-    let db_path = root.join("core.db");
-    let mut running = spawn(
-        &[
+fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly() {
+    for revision in [
+        None,
+        Some("nope"),
+        Some("0"),
+        Some("3"),
+        Some("4"),
+        Some("5"),
+        Some("6"),
+    ] {
+        let root = temp_root("rev2");
+        let db_path = root.join("core.db");
+        let ready_file = root.join("ready");
+        let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string();
+        let mut envs = vec![
             ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
             ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
-            ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
-            ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
+            ("JMODGUARD_HEALTH_BIND", bind.as_str()),
+            ("JMODGUARD_READY_FILE", ready_file.to_str().unwrap()),
             ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-        ],
-        &["JMODGUARD_LAUNCHER_REVISION"],
-    );
-    wait_log(
-        &running,
-        "this release requires launcher revision 3; the running launcher is revision 2",
-    );
-    let log = wait_log(&running, "health listener");
-    let addr = health_addr(&log);
-    let health = get(&addr, "/health");
-    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
-    let ready = get(&addr, "/ready");
-    assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(running.child.try_wait().unwrap().is_none());
-    assert!(
-        !db_path.exists(),
-        "a refused bot must not open the database"
-    );
-    let _ = std::fs::remove_dir_all(&root);
+        ];
+        if let Some(revision) = revision {
+            envs.push(("JMODGUARD_LAUNCHER_REVISION", revision));
+        }
+        let remove = if revision.is_none() {
+            vec!["JMODGUARD_LAUNCHER_REVISION"]
+        } else {
+            vec![]
+        };
+        let mut running = spawn(&envs, &remove);
+        wait_log(&running, "this release requires launcher revision 7");
+        let log = wait_log(&running, "health listener");
+        let addr = health_addr(&log);
+        let health = get(&addr, "/health");
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        let ready = get(&addr, "/ready");
+        assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
+        assert!(running.child.try_wait().unwrap().is_none());
+        assert!(
+            !db_path.exists(),
+            "a refused bot must not open the database"
+        );
+        assert!(
+            !ready_file.exists(),
+            "refusal must not claim Discord readiness"
+        );
+        assert!(
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(running.child.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = running.child.try_wait().unwrap() {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "SIGTERM is an intentional clean exit"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "refused child did not stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[test]
-fn revision_three_launcher_child_starts_and_claims_the_lease() {
-    let root = temp_root("rev3");
+fn revision_seven_launcher_child_starts_and_claims_the_lease() {
+    let root = temp_root("rev7");
     let db_path = root.join("core.db");
     let running = spawn(
         &[
@@ -203,7 +242,7 @@ fn revision_three_launcher_child_starts_and_claims_the_lease() {
             ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
             ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
             ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "3"),
+            ("JMODGUARD_LAUNCHER_REVISION", "7"),
         ],
         &[],
     );
@@ -213,7 +252,7 @@ fn revision_three_launcher_child_starts_and_claims_the_lease() {
     while !lease_present(&db_path) {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "revision 3 child did not claim the writer lease\n{log}"
+            "revision 7 child did not claim the writer lease\n{log}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

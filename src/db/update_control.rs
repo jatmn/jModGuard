@@ -9,7 +9,8 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
 pub const LAUNCHER_REVISION: u32 = 10;
-pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
+// Selected bots need the auth-exit hold before the readiness deadline check.
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
