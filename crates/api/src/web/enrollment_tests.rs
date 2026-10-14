@@ -2685,6 +2685,18 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(status, StatusCode::OK, "{other}");
     assert!(other["cases"].as_array().unwrap().is_empty());
     let id = ids[0].as_str().unwrap();
+    assert_eq!(
+        body["summaries"][id],
+        serde_json::json!({
+            "action": "ban", "outcome": "succeeded", "subject_id": "1", "occurred_at_ms": 1
+        })
+    );
+    assert!(!body.to_string().contains(tag.as_str()));
+    assert!(!body.to_string().contains("secret"));
+    assert_eq!(other["summaries"], serde_json::json!({}));
+    let (status, posted) = f.request("POST", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    assert_eq!(posted["summaries"], body["summaries"]);
     let (status, detail) = f
         .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
         .await;
@@ -2981,6 +2993,7 @@ async fn case_delete_and_retry_ignore_retired_backup_queue() {
         .request("GET", "/api/guilds/10/cases?removed=true", "")
         .await;
     assert_eq!(removed["cases"][0], id);
+    assert_eq!(removed["summaries"], serde_json::json!({}));
     let (_, active) = f.request("GET", "/api/guilds/10/cases", "").await;
     assert!(active["cases"].as_array().unwrap().is_empty());
     f.request("DELETE", &url, "").await;
@@ -4912,4 +4925,80 @@ async fn known_bad_image_delete_rate_limit_leaves_row_intact() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let mut expected = Vec::new();
+    for n in 1..=51 {
+        let id = CaseId::try_from(format!("{n:032x}")).unwrap();
+        store
+            .record_case(
+                scope.clone(),
+                id.clone(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: n },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: i64::MAX,
+                    actor_id: Some(42),
+                    occurred_at_ms: n,
+                    reason: Some("private reason".into()),
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+        expected.push(id.as_str().to_owned());
+    }
+    let (status, first) = f.request("POST", "/api/guilds/10/cases?limit=50", "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["cases"], serde_json::json!(expected[..50]));
+    assert_eq!(first["summaries"].as_object().unwrap().len(), 50);
+    for (n, id) in expected[..50].iter().enumerate() {
+        assert_eq!(
+            first["summaries"][id],
+            serde_json::json!({
+                "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(), "occurred_at_ms": n + 1
+            })
+        );
+    }
+    store
+        .remove_case(scope, CaseId::try_from(expected[49].clone()).unwrap())
+        .await
+        .unwrap();
+    let (status, next) = f
+        .request(
+            "POST",
+            &format!("/api/guilds/10/cases?after={}&limit=50", expected[49]),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], serde_json::json!(expected[50..]));
+    let (status, empty) = f
+        .request(
+            "POST",
+            &format!("/api/guilds/10/cases?after={}", expected[50]),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(empty["cases"], serde_json::json!([]));
+    assert_eq!(empty["summaries"], serde_json::json!({}));
 }
