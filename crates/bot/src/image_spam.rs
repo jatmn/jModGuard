@@ -54,6 +54,7 @@ struct Post {
 /// and its Gateway echo. The live observation is still retired normally.
 pub(crate) struct OwnDelete {
     post: Post,
+    proof_lifetime: Weak<()>,
     echoed: Arc<AtomicBool>,
     succeeded: bool,
 }
@@ -74,6 +75,8 @@ struct Bucket {
     window: Duration,
     last_seen: Instant,
     token: (u64, u64),
+    /// Shared with the parked watermark, never kept alive by delete receipts.
+    proof_lifetime: Arc<()>,
     posts: Vec<Post>,
     budget: Budget,
     reported_until: Instant,
@@ -82,6 +85,7 @@ struct Bucket {
 }
 /// Replay/rate tombstone after posts are gone; does not occupy live author slots.
 struct Watermark {
+    proof_lifetime: Arc<()>,
     retired_before: u64,
     last_seen: Instant,
     token: (u64, u64),
@@ -225,6 +229,7 @@ fn park_author(g: &mut Guild, authors: &mut usize, author: u64, max_watermarks: 
     g.watermarks.insert(
         author,
         Watermark {
+            proof_lifetime: b.proof_lifetime,
             retired_before: b.retired_before,
             last_seen: b.last_seen,
             token: b.token,
@@ -397,11 +402,20 @@ impl Detector {
         own_deletes: &[OwnDelete],
     ) -> bool {
         let state = self.state.lock();
-        let bucket = state
-            .guilds
-            .get(&guild)
-            .and_then(|g| g.authors.get(&author));
-        if bucket.is_some_and(|b| b.token != proof.token) {
+        let Some(g) = state.guilds.get(&guild) else {
+            return false;
+        };
+        let bucket = g.authors.get(&author);
+        let Some((token, proof_lifetime)) =
+            bucket.map(|b| (b.token, &b.proof_lifetime)).or_else(|| {
+                g.watermarks
+                    .get(&author)
+                    .map(|w| (w.token, &w.proof_lifetime))
+            })
+        else {
+            return false;
+        };
+        if token != proof.token {
             return false;
         }
         let posts: Vec<_> = proof
@@ -419,6 +433,9 @@ impl Detector {
                     .find(|deleted| {
                         deleted.post.channel == *channel
                             && deleted.post.id == *message
+                            && deleted
+                                .proof_lifetime
+                                .ptr_eq(&Arc::downgrade(proof_lifetime))
                             && deleted.succeeded
                             && deleted.echoed.load(Ordering::Acquire)
                     })
@@ -477,6 +494,7 @@ impl Detector {
             .find(|p| p.channel == channel && p.id == message)?;
         let deleted = OwnDelete {
             post: post.clone(),
+            proof_lifetime: Arc::downgrade(&bucket.proof_lifetime),
             echoed: Arc::new(AtomicBool::new(false)),
             succeeded: false,
         };
@@ -526,6 +544,15 @@ impl Detector {
             self.limits.max_authors_per_guild,
             |_| true,
         );
+        // Own echoes may already have parked the author. Revoke the detached
+        // receipts as well as the live posts, without restoring any observations.
+        if let Some(w) = state
+            .guilds
+            .get_mut(&guild)
+            .and_then(|g| g.watermarks.get_mut(&author))
+        {
+            w.proof_lifetime = Arc::new(());
+        }
     }
     pub fn invalidate_guild(&self, guild: u64) {
         let mut state = self.state.lock();
@@ -544,6 +571,11 @@ impl Detector {
                 self.limits.max_authors_per_guild,
                 |_| true,
             );
+        }
+        if let Some(g) = state.guilds.get_mut(&guild) {
+            for w in g.watermarks.values_mut() {
+                w.proof_lifetime = Arc::new(());
+            }
         }
     }
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
@@ -659,6 +691,10 @@ impl Detector {
         });
         let watermark = g.watermarks.remove(&author);
         let b = g.authors.entry(author).or_insert_with(|| Bucket {
+            proof_lifetime: watermark
+                .as_ref()
+                .map(|w| Arc::clone(&w.proof_lifetime))
+                .unwrap_or_default(),
             retired_before: watermark.as_ref().map(|w| w.retired_before).unwrap_or(0),
             window: Duration::from_secs(policy.window_secs),
             last_seen: now,
@@ -671,6 +707,9 @@ impl Detector {
             reported_until: watermark.as_ref().map(|w| w.reported_until).unwrap_or(now),
             blocked_notice: false,
         });
+        if b.token != token {
+            b.proof_lifetime = Arc::new(());
+        }
         b.token = token;
         if b.posts.len() >= self.limits.max_posts_per_author {
             self.capacity_drop();
@@ -2616,6 +2655,8 @@ mod tests {
         OwnEchoAndExternalBulkDelete,
         OwnEchoAndRemoveHash,
         LateOwnDeleteEcho,
+        OwnEchoAndWhitelistRole,
+        OwnEchoAndMemberRemoval,
     }
 
     // Serenity exposes Context construction through a shard runner. Connect only
@@ -2734,6 +2775,7 @@ mod tests {
         let mut rule = crate::defaults::default_rules().remove(1);
         rule.enabled = true;
         rule.skip_moderators = false;
+        rule.whitelist_roles = vec![7];
         rule.dry_run = false;
         rule.params["mode"] = "exact_image".into();
         rule.actions = serde_json::from_value(serde_json::json!([
@@ -2839,6 +2881,8 @@ mod tests {
                                     | DispatchChange::OwnEchoAndExternalDelete
                                     | DispatchChange::OwnEchoAndExternalBulkDelete
                                     | DispatchChange::OwnEchoAndRemoveHash
+                                    | DispatchChange::OwnEchoAndWhitelistRole
+                                    | DispatchChange::OwnEchoAndMemberRemoval
                             )
                         {
                             let parts: Vec<_> = path.split('/').collect();
@@ -2864,6 +2908,31 @@ mod tests {
                         }
                         match change {
                             DispatchChange::None | DispatchChange::OwnDeleteEcho => {}
+                            DispatchChange::OwnEchoAndWhitelistRole => {
+                                let event = serde_json::from_value(serde_json::json!({
+                                    "guild_id": "1",
+                                    "user": {"id": "99", "username": "fixture", "discriminator": "0001", "avatar": null},
+                                    "roles": ["7"],
+                                    "joined_at": "2026-01-01T00:00:00Z"
+                                })).unwrap();
+                                runtime.block_on(handler.guild_member_update(
+                                    ctx.clone(),
+                                    None,
+                                    None,
+                                    event,
+                                ));
+                            }
+                            DispatchChange::OwnEchoAndMemberRemoval => {
+                                let user = serde_json::from_value(serde_json::json!({
+                                    "id": "99", "username": "fixture", "discriminator": "0001", "avatar": null
+                                })).unwrap();
+                                runtime.block_on(handler.guild_member_removal(
+                                    ctx.clone(),
+                                    GuildId::new(1),
+                                    user,
+                                    None,
+                                ));
+                            }
                             DispatchChange::OwnEchoAndExternalDelete => {
                                 runtime.block_on(handler.message_delete(
                                     ctx.clone(),
@@ -2975,6 +3044,8 @@ mod tests {
                     | DispatchChange::OwnEchoAndExternalDelete
                     | DispatchChange::OwnEchoAndExternalBulkDelete
                     | DispatchChange::OwnEchoAndRemoveHash
+                    | DispatchChange::OwnEchoAndWhitelistRole
+                    | DispatchChange::OwnEchoAndMemberRemoval
                     | DispatchChange::LateOwnDeleteEcho
             ) {
                 assert_eq!(
@@ -3177,6 +3248,197 @@ mod tests {
             0,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_whitelist_role_granted_after_own_echo_skips_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::OwnEchoAndWhitelistRole,
+            "GET",
+            "/bans/99",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_bad_member_removed_after_own_echo_skips_ban() {
+        image_dispatch_race(
+            true,
+            DispatchChange::OwnEchoAndMemberRemoval,
+            "GET",
+            "/bans/99",
+            1,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_whitelist_role_granted_after_own_echo_skips_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnEchoAndWhitelistRole,
+            "GET",
+            "/bans/99",
+            3,
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_member_removed_after_own_echo_skips_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnEchoAndMemberRemoval,
+            "GET",
+            "/bans/99",
+            3,
+            0,
+        )
+        .await;
+    }
+
+    #[test]
+    fn own_delete_receipts_are_revoked_by_author_and_guild_invalidation() {
+        for guild_wide in [false, true] {
+            for echo_first in [false, true] {
+                for retain_live_post in [false, true] {
+                    let detector = Detector::new(Limits::default()).unwrap();
+                    let now = Instant::now();
+                    let mut policy = policy();
+                    policy.known_bad_hashes.insert([1; 32]);
+                    detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
+                    if retain_live_post {
+                        detector.admit(1, 2, post(11, 101, now, &[2]), (0, 0), &policy, now, false);
+                    }
+                    let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
+                    deleted.finish(true);
+                    let messages = [(100, 10)];
+                    let evidence = evidence(&messages, 2, &[1]);
+                    let proving = || {
+                        detector.enforcement_still_proving(
+                            1,
+                            2,
+                            MatchProof {
+                                token: (0, 0),
+                                messages: &messages,
+                                evidence: &evidence,
+                                policy: &policy,
+                                now,
+                            },
+                            std::slice::from_ref(&deleted),
+                        )
+                    };
+                    if echo_first {
+                        detector.deleted(1, 100, 10);
+                    }
+                    assert!(proving());
+                    detector.invalidate_author(1, 3);
+                    detector.invalidate_guild(2);
+                    assert!(
+                        proving(),
+                        "unrelated invalidation must not cancel this author"
+                    );
+                    if guild_wide {
+                        detector.invalidate_guild(1);
+                    } else {
+                        detector.invalidate_author(1, 2);
+                    }
+                    detector.deleted(1, 100, 10);
+                    assert!(
+                        !proving(),
+                        "revocation must survive early or late own echoes, with live posts or only receipts"
+                    );
+                    let mut next = post(12, 102, now, &[1]);
+                    next.revision = detector.revision();
+                    assert!(matches!(
+                        detector.admit(1, 2, next, (0, 0), &policy, now, false),
+                        AdmitOutcome::Matched(_)
+                    ));
+                    assert!(!proving(), "new observations must not revive old receipts");
+                    assert_eq!(detector.author_of(1, 100, 10), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn own_delete_receipts_cannot_outlive_config_change() {
+        let detector = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let mut policy = policy();
+        policy.known_bad_hashes.insert([1; 32]);
+        detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
+        let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
+        deleted.finish(true);
+        detector.deleted(1, 100, 10);
+        for (id, token) in [(11, (1, 1)), (12, (0, 0))] {
+            let mut next = post(id, 101, now, &[1]);
+            next.revision = detector.revision();
+            assert!(matches!(
+                detector.admit(1, 2, next, token, &policy, now, false),
+                AdmitOutcome::Matched(_)
+            ));
+            detector.deleted(1, 101, id);
+            assert!(
+                !detector.enforcement_still_proving(
+                    1,
+                    2,
+                    MatchProof {
+                        token: (0, 0),
+                        messages: &[(100, 10)],
+                        evidence: &evidence(&[(100, 10)], 2, &[1]),
+                        policy: &policy,
+                        now
+                    },
+                    std::slice::from_ref(&deleted),
+                ),
+                "a token change must permanently revoke old receipts even after parking again"
+            );
+        }
+    }
+
+    #[test]
+    fn own_delete_receipts_fail_closed_when_tombstone_is_evicted() {
+        let detector = Detector::new(Limits {
+            max_authors_per_guild: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        let now = Instant::now();
+        let mut policy = policy();
+        policy.known_bad_hashes.insert([1; 32]);
+        detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
+        let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
+        deleted.finish(true);
+        detector.deleted(1, 100, 10);
+        let mut next = post(11, 101, now, &[1]);
+        next.revision = detector.revision();
+        assert!(matches!(
+            detector.admit(1, 3, next, (0, 0), &policy, now, false),
+            AdmitOutcome::Matched(_)
+        ));
+        detector.deleted(1, 101, 11);
+        assert!(
+            !detector.enforcement_still_proving(
+                1,
+                2,
+                MatchProof {
+                    token: (0, 0),
+                    messages: &[(100, 10)],
+                    evidence: &evidence(&[(100, 10)], 2, &[1]),
+                    policy: &policy,
+                    now
+                },
+                &[deleted],
+            ),
+            "bounded tombstone eviction must discard the receipt's authority"
+        );
+        assert_eq!(detector.author_of(1, 100, 10), None);
     }
 
     #[test]
