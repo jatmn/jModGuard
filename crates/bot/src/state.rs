@@ -632,6 +632,9 @@ pub struct BotState {
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     slash_unauthorized: AtomicBool,
     slash_retries: Mutex<HashMap<u64, SlashRetry>>,
+    /// Last successful Discord payload per guild. Hold this lock across the
+    /// versioned read and PUT so startup, join and poll cannot register out of order.
+    pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
     gateway_ban_flights: [Mutex<GatewayBanFlight>; 256],
@@ -722,6 +725,7 @@ impl BotState {
             slash_sync_progress: Mutex::new(None),
             slash_unauthorized: AtomicBool::new(false),
             slash_retries: Mutex::new(HashMap::new()),
+            slash_registrations: tokio::sync::Mutex::new(HashMap::new()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
             gateway_ban_flights: std::array::from_fn(|_| {
@@ -1492,6 +1496,15 @@ impl BotState {
 
     pub(crate) fn reset_slash_guild_retry(&self, guild: u64) {
         self.slash_retries.lock().remove(&guild);
+    }
+
+    pub(crate) async fn forget_slash_guild(&self, guild: u64) {
+        // Wait for any in-flight PUT before forgetting its result.
+        self.slash_registrations.lock().await.remove(&guild);
+        self.reset_slash_guild_retry(guild);
+        // Discard an in-flight pass's failure set too: a confirmed leave must
+        // not leave reconciliation waiting for that guild to return to cache.
+        self.retry_slash_registry_version();
     }
 
     pub fn acknowledged_slash_registry_version(&self) -> u64 {
