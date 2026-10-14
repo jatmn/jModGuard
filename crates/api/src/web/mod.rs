@@ -249,7 +249,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
         )));
     }
     let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
-        return Err(ApiError(anyhow::anyhow!("not authenticated")));
+        return Err(ApiError(anyhow::Error::new(NotAuthenticated)));
     };
     reject_retired_session(app, session).await?;
     if let Some(id) = session.id()
@@ -397,6 +397,17 @@ impl SessionAuth {
         ));
     }
 }
+
+#[derive(Debug)]
+pub struct NotAuthenticated;
+
+impl std::fmt::Display for NotAuthenticated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not authenticated")
+    }
+}
+
+impl std::error::Error for NotAuthenticated {}
 
 #[derive(Debug)]
 struct AuthLost;
