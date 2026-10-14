@@ -24,14 +24,14 @@ struct Config {
     pub log: LogConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct DiscordConfig {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct DbConfig {
     pub path: PathBuf,
@@ -42,7 +42,7 @@ pub struct DbConfig {
     pub pool_size: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     pub bind: String,
@@ -53,6 +53,53 @@ pub struct WebConfig {
     /// Empty = same-origin only (no CORS layer). Env: `JMODGUARD_CORS_ORIGINS`
     /// (comma-separated).
     pub cors_origins: Vec<String>,
+}
+
+impl std::fmt::Debug for DiscordConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordConfig")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbConfig")
+            .field("path", &self.path)
+            .field("url", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("pool_size", &self.pool_size)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WebConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebConfig")
+            .field("bind", &self.bind)
+            .field("base_url", &self.base_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_client_secret", &"<redacted>")
+            .field("cors_origins", &self.cors_origins)
+            .finish()
+    }
+}
+
+impl DbConfig {
+    /// Remote diagnostics never include credentials, paths, queries or fragments.
+    pub fn log_label(&self) -> String {
+        if self.url.is_empty() {
+            return self.path.display().to_string();
+        }
+        match url::Url::parse(&self.url) {
+            Ok(url) => match url.host_str() {
+                Some(host) => format!("{}://{host}", url.scheme()),
+                None => "<remote database>".into(),
+            },
+            Err(_) => "<invalid remote database URL>".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -567,11 +614,23 @@ impl Config {
     }
 
     fn parse_file(raw: &str, api: bool) -> Result<Self> {
-        if api {
-            Ok(toml::from_str::<ApiProcessConfig>(raw)?.into())
+        let parsed = if api {
+            toml::from_str::<ApiProcessConfig>(raw).map(Self::from)
         } else {
-            Ok(toml::from_str::<BotProcessConfig>(raw)?.into())
-        }
+            toml::from_str::<BotProcessConfig>(raw).map(Self::from)
+        };
+        parsed.map_err(|error| {
+            // Do not retain the TOML error as a source: Display and Debug quote
+            // the input line and invalid value, which can contain credentials.
+            if let Some(span) = error.span() {
+                let before = &raw[..raw.floor_char_boundary(span.start.min(raw.len()))];
+                let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+                let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                anyhow::anyhow!("invalid TOML at line {line}, column {column}")
+            } else {
+                anyhow::anyhow!("invalid TOML configuration")
+            }
+        })
     }
 
     fn retention_days_in_range(days: u32, source: &str) -> Result<u32> {
@@ -1772,5 +1831,76 @@ impl ActionWorkerConfig {
             }
         }
         self.validate()
+    }
+}
+
+#[cfg(test)]
+mod logging_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn remote_database_labels_omit_private_url_parts() {
+        for url in [
+            "libsql://user:PRIVATE_PASSWORD@example.com/PRIVATE_PATH?token=PRIVATE_QUERY#PRIVATE_FRAGMENT",
+            "https://user:PRIVATE_PASSWORD@example.com:8443/PRIVATE_PATH?token=PRIVATE_QUERY",
+        ] {
+            let cfg = DbConfig {
+                url: url.into(),
+                ..Default::default()
+            };
+            let label = cfg.log_label();
+            assert_eq!(
+                label,
+                format!("{}://example.com", url.split(':').next().unwrap())
+            );
+        }
+        let cfg = DbConfig {
+            url: "PRIVATE_INVALID_URL".into(),
+            ..Default::default()
+        };
+        assert!(!cfg.log_label().contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn config_debug_redacts_nested_secrets() {
+        let secret = "SENTINEL_PRIVATE_CREDENTIAL";
+        let mut bot = BotProcessConfig::default();
+        bot.discord.token = secret.into();
+        bot.db.url = format!("libsql://user:{secret}@example.com/private?token={secret}");
+        bot.db.token = secret.into();
+        let api = ApiProcessConfig {
+            db: bot.db.clone(),
+            web: WebConfig {
+                oauth_client_secret: secret.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for output in [
+            format!("{bot:?}"),
+            format!("{api:?}"),
+            format!("{:?}", bot.db_open_options()),
+            format!("{:?}", api.db_open_options()),
+        ] {
+            assert!(!output.contains(secret), "Debug exposed a credential");
+            assert!(!output.contains("/private"), "Debug exposed the DB URL");
+            assert!(output.contains("<redacted>"));
+        }
+    }
+
+    #[test]
+    fn config_parse_errors_omit_source_and_values() {
+        for api in [false, true] {
+            for raw in [
+                "[db]\ntoken = \"SENTINEL_PRIVATE_CREDENTIAL",
+                "[db]\npool_size = \"SENTINEL_PRIVATE_CREDENTIAL\"",
+            ] {
+                let error = Config::parse_file(raw, api).unwrap_err();
+                let output = format!("{error:#} {error:?}");
+                assert!(!output.contains("SENTINEL_PRIVATE_CREDENTIAL"));
+                assert!(output.contains("line 2"));
+                assert!(output.contains("column"));
+            }
+        }
     }
 }

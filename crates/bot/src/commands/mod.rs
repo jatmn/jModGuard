@@ -468,9 +468,9 @@ pub async fn handle_prefix(
     };
     let prefix = &cfg.settings.prefix;
     tracing::debug!(
-        "prefix check: prefix={prefix:?}, content={:?}, starts={}",
-        msg.content,
-        prefix.is_empty() || msg.content.starts_with(prefix.as_str())
+        content_len = msg.content.len(),
+        starts = !prefix.is_empty() && msg.content.starts_with(prefix.as_str()),
+        "prefix check"
     );
     if prefix.is_empty() || !msg.content.starts_with(prefix.as_str()) {
         return Ok(false);
@@ -2827,6 +2827,72 @@ mod tests {
             "payload validation failures must not park the channel"
         );
         server.abort();
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prefix_check_logs_no_message_content() {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (app, path) = temp_command_test_db();
+        let cfg = Arc::new(CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: std::time::Instant::now(),
+            settings: crate::types::GuildSettings {
+                prefix: "!".into(),
+                ..Default::default()
+            },
+            rules: Default::default(),
+            commands: Default::default(),
+            templates: Default::default(),
+            log_channels: Default::default(),
+            known_bad_hashes: Default::default(),
+            log_filters: Default::default(),
+            regexes: Vec::new(),
+            custom_patterns: Default::default(),
+        });
+        let mut msg = serenity::model::channel::Message::default();
+        msg.content = "SENTINEL_PRIVATE_MESSAGE".into();
+        msg.guild_id = Some(GuildId::new(10));
+        msg.author.id = UserId::new(2);
+        let result = handle_prefix(
+            &app,
+            &serenity::http::Http::new("unused"),
+            &serenity::cache::Cache::default(),
+            cfg,
+            &msg,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!result);
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("prefix check"),
+            "must exercise the diagnostic"
+        );
+        assert!(!logs.contains("SENTINEL_PRIVATE_MESSAGE"));
         drop(app);
         remove_command_test_db(&path);
     }
