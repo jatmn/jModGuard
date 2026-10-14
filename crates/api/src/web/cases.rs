@@ -98,25 +98,13 @@ pub async fn list_cases(
     };
     // Keep the ID page (including its cursor) stable if a case is removed
     // between these scoped reads. Missing summaries do not trigger client reads.
-    let mut summaries = serde_json::Map::new();
-    if !page.removed {
-        for id in &ids {
-            if let Some(data) = store
-                .case(scope.clone(), id.clone(), tenant::case_limits())
-                .await?
-            {
-                summaries.insert(
-                    id.as_str().to_owned(),
-                    serde_json::json!({
-                        "action": data.action,
-                        "outcome": data.outcome,
-                        "subject_id": data.subject_id.to_string(),
-                        "occurred_at_ms": data.occurred_at_ms,
-                    }),
-                );
-            }
-        }
-    }
+    let summaries = if page.removed {
+        std::collections::BTreeMap::new()
+    } else {
+        store
+            .case_summaries(scope, ids.clone(), tenant::case_limits())
+            .await?
+    };
     Ok(Json(serde_json::json!({
         "cases": ids.into_iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
         "summaries": summaries,

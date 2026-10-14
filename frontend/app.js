@@ -492,6 +492,8 @@ async function init() {
 async function logout() {
   if (!canLeave()) return;
   ui.set({ dirty: false });
+  stopPrivateWatchers();
+  state.guildId = null;
   if (isPreview()) {
     try {
       await api("/api/preview", "DELETE");
@@ -724,10 +726,14 @@ function isUnauthenticated(err) {
   );
 }
 
-function handleAuthLoss(error) {
-  if (!isUnauthenticated(error)) return false;
+function stopPrivateWatchers() {
   for (const dispose of authLossCleanups) dispose();
   for (const key of pendingLogChannelActions.keys()) clearPendingLogChannelEntry(key);
+}
+
+function handleAuthLoss(error) {
+  if (!isUnauthenticated(error)) return false;
+  stopPrivateWatchers();
   if (currentPreviewToken()) {
     showPreviewUnavailable();
     return true;
@@ -1140,8 +1146,9 @@ function applyQueuedLogChannel(job) {
     };
     pendingLogChannelActions.set(key, entry);
     const poll = logChannelPolls.get(logChannelPollKey(job));
-    if (poll && existing?.job.id !== job.id && poll.attempt >= actionReconcileDelays.length) {
+    if (poll && existing?.job.id !== job.id) {
       poll.attempt = 0;
+      ++poll.admission;
       poll.dueAt = Math.max(poll.dueAt, Date.now() + actionReconcileDelays[0]);
     }
     row.pending_action = { id: job.id, state: job.state, previous };
@@ -1163,10 +1170,11 @@ function logChannelPollVisible(job) {
     state.guildId === job.guild_id && state.config?.enrollment_id === job.enrollment_id;
 }
 
-function pauseLogChannelPolls() {
+function pauseLogChannelPolls(invalidate = false) {
   for (const poll of logChannelPolls.values()) {
     clearTimeout(poll.timer);
     poll.timer = null;
+    if (invalidate) ++poll.generation;
   }
 }
 
@@ -1178,7 +1186,7 @@ function scheduleLogChannelReconcile(job) {
   const key = logChannelPollKey(job);
   let poll = logChannelPolls.get(key);
   if (!poll) {
-    poll = { timer: null, dueAt: Date.now() + actionReconcileDelays[0], retryUntil: 0, attempt: 0, inFlight: null };
+    poll = { timer: null, dueAt: Date.now() + actionReconcileDelays[0], retryUntil: 0, attempt: 0, inFlight: null, generation: 0, admission: 0 };
     logChannelPolls.set(key, poll);
   }
   if (poll.timer !== null || poll.inFlight || !logChannelPollVisible(job) ||
@@ -1200,9 +1208,12 @@ async function reconcileQueuedLogChannel(original) {
   scheduleLogChannelReconcile(original);
   const poll = logChannelPolls.get(key);
   if (poll.inFlight) return poll.inFlight;
-  if (Date.now() < poll.retryUntil || (poll.attempt > 0 && Date.now() < poll.dueAt)) return;
+  if (Date.now() < poll.retryUntil || ((poll.attempt > 0 || poll.admission > 0) && Date.now() < poll.dueAt)) return;
   clearTimeout(poll.timer);
   poll.timer = null;
+  const generation = poll.generation;
+  const admission = poll.admission;
+  const current = () => logChannelPolls.get(key) === poll && poll.generation === generation;
   poll.inFlight = (async () => {
     let retryAfterMs = 0;
     try {
@@ -1210,8 +1221,8 @@ async function reconcileQueuedLogChannel(original) {
       const jobs = entries.some(item => ["pending", "claimed", "running"].includes(item.job.state))
         ? await apiRead(`/api/guilds/${original.guild_id}/actions`) : [];
       for (const item of entries) {
-        if (document.visibilityState !== "visible") break;
-        await reconcileLogChannelEntry(item.job, jobs);
+        if (!current() || document.visibilityState !== "visible") break;
+        await reconcileLogChannelEntry(item.job, jobs, current);
       }
     } catch (error) {
       if (isUnauthenticated(error)) return;
@@ -1219,10 +1230,10 @@ async function reconcileQueuedLogChannel(original) {
     } finally {
       poll.inFlight = null;
       if (logChannelPolls.get(key) === poll) {
-        ++poll.attempt;
+        if (poll.admission === admission) ++poll.attempt;
         poll.retryUntil = Date.now() + retryAfterMs;
         poll.dueAt = Date.now() + Math.max(actionReconcileDelays[poll.attempt] || 0, retryAfterMs);
-        if (poll.attempt >= actionReconcileDelays.length)
+        if (poll.attempt >= actionReconcileDelays.length && current())
           toast("Could not confirm the log-channel result. See Bot actions for details.", "info");
         else scheduleLogChannelReconcile(original);
       }
@@ -1231,11 +1242,12 @@ async function reconcileQueuedLogChannel(original) {
   return poll.inFlight;
 }
 
-async function reconcileLogChannelEntry(original, jobs) {
+async function reconcileLogChannelEntry(original, jobs, current) {
   const key = logChannelActionKey(original);
   let entry = pendingLogChannelActions.get(key);
   let row = logChannelRow(original.action.event);
   if (
+    !current() ||
     !entry ||
     entry.job.id !== original.id ||
     !row?.pending_action ||
@@ -1253,6 +1265,7 @@ async function reconcileLogChannelEntry(original, jobs) {
     entry = pendingLogChannelActions.get(key);
     row = logChannelRow(original.action.event);
     if (
+      !current() ||
       !entry ||
       entry.job.id !== original.id ||
       !row?.pending_action ||
@@ -1289,12 +1302,13 @@ async function reconcileLogChannelEntry(original, jobs) {
     );
   } catch (error) {
     if (isUnauthenticated(error)) return;
-    renderLogChannelsPreservingDrafts();
+    if (current()) renderLogChannelsPreservingDrafts();
     throw error;
   }
   entry = pendingLogChannelActions.get(key);
   row = logChannelRow(original.action.event);
   if (
+    !current() ||
     !entry ||
     entry.job.id !== original.id ||
     !row?.pending_action ||
@@ -3095,15 +3109,17 @@ function TemplateCard({ record: t }) {
 
 function tabLogChannels() {
   useEffect(() => {
+    const guildId = state.guildId, enrollmentId = state.config?.enrollment_id;
     const visibility = () => {
-      pauseLogChannelPolls();
+      pauseLogChannelPolls(document.visibilityState !== "visible");
       resumeLogChannelPolls();
     };
     document.addEventListener("visibilitychange", visibility);
     resumeLogChannelPolls();
     return () => {
       document.removeEventListener("visibilitychange", visibility);
-      pauseLogChannelPolls();
+      pauseLogChannelPolls(state.tab !== "logchannels" || state.guildId !== guildId ||
+        state.config?.enrollment_id !== enrollmentId);
     };
   }, [state.guildId, state.config?.enrollment_id]);
   return h(
@@ -3428,14 +3444,17 @@ function tabMembers() {
       (sync?.status === "complete" && auditPaginationStalled(sync));
     const schedulePoll = () => {
       clearTimer();
-      if (!aliveHere() || document.visibilityState !== "visible") return;
+      if (!aliveHere()) return;
       const active =
         statusRetryNeeded ||
         pendingSyncAction ||
         (latestStatus &&
           (["queued", "running", "waiting"].includes(latestStatus.status) ||
             ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
-      if (!active) return;
+      if (!active) {
+        pollDueAt = 0;
+        return;
+      }
       if (!pollDueAt) {
         let delay = Math.min(10000 * 2 ** Math.min(pollAttempt, 5), 300000);
         const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
@@ -3451,6 +3470,7 @@ function tabMembers() {
         delay = Math.max(delay, lastStatusError?.retryAfterMs || 0);
         pollDueAt = Date.now() + delay;
       }
+      if (document.visibilityState !== "visible") return;
       timer = setTimeout(() => {
         timer = null;
         if (Date.now() < pollDueAt) return schedulePoll();
@@ -3888,6 +3908,8 @@ function tabMembers() {
           ),
         ]);
         schedulePoll();
+      } finally {
+        if (request === statusRequest) statusAbort = null;
       }
     };
     const loadMembers = async () => {
@@ -4128,7 +4150,8 @@ function tabMembers() {
     const visibility = () => {
       if (document.visibilityState === "visible" && aliveHere()) {
         if (latestStatus) renderStatus(latestStatus);
-        schedulePoll();
+        if (!pollDueAt && !statusAbort) loadStatus();
+        else schedulePoll();
       } else {
         clearTimer();
         clearCountdown();

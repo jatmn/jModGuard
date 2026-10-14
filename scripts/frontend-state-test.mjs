@@ -89,7 +89,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -3679,7 +3679,7 @@ test('log-channel checks are single flight when another event is queued during a
   assert.equal(reads, 1);
   pending.resolve(response([first, second]));
   await Promise.all([read, shared]);
-  assert.equal([...h.timers.values()].filter(timer => timer.delay === 1500).length, 1);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 1000).length, 1);
 });
 
 test('log-channel timers stop on navigation and keep guild schedules separate', async () => {
@@ -3859,4 +3859,222 @@ test('restarting an exhausted log watcher still respects its last Retry-After', 
   assert.equal(reads, 10);
   await runLogPoll(h, 1800000);
   assert.equal(reads, 11);
+});
+
+for (const timing of ['before', 'in-flight', 'after']) test(`new log admission gets a full window ${timing} exhaustion`, async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let reads = 0, finish;
+  const h = harness(async () => {
+    reads++;
+    if (timing === 'in-flight' && reads === 10) return new Promise(resolve => { finish = resolve; });
+    return response([first, second]);
+  });
+  logView(h);
+  queueLog(h, first);
+  for (const delay of h.app.actionReconcileDelays.slice(0, 9)) await runLogPoll(h, delay);
+  if (timing === 'before') queueLog(h, second);
+  const final = runLogPoll(h, 150000);
+  if (timing === 'in-flight') {
+    queueLog(h, second);
+    h.app.reconcileQueuedLogChannel(second);
+    assert.equal(reads, 10);
+  }
+  if (finish) finish(response([first, second]));
+  await final;
+  if (timing === 'after') queueLog(h, second);
+  await runLogPoll(h, timing === 'before' ? 1500 : 1000);
+  assert.equal(reads, 11, 'new admission must keep the shared watcher alive');
+  for (const delay of h.app.actionReconcileDelays.slice(timing === 'before' ? 2 : 1)) await runLogPoll(h, delay);
+  assert.equal(reads, timing === 'before' ? 19 : 20, 'new action receives ten checks');
+  assert.equal(h.timers.size, 1, 'only the informational toast expiry remains');
+});
+
+for (const status of ['paused', 'complete', 'needs_attention']) test(`Members discovers an externally resumed ${status} import on visibility return`, async () => {
+  let reads = 0, finish;
+  const h = harness(async url => {
+    if (!url.endsWith('/member-sync')) return response({members: []});
+    if (++reads === 1) return response({status});
+    return new Promise(resolve => { finish = resolve; });
+  });
+  const panel = memberView(h);
+  await settle();
+  visibility(h, 'hidden');
+  visibility(h, 'visible');
+  visibility(h, 'visible');
+  assert.equal(reads, 2, 'visibility performs one fresh read without duplicating an in-flight read');
+  finish(response({status: 'running', progress_revision: 2}));
+  await settle();
+  assert.match(textOf(panel), /running/);
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
+});
+
+for (const failure of [503, 429]) test(`new log admission preserves ${failure} cooldown and retries`, async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let reads = 0;
+  const h = harness(async () => {
+    if (++reads === 1) return {ok: false, status: failure, headers: {get: () => failure === 429 ? '120' : null}, text: async () => '{}'};
+    return response([first, {...second, state: 'succeeded'}]);
+  });
+  logView(h);
+  queueLog(h, first);
+  await runLogPoll(h, 1000);
+  queueLog(h, second);
+  await h.app.reconcileQueuedLogChannel(second);
+  assert.equal(reads, 1);
+  await runLogPoll(h, failure === 429 ? 120000 : 1500);
+  assert.equal(h.app.state.config.log_channels[1].pending_action, null);
+  assert.equal(reads, 2);
+});
+
+test('replayed admission does not extend the bounded log watcher', async () => {
+  const job = logJob();
+  const h = harness(async () => response([job]));
+  logView(h);
+  queueLog(h, job);
+  for (const delay of h.app.actionReconcileDelays) {
+    queueLog(h, job);
+    await runLogPoll(h, delay);
+  }
+  assert.equal(h.timers.size, 1, 'only toast expiry remains');
+});
+
+for (const stage of ['receipt', 'mapping']) for (const exit of ['navigation', 'navigation return', 'auth loss', 'logout'])
+  test(`late log ${stage} response after ${exit} cannot update the row`, async () => {
+    const job = logJob();
+    let finish, calls = 0;
+    const h = harness(async url => {
+      if (url.endsWith('/logout')) return new Promise(() => {});
+      if (!url.endsWith('/actions') && !url.includes('/logchannels/')) return response({cases: []});
+      calls++;
+      if (stage === 'mapping' && url.endsWith('/actions')) return response([{...job, state: 'failed'}]);
+      return new Promise(resolve => { finish = resolve; });
+    });
+    logView(h);
+    queueLog(h, job);
+    const pending = h.app.reconcileQueuedLogChannel(job);
+    await settle();
+    const row = h.app.state.config.log_channels[0];
+    const snapshot = JSON.stringify(row);
+    if (exit.startsWith('navigation')) {
+      h.app.navigate('cases');
+      if (exit === 'navigation return') h.app.navigate('logchannels');
+    } else if (exit === 'logout') h.app.logout();
+    else h.app.handleAuthLoss({code: 'auth_lost', message: 'expired'});
+    await settle();
+    finish(response(stage === 'receipt' ? [{...job, state: 'succeeded'}] : {effective: '999', guild_override: '999'}));
+    await pending;
+    await settle();
+    assert.equal(JSON.stringify(row), snapshot);
+    visibility(h, 'hidden');
+    visibility(h, 'visible');
+    assert.equal(calls, stage === 'receipt' ? 1 : 2);
+    assert.equal([...h.timers.values()].filter(timer => timer.delay === 1500).length, exit === 'navigation return' ? 1 : 0);
+  });
+
+for (const failure of [503, 429]) test(`Members visibility refresh recovers from ${failure} without bypassing cooldown`, async () => {
+  let reads = 0;
+  const h = harness(async url => {
+    if (!url.endsWith('/member-sync')) return response({members: []});
+    if (++reads === 1) return response({status: 'paused'});
+    if (reads === 2) return {ok: false, status: failure, headers: {get: () => failure === 429 ? '120' : null}, text: async () => '{}'};
+    return response({status: 'running'});
+  });
+  const panel = memberView(h);
+  await settle();
+  visibility(h, 'hidden'); visibility(h, 'visible'); await settle();
+  assert.equal(reads, 2);
+  visibility(h, 'hidden'); h.advanceTime(5000); visibility(h, 'visible');
+  assert.equal(reads, 2);
+  await runMemberPoll(h, failure === 429 ? 115000 : 5000);
+  assert.equal(reads, 3);
+  assert.match(textOf(panel), /running/);
+});
+
+for (const exit of ['navigation', 'auth loss', 'logout']) test(`Members visibility read ignores a late response after ${exit}`, async () => {
+  let reads = 0, finish;
+  const h = harness(async url => {
+    if (url.endsWith('/logout')) return new Promise(() => {});
+    if (!url.endsWith('/member-sync')) return response({members: [], cases: []});
+    if (++reads === 1) return response({status: 'paused'});
+    return new Promise(resolve => { finish = resolve; });
+  });
+  h.app.state.config = {enrollment_id: 'membership'};
+  h.app.navigate('members');
+  await settle();
+  visibility(h, 'hidden'); visibility(h, 'visible');
+  assert.equal(reads, 2);
+  if (exit === 'navigation') h.app.navigate('cases');
+  else if (exit === 'logout') h.app.logout();
+  else h.app.handleAuthLoss({code: 'auth_lost', message: 'expired'});
+  await settle();
+  finish(response({status: 'running', progress_revision: 2}));
+  await settle();
+  visibility(h, 'hidden'); visibility(h, 'visible');
+  assert.equal(reads, 2);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay >= 10000).length, 0);
+  assert.doesNotMatch(h.nodes.get('#content')?.textContent || '', /running/);
+});
+
+for (const failure of [false, true]) test(`Members preserves a ${failure ? 'rate limit' : 'worker deadline'} received while hidden`, async () => {
+  let reads = 0, finish;
+  const h = harness(async url => {
+    if (!url.endsWith('/member-sync')) return response({members: []});
+    if (++reads === 1) return response({status: 'paused'});
+    return new Promise(resolve => { finish = resolve; });
+  });
+  memberView(h); await settle();
+  visibility(h, 'hidden'); visibility(h, 'visible'); visibility(h, 'hidden');
+  finish(failure
+    ? {ok: false, status: 429, headers: {get: () => '120'}, text: async () => '{}'}
+    : response({status: 'waiting', as_of: 1000, next_attempt_at: 121000}));
+  await settle();
+  h.advanceTime(20000); visibility(h, 'visible');
+  assert.equal(reads, 2);
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 100000));
+});
+
+test('logout rejects an admission response that arrives before logout completes', async () => {
+  const h = harness(async () => new Promise(() => {}));
+  logView(h);
+  h.app.logout();
+  assert.equal(h.app.applyQueuedLogChannel(logJob()), false);
+  assert.equal(h.app.state.config.log_channels[0].effective, '111');
+});
+
+test('a late authoritative mapping rate limit preserves its deadline after navigation', async () => {
+  let finish;
+  const job = {...logJob(), state: 'failed'};
+  const h = harness(async url => {
+    if (url.includes('/logchannels/')) return new Promise(resolve => { finish = resolve; });
+    return response({cases: []});
+  });
+  logView(h);
+  queueLog(h, job);
+  const read = h.app.reconcileQueuedLogChannel(job);
+  h.app.navigate('cases');
+  finish({ok: false, status: 429, headers: {get: () => '120'}, text: async () => '{}'});
+  await read;
+  h.app.navigate('logchannels');
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 120000));
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+});
+
+test('Members refreshes on visibility after a rejected control leaves an idle status', async () => {
+  let reads = 0;
+  const action = {id: 'resume', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'membership', state: 'pending'};
+  const h = harness(async url => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/actions')) return response([{...action, state: 'failed'}]);
+    if (url.endsWith('/member-sync')) return response({status: ++reads <= 2 ? 'paused' : 'running', run_id: 'import', progress_revision: 1});
+    return response({members: []});
+  });
+  const panel = memberView(h);
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Resume'), 'click');
+  assert.equal(reads, 2);
+  assert.match(textOf(panel), /action failed/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay >= 10000).length, 0);
+  visibility(h, 'hidden'); visibility(h, 'visible'); await settle();
+  assert.equal(reads, 3, 'an inactive status must not retain an obsolete poll deadline');
+  assert.match(textOf(panel), /running/);
 });
