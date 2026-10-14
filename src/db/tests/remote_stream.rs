@@ -1550,6 +1550,13 @@ async fn lease_claim_admission_cases(use_remote: bool, pause_growth: bool) {
                 for conn in db.connections.idle.lock().unwrap().iter_mut() {
                     conn.set_test_capacity_limits(allocation + 1, allocation + 16 * 1024 * 1024);
                 }
+                // Armed renewal uses its own connection and must face the same headroom.
+                db.lease_connection
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("lease connection initialized")
+                    .set_test_capacity_limits(allocation + 1, allocation + 16 * 1024 * 1024);
             }
         };
         assert_eq!(stored(), before);
