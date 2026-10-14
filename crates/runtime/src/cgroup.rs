@@ -19,7 +19,7 @@ const V1_UNLIMITED_BYTES: u64 = 1 << 62;
 
 static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
 
-/// Real program memory: `memory.current` minus `inactive_file`.
+/// Program memory: cgroup usage minus inactive file cache (or its stat fallback).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryUse {
     pub program_bytes: u64,
@@ -27,7 +27,7 @@ pub struct MemoryUse {
 }
 
 /// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes,
-/// mean the cgroup has no limit.
+/// mean the cgroup has no limit. An absent limit file also means no limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryLimit {
     Bytes(u64),
@@ -526,34 +526,86 @@ fn read_memory(dir: &Path) -> Option<MemoryUse> {
         return parse_v2_memory(dir, &text);
     }
     if v2_path.exists() {
-        return None;
+        return memory_input(None, "memory.current");
     }
-    let text = read_limited(&dir.join("memory.usage_in_bytes"))?;
+    let text = memory_input(
+        read_limited(&dir.join("memory.usage_in_bytes")),
+        "memory.usage_in_bytes",
+    )?;
     parse_v1_memory(dir, &text)
 }
 
+// Report only a fixed file/key name, never the resolved cgroup path or contents.
+fn memory_input<T>(value: Option<T>, name: &'static str) -> Option<T> {
+    static REPORTED: Once = Once::new();
+    if value.is_none() {
+        REPORTED.call_once(|| {
+            tracing::warn!(
+                name,
+                "container memory unavailable: cgroup file or key missing, unreadable, or invalid"
+            );
+        });
+    }
+    value
+}
+
+fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
+    let path = dir.join(name);
+    if let Some(text) = read_limited(&path) {
+        return memory_input(parse_memory_max(&text), name);
+    }
+    // An unreadable existing file is not evidence of an unlimited cgroup.
+    if matches!(path.try_exists(), Ok(false)) {
+        return Some(MemoryLimit::Unlimited);
+    }
+    memory_input(None, name)
+}
+
 fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
+    let current = memory_input(parse_u64_token(current_text), "memory.current")?;
+    let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
+    let fallback = stat_value(&stat, "file")
+        .zip(stat_value(&stat, "active_file"))
+        .map(|(file, active)| file.saturating_sub(active));
     memory_use(
-        current_text,
-        &read_limited(&dir.join("memory.stat"))?,
-        &read_limited(&dir.join("memory.max"))?,
+        current,
+        &stat,
+        read_memory_limit(dir, "memory.max")?,
+        fallback,
     )
 }
 
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
+    let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
+    let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
+    let fallback = stat_value(&stat, "total_inactive_file");
     memory_use(
-        current_text,
-        &read_limited(&dir.join("memory.stat"))?,
-        &read_limited(&dir.join("memory.limit_in_bytes"))?,
+        current,
+        &stat,
+        read_memory_limit(dir, "memory.limit_in_bytes")?,
+        fallback,
     )
 }
 
-fn memory_use(current_text: &str, stat_text: &str, limit_text: &str) -> Option<MemoryUse> {
-    let current = parse_u64_token(current_text)?;
-    let inactive = stat_value(stat_text, "inactive_file")?;
+fn memory_use(
+    current: u64,
+    stat_text: &str,
+    limit: MemoryLimit,
+    fallback: Option<u64>,
+) -> Option<MemoryUse> {
+    // Keep malformed primary counters unavailable; fallback is for absent keys.
+    let inactive = if stat_text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("inactive_file"))
+    {
+        stat_value(stat_text, "inactive_file")
+    } else {
+        fallback
+    };
+    let inactive = memory_input(inactive, "inactive_file")?;
     Some(MemoryUse {
         program_bytes: current.saturating_sub(inactive),
-        limit: parse_memory_max(limit_text)?,
+        limit,
     })
 }
 
@@ -777,17 +829,169 @@ mod tests {
     }
 
     #[test]
-    fn missing_inactive_file_does_not_pretend_current_is_program_use() {
+    fn v2_missing_memory_max_is_unlimited() {
         let tree = temp_tree();
         write_files(
             &tree.path,
             &[
                 ("memory.current", "1000\n"),
-                ("memory.stat", "anon 1000\n"),
-                ("memory.max", "max\n"),
+                ("memory.stat", "inactive_file 100\n"),
             ],
         );
-        assert!(read_cgroup(Some(&tree.path), None).memory.is_none());
+        assert_eq!(
+            read_cgroup(Some(&tree.path), None).memory,
+            Some(MemoryUse {
+                program_bytes: 900,
+                limit: MemoryLimit::Unlimited
+            })
+        );
+    }
+
+    #[test]
+    fn v2_missing_inactive_file_uses_file_minus_active_file() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "anon 600\nfile 400\nactive_file 150\n"),
+                ("memory.max", "2048\n"),
+            ],
+        );
+        assert_eq!(
+            read_cgroup(Some(&tree.path), None).memory,
+            Some(MemoryUse {
+                program_bytes: 750,
+                limit: MemoryLimit::Bytes(2048)
+            })
+        );
+    }
+
+    #[test]
+    fn missing_inactive_file_does_not_pretend_current_is_program_use() {
+        let tree = temp_tree();
+        // Neither missing nor partial fallback keys establish inactive memory.
+        for stat in ["anon 1000\n", "file 400\n", "active_file 150\n"] {
+            write_files(
+                &tree.path,
+                &[
+                    ("memory.current", "1000\n"),
+                    ("memory.stat", stat),
+                    ("memory.max", "max\n"),
+                ],
+            );
+            assert!(
+                read_cgroup(Some(&tree.path), None).memory.is_none(),
+                "{stat}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_with_only_memory_stat_and_cpu_stat_keeps_memory_unavailable() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                (
+                    "memory.stat",
+                    "anon 600\nfile 400\nactive_file 150\ninactive_file 250\n",
+                ),
+                ("cpu.stat", "usage_usec 5000\n"),
+            ],
+        );
+        // Root memory.stat alone must not be treated as container usage.
+        let reading = read_mount_root(&tree.path);
+        assert_eq!(reading.memory, None);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
+    }
+
+    #[test]
+    fn v1_missing_limit_is_unlimited() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.usage_in_bytes", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+            ],
+        );
+        assert_eq!(
+            read_cgroup(Some(&tree.path), None).memory,
+            Some(MemoryUse {
+                program_bytes: 900,
+                limit: MemoryLimit::Unlimited
+            })
+        );
+    }
+
+    #[test]
+    fn v1_missing_inactive_file_uses_total_inactive_file() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.usage_in_bytes", "1000\n"),
+                ("memory.stat", "rss 700\ntotal_inactive_file 250\n"),
+                ("memory.limit_in_bytes", "2048\n"),
+            ],
+        );
+        assert_eq!(
+            read_cgroup(Some(&tree.path), None).memory,
+            Some(MemoryUse {
+                program_bytes: 750,
+                limit: MemoryLimit::Bytes(2048)
+            })
+        );
+    }
+
+    #[test]
+    fn v2_inactive_file_fallback_saturates_both_subtractions() {
+        let tree = temp_tree();
+        for (stat, expected) in [
+            ("file 100\nactive_file 150\n", 1000),
+            ("file 1500\nactive_file 100\n", 0),
+        ] {
+            write_files(
+                &tree.path,
+                &[
+                    ("memory.current", "1000\n"),
+                    ("memory.stat", stat),
+                    ("memory.max", "max\n"),
+                ],
+            );
+            assert_eq!(
+                read_cgroup(Some(&tree.path), None)
+                    .memory
+                    .unwrap()
+                    .program_bytes,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn present_invalid_or_unreadable_memory_limits_stay_unavailable() {
+        for (current, limit) in [
+            ("memory.current", "memory.max"),
+            ("memory.usage_in_bytes", "memory.limit_in_bytes"),
+        ] {
+            let tree = temp_tree();
+            for text in ["invalid\n", ""] {
+                write_files(
+                    &tree.path,
+                    &[
+                        (current, "1000\n"),
+                        ("memory.stat", "inactive_file 100\n"),
+                        (limit, text),
+                    ],
+                );
+                assert!(read_cgroup(Some(&tree.path), None).memory.is_none());
+            }
+            std::fs::remove_file(tree.path.join(limit)).unwrap();
+            std::fs::create_dir(tree.path.join(limit)).unwrap();
+            assert!(read_cgroup(Some(&tree.path), None).memory.is_none());
+        }
     }
 
     #[test]
