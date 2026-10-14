@@ -1398,10 +1398,11 @@ mod tests {
     use crate::types::Behavior;
 
     #[tokio::test]
-    async fn slash_http_failures_are_parked_backed_off_or_stopped() {
+    async fn slash_http_saves_registration_and_failure_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         for (status, code) in [
+            (200, 0),
             (403, 50013),
             (404, 10004),
             (400, 50035),
@@ -1427,7 +1428,12 @@ mod tests {
                         }
                     }
                     count.fetch_add(1, Ordering::SeqCst);
-                    let body = format!(r#"{{"code":{code},"message":"fixture rejection"}}"#);
+                    let body = if status == 200 {
+                        assert!(request.starts_with(b"PUT "));
+                        "[]".to_owned()
+                    } else {
+                        format!(r#"{{"code":{code},"message":"fixture rejection"}}"#)
+                    };
                     let response = format!(
                         "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1447,6 +1453,62 @@ mod tests {
                 .build();
             let target = app.acknowledged_slash_registry_version();
             let guild = GuildId::new(10);
+            if status == 200 {
+                assert!(sync_slash_commands_versioned_http(&app, &http, guild, target).await);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let mut command = db::get_command_row(&app.db, 0, "stats")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = db::get_primary_versions(&app.db).await.unwrap();
+                db::upsert_command(&app.db, 0, "stats", &command)
+                    .await
+                    .unwrap();
+                assert_eq!(db::get_primary_versions(&app.db).await.unwrap(), before);
+                assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "no poll-triggered PUT");
+
+                command.description.push_str(" changed");
+                db::upsert_command(&app.db, 0, "stats", &command)
+                    .await
+                    .unwrap();
+                let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
+                assert_eq!(changed, target + 1);
+                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                app.commit_slash_registry_version(changed);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+                // Join and startup dispatch do not depend on a pending version.
+                db::enroll_guild(&app.db, 20, 100).await.unwrap();
+                assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
+                assert!(
+                    sync_slash_commands_versioned_http(&app, &http, GuildId::new(20), changed)
+                        .await
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                let restarted = BotState::new(Default::default(), app.db.clone()).unwrap();
+                restarted.activation.mark_lock_held(true);
+                db::upsert_command(&restarted.db, 0, "stats", &command)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    restarted.pending_slash_registry_version().await.unwrap(),
+                    None
+                );
+                assert!(
+                    sync_slash_commands_versioned_http(&restarted, &http, guild, changed).await
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 4);
+                server.abort();
+                assert!(server.await.unwrap_err().is_cancelled());
+                drop(restarted);
+                drop(app);
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                }
+                crate::tenant::remove_sidecars(&path);
+                continue;
+            }
             assert!(!sync_slash_commands_versioned_http(&app, &http, guild, target).await);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(!app.slash_sync_due(
@@ -1490,6 +1552,27 @@ mod tests {
                     "gateway 401 must be surfaced without retrying"
                 );
             } else if status == 503 {
+                app.retry_slash_registry_version();
+                app.plan_slash_resync(target, &[10, 20]);
+                assert!(!app.finish_slash_resync(target, [10].into_iter().collect()));
+                let command = db::get_command_row(&app.db, 0, "stats")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db::upsert_command(&app.db, 0, "stats", &command)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    app.pending_slash_registry_version().await.unwrap(),
+                    Some(target)
+                );
+                assert_eq!(
+                    app.plan_slash_resync(target, &[10, 20]),
+                    crate::state::SlashResyncPlan::Sync {
+                        guilds: vec![10],
+                        invalidate: false,
+                    }
+                );
                 assert!(app.slash_sync_due(
                     10,
                     target,

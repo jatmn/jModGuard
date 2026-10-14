@@ -165,6 +165,26 @@ async fn upsert_row<T: Serialize + Send + 'static>(
         let n = key_params.len() + 1;
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        // Compare under the write lock so concurrent identical command saves
+        // cannot publish redundant configuration/registry revisions.
+        if bump_slash_registry
+            && tx.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {table}
+                     WHERE ({key_cols}) = ({keys}) AND data = ?{n})"
+                ),
+                params_from_iter(
+                    key_params
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(json.clone().into())),
+                ),
+                |r| Ok(r.get::<bool>(0)?),
+            )?
+        {
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute_rows(
             &format!(
                 "INSERT INTO {table} ({key_cols}, data) VALUES ({keys}, ?{n})

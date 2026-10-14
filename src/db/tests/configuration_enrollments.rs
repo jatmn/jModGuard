@@ -960,3 +960,46 @@ async fn atomic_global_rule_save_preserves_both_rows_on_fence_membership_or_comm
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_command_saves_preserve_versions_across_concurrency_and_restart() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = edit_scope(&scope, false);
+    let mut command = crate::defaults::sample_plan_command();
+    upsert_enrolled_command(&f.db, write.clone(), &command.name, &command)
+        .await
+        .unwrap();
+    let before = get_primary_versions(&f.db).await.unwrap();
+    upsert_enrolled_command(&f.db, write.clone(), &command.name, &command)
+        .await
+        .unwrap();
+    assert_eq!(get_primary_versions(&f.db).await.unwrap(), before);
+
+    command.description.push_str(" changed");
+    let (first, second) = tokio::join!(
+        upsert_enrolled_command(&f.db, write.clone(), &command.name, &command),
+        upsert_enrolled_command(&f.db, write.clone(), &command.name, &command),
+    );
+    first.unwrap();
+    second.unwrap();
+    let changed = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(changed.config, before.config + 1);
+    assert_eq!(changed.slash, before.slash + 1);
+    assert_ne!(changed.config_revision, before.config_revision);
+    assert_ne!(changed.slash_revision, before.slash_revision);
+
+    let reopened = Db::open(&f.path, 2).unwrap();
+    upsert_enrolled_command(&reopened, write.clone(), &command.name, &command)
+        .await
+        .unwrap();
+    assert_eq!(get_primary_versions(&reopened).await.unwrap(), changed);
+
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let retired = get_primary_versions(&f.db).await.unwrap();
+    let error = upsert_enrolled_command(&f.db, write, &command.name, &command)
+        .await
+        .unwrap_err();
+    assert!(error.is::<EnrollmentChanged>(), "{error:#}");
+    assert_eq!(get_primary_versions(&f.db).await.unwrap(), retired);
+}
