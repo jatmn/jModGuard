@@ -624,7 +624,7 @@ pub async fn sync_slash_commands(app: &Arc<BotState>, ctx: &Context, guild_id: G
             return false;
         }
     };
-    sync_slash_commands_versioned_http(app, &ctx.http, guild_id, target).await
+    sync_slash_commands_versioned_http(app, ctx, guild_id, target).await
 }
 
 /// Registry-poll variant: command rows and the version that identifies them
@@ -632,10 +632,20 @@ pub async fn sync_slash_commands(app: &Arc<BotState>, ctx: &Context, guild_id: G
 /// of allowing Discord to accept stale rows under a newer acknowledged version.
 pub async fn sync_slash_commands_versioned_http(
     app: &Arc<BotState>,
-    http: impl AsRef<serenity::http::Http>,
+    http: impl serenity::http::CacheHttp,
     guild_id: GuildId,
     target_version: u64,
 ) -> bool {
+    let mut registrations = app.slash_registrations.lock().await;
+    // A poll may have captured this guild before its leave event. Check after
+    // taking the lock so a completed cleanup cannot be undone by that poll.
+    // Treat unavailable guilds as pending too; guild-create will retry them.
+    if http
+        .cache()
+        .is_some_and(|cache| cache.guild(guild_id).is_none())
+    {
+        return false;
+    }
     let expected_revision = app.slash_registry_revision();
     if !app.slash_sync_due(
         guild_id.get(),
@@ -681,11 +691,12 @@ pub async fn sync_slash_commands_versioned_http(
     }
     set_slash_commands(
         app,
-        http,
+        http.http(),
         guild_id,
         &commands,
         target_version,
         &expected_revision,
+        &mut registrations,
     )
     .await
 }
@@ -697,9 +708,12 @@ async fn set_slash_commands(
     registry: &std::collections::HashMap<String, CommandDef>,
     target: u64,
     revision: &str,
+    registrations: &mut std::collections::HashMap<u64, serde_json::Value>,
 ) -> bool {
     let mut commands: Vec<CreateCommand> = Vec::new();
-    for cmd in registry.values() {
+    let mut ordered: Vec<_> = registry.iter().collect();
+    ordered.sort_unstable_by_key(|(name, _)| *name);
+    for (_, cmd) in ordered {
         if !cmd.enabled {
             continue;
         }
@@ -719,6 +733,19 @@ async fn set_slash_commands(
         }
         commands.push(builder);
     }
+    let payload = match serde_json::to_value(&commands) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!("slash sync: cannot serialize commands for {guild_id}: {error}");
+            return false;
+        }
+    };
+    if registrations.get(&guild_id.get()) == Some(&payload) {
+        return true;
+    }
+    // A failed or cancelled PUT may still reach Discord. Do not retain the
+    // previous payload as proof that a later edit reverting to it needs no PUT.
+    registrations.remove(&guild_id.get());
     tracing::info!(
         guild_id = guild_id.get(),
         target,
@@ -731,6 +758,7 @@ async fn set_slash_commands(
     match crate::discord::race_discord_call(&app.activation, sync).await {
         crate::discord::DiscordCall::Cancelled => false,
         crate::discord::DiscordCall::Finished(Ok(Ok(_))) => {
+            registrations.insert(guild_id.get(), payload);
             app.reset_slash_guild_retry(guild_id.get());
             true
         }
@@ -1414,6 +1442,16 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&calls);
+            let response_status = Arc::new(AtomicUsize::new(status));
+            let server_status = Arc::clone(&response_status);
+            let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let received_requests = Arc::clone(&requests);
+            let pause = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_pause = Arc::clone(&pause);
+            let received = Arc::new(tokio::sync::Notify::new());
+            let server_received = Arc::clone(&received);
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let server_resume = Arc::clone(&resume);
             let server = tokio::spawn(async move {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
@@ -1423,11 +1461,43 @@ mod tests {
                         let n = stream.read(&mut buf).await.unwrap();
                         assert!(n > 0);
                         request.extend_from_slice(&buf[..n]);
-                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                if request.starts_with(b"PUT ") {
+                                    let route = headers
+                                        .lines()
+                                        .next()
+                                        .unwrap()
+                                        .split_whitespace()
+                                        .nth(1)
+                                        .unwrap();
+                                    let mut segments = route.split('/');
+                                    segments.find(|segment| *segment == "guilds").unwrap();
+                                    let guild: u64 = segments.next().unwrap().parse().unwrap();
+                                    let payload: serde_json::Value =
+                                        serde_json::from_slice(&request[end + 4..end + 4 + length])
+                                            .unwrap();
+                                    received_requests.lock().push((guild, payload));
+                                }
+                                break;
+                            }
                         }
                     }
                     count.fetch_add(1, Ordering::SeqCst);
+                    if server_pause.swap(false, Ordering::SeqCst) {
+                        server_received.notify_one();
+                        server_resume.notified().await;
+                    }
+                    let status = server_status.load(Ordering::SeqCst);
                     let body = if status == 200 {
                         assert!(request.starts_with(b"PUT "));
                         "[]".to_owned()
@@ -1468,29 +1538,55 @@ mod tests {
                 assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
                 assert_eq!(calls.load(Ordering::SeqCst), 1, "no poll-triggered PUT");
 
+                // Establish another guild before a guild-local edit.
+                assert!(
+                    sync_slash_commands_versioned_http(&app, &http, GuildId::new(20), target).await
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
                 command.description.push_str(" changed");
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 10, "stats", &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
                 assert_eq!(changed, target + 1);
-                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
-                app.commit_slash_registry_version(changed);
-                assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-                // Join and startup dispatch do not depend on a pending version.
-                db::enroll_guild(&app.db, 20, 100).await.unwrap();
-                assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
-                assert!(
-                    sync_slash_commands_versioned_http(&app, &http, GuildId::new(20), changed)
+                let crate::state::SlashResyncPlan::Sync { guilds, .. } =
+                    app.plan_slash_resync(changed, &[10, 20])
+                else {
+                    panic!("expected pending guild reconciliation");
+                };
+                for guild in guilds {
+                    let before = calls.load(Ordering::SeqCst);
+                    assert!(
+                        sync_slash_commands_versioned_http(
+                            &app,
+                            &http,
+                            GuildId::new(guild),
+                            changed
+                        )
                         .await
-                );
-                assert_eq!(calls.load(Ordering::SeqCst), 3);
-                let restarted = BotState::new(Default::default(), app.db.clone()).unwrap();
-                restarted.activation.mark_lock_held(true);
-                db::upsert_command(&restarted.db, 0, "stats", &command)
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst) - before,
+                        usize::from(guild == 10),
+                        "only the edited guild should receive a PUT"
+                    );
+                }
+                assert!(app.finish_slash_resync(changed, Default::default()));
+                db::upsert_command(&app.db, 10, "stats", &command)
                     .await
                     .unwrap();
+                assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
+                assert_eq!(calls.load(Ordering::SeqCst), 3, "unchanged guild save");
+
+                // Join and startup dispatch do not depend on a pending version.
+                db::enroll_guild(&app.db, 30, 100).await.unwrap();
+                assert!(
+                    sync_slash_commands_versioned_http(&app, &http, GuildId::new(30), changed)
+                        .await
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 4);
+                let restarted = BotState::new(Default::default(), app.db.clone()).unwrap();
+                restarted.activation.mark_lock_held(true);
                 assert_eq!(
                     restarted.pending_slash_registry_version().await.unwrap(),
                     None
@@ -1498,7 +1594,191 @@ mod tests {
                 assert!(
                     sync_slash_commands_versioned_http(&restarted, &http, guild, changed).await
                 );
-                assert_eq!(calls.load(Ordering::SeqCst), 4);
+                assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+                // A new global command changes every guild's effective payload.
+                let mut global = command.clone();
+                global.name = "shared".into();
+                db::upsert_command(&app.db, 0, &global.name, &global)
+                    .await
+                    .unwrap();
+                let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
+                requests.lock().clear();
+                for guild in [10, 20, 30] {
+                    assert!(
+                        sync_slash_commands_versioned_http(
+                            &app,
+                            &http,
+                            GuildId::new(guild),
+                            changed
+                        )
+                        .await
+                    );
+                }
+                assert_eq!(
+                    requests
+                        .lock()
+                        .iter()
+                        .map(|(guild, _)| *guild)
+                        .collect::<Vec<_>>(),
+                    vec![10, 20, 30]
+                );
+                app.commit_slash_registry_version(changed);
+
+                // A second save during a PUT must survive completion of the old pass.
+                command.description = "first concurrent edit".into();
+                db::upsert_command(&app.db, 10, "stats", &command)
+                    .await
+                    .unwrap();
+                let first = app.pending_slash_registry_version().await.unwrap().unwrap();
+                app.plan_slash_resync(first, &[10, 20, 30]);
+                pause.store(true, Ordering::SeqCst);
+                let (synced, second) = tokio::join!(
+                    sync_slash_commands_versioned_http(&app, &http, guild, first),
+                    async {
+                        received.notified().await;
+                        command.description = "second concurrent edit".into();
+                        db::upsert_command(&app.db, 10, "stats", &command)
+                            .await
+                            .unwrap();
+                        let second = app.pending_slash_registry_version().await.unwrap().unwrap();
+                        resume.notify_one();
+                        second
+                    }
+                );
+                assert!(synced);
+                assert!(!app.finish_slash_resync(first, Default::default()));
+                requests.lock().clear();
+                let (a, b) = tokio::join!(
+                    sync_slash_commands_versioned_http(&app, &http, guild, second),
+                    sync_slash_commands_versioned_http(&app, &http, guild, second),
+                );
+                assert!(a && b);
+                for guild in [20, 30] {
+                    assert!(
+                        sync_slash_commands_versioned_http(
+                            &app,
+                            &http,
+                            GuildId::new(guild),
+                            second
+                        )
+                        .await
+                    );
+                }
+                assert!(!sync_slash_commands_versioned_http(&app, &http, guild, first).await);
+                {
+                    let sent = requests.lock();
+                    assert_eq!(sent.len(), 1, "concurrent syncs must not duplicate PUTs");
+                    assert_eq!(sent[0].0, 10);
+                    let stats = sent[0]
+                        .1
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|cmd| cmd["name"] == "stats")
+                        .unwrap();
+                    assert_eq!(stats["description"], "second concurrent edit");
+                }
+                app.commit_slash_registry_version(second);
+
+                // A transient failure must retry without another configuration write.
+                command.description = "retry this edit".into();
+                db::upsert_command(&app.db, 10, "stats", &command)
+                    .await
+                    .unwrap();
+                let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
+                app.plan_slash_resync(changed, &[10, 20, 30]);
+                response_status.store(503, Ordering::SeqCst);
+                assert!(!sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
+                response_status.store(200, Ordering::SeqCst);
+                requests.lock().clear();
+                tokio::time::sleep(std::time::Duration::from_secs(38)).await;
+                assert_eq!(
+                    app.pending_slash_registry_version().await.unwrap(),
+                    Some(changed)
+                );
+                let crate::state::SlashResyncPlan::Sync { guilds, .. } =
+                    app.plan_slash_resync(changed, &[10, 20, 30])
+                else {
+                    panic!("expected retry");
+                };
+                assert_eq!(guilds, vec![10]);
+                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert!(app.finish_slash_resync(changed, Default::default()));
+                assert_eq!(
+                    requests
+                        .lock()
+                        .iter()
+                        .map(|(guild, _)| *guild)
+                        .collect::<Vec<_>>(),
+                    vec![10]
+                );
+
+                // A failed PUT may have applied remotely. Reverting to the
+                // last successful payload must still send the restored value.
+                let restored = command.clone();
+                command.description = "uncertain edit".into();
+                db::upsert_command(&app.db, 10, "stats", &command)
+                    .await
+                    .unwrap();
+                let uncertain = app.pending_slash_registry_version().await.unwrap().unwrap();
+                response_status.store(503, Ordering::SeqCst);
+                assert!(!sync_slash_commands_versioned_http(&app, &http, guild, uncertain).await);
+                db::upsert_command(&app.db, 10, "stats", &restored)
+                    .await
+                    .unwrap();
+                let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
+                response_status.store(200, Ordering::SeqCst);
+                requests.lock().clear();
+                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert_eq!(requests.lock().len(), 1, "restore requires a PUT");
+                app.commit_slash_registry_version(changed);
+
+                // A confirmed leave forgets success and pending failures; rejoin PUTs again.
+                app.retry_slash_registry_version();
+                app.plan_slash_resync(changed, &[10, 20, 30]);
+                assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
+                app.forget_slash_guild(10).await;
+                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                let cache = Arc::new(serenity::cache::Cache::default());
+                requests.lock().clear();
+                // An older poll can still hold the departed guild's ID.
+                assert!(
+                    !sync_slash_commands_versioned_http(&app, (&cache, &http), guild, changed)
+                        .await
+                );
+                assert!(requests.lock().is_empty());
+                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
+                let crate::state::SlashResyncPlan::Sync { guilds, .. } =
+                    app.plan_slash_resync(changed, &[20, 30])
+                else {
+                    panic!("left guild must not block the remaining guilds");
+                };
+                requests.lock().clear();
+                for guild in guilds {
+                    assert!(
+                        sync_slash_commands_versioned_http(
+                            &app,
+                            &http,
+                            GuildId::new(guild),
+                            changed
+                        )
+                        .await
+                    );
+                }
+                assert!(app.finish_slash_resync(changed, Default::default()));
+                assert!(requests.lock().is_empty());
+                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert_eq!(
+                    requests
+                        .lock()
+                        .iter()
+                        .map(|(guild, _)| *guild)
+                        .collect::<Vec<_>>(),
+                    vec![10]
+                );
                 server.abort();
                 assert!(server.await.unwrap_err().is_cancelled());
                 drop(restarted);
