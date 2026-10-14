@@ -5802,6 +5802,262 @@ async fn ready_with_probe(
     (f, store, scope)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetime() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    // 25 ms per request leaves ample margin under the five-second transaction
+    // lifetime for the full current mark path, including capacity/receipt work.
+    // The larger-latency case (~350 ms per request) is tracked separately in #286.
+    let (fixture, db) = HranaFixture::delayed_database(
+        &f.store_path,
+        Duration::from_millis(25),
+        Duration::from_secs(5),
+    )
+    .await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+    assert!(remote.db.is_remote());
+
+    remote
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .expect("coverage-gap mark must commit within the provider lifetime");
+    fixture.assert_committed_within_lifetime(1);
+    // Read independently from SQLite: the HTTP fixture cannot manufacture the
+    // mark or the audit recovery row by returning a successful response.
+    let marked = local
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(marked.reconciliation_needed);
+    assert_eq!(marked.reconciliation_reason.as_deref(), Some("gateway_gap"));
+    assert_eq!(marked.initial_completed_at, Some(2_000));
+    assert_eq!(marked.audit_recovery_status.as_deref(), Some("queued"));
+
+    local
+        .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), 3_001, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    // A running recovery must see the second statement in the Hrana batch,
+    // even when the first INSERT/UPSERT does not update the existing row.
+    remote
+        .mark_member_reconciliation_needed(scope, "newer_gap", 4_000)
+        .await
+        .unwrap();
+    fixture.assert_committed_within_lifetime(2);
+    let persisted = local.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT s.reconciliation_needed,s.reconciliation_reason,s.gap_at_ms,s.gap_generation,a.status,a.restart_requested_at_ms FROM guild_member_seed s JOIN guild_member_audit_recovery a USING(guild_id,enrollment_id) WHERE s.guild_id=10",
+            (),
+            |row| Ok((row.get::<bool>(0)?, row.get::<String>(1)?, row.get::<i64>(2)?, row.get::<i64>(3)?, row.get::<String>(4)?, row.get::<Option<i64>>(5)?)),
+        )
+    }).await.unwrap();
+    assert_eq!(
+        persisted,
+        (
+            true,
+            "newer_gap".into(),
+            4_000,
+            2,
+            "running".into(),
+            Some(4_000)
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_racing_sync_completion_preserves_newer_gap() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    for mark_first in [false, true] {
+        let (f, store, scope) = ready().await;
+        complete_for_checks(&store, &scope).await;
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap();
+        store
+            .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+            .await
+            .unwrap();
+        store
+            .member_sync_action(
+                scope.clone(),
+                42,
+                MemberSyncAction::Reconcile,
+                "reconcile".into(),
+                3_001,
+            )
+            .await
+            .unwrap();
+        // Advance through the real page owner, stopping at the final unban page.
+        for (index, phase) in [
+            MemberSyncPhase::Members,
+            MemberSyncPhase::Bans,
+            MemberSyncPhase::Verify,
+            MemberSyncPhase::Audit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = 3_001 + index as i64 * 15_001;
+            let claim = store
+                .claim_member_sync(scope.clone(), 42, "worker".into(), now, 90_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.phase, phase);
+            store
+                .commit_member_page(
+                    scope.clone(),
+                    claim.clone(),
+                    page(phase, claim.cursor, true),
+                    now + 1,
+                )
+                .await
+                .unwrap();
+        }
+        let now = 63_005;
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), now, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.cursor.as_deref(), Some("unban:"));
+        let last_page = page(MemberSyncPhase::Audit, claim.cursor.clone(), true);
+
+        // A separate pool confines the commit probe to the first writer. Hold
+        // its SQLite transaction until the rival's DB worker checks out a
+        // connection, so both commit orders run with overlapping calls and
+        // without timing sleeps. The first writer already owns the write lock.
+        let first = GuildDataStore::open(f.options(), store.expected.clone()).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(release_rx);
+        first.db.install_commit_lease_probe(Arc::new(move |commit| {
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))?;
+            }
+            commit()
+        }));
+        let first_scope = scope.clone();
+        let reconcile_run = claim.run_id.clone();
+        let first_claim = claim.clone();
+        let first_page = last_page.clone();
+        let writer = tokio::spawn(async move {
+            if mark_first {
+                first
+                    .mark_member_reconciliation_needed(first_scope, "newer_gap", now + 1)
+                    .await
+            } else {
+                first
+                    .commit_member_page(first_scope, first_claim, first_page, now + 1)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let rival = async {
+            if mark_first {
+                store
+                    .commit_member_page(scope.clone(), claim, last_page, now + 2)
+                    .await
+                    .map(|_| ())
+            } else {
+                store
+                    .mark_member_reconciliation_needed(scope.clone(), "newer_gap", now + 2)
+                    .await
+            }
+        };
+        tokio::pin!(rival);
+        let idle_before = store.db.connections.idle.lock().unwrap().len();
+        assert!(idle_before > 0);
+        let rival_entered = async {
+            while store.db.connections.idle.lock().unwrap().len() == idle_before {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = &mut rival => panic!("rival finished before writer release (mark_first={mark_first}): {result:?}"),
+            entered = tokio::time::timeout(Duration::from_secs(10), rival_entered) => {
+                entered.expect("rival must check out a connection while the first writer is held");
+            },
+        }
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        let result = rival.await;
+        if mark_first {
+            assert!(
+                matches!(
+                    result.unwrap_err().downcast_ref::<MemberSyncError>(),
+                    Some(MemberSyncError::Stale)
+                ),
+                "the old page claim must be stale"
+            );
+            // Reclaim after the old lease expires; completion of that same run
+            // still must not clear the generation recorded by the newer mark.
+            let retry_at = now + 90_001;
+            let retry = store
+                .claim_member_sync(scope.clone(), 42, "worker".into(), retry_at, 90_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.run_id, reconcile_run);
+            store
+                .commit_member_page(
+                    scope.clone(),
+                    retry.clone(),
+                    page(MemberSyncPhase::Audit, retry.cursor, true),
+                    retry_at + 1,
+                )
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let status = store
+            .member_sync_status(scope.clone(), 42, now + 90_003)
+            .await
+            .unwrap();
+        assert_eq!(status.status, "complete");
+        assert_eq!(status.initial_completed_at, Some(2_000));
+        assert!(status.reconciliation_needed, "mark_first={mark_first}");
+        assert_eq!(status.reconciliation_reason.as_deref(), Some("newer_gap"));
+        let generation = store
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT gap_generation FROM guild_member_seed WHERE guild_id=10",
+                    (),
+                    |row| Ok(row.get::<i64>(0)?),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(generation, 2, "each mark must commit exactly once");
+    }
+}
+
 #[tokio::test]
 async fn coverage_gap_mark_batches_writes_for_remote_transport() {
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
