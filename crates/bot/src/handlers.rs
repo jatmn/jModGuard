@@ -1120,7 +1120,7 @@ impl EventHandler for Handler {
         }
         self.app
             .image_spam
-            .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
+            .deleted(guild_id.get(), channel_id.get(), deleted_message_id.get());
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
