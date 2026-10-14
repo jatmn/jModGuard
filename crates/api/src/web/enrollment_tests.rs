@@ -3366,6 +3366,48 @@ async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
 }
 
 #[tokio::test]
+async fn recovery_routes_require_an_authenticated_owner() {
+    let mut f = Fixture::new(false).await;
+    for authenticated in [true, false] {
+        if !authenticated {
+            f.cookie.clear();
+        }
+        for (method, route, input) in [
+            ("GET", "/api/service-upgrade", ""),
+            (
+                "POST",
+                "/api/service-upgrade/check",
+                r#"{"channel":"stable"}"#,
+            ),
+            (
+                "POST",
+                "/api/service-upgrade",
+                r#"{"bot_digest":"","api_digest":"","confirmed":true}"#,
+            ),
+            ("POST", "/api/service-upgrade/cancel", r#"{"id":"missing"}"#),
+        ] {
+            let (status, body) = f.request(method, route, input).await;
+            let (expected_status, expected_message) = if authenticated {
+                (
+                    StatusCode::FORBIDDEN,
+                    "only the configured owner can manage upgrades",
+                )
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "sign in to manage service upgrades",
+                )
+            };
+            assert_eq!(status, expected_status, "{method} {route}: {body}");
+            assert_eq!(body, serde_json::json!({"error": expected_message}));
+        }
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn owner_routes_preserve_auth_loss_for_an_already_loaded_session() {
     let f = Fixture::new(true).await;
     let store = Arc::new(MemoryStore::default());

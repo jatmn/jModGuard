@@ -56,25 +56,29 @@ fn problem(status: StatusCode, message: impl ToString) -> (StatusCode, Json<Valu
     (status, Json(json!({"error":message.to_string()})))
 }
 
+fn owner_error(failure: ApiError) -> (StatusCode, Json<Value>) {
+    match failure {
+        failure if failure.0.is::<AuthLost>() => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
+        ),
+        failure if failure.0.is::<NotAuthenticated>() => problem(
+            StatusCode::UNAUTHORIZED,
+            "sign in to manage service upgrades",
+        ),
+        _ => problem(
+            StatusCode::FORBIDDEN,
+            "only the configured owner can manage upgrades",
+        ),
+    }
+}
+
 async fn owner(state: &RecoveryState, session: &Session) -> Result<(), (StatusCode, Json<Value>)> {
     if let Some(api) = state.api.as_ref() {
-        return match session_owner(api, session).await {
-            Ok(_) => Ok(()),
-            Err(failure) if failure.0.is::<AuthLost>() => Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
-            )),
-            Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
-                Err(problem(
-                    StatusCode::UNAUTHORIZED,
-                    "sign in to manage service upgrades",
-                ))
-            }
-            Err(_) => Err(problem(
-                StatusCode::FORBIDDEN,
-                "only the configured owner can manage upgrades",
-            )),
-        };
+        return session_owner(api, session)
+            .await
+            .map(|_| ())
+            .map_err(owner_error);
     }
     // Maintenance has its own fresh MemoryStore and no production retirement
     // paths or coordinator/tombstone state. Keep its OAuth owner check intact.
@@ -391,6 +395,41 @@ mod tests {
         session.insert(SESSION_USER, uid).await.unwrap();
         session.save().await.unwrap();
         format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap())
+    }
+
+    #[test]
+    fn owner_error_uses_error_types_not_message_text() {
+        assert_eq!(NotAuthenticated.to_string(), "not authenticated");
+        let typed = anyhow::Error::new(NotAuthenticated).context("session unavailable");
+        assert_eq!(typed.to_string(), "session unavailable");
+        let (status, body) = owner_error(ApiError(typed));
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0,
+            json!({"error":"sign in to manage service upgrades"})
+        );
+
+        let (status, body) = owner_error(ApiError(
+            anyhow::Error::new(AuthLost).context("not authenticated"),
+        ));
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0,
+            json!({"error":"discord authorization failed", "code":"auth_lost"})
+        );
+
+        for message in [
+            "not authenticated",
+            "database unavailable",
+            "temporary failure",
+        ] {
+            let (status, body) = owner_error(ApiError(anyhow::anyhow!(message)));
+            assert_eq!(status, StatusCode::FORBIDDEN, "{message}");
+            assert_eq!(
+                body.0,
+                json!({"error":"only the configured owner can manage upgrades"})
+            );
+        }
     }
 
     #[tokio::test]
