@@ -425,8 +425,6 @@ impl HranaFixture {
             before_final_lease_reread: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             during_leased_guild_commit: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }

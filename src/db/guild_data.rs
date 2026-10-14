@@ -604,8 +604,8 @@ impl GuildDataStore {
     /// guild-store mutations, not only at `TenantRuntime::live` handle acquisition.
     ///
     /// When the core pool has an armed writer, every guild mutation commit re-reads the core
-    /// `active_bot_lease` row under a short writer lock, then commits after that lock is
-    /// released. The guild transaction also requires `guild_writer_epoch` to equal the
+    /// `active_bot_lease` row in fresh primary snapshots, releasing core before
+    /// the guild commit. The guild transaction also requires `guild_writer_epoch` to equal the
     /// generation snapshotted for that commit. An empty owner slot does not query and does
     /// not change commits.
     pub fn with_core_write_fence(self, core: Db) -> Self {
@@ -668,7 +668,7 @@ impl GuildDataStore {
             .await
     }
 
-    /// Re-read the core lease, then release that writer lock before the guild `COMMIT`.
+    /// Re-read the core lease without a writer lock, then release core before guild `COMMIT`.
     /// An empty owner slot does not query. The guild epoch check inside the guild
     /// transaction is what rejects a stale holder. Renewal of the same owner does not
     /// take a new generation and does not wait on the guild commit.
@@ -681,45 +681,15 @@ impl GuildDataStore {
         if let Some(hook) = core.take_before_final_lease_reread() {
             hook();
         }
-        core.with_conn_sync(|conn| {
-            let tx = conn.transaction_primary_read()?;
-            let value = Self::lease_row(&tx)?;
-            if let Err(error) =
-                crate::db_compat::reject_active_bot_lease(value.as_deref(), &expected)
-            {
-                let _ = tx.finish_read();
-                return Err(error);
-            }
-            tx.finish_read()
-        })?;
-        core.with_conn_sync(|conn| {
-            // Deferred snapshot: it does not reserve the writer lock, so renewal
-            // can commit while the remote guild COMMIT is still in flight.
-            let tx = conn.transaction_primary_snapshot()?;
-            #[cfg(test)]
-            if let Some(hook) = core.take_during_leased_guild_commit() {
-                hook();
-            }
-            let committed = commit();
-            let finished = tx.finish_read();
-            #[cfg(test)]
-            let finished = if core.take_lease_cleanup_failure() {
-                Err(anyhow::anyhow!("injected core read cleanup failure"))
-            } else {
-                finished
-            };
-            match committed {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    if let Err(error) = finished {
-                        tracing::warn!(
-                            "core lease read cleanup failed after guild commit: {error:#}"
-                        );
-                    }
-                    Ok(())
-                }
-            }
-        })
+        Self::read_core_lease(core, &expected)?;
+        // The guild transaction retains its writer lock and checks its epoch
+        // before COMMIT. An empty core snapshot adds no fencing; release core
+        // so slow guild commits cannot occupy its pool or a provider stream.
+        #[cfg(test)]
+        if let Some(hook) = core.take_during_leased_guild_commit() {
+            hook();
+        }
+        commit()
     }
 
     fn read_core_lease(core: &Db, expected: &str) -> Result<()> {

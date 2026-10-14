@@ -866,14 +866,78 @@ async fn slow_guild_commit_still_lets_the_same_owner_renew() {
     store.verify_placement(placement).await.unwrap();
 }
 
-#[tokio::test]
-async fn guild_commit_stays_ok_when_only_core_cleanup_fails() {
+#[tokio::test(flavor = "multi_thread")]
+async fn guild_commit_does_not_wait_for_the_core_writer() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
-    let store = GuildDataStore::initialize(f.options(), reg.clone())
+    let placement = f.placement(&reg, 24).await;
+    let store = GuildDataStore::initialize(f.options(), reg)
         .unwrap()
         .with_core_write_fence(f.catalog.clone());
-    let placement = f.placement(&reg, 23).await;
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &"ab".repeat(16),
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    raise_held(&store, &f.catalog).await;
+
+    let (begin_tx, begin_rx) = tokio::sync::oneshot::channel();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    f.catalog.arm_before_final_lease_reread(move || {
+        begin_tx.send(()).unwrap();
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    });
+    let core = f.catalog.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), begin_rx)
+            .await
+            .expect("guild operation must reach its final lease check")
+            .unwrap();
+        core.with_conn(move |conn| {
+            let tx = conn.transaction_primary_read()?;
+            held_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            tx.finish_read()
+        })
+        .await
+    });
+    let write_store = store.clone();
+    let write_placement = placement.clone();
+    let mut guild =
+        tokio::spawn(async move { write_store.bind_initial_placement(write_placement).await });
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(1), &mut guild).await;
+    release_tx.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+    let independent = finished.is_ok();
+    match finished {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => guild.await.unwrap().unwrap(),
+    }
+    store.verify_placement(placement).await.unwrap();
+    assert!(independent, "guild commit waited for core's writer lock");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guild_commits_release_remote_core_for_concurrent_writes() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let mut placements = Vec::new();
+    for guild in 25..28 {
+        placements.push(f.placement(&reg, guild).await);
+    }
     let owner = "ab".repeat(16);
     assert!(
         claim_active_bot(
@@ -885,13 +949,77 @@ async fn guild_commit_stays_ok_when_only_core_cleanup_fails() {
         .await
         .unwrap()
     );
-    raise_held(&store, &f.catalog).await;
-    f.catalog.arm_lease_cleanup_failure();
-    store
-        .bind_initial_placement(placement.clone())
+    // Real HTTP/libSQL against SQLite, with the existing conservative provider
+    // model: every interactive transaction occupies its single writer slot.
+    let (fixture, core) = HranaFixture::delayed_database(
+        &f.catalog_path,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+    )
+    .await;
+    core.arm_writer_term(&owner, f.catalog.leased_generation().unwrap());
+    let store = GuildDataStore::initialize(f.options(), reg)
+        .unwrap()
+        .with_core_write_fence(core.clone());
+    raise_held(&store, &core).await;
+    // Model a busy pool with only one connection left for these operations.
+    let _occupied = core.permits.acquire().await.unwrap();
+    for placement in placements {
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        core.arm_during_leased_guild_commit(move || {
+            paused_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let write_store = store.clone();
+        let write_placement = placement.clone();
+        let guild =
+            tokio::spawn(async move { write_store.bind_initial_placement(write_placement).await });
+        tokio::time::timeout(Duration::from_secs(5), paused_rx)
+            .await
+            .expect("guild operation must reach its commit")
+            .unwrap();
+        let write_core = core.clone();
+        let id = placement.guild_id();
+        let mut writer = tokio::spawn(async move {
+            write_core
+                .with_conn(move |conn| {
+                    let mut tx = conn.transaction_primary_read()?;
+                    tx.ensure_mutation_receipt()?;
+                    tx.execute_rows(
+                        "INSERT INTO meta(key,value) VALUES('guild_commit_probe',?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![id.to_string()],
+                        1,
+                    )?;
+                    tx.commit()
+                })
+                .await
+        });
+        let finished = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+        release_tx.send(()).unwrap();
+        guild.await.unwrap().unwrap();
+        let independent = finished.is_ok();
+        match finished {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => writer.await.unwrap().unwrap(),
+        }
+        store.verify_placement(placement).await.unwrap();
+        assert!(independent, "core write waited for the paused guild commit");
+    }
+    fixture.assert_committed_within_lifetime(3);
+    let stored: String = f
+        .catalog
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM meta WHERE key='guild_commit_probe'",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
         .await
         .unwrap();
-    store.verify_placement(placement).await.unwrap();
+    assert_eq!(stored, "27", "all concurrent core writes must persist");
 }
 
 #[tokio::test]
