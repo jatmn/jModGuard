@@ -513,7 +513,16 @@ async fn require_auth_with(
             .await
             .map_err(anyhow::Error::from)?;
     }
-    if let Some((retry_after, rate_limited)) = state.refresh_wait() {
+    let refresh_wait = state.refresh_wait().or_else(|| {
+        // A refresh 429 may outlive the capped session hold. Do not spend
+        // another guild/profile request on the rejected access token while
+        // the shared token route still prevents recovery.
+        let (_, true) = state.refresh_hold? else {
+            return None;
+        };
+        app.oauth.route_remaining("token").map(|wait| (wait, true))
+    });
+    if let Some((retry_after, rate_limited)) = refresh_wait {
         // A hold never renews a successful snapshot, and permission checks
         // cannot borrow the longer display cache while refresh is unavailable.
         let guilds = if guild_list_cache_allowed(guild_mode) {

@@ -583,7 +583,7 @@ impl OAuthClient {
         Ok(all)
     }
 
-    fn route_remaining(&self, key: &str) -> Option<Duration> {
+    pub(super) fn route_remaining(&self, key: &str) -> Option<Duration> {
         let mut gate = self
             .guild_list
             .lock()
