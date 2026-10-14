@@ -900,6 +900,16 @@ async fn stats_response(
     // Cached by the background sampler. This does not open cgroup files or wait.
     let bot_use = jmodguard::cgroup::latest_container_sample();
     let s = db::guild_stats(&app.reads, guild_id).await?;
+    let cases = async {
+        let enrollment = db::guild_enrollment(&app.db, guild_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("guild membership unavailable"))?;
+        let (store, scope) = app.tenant.live(enrollment).await?;
+        store.case_count(scope, crate::tenant::case_limits()).await
+    }
+    .await
+    .inspect_err(|error| tracing::warn!("stats case-count lookup failed: {error:#}"))
+    .ok();
     let updates = db::component_updates_status(&app.reads)
         .await
         .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
@@ -917,7 +927,7 @@ async fn stats_response(
     Ok(crate::templates::stats_with_container_use(
         crate::templates::stats_response_with_update_availability(
             uptime_seconds,
-            s.events,
+            cases,
             s.warns,
             s.bans,
             updates.as_deref(),
@@ -1477,6 +1487,92 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stats_counts_cases_and_reports_unavailable_stores() {
+        use crate::db::guild_data::{CaseAction, CaseEvidence, CaseOutcome};
+        use crate::db::guild_stores::{
+            StoreId, StorePolicy, assign_initial_placement, register_store,
+        };
+
+        let path =
+            std::env::temp_dir().join(format!("stats_cases_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let app = crate::state::BotState::new(Default::default(), database).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        assert!(
+            crate::cases::record(
+                &app,
+                Some(enrollment.clone()),
+                CaseAction::Ban,
+                CaseOutcome::Succeeded,
+                42,
+                None,
+                None,
+                CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 0);
+        let cases_only = stats_response(&app, 10, 20).await.unwrap();
+        assert!(cases_only.contains("**📋 Cases:** `1`"), "{cases_only}");
+        assert!(!cases_only.contains("Moderation records"), "{cases_only}");
+
+        db::insert_event(
+            &app.db,
+            10,
+            "member_ban",
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 1);
+        let legacy_and_cases = stats_response(&app, 10, 20).await.unwrap();
+        assert!(
+            legacy_and_cases.contains("**📋 Cases:** `1`"),
+            "{legacy_and_cases}"
+        );
+
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        store.close_membership(scope).await.unwrap();
+        let closed = stats_response(&app, 10, 20).await.unwrap();
+        assert!(closed.contains("**📋 Cases:** `unavailable`"), "{closed}");
+
+        let missing = stats_response(&app, 20, 20).await.unwrap();
+        assert!(missing.contains("**📋 Cases:** `unavailable`"), "{missing}");
+        let empty = db::enroll_guild(&app.db, 20, 100).await.unwrap().unwrap();
+        let unplaced = stats_response(&app, 20, 20).await.unwrap();
+        assert!(
+            unplaced.contains("**📋 Cases:** `unavailable`"),
+            "{unplaced}"
+        );
+        app.tenant.activate(empty).await.unwrap();
+        let zero = stats_response(&app, 20, 20).await.unwrap();
+        assert!(zero.contains("**📋 Cases:** `0`"), "{zero}");
+
+        db::enroll_guild(&app.db, 30, 100).await.unwrap().unwrap();
+        let offline = StoreId::new();
+        register_store(&app.db, offline.clone(), StorePolicy::Shared)
+            .await
+            .unwrap();
+        assign_initial_placement(&app.db, 30, offline)
+            .await
+            .unwrap();
+        let offline = stats_response(&app, 30, 20).await.unwrap();
+        assert!(offline.contains("**📋 Cases:** `unavailable`"), "{offline}");
+
+        drop(store);
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[tokio::test]
     async fn stats_release_read_failure_is_unavailable() {
