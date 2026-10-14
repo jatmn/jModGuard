@@ -1671,6 +1671,64 @@ async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn launcher_cas_recovers_missing_row_then_resumes_cas() {
+    let path = super::tmp_db_path("launcher_cas_missing");
+    let local = Db::open(&path, 2).unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let remote = fixture.db();
+    let control = UpdateControl::from_application(&remote);
+    let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    control.arm_launcher_fence(owner);
+    assert!(control.renew_launcher_fence().await.unwrap());
+    let before = control.launcher_fence_deadline().unwrap();
+    local
+        .with_conn(|conn| {
+            conn.execute_rows("DELETE FROM meta WHERE key='launcher_lease'", (), 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        control.renew_launcher_fence_cas().await.unwrap(),
+        "a renewal tick must reacquire a deleted launcher fence"
+    );
+    let recovered = control.launcher_fence_deadline().unwrap();
+    assert!(recovered > before);
+    let value = local
+        .with_conn(|conn| meta_string_conn(conn, "launcher_lease"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (stored_owner, expiry) = value.split_once(' ').unwrap();
+    assert_eq!(stored_owner, owner);
+    assert!(expiry.parse::<i64>().unwrap() > crate::control::now_ms());
+
+    fixture.state.lock().unwrap().statements.clear();
+    assert!(control.renew_launcher_fence_cas().await.unwrap());
+    assert!(control.launcher_fence_deadline().unwrap() > recovered);
+    {
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.statements.len(), 1, "the next tick must use only CAS");
+        // libSQL normalizes SQL before sending it over Hrana.
+        assert!(state.statements[0].starts_with("UPDATE meta SET value"));
+        assert!(state.statements[0].contains("'launcher_lease'"));
+    }
+    drop(control);
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn launcher_cas_preserves_existing_fence_semantics() {
     let path = super::tmp_db_path("launcher_cas");
     let db = Db::open(&path, 2).unwrap();
@@ -1688,6 +1746,25 @@ async fn launcher_cas_preserves_existing_fence_semantics() {
     assert!(!control.renew_launcher_fence_cas().await.unwrap());
     control.arm_launcher_fence(owner);
     assert!(control.renew_launcher_fence().await.unwrap());
+    let foreign_value = format!("{foreign} {}", crate::control::now_ms() + 60_000);
+    let value = foreign_value.clone();
+    db.with_conn(move |conn| {
+        conn.set_expected_launcher(None);
+        let tx = conn.transaction_immediate()?;
+        write_meta_string_conn(&tx, "launcher_lease", &value)?;
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    let before = control.launcher_fence_deadline();
+    assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    assert_eq!(control.launcher_fence_deadline(), before);
+    assert_eq!(
+        db.with_conn(|conn| meta_string_conn(conn, "launcher_lease"))
+            .await
+            .unwrap(),
+        Some(foreign_value)
+    );
     db.with_conn(move |conn| {
         conn.set_expected_launcher(None);
         let tx = conn.transaction_immediate()?;
@@ -1709,6 +1786,23 @@ async fn launcher_cas_preserves_existing_fence_semantics() {
     .await
     .unwrap();
     assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    // A restore can remove the row while blocking its recreation.
+    let restored = libsql::Builder::new_local(&path).build().await.unwrap();
+    restored
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key='launcher_lease'", ())
+        .await
+        .unwrap();
+    let before = control.launcher_fence_deadline();
+    assert!(!control.renew_launcher_fence_cas().await.unwrap());
+    assert_eq!(control.launcher_fence_deadline(), before);
+    assert!(
+        db.with_conn(|conn| meta_string_conn(conn, "launcher_lease"))
+            .await
+            .unwrap()
+            .is_none()
+    );
     drop(control);
     drop(db);
     super::cleanup_db(&path);
