@@ -1215,24 +1215,30 @@ async function reconcileQueuedLogChannel(original) {
   const admission = poll.admission;
   const current = () => logChannelPolls.get(key) === poll && poll.generation === generation;
   poll.inFlight = (async () => {
-    let retryAfterMs = 0;
+    let retryUntil = 0;
     try {
       const entries = [...pendingLogChannelActions.values()].filter(item => logChannelPollKey(item.job) === key);
       const jobs = entries.some(item => ["pending", "claimed", "running"].includes(item.job.state))
         ? await apiRead(`/api/guilds/${original.guild_id}/actions`) : [];
       for (const item of entries) {
         if (!current() || document.visibilityState !== "visible") break;
-        await reconcileLogChannelEntry(item.job, jobs, current);
+        try {
+          await reconcileLogChannelEntry(item.job, jobs, current);
+        } catch (error) {
+          if (isUnauthenticated(error)) throw error;
+          // One unavailable mapping must not strand other terminal receipts.
+          retryUntil = Math.max(retryUntil, Date.now() + (error.retryAfterMs || 0));
+        }
       }
     } catch (error) {
       if (isUnauthenticated(error)) return;
-      retryAfterMs = error.retryAfterMs || 0;
+      retryUntil = Math.max(retryUntil, Date.now() + (error.retryAfterMs || 0));
     } finally {
       poll.inFlight = null;
       if (logChannelPolls.get(key) === poll) {
         if (poll.admission === admission) ++poll.attempt;
-        poll.retryUntil = Date.now() + retryAfterMs;
-        poll.dueAt = Date.now() + Math.max(actionReconcileDelays[poll.attempt] || 0, retryAfterMs);
+        poll.retryUntil = retryUntil;
+        poll.dueAt = Math.max(Date.now() + (actionReconcileDelays[poll.attempt] || 0), retryUntil);
         if (poll.attempt >= actionReconcileDelays.length && current())
           toast("Could not confirm the log-channel result. See Bot actions for details.", "info");
         else scheduleLogChannelReconcile(original);

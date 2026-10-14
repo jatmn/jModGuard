@@ -3627,6 +3627,126 @@ test('log-channel events share one guild check and continue after the first even
   assert.equal(h.app.state.config.log_channels[1].pending_action, null);
 });
 
+for (const succeededFirst of [false, true]) test(`log-channel mapping failures do not strand successful receipts (succeeded first: ${succeededFirst})`, async () => {
+  const failed = logJob(), succeeded = logJob('member_leave');
+  let receiptReads = 0, mappingReads = 0;
+  const h = harness(async url => {
+    if (url.endsWith('/actions')) {
+      receiptReads++;
+      return response([{...failed, state: 'failed'}, {...succeeded, state: 'succeeded'}]);
+    }
+    assert.ok(url.endsWith('/logchannels/member_join'));
+    mappingReads++;
+    return {ok: false, status: 503, headers: {get: () => null}, text: async () => '{}'};
+  });
+  logView(h);
+  for (const job of succeededFirst ? [succeeded, failed] : [failed, succeeded]) queueLog(h, job);
+  for (const delay of h.app.actionReconcileDelays) {
+    await runLogPoll(h, delay);
+    assert.equal(h.app.state.config.log_channels[1].pending_action, null);
+    assert.equal(h.app.state.config.log_channels[1].effective, '222');
+    assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
+    assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  }
+  assert.equal(receiptReads, 1, 'known terminal receipts need only mapping retries');
+  assert.equal(mappingReads, 10, 'the unresolved mapping gets the full shared window');
+  assert.equal(h.timers.size, 1, 'only the exhaustion toast expiry remains');
+});
+
+test('log-channel mapping 401 clears auth and stops the shared loop', async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let reads = 0;
+  const h = harness(async url => {
+    reads++;
+    if (url.endsWith('/actions')) return response([{...first, state: 'failed'}, {...second, state: 'succeeded'}]);
+    assert.ok(url.endsWith('/logchannels/member_join'));
+    return {ok: false, status: 401, headers: {get: () => null}, text: async () => '{}'};
+  });
+  logView(h);
+  queueLog(h, first);
+  queueLog(h, second);
+  const secondRow = h.app.state.config.log_channels[1];
+  await runLogPoll(h, 1000);
+  assert.equal(h.app.state.me, null);
+  assert.equal(h.app.state.guildId, null);
+  assert.equal(secondRow.pending_action.state, 'pending', 'auth loss stops before the second receipt');
+  visibility(h, 'hidden');
+  visibility(h, 'visible');
+  logView(h);
+  await h.app.reconcileQueuedLogChannel(first);
+  await h.app.reconcileQueuedLogChannel(second);
+  assert.equal(reads, 2, 'auth cleanup removed both pending entries');
+  assert.equal(h.timers.size, 0);
+});
+
+test('log-channel mapping Retry-After defers the shared timer while another receipt settles', async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let reads = 0;
+  const h = harness(async url => {
+    reads++;
+    if (url.endsWith('/actions')) return response([{...first, state: 'uncertain'}, {...second, state: 'succeeded'}]);
+    assert.ok(url.endsWith('/logchannels/member_join'));
+    return {ok: false, status: 429, headers: {get: () => '120'}, text: async () => '{}'};
+  });
+  logView(h);
+  queueLog(h, first);
+  queueLog(h, second);
+  await runLogPoll(h, 1000);
+  assert.equal(h.app.state.config.log_channels[1].pending_action, null);
+  assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'uncertain');
+  await h.app.reconcileQueuedLogChannel(first);
+  assert.equal(reads, 2, 'manual reconciliation cannot bypass shared Retry-After');
+  visibility(h, 'hidden');
+  h.advanceTime(500);
+  visibility(h, 'visible');
+  await runLogPoll(h, 119500);
+  assert.equal(reads, 3);
+});
+
+for (const headers of [['120', '30'], ['30', '120']]) test(`log-channel mapping failures aggregate the latest deadline (${headers})`, async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let mappingReads = 0;
+  const h = harness(async url => {
+    if (url.endsWith('/actions')) return response([{...first, state: 'failed'}, {...second, state: 'uncertain'}]);
+    const header = headers[mappingReads++];
+    if (mappingReads === 2) h.advanceTime(10000);
+    return {ok: false, status: 429, headers: {get: () => header}, text: async () => '{}'};
+  });
+  logView(h);
+  queueLog(h, first);
+  queueLog(h, second);
+  await runLogPoll(h, 1000);
+  assert.equal(mappingReads, 2);
+  assert.equal(h.timers.size, 1, 'both failures retain one shared timer');
+  assert.equal([...h.timers.values()][0].delay, Math.max(Number(headers[0]) * 1000 - 10000, Number(headers[1]) * 1000));
+});
+
+for (const change of ['removed', 'replaced']) test(`log-channel loop fences a later entry ${change} during a mapping read`, async () => {
+  const first = logJob(), second = logJob('member_leave');
+  let finish, reads = 0;
+  const h = harness(async url => {
+    reads++;
+    if (url.endsWith('/actions')) return response([{...first, state: 'failed'}, {...second, state: 'failed'}]);
+    assert.ok(url.endsWith('/logchannels/member_join'), 'the stale second entry must not start a mapping read');
+    return new Promise(resolve => { finish = resolve; });
+  });
+  logView(h);
+  queueLog(h, first);
+  queueLog(h, second);
+  const read = runLogPoll(h, 1000);
+  await settle();
+  const shared = h.app.reconcileQueuedLogChannel(second);
+  if (change === 'removed') h.app.applyQueuedLogChannel({...second, state: 'succeeded'});
+  else queueLog(h, {...second, id: 'replacement', action: {...second.action, channel_id: '333'}});
+  const snapshot = JSON.stringify(h.app.state.config.log_channels[1]);
+  finish({ok: false, status: 503, headers: {get: () => null}, text: async () => '{}'});
+  await Promise.all([read, shared]);
+  assert.equal(JSON.stringify(h.app.state.config.log_channels[1]), snapshot);
+  assert.equal(reads, 2, 'the mapping read remains single flight');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === (change === 'removed' ? 1500 : 1000)).length, 1);
+});
+
 for (const header of ['120', '1800', null, 'invalid', '-1']) test(`log-channel checks respect Retry-After ${header}`, async () => {
   let reads = 0;
   const h = harness(async () => {
