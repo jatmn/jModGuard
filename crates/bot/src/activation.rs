@@ -26,6 +26,7 @@ pub struct Activation {
     lock_held: AtomicBool,
     discord_connected: AtomicBool,
     shutting_down: Arc<AtomicBool>,
+    shutdown_wait: tokio::sync::Notify,
     cut_off: AtomicBool,
     cutoff_wait: tokio::sync::Notify,
     in_flight: std::sync::atomic::AtomicUsize,
@@ -91,6 +92,7 @@ impl Activation {
             lock_held: AtomicBool::new(false),
             discord_connected: AtomicBool::new(false),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_wait: tokio::sync::Notify::new(),
             cut_off: AtomicBool::new(false),
             cutoff_wait: tokio::sync::Notify::new(),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -263,6 +265,8 @@ impl Activation {
     /// Stop new intake. In-flight work may finish until [`Self::cut_off`].
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        // One renewal waiter; retain a permit if it has not entered backoff yet.
+        self.shutdown_wait.notify_one();
     }
 
     /// Lease loss or a killed renewal. No further record, ban, or log.
@@ -509,7 +513,14 @@ fn spawn_renewal_every(
                             };
                             break (requested_at, Err(error));
                         }
-                        tokio::time::sleep(backoff).await;
+                        tokio::select! {
+                            biased;
+                            _ = activation.shutdown_wait.notified() => {
+                                loss_reason = "active-bot lease renewal interrupted by shutdown";
+                                break (requested_at, Err(error));
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
                         backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
                     }
                     Ok(false) => {
@@ -550,6 +561,9 @@ fn spawn_renewal_every(
                 }
             }
             if !settle_renewal(&activation, &result) {
+                if activation.is_shutting_down() {
+                    tracing::info!(reason = loss_reason, "active-bot lease renewal stopped");
+                }
                 break;
             }
         }
@@ -968,6 +982,67 @@ mod tests {
         let _ = renewal.await;
         drop(db);
         cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_renewal_before_and_during_backoff() {
+        use crate::logging::persistence_log_tests::CapturedLog;
+
+        for during_backoff in [true, false] {
+            let (path, db) = temp_db("renew-backoff-shutdown");
+            let activation = Activation::new();
+            assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+            let before = activation.authority_deadline();
+            *activation.renewal_fault_delay.lock().unwrap() = Duration::from_millis(10);
+            activation.fail_next_renewal();
+            let log = CapturedLog::default();
+            tokio::time::pause();
+            let mut renewal = tracing::dispatcher::with_default(&log.dispatch(), || {
+                spawn_renewal_every(
+                    db.clone(),
+                    Arc::clone(&activation),
+                    None,
+                    Duration::from_millis(20),
+                )
+            });
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(activation.renewal_attempts.load(Ordering::Acquire), 1);
+            if during_backoff {
+                // Finish the injected error so the loop enters its 250ms sleep.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            activation.begin_shutdown();
+            let finished = tokio::time::timeout(Duration::from_millis(100), &mut renewal).await;
+            renewal.abort();
+            tokio::time::resume();
+            finished
+                .expect("shutdown must finish well before the 250ms backoff")
+                .unwrap();
+            assert_eq!(activation.renewal_attempts.load(Ordering::Acquire), 1);
+            assert_eq!(activation.authority_deadline(), before);
+            assert!(
+                log.text()
+                    .contains("active-bot lease renewal interrupted by shutdown")
+            );
+            assert!(activation.may_record(), "shutdown notices retain authority");
+
+            // Follow the existing shutdown owner: drain notices, then release.
+            drain_for_shutdown_notices(&activation, async {}).await;
+            db::release_active_bot(&db, activation.instance())
+                .await
+                .unwrap();
+            let replacement = Activation::new();
+            assert_eq!(
+                poll_writer_lock(&db, &replacement).await.unwrap(),
+                WriterLockPoll::Ready
+            );
+            db::release_active_bot(&db, replacement.instance())
+                .await
+                .unwrap();
+            drop(db);
+            cleanup(&path);
+        }
     }
 
     #[tokio::test]
