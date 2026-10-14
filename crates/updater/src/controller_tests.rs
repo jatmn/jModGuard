@@ -125,7 +125,12 @@ fn main() {{
         std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "ready").unwrap();
         event("ready");
     }}
-    while !STOP.load(Ordering::SeqCst) {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
+    while !STOP.load(Ordering::SeqCst) {{
+        if !maintenance && let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
+            std::process::exit(code.trim().parse().unwrap());
+        }}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }}
     if !maintenance {{
         event("stopping");
         while root.join("hold-{name}-stop").exists() {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
@@ -3274,6 +3279,20 @@ async fn independent_exiting_bot(
     ComponentRelease,
     tokio::task::JoinHandle<()>,
 ) {
+    selected_exiting_bot(code, false, false).await
+}
+
+async fn selected_exiting_bot(
+    code: i32,
+    restored: bool,
+    after_ready: bool,
+) -> (
+    PathBuf,
+    Db,
+    Supervisor,
+    ComponentRelease,
+    tokio::task::JoinHandle<()>,
+) {
     let root =
         std::env::temp_dir().join(format!("independent-exit-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
@@ -3330,18 +3349,27 @@ async fn independent_exiting_bot(
             .digest,
         installed.digest
     );
-    let candidate = releases.pop().unwrap();
-    tokio::fs::write(root.join("exit-code-desired-bot"), code.to_string())
-        .await
-        .unwrap();
-    control
-        .checked("bot", "latest", Some(candidate.clone()), None, now())
-        .await
-        .unwrap();
-    db::request_component_install(&db, "bot", &candidate.digest, now())
-        .await
-        .unwrap();
-    // Record only the replacement and recovery starts, after both baselines ran.
+    let (candidate, fixture) = if restored {
+        restart(&mut bot).await;
+        (installed.clone(), "installed-bot")
+    } else {
+        let candidate = releases.pop().unwrap();
+        control
+            .checked("bot", "latest", Some(candidate.clone()), None, now())
+            .await
+            .unwrap();
+        db::request_component_install(&db, "bot", &candidate.digest, now())
+            .await
+            .unwrap();
+        (candidate, "desired-bot")
+    };
+    let exit_file = root.join(format!("exit-code-{fixture}"));
+    if !after_ready {
+        tokio::fs::write(&exit_file, code.to_string())
+            .await
+            .unwrap();
+    }
+    // Record only replacement/recovery starts, after both baselines ran.
     tokio::fs::write(root.join("events"), "").await.unwrap();
     bot.tick().await.unwrap();
     assert_eq!(
@@ -3354,8 +3382,18 @@ async fn independent_exiting_bot(
             .digest,
         candidate.digest
     );
+    if after_ready {
+        wait_for_bot_ready(&mut bot).await;
+        // Rename publishes the whole code before the child can read it.
+        let pending = exit_file.with_extension("tmp");
+        tokio::fs::write(&pending, code.to_string()).await.unwrap();
+        tokio::fs::rename(pending, exit_file).await.unwrap();
+    }
     bot.running.as_mut().unwrap().child.wait().await.unwrap();
-    assert!(!bot.running.as_ref().unwrap().ready_file.exists());
+    assert_eq!(
+        bot.running.as_ref().unwrap().ready_file.exists(),
+        after_ready
+    );
     (root, db, bot, candidate, server)
 }
 
@@ -3640,6 +3678,114 @@ async fn independent_rejected_token_cleared_selection_restores_installed() {
     bot.stop_application().await.unwrap();
     bot.end_idle().await.unwrap();
     server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
+    for restored in [false, true] {
+        for after_ready in [false, true] {
+            let (root, db, mut bot, _, server) = selected_exiting_bot(
+                jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
+                restored,
+                after_ready,
+            )
+            .await;
+            let before = bot.control.component("bot").await.unwrap();
+            let starts = independent_exit_starts(&root).await;
+            let ready_file = bot.running.as_ref().unwrap().ready_file.clone();
+            // Advance both child ages beyond the historical 120s deadline.
+            let elapsed = READY_TIMEOUT + Duration::from_secs(1);
+            let child = bot.running.as_mut().unwrap();
+            child.started_at = now() - elapsed.as_secs() as i64;
+            child.started = Instant::now() - elapsed;
+            assert!(!bot.tick().await.unwrap());
+            assert!(bot.restart.held);
+            // Advance the hold clock by the same interval, still before fallback retry.
+            bot.restart.auth_retry_at = bot.restart.auth_retry_at.map(|at| at - elapsed);
+            for _ in 0..3 {
+                assert!(!bot.tick().await.unwrap());
+                assert!(bot.running.is_none());
+                assert!(bot.restart.held);
+            }
+            let after = bot.control.component("bot").await.unwrap();
+            assert_eq!(after.installed, before.installed);
+            assert_eq!(after.desired, before.desired);
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.last_error, before.last_error);
+            assert_eq!(independent_exit_starts(&root).await, starts);
+            assert!(!ready_file.exists(), "hold must not fabricate readiness");
+            bot.end_idle().await.unwrap();
+            server.abort();
+            let _ = server.await;
+            drop((bot, db));
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_auth_hold_requires_capable_launcher_before_spawn() {
+    let root = std::env::temp_dir().join(format!("auth-admission-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let mut bot = offline_controller("bot", control, &root);
+    let release = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+    for revision in 0..7 {
+        bot.launcher_revision = revision;
+        // A nonexistent executable ensures rejection occurs at admission, before spawn.
+        let error = bot
+            .start(
+                &root.join("must-not-start"),
+                &release.source_sha,
+                Some(release.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("launcher update required before application start"),
+            "{error:#}"
+        );
+        assert!(bot.running.is_none());
+    }
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn baked_auth_rejection_after_ready_is_held() {
+    let root = std::env::temp_dir().join(format!("baked-auth-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let child = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut bot = offline_controller("bot", control, &root);
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    let ready_file = bot.running.as_ref().unwrap().ready_file.clone();
+    assert!(ready_file.exists());
+    let pending = root.join("pending-exit");
+    tokio::fs::write(
+        &pending,
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::rename(pending, root.join("exit-code-baked-bot"))
+        .await
+        .unwrap();
+    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    for _ in 0..3 {
+        assert!(!bot.tick().await.unwrap());
+        assert!(bot.restart.held);
+        assert!(bot.running.is_none());
+    }
+    assert!(!ready_file.exists());
+    assert_eq!(independent_exit_starts(&root).await, ["baked-bot.start"]);
+    bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
