@@ -167,6 +167,10 @@ struct RecoverySlot {
 struct RememberedDiscordState {
     expires: HashMap<DiscordRestTarget, Instant>,
     global_recovery: u64,
+    // Unique guild recovery generations and the fallback for reclaimed slots.
+    // Neither resets on clear_all; ordinary clears leave unrelated guilds alone.
+    guild_generation: u64,
+    guild_generation_floor: u64,
     guild_recovery: HashMap<u64, RecoverySlot>,
     member_moderation_recovery: HashMap<(u64, u64), RecoverySlot>,
 }
@@ -228,7 +232,7 @@ impl RememberedDiscordTargets {
             .guild_recovery
             .get(&guild)
             .map(|slot| slot.generation)
-            .unwrap_or(0)
+            .unwrap_or(state.guild_generation_floor)
     }
 
     fn member_moderation_generation(
@@ -248,9 +252,13 @@ impl RememberedDiscordTargets {
     }
 
     fn prune_recovery_metadata(&self, state: &mut RememberedDiscordState, now: Instant) {
-        state
-            .guild_recovery
-            .retain(|_, slot| slot.touched + REMEMBERED_REST_TARGET_TTL > now);
+        state.guild_recovery.retain(|_, slot| {
+            if slot.touched + REMEMBERED_REST_TARGET_TTL > now {
+                return true;
+            }
+            state.guild_generation_floor = state.guild_generation_floor.max(slot.generation);
+            false
+        });
         let expired_members: Vec<_> = state
             .member_moderation_recovery
             .iter()
@@ -267,13 +275,15 @@ impl RememberedDiscordTargets {
 
     fn evict_oldest_recovery_slot<K: Copy + Eq + std::hash::Hash>(
         map: &mut HashMap<K, RecoverySlot>,
+        generation_floor: &mut u64,
     ) {
         if let Some(key) = map
             .iter()
             .min_by_key(|(_, slot)| slot.touched)
             .map(|(key, _)| *key)
+            && let Some(slot) = map.remove(&key)
         {
-            map.remove(&key);
+            *generation_floor = (*generation_floor).max(slot.generation);
         }
     }
 
@@ -295,9 +305,10 @@ impl RememberedDiscordTargets {
         key: K,
         generation: u64,
         now: Instant,
+        generation_floor: &mut u64,
     ) {
         if map.len() >= MAX_REMEMBERED_REST_TARGETS && !map.contains_key(&key) {
-            Self::evict_oldest_recovery_slot(map);
+            Self::evict_oldest_recovery_slot(map, generation_floor);
         }
         map.insert(
             key,
@@ -333,8 +344,14 @@ impl RememberedDiscordTargets {
 
     fn bump_guild_recovery(&self, state: &mut RememberedDiscordState, guild: u64, now: Instant) {
         self.prune_recovery_metadata(state, now);
-        let next = Self::guild_generation(state, guild) + 1;
-        Self::insert_recovery_slot(&mut state.guild_recovery, guild, next, now);
+        state.guild_generation += 1;
+        Self::insert_recovery_slot(
+            &mut state.guild_recovery,
+            guild,
+            state.guild_generation,
+            now,
+            &mut state.guild_generation_floor,
+        );
     }
 
     fn bump_member_moderation_recovery(
@@ -541,7 +558,14 @@ impl RememberedDiscordTargets {
     #[cfg(test)]
     fn seed_guild_recovery_slot(&self, guild: u64, generation: u64, touched: Instant) {
         let mut state = self.state.lock();
-        Self::insert_recovery_slot(&mut state.guild_recovery, guild, generation, touched);
+        let state = &mut *state;
+        Self::insert_recovery_slot(
+            &mut state.guild_recovery,
+            guild,
+            generation,
+            touched,
+            &mut state.guild_generation_floor,
+        );
     }
 
     #[cfg(test)]
@@ -1023,6 +1047,92 @@ mod tests {
         assert!(!cache.blocked(victim, now));
     }
 
+    #[test]
+    fn member_capacity_eviction_alone_raises_generation_floor() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let victim = DiscordRestTarget::AutomodMember {
+            guild: 3,
+            user: 1,
+            action: AutomodRestAction::Kick,
+        };
+        let epoch = cache.capture_recovery_epoch(victim);
+        // Seed without a role clear: only eviction can raise the floor.
+        cache.seed_member_recovery_slot(3, 1, 7, now - Duration::from_secs(1));
+        for user in 2..=super::MAX_REMEMBERED_REST_TARGETS {
+            cache.seed_member_recovery_slot(3, user as u64, 1, now);
+        }
+        assert_eq!(cache.member_moderation_generation_floor(), 0);
+        cache.seed_member_recovery_slot(3, 5000, 1, now);
+        assert!(!cache.member_recovery_slot_present(3, 1));
+        assert_eq!(cache.member_moderation_generation_floor(), 7);
+        assert!(!cache.try_remember_permanent(epoch, victim, now));
+        assert!(!cache.blocked(victim, now));
+    }
+
+    #[test]
+    fn member_ttl_expiry_alone_raises_generation_floor() {
+        let cache = RememberedDiscordTargets::default();
+        let now = Instant::now();
+        let victim = DiscordRestTarget::AutomodMember {
+            guild: 3,
+            user: 1,
+            action: AutomodRestAction::Kick,
+        };
+        let epoch = cache.capture_recovery_epoch(victim);
+        // Below capacity, with no role clear or insertion to raise the floor.
+        cache.seed_member_recovery_slot(3, 1, 7, now - REMEMBERED_REST_TARGET_TTL);
+        assert_eq!(cache.member_moderation_generation_floor(), 0);
+        assert!(!cache.blocked(victim, now));
+        assert!(!cache.member_recovery_slot_present(3, 1));
+        assert_eq!(cache.member_moderation_generation_floor(), 7);
+        assert!(!cache.try_remember_permanent(epoch, victim, now));
+        assert!(!cache.blocked(victim, now));
+    }
+
+    #[tokio::test]
+    async fn guild_slot_reclamation_does_not_restore_stale_rejections() {
+        let deny = fixture_discord_http_error(403, 50013).await;
+        for expire in [false, true] {
+            let cache = RememberedDiscordTargets::default();
+            let target = DiscordRestTarget::GuildChannel {
+                guild: 1,
+                channel: 2,
+            };
+            let original = cache.capture_recovery_epoch(target);
+            cache.clear_guild(1);
+            let stale = cache.capture_recovery_epoch(target);
+            cache.clear_guild(1);
+            let now = Instant::now();
+            if expire {
+                // Advance cleanup time, without sleeping for the 30-minute TTL.
+                cache.prune_recovery_metadata_for_test(now + REMEMBERED_REST_TARGET_TTL);
+                assert_eq!(cache.recovery_metadata_counts().0, 0);
+            } else {
+                for guild in 2..=(super::MAX_REMEMBERED_REST_TARGETS + 1) {
+                    cache.clear_guild(guild as u64);
+                }
+                assert_eq!(
+                    cache.recovery_metadata_counts().0,
+                    super::MAX_REMEMBERED_REST_TARGETS
+                );
+            }
+            assert!(!cache.state.lock().guild_recovery.contains_key(&1));
+            cache.remember_rest_rejection(original, &deny, target, now);
+            assert!(!cache.blocked(target, now), "missing slot, expiry={expire}");
+            cache.clear_guild(1);
+            cache.remember_rest_rejection(stale, &deny, target, now);
+            assert!(!cache.blocked(target, now), "rebuilt slot, expiry={expire}");
+            let fresh = cache.capture_recovery_epoch(target);
+            assert!(fresh.guild > stale.guild);
+            cache.remember_rest_rejection(fresh, &deny, target, now);
+            assert!(
+                cache.blocked(target, now),
+                "fresh rejection, expiry={expire}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn evicted_member_recovery_slot_does_not_restore_stale_generation() {
         const CAP: usize = 4096;
@@ -1089,8 +1199,8 @@ mod tests {
             cache.clear_member_moderation_rejections(1, user);
         }
         let (guilds, members) = cache.recovery_metadata_counts();
-        assert!(guilds <= CAP);
-        assert!(members <= CAP);
+        assert_eq!(guilds, 0);
+        assert_eq!(members, CAP);
     }
 
     #[test]
