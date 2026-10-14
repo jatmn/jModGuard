@@ -16,6 +16,12 @@ const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Process-local only: container restart is the explicit reset for a bad token.
+///
+/// Intended update interaction: while a rejected-token hold is active, `tick`
+/// idles before control reads, so launcher updates and paired-upgrade steps
+/// wait until the next auth retry or a container restart. Crash backoff
+/// (5 s doubling, capped at 60 s) can likewise delay a paired `StartingBot`
+/// by up to 60 s. Revisit both together if hold or backoff policy changes.
 #[derive(Default)]
 struct RestartPolicy {
     held: bool,
