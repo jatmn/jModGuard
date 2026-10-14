@@ -467,8 +467,8 @@ impl UpdateControl {
         Ok(())
     }
 
-    /// One-statement periodic renewal of an existing launcher fence. Initial
-    /// acquisition stays on the interactive path because the row may be absent.
+    /// One-statement periodic renewal, falling back to fenced acquisition if
+    /// a restore removed the row. Initial acquisition stays interactive.
     pub async fn renew_launcher_fence_cas(&self) -> Result<bool> {
         let Some(instance) = self
             .db
@@ -489,18 +489,46 @@ impl UpdateControl {
             requested_at < deadline,
             "launcher fence authority window expired"
         );
-        let renewal = self.db.with_lease_conn(move |conn| {
-            let now = crate::control::now_ms();
-            let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
-            Ok(conn.execute_lease_cas(
-                crate::db_compat::LAUNCHER_FENCE_CAS,
-                params![next, format!("{instance} "), now],
-                deadline.saturating_duration_since(std::time::Instant::now()),
-            )? == 1)
-        });
-        let renewed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renewal)
-            .await
-            .context("launcher fence renewal timed out")??;
+        let renewal = async {
+            let (renewed, missing) = self
+                .db
+                .with_lease_conn(move |conn| {
+                    let now = crate::control::now_ms();
+                    let next = format!("{instance} {}", now.saturating_add(LAUNCHER_FENCE_TTL_MS));
+                    if conn.execute_lease_cas(
+                        crate::db_compat::LAUNCHER_FENCE_CAS,
+                        params![next, format!("{instance} "), now],
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    )? == 1
+                    {
+                        return Ok((true, false));
+                    }
+                    // One bounded read on this lease connection distinguishes a
+                    // missing row from contention. Acquisition rechecks both fences
+                    // under its write lock; this snapshot never authorizes a write.
+                    let missing = conn.query_row(
+                        "SELECT NOT EXISTS(SELECT 1 FROM meta WHERE key='launcher_lease')
+                         AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'",
+                        (),
+                        |row| Ok(row.get::<i64>(0)? != 0),
+                    )?;
+                    Ok((false, missing))
+                })
+                .await?;
+            if missing {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "launcher fence renewal completed too late"
+                );
+                Ok::<_, anyhow::Error>((self.acquire_launcher_fence().await?, true))
+            } else {
+                Ok((renewed, false))
+            }
+        };
+        let (renewed, recovered) =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renewal)
+                .await
+                .context("launcher fence renewal timed out")??;
         // timeout_at can poll a ready response before its timer on a busy executor.
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
@@ -508,6 +536,9 @@ impl UpdateControl {
         );
         if renewed {
             self.confirm_launcher_fence(requested_at)?;
+            if recovered {
+                tracing::info!("missing bot launcher fence recreated");
+            }
         }
         Ok(renewed)
     }
@@ -520,6 +551,15 @@ impl UpdateControl {
             return Ok(false);
         }
         let requested_at = std::time::Instant::now();
+        let renewed = self.acquire_launcher_fence().await?;
+        if renewed {
+            self.confirm_launcher_fence(requested_at)?;
+        }
+        Ok(renewed)
+    }
+
+    // Shared acquisition transaction; callers confirm only within their deadline.
+    async fn acquire_launcher_fence(&self) -> Result<bool> {
         match self
             .db
             .with_conn(|conn| {
@@ -529,10 +569,7 @@ impl UpdateControl {
             })
             .await
         {
-            Ok(()) => {
-                self.confirm_launcher_fence(requested_at)?;
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             Err(error) if launcher_fence_held(&error) => Ok(false),
             Err(error) => Err(error),
         }
