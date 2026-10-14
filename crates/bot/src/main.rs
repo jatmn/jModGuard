@@ -106,16 +106,33 @@ fn persist_member_sync_rate_limit(db: &db::Db, bot_id: i64, deadline_ms: i64) ->
     })
 }
 
-/// Release the writer lease before an already-fatal authentication exit.
+async fn idle_until_shutdown() {
+    shutdown_signal().await;
+    jmodguard::log_shutdown_finished("bot");
+    tracing::info!("bot process stopped");
+}
+
+/// Release the writer lease before an already-fatal authentication exit or hold.
 /// Running REST workers keep their existing parked behavior; only startup
 /// discovery and the gateway's fatal 4004 return use this process boundary.
-async fn auth_failure_exit_code(app: &BotState, error: &serenity::Error) -> Option<i32> {
+async fn auth_failure_exit_code(
+    app: &BotState,
+    error: &serenity::Error,
+    launcher_revision: Option<u32>,
+) -> Option<i32> {
     let code = jmodguard_bot::discord::fatal_auth_exit_code(error)?;
     app.activation.begin_shutdown();
     app.activation.note_lease_lost();
     jmodguard::set_process_ready(false);
     if let Err(error) = db::release_active_bot(&app.db, app.activation.instance()).await {
         tracing::warn!("active-bot lease release after token rejection failed: {error:#}");
+    }
+    if !jmodguard::launcher_child::launcher_holds_auth_exit(launcher_revision) {
+        tracing::error!(
+            "Discord rejected the bot token; this launcher cannot hold auth exits. Bot held in-process; fix the token and restart the container"
+        );
+        idle_until_shutdown().await;
+        return Some(0);
     }
     Some(code)
 }
@@ -156,9 +173,7 @@ async fn main() -> Result<()> {
 
     if let Some(message) = jmodguard::launcher_child::refusal_message() {
         tracing::error!("{message}");
-        shutdown_signal().await;
-        jmodguard::log_shutdown_finished("bot");
-        tracing::info!("bot process stopped");
+        idle_until_shutdown().await;
         return Ok(());
     }
 
@@ -559,7 +574,12 @@ async fn main() -> Result<()> {
         match jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await {
             Err(error) => {
                 if let Some(discord_error) = error.downcast_ref::<serenity::Error>()
-                    && let Some(code) = auth_failure_exit_code(&app, discord_error).await
+                    && let Some(code) = auth_failure_exit_code(
+                        &app,
+                        discord_error,
+                        jmodguard::launcher_child::detected_launcher_revision(),
+                    )
+                    .await
                 {
                     std::process::exit(code);
                 }
@@ -611,7 +631,13 @@ async fn main() -> Result<()> {
         shard_manager.shutdown_all().await;
     });
     if let Err(error) = client.start().await {
-        if let Some(code) = auth_failure_exit_code(&app, &error).await {
+        if let Some(code) = auth_failure_exit_code(
+            &app,
+            &error,
+            jmodguard::launcher_child::detected_launcher_revision(),
+        )
+        .await
+        {
             std::process::exit(code);
         }
         anyhow::bail!("discord client error: {error:#}");
@@ -626,7 +652,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_401_and_gateway_4004_release_the_lease_before_auth_exit() {
+    async fn startup_401_and_gateway_4004_exit_or_idle_after_shutdown() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let path =
             std::env::temp_dir().join(format!("auth-exit-{:032x}.db", rand::random::<u128>()));
@@ -661,30 +687,88 @@ mod tests {
         let gateway =
             serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidAuthentication);
         for error in [startup, gateway] {
-            let app = BotState::new(Default::default(), db.clone()).unwrap();
-            assert!(
-                jmodguard_bot::activation::wait_for_writer_lock(&db, &app.activation)
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                auth_failure_exit_code(&app, &error).await,
-                Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
-            );
-            assert!(!app.activation.may_record());
-            // Direct claim must succeed now, without the old ~20-second expiry.
-            let next = jmodguard_bot::activation::Activation::new();
-            assert!(
-                db::claim_active_bot(
-                    &db,
-                    next.instance(),
-                    chrono::Utc::now().timestamp_millis(),
-                    Arc::new(std::sync::atomic::AtomicBool::new(false))
-                )
-                .await
-                .unwrap()
-            );
-            db::release_active_bot(&db, next.instance()).await.unwrap();
+            for revision in [None, Some(7), Some(6)] {
+                for fail_release in [false, true] {
+                    let app = BotState::new(Default::default(), db.clone()).unwrap();
+                    assert!(
+                        jmodguard_bot::activation::wait_for_writer_lock(&db, &app.activation)
+                            .await
+                            .unwrap()
+                    );
+                    if fail_release {
+                        db.with_conn(|conn| {
+                            conn.execute_batch_bounded(
+                                "CREATE TRIGGER reject_lease_release BEFORE DELETE ON meta
+                                 WHEN OLD.key = 'active_bot_lease'
+                                 BEGIN SELECT RAISE(ABORT, 'fixture release failure'); END;",
+                                65_536,
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                        let error = db::release_active_bot(&db, app.activation.instance())
+                            .await
+                            .unwrap_err();
+                        assert!(format!("{error:#}").contains("fixture release failure"));
+                    }
+                    jmodguard::set_process_ready(true);
+                    let exit = auth_failure_exit_code(&app, &error, revision);
+                    tokio::pin!(exit);
+                    let result = tokio::time::timeout(Duration::from_secs(1), &mut exit).await;
+                    if revision == Some(6) {
+                        assert!(
+                            result.is_err(),
+                            "old launcher must never receive an auth exit"
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+                        );
+                    }
+                    assert!(app.activation.is_shutting_down());
+                    assert!(!app.activation.may_record());
+                    assert!(!app.activation.allows_discord_connect());
+                    assert!(!jmodguard::process_ready());
+                    if fail_release {
+                        db.with_conn(|conn| {
+                            conn.execute_batch_bounded(
+                                "DROP TRIGGER reject_lease_release",
+                                65_536,
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                        if revision == Some(6) {
+                            // Database recovery must not end the in-process hold.
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(50), &mut exit)
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                        db::release_active_bot(&db, app.activation.instance())
+                            .await
+                            .unwrap();
+                    }
+                    // A fresh activation can claim immediately after release, as on restart.
+                    let next = jmodguard_bot::activation::Activation::new();
+                    assert!(
+                        db::claim_active_bot(
+                            &db,
+                            next.instance(),
+                            chrono::Utc::now().timestamp_millis(),
+                            Arc::new(std::sync::atomic::AtomicBool::new(false))
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    assert!(!next.is_shutting_down());
+                    db::release_active_bot(&db, next.instance()).await.unwrap();
+                }
+            }
         }
         assert_eq!(
             jmodguard_bot::discord::fatal_auth_exit_code(&serenity::Error::Gateway(
