@@ -525,7 +525,7 @@ async fn main() -> Result<()> {
                                 for gid in guilds {
                                     if !jmodguard_bot::commands::sync_slash_commands_versioned_http(
                                         &app,
-                                        &http,
+                                        (&cache, http.as_ref()),
                                         serenity::model::id::GuildId::new(gid),
                                         remote,
                                     )
