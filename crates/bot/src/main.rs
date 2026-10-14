@@ -132,6 +132,7 @@ async fn auth_failure_exit_code(
             "Discord rejected the bot token; this launcher cannot hold auth exits. Bot held in-process; fix the token and restart the container"
         );
         idle_until_shutdown().await;
+        // SIGTERM intentionally ends this old-launcher hold with a clean exit (0).
         return Some(0);
     }
     Some(code)
@@ -652,7 +653,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_401_and_gateway_4004_exit_or_idle_after_shutdown() {
+    async fn startup_401_and_initial_or_ready_gateway_4004_exit_or_idle_after_shutdown() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let path =
             std::env::temp_dir().join(format!("auth-exit-{:032x}.db", rand::random::<u128>()));
@@ -686,8 +687,8 @@ mod tests {
         );
         let gateway =
             serenity::Error::Gateway(serenity::gateway::GatewayError::InvalidAuthentication);
-        for error in [startup, gateway] {
-            for revision in [None, Some(7), Some(6)] {
+        for (error, was_ready) in [(&startup, false), (&gateway, false), (&gateway, true)] {
+            for revision in [None, Some(7), Some(8), Some(9), Some(10), Some(6)] {
                 for fail_release in [false, true] {
                     let app = BotState::new(Default::default(), db.clone()).unwrap();
                     assert!(
@@ -712,8 +713,8 @@ mod tests {
                             .unwrap_err();
                         assert!(format!("{error:#}").contains("fixture release failure"));
                     }
-                    jmodguard::set_process_ready(true);
-                    let exit = auth_failure_exit_code(&app, &error, revision);
+                    jmodguard::set_process_ready(was_ready);
+                    let exit = auth_failure_exit_code(&app, error, revision);
                     tokio::pin!(exit);
                     let result = tokio::time::timeout(Duration::from_secs(1), &mut exit).await;
                     if revision == Some(6) {
