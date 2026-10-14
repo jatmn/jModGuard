@@ -60,12 +60,16 @@ pub fn format_log_timestamps(vars: &mut BTreeMap<String, String>) {
 }
 
 /// Default stats response, rendered through the same template engine as logs.
-pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) -> String {
+/// A missing case count means the guild store or membership is unavailable.
+pub fn stats_response(uptime_seconds: u64, cases: Option<i64>, warns: i64, bans: i64) -> String {
     render(
-        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `{uptime}`\n**📋 Moderation records:** `{records}`\n**⚠️ Warns:** `{warns}`\n**🔨 Bans:** `{bans}`",
+        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `{uptime}`\n**📋 Cases:** `{cases}`\n**⚠️ Warns:** `{warns}`\n**🔨 Bans:** `{bans}`",
         &BTreeMap::from([
             ("uptime".into(), format_compact_duration(uptime_seconds)),
-            ("records".into(), records.to_string()),
+            (
+                "cases".into(),
+                cases.map_or_else(|| "unavailable".into(), |count| count.to_string()),
+            ),
             ("warns".into(), warns.to_string()),
             ("bans".into(), bans.to_string()),
         ]),
@@ -77,25 +81,18 @@ pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) 
 ///
 /// ```
 /// let response: String = jmodguard::templates::stats_response_with_updates(
-///     20, 1, 2, 3, &[], 1_000,
+///     20, Some(1), 2, 3, &[], 1_000,
 /// );
 /// ```
 pub fn stats_response_with_updates(
     uptime_seconds: u64,
-    records: i64,
+    cases: Option<i64>,
     warns: i64,
     bans: i64,
     updates: &[crate::db::ComponentUpdate],
     now: i64,
 ) -> String {
-    stats_response_with_update_availability(
-        uptime_seconds,
-        records,
-        warns,
-        bans,
-        Some(updates),
-        now,
-    )
+    stats_response_with_update_availability(uptime_seconds, cases, warns, bans, Some(updates), now)
 }
 
 /// Render release lookup availability alongside moderation stats. None means
@@ -103,7 +100,7 @@ pub fn stats_response_with_updates(
 /// semantics, including unknown markers for missing or stale observations.
 pub fn stats_response_with_update_availability(
     uptime_seconds: u64,
-    records: i64,
+    cases: Option<i64>,
     warns: i64,
     bans: i64,
     updates: Option<&[crate::db::ComponentUpdate]>,
@@ -114,7 +111,7 @@ pub fn stats_response_with_update_availability(
             "{moderation}\n\n**Release status**\nunavailable",
             &BTreeMap::from([(
                 "moderation".into(),
-                stats_response(uptime_seconds, records, warns, bans),
+                stats_response(uptime_seconds, cases, warns, bans),
             )]),
         );
     };
@@ -197,6 +194,11 @@ pub fn stats_response_with_update_availability(
             "unknown"
         };
         let icon = release_status_icon(availability);
+        let sha = if sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            &sha[..7]
+        } else {
+            sha
+        };
         lines.push(format!("**{component}:** `{sha}` · {label} {age} · {icon}"));
     }
     render(
@@ -204,7 +206,7 @@ pub fn stats_response_with_update_availability(
         &BTreeMap::from([
             (
                 "moderation".into(),
-                stats_response(uptime_seconds, records, warns, bans),
+                stats_response(uptime_seconds, cases, warns, bans),
             ),
             ("releases".into(), lines.join("\n")),
         ]),
@@ -493,12 +495,28 @@ mod presentation_tests {
         assert_eq!(
             stats_response(
                 std::time::Duration::from_secs_f64(1361.499531819).as_secs(),
-                0,
+                Some(0),
                 0,
                 1
             ),
-            "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `22m 41s`\n**📋 Moderation records:** `0`\n**⚠️ Warns:** `0`\n**🔨 Bans:** `1`"
+            "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `22m 41s`\n**📋 Cases:** `0`\n**⚠️ Warns:** `0`\n**🔨 Bans:** `1`"
         );
+    }
+
+    #[test]
+    fn stats_distinguishes_zero_cases_from_unavailable() {
+        for (cases, expected) in [(Some(0), "0"), (Some(2), "2"), (None, "unavailable")] {
+            for updates in [Some(&[][..]), None] {
+                let out = stats_response_with_update_availability(20, cases, 3, 4, updates, 1100);
+                assert!(
+                    out.contains(&format!("**📋 Cases:** `{expected}`")),
+                    "{out}"
+                );
+                assert!(out.contains("**⚠️ Warns:** `3`"), "{out}");
+                assert!(out.contains("**🔨 Bans:** `4`"), "{out}");
+                assert!(!out.contains("Moderation records"), "{out}");
+            }
+        }
     }
 
     #[test]
@@ -560,12 +578,12 @@ mod presentation_tests {
             state: "running".into(),
             last_error: None,
         };
-        let fresh = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
-        assert!(fresh.contains(&format!("`{}`", "a".repeat(40))));
+        let fresh = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
+        assert!(fresh.contains("`aaaaaaa`"));
         assert!(fresh.contains("⬆️"));
         assert!(!fresh.contains("update available"));
         row.channel = "nightly".into();
-        let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let wrong_channel = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
         assert!(!wrong_channel.contains("update available"));
         let wrong_api = wrong_channel
             .lines()
@@ -577,7 +595,7 @@ mod presentation_tests {
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
-        let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let baked_current = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
         let api_line = baked_current
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -585,11 +603,46 @@ mod presentation_tests {
         assert!(api_line.ends_with("⚠️"), "{api_line}");
         assert!(!baked_current.contains("no source update"));
         row.channel = "nightly".into();
-        let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let wrong_channel_current =
+            stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
         assert!(!wrong_channel_current.contains("no source update"));
         row.channel = "stable".into();
+        // Source comparisons still use the full SHA, even when prefixes match.
+        let mut same_prefix = row.clone();
+        same_prefix.candidate.as_mut().unwrap().source_sha = format!("aaaaaaa{}", "b".repeat(33));
+        let out = stats_response_with_updates(20, Some(1), 2, 3, &[same_prefix], 1100);
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("**api:**") && line.ends_with("⬆️"))
+        );
+
+        for component in ["bot", "api", "webui"] {
+            for (source, expected) in [
+                ("abcdef0123456789abcdef0123456789abcdef01", "abcdef0"),
+                ("ABCDEF0123456789ABCDEF0123456789ABCDEF01", "ABCDEF0"),
+                ("unknown", "unknown"),
+                ("abcdef012345", "abcdef012345"),
+                (
+                    "g123456789012345678901234567890123456789",
+                    "g123456789012345678901234567890123456789",
+                ),
+            ] {
+                let mut display = row.clone();
+                display.component = component.into();
+                display.observed.as_mut().unwrap().source_sha = source.into();
+                display.candidate.as_mut().unwrap().source_sha = source.into();
+                display.installed = display.candidate.clone();
+                let out = stats_response_with_updates(20, Some(1), 2, 3, &[display], 1100);
+                let line = out
+                    .lines()
+                    .find(|line| line.starts_with(&format!("**{component}:**")))
+                    .unwrap();
+                assert!(line.contains(&format!("`{expected}`")), "{line}");
+                assert!(line.ends_with("✅"), "{line}");
+            }
+        }
         row.observed_at = Some(1);
-        let stale = stats_response_with_updates(20, 1, 2, 3, &[row], 9000);
+        let stale = stats_response_with_updates(20, Some(1), 2, 3, &[row], 9000);
         assert!(!stale.contains(&"a".repeat(40)));
         let stale_api = stale
             .lines()
@@ -601,7 +654,7 @@ mod presentation_tests {
 
     #[test]
     fn missing_release_rows_use_the_unknown_icon() {
-        let out = stats_response_with_updates(0, 0, 0, 0, &[], 1_000);
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[], 1_000);
         for component in ["bot", "api", "webui"] {
             assert!(
                 out.contains(&format!("**{component}:** ❓")),
