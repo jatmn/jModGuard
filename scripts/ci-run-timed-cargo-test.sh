@@ -377,17 +377,93 @@ jmodguard_cargo_exclude_names() {
   done
 }
 
+# Translate glob::Pattern tokens, not shell syntax. Package names have no '/':
+# a nonterminal **/ can only match zero components; a terminal ** matches all.
+# Return 2 for invalid patterns so rescoping cannot silently discard Cargo errors.
+jmodguard_cargo_glob_matches() (
+  local pkg=$1 glob=$2 pattern='' class neg lo hi ch
+  local i=0 j start count never=0
+  local LC_COLLATE=C
+  shopt -u nocasematch
+  while [ "$i" -lt "${#glob}" ]; do
+    ch=${glob:i:1}
+    case "$ch" in
+      '?') pattern+='?'; i=$((i + 1)) ;;
+      '*')
+        start=$i
+        while [ "${glob:i:1}" = '*' ]; do i=$((i + 1)); done
+        count=$((i - start))
+        [ "$count" -le 2 ] || return 2
+        if [ "$count" -eq 2 ]; then
+          [ "$start" -eq 0 ] || [ "${glob:start-1:1}" = / ] || return 2
+          if [ "$i" -lt "${#glob}" ]; then
+            [ "${glob:i:1}" = / ] || return 2
+            i=$((i + 1))
+          fi
+          [ "$i" -eq "${#glob}" ] || continue
+        fi
+        pattern+='*'
+        ;;
+      '[')
+        i=$((i + 1))
+        neg=''
+        if [ "${glob:i:1}" = '!' ]; then neg='!'; i=$((i + 1)); fi
+        # The first member (including ']') is always literal.
+        j=$((i + 1))
+        while [ "$j" -lt "${#glob}" ] && [ "${glob:j:1}" != ']' ]; do j=$((j + 1)); done
+        [ "$j" -lt "${#glob}" ] || return 2
+        class=''
+        while [ "$i" -lt "$j" ]; do
+          lo=${glob:i:1}
+          if [ "$((i + 2))" -lt "$j" ] && [ "${glob:i+1:1}" = '-' ]; then
+            hi=${glob:i+2:1}
+            # glob accepts reversed ranges, but they match nothing.
+            [[ "$lo" > "$hi" ]] || class+="\\$lo-\\$hi"
+            i=$((i + 3))
+          else
+            class+="\\$lo"
+            i=$((i + 1))
+          fi
+        done
+        if [ -n "$class" ]; then
+          pattern+="[$neg$class]"
+        elif [ -n "$neg" ]; then
+          pattern+='?'
+        else
+          never=1
+        fi
+        i=$((j + 1))
+        ;;
+      *) pattern+="\\$ch"; i=$((i + 1)) ;;
+    esac
+  done
+  # Only the translated tokens may act as Bash pattern syntax.
+  # shellcheck disable=SC2053
+  [ "$never" -eq 0 ] && [[ $pkg == $pattern ]]
+)
+
 jmodguard_package_is_excluded() {
   local pkg=$1
   shift
-  local ex
+  local ex rc matched=1
   while IFS= read -r ex; do
     [ -n "$ex" ] || continue
-    # Unquoted pattern intentionally matches Cargo globs (*, ?, [...]).
-    # shellcheck disable=SC2254
-    case "$pkg" in $ex) return 0 ;; esac
+    # Cargo's is_glob_pattern includes ']' too. Plain names use equality;
+    # backslashes and Bash extglob operators never escape or expand them.
+    case "$ex" in
+      *\**|*\?*|*\[*|*\]*)
+        rc=0
+        jmodguard_cargo_glob_matches "$pkg" "$ex" || rc=$?
+        if [ "$rc" -eq 2 ]; then
+          printf 'ci-preflight: invalid Cargo exclusion pattern: %s\n' "$ex" >&2
+          return 2
+        fi
+        [ "$rc" -ne 0 ] || matched=0
+        ;;
+      *) [ "$pkg" != "$ex" ] || matched=0 ;;
+    esac
   done < <(jmodguard_cargo_exclude_names "$@")
-  return 1
+  return "$matched"
 }
 
 # One scope per line: lib, or test:<binary-name>
@@ -425,10 +501,16 @@ run_timed_cargo_test_list_scopes() {
       packages+=("$line")
     done < <(jq -r '.packages[] | .name' "$meta")
   fi
-  local p had_scope=0
+  local p had_scope=0 exclude_rc
   for p in "${packages[@]}"; do
     if jmodguard_package_is_excluded "$p" "${cargo_args[@]}"; then
       continue
+    else
+      exclude_rc=$?
+      if [ "$exclude_rc" -ne 1 ]; then
+        rm -f "$meta" "$meta_err"
+        return "$exclude_rc"
+      fi
     fi
     had_scope=0
     if jq -e --arg p "$p" '
@@ -857,15 +939,16 @@ run_timed_cargo_test_gnu() {
   done
 
   local -a scopes=()
-  local scope scoped_line
+  local scope scoped_line scope_lines
   local -a scoped_args=()
 
   jmodguard_timed_cargo_install_traps
 
+  scope_lines="$(run_timed_cargo_test_list_scopes "${cargo_args[@]}")" || return "$?"
   while IFS= read -r scope; do
     [ -n "$scope" ] || continue
     scopes+=("$scope")
-  done < <(run_timed_cargo_test_list_scopes "${cargo_args[@]}")
+  done <<<"$scope_lines"
   if [ "${#scopes[@]}" -eq 0 ]; then
     echo 'ci-preflight: no cargo test targets to run' >&2
     return 1

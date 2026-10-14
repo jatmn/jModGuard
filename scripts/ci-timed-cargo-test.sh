@@ -17,6 +17,44 @@ fail() {
   exit 1
 }
 
+# Cargo/glob semantics, including literal characters illegal in package names
+# so escaping errors cannot hide behind Cargo's package-name validation.
+while IFS='|' read -r exclude_pattern excluded retained; do
+  jmodguard_package_is_excluded "$excluded" --exclude "$exclude_pattern" \
+    || fail "matcher $exclude_pattern: must exclude $excluded"
+  if jmodguard_package_is_excluded "$retained" "--exclude=$exclude_pattern"; then
+    fail "matcher $exclude_pattern: must retain $retained"
+  fi
+done <<'EOF'
+review-[^a]|review-a|review-b
+review-[^a]|review-^|review-b
+review-[!a]|review-b|review-a
+review-\a|review-\a|review-a
+review-\?|review-\a|review-a
+review-[\a]|review-\|review-b
+review-[]a]|review-]|review-b
+review-[]\a]|review-\|review-b
+review-[!]]|review-a|review-]
+review-[a-c]|review-b|review-d
+review-[z-aq]|review-q|review-a
+review-[!z-a]|review-a|other
+review-[-a]|review--|review-b
+review-[a-c-e]|review--|review-d
+review-[[:alpha:]]|review-a]|review-b
+review-@(a)|review-@(a)|review-a
+review-?(a)|review-x(a)|review-a
+review-*?|review-ab|review-
+**/review-a|review-a|review-b
+**/**/review-a|review-a|review-b
+EOF
+for exclude_pattern in 'review-[' 'review-[]' 'review-[!]' 'review-**' '**a' '***'; do
+  matcher_rc=0
+  # An earlier match must not conceal an invalid later exclusion.
+  jmodguard_package_is_excluded review-a --exclude review-a --exclude "$exclude_pattern" \
+    2>"$fixture/matcher-error.log" || matcher_rc=$?
+  [ "$matcher_rc" -eq 2 ] || fail "matcher $exclude_pattern: expected invalid pattern (2), got $matcher_rc"
+done
+
 # Cargo shim lines for per-package timed runs must use -p, not workspace-wide selectors.
 jmodguard_assert_per_scope_test_invocations() {
   local label=$1
@@ -718,6 +756,69 @@ for exclude_spec in timed-doctest-probe 'timed-doctest-*' 'timed-doctest-prob?' 
       && fail "exclude $exclude_form/$exclude_spec: excluded doctest ran"
   done
 done
+
+# Compare exclusions with native Cargo using observable package execution and a
+# retained failing unit test. The caret is a class member, not negation.
+exclude_ws="$fixture/exclude-ws"
+mkdir -p "$exclude_ws/review-a/src" "$exclude_ws/review-b/src"
+cat >"$exclude_ws/Cargo.toml" <<'EOF'
+[workspace]
+resolver = "2"
+members = ["review-a", "review-b"]
+EOF
+for review_pkg in review-a review-b; do
+  cat >"$exclude_ws/$review_pkg/Cargo.toml" <<EOF
+[package]
+name = "$review_pkg"
+version = "0.1.0"
+edition = "2021"
+EOF
+  cat >"$exclude_ws/$review_pkg/src/lib.rs" <<'RS'
+#[test]
+fn selected_package() {
+    let package = env!("CARGO_PKG_NAME");
+    std::fs::write(std::path::Path::new(&std::env::var("EXCLUDE_MARKERS").unwrap()).join(package), "ran").unwrap();
+    assert_ne!(package, "review-b", "retained package failure");
+}
+RS
+done
+for exclude_form in separate equals; do
+  exclude_args=(--workspace)
+  if [ "$exclude_form" = separate ]; then
+    exclude_args+=(--exclude 'review-[^a]')
+  else
+    exclude_args+=('--exclude=review-[^a]')
+  fi
+  for exclude_runner in native timed; do
+    export EXCLUDE_MARKERS="$fixture/exclude-$exclude_form-$exclude_runner"
+    mkdir -p "$EXCLUDE_MARKERS"
+    exclude_rc=0
+    (
+      cd "$exclude_ws"
+      if [ "$exclude_runner" = native ]; then
+        cargo test "${exclude_args[@]}"
+      else
+        run_timed_cargo_test_gnu "${exclude_args[@]}"
+      fi
+    ) >"$fixture/exclude-$exclude_runner.log" 2>&1 || exclude_rc=$?
+    [ ! -e "$EXCLUDE_MARKERS/review-a" ] \
+      || fail "exclude $exclude_form/$exclude_runner: excluded review-a ran"
+    [ -e "$EXCLUDE_MARKERS/review-b" ] \
+      || fail "exclude $exclude_form/$exclude_runner: retained review-b did not run"
+    [ "$exclude_rc" -eq 101 ] \
+      || fail "exclude $exclude_form/$exclude_runner: expected retained failure (101), got $exclude_rc"
+  done
+done
+unset EXCLUDE_MARKERS
+
+# Invalid glob syntax must fail before any per-package execution, even when a
+# previous exclusion matched. Cargo must not be handed a stripped valid subset.
+invalid_exclude_rc=0
+(cd "$exclude_ws"; run_timed_cargo_test_gnu --workspace --exclude review-a --exclude 'review-**') \
+  >"$fixture/invalid-exclude.log" 2>&1 || invalid_exclude_rc=$?
+[ "$invalid_exclude_rc" -ne 0 ] || fail 'invalid exclusion: runner must fail'
+grep -q 'invalid Cargo exclusion pattern' "$fixture/invalid-exclude.log" \
+  || fail 'invalid exclusion: must fail during selection'
 
 contract_log="$fixture/contract-no-target.log"
 set +e
