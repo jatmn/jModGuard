@@ -401,7 +401,7 @@ pub fn startup_backoff(failed_attempts: u32, initial: Duration, max: Duration) -
 }
 
 /// Options for opening either local SQLite or a remote libSQL database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbOpenOptions {
     pub path: PathBuf,
     pub url: String,
@@ -415,6 +415,21 @@ pub struct DbOpenOptions {
     pub default_prefix: String,
     /// Seeded into the global settings row on first boot (`bot.retention_days`).
     pub retention_days: u32,
+}
+
+impl std::fmt::Debug for DbOpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbOpenOptions")
+            .field("path", &self.path)
+            .field("url", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("pool_size", &self.pool_size)
+            .field("migrate", &self.migrate)
+            .field("read_only", &self.read_only)
+            .field("default_prefix", &self.default_prefix)
+            .field("retention_days", &self.retention_days)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -1101,7 +1116,8 @@ impl Db {
                 Ok(db) => return Ok(db),
                 Err(err) if is_startup_retryable(&err, !opts.url.trim().is_empty()) => {
                     tracing::info!(
-                        "database not ready (attempt {}/{attempts}); retrying: {err:#}",
+                        kind = ?startup_retry_kind(&err, !opts.url.trim().is_empty()),
+                        "database not ready (attempt {}/{attempts}); retrying",
                         i + 1
                     );
                     last = Some(err);
@@ -1176,8 +1192,7 @@ impl Db {
                         elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                         budget_ms = u64::try_from(budget.budget.as_millis()).unwrap_or(u64::MAX),
                         backoff_ms = u64::try_from(sleep_for.as_millis()).unwrap_or(u64::MAX),
-                        "database not ready; retrying: {:#}",
-                        last.as_ref().expect("retry stores the error")
+                        "database not ready; retrying"
                     );
                     tokio::time::sleep(sleep_for).await;
                 }

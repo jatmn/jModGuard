@@ -314,6 +314,14 @@ actions are what populate it).
 
 **Diagnostics in the log:** keep the default `log.level = "info"` for
 production. `JMODGUARD_LOG_LEVEL` overrides that setting; `RUST_LOG` is ignored.
+Only a single level (`error`, `warn`, `info`, `debug`, `trace`, or `off`) is accepted;
+invalid levels or target directives fall back to `info`. Sensitive dependency
+logging is capped at `warn` (`serenity`, `tungstenite`, `libsql`, `hyper`, `reqwest`),
+with `serenity::gateway` capped at `error`, even with application `debug`/`trace`.
+More restrictive application levels (`error` or `off`) still apply.
+These limits prevent raw gateway events, request bodies and query values from
+entering logs. Startup remote database labels include only scheme and host;
+configuration Debug output redacts credentials and remote database URLs.
 At `info`, per-message and per-guild debug diagnostics are suppressed, while
 startup, command and warning/error logs remain available. Enable `debug` only
 briefly for troubleshooting: message/guild/channel metadata and other diagnostics

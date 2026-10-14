@@ -191,12 +191,44 @@ pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
     u64::try_from(seconds).unwrap_or(u64::MAX).max(1)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: u64,
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+// Only protocol error codes are safe diagnostics. Even an `error` field is
+// untrusted provider text and may echo credentials; never print descriptions.
+fn token_error_code(bytes: &[u8]) -> &'static str {
+    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+    {
+        Some("invalid_request") => "invalid_request",
+        Some("invalid_client") => "invalid_client",
+        Some("invalid_grant") => "invalid_grant",
+        Some("unauthorized_client") => "unauthorized_client",
+        Some("unsupported_grant_type") => "unsupported_grant_type",
+        Some("invalid_scope") => "invalid_scope",
+        Some("server_error") => "server_error",
+        Some("temporarily_unavailable") => "temporarily_unavailable",
+        _ => "unknown_error",
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -381,10 +413,7 @@ impl OAuthClient {
             .into());
         }
         if !status.is_success() {
-            anyhow::bail!(
-                "discord oauth error {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+            anyhow::bail!("discord oauth error {status}: {}", token_error_code(&bytes));
         }
         serde_json::from_slice(&bytes).context("invalid oauth token response")
     }
@@ -1272,6 +1301,59 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = first.await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn token_debug_redacts_access_and_refresh() {
+        let token = TokenResponse {
+            access_token: "PRIVATE_ACCESS".into(),
+            refresh_token: Some("PRIVATE_REFRESH".into()),
+            expires_in: 3600,
+            scope: Some("identify".into()),
+        };
+        let shown = format!("{token:?}");
+        assert!(!shown.contains("PRIVATE_"));
+        assert!(shown.contains("3600"));
+        assert!(shown.contains("identify"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_errors_do_not_echo_provider_body() {
+        for (status, body, expected) in [
+            (
+                500,
+                r#"{"error":"server_error","error_description":"PRIVATE_RESPONSE","access_token":"PRIVATE_TOKEN"}"#,
+                "server_error",
+            ),
+            (500, r#"{"error":"PRIVATE_RESPONSE"}"#, "unknown_error"),
+            (502, "<html>PRIVATE_RESPONSE</html>", "unknown_error"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let app = axum::Router::new().route(
+                    "/token",
+                    axum::routing::post(move || async move {
+                        (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                    }),
+                );
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = test_oauth(
+                reqwest::Client::new(),
+                None,
+                Some(format!("http://{address}/token")),
+                None,
+            );
+            let result = client.exchange_code("PRIVATE_CODE").await;
+            server.abort();
+            let _ = server.await;
+            let error = result.unwrap_err();
+            let diagnostic = format!("{error:#} {error:?}");
+            assert!(diagnostic.contains(&status.to_string()));
+            assert!(diagnostic.contains(expected));
+            assert!(!diagnostic.contains("PRIVATE_"));
+        }
     }
 
     fn test_oauth(

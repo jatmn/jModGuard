@@ -78,11 +78,7 @@ async fn main() -> Result<()> {
     // Wait briefly so systemd/container start order can race the bot's first migrate.
     let cfg_for_state = cfg.clone();
     let open_cfg = cfg.clone();
-    let db_label = if cfg.db.url.is_empty() {
-        cfg.db.path.display().to_string()
-    } else {
-        cfg.db.url.clone()
-    };
+    let db_label = cfg.db.log_label();
     let web_app = health::serve_while(&listener, async {
         tokio::select! {
             result = async {

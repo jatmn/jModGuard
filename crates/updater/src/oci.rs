@@ -116,10 +116,13 @@ impl Registry {
             .http
             .get(url)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?
             .json()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         ensure!(!token.token.is_empty(), "GHCR returned an empty pull token");
         Ok(Some(token.token))
     }
@@ -138,7 +141,7 @@ impl Registry {
         if let Some(accept) = accept {
             request = request.header(ACCEPT, accept);
         }
-        let mut response = request.send().await?;
+        let mut response = request.send().await.map_err(reqwest::Error::without_url)?;
         ensure!(
             response.status().is_success(),
             "registry returned HTTP {}",
@@ -151,7 +154,11 @@ impl Registry {
         }
         let headers = response.headers().clone();
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
             ensure!(
                 body.len().saturating_add(chunk.len()) <= limit,
                 "registry object exceeds size limit"
@@ -431,6 +438,29 @@ fn extract_layer(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registry_transport_errors_omit_urls() {
+        // Exercise the same request owner used by API discovery and launcher downloads.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let registry = super::Registry::new(&format!("http://{addr}")).unwrap();
+        let error = registry
+            .get_limited(
+                format!("http://{addr}/PRIVATE_PATH?token=PRIVATE_TOKEN"),
+                None,
+                None,
+                1024,
+            )
+            .await
+            .unwrap_err();
+        let request = error.downcast_ref::<reqwest::Error>().unwrap();
+        assert!(request.url().is_none());
+        let diagnostic = format!("{error:#} {error:?}");
+        assert!(!diagnostic.contains("PRIVATE_"));
+        assert!(!diagnostic.contains(&format!("http://{addr}")));
+    }
+
     use super::*;
     use std::io::Write;
 

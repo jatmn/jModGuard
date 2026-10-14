@@ -43,7 +43,7 @@ pub fn init_tracing(cfg: &LogConfig, process: &str) {
     let dir = cfg.directory.clone();
     // The loader already applies JMODGUARD_LOG_LEVEL over log.level. Do not
     // override that configuration with RUST_LOG or crate-specific directives.
-    let filter = tracing_subscriber::EnvFilter::new(&cfg.level);
+    let filter = logging_filter(&cfg.level);
 
     let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -70,4 +70,94 @@ pub fn init_tracing(cfg: &LogConfig, process: &str) {
     // the writer thread and silently loses all log output.
     std::mem::forget(guard);
     fmt.with_writer(non_blocking).try_init().ok();
+}
+
+// Accept an application level, not arbitrary target directives that could
+// override the privacy limits with a more specific dependency target.
+fn logging_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    let level = level.parse::<LevelFilter>().unwrap_or(LevelFilter::INFO);
+    let mut filter = tracing_subscriber::EnvFilter::default().add_directive(level.into());
+    for (target, ceiling) in [
+        ("serenity", LevelFilter::WARN),
+        ("serenity::gateway", LevelFilter::ERROR),
+        ("tungstenite", LevelFilter::WARN),
+        ("libsql", LevelFilter::WARN),
+        ("hyper", LevelFilter::WARN),
+        ("reqwest", LevelFilter::WARN),
+    ] {
+        let directive = format!("{target}={}", level.min(ceiling));
+        filter = filter.add_directive(directive.parse().expect("valid logging directive"));
+    }
+    filter
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::logging_filter;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sensitive_library_events_are_filtered_at_every_app_level() {
+        for level in [
+            "debug",
+            "trace",
+            "info",
+            "warn",
+            "error",
+            "off",
+            "debug,serenity::gateway::ws=trace",
+        ] {
+            let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
+            let writer = bytes.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(logging_filter(level))
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "jmodguard_bot", "app debug");
+                tracing::info!(target: "jmodguard_api", "app info");
+                tracing::warn!(target: "serenity::gateway::ws", "PRIVATE gateway payload");
+                tracing::warn!(target: "serenity::gateway::shard", "PRIVATE shard payload");
+                tracing::debug!(target: "serenity::http::ratelimiting", "PRIVATE request body");
+                tracing::trace!(target: "tungstenite::protocol", "PRIVATE identify token");
+                tracing::debug!(target: "tungstenite::protocol", "PRIVATE frame");
+                tracing::trace!(target: "libsql::remote", "PRIVATE query values");
+                tracing::debug!(target: "hyper::client", "PRIVATE http");
+                tracing::debug!(target: "reqwest::connect", "PRIVATE URL");
+                tracing::warn!(target: "reqwest", "transport warning");
+                tracing::error!(target: "serenity::gateway", "gateway error");
+            });
+            let logs = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+            assert!(!logs.contains("PRIVATE"), "level {level}: {logs}");
+            assert_eq!(
+                logs.contains("app debug"),
+                matches!(level, "debug" | "trace")
+            );
+            assert_eq!(
+                logs.contains("app info"),
+                !matches!(level, "warn" | "error" | "off")
+            );
+            assert_eq!(
+                logs.contains("transport warning"),
+                !matches!(level, "error" | "off")
+            );
+            assert_eq!(logs.contains("gateway error"), level != "off");
+        }
+    }
 }

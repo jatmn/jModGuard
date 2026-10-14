@@ -47,13 +47,20 @@ impl Storage {
             .get(self.url(path)?)
             .header("AccessKey", &self.password)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let mut response = response.error_for_status()?;
+        let mut response = response
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         let mut out = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
             ensure!(
                 out.len().saturating_add(chunk.len()) <= 32 * 1024 * 1024,
                 "Storage object too large"
@@ -73,8 +80,10 @@ impl Storage {
             .header("Content-Type", content_type)
             .body(data.to_vec())
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         let stored = self
             .get(path)
             .await?
@@ -96,7 +105,8 @@ impl Storage {
             .delete(self.url(path)?)
             .header("AccessKey", &self.password)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         ensure!(
             response.status().is_success() || response.status() == StatusCode::NOT_FOUND,
             "Storage DELETE failed: {}",
@@ -240,7 +250,8 @@ impl Storage {
                 .delete(self.url(path)?)
                 .header("AccessKey", &self.password)
                 .send()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
             ensure!(
                 response.status().is_success() || response.status() == StatusCode::NOT_FOUND,
                 "Storage HTML restore failed"
@@ -289,6 +300,35 @@ mod tests {
     };
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
+    #[tokio::test]
+    async fn storage_status_errors_omit_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(|| async { StatusCode::FORBIDDEN }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let storage = Storage {
+            http: reqwest::Client::new(),
+            root: format!("http://{address}/PRIVATE_ZONE"),
+            password: "PRIVATE_PASSWORD".into(),
+        };
+        for result in [
+            storage.get("index.html").await.map(|_| ()),
+            storage
+                .put_verified("index.html", b"html", "text/html")
+                .await,
+        ] {
+            let error = result.unwrap_err();
+            let request = error.downcast_ref::<reqwest::Error>().unwrap();
+            assert!(request.url().is_none());
+            assert_eq!(request.status(), Some(StatusCode::FORBIDDEN));
+            assert!(!format!("{error:#} {error:?}").contains("PRIVATE_"));
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn storage_path_allowlist_excludes_directories_and_legacy_files() {
         assert!(is_managed("index.html"));

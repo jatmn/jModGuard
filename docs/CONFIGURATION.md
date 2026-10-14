@@ -33,8 +33,11 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 
 Use `info` for production. `JMODGUARD_LOG_LEVEL` overrides `log.level` and
 is the only environment override for tracing; `RUST_LOG` is ignored. The
-configured filter applies to all targets, with no automatic debug override
-for jModGuard. Per-message and per-guild diagnostics require `debug`.
+configured level applies to application targets, with no automatic debug override.
+Sensitive dependencies are capped at `warn`, with Serenity gateway logs capped at
+`error`; more restrictive configured levels still apply. Only a single level is
+accepted, not target directives. See [diagnostics setup](SETUP.md#11-troubleshooting).
+Per-message and per-guild diagnostics require `debug`.
 Enable it only briefly: diagnostic metadata can reveal per-user activity even
 though the per-message line omits author IDs and message text. Restrict log access.
 

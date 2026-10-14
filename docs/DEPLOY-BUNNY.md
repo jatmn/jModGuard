@@ -245,7 +245,7 @@ stdout/stderr. They set `JMODGUARD_REQUIRE_REMOTE_DB=1`: missing Bunny
 secrets exit instead of opening SQLite on ephemeral disk.
 
 Use `JMODGUARD_LOG_LEVEL=info` for production (the default). It overrides
-`log.level` in `config.toml` and controls all tracing targets; `RUST_LOG`
+`log.level` in `config.toml` and controls application tracing; `RUST_LOG`
 is ignored. At `info`, per-message and per-guild debug diagnostics are suppressed.
 Enable `debug` only briefly for troubleshooting: debug logs include message,
 guild and channel IDs, sizes and attachment counts. Although the per-message

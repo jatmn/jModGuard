@@ -47,7 +47,8 @@ pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
             Err(error) if db::is_startup_retryable(&error, remote) => {
                 tracing::warn!(
                     attempt,
-                    "API database is not ready; retrying without migrating: {error:#}"
+                    kind = ?db::startup_retry_kind(&error, remote),
+                    "API database is not ready; retrying without migrating"
                 );
                 tokio::time::sleep(db::startup_backoff(
                     attempt,
@@ -115,7 +116,8 @@ pub async fn build_state(cfg: ApiProcessConfig, db: Db) -> Result<Arc<ApiState>>
             Ok(Err(error)) if db::is_startup_retryable(&error, remote) => {
                 tracing::warn!(
                     attempt,
-                    "API starting-state read is not ready; retrying: {error:#}"
+                    kind = ?db::startup_retry_kind(&error, remote),
+                    "API starting-state read is not ready; retrying"
                 );
             }
             Ok(Err(error)) => return Err(error),

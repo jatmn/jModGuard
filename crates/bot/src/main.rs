@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
             if cfg.is_remote_db() {
                 format!(
                     "failed to open remote database {} after waiting for a transient connect/bootstrap",
-                    cfg.db.url
+                    cfg.db.log_label()
                 )
             } else {
                 format!("failed to open database {}", cfg.db.path.display())
@@ -198,14 +198,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
-    tracing::info!(
-        "database ready (migrate=true) at {}",
-        if cfg.db.url.is_empty() {
-            cfg.db.path.display().to_string()
-        } else {
-            cfg.db.url.clone()
-        }
-    );
+    tracing::info!("database ready (migrate=true) at {}", cfg.db.log_label());
 
     let app = BotState::new(cfg.clone(), db)?;
     let activation = Arc::clone(&app.activation);
