@@ -1374,6 +1374,218 @@ async fn lease_renewal_bypasses_exhausted_core_pool() {
     super::cleanup_db(&path);
 }
 
+// Exercise the public renewal owner through both libSQL backends. The remote
+// variant uses the real HTTP client with the existing SQLite-backed Hrana fixture.
+async fn lease_extend_only_cases(use_remote: bool) {
+    let path = super::tmp_db_path("lease_extend_only");
+    let local = Db::open(&path, 2).unwrap();
+    let fixture = if use_remote {
+        let fixture = HranaFixture::start().await;
+        let runtime = DbRuntime::new().unwrap();
+        let backing = runtime
+            .block_on(libsql::Builder::new_local(&path).build())
+            .unwrap()
+            .connect()
+            .unwrap();
+        fixture.state.lock().unwrap().backing = Some((runtime, backing));
+        Some(fixture)
+    } else {
+        None
+    };
+    let db = fixture
+        .as_ref()
+        .map_or_else(|| local.clone(), HranaFixture::db);
+    let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let foreign = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let now = crate::control::now_ms();
+    assert!(
+        claim_active_bot(&db, owner, now, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let generation = db.leased_generation().unwrap();
+    let stored = || {
+        local
+            .with_conn_sync(|conn| {
+                Ok((
+                    meta_string_conn(conn, "active_bot_lease")?.unwrap(),
+                    meta_string_conn(conn, "active_bot_generation")?.unwrap(),
+                ))
+            })
+            .unwrap()
+    };
+    for (label, offset, expected_offset, matches) in [
+        ("equal", 0, 0, true),
+        ("earlier", -1, 0, true),
+        ("backward clock", -30_000, 0, true),
+        ("forward clock within lease", 1_000, 1_000, true),
+        ("expired at exact boundary", 21_000, 1_000, false),
+        ("forward clock beyond lease", 30_000, 1_000, false),
+    ] {
+        assert_eq!(
+            renew_active_bot(
+                &db,
+                owner,
+                now + offset,
+                std::time::Instant::now() + Duration::from_secs(10),
+                Arc::clone(&refuse)
+            )
+            .await
+            .unwrap(),
+            matches,
+            "{label}"
+        );
+        assert_eq!(
+            stored(),
+            (
+                format!(
+                    "{owner} {}",
+                    now + ACTIVE_BOT_LEASE_TTL_MS + expected_offset
+                ),
+                generation.to_string()
+            ),
+            "{label}"
+        );
+    }
+
+    // An unarmed caller takes the interactive claim fallback even when this
+    // holder already owns the row. That path must preserve the later expiry too.
+    db.arm_writer_term(owner, 0);
+    assert_eq!(db.leased_generation(), Some(0));
+    assert!(
+        renew_active_bot(
+            &db,
+            owner,
+            now,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse)
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        stored(),
+        (format!("{owner} {}", now + 21_000), generation.to_string())
+    );
+
+    // Each ownership predicate must independently reject an otherwise valid
+    // extension, including a same-holder term mismatch (ABA).
+    for (label, holder, term) in [
+        ("stale holder", foreign, generation),
+        ("stale generation", owner, generation + 1),
+    ] {
+        db.arm_writer_term(holder, term);
+        let before = stored();
+        assert!(
+            !renew_active_bot(
+                &db,
+                holder,
+                now + 4_000,
+                std::time::Instant::now() + Duration::from_secs(10),
+                Arc::clone(&refuse)
+            )
+            .await
+            .unwrap(),
+            "{label}"
+        );
+        assert_eq!(stored(), before, "{label}");
+    }
+    db.arm_writer_term(owner, generation);
+    let later = fixture
+        .as_ref()
+        .map_or_else(|| Db::open(&path, 2).unwrap(), HranaFixture::db);
+    later.arm_writer_term(owner, generation);
+
+    // Queue a renewal behind this handle's dedicated connection. Polling once
+    // captures the term and submits its blocking job. Another handle writes
+    // first, then the queued request must respect that new durable state.
+    for (label, pending_offset, later_offset, holder, matches, expected_offset) in [
+        ("overlapping renewals", 2_000, 3_000, owner, true, 23_000),
+        (
+            "late write after takeover",
+            25_000,
+            24_000,
+            foreign,
+            false,
+            44_000,
+        ),
+        (
+            "late write after same-holder takeover",
+            46_000,
+            45_000,
+            owner,
+            false,
+            65_000,
+        ),
+    ] {
+        let blocked = db.clone();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _slot = blocked.lease_connection.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.await.unwrap();
+        let mut pending = Box::pin(renew_active_bot(
+            &db,
+            owner,
+            now + pending_offset,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let later_result = if matches {
+            renew_active_bot(
+                &later,
+                holder,
+                now + later_offset,
+                std::time::Instant::now() + Duration::from_secs(10),
+                Arc::clone(&refuse),
+            )
+            .await
+        } else {
+            claim_active_bot(&later, holder, now + later_offset, Arc::clone(&refuse)).await
+        };
+        if !matches && holder == owner {
+            // Re-arming even this same handle must not rebind the queued request.
+            db.arm_writer_term(owner, later.leased_generation().unwrap());
+        }
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(later_result.unwrap(), "{label}");
+        assert_eq!(pending.await.unwrap(), matches, "{label}");
+        assert_eq!(
+            stored(),
+            (
+                format!("{holder} {}", now + expected_offset),
+                later.leased_generation().unwrap().to_string()
+            ),
+            "{label}"
+        );
+    }
+    drop(later);
+    drop(db);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_extend_only_local() {
+    lease_extend_only_cases(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_extend_only_remote() {
+    lease_extend_only_cases(true).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
     let path = super::tmp_db_path("lease_cas_fences");
