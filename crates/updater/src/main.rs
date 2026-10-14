@@ -72,6 +72,33 @@ impl RestartPolicy {
         false
     }
 
+    async fn retry_auth_with_health(
+        &mut self,
+        now: Instant,
+        health: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+        bind: Option<&str>,
+    ) -> Result<bool> {
+        if !self.retry_auth(now) {
+            return Ok(false);
+        }
+        // Replace the captured hold reason before any fallible control work.
+        // The boot loop/supervisor is the sole owner of policy transitions.
+        if let Some(task) = health.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(bind) = bind {
+            *health = Some(tokio::spawn(
+                jmodguard::health::serve_listener_as_with_reason(
+                    jmodguard::health::bind(bind).await?,
+                    "launcher",
+                    self.not_ready_reason(),
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
     fn recovered(&mut self) {
         self.auth_failures = 0;
         self.auth_retry_at = None;
@@ -1448,7 +1475,15 @@ impl Supervisor {
     async fn tick(&mut self) -> Result<bool> {
         // Hold before control reads, restore, update selection or rollback.
         let held = self.hold_rejected_token().await?;
-        if (held && !self.restart.retry_auth(Instant::now()))
+        if (held
+            && !self
+                .restart
+                .retry_auth_with_health(
+                    Instant::now(),
+                    &mut self.health,
+                    self.health_bind.as_deref(),
+                )
+                .await?)
             || (self.running.is_none() && self.restart.waiting(Instant::now()))
         {
             self.idle().await?;
@@ -1701,7 +1736,9 @@ async fn main() -> Result<()> {
                 ));
             }
         }
-        restart.retry_auth(Instant::now());
+        restart
+            .retry_auth_with_health(Instant::now(), &mut boot_health, health_bind.as_deref())
+            .await?;
         let open_opts = opts.clone();
         match tokio::task::spawn_blocking(move || UpdateControl::open(&open_opts)).await? {
             Ok(Some(control)) => {
@@ -2201,6 +2238,29 @@ mod tests {
         policy.exited(true, Some(1), Duration::from_secs(300), now);
         assert_eq!(policy.not_before, Some(now + POLL));
         assert!(!policy.held);
+    }
+
+    #[test]
+    fn fresh_restart_policy_has_no_process_local_hold_reason() {
+        assert_eq!(RestartPolicy::default().not_ready_reason(), "not ready");
+    }
+
+    #[test]
+    fn retry_and_recovery_clear_the_ready_hold_reason() {
+        let mut policy = RestartPolicy::default();
+        let now = Instant::now();
+        policy.exited(
+            true,
+            Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE),
+            Duration::ZERO,
+            now,
+        );
+        assert_eq!(policy.not_ready_reason(), "discord token rejected");
+        assert!(policy.retry_auth(policy.auth_retry_at.unwrap()));
+        assert_eq!(policy.not_ready_reason(), "not ready");
+        // Recovery occurs after a retry child starts, never while still held.
+        policy.recovered();
+        assert_eq!(policy.not_ready_reason(), "not ready");
     }
 
     #[test]
