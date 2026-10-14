@@ -189,27 +189,57 @@ where
 
 fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let result = match control.launcher_fence_deadline() {
-                Some(deadline) if Instant::now() < deadline => {
-                    renew_launcher_fence_promptly(deadline, || control.renew_launcher_fence_cas())
-                        .await
-                }
-                // Confirm authority again through the existing fenced acquisition;
-                // extending an expired local horizon would trust an unconfirmed owner.
-                _ => control.renew_launcher_fence().await,
-            };
-            match result {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
-                Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
-            }
-        }
+        renew_launcher_fence_periodically(&control, || control.renew_launcher_fence_cas()).await;
     })
+}
+
+async fn renew_launcher_fence_periodically<F, Fut>(control: &UpdateControl, mut renew: F)
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<bool>> + Send,
+{
+    let mut interval = tokio::time::interval(POLL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    let mut reclaim_at = control.launcher_fence_deadline();
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = async {
+                match reclaim_at {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+        let result = match control.launcher_fence_deadline() {
+            Some(deadline) if Instant::now() < deadline => {
+                let result = renew_launcher_fence_promptly(deadline, &mut renew).await;
+                // A spent window wakes the next iteration immediately, even if
+                // the next regular poll is still in the future.
+                reclaim_at = control.launcher_fence_deadline();
+                result
+            }
+            // Confirm authority again through the existing fenced acquisition;
+            // extending an expired local horizon would trust an unconfirmed owner.
+            _ => {
+                let result = control.renew_launcher_fence().await;
+                // Attempt each expired horizon once; a failed acquisition must
+                // fall back to polling rather than spin on the elapsed timer.
+                reclaim_at = control
+                    .launcher_fence_deadline()
+                    .filter(|deadline| Instant::now() < *deadline);
+                result
+            }
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("bot launcher fence is held by another launcher"),
+            Err(error) => tracing::warn!("bot launcher fence renewal failed: {error:#}"),
+        }
+    }
 }
 
 fn role() -> Result<String> {
@@ -2103,7 +2133,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launcher_periodic_tick_recovers_after_a_hung_tick_and_resumes_cas() {
+    async fn launcher_recovers_at_expiry_after_a_hung_tick_and_resumes_cas() {
+        assert_launcher_recovers_at_expiry(true).await;
+    }
+
+    #[tokio::test]
+    async fn launcher_recovers_at_expiry_after_renewal_errors_and_resumes_cas() {
+        assert_launcher_recovers_at_expiry(false).await;
+    }
+
+    async fn assert_launcher_recovers_at_expiry(hung: bool) {
         let path = std::env::temp_dir().join(format!(
             "launcher_recover_{:032x}.db",
             rand::random::<u128>()
@@ -2113,25 +2152,34 @@ mod tests {
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
-        // Real 20s fence: a hung production renewal owner spends the window.
-        assert!(
-            renew_launcher_fence_promptly(before, std::future::pending::<Result<bool>>)
-                .await
-                .is_err()
-        );
-        assert_eq!(control.launcher_fence_deadline(), Some(before));
-        assert!(Instant::now() >= before);
-        let renewal = spawn_launcher_fence_renewal(control.clone());
-        let recovered = tokio::time::timeout(POLL + Duration::from_secs(3), async {
-            while control.launcher_fence_deadline() == Some(before) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        // Offset the poll schedule from the real 20s authority deadline.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let renewing = control.clone();
+        let renewal = tokio::spawn(async move {
+            renew_launcher_fence_periodically(&renewing, || async {
+                if renewing.launcher_fence_deadline() == Some(before) {
+                    if hung {
+                        std::future::pending::<()>().await;
+                    }
+                    return Err(anyhow::anyhow!("provider unavailable"));
+                }
+                renewing.renew_launcher_fence_cas().await
+            })
+            .await;
+        });
+        let recovered = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(before + Duration::from_secs(1)),
+            async {
+                while control.launcher_fence_deadline() == Some(before) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
         .await;
         if recovered.is_err() {
             renewal.abort();
             let _ = renewal.await;
-            panic!("next periodic tick must reacquire after expiry");
+            panic!("spent-window renewal must reclaim before the next regular poll");
         }
         let rearmed = control.launcher_fence_deadline().unwrap();
         let resumed = tokio::time::timeout(POLL + Duration::from_secs(3), async {
@@ -2158,9 +2206,34 @@ mod tests {
         assert!(
             row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap() > jmodguard::control::now_ms()
         );
-        eprintln!(
-            "hung tick expired; periodic task reacquired, rearmed horizon and resumed CAS; durable fence live"
-        );
+        drop(control);
+        drop(db);
+        remove_launcher_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn launcher_reclaims_an_already_expired_window_without_waiting_for_a_tick() {
+        let path = std::env::temp_dir().join(format!(
+            "launcher_expired_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+        control.arm_launcher_fence(&"a".repeat(32));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let before = control.launcher_fence_deadline().unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(before)).await;
+        let renewal = spawn_launcher_fence_renewal(control.clone());
+        let recovered = tokio::time::timeout(Duration::from_secs(1), async {
+            while control.launcher_fence_deadline() == Some(before) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        renewal.abort();
+        assert!(renewal.await.unwrap_err().is_cancelled());
+        recovered.expect("an expired window must trigger immediate fenced acquisition");
+        assert!(control.launcher_fence_deadline().unwrap() > before);
         drop(control);
         drop(db);
         remove_launcher_test_db(&path);
