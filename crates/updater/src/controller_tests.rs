@@ -2955,6 +2955,136 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
+async fn assert_launcher_health(addr: std::net::SocketAddr, reason: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (path, status, body) in [
+        ("/health", "HTTP/1.1 200 OK", "ok"),
+        ("/ready", "HTTP/1.1 503 Service Unavailable", reason),
+    ] {
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with(status), "{response}");
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1, body);
+    }
+}
+
+async fn held_launcher_health(
+    restart: &mut RestartPolicy,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    restart.exited(
+        true,
+        Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE),
+        Duration::ZERO,
+        Instant::now(),
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(jmodguard::health::serve_listener_as_with_reason(
+        listener,
+        "launcher",
+        restart.not_ready_reason(),
+    ));
+    assert_launcher_health(addr, "discord token rejected").await;
+    // Move only the deadline: preserve the production hold/retry transition.
+    restart.auth_retry_at = Some(Instant::now());
+    (addr, task)
+}
+
+#[tokio::test]
+async fn failed_auth_retry_tick_refreshes_ready_reason_before_control_error() {
+    let root = std::env::temp_dir().join(format!("retry-tick-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let (addr, task) = held_launcher_health(&mut bot.restart).await;
+    bot.health = Some(task);
+    bot.health_bind = Some(addr.to_string());
+    db.with_conn_sync(|conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute_bounded(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('component_upgrade_v1','invalid')",
+            (),
+            64 * 1024,
+        )?;
+        tx.commit()
+    })
+    .unwrap();
+    let error = bot.tick().await.unwrap_err();
+    assert!(error.to_string().contains("expected value"), "{error:#}");
+    assert!(!bot.restart.held);
+    assert!(bot.running.is_none());
+    assert_launcher_health(addr, "not ready").await;
+    // Later failed polls must not restore the stale reason, either.
+    assert!(bot.tick().await.is_err());
+    assert_launcher_health(addr, "not ready").await;
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_auth_retry_boot_open_keeps_current_ready_reason() {
+    let root = std::env::temp_dir().join(format!("retry-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let opts = DbOpenOptions {
+        path: root.join("core.db"),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        read_only: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let db = Db::open_with(opts.clone()).unwrap();
+    db.with_conn_sync(|conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute_bounded(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            params!["foreign", "schema_family"],
+            64 * 1024,
+        )?;
+        tx.commit()
+    })
+    .unwrap();
+    let mut restart = RestartPolicy::default();
+    let (addr, task) = held_launcher_health(&mut restart).await;
+    let mut health = Some(task);
+    assert!(
+        restart
+            .retry_auth_with_health(Instant::now(), &mut health, Some(&addr.to_string()))
+            .await
+            .unwrap()
+    );
+    // Same retry/open ordering as the boot loop; the database failure is real.
+    let error = UpdateControl::open(&opts)
+        .err()
+        .expect("foreign store must fail");
+    assert!(
+        error.to_string().contains("unsupported update-control"),
+        "{error:#}"
+    );
+    assert!(!restart.held);
+    assert_launcher_health(addr, "not ready").await;
+    let task = health.take().unwrap();
+    task.abort();
+    let _ = task.await;
+    drop(db);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 #[tokio::test]
 async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3086,6 +3216,7 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     }
     assert!(bot.restart.held);
     assert_eq!(bot.restart.auth_failures, 2);
+    assert_launcher_health(addr, "discord token rejected").await;
     let next = bot
         .restart
         .auth_retry_at
@@ -3114,6 +3245,9 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     }
     assert!(!bot.restart.held);
     assert_eq!(bot.restart.auth_failures, 0);
+    assert!(bot.health.is_none(), "start must release the idle listener");
+    let released = tokio::net::TcpListener::bind(addr).await.unwrap();
+    drop(released);
     assert!(bot.restart.auth_retry_at.is_none());
     assert_eq!(
         logs.lock()
@@ -3125,6 +3259,7 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     );
     drop(guard);
     bot.stop_application().await.unwrap();
+    assert_launcher_health(addr, "not ready").await;
     bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
