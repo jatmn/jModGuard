@@ -52,6 +52,9 @@ const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 const GATEWAY_MANUAL_BAN_AUDIT_TTL: Duration = Duration::from_secs(120);
 const MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE: usize = 8;
 const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
+/// Idle failure cutoffs kept on one lock stripe. In-flight observations stay
+/// even when that pushes the stripe over this cap.
+const MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayCaseSuppression {
@@ -107,9 +110,12 @@ struct GatewayBanEchoEntry {
 
 /// Lock stripes stay fixed so the mutex table cannot grow. The gate itself is
 /// per guild and user: a shared stripe may delay the other member's wait, and
-/// it must not change that member's in-flight count or failure cutoff.
+/// it must not change that member's own in-flight count or failure cutoff.
+/// Idle entries past the per-stripe cap fold into `cutoff_floor_ms`, which only
+/// rises, and that floor covers a member who no longer has an entry.
 struct GatewayBanFlight {
     started_at_ms: i64,
+    cutoff_floor_ms: i64,
     subjects: HashMap<(u64, u64), GatewayBanSubject>,
 }
 
@@ -154,6 +160,54 @@ fn apply_gateway_ban_release(
     if idle {
         flight.subjects.remove(&(guild, user));
     }
+    reclaim_idle_ban_subjects(flight);
+}
+
+fn ban_subject_cutoff(subject: &GatewayBanSubject) -> i64 {
+    subject.failed_through_ms.max(subject.uncertain_through_ms)
+}
+
+/// Drop the idle subject with the lowest cutoff and raise the stripe floor.
+/// In-flight subjects stay put.
+fn evict_one_idle_ban_subject(flight: &mut GatewayBanFlight) -> bool {
+    let victim = flight
+        .subjects
+        .iter()
+        .filter(|(_, subject)| subject.active == 0)
+        .min_by_key(|(key, subject)| (ban_subject_cutoff(subject), *key))
+        .map(|(key, _)| *key);
+    let Some(victim) = victim else {
+        return false;
+    };
+    let Some(subject) = flight.subjects.remove(&victim) else {
+        return false;
+    };
+    flight.cutoff_floor_ms = flight.cutoff_floor_ms.max(ban_subject_cutoff(&subject));
+    true
+}
+
+fn reclaim_idle_ban_subjects(flight: &mut GatewayBanFlight) {
+    while flight.subjects.len() > MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE {
+        if !evict_one_idle_ban_subject(flight) {
+            return;
+        }
+    }
+}
+
+fn make_room_for_ban_subject(flight: &mut GatewayBanFlight, guild: u64, user: u64) {
+    if flight.subjects.contains_key(&(guild, user)) {
+        return;
+    }
+    while flight.subjects.len() >= MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE {
+        if !evict_one_idle_ban_subject(flight) {
+            tracing::warn!(
+                subjects = flight.subjects.len(),
+                cap = MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE,
+                "gateway ban stripe retained in-flight subjects above its cap"
+            );
+            return;
+        }
+    }
 }
 
 impl GatewayBanObservation {
@@ -162,7 +216,7 @@ impl GatewayBanObservation {
         let subject = flight.subjects.get(&(self.guild, self.user));
         let uncertain = subject
             .map(|subject| subject.uncertain_through_ms)
-            .unwrap_or(flight.started_at_ms);
+            .unwrap_or_else(|| flight.started_at_ms.max(flight.cutoff_floor_ms));
         let active = subject.map(|subject| subject.active).unwrap_or(0);
         if active > 1 {
             uncertain.max(self.observed.timestamp_millis())
@@ -811,6 +865,7 @@ impl BotState {
                 std::array::from_fn(|_| {
                     Arc::new(tokio::sync::Mutex::new(GatewayBanFlight {
                         started_at_ms,
+                        cutoff_floor_ms: 0,
                         subjects: HashMap::new(),
                     }))
                 })
@@ -1178,6 +1233,7 @@ impl BotState {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
         let observed = {
             let mut state = flight.lock().await;
+            make_room_for_ban_subject(&mut state, guild, user);
             let started_at_ms = state.started_at_ms;
             let subject = state
                 .subjects
@@ -1229,9 +1285,10 @@ impl BotState {
                 // must not release the fence while SQL is still running.
                 let flight = flight.blocking_lock();
                 let audit_at = (entry_id >> 22) + 1_420_070_400_000;
-                let blocked = flight.subjects.get(&(guild, user)).is_some_and(|subject| {
-                    subject.active != 0 || audit_at <= subject.failed_through_ms
-                });
+                let blocked = match flight.subjects.get(&(guild, user)) {
+                    Some(subject) => subject.active != 0 || audit_at <= subject.failed_through_ms,
+                    None => audit_at <= flight.cutoff_floor_ms,
+                };
                 if blocked {
                     return Ok(false);
                 }
@@ -2127,6 +2184,182 @@ mod tests {
             observation.finish(true).await;
         }
         held.join().unwrap();
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn users_on_one_stripe(shards: usize, count: usize) -> Vec<u64> {
+        let mut users = Vec::with_capacity(count);
+        let mut stripe = None;
+        for user in 1..1_000_000u64 {
+            let index = gateway_ban_flight_index(10, user, shards);
+            if stripe.is_none() || stripe == Some(index) {
+                stripe = Some(index);
+                users.push(user);
+                if users.len() == count {
+                    return users;
+                }
+            }
+        }
+        panic!("not enough synthetic users on one flight stripe");
+    }
+
+    fn audit_id_at(ms: i64) -> i64 {
+        (ms - 1_420_070_400_000) << 22
+    }
+
+    #[tokio::test]
+    async fn evicted_idle_ban_cutoff_remains_a_stripe_floor() {
+        let users = users_on_one_stripe(256, MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE + 1);
+        let stripe = gateway_ban_flight_index(10, users[0], 256);
+        let directory =
+            std::env::temp_dir().join(format!("stripe_floor_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let base = (chrono::Utc::now().timestamp() + 120) * 1000;
+        for (offset, user) in users.iter().enumerate() {
+            let mut observation = app.begin_gateway_ban_observation(10, *user).await;
+            observation.observed =
+                chrono::DateTime::from_timestamp_millis(base + (offset as i64) * 10_000).unwrap();
+            observation.finish(false).await;
+        }
+        let floor = {
+            let flight = app.gateway_ban_flights[stripe].lock().await;
+            assert_eq!(flight.subjects.len(), MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE);
+            assert!(!flight.subjects.contains_key(&(10, users[0])));
+            assert!(flight.subjects.contains_key(&(10, *users.last().unwrap())));
+            assert!(flight.cutoff_floor_ms >= base);
+            flight.cutoff_floor_ms
+        };
+        let early = chrono::DateTime::from_timestamp_millis(base)
+            .unwrap()
+            .to_rfc3339();
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            users[0] as i64,
+            None,
+            None,
+            Some(&early),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let early_audit = audit_id_at(base);
+        assert!(
+            !app.reconcile_gateway_manual_ban_audit_entry(
+                Some(scope.clone()),
+                10,
+                users[0],
+                early_audit
+            )
+            .await
+            .unwrap()
+        );
+        let later_ms = floor + 10_000;
+        let later = chrono::DateTime::from_timestamp_millis(later_ms)
+            .unwrap()
+            .to_rfc3339();
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            users[0] as i64,
+            None,
+            None,
+            Some(&later),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.reconcile_gateway_manual_ban_audit_entry(
+                Some(scope.clone()),
+                10,
+                users[0],
+                audit_id_at(later_ms)
+            )
+            .await
+            .unwrap()
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_ban_subjects_remain_when_the_stripe_exceeds_its_cap() {
+        let users = users_on_one_stripe(256, MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE + 1);
+        let stripe = gateway_ban_flight_index(10, users[0], 256);
+        let directory =
+            std::env::temp_dir().join(format!("stripe_active_cap_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let at_ms = (chrono::Utc::now().timestamp() + 120) * 1000;
+        let at = chrono::DateTime::from_timestamp_millis(at_ms)
+            .unwrap()
+            .to_rfc3339();
+        let audit = audit_id_at(at_ms);
+        for user in &users {
+            db::record_gateway_ban(
+                &app.db,
+                Some(scope.clone()),
+                *user as i64,
+                None,
+                None,
+                Some(&at),
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let mut held = Vec::with_capacity(users.len());
+        for user in &users {
+            held.push(app.begin_gateway_ban_observation(10, *user).await);
+        }
+        {
+            let flight = app.gateway_ban_flights[stripe].lock().await;
+            assert!(flight.subjects.len() > MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE);
+            for user in &users {
+                assert!(
+                    flight
+                        .subjects
+                        .get(&(10, *user))
+                        .is_some_and(|subject| subject.active > 0),
+                    "{user}"
+                );
+            }
+        }
+        for user in &users {
+            assert!(
+                !app.reconcile_gateway_manual_ban_audit_entry(
+                    Some(scope.clone()),
+                    10,
+                    *user,
+                    audit
+                )
+                .await
+                .unwrap(),
+                "{user}"
+            );
+        }
+        for observation in held {
+            observation.finish(true).await;
+        }
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }

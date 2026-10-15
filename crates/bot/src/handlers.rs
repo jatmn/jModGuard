@@ -577,6 +577,12 @@ impl EventHandler for Handler {
             banned_user.id.get(),
         )
         .await;
+        // Sample the fence and the queued audits before resolve. Any wait after
+        // resolve lets a failed dispatch clear this echo, and persistence would
+        // keep the stale ownership decision.
+        let audit_after_ms = in_flight.audit_after_ms().await;
+        let pending_audits =
+            app.pending_gateway_manual_ban_audit_entries(guild_id.get(), banned_user.id.get());
         let echo = echo.resolve();
         let observed_at = observed.to_rfc3339();
         // A bot echo is not a second ban and not a manual moderation record.
@@ -588,7 +594,6 @@ impl EventHandler for Handler {
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. Id-less redeliveries retain bounded
         // observations; only a distinguishing late audit creates another row.
-        let audit_after_ms = in_flight.audit_after_ms().await;
         let ban_write = crate::logging::log_persistence_result(
             "gateway ban row",
             persist_gateway_ban_observation(
@@ -609,10 +614,7 @@ impl EventHandler for Handler {
                     echo.operation_id.as_deref(),
                     member_was_banned,
                     db::GatewayBanAuditEntries::Observed {
-                        pending: app.pending_gateway_manual_ban_audit_entries(
-                            guild_id.get(),
-                            banned_user.id.get(),
-                        ),
+                        pending: pending_audits,
                         audit_after_ms,
                     },
                 ),
