@@ -7,6 +7,7 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
 use jmodguard_updater::oci::{Registry, sha256_hex};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -130,6 +131,43 @@ struct Running {
     started: Instant,
     release: Option<ComponentRelease>,
     path: PathBuf,
+}
+
+/// Last binary this supervisor started. A crash can relaunch it without a
+/// control read; an intentional stop leaves `exited_for_restart` clear.
+#[derive(Clone)]
+struct RestartTarget {
+    path: PathBuf,
+    source_sha: String,
+    release: Option<ComponentRelease>,
+}
+
+#[derive(Debug)]
+enum ChildLiveness {
+    Running,
+    Exited(Option<i32>),
+    Reaped,
+}
+
+/// Serves launcher health after the watched child exits. Drop aborts both the
+/// watcher and a listener it bound but the supervisor has not adopted yet.
+struct ChildExitWatch {
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    bound: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
+}
+
+impl Drop for ChildExitWatch {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Ok(mut slot) = self.bound.lock()
+            && let Some(serve) = slot.take()
+        {
+            serve.abort();
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -328,6 +366,191 @@ async fn stop(running: &mut Running) -> Result<()> {
     Ok(())
 }
 
+fn open_pidfd(pid: u32) -> std::io::Result<std::fs::File> {
+    // SAFETY: pidfd_open only inspects `pid`. A non-negative result is a new fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the syscall returned a unique fd. `File` closes it on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd as std::os::fd::RawFd) })
+}
+
+/// `WNOWAIT` so the supervisor can still reap the same child with `try_wait`.
+fn child_liveness(pidfd: std::os::fd::RawFd) -> std::io::Result<ChildLiveness> {
+    child_liveness_wait(libc::P_PIDFD, pidfd as libc::id_t)
+}
+
+/// Same observation when `pidfd_open` is unavailable. `WNOWAIT` still does not reap.
+fn child_liveness_pid(pid: u32) -> std::io::Result<ChildLiveness> {
+    child_liveness_wait(libc::P_PID, pid as libc::id_t)
+}
+
+fn child_liveness_wait(kind: libc::idtype_t, id: libc::id_t) -> std::io::Result<ChildLiveness> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is zeroed and lives for the call. `WNOWAIT` does not reap.
+        let rc = unsafe {
+            libc::waitid(
+                kind,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(ChildLiveness::Reaped);
+            }
+            return Err(error);
+        }
+        // SAFETY: a zero `si_pid` means waitid found nobody. Otherwise this is SIGCHLD.
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(ChildLiveness::Running);
+        }
+        return Ok(match info.si_code {
+            libc::CLD_EXITED => ChildLiveness::Exited(Some(unsafe { info.si_status() })),
+            libc::CLD_KILLED | libc::CLD_DUMPED => ChildLiveness::Exited(None),
+            _ => ChildLiveness::Running,
+        });
+    }
+}
+
+fn readiness_for_exit(code: Option<i32>) -> &'static str {
+    if code == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+        "discord token rejected"
+    } else {
+        "not ready"
+    }
+}
+
+fn addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// Retry only while the exited child still owns the socket. Other bind errors
+/// stop immediately. `WNOWAIT` observation stays in the caller.
+async fn bind_health_retry(
+    addr: &str,
+    reason: &'static str,
+    deadline: Instant,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match jmodguard::health::bind(addr).await {
+            Ok(listener) => {
+                return Some(tokio::spawn(
+                    jmodguard::health::serve_listener_as_with_reason(listener, "launcher", reason),
+                ));
+            }
+            Err(error) if addr_in_use(&error) && Instant::now() < deadline => {
+                let pause = delay.min(deadline.saturating_duration_since(Instant::now()));
+                if pause.is_zero() {
+                    tracing::warn!("launcher health bind stayed busy: {error:#}");
+                    return None;
+                }
+                tokio::select! {
+                    _ = &mut *cancel => return None,
+                    _ = tokio::time::sleep(pause) => {}
+                }
+                delay = delay.saturating_mul(2).min(Duration::from_millis(200));
+            }
+            Err(error) if addr_in_use(&error) => {
+                tracing::warn!("launcher health bind stayed busy: {error:#}");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!("launcher health bind failed: {error:#}");
+                return None;
+            }
+        }
+    }
+}
+
+async fn watch_child_health(
+    pid: u32,
+    bind: String,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+    bound: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
+) {
+    watch_child_health_from(pid, bind, cancel, bound, true).await
+}
+
+/// `prefer_pidfd` is false only when the test is covering the pid fallback.
+/// A pidfd failure keeps watching until cancel so this tick can still bind health.
+async fn watch_child_health_from(
+    pid: u32,
+    bind: String,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+    bound: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
+    prefer_pidfd: bool,
+) {
+    let mut pidfd = if prefer_pidfd {
+        match open_pidfd(pid) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                tracing::warn!("pidfd_open failed; watching the child pid instead: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut logged_pidfd_loss = false;
+    loop {
+        tokio::select! {
+            _ = &mut cancel => return,
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        let liveness = if let Some(file) = pidfd.as_ref() {
+            match child_liveness(file.as_raw_fd()) {
+                Ok(liveness) => liveness,
+                Err(error) => {
+                    if !logged_pidfd_loss {
+                        tracing::warn!(
+                            "pidfd wait failed; watching the child pid instead: {error}"
+                        );
+                        logged_pidfd_loss = true;
+                    }
+                    pidfd = None;
+                    continue;
+                }
+            }
+        } else {
+            match child_liveness_pid(pid) {
+                Ok(liveness) => liveness,
+                Err(_) => continue,
+            }
+        };
+        match liveness {
+            ChildLiveness::Running => {}
+            ChildLiveness::Exited(code) => {
+                if let Some(serve) = bind_health_retry(
+                    &bind,
+                    readiness_for_exit(code),
+                    Instant::now() + POLL,
+                    &mut cancel,
+                )
+                .await
+                {
+                    *bound.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(serve);
+                }
+                return;
+            }
+            ChildLiveness::Reaped => return,
+        }
+    }
+}
+
 async fn stage(
     registry: &Registry,
     release: &ComponentRelease,
@@ -472,11 +695,28 @@ struct Supervisor {
     registry: Registry,
     control: UpdateControl,
     instance: String,
+    /// Declared before `running` so a dropped supervisor cancels the watch
+    /// before `kill_on_drop` stops the child.
+    child_watch: Option<ChildExitWatch>,
     running: Option<Running>,
     restart: RestartPolicy,
+    restart_target: Option<RestartTarget>,
+    exited_for_restart: bool,
+    /// `report_ready` already applied restart policy for the child still recorded
+    /// in `running`. Settling that same exit must not count it again.
+    exit_accounted: bool,
     maintenance: Option<Running>,
     health: Option<tokio::task::JoinHandle<Result<()>>>,
     health_bind: Option<String>,
+    /// Test-only stall immediately before the post-exit `upgrade` read.
+    #[cfg(test)]
+    exit_control_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Test-only stall after the opening hold check and before `idle`.
+    #[cfg(test)]
+    before_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Test-only stall after `idle` and before the pre-control hold check.
+    #[cfg(test)]
+    after_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
@@ -663,12 +903,11 @@ impl Supervisor {
         self.note_receipt_delay();
     }
 
-    async fn flush_pending_failure(&mut self) -> Result<bool> {
-        if self.pending_failure.is_none() {
-            return Ok(false);
-        }
-        if !self.receipt_wait_elapsed() {
-            return Ok(true);
+    /// Saves a pending failure receipt when its backoff has elapsed.
+    /// `Ok(())` never means "skip the child". Callers restart first.
+    async fn flush_pending_failure(&mut self) -> Result<()> {
+        if self.pending_failure.is_none() || !self.receipt_wait_elapsed() {
+            return Ok(());
         }
         if let Some((digest, message)) = self
             .pending_failure
@@ -688,7 +927,7 @@ impl Supervisor {
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("launcher failure receipt was not saved: {error:#}");
                     self.note_receipt_delay();
-                    return Ok(true);
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             }
@@ -707,7 +946,7 @@ impl Supervisor {
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("component failure receipt was not saved: {error:#}");
                     self.note_receipt_delay();
-                    return Ok(true);
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             }
@@ -720,7 +959,7 @@ impl Supervisor {
             self.pending_failure = None;
             self.reset_receipt_backoff();
         }
-        Ok(false)
+        Ok(())
     }
 
     async fn apply_startup_receipt(&self, receipt: &StartupReceipt) -> Result<()> {
@@ -836,7 +1075,57 @@ impl Supervisor {
         Ok(())
     }
 
+    fn arm_child_health_watch(&mut self) {
+        if self.child_watch.is_some() || self.health.is_some() || self.role != "bot" {
+            return;
+        }
+        let Some(bind) = self.health_bind.clone() else {
+            return;
+        };
+        let Some(pid) = self.running.as_ref().and_then(|child| child.child.id()) else {
+            return;
+        };
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
+        let bound = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&bound);
+        self.child_watch = Some(ChildExitWatch {
+            cancel: Some(cancel),
+            task: Some(tokio::spawn(async move {
+                watch_child_health(pid, bind, cancel_rx, slot).await;
+            })),
+            bound,
+        });
+    }
+
+    async fn disarm_child_health_watch(&mut self) {
+        let Some(mut watch) = self.child_watch.take() else {
+            return;
+        };
+        if let Some(cancel) = watch.cancel.take() {
+            let _ = cancel.send(());
+        }
+        // Take the task before drop so `Drop` does not abort it mid-bind.
+        if let Some(task) = watch.task.take() {
+            let _ = task.await;
+        }
+        let serve = watch
+            .bound
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        drop(watch);
+        if let Some(serve) = serve {
+            if self.health.is_none() {
+                self.health = Some(serve);
+            } else {
+                serve.abort();
+                let _ = serve.await;
+            }
+        }
+    }
+
     async fn end_idle(&mut self) -> Result<()> {
+        self.disarm_child_health_watch().await;
         if let Some(mut child) = self.maintenance.take() {
             tracing::info!("stopping temporary maintenance API before the application starts");
             stop(&mut child).await?;
@@ -850,13 +1139,135 @@ impl Supervisor {
     }
 
     async fn stop_application(&mut self) -> Result<()> {
+        self.stop_child(false).await
+    }
+
+    /// `restart_after_exit` keeps the local binary for the next poll. Every
+    /// other stop is intentional and must not relaunch that process.
+    async fn stop_child(&mut self, restart_after_exit: bool) -> Result<()> {
+        // Cancel before SIGTERM so the watcher does not treat our stop as a crash.
+        self.disarm_child_health_watch().await;
+        if restart_after_exit && let Some(child) = &self.running {
+            self.restart_target = Some(RestartTarget {
+                path: child.path.clone(),
+                source_sha: child.source_sha.clone(),
+                release: child.release.clone(),
+            });
+        }
         // Keep ownership until reaping succeeds. No acknowledgement on error.
         if let Some(child) = self.running.as_mut() {
             stop(child).await?;
         }
         self.running = None;
         self.reported = false;
+        self.exited_for_restart = restart_after_exit;
         self.idle().await
+    }
+
+    /// `hold_rejected_token` reaps every exit and only binds health for code 78.
+    /// Any other reaped exit must bind launcher health and record restart policy
+    /// before a receipt or control await. `running` stays set so this tick can
+    /// still report the exit after that await. A live child is left for the watcher.
+    async fn recover_reaped_ordinary_exit(&mut self) -> Result<()> {
+        if self.role != "bot" {
+            return Ok(());
+        }
+        let (code, uptime, target) = {
+            let Some(child) = self.running.as_mut() else {
+                return Ok(());
+            };
+            if child.child.id().is_some() {
+                return Ok(());
+            }
+            let Some(status) = child.child.try_wait()? else {
+                return Ok(());
+            };
+            if status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+                return Ok(());
+            }
+            (
+                status.code(),
+                child.started.elapsed(),
+                RestartTarget {
+                    path: child.path.clone(),
+                    source_sha: child.source_sha.clone(),
+                    release: child.release.clone(),
+                },
+            )
+        };
+        self.idle().await?;
+        if self.standby.is_some() || self.rollback.is_some() {
+            return Ok(());
+        }
+        self.restart_target.get_or_insert(target);
+        if !self.exit_accounted {
+            self.restart.exited(true, code, uptime, Instant::now());
+            self.exit_accounted = true;
+        }
+        self.exited_for_restart = true;
+        Ok(())
+    }
+
+    /// Relaunch the last local child before any receipt or control await.
+    async fn restart_exited_child(&mut self) -> Result<()> {
+        if !self.exited_for_restart
+            || self.running.is_some()
+            || self.restart.waiting(Instant::now())
+        {
+            return Ok(());
+        }
+        let Some(target) = self.restart_target.clone() else {
+            self.exited_for_restart = false;
+            return Ok(());
+        };
+        tracing::info!("restarting child before the failure receipt is saved");
+        self.start(&target.path, &target.source_sha, target.release)
+            .await
+    }
+
+    /// Record an exit that `report_ready` did not reach. The watcher only binds
+    /// health; restart policy stays here. A replacement with a standby binary
+    /// is left in place so a later successful read can roll it back.
+    async fn settle_exited_child(&mut self) -> Result<()> {
+        if self.role != "bot" {
+            self.exit_accounted = false;
+            return Ok(());
+        }
+        let (code, uptime) = {
+            let Some(child) = self.running.as_mut() else {
+                self.exit_accounted = false;
+                return Ok(());
+            };
+            let Some(status) = child.child.try_wait()? else {
+                self.exit_accounted = false;
+                return Ok(());
+            };
+            (status.code(), child.started.elapsed())
+        };
+        if code == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+            self.exit_accounted = false;
+            self.hold_rejected_token().await?;
+            return Ok(());
+        }
+        if self.standby.is_some() || self.rollback.is_some() {
+            return Ok(());
+        }
+        if !self.exit_accounted {
+            self.restart.exited(true, code, uptime, Instant::now());
+        }
+        self.exit_accounted = false;
+        self.stop_child(true).await
+    }
+
+    /// The exit may already have been reaped, so the watcher can observe
+    /// `Reaped` and stop. Bind launcher health before any later control read.
+    async fn bind_health_after_observed_exit(&mut self) {
+        if self.health.is_some() || self.role != "bot" {
+            return;
+        }
+        if let Err(error) = self.idle().await {
+            tracing::warn!("launcher health was not restored after the child exited: {error:#}");
+        }
     }
 
     async fn start(
@@ -876,10 +1287,31 @@ impl Supervisor {
             release.supports_launcher(self.launcher_revision)?;
         }
         self.end_idle().await?;
-        self.running = Some(launch(path, sha, release).await?);
+        let child = match launch(path, sha, release).await {
+            Ok(child) => child,
+            Err(error) => {
+                // The listener was released before spawn. Put it back on this
+                // tick; a later poll must not be what makes /health exist again.
+                if let Err(idle_error) = self.idle().await {
+                    tracing::warn!(
+                        "launcher health was not restored after a failed start: {idle_error:#}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        self.restart_target = Some(RestartTarget {
+            path: child.path.clone(),
+            source_sha: child.source_sha.clone(),
+            release: child.release.clone(),
+        });
+        self.exited_for_restart = false;
+        self.exit_accounted = false;
+        self.running = Some(child);
         self.rejected_candidate = None;
         self.reported = false;
         self.last_observed = None;
+        self.arm_child_health_watch();
         Ok(())
     }
 
@@ -902,12 +1334,16 @@ impl Supervisor {
                     self.hold_rejected_token().await?;
                     return Ok(false);
                 }
-                self.restart.exited(
-                    self.role == "bot",
-                    status.code(),
-                    child.started.elapsed(),
-                    Instant::now(),
-                );
+                // The pre-control recover path may already have counted this exit.
+                if !self.exit_accounted {
+                    self.restart.exited(
+                        self.role == "bot",
+                        status.code(),
+                        child.started.elapsed(),
+                        Instant::now(),
+                    );
+                    self.exit_accounted = true;
+                }
                 bail!("application exited: {status}");
             }
             if child.started.elapsed() >= Duration::from_secs(300) {
@@ -1411,6 +1847,13 @@ impl Supervisor {
         }
         let restoring_previous = self.rollback.is_some();
         if let Err(error) = self.report_ready().await {
+            // report_ready reaps before this read. Bind health first so a stall
+            // here cannot leave /health down after the watcher sees Reaped.
+            self.bind_health_after_observed_exit().await;
+            #[cfg(test)]
+            if let Some(gate) = self.exit_control_gate.take() {
+                let _ = gate.await;
+            }
             // After a coordinated migration, never try a previous/baked child.
             if let Some(op) = self.control.upgrade().await?
                 && op.phase == Phase::Complete
@@ -1495,7 +1938,7 @@ impl Supervisor {
                     Err(save) => return Err(save),
                 }
             } else {
-                self.stop_application().await?;
+                self.stop_child(true).await?;
                 return Err(error);
             }
         }
@@ -1671,8 +2114,15 @@ impl Supervisor {
     }
 
     async fn tick(&mut self) -> Result<bool> {
+        self.disarm_child_health_watch().await;
         // Hold before control reads, restore, update selection or rollback.
         let held = self.hold_rejected_token().await?;
+        // Exit 78 can land after the check above. The test parks here so that
+        // ordering is observable; production falls through with no wait.
+        #[cfg(test)]
+        if let Some(gate) = self.before_idle_gate.take() {
+            let _ = gate.await;
+        }
         if (held
             && !self
                 .restart
@@ -1690,10 +2140,47 @@ impl Supervisor {
         if self.role == "bot" {
             self.idle().await?;
         }
-        self.flush_startup_receipts().await?;
-        if self.flush_pending_failure().await? {
+        // An ordinary exit can land after idle saw the child alive. The test
+        // parks here so that ordering is observable; production does not wait.
+        #[cfg(test)]
+        if let Some(gate) = self.after_idle_gate.take() {
+            let _ = gate.await;
+        }
+        // idle reaps exit 78 and leaves the socket unbound, and the reaped pid
+        // cannot be watched. Hold before restart or any control await so the
+        // token listener is up for the whole stall and the child is not restarted.
+        if self.hold_rejected_token().await?
+            && !self
+                .restart
+                .retry_auth_with_health(
+                    Instant::now(),
+                    &mut self.health,
+                    self.health_bind.as_deref(),
+                )
+                .await?
+        {
             return Ok(false);
         }
+        // That hold reaps a non-78 exit without binding. Restore health and
+        // record the restart before the control await, including exits reaped
+        // by the opening hold check. A child that is still alive is watched
+        // below, so its exit during the stall binds inside the same window.
+        self.recover_reaped_ordinary_exit().await?;
+        // Restart from the retained binary before any receipt or control await.
+        // The receipt is retried below, or on a later poll, and must not gate this.
+        self.restart_exited_child().await?;
+        self.arm_child_health_watch();
+        let result = self.tick_control().await;
+        self.disarm_child_health_watch().await;
+        // A control error can return before report_ready. Record the exit
+        // anyway so the next poll can restart without another control read.
+        self.settle_exited_child().await?;
+        result
+    }
+
+    async fn tick_control(&mut self) -> Result<bool> {
+        self.flush_startup_receipts().await?;
+        self.flush_pending_failure().await?;
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
@@ -2122,11 +2609,21 @@ async fn main() -> Result<()> {
         registry: Registry::ghcr()?,
         control,
         instance,
+        child_watch: None,
         running: initial,
         restart,
+        restart_target: None,
+        exited_for_restart: false,
+        exit_accounted: false,
         maintenance,
         health: boot_health,
         health_bind,
+        #[cfg(test)]
+        exit_control_gate: None,
+        #[cfg(test)]
+        before_idle_gate: None,
+        #[cfg(test)]
+        after_idle_gate: None,
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
