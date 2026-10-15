@@ -1252,7 +1252,10 @@ impl BotState {
         user: u64,
     ) -> GatewayBanObservation {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
-        let observed = {
+        // The audit match window is five seconds. Sample before the stripe
+        // wait so a stalled lock cannot push this observation outside it.
+        let observed = chrono::Utc::now();
+        {
             let mut state = flight.lock().await;
             make_room_for_ban_subject(&mut state, guild, user);
             let started_at_ms = state.started_at_ms;
@@ -1270,10 +1273,7 @@ impl BotState {
                     failed_through_ms,
                 });
             subject.active += 1;
-            // Register before sampling time. The wait above is the handler's
-            // yield; the count is published before this function returns.
-            chrono::Utc::now()
-        };
+        }
         GatewayBanObservation {
             flight,
             guild,
@@ -2207,6 +2207,91 @@ mod tests {
             let observation = begin.await;
             observation.finish(true).await;
         }
+        held.join().unwrap();
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stripe_lock_stall_keeps_the_audit_moderator_and_reason() {
+        let directory =
+            std::env::temp_dir().join(format!("flight_stall_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let flight = Arc::clone(app.gateway_ban_flight(10, 55));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let guard = flight.blocking_lock();
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(15));
+            drop(guard);
+        });
+        entered_rx.await.unwrap();
+        let audit_at = chrono::Utc::now().timestamp_millis();
+        let observation = {
+            let begin = app.begin_gateway_ban_observation(10, 55);
+            tokio::pin!(begin);
+            tokio::select! {
+                biased;
+                _ = &mut begin => panic!("observation finished while the stripe lock was held"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5_200)).await;
+            release_tx.send(()).unwrap();
+            begin.await
+        };
+        assert!(chrono::Utc::now().timestamp_millis() - audit_at > 5_000);
+        let observed_at = observation.observed.to_rfc3339();
+        observation.finish(true).await;
+        let write = db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            Some("member"),
+            None,
+            Some(&observed_at),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let db::GatewayBanWrite::Recorded { row_id } = write else {
+            panic!("stall must still insert the ban row");
+        };
+        let matched = app
+            .reconcile_gateway_manual_ban_audit_entry(
+                Some(scope.clone()),
+                10,
+                55,
+                audit_id_at(audit_at),
+            )
+            .await
+            .unwrap();
+        if matched {
+            db::attribute_enrolled_ban(
+                &app.db,
+                Some(scope.clone()),
+                row_id,
+                55,
+                77,
+                Some("moderator"),
+                "manual reason",
+            )
+            .await
+            .unwrap();
+        }
+        let rows = db::list_enrolled_bans(&app.db, scope, 10).await.unwrap();
+        let row = rows.iter().find(|row| row.active).expect("active ban");
+        assert_eq!(row.moderator_id, Some(77));
+        assert_eq!(row.moderator_name.as_deref(), Some("moderator"));
+        assert_eq!(row.reason.as_deref(), Some("manual reason"));
         held.join().unwrap();
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
