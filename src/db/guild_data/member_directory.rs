@@ -28,6 +28,9 @@ static COVERAGE_GAP_AFTER_WRITER_FENCE: Mutex<Option<Box<dyn Fn() + Send + Sync>
     Mutex::new(None);
 
 #[cfg(test)]
+static COVERAGE_GAP_AFTER_BATCH: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+#[cfg(test)]
 static COVERAGE_GAP_HOOK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
@@ -57,6 +60,11 @@ pub(crate) fn test_set_coverage_gap_after_receipt_admission(
 #[cfg(test)]
 pub(crate) fn test_set_coverage_gap_after_writer_fence(hook: Option<Box<dyn Fn() + Send + Sync>>) {
     *COVERAGE_GAP_AFTER_WRITER_FENCE.lock().unwrap() = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_coverage_gap_after_batch(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *COVERAGE_GAP_AFTER_BATCH.lock().unwrap() = hook;
 }
 
 #[cfg(test)]
@@ -106,6 +114,16 @@ fn run_coverage_gap_after_writer_fence_hook() {
 
 #[cfg(not(test))]
 fn run_coverage_gap_after_writer_fence_hook() {}
+
+#[cfg(test)]
+fn run_coverage_gap_after_batch_hook() {
+    if let Some(hook) = COVERAGE_GAP_AFTER_BATCH.lock().unwrap().as_ref() {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_coverage_gap_after_batch_hook() {}
 
 /// Guild whose member-sync statements are being counted. Unset until a test asks.
 static MEMBER_SYNC_WATCHED_GUILD: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -633,14 +651,6 @@ fn coverage_gap_batch_error(error: anyhow::Error) -> anyhow::Error {
     error
 }
 
-fn coverage_gap_lease_rejected(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
-            .is_some()
-    })
-}
-
 fn coverage_gap_read_epoch(conn: &impl SqlExecutor) -> Result<Option<i64>> {
     conn.query_row(
         "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
@@ -650,20 +660,18 @@ fn coverage_gap_read_epoch(conn: &impl SqlExecutor) -> Result<Option<i64>> {
     .optional()
 }
 
-/// Lease and epoch admission that finishes before `BEGIN IMMEDIATE`.
+/// Fail-fast lease and epoch admission before `BEGIN IMMEDIATE`.
 ///
-/// The generation and owner are the values the open transaction's batch must
-/// still observe. `None` owner means no core lease was armed.
+/// These reads do not authorize the commit. The returned generation is what
+/// the batch must still see. The core lease is read again once, at commit.
 fn coverage_gap_writer_prelude(
     core: Option<&Db>,
     conn: &crate::db_compat::Connection,
-) -> Result<(Option<i64>, Option<String>)> {
-    let mut held_owner = None;
+) -> Result<Option<i64>> {
     if let Some(core) = core
         && let Some(owner) = core.leased_owner()
     {
         GuildDataStore::read_core_lease(core, &owner)?;
-        held_owner = Some(owner);
     }
     let generation = conn.expected_writer_generation();
     if let Some(generation) = generation {
@@ -672,23 +680,16 @@ fn coverage_gap_writer_prelude(
             return Err(crate::db_compat::ActiveBotLeaseRejected.into());
         }
     }
-    Ok((generation, held_owner))
+    Ok(generation)
 }
 
-fn coverage_gap_writer_fence_sql(generation: Option<i64>, lease_ok: bool) -> String {
-    if generation.is_none() && lease_ok {
+fn coverage_gap_writer_fence_sql(generation: Option<i64>) -> String {
+    let Some(generation) = generation else {
         return String::new();
-    }
-    let generation_sql = match generation {
-        Some(generation) => {
-            format!("(SELECT generation FROM guild_writer_epoch WHERE singleton=1)={generation}")
-        }
-        None => "1=1".to_string(),
     };
-    let lease_flag = i32::from(lease_ok);
     let message = crate::db_compat::ActiveBotLeaseRejected.to_string();
     format!(
-        "SELECT CASE WHEN {lease_flag}=1 AND {generation_sql} THEN 1 ELSE json_set('{{}}', '{message}', 1) END;"
+        "SELECT CASE WHEN (SELECT generation FROM guild_writer_epoch WHERE singleton=1)={generation} THEN 1 ELSE json_set('{{}}', '{message}', 1) END;"
     )
 }
 
@@ -1235,38 +1236,37 @@ impl GuildDataStore {
                 coverage_gap_refuse_restore(conn)?;
             }
             run_coverage_gap_after_receipt_admission_hook();
-            // Core lease snapshots and the guild epoch read finish before the
-            // write transaction. The batch fence below compares those captured
-            // values and aborts the mark if either one no longer matches, so
-            // commit does not repeat the reads.
-            let (writer_generation, held_owner) =
-                coverage_gap_writer_prelude(core.as_ref(), conn)?;
-            #[cfg(test)]
-            if let Some(core) = core.as_ref()
-                && let Some(hook) = core.take_before_final_lease_reread()
-            {
-                hook();
-            }
+            // Pre-BEGIN lease and epoch reads fail fast. They do not authorize
+            // the commit. The batch compares the captured epoch. Commit reads
+            // the core lease once and does not repeat the epoch query.
+            let writer_generation = coverage_gap_writer_prelude(core.as_ref(), conn)?;
             run_coverage_gap_after_writer_fence_hook();
             let mut tx = conn.transaction_primary_read()?;
-            tx.suppress_commit_writer_recheck(held_owner.is_some(), writer_generation.is_some());
+            // The shared guild probe reads the lease twice so a test can change
+            // it between those reads. The second snapshot does not fit in this
+            // mark's remote lifetime, so an attached core performs that check once.
+            // A store with no core keeps whatever probe it already has.
+            tx.suppress_commit_writer_recheck(false, writer_generation.is_some());
+            if let Some(core) = core.clone() {
+                tx.set_commit_lease_probe(Some(std::sync::Arc::new(move |commit| {
+                    let Some(owner) = core.leased_owner() else {
+                        return commit();
+                    };
+                    #[cfg(test)]
+                    if let Some(hook) = core.take_before_final_lease_reread() {
+                        hook();
+                    }
+                    Self::read_core_lease(&core, &owner)?;
+                    #[cfg(test)]
+                    if let Some(hook) = core.take_during_leased_guild_commit() {
+                        hook();
+                    }
+                    commit()
+                })));
+            }
             let (receipt_sql, receipt_prune) = tx
                 .stage_mutation_receipt(meta_present)?
                 .unwrap_or_default();
-            // One confirming read of the owner captured above. A lost lease
-            // becomes a false flag in the batch fence instead of a commit probe.
-            let lease_ok = if let Some(owner) = held_owner.as_deref() {
-                let Some(core) = core.as_ref() else {
-                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
-                };
-                match Self::read_core_lease(core, owner) {
-                    Ok(()) => true,
-                    Err(error) if coverage_gap_lease_rejected(&error) => false,
-                    Err(error) => return Err(error),
-                }
-            } else {
-                true
-            };
             let restore_check = if receipt_sql.is_empty() {
                 String::new()
             } else {
@@ -1278,7 +1278,7 @@ impl GuildDataStore {
             let run_id = sql_literal(&random_id());
             let joined_at_ns = scope.enrollment.joined_at_ns;
             let expected_revision = revision_before + 1;
-            let fence_sql = coverage_gap_writer_fence_sql(writer_generation, lease_ok);
+            let fence_sql = coverage_gap_writer_fence_sql(writer_generation);
             // Receipt admission, the one-row mark check, and audit recovery
             // share one batch. The 32 MiB batch bound covers the seed row that
             // the removed COUNT used to budget on its own.
@@ -1291,6 +1291,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             if let Err(error) = tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH) {
                 return Err(coverage_gap_batch_error(error));
             }
+            run_coverage_gap_after_batch_hook();
             tx.commit()
         })
         .await

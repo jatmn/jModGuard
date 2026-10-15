@@ -5987,22 +5987,70 @@ async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit() {
         .unwrap();
     let remote = armed_coverage_gap_store(&local, &f.catalog);
     let before = coverage_gap_persisted_mark(&local).await;
-    let path = f.catalog_path.clone();
-    super::super::member_directory::test_set_coverage_gap_after_writer_fence(Some(Box::new(
-        move || {
-            let conn = crate::db_compat::Connection::open(&path).unwrap();
-            conn.execute_batch_bounded(
-                "DELETE FROM meta WHERE key='active_bot_lease'",
-                SCHEMA_BATCH_LIMIT,
-            )
-            .unwrap();
-        },
-    )));
+    super::super::member_directory::test_set_coverage_gap_after_batch(Some(
+        delete_active_bot_lease(f.catalog_path.clone()),
+    ));
     let error = remote
         .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_writer_fence(None);
+    super::super::member_directory::test_set_coverage_gap_after_batch(None);
+    assert!(super::lease_rejected(&error), "{error:#}");
+    assert_eq!(coverage_gap_persisted_mark(&local).await, before);
+    assert!(!before.0);
+}
+
+fn delete_active_bot_lease(path: std::path::PathBuf) -> Box<dyn Fn() + Send + Sync> {
+    Box::new(move || {
+        let conn = crate::db_compat::Connection::open(&path).unwrap();
+        conn.execute_batch_bounded(
+            "DELETE FROM meta WHERE key='active_bot_lease'",
+            SCHEMA_BATCH_LIMIT,
+        )
+        .unwrap();
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit_over_http() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    local
+        .raise_writer_epoch(f.catalog.leased_generation().unwrap())
+        .await
+        .unwrap();
+    let (_fixture, db) =
+        HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5)).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    }
+    .with_core_write_fence(f.catalog.clone());
+    let before = coverage_gap_persisted_mark(&local).await;
+    super::super::member_directory::test_set_coverage_gap_after_batch(Some(
+        delete_active_bot_lease(f.catalog_path.clone()),
+    ));
+    let error = remote
+        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_batch(None);
     assert!(super::lease_rejected(&error), "{error:#}");
     assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     assert!(!before.0);

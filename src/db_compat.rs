@@ -2295,8 +2295,11 @@ impl Transaction {
         Ok(Some((admit, prune.to_string())))
     }
 
-    /// The caller already re-checked the core lease and guild writer epoch.
-    /// Commit must not repeat those reads while this write transaction is open.
+    /// Drop commit-time reads this transaction has already fenced.
+    ///
+    /// `lease` removes the core lease probe. `epoch` removes the guild epoch
+    /// query. The coverage-gap mark drops the epoch query and installs one
+    /// lease read in its place.
     pub(crate) fn suppress_commit_writer_recheck(&mut self, lease: bool, epoch: bool) {
         if lease {
             self.commit_lease_probe = None;
@@ -2304,6 +2307,10 @@ impl Transaction {
         if epoch {
             self.expected_writer_generation = None;
         }
+    }
+
+    pub(crate) fn set_commit_lease_probe(&mut self, probe: Option<CommitLeaseProbe>) {
+        self.commit_lease_probe = probe;
     }
 }
 
