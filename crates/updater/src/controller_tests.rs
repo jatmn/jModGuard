@@ -186,6 +186,7 @@ fn controller(
         health: None,
         health_bind: None,
         exit_control_gate: None,
+        before_idle_gate: None,
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
@@ -3402,6 +3403,158 @@ async fn rejected_token_exit_during_stalled_tick_keeps_hold_reason() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+/// Exit 78 lands after the opening hold check and before `idle`. The token
+/// listener has to be up while a control read is still stalled, and the child
+/// must not be restarted.
+#[tokio::test(flavor = "current_thread")]
+async fn token_exit_before_idle_keeps_health_during_stalled_control() {
+    let name = "health-token-idle";
+    let root =
+        std::env::temp_dir().join(format!("health-token-idle-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, name).await;
+    let bind_request = root.join(format!("bind-health-{name}"));
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
+        .await
+        .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join(format!("health-bound-{name}"));
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none(), "live child owns health");
+    let pid = bot
+        .running
+        .as_ref()
+        .unwrap()
+        .child
+        .id()
+        .expect("live child pid");
+    let (release_gate, gate) = tokio::sync::oneshot::channel();
+    bot.before_idle_gate = Some(gate);
+    let control = bot.control.clone();
+
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !tick.is_finished(),
+        "tick must wait after the hold check while the child is still alive"
+    );
+    assert!(
+        !launcher_health_responds(addr).await,
+        "launcher must not own health before the token exit"
+    );
+    tokio::fs::write(
+        root.join(format!("exit-code-{name}")),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if child_is_zombie(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child did not exit 78 before idle");
+    let stalled = tokio::spawn(async move { control.component("bot").await });
+    tokio::task::yield_now().await;
+    assert!(
+        !stalled.is_finished(),
+        "control read must be stalled before idle runs"
+    );
+    release_gate.send(()).unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if launcher_health_responds(addr).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("health stayed down after exit 78 while the control read was stalled");
+    assert!(
+        !stalled.is_finished(),
+        "control read must still be stalled after health returns"
+    );
+    assert_launcher_health(addr, "discord token rejected").await;
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(!result.unwrap());
+    assert!(
+        !stalled.is_finished(),
+        "binding health must not wait for the stalled control read"
+    );
+    assert!(bot.restart.held);
+    assert!(bot.running.is_none());
+    assert!(!bot.exited_for_restart);
+    assert_eq!(child_start_count(&root, name), 1);
+    assert!(!bot.tick().await.unwrap());
+    assert!(
+        bot.running.is_none(),
+        "token hold must not restart the child"
+    );
+    assert_eq!(child_start_count(&root, name), 1);
+    assert_launcher_health(addr, "discord token rejected").await;
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    stalled.await.unwrap().unwrap();
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+fn child_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
     let root =
@@ -4633,28 +4786,55 @@ async fn selected_exiting_bot(
     // Record only replacement/recovery starts, after both baselines ran.
     tokio::fs::write(root.join("events"), "").await.unwrap();
     bot.tick().await.unwrap();
-    assert_eq!(
-        bot.running
-            .as_ref()
-            .unwrap()
-            .release
-            .as_ref()
-            .unwrap()
-            .digest,
-        candidate.digest
-    );
     if after_ready {
+        assert_eq!(
+            bot.running
+                .as_ref()
+                .unwrap()
+                .release
+                .as_ref()
+                .unwrap()
+                .digest,
+            candidate.digest
+        );
         wait_for_bot_ready(&mut bot).await;
         // Rename publishes the whole code before the child can read it.
         let pending = exit_file.with_extension("tmp");
         tokio::fs::write(&pending, code.to_string()).await.unwrap();
         tokio::fs::rename(pending, exit_file).await.unwrap();
+        bot.running.as_mut().unwrap().child.wait().await.unwrap();
+        assert!(bot.running.as_ref().unwrap().ready_file.exists());
+    } else if let Some(child) = bot.running.as_mut() {
+        assert_eq!(child.release.as_ref().unwrap().digest, candidate.digest);
+        let ready_file = child.ready_file.clone();
+        child.child.wait().await.unwrap();
+        assert!(!ready_file.exists());
+    } else {
+        // settle_exited_child already reaped an immediate token rejection.
+        // The hold, not a still-running child, is the record of that exit.
+        assert_eq!(
+            code,
+            jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE
+        );
+        assert!(bot.restart.held);
+        assert!(!bot.exited_for_restart);
+        let recorded = bot.rejected_candidate.clone().or_else(|| {
+            bot.restart_target
+                .as_ref()
+                .and_then(|target| target.release.clone())
+        });
+        assert_eq!(
+            recorded.expect("held exit recorded the candidate").digest,
+            candidate.digest
+        );
+        let events = tokio::fs::read_to_string(root.join("events"))
+            .await
+            .unwrap();
+        assert!(
+            !events.lines().any(|line| line.ends_with(".ready")),
+            "an immediate token rejection must not publish readiness"
+        );
     }
-    bot.running.as_mut().unwrap().child.wait().await.unwrap();
-    assert_eq!(
-        bot.running.as_ref().unwrap().ready_file.exists(),
-        after_ready
-    );
     (root, db, bot, candidate, server)
 }
 
@@ -4955,16 +5135,24 @@ async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
             .await;
             let before = bot.control.component("bot").await.unwrap();
             let starts = independent_exit_starts(&root).await;
-            let ready_file = bot.running.as_ref().unwrap().ready_file.clone();
-            // Advance both child ages beyond the historical 120s deadline.
+            let ready_file = bot.running.as_ref().map(|child| child.ready_file.clone());
             let elapsed = READY_TIMEOUT + Duration::from_secs(1);
-            let child = bot.running.as_mut().unwrap();
-            child.started_at = now() - elapsed.as_secs() as i64;
-            child.started = Instant::now() - elapsed;
+            if let Some(child) = bot.running.as_mut() {
+                // Advance both child ages beyond the historical 120s deadline.
+                child.started_at = now() - elapsed.as_secs() as i64;
+                child.started = Instant::now() - elapsed;
+            } else {
+                assert!(
+                    bot.restart.held,
+                    "an already settled token exit must be held"
+                );
+            }
             assert!(!bot.tick().await.unwrap());
             assert!(bot.restart.held);
             // Advance the hold clock by the same interval, still before fallback retry.
-            bot.restart.auth_retry_at = bot.restart.auth_retry_at.map(|at| at - elapsed);
+            if ready_file.is_some() {
+                bot.restart.auth_retry_at = bot.restart.auth_retry_at.map(|at| at - elapsed);
+            }
             for _ in 0..3 {
                 assert!(!bot.tick().await.unwrap());
                 assert!(bot.running.is_none());
@@ -4976,7 +5164,17 @@ async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
             assert_eq!(after.state, before.state);
             assert_eq!(after.last_error, before.last_error);
             assert_eq!(independent_exit_starts(&root).await, starts);
-            assert!(!ready_file.exists(), "hold must not fabricate readiness");
+            if let Some(ready_file) = ready_file {
+                assert!(!ready_file.exists(), "hold must not fabricate readiness");
+            } else {
+                let events = tokio::fs::read_to_string(root.join("events"))
+                    .await
+                    .unwrap();
+                assert!(
+                    !events.lines().any(|line| line.ends_with(".ready")),
+                    "hold must not fabricate readiness"
+                );
+            }
             bot.end_idle().await.unwrap();
             server.abort();
             let _ = server.await;

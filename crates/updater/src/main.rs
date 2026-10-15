@@ -707,6 +707,9 @@ struct Supervisor {
     /// Test-only stall immediately before the post-exit `upgrade` read.
     #[cfg(test)]
     exit_control_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Test-only stall after the opening hold check and before `idle`.
+    #[cfg(test)]
+    before_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
@@ -1905,6 +1908,12 @@ impl Supervisor {
         self.disarm_child_health_watch().await;
         // Hold before control reads, restore, update selection or rollback.
         let held = self.hold_rejected_token().await?;
+        // Exit 78 can land after the check above. The test parks here so that
+        // ordering is observable; production falls through with no wait.
+        #[cfg(test)]
+        if let Some(gate) = self.before_idle_gate.take() {
+            let _ = gate.await;
+        }
         if (held
             && !self
                 .restart
@@ -1921,6 +1930,21 @@ impl Supervisor {
         }
         if self.role == "bot" {
             self.idle().await?;
+        }
+        // idle reaps exit 78 and leaves the socket unbound, and the reaped pid
+        // cannot be watched. Hold before restart or any control await so the
+        // token listener is up for the whole stall and the child is not restarted.
+        if self.hold_rejected_token().await?
+            && !self
+                .restart
+                .retry_auth_with_health(
+                    Instant::now(),
+                    &mut self.health,
+                    self.health_bind.as_deref(),
+                )
+                .await?
+        {
+            return Ok(false);
         }
         // Restart from the retained binary before any receipt or control await.
         // The receipt is retried below, or on a later poll, and must not gate this.
@@ -2376,6 +2400,8 @@ async fn main() -> Result<()> {
         health_bind,
         #[cfg(test)]
         exit_control_gate: None,
+        #[cfg(test)]
+        before_idle_gate: None,
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
