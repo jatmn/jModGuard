@@ -81,6 +81,11 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
 /// behind an abandoned `BEGIN IMMEDIATE`.
 pub(crate) const REMOTE_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// Remote reads and snapshots must end before the provider closes an
+/// interactive transaction (about five seconds). One hung statement otherwise
+/// waits out the pool deadline and can hold the writer across the lease TTL.
+pub(crate) const INTERACTIVE_READ_BUDGET: Duration = Duration::from_secs(4);
+
 /// True when Bunny Database / Turso closed an interactive Hrana transaction.
 ///
 /// This is distinct from the client-side [`DatabaseOperationTimedOut`] deadline.
@@ -458,7 +463,19 @@ impl DbRuntime {
     where
         F: Future<Output = std::result::Result<libsql::Transaction, libsql::Error>> + Send,
     {
-        let Some(operation_timeout) = self.operation_timeout else {
+        self.complete_or_release_open_within(operation, self.operation_timeout, future)
+    }
+
+    fn complete_or_release_open_within<F>(
+        &self,
+        operation: &'static str,
+        operation_timeout: Option<Duration>,
+        future: F,
+    ) -> Result<libsql::Transaction>
+    where
+        F: Future<Output = std::result::Result<libsql::Transaction, libsql::Error>> + Send,
+    {
+        let Some(operation_timeout) = operation_timeout else {
             return self.block_on(future).map_err(Into::into);
         };
         let watch = active_caller_abandon();
@@ -569,6 +586,10 @@ impl DbRuntime {
 
     pub(crate) fn is_remote(&self) -> bool {
         self.operation_timeout.is_some()
+    }
+
+    pub(crate) fn operation_limit(&self) -> Option<Duration> {
+        self.operation_timeout
     }
 
     /// Drop a remote connection on this runtime. libsql sends a stream close
@@ -1215,6 +1236,14 @@ impl Connection {
         self.transaction_immediate()
     }
 
+    /// Remote reads and snapshots. Local files and write transactions pass
+    /// `None` and keep the connection deadline.
+    fn interactive_read_budget(&self) -> Option<Duration> {
+        self.runtime
+            .operation_limit()
+            .map(|limit| INTERACTIVE_READ_BUDGET.min(limit))
+    }
+
     /// Starts a write transaction at the primary immediately. Remote libSQL
     /// can reject a deferred transaction when it must upgrade from a replica
     /// read to a primary write while another writer is active.
@@ -1222,27 +1251,35 @@ impl Connection {
         &self,
         operation: &'static str,
         behavior: libsql::TransactionBehavior,
-    ) -> Result<libsql::Transaction> {
+        read_budget: Option<Duration>,
+    ) -> Result<(libsql::Transaction, Option<tokio::time::Instant>)> {
         let runtime = self.runtime.clone();
         let immediate = matches!(behavior, libsql::TransactionBehavior::Immediate);
-        let inner = runtime
-            .complete_or_release_open(operation, self.inner.transaction_with_behavior(behavior))?;
+        let started = tokio::time::Instant::now();
+        let open = self.inner.transaction_with_behavior(behavior);
+        let inner = match read_budget {
+            Some(budget) => {
+                runtime.complete_or_release_open_within(operation, Some(budget), open)?
+            }
+            None => runtime.complete_or_release_open(operation, open)?,
+        };
         if let Some(probe) = &self.runtime.startup_probe {
             probe.transactions.fetch_add(1, Ordering::Relaxed);
             if immediate {
                 probe.record_immediate();
             }
         }
-        Ok(inner)
+        Ok((inner, read_budget.map(|budget| started + budget)))
     }
 
     pub fn transaction_immediate(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let inner = self.open_remote_transaction(
+        let (inner, _) = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
+            None,
         )?;
-        let mut transaction = self.wrap_transaction(inner, None, true);
+        let mut transaction = self.wrap_transaction(inner, None, true, None);
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
@@ -1257,11 +1294,12 @@ impl Connection {
     /// `BEGIN READONLY` is not used here: remote libSQL may serve it from a
     /// replica. The snapshot cannot be upgraded into a write.
     pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
-        let inner = self.open_remote_transaction(
+        let (inner, deadline) = self.open_remote_transaction(
             "begin primary snapshot",
             libsql::TransactionBehavior::Deferred,
+            self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, false))
+        Ok(self.wrap_transaction(inner, None, false, deadline))
     }
 
     /// Snapshot capture reads before acquiring the writer lock. A concurrent
@@ -1269,22 +1307,24 @@ impl Connection {
     /// entire operation on a proven busy error, never reuse the read results.
     pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let inner = self.open_remote_transaction(
+        let (inner, deadline) = self.open_remote_transaction(
             "begin capture transaction",
             libsql::TransactionBehavior::Deferred,
+            self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, true))
+        Ok(self.wrap_transaction(inner, None, true, deadline))
     }
 
     /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
     /// Remote libSQL may serve it from a replica, so callers that need a fresh
     /// primary snapshot use [`Self::transaction_primary_snapshot`].
     pub fn transaction_consistent_read(&self) -> Result<Transaction> {
-        let inner = self.open_remote_transaction(
+        let (inner, deadline) = self.open_remote_transaction(
             "begin consistent read",
             libsql::TransactionBehavior::ReadOnly,
+            self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, false))
+        Ok(self.wrap_transaction(inner, None, false, deadline))
     }
 
     /// Maintenance-only DELETE transaction. It preserves a 16 MB hard-limit
@@ -1300,11 +1340,12 @@ impl Connection {
     /// on the returned transaction so lost COMMIT responses remain recoverable.
     pub fn transaction_primary_read(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let inner = self.open_remote_transaction(
+        let (inner, _) = self.open_remote_transaction(
             "begin primary read transaction",
             libsql::TransactionBehavior::Immediate,
+            None,
         )?;
-        Ok(self.wrap_transaction(inner, None, true))
+        Ok(self.wrap_transaction(inner, None, true, None))
     }
 
     fn wrap_transaction(
@@ -1312,6 +1353,7 @@ impl Connection {
         inner: libsql::Transaction,
         mutation_receipt: Option<String>,
         allows_write: bool,
+        read_deadline: Option<tokio::time::Instant>,
     ) -> Transaction {
         Transaction {
             inner: Some(inner),
@@ -1321,6 +1363,7 @@ impl Connection {
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
             allows_write,
+            read_deadline,
             mutation_receipt,
             capacity_dirty: AtomicBool::new(false),
             capacity_poisoned: AtomicBool::new(false),
@@ -1568,6 +1611,9 @@ pub struct Transaction {
     /// False for snapshots and replica reads. Those transactions must not
     /// upgrade into a write and take the reserved lock.
     allows_write: bool,
+    /// Remote reads and snapshots. Cleared in effect once a capture prepares
+    /// a write; member write transactions never set it.
+    read_deadline: Option<tokio::time::Instant>,
     mutation_receipt: Option<String>,
     capacity_dirty: AtomicBool,
     capacity_poisoned: AtomicBool,
@@ -1746,9 +1792,40 @@ impl Transaction {
 
     fn remote_write_needs_prompt_release(&self) -> bool {
         self.runtime.is_remote()
-            && self.allows_write
             && self.client_deadline.load(Ordering::Acquire)
             && !self.stream_exhausted.load(Ordering::Acquire)
+            && (self.allows_write || self.read_deadline.is_some())
+    }
+
+    /// Time left in a remote read or snapshot. `None` keeps the runtime deadline
+    /// (writes, and a capture after it has prepared a mutation).
+    fn statement_wait(&self) -> Option<Duration> {
+        let deadline = self.read_deadline?;
+        if self.write_prepared.load(Ordering::Acquire) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        Some(match self.runtime.operation_limit() {
+            Some(limit) => remaining.min(limit),
+            None => remaining,
+        })
+    }
+
+    fn drive<T, E>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = std::result::Result<T, E>> + Send,
+    ) -> Result<T>
+    where
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        if let Some(timeout) = self.statement_wait() {
+            self.runtime
+                .block_on_database_within(operation, Some(timeout), future, true)
+        } else {
+            self.runtime.block_on_database(operation, future)
+        }
     }
 
     fn map_stream<T>(&self, result: Result<T>) -> Result<T> {
@@ -1760,12 +1837,11 @@ impl Transaction {
 
     fn execute_unchecked(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
         self.map_stream(
-            self.runtime
-                .block_on_database(
-                    "transaction internal execute",
-                    self.inner().execute(sql, params),
-                )
-                .map(|rows| rows as usize),
+            self.drive(
+                "transaction internal execute",
+                self.inner().execute(sql, params),
+            )
+            .map(|rows| rows as usize),
         )
     }
 
@@ -1780,14 +1856,11 @@ impl Transaction {
         {
             probe.record_catalog();
         }
-        self.map_stream(
-            self.runtime
-                .block_on_database("transaction internal query", async {
-                    let mut rows = self.inner().query(sql, params).await?;
-                    let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
-                    map(&row)
-                }),
-        )
+        self.map_stream(self.drive("transaction internal query", async {
+            let mut rows = self.inner().query(sql, params).await?;
+            let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
+            map(&row)
+        }))
     }
 
     fn insert_remote_mutation_receipt(&mut self, receipt: &str) -> Result<String> {
@@ -1877,20 +1950,14 @@ impl Transaction {
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         require_connection_setup_batch(sql)?;
-        self.map_stream(
-            self.runtime
-                .block_on_database("transaction execute_batch", self.inner().execute_batch(sql)),
-        )?;
+        self.map_stream(self.drive("transaction execute_batch", self.inner().execute_batch(sql)))?;
         Ok(())
     }
 
     pub fn execute_batch_bounded(&self, sql: &str, max_growth_bytes: u64) -> Result<()> {
         anyhow::ensure!(batch_kind(sql)?, "bounded batch must contain a mutation");
         self.reserve_growth(max_growth_bytes)?;
-        self.map_stream(
-            self.runtime
-                .block_on_database("transaction bounded batch", self.inner().execute_batch(sql)),
-        )?;
+        self.map_stream(self.drive("transaction bounded batch", self.inner().execute_batch(sql)))?;
         Ok(())
     }
 
@@ -2437,9 +2504,8 @@ impl SqlExecutor for Transaction {
 
     fn prepare(&self, sql: &str) -> Result<Statement> {
         require_read_sql(sql)?;
-        let inner = self
-            .runtime
-            .block_on_database("transaction prepare", self.inner().prepare(sql))?;
+        let inner =
+            self.map_stream(self.drive("transaction prepare", self.inner().prepare(sql)))?;
         Ok(Statement {
             inner,
             runtime: self.runtime.clone(),

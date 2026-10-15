@@ -7,7 +7,7 @@ use hyper::{Body, Request, Response, Server, StatusCode};
 use serde_json::{Value as Json, json};
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 struct HranaState {
@@ -95,6 +95,7 @@ struct ProviderModel {
     limit: Duration,
     timeouts: AtomicUsize,
     committed_durations: Mutex<Vec<Duration>>,
+    stall_owned: AtomicBool,
 }
 
 impl ProviderModel {
@@ -107,6 +108,7 @@ impl ProviderModel {
             limit,
             timeouts: AtomicUsize::new(0),
             committed_durations: Mutex::new(Vec::new()),
+            stall_owned: AtomicBool::new(false),
         })
     }
 }
@@ -128,12 +130,25 @@ async fn provider_response(
             }
         }
     };
-    tokio::time::sleep(model.delay).await;
     let requests = if path == "/v3/pipeline" {
         input["requests"].as_array().unwrap().clone()
     } else {
         vec![input.clone()]
     };
+    let first_sql = requests.first().map(statement_sql).unwrap_or_default();
+    let owns_transaction = model.transactions.lock().unwrap().contains_key(&baton);
+    let transaction_edge = first_sql.starts_with("BEGIN")
+        || first_sql.starts_with("COMMIT")
+        || first_sql.starts_with("ROLLBACK");
+    if owns_transaction && !transaction_edge && model.stall_owned.swap(false, Ordering::SeqCst) {
+        {
+            let mut guard = state.lock().unwrap();
+            guard.statement_hung = true;
+            guard.progress.notify_waiters();
+        }
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(model.delay).await;
     let mut responses = Vec::new();
     let mut closed = false;
     for request in &requests {
@@ -373,7 +388,14 @@ impl HranaFixture {
     }
 
     fn db(&self) -> Db {
-        let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_secs(3))).unwrap();
+        self.db_with_operation_timeout(Duration::from_secs(3))
+    }
+
+    fn db_with_operation_timeout(&self, timeout: Duration) -> Db {
+        let runtime = DbRuntime::with_operation_timeout(Some(timeout)).unwrap();
+        let lease_runtime =
+            DbRuntime::with_operation_timeout(Some(crate::db_compat::INTERACTIVE_READ_BUDGET))
+                .unwrap();
         let database = runtime
             .block_on_database(
                 "connect",
@@ -397,6 +419,7 @@ impl HranaFixture {
             read_only: false,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
+            lease_runtime: lease_runtime.clone(),
             startup_deferred: false,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
@@ -411,7 +434,7 @@ impl HranaFixture {
                 commit_lease_probe: Arc::new(Mutex::new(None)),
             }),
             lease_connection: Arc::new(Mutex::new(Some(
-                Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap(),
+                Connection::from_database(Arc::clone(&database), lease_runtime).unwrap(),
             ))),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),
@@ -2314,6 +2337,125 @@ async fn lease_window_three_second_response_extends_authority() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_window_four_point_eight_second_writer_extends_authority() {
     lease_window_provider_case(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_snapshot_does_not_drop_the_lease_inside_the_ttl() {
+    let path = super::tmp_db_path("lease_stalled_snapshot");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let initial = crate::control::now_ms();
+    assert!(
+        claim_active_bot(&local, instance, initial, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let before = local
+        .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
+        .unwrap()
+        .unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    let model = ProviderModel::new(Duration::ZERO, Duration::from_secs(5));
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.backing = Some((runtime, backing));
+        state.provider = Some(Arc::clone(&model));
+    }
+    // Longer than the lease TTL, so an unbounded pool call would starve renewal.
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(30));
+    remote.arm_writer_term(instance, local.leased_generation().unwrap());
+    model.stall_owned.store(true, Ordering::SeqCst);
+    let reader = remote.clone();
+    let started = std::time::Instant::now();
+    let read = tokio::task::spawn_blocking(move || {
+        reader.with_conn_sync(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            tx.query_row("SELECT 1", (), |_| Ok(()))?;
+            Ok(())
+        })
+    });
+    fixture.wait_until(|state| state.statement_hung).await;
+
+    let blocked = renew_active_bot(
+        &remote,
+        instance,
+        crate::control::now_ms(),
+        std::time::Instant::now() + Duration::from_secs(1),
+        Arc::clone(&refuse),
+    )
+    .await
+    .expect_err("a CAS blocked by the stalled snapshot must not report success");
+    assert!(
+        blocked
+            .to_string()
+            .contains("active-bot lease renewal timed out"),
+        "timed-out renewal must stay retriable: {blocked:#}"
+    );
+    assert!(
+        !is_database_operation_timeout(&blocked),
+        "the activation loop exits on a database operation timeout: {blocked:#}"
+    );
+    assert!(remote.lease_connection.lock().unwrap().is_none());
+    let during = local
+        .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(during, before, "the timed-out CAS must not extend the row");
+
+    let read_error = tokio::time::timeout(Duration::from_secs(8), read)
+        .await
+        .expect("stalled snapshot was not bounded inside the provider lifetime")
+        .unwrap()
+        .expect_err("the stalled snapshot must fail on the read budget");
+    assert!(
+        is_database_operation_timeout(&read_error),
+        "snapshot deadline must be the client budget: {read_error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "snapshot held the writer for {:?}",
+        started.elapsed()
+    );
+    assert!(
+        model.transactions.lock().unwrap().is_empty(),
+        "ROLLBACK must release the provider writer before the lease TTL"
+    );
+
+    assert!(
+        renew_active_bot(
+            &remote,
+            instance,
+            crate::control::now_ms(),
+            std::time::Instant::now() + Duration::from_secs(10),
+            refuse,
+        )
+        .await
+        .unwrap(),
+        "renewal after the stalled snapshot releases"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(u64::try_from(ACTIVE_BOT_LEASE_TTL_MS).unwrap()),
+        "lease renewal lost inside the TTL after {:?}",
+        started.elapsed()
+    );
+    let renewed = local
+        .with_conn_sync(|conn| meta_string_conn(conn, "active_bot_lease"))
+        .unwrap()
+        .unwrap();
+    let expiry = renewed.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
+    assert!(expiry > initial + ACTIVE_BOT_LEASE_TTL_MS);
+    assert!(remote.lease_connection.lock().unwrap().is_some());
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 #[tokio::test(flavor = "multi_thread")]

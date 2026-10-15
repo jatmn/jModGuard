@@ -446,6 +446,9 @@ pub struct Db {
     read_only: bool,
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
+    /// Renewal `block_on` does not share the pool workers or the 75s startup
+    /// deadline. The CAS still uses the caller authority window.
+    lease_runtime: DbRuntime,
     startup_deferred: bool,
     connections: Arc<ConnectionPool>,
     /// Renewal never waits for a core pool permit. Errors discard this stream.
@@ -988,8 +991,16 @@ impl Db {
                 connections.push(connection);
             }
 
+            // Remote renewal gets its own runtime. A stalled pool read must not
+            // occupy both database workers until the 75s startup deadline.
+            // Local files share the pool runtime; there is no remote lifetime.
+            let lease_runtime = if remote {
+                DbRuntime::with_operation_timeout(Some(crate::db_compat::INTERACTIVE_READ_BUDGET))?
+            } else {
+                runtime.for_operation_timeout(None)
+            };
             let mut lease_connection =
-                Connection::from_database(Arc::clone(&database), runtime.clone())?;
+                Connection::from_database(Arc::clone(&database), lease_runtime.clone())?;
             lease_connection.set_read_only(opts.read_only);
             configure_connection(&lease_connection, remote, 2_000, opts.read_only)?;
 
@@ -1011,6 +1022,7 @@ impl Db {
                 read_only: opts.read_only,
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
+                lease_runtime,
                 startup_deferred: false,
                 connections: Arc::new(ConnectionPool {
                     idle: Mutex::new(connections),
@@ -1285,7 +1297,7 @@ impl Db {
         anyhow::ensure!(!self.read_only, "read-only database cannot renew a lease");
         let slot = Arc::clone(&self.lease_connection);
         let database = Arc::clone(&self._database);
-        let runtime = self.runtime.clone();
+        let runtime = self.lease_runtime.clone();
         let remote = self.remote;
         let watch = crate::db_compat::AbandonWatch::new();
         let _caller = CallerCancel::arm(Arc::clone(&watch));

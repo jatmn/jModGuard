@@ -591,7 +591,17 @@ pub async fn renew_active_bot(
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )? == 1)
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            // The activation loop treats this client deadline as fatal. The CAS
+            // is idempotent, so a lost attempt must stay retriable until the
+            // authority window itself is gone.
+            if is_database_operation_timeout(&error) {
+                anyhow::anyhow!("active-bot lease renewal timed out")
+            } else {
+                error
+            }
+        })?;
     // The runtime may poll a ready response before its deadline timer.
     anyhow::ensure!(
         std::time::Instant::now() < deadline,
