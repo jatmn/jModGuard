@@ -84,6 +84,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        if self.0.is::<NotAuthenticated>() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": NotAuthenticated.to_string()})),
+            )
+                .into_response();
+        }
         if self.0.is::<AuthLost>() {
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "discord authorization failed", "code": "auth_lost"}))).into_response();
         }
@@ -455,18 +462,25 @@ async fn require_auth_with(
     guild_mode: GuildListMode,
 ) -> ApiResult<AuthCtx> {
     reject_retired_session(app, session).await?;
-    let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
-        return Err(ApiError(anyhow::anyhow!("not authenticated")));
+    let Some(user_id) = session
+        .get::<u64>(SESSION_USER)
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?
+    else {
+        return Err(ApiError(anyhow::Error::new(NotAuthenticated)));
     };
     // MemoryStore gives each login its own identity. The lock spans token
     // recovery, so waiters use the leader's token even if their Session handle
     // loaded the old record before that leader saved it.
     if session.id().is_none() {
-        session.save().await.map_err(anyhow::Error::from)?;
+        session
+            .save()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
     }
     let id = session
         .id()
-        .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?;
+        .ok_or_else(|| ApiError(anyhow::Error::new(NotAuthenticated)))?;
     app.sweep_auth_sessions(std::time::Instant::now());
     // Hold the vacant tombstone entry through coordinator lookup/insertion.
     // Retirement cannot insert its fence and remove the coordinator between
@@ -480,13 +494,19 @@ async fn require_auth_with(
         }
     };
     let Some(state) = state else {
-        session.flush().await.map_err(anyhow::Error::from)?;
+        session
+            .flush()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         return Err(AuthLost.into());
     };
     let mut state = state.lock().await;
     reject_retired_session(app, session).await?;
     if state.dead {
-        session.flush().await.map_err(anyhow::Error::from)?;
+        session
+            .flush()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         return Err(AuthLost.into());
     }
     state.last_used = Some(std::time::Instant::now());
@@ -495,23 +515,25 @@ async fn require_auth_with(
         None => session
             .get::<String>(SESSION_TOKEN)
             .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| ApiError(anyhow::anyhow!("session expired")))?,
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?
+            .ok_or_else(|| ApiError(anyhow::Error::new(NotAuthenticated)))?,
     };
     if state.token.is_none() {
-        state.refresh = session.get::<String>(SESSION_REFRESH).await.ok().flatten();
+        state.refresh = session
+            .get::<String>(SESSION_REFRESH)
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
     }
     state.token = Some(token.clone());
     session
         .insert(SESSION_TOKEN, &token)
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
     if let Some(refresh) = &state.refresh {
         session
             .insert(SESSION_REFRESH, refresh)
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
     }
     let refresh_wait = state.refresh_wait().or_else(|| {
         // A refresh 429 may outlive the capped session hold. Do not spend
@@ -587,15 +609,18 @@ async fn require_auth_with(
         session
             .insert(SESSION_TOKEN, &refreshed.access_token)
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         if let Some(refresh) = refreshed.refresh_token {
             state.refresh = Some(refresh.clone());
             session
                 .insert(SESSION_REFRESH, refresh)
                 .await
-                .map_err(anyhow::Error::from)?;
+                .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         }
-        session.save().await.map_err(anyhow::Error::from)?;
+        session
+            .save()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         let result = load_auth(
             app,
             user_id,
@@ -617,7 +642,10 @@ async fn require_auth_with(
         .entry(id)
         .or_insert_with(std::time::Instant::now);
     state.retire();
-    session.flush().await.map_err(anyhow::Error::from)?;
+    session
+        .flush()
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
     Err(AuthLost.into())
 }
 
@@ -2088,7 +2116,7 @@ mod tests {
             Body::from(body.to_owned())
         };
         let res = app.oneshot(builder.body(req_body).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
         super::assert_uncacheable_headers(res.headers());
         let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await
@@ -2302,7 +2330,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         super::assert_uncacheable_headers(res.headers());
         let vary = res
             .headers()
@@ -2427,7 +2455,7 @@ mod tests {
         );
         let api = http_get(addr, "/api/me").await;
         assert!(
-            api.starts_with("HTTP/1.1 400"),
+            api.starts_with("HTTP/1.1 401"),
             "app routes must leave the startup 503 after handoff: {api}"
         );
     }
@@ -2464,7 +2492,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2725,7 +2753,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await
             .unwrap();

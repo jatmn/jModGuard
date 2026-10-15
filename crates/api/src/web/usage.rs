@@ -70,7 +70,7 @@ async fn authorize(
                 Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
             ));
         }
-        Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
+        Err(failure) if failure.0.is::<super::NotAuthenticated>() => {
             return Err(error(StatusCode::UNAUTHORIZED, "sign in required"));
         }
         Err(_) => return Err(error(StatusCode::FORBIDDEN, "bot owner required")),

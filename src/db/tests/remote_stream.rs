@@ -425,8 +425,6 @@ impl HranaFixture {
             before_final_lease_reread: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             during_leased_guild_commit: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }
@@ -1463,6 +1461,233 @@ async fn lease_renewal_bypasses_exhausted_core_pool() {
     );
     drop(db);
     super::cleanup_db(&path);
+}
+
+// Claims create authority and may allocate metadata/receipts. Exercise refusal
+// through the public owner with real SQLite, also behind the libSQL HTTP client.
+async fn lease_claim_admission_cases(use_remote: bool, pause_growth: bool) {
+    for takeover in [false, true] {
+        let path = super::tmp_db_path("lease_claim_admission");
+        let local = Db::open(&path, 2).unwrap();
+        let fixture = if use_remote {
+            let fixture = HranaFixture::start().await;
+            let runtime = DbRuntime::new().unwrap();
+            let backing = runtime
+                .block_on(libsql::Builder::new_local(&path).build())
+                .unwrap()
+                .connect()
+                .unwrap();
+            fixture.state.lock().unwrap().backing = Some((runtime, backing));
+            Some(fixture)
+        } else {
+            None
+        };
+        let db = fixture
+            .as_ref()
+            .map_or_else(|| local.clone(), HranaFixture::db);
+        let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let claimant = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let now = crate::control::now_ms();
+        if takeover {
+            assert!(
+                claim_active_bot(&db, owner, now, Arc::clone(&refuse))
+                    .await
+                    .unwrap()
+            );
+        }
+        let stored = || {
+            local
+                .with_conn_sync(|conn| {
+                    Ok((
+                        meta_string_conn(conn, "active_bot_lease")?,
+                        meta_string_conn(conn, "active_bot_generation")?,
+                        conn.query_row("SELECT COUNT(*) FROM mutation_receipts", (), |row| {
+                            Ok(row.get::<i64>(0)?)
+                        })?,
+                    ))
+                })
+                .unwrap()
+        };
+        let before = stored();
+        let generation = db.leased_generation();
+        let expected_error = if pause_growth {
+            // Exceed the real bound, even including both remote receipt allowances.
+            // Rollback must leave only the shared runtime pause behind.
+            let error = db
+                .with_conn(|conn| {
+                    let mut tx = conn.transaction_primary_read()?;
+                    tx.ensure_mutation_receipt()?;
+                    tx.execute_bounded(
+                        "INSERT INTO meta(key,value) VALUES('underestimated',zeroblob(12582912))",
+                        (),
+                        0,
+                    )?;
+                    tx.commit()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("growth exceeded the reserved bound"),
+                "{error:#}"
+            );
+            assert!(db.capacity_runtime_status().growth_paused);
+            "database growth paused"
+        } else {
+            "capacity budget exhausted"
+        };
+        let constrain_capacity = || {
+            if !pause_growth {
+                // Remote errors discard a pooled connection; constrain its replacement too.
+                db.with_conn_sync(|_| Ok(())).unwrap();
+                let allocation = local
+                    .with_conn_sync(|conn| crate::capacity::allocated_bytes(conn))
+                    .unwrap();
+                // Some free bytes remain, but not enough for the first remote
+                // receipt (or the local metadata write's conservative allowance).
+                for conn in db.connections.idle.lock().unwrap().iter_mut() {
+                    conn.set_test_capacity_limits(allocation + 1, allocation + 16 * 1024 * 1024);
+                }
+                // Armed renewal uses its own connection and must face the same headroom.
+                db.lease_connection
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("lease connection initialized")
+                    .set_test_capacity_limits(allocation + 1, allocation + 16 * 1024 * 1024);
+            }
+        };
+        assert_eq!(stored(), before);
+        constrain_capacity();
+        assert!(
+            !claim_active_bot(
+                &db,
+                claimant,
+                now,
+                Arc::new(std::sync::atomic::AtomicBool::new(true))
+            )
+            .await
+            .unwrap()
+        );
+        if takeover {
+            // A live foreign owner remains a read-only refusal, even under pressure.
+            assert!(
+                !claim_active_bot(&db, claimant, now, Arc::clone(&refuse))
+                    .await
+                    .unwrap()
+            );
+        }
+        let claim_time = if takeover {
+            now + ACTIVE_BOT_LEASE_TTL_MS
+        } else {
+            now
+        };
+        let error = claim_active_bot(&db, claimant, claim_time, Arc::clone(&refuse))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        assert_eq!(
+            stored(),
+            before,
+            "refusal changed durable authority or receipts"
+        );
+        assert_eq!(
+            db.leased_generation(),
+            generation,
+            "refusal armed a new writer term"
+        );
+
+        // A claimant without this armed owner/generation cannot use renewal to bypass admission.
+        constrain_capacity();
+        let error = renew_active_bot(
+            &db,
+            claimant,
+            claim_time,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&refuse),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        assert_eq!(stored(), before);
+        assert_eq!(db.leased_generation(), generation);
+
+        constrain_capacity();
+        let error = db
+            .with_conn(|conn| {
+                conn.execute_rows(
+                    "INSERT INTO meta(key,value) VALUES('ordinary','denied')",
+                    (),
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        assert_eq!(stored(), before);
+        if takeover {
+            // Renewal of this still-armed generation takes the separate CAS path.
+            assert!(
+                renew_active_bot(
+                    &db,
+                    owner,
+                    now + 1,
+                    std::time::Instant::now() + Duration::from_secs(10),
+                    Arc::clone(&refuse)
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(
+                stored(),
+                (
+                    Some(format!("{owner} {}", now + 1 + ACTIVE_BOT_LEASE_TTL_MS)),
+                    before.1.clone(),
+                    before.2
+                )
+            );
+            assert_eq!(db.leased_generation(), generation);
+            assert!(
+                !renew_active_bot(
+                    &db,
+                    owner,
+                    now + 1 + ACTIVE_BOT_LEASE_TTL_MS,
+                    std::time::Instant::now() + Duration::from_secs(10),
+                    Arc::clone(&refuse)
+                )
+                .await
+                .unwrap(),
+                "CAS must not revive expired authority"
+            );
+        }
+        drop(db);
+        drop(fixture);
+        drop(local);
+        super::cleanup_db(&path);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_lease_claims_obey_growth_pause() {
+    lease_claim_admission_cases(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_lease_claims_obey_growth_pause() {
+    lease_claim_admission_cases(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_lease_claims_obey_capacity_admission() {
+    lease_claim_admission_cases(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_lease_claims_obey_receipt_capacity_admission() {
+    lease_claim_admission_cases(true, false).await;
 }
 
 // Exercise the public renewal owner through both libSQL backends. The remote

@@ -470,8 +470,6 @@ pub struct Db {
     before_final_lease_reread: BeforeFinalLeaseReread,
     #[cfg(test)]
     during_leased_guild_commit: DuringLeasedGuildCommit,
-    #[cfg(test)]
-    fail_lease_cleanup: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -634,18 +632,6 @@ impl Db {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn arm_lease_cleanup_failure(&self) {
-        self.fail_lease_cleanup
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn take_lease_cleanup_failure(&self) -> bool {
-        self.fail_lease_cleanup
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1055,8 +1041,6 @@ impl Db {
                 before_final_lease_reread: Arc::new(Mutex::new(None)),
                 #[cfg(test)]
                 during_leased_guild_commit: Arc::new(Mutex::new(None)),
-                #[cfg(test)]
-                fail_lease_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })

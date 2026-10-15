@@ -3290,11 +3290,8 @@ async fn concurrent_rejected_tokens_refresh_once_or_die_without_more_discord_cal
             if failure == "none" {
                 assert_eq!(status, StatusCode::OK, "{body}");
             } else {
-                assert!(
-                    status == StatusCode::UNAUTHORIZED || body["error"] == "not authenticated",
-                    "{status}: {body}"
-                );
-                if status == StatusCode::UNAUTHORIZED {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                if body["error"] != "not authenticated" {
                     assert_eq!(body["code"], "auth_lost");
                 }
             }

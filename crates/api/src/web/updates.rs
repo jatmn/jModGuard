@@ -180,7 +180,7 @@ async fn owner(app: &Arc<ApiState>, session: &Session) -> Result<(), (StatusCode
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"discord authorization failed", "code":"auth_lost"})),
         )),
-        Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
+        Err(failure) if failure.0.is::<super::NotAuthenticated>() => {
             Err(error(StatusCode::UNAUTHORIZED, "sign in required"))
         }
         Err(_) => Err(error(StatusCode::FORBIDDEN, "bot owner required")),
