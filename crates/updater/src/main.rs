@@ -1265,6 +1265,13 @@ impl Supervisor {
         if self.health.is_some() || self.role != "bot" {
             return;
         }
+        match self.hold_rejected_token().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!("token hold was not established after the child exited: {error:#}");
+            }
+        }
         if let Err(error) = self.idle().await {
             tracing::warn!("launcher health was not restored after the child exited: {error:#}");
         }

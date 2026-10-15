@@ -4482,6 +4482,67 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+#[tokio::test]
+async fn readiness_error_then_token_exit_binds_health_before_control_read() {
+    let root = std::env::temp_dir().join(format!("ready-token-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let name = "ready-token";
+    let child = executable(&root, name).await;
+    tokio::fs::write(root.join(format!("hold-{name}-ready")), "hold")
+        .await
+        .unwrap();
+    let release = image(&mut HashMap::new(), "bot", b"readiness-timeout");
+    bot.start(&child, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    let error = bot.report_ready().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replacement child readiness timed out"),
+        "{error:#}"
+    );
+    assert!(
+        bot.running
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    assert!(!bot.restart.held);
+
+    // Reproduce the handoff in normal(): readiness has failed, then exit 78
+    // arrives before health recovery and the following control read.
+    publish_exit_code(root.join(format!("exit-code-{name}")), 78).await;
+    // The fixture waits for readiness before checking its requested exit.
+    tokio::fs::remove_file(root.join(format!("hold-{name}-ready")))
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(78));
+    let reserved = bind_outside_ephemeral_range().await;
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    bot.health_bind = Some(addr.to_string());
+    bot.bind_health_after_observed_exit().await;
+
+    // Inspect the boundary before allowing any control read to run.
+    assert!(bot.restart.held, "token hold must precede the control read");
+    assert!(bot.running.is_none());
+    assert_launcher_health(addr, "discord token rejected").await;
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 /// `report_ready` already counted this exit. A later control error must not
 /// make `settle_exited_child` count it again and stretch the backoff.
 #[tokio::test]
