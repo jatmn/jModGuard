@@ -4961,13 +4961,29 @@ async fn independent_exiting_bot(
     ComponentRelease,
     tokio::task::JoinHandle<()>,
 ) {
-    selected_exiting_bot(code, false, false).await
+    independent_exiting_bot_prepared(code, |_| {}).await
+}
+
+/// `prepare` runs after the exit file is in place and before the candidate
+/// start tick, which is the first poll that can settle that exit.
+async fn independent_exiting_bot_prepared(
+    code: i32,
+    prepare: impl FnOnce(&mut Supervisor),
+) -> (
+    PathBuf,
+    Db,
+    Supervisor,
+    ComponentRelease,
+    tokio::task::JoinHandle<()>,
+) {
+    selected_exiting_bot(code, false, false, prepare).await
 }
 
 async fn selected_exiting_bot(
     code: i32,
     restored: bool,
     after_ready: bool,
+    prepare: impl FnOnce(&mut Supervisor),
 ) -> (
     PathBuf,
     Db,
@@ -5053,6 +5069,7 @@ async fn selected_exiting_bot(
     }
     // Record only replacement/recovery starts, after both baselines ran.
     tokio::fs::write(root.join("events"), "").await.unwrap();
+    prepare(&mut bot);
     bot.tick().await.unwrap();
     if after_ready {
         assert_eq!(
@@ -5839,9 +5856,11 @@ async fn recovered_candidate_readiness_timeout_rolls_back() {
 
 #[tokio::test]
 async fn failed_rejected_marker_write_is_retried_before_restart() {
-    let (root, db, mut bot, candidate, server) =
-        independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
-    bot.fail_rejected_candidate_write = true;
+    let (root, db, mut bot, candidate, server) = independent_exiting_bot_prepared(
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
+        |bot| bot.fail_rejected_candidate_write = true,
+    )
+    .await;
     bot.tick().await.unwrap();
     assert!(bot.restart.held);
     assert!(bot.running.is_none());
@@ -6231,6 +6250,7 @@ async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
                 jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
                 restored,
                 after_ready,
+                |_| {},
             )
             .await;
             let before = bot.control.component("bot").await.unwrap();
