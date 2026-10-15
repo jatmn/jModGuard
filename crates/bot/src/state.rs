@@ -327,6 +327,14 @@ struct PendingGatewayBanAudit {
     entry_id: i64,
     expires: Instant,
     attribution: Option<db::GatewayBanAuditAttribution>,
+    valid: Arc<AtomicBool>,
+}
+
+impl Drop for PendingGatewayBanAudit {
+    fn drop(&mut self) {
+        // Clear, expiry, eviction and acknowledgment also revoke sleeping passes.
+        self.valid.store(false, Ordering::Release);
+    }
 }
 
 impl GatewayManualBanAuditQueue {
@@ -368,6 +376,7 @@ impl GatewayManualBanAuditQueue {
             entry_id,
             expires: now + GATEWAY_MANUAL_BAN_AUDIT_TTL,
             attribution,
+            valid: Arc::new(AtomicBool::new(true)),
         });
     }
 
@@ -1347,20 +1356,32 @@ impl BotState {
     ) -> Result<bool> {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
         let enrollment = enrollment.ok_or(db::EnrollmentChanged)?;
-        let attribution = self
+        let Some((attribution, valid, expires)) = self
             .gateway_manual_ban_audit_entries
             .lock()
             .entries
             .get(&(guild, user))
             .and_then(|entries| entries.iter().find(|entry| entry.entry_id == entry_id))
-            .and_then(|entry| entry.attribution.clone());
+            .map(|entry| {
+                (
+                    entry.attribution.clone(),
+                    Arc::clone(&entry.valid),
+                    entry.expires,
+                )
+            })
+        else {
+            return Ok(false);
+        };
         let audit_at = (entry_id >> 22) + 1_420_070_400_000;
         loop {
             let remaining_ms = {
                 let state = flight.lock();
                 // In particular, the callback's pre-write pass must not wait
                 // on its own active observation before it can save the row.
-                if gateway_ban_audit_blocked(&state, guild, user, audit_at) {
+                if !valid.load(Ordering::Acquire)
+                    || expires <= Instant::now()
+                    || gateway_ban_audit_blocked(&state, guild, user, audit_at)
+                {
                     return Ok(false);
                 }
                 audit_at + 5_001 - chrono::Utc::now().timestamp_millis()
@@ -1374,7 +1395,9 @@ impl BotState {
             .with_conn(move |conn| {
                 {
                     let state = flight.lock();
-                    if gateway_ban_audit_blocked(&state, guild, user, audit_at)
+                    if !valid.load(Ordering::Acquire)
+                        || expires <= Instant::now()
+                        || gateway_ban_audit_blocked(&state, guild, user, audit_at)
                         || chrono::Utc::now().timestamp_millis() <= audit_at + 5_000
                     {
                         return Ok(false);
@@ -2322,6 +2345,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleared_audit_cannot_reconcile_a_later_ban() {
+        for requeue in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("cleared_audit_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            let observed = chrono::Utc::now() + chrono::Duration::seconds(1);
+            let audit = audit_id_at(observed.timestamp_millis());
+            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            let reconcile =
+                app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, 55, audit);
+            tokio::pin!(reconcile);
+            tokio::select! {
+                biased;
+                _ = &mut reconcile => panic!("audit must wait for its match window"),
+                _ = std::future::ready(()) => {}
+            }
+            // Unban removes the pending audit while its pass is asleep.
+            app.clear_gateway_manual_ban_audit_entries(10, 55);
+            if requeue {
+                // A replay must not revive the old pass's captured work.
+                app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            }
+            db::record_gateway_ban(
+                &app.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some(&observed.to_rfc3339()),
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !reconcile.await.unwrap(),
+                "cleared pass must not bind a later ban"
+            );
+            assert!(
+                !db::gateway_manual_ban_audit_entry_is_known(
+                    &app.db,
+                    Some(scope.clone()),
+                    10,
+                    55,
+                    audit,
+                )
+                .await
+                .unwrap()
+            );
+            if requeue {
+                assert!(
+                    app.reconcile_gateway_manual_ban_audit_entry(Some(scope), 10, 55, audit,)
+                        .await
+                        .unwrap(),
+                    "fresh replay remains eligible"
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_audit_callback_reconciles_without_another_event() {
+        let directory =
+            std::env::temp_dir().join(format!("cancelled_audit_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let mut observation = app.begin_gateway_ban_observation(10, 55).await;
+        observation.enrollment = Some(scope.clone());
+        observation.observed += chrono::Duration::seconds(1);
+        let audit = audit_id_at(observation.observed.timestamp_millis());
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&observation.observed.to_rfc3339()),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        // The observation's retry has already completed with an empty queue.
+        observation.finish(true).await;
+        {
+            let callback = crate::handlers::reconcile_received_gateway_ban_audit(
+                &app,
+                Some(scope.clone()),
+                10,
+                55,
+                audit,
+                db::GatewayBanAuditAttribution {
+                    moderator_id: 77,
+                    moderator_name: Some("moderator".to_owned()),
+                    reason: "manual ban".to_owned(),
+                },
+            );
+            tokio::pin!(callback);
+            tokio::select! {
+                biased;
+                _ = &mut callback => panic!("audit must wait for its match window"),
+                _ = std::future::ready(()) => {}
+            }
+            // Dropping the callback must leave its queued reconciliation running.
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !app
+                .pending_gateway_manual_ban_audit_entries(10, 55)
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("audit callback cancellation must not strand its audit");
+        assert!(
+            db::gateway_manual_ban_audit_entry_is_known(&app.db, Some(scope), 10, 55, audit,)
+                .await
+                .unwrap()
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn audit_waits_for_delayed_callbacks_before_matching_an_older_ban() {
         let directory =
             std::env::temp_dir().join(format!("audit_window_{:032x}", rand::random::<u128>()));
@@ -2360,6 +2522,10 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !reconcile.is_finished(),
+            "reconciliation must wait for delayed callbacks"
+        );
         assert!(
             !db::gateway_manual_ban_audit_entry_is_known(
                 &app.db,
@@ -2448,6 +2614,7 @@ mod tests {
             })
         };
         entered_rx.await.unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, audit_id_at(old_time.timestamp_millis()));
         let reconciliation = {
             let app = Arc::clone(&app);
             let scope = scope.clone();
@@ -2582,6 +2749,7 @@ mod tests {
         .await
         .unwrap();
         let early_audit = audit_id_at(base);
+        app.queue_gateway_manual_ban_audit_entry(10, users[0], early_audit);
         assert!(
             !app.reconcile_gateway_manual_ban_audit_entry(
                 Some(scope.clone()),
@@ -2609,6 +2777,7 @@ mod tests {
         )
         .await
         .unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, users[0], audit_id_at(later_ms));
         assert!(
             app.reconcile_gateway_manual_ban_audit_entry(
                 Some(scope.clone()),
@@ -2630,6 +2799,7 @@ mod tests {
         old_audit: i64,
         floor: i64,
     ) {
+        app.queue_gateway_manual_ban_audit_entry(10, user, old_audit);
         assert!(
             !app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, user, old_audit)
                 .await
@@ -2849,6 +3019,7 @@ mod tests {
             }
         }
         for user in &users {
+            app.queue_gateway_manual_ban_audit_entry(10, *user, audit);
             assert!(
                 !app.reconcile_gateway_manual_ban_audit_entry(
                     Some(scope.clone()),

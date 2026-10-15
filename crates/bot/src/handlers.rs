@@ -166,6 +166,26 @@ async fn persist_gateway_ban_observation(
     result
 }
 
+// Enqueue and reconcile with the enrollment captured by this audit callback.
+pub(crate) async fn reconcile_received_gateway_ban_audit(
+    app: &Arc<BotState>,
+    enrollment: Option<db::GuildEnrollment>,
+    guild: u64,
+    user: u64,
+    entry_id: i64,
+    attribution: db::GatewayBanAuditAttribution,
+) {
+    app.queue_attributed_gateway_manual_ban_audit_entry(guild, user, entry_id, attribution);
+    let app = Arc::clone(app);
+    // Arm the pass before awaiting it: dropping this callback detaches the task.
+    let reconcile = tokio::spawn(async move {
+        reconcile_pending_gateway_ban_audits(&app, enrollment, guild, user).await;
+    });
+    if let Err(error) = reconcile.await {
+        tracing::warn!("gateway manual ban audit task failed: {error:#}");
+    }
+}
+
 // Pending entries survive transient SQL errors and duplicate audit deliveries.
 // Successful reconciliation (including an already persisted ID) is the only ack.
 pub(crate) async fn reconcile_pending_gateway_ban_audits(
@@ -825,7 +845,9 @@ impl EventHandler for Handler {
                 let guild = guild_id.get();
                 let user = target.get();
                 let enrollment = crate::cases::capture(self.app(), guild).await;
-                self.app.queue_attributed_gateway_manual_ban_audit_entry(
+                reconcile_received_gateway_ban_audit(
+                    &self.app,
+                    enrollment,
                     guild,
                     user,
                     entry_id,
@@ -840,8 +862,8 @@ impl EventHandler for Handler {
                             .unwrap_or("No reason provided")
                             .to_owned(),
                     },
-                );
-                reconcile_pending_gateway_ban_audits(&self.app, enrollment, guild, user).await;
+                )
+                .await;
             }
             // The audit snowflake is the durable action identity. A repeat ban
             // or unban has a different ID; a replay of this entry is idempotent.
