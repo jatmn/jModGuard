@@ -176,8 +176,11 @@ fn controller(
         registry,
         control,
         instance: format!("{:032x}", rand::random::<u128>()),
+        child_watch: None,
         running: None,
         restart: RestartPolicy::default(),
+        restart_target: None,
+        exited_for_restart: false,
         maintenance: None,
         health: None,
         health_bind: None,
@@ -208,6 +211,8 @@ async fn restart(service: &mut Supervisor) {
     service.pending_startup.clear();
     service.receipt_attempt = 0;
     service.receipt_not_before = None;
+    service.exited_for_restart = false;
+    service.restart_target = None;
 }
 
 #[tokio::test]
@@ -2960,6 +2965,29 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
+async fn launcher_health_responds(addr: std::net::SocketAddr) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_millis(200), async {
+        let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+            return false;
+        };
+        if stream
+            .write_all(b"GET /health HTTP/1.0\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let Ok(n) = stream.read(&mut buf).await else {
+            return false;
+        };
+        std::str::from_utf8(&buf[..n]).is_ok_and(|text| text.starts_with("HTTP/1.1 200"))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn assert_launcher_health(addr: std::net::SocketAddr, reason: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for (path, status, body) in [
@@ -3090,8 +3118,11 @@ async fn exited_bot_serves_health_while_tick_database_is_stalled() {
         assert!(bot.health.is_none());
     }
     drop(occupied);
-    // Once restart backoff expires, a control error must also retain health.
+    // Backoff has elapsed. A bad control row must not skip the restart, and the
+    // live child keeps the health socket while that read fails.
     bot.restart.not_before = None;
+    tokio::fs::remove_file(&exit).await.unwrap();
+    tokio::fs::remove_file(&bound).await.unwrap();
     db.with_conn_sync(|conn| {
         let tx = conn.transaction_immediate()?;
         tx.execute_bounded(
@@ -3104,10 +3135,29 @@ async fn exited_bot_serves_health_while_tick_database_is_stalled() {
     .unwrap();
     let error = bot.tick().await.unwrap_err();
     assert!(error.to_string().contains("expected value"), "{error:#}");
-    assert_launcher_health(addr, "not ready").await;
+    assert!(
+        bot.running.is_some(),
+        "control error must not skip the local restart"
+    );
+    assert!(bot.health.is_none(), "live child owns health");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted child never bound health");
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
 
-    // A replacement must acquire the same socket after the launcher task exits.
-    tokio::fs::remove_file(exit).await.unwrap();
+    // A replacement must acquire the same socket after the launcher releases it.
+    bot.stop_application().await.unwrap();
+    assert_launcher_health(addr, "not ready").await;
     tokio::fs::remove_file(&bound).await.unwrap();
     bot.start(&child, &"b".repeat(40), None).await.unwrap();
     assert!(bot.health.is_none());
@@ -3131,6 +3181,552 @@ async fn exited_bot_serves_health_while_tick_database_is_stalled() {
     let released = tokio::net::TcpListener::bind(addr).await.unwrap();
     drop((released, bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn running_bot_exit_during_stalled_tick_restores_health() {
+    let root =
+        std::env::temp_dir().join(format!("health-stall-live-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, "health-live").await;
+    let bind_request = root.join("bind-health-health-live");
+    tokio::fs::write(
+        &bind_request,
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string(),
+    )
+    .await
+    .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-live");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none(), "live child owns health");
+
+    // Hold every pool permit before the tick. One current-thread yield then
+    // polls tick() through its live-child check and parks it on the database
+    // acquire, before this test is allowed to exit the child.
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !tick.is_finished(),
+        "database step must stall while the child is still running"
+    );
+    assert!(
+        !launcher_health_responds(addr).await,
+        "launcher must not own health before the live child exits"
+    );
+    let exit = root.join("exit-code-health-live");
+    tokio::fs::write(&exit, "1").await.unwrap();
+    let recovered = tokio::time::timeout(POLL, async {
+        loop {
+            if launcher_health_responds(addr).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "health remained unbound after the child exited during the stalled database step"
+    );
+    assert_launcher_health(addr, "not ready").await;
+    assert!(
+        !tick.is_finished(),
+        "database step must still be stalled after health returns"
+    );
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("application exited")
+    );
+    assert_launcher_health(addr, "not ready").await;
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+fn child_start_count(root: &std::path::Path, name: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(root.join("events")) else {
+        return 0;
+    };
+    text.lines()
+        .filter(|line| *line == format!("{name}.start"))
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_token_exit_during_stalled_tick_keeps_hold_reason() {
+    let root = std::env::temp_dir().join(format!(
+        "health-stall-token-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, "health-token").await;
+    let bind_request = root.join("bind-health-health-token");
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
+        .await
+        .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-token");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none());
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !tick.is_finished(),
+        "database step must stall while the child is running"
+    );
+    let exit = root.join("exit-code-health-token");
+    tokio::fs::write(
+        &exit,
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if launcher_health_responds(addr).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("health remained unbound after token rejection during the stalled step");
+    assert_launcher_health(addr, "discord token rejected").await;
+    assert!(!tick.is_finished());
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(!result.unwrap());
+    assert!(bot.restart.held);
+    assert!(bot.running.is_none());
+    assert_eq!(child_start_count(&root, "health-token"), 1);
+    assert!(!bot.tick().await.unwrap());
+    assert!(
+        bot.running.is_none(),
+        "token hold must not restart the child"
+    );
+    assert_eq!(child_start_count(&root, "health-token"), 1);
+    assert_launcher_health(addr, "discord token rejected").await;
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
+    let root =
+        std::env::temp_dir().join(format!("receipt-restart-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, "health-receipt").await;
+    let bind_request = root.join("bind-health-health-receipt");
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
+        .await
+        .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join("health-bound-health-receipt");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    let exit = root.join("exit-code-health-receipt");
+    tokio::fs::write(&exit, "1").await.unwrap();
+    tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let error = bot.tick().await.unwrap_err();
+    assert!(
+        error.to_string().contains("application exited"),
+        "{error:#}"
+    );
+    assert!(bot.exited_for_restart);
+    assert!(bot.running.is_none());
+    assert_launcher_health(addr, "not ready").await;
+    bot.pending_failure = Some(PendingFailure {
+        component: Some((
+            release_at("bot", 'd', db::CORE_SCHEMA_VERSION),
+            "component failed".into(),
+        )),
+        launcher: None,
+    });
+    bot.receipt_not_before = Some(Instant::now() + Duration::from_secs(60));
+    assert!(
+        !bot.tick().await.unwrap(),
+        "crash backoff still holds the restart"
+    );
+    assert!(bot.running.is_none());
+    assert_eq!(child_start_count(&root, "health-receipt"), 1);
+    assert_launcher_health(addr, "not ready").await;
+
+    bot.restart.not_before = None;
+    tokio::fs::remove_file(&exit).await.unwrap();
+    tokio::fs::remove_file(&bound).await.unwrap();
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    let started = Instant::now();
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            assert!(
+                !tick.is_finished(),
+                "database step finished before the child restarted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child was not restarted while the receipt database call was stalled");
+    assert!(started.elapsed() < POLL);
+    assert!(!tick.is_finished());
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(!result.unwrap());
+    assert!(bot.running.as_ref().unwrap().child.id().is_some());
+    assert!(bot.health.is_none(), "restarted child owns health");
+    assert!(
+        bot.pending_failure.is_some(),
+        "the unsaved receipt stays pending for a later retry"
+    );
+    assert!(bot.receipt_not_before.is_some());
+    assert!(!bot.tick().await.unwrap());
+    assert_eq!(child_start_count(&root, "health-receipt"), 2);
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_link_unavailable_receipt_restarts_without_waiting() {
+    let root = std::env::temp_dir().join(format!("receipt-link-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    drop(db);
+    let opts = DbOpenOptions {
+        read_only: true,
+        path,
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    assert!(!control.writes_locally());
+    let mut bot = offline_controller("bot", control, &root);
+    let child = executable(&root, "health-link").await;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(root.join("bind-health-health-link"), addr.to_string())
+        .await
+        .unwrap();
+    bot.restart_target = Some(RestartTarget {
+        path: child,
+        source_sha: "b".repeat(40),
+        release: None,
+    });
+    bot.exited_for_restart = true;
+    bot.pending_failure = Some(PendingFailure {
+        component: Some((
+            release_at("bot", 'e', db::CORE_SCHEMA_VERSION),
+            "component failed".into(),
+        )),
+        launcher: None,
+    });
+    bot.idle().await.unwrap();
+    assert_launcher_health(addr, "not ready").await;
+    let started = Instant::now();
+    assert!(!bot.tick().await.unwrap());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "receipt failure delayed restart by {:?}",
+        started.elapsed()
+    );
+    assert!(bot.running.as_ref().unwrap().child.id().is_some());
+    assert!(bot.health.is_none());
+    assert!(bot.pending_failure.is_some());
+    let bound = root.join("health-bound-health-link");
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted child never bound health");
+    assert_eq!(
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert!(!bot.tick().await.unwrap());
+    assert_eq!(child_start_count(&root, "health-link"), 1);
+    assert!(
+        bot.pending_failure.is_some(),
+        "control link failure stays pending"
+    );
+    bot.stop_application().await.unwrap();
+    assert_launcher_health(addr, "not ready").await;
+    bot.end_idle().await.unwrap();
+    drop(bot);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[test]
+fn child_liveness_observes_exit_without_reaping() {
+    use std::os::fd::AsRawFd;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let pidfd = open_pidfd(pid).unwrap();
+    assert!(matches!(
+        child_liveness(pidfd.as_raw_fd()).unwrap(),
+        ChildLiveness::Running
+    ));
+    assert!(child.try_wait().unwrap().is_none());
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    assert_eq!(rc, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let code = loop {
+        match child_liveness(pidfd.as_raw_fd()).unwrap() {
+            ChildLiveness::Exited(code) => break code,
+            ChildLiveness::Running if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("unexpected liveness after kill: {other:?}"),
+        }
+    };
+    assert!(code.is_none(), "signal death is not an exit code");
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "supervisor can still reap"
+    );
+    assert!(matches!(
+        child_liveness(pidfd.as_raw_fd()).unwrap(),
+        ChildLiveness::Reaped
+    ));
+}
+
+/// `bind(0)` draws from the ephemeral range. Reclaiming one of those ports
+/// races every other test that also binds an ephemeral port.
+async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
+    for port in 20_000..20_128 {
+        if let Ok(listener) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
+            return listener;
+        }
+    }
+    panic!("no free loopback port outside the ephemeral range");
+}
+
+#[tokio::test]
+async fn health_bind_retries_only_while_the_port_is_busy() {
+    let listener = bind_outside_ephemeral_range().await;
+    let addr = listener.local_addr().unwrap();
+    let (_cancel, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let started = Instant::now();
+    let missed = bind_health_retry(
+        &addr.to_string(),
+        "not ready",
+        Instant::now() + Duration::from_millis(80),
+        &mut cancel_rx,
+    )
+    .await;
+    assert!(missed.is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "retry returned too quickly: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "retry ran too long: {elapsed:?}"
+    );
+
+    let (cancel, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let retry = tokio::spawn(async move {
+        bind_health_retry(
+            &addr.to_string(),
+            "not ready",
+            Instant::now() + Duration::from_secs(5),
+            &mut cancel_rx,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancel.send(()).unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_millis(500), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cancelled.is_none(), "cancel must not leave a listener");
+
+    drop(listener);
+    let (_cancel, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = bind_health_retry(
+        &addr.to_string(),
+        "discord token rejected",
+        Instant::now() + POLL,
+        &mut cancel_rx,
+    )
+    .await
+    .expect("bind after the port is released");
+    assert_launcher_health(addr, "discord token rejected").await;
+    serve.abort();
+    let _ = serve.await;
+
+    let (_cancel, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let started = Instant::now();
+    let invalid = bind_health_retry(
+        "invalid-address",
+        "not ready",
+        Instant::now() + Duration::from_secs(5),
+        &mut cancel_rx,
+    )
+    .await;
+    assert!(invalid.is_none());
+    assert!(started.elapsed() < Duration::from_millis(500));
 }
 
 async fn held_launcher_health(
