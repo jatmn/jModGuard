@@ -5140,18 +5140,35 @@ async fn independent_rejected_token_retries_desired_before_installed_and_doubles
     );
     bot.restart.auth_retry_at = Some(Instant::now());
     bot.tick().await.unwrap();
-    assert_eq!(
-        bot.running
-            .as_ref()
+    // The exit file is already present, so this child can exit before tick
+    // returns. Settlement then holds the token and clears `running`. A quiet
+    // run can still return while the child is recorded. Either result is valid.
+    if let Some(running) = bot.running.as_mut() {
+        assert_eq!(
+            running.release.as_ref().unwrap().digest,
+            candidate.digest,
+            "timed retry must start the desired candidate before any installed/baked child"
+        );
+        tokio::time::timeout(POLL, running.child.wait())
+            .await
             .unwrap()
-            .release
-            .as_ref()
-            .unwrap()
-            .digest,
-        candidate.digest,
-        "timed retry must start the desired candidate before any installed/baked child"
-    );
-    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+            .unwrap();
+    } else {
+        // settle_exited_child already reaped this immediate token rejection.
+        // The hold, not a still-running child, is the record of that exit.
+        assert!(bot.restart.held);
+        assert!(!bot.exited_for_restart);
+        let recorded = bot.rejected_candidate.clone().or_else(|| {
+            bot.restart_target
+                .as_ref()
+                .and_then(|target| target.release.clone())
+        });
+        assert_eq!(
+            recorded.expect("held exit recorded the candidate").digest,
+            candidate.digest,
+            "timed retry must start the desired candidate before any installed/baked child"
+        );
+    }
     assert_eq!(
         independent_exit_starts(&root).await,
         ["desired-bot.start", "desired-bot.start"]
