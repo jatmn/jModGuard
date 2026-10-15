@@ -710,6 +710,9 @@ struct Supervisor {
     /// Test-only stall after the opening hold check and before `idle`.
     #[cfg(test)]
     before_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Test-only stall after `idle` and before the pre-control hold check.
+    #[cfg(test)]
+    after_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
@@ -1034,6 +1037,50 @@ impl Supervisor {
         self.idle().await
     }
 
+    /// `hold_rejected_token` reaps every exit and only binds health for code 78.
+    /// Any other reaped exit must bind launcher health and record restart policy
+    /// before a receipt or control await. `running` stays set so this tick can
+    /// still report the exit after that await. A live child is left for the watcher.
+    async fn recover_reaped_ordinary_exit(&mut self) -> Result<()> {
+        if self.role != "bot" {
+            return Ok(());
+        }
+        let (code, uptime, target) = {
+            let Some(child) = self.running.as_mut() else {
+                return Ok(());
+            };
+            if child.child.id().is_some() {
+                return Ok(());
+            }
+            let Some(status) = child.child.try_wait()? else {
+                return Ok(());
+            };
+            if status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+                return Ok(());
+            }
+            (
+                status.code(),
+                child.started.elapsed(),
+                RestartTarget {
+                    path: child.path.clone(),
+                    source_sha: child.source_sha.clone(),
+                    release: child.release.clone(),
+                },
+            )
+        };
+        self.idle().await?;
+        if self.standby.is_some() || self.rollback.is_some() {
+            return Ok(());
+        }
+        self.restart_target.get_or_insert(target);
+        if !self.exit_accounted {
+            self.restart.exited(true, code, uptime, Instant::now());
+            self.exit_accounted = true;
+        }
+        self.exited_for_restart = true;
+        Ok(())
+    }
+
     /// Relaunch the last local child before any receipt or control await.
     async fn restart_exited_child(&mut self) -> Result<()> {
         if !self.exited_for_restart
@@ -1160,13 +1207,16 @@ impl Supervisor {
                     self.hold_rejected_token().await?;
                     return Ok(false);
                 }
-                self.restart.exited(
-                    self.role == "bot",
-                    status.code(),
-                    child.started.elapsed(),
-                    Instant::now(),
-                );
-                self.exit_accounted = true;
+                // The pre-control recover path may already have counted this exit.
+                if !self.exit_accounted {
+                    self.restart.exited(
+                        self.role == "bot",
+                        status.code(),
+                        child.started.elapsed(),
+                        Instant::now(),
+                    );
+                    self.exit_accounted = true;
+                }
                 bail!("application exited: {status}");
             }
             if child.started.elapsed() >= Duration::from_secs(300) {
@@ -1931,6 +1981,12 @@ impl Supervisor {
         if self.role == "bot" {
             self.idle().await?;
         }
+        // An ordinary exit can land after idle saw the child alive. The test
+        // parks here so that ordering is observable; production does not wait.
+        #[cfg(test)]
+        if let Some(gate) = self.after_idle_gate.take() {
+            let _ = gate.await;
+        }
         // idle reaps exit 78 and leaves the socket unbound, and the reaped pid
         // cannot be watched. Hold before restart or any control await so the
         // token listener is up for the whole stall and the child is not restarted.
@@ -1946,6 +2002,11 @@ impl Supervisor {
         {
             return Ok(false);
         }
+        // That hold reaps a non-78 exit without binding. Restore health and
+        // record the restart before the control await, including exits reaped
+        // by the opening hold check. A child that is still alive is watched
+        // below, so its exit during the stall binds inside the same window.
+        self.recover_reaped_ordinary_exit().await?;
         // Restart from the retained binary before any receipt or control await.
         // The receipt is retried below, or on a later poll, and must not gate this.
         self.restart_exited_child().await?;
@@ -2402,6 +2463,8 @@ async fn main() -> Result<()> {
         exit_control_gate: None,
         #[cfg(test)]
         before_idle_gate: None,
+        #[cfg(test)]
+        after_idle_gate: None,
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,

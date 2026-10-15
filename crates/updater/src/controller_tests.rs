@@ -187,6 +187,7 @@ fn controller(
         health_bind: None,
         exit_control_gate: None,
         before_idle_gate: None,
+        after_idle_gate: None,
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
@@ -3541,6 +3542,259 @@ async fn token_exit_before_idle_keeps_health_during_stalled_control() {
         blocker.await.unwrap();
     }
     stalled.await.unwrap().unwrap();
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+/// Hold both pooled connections. The next supervisor read parks until `releases` is dropped.
+async fn block_sqlite_pool(
+    db: &Db,
+) -> (
+    Vec<std::sync::mpsc::Sender<()>>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                let _ = entered.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+    }
+    (releases, blockers)
+}
+
+/// Exit 1 lands after `idle` saw the child alive and before the pre-control hold
+/// check. That check reaps it. `/health` has to answer within one poll while the
+/// SQLite pool is still blocked, and the exit is counted once for restart.
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
+    let name = "health-ordinary-idle";
+    let root = std::env::temp_dir().join(format!(
+        "health-ordinary-idle-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, name).await;
+    let bind_request = root.join(format!("bind-health-{name}"));
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
+        .await
+        .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join(format!("health-bound-{name}"));
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none(), "live child owns health");
+    let pid = bot
+        .running
+        .as_ref()
+        .unwrap()
+        .child
+        .id()
+        .expect("live child pid");
+    let (release_gate, gate) = tokio::sync::oneshot::channel();
+    bot.after_idle_gate = Some(gate);
+    let (releases, blockers) = block_sqlite_pool(&db).await;
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !tick.is_finished(),
+        "tick must wait after idle while the child is still alive"
+    );
+    assert!(
+        !launcher_health_responds(addr).await,
+        "launcher must not own health before the ordinary exit"
+    );
+    let exit = root.join(format!("exit-code-{name}"));
+    tokio::fs::write(&exit, "1").await.unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if child_is_zombie(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child did not exit 1 before the pre-control hold check");
+    release_gate.send(()).unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if launcher_health_responds(addr).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("health stayed down after exit 1 while the database was blocked");
+    assert!(
+        !tick.is_finished(),
+        "database must still be blocked after health returns"
+    );
+    assert_launcher_health(addr, "not ready").await;
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("application exited")
+    );
+    assert_launcher_health(addr, "not ready").await;
+    assert!(bot.exited_for_restart);
+    assert!(bot.restart.waiting(Instant::now()));
+    assert_eq!(bot.restart.failures, 1);
+    assert!(bot.running.is_none());
+    assert_eq!(child_start_count(&root, name), 1);
+    assert!(!bot.tick().await.unwrap());
+    assert_eq!(
+        child_start_count(&root, name),
+        1,
+        "backoff must hold the restart"
+    );
+    bot.restart.not_before = None;
+    tokio::fs::remove_file(&exit).await.unwrap();
+    tokio::fs::remove_file(&bound).await.unwrap();
+    bot.tick().await.unwrap();
+    assert_eq!(child_start_count(&root, name), 2);
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+/// The child is still alive when the tick parks on a blocked SQLite pool, then
+/// exits 1. `/health` has to answer within one poll before that read finishes.
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_exit_during_blocked_pool_restores_health() {
+    let name = "health-ordinary-pool";
+    let root = std::env::temp_dir().join(format!(
+        "health-ordinary-pool-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let child = executable(&root, name).await;
+    let bind_request = root.join(format!("bind-health-{name}"));
+    tokio::fs::write(&bind_request, "127.0.0.1:0")
+        .await
+        .unwrap();
+    bot.start(&child, &"b".repeat(40), None).await.unwrap();
+    let bound = root.join(format!("health-bound-{name}"));
+    tokio::time::timeout(POLL, async {
+        while !bound.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child never bound health");
+    let addr: std::net::SocketAddr = tokio::fs::read_to_string(&bound)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    bot.health_bind = Some(addr.to_string());
+    tokio::fs::write(&bind_request, addr.to_string())
+        .await
+        .unwrap();
+    bot.idle().await.unwrap();
+    assert!(bot.health.is_none(), "live child owns health");
+    let pid = bot
+        .running
+        .as_ref()
+        .unwrap()
+        .child
+        .id()
+        .expect("live child pid");
+    let (releases, blockers) = block_sqlite_pool(&db).await;
+    let tick = tokio::spawn(async move {
+        let result = bot.tick().await;
+        (bot, result)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !tick.is_finished(),
+        "database step must stall while the child is still running"
+    );
+    assert!(
+        !child_is_zombie(pid),
+        "child must still be alive when the database stalls"
+    );
+    assert!(
+        !launcher_health_responds(addr).await,
+        "launcher must not own health before the live child exits"
+    );
+    tokio::fs::write(root.join(format!("exit-code-{name}")), "1")
+        .await
+        .unwrap();
+    tokio::time::timeout(POLL, async {
+        loop {
+            if launcher_health_responds(addr).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("health stayed down after exit 1 while the database was blocked");
+    assert!(
+        !tick.is_finished(),
+        "database must still be blocked after health returns"
+    );
+    assert_launcher_health(addr, "not ready").await;
+    drop(releases);
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("application exited")
+    );
+    assert_launcher_health(addr, "not ready").await;
+    assert!(bot.exited_for_restart);
+    assert!(bot.restart.waiting(Instant::now()));
+    assert_eq!(bot.restart.failures, 1);
+    assert!(bot.running.is_none());
+    assert_eq!(child_start_count(&root, name), 1);
     bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
