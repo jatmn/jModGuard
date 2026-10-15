@@ -1157,7 +1157,9 @@ fn member_ban_event_json_lacks_audit_entry_id(data: &str) -> bool {
     }
 }
 
-fn reconcile_gateway_manual_ban_audit_entry_conn(
+/// Reconcile inside an existing DB worker, allowing the bot to retain its
+/// live observation fence through the SQL decision and commit.
+pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     conn: &mut Connection,
     enrollment: &GuildEnrollment,
     guild_id: i64,
@@ -1342,6 +1344,55 @@ pub async fn reconcile_gateway_manual_ban_audit_entry(
             user_id,
             audit_entry_id,
         )
+    })
+    .await
+}
+
+/// Find a ban split from this callback's original mirror and observation.
+/// Ordinary redeliveries and unrelated newer bans are not attribution targets.
+pub async fn gateway_ban_split_for_observation(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    original_row_id: i64,
+    observed_at_ms: i64,
+) -> Result<Option<i64>> {
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let matches = {
+            let mut statement = tx.prepare(
+                "SELECT CAST(json_extract(data, '$.ban_id') AS INTEGER) FROM events
+                 WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+                   AND json_valid(data)
+                   AND json_extract(data, '$.ban_id') != ?3
+                   AND json_extract(data, '$.gateway_observation_origin') = (
+                     SELECT COALESCE(json_extract(data, '$.gateway_observation_origin'), ?3)
+                     FROM events WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+                       AND json_valid(data) AND json_extract(data, '$.ban_id')=?3
+                     ORDER BY id DESC LIMIT 1)
+                   AND CAST(ROUND((julianday(created_at) - 2440587.5) * 86400000) AS INTEGER)=?4
+                 LIMIT 2",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        enrollment.guild_id,
+                        user_id,
+                        original_row_id,
+                        observed_at_ms
+                    ],
+                    |row| Ok(row.get::<i64>(0)?),
+                )?
+                .collect::<Result<Vec<_>>>()?
+        };
+        tx.finish_read()?;
+        Ok(match matches.as_slice() {
+            [row_id] => Some(*row_id),
+            _ => None,
+        })
     })
     .await
 }
