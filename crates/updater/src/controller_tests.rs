@@ -3966,9 +3966,7 @@ async fn control_link_unavailable_receipt_restarts_without_waiting() {
     assert!(!control.writes_locally());
     let mut bot = offline_controller("bot", control, &root);
     let child = executable(&root, "health-link").await;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
+    let listener = bind_outside_ephemeral_range().await;
     let addr = listener.local_addr().unwrap();
     drop(listener);
     bot.health_bind = Some(addr.to_string());
@@ -4603,6 +4601,26 @@ async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
     panic!("no free loopback port outside the ephemeral range");
 }
 
+/// A port this process will close and bind again. It stays out of
+/// `20_000..30_000` so the shared allocator cannot claim it during that gap,
+/// and out of the kernel ephemeral range so `bind(0)` cannot either.
+async fn bind_reclaimable_health_port() -> tokio::net::TcpListener {
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    const FIRST: u16 = 31_000;
+    const SPAN: u16 = 1_000;
+    let origin = (std::process::id() as u16) % SPAN;
+    for _ in 0..SPAN {
+        let port =
+            FIRST + (origin + NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) % SPAN;
+        if let Ok(listener) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
+            return listener;
+        }
+    }
+    panic!("no free reclaimable health port");
+}
+
 #[tokio::test]
 async fn health_bind_retries_only_while_the_port_is_busy() {
     let listener = bind_outside_ephemeral_range().await;
@@ -4681,9 +4699,7 @@ async fn held_launcher_health(
         Duration::ZERO,
         Instant::now(),
     );
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
+    let listener = bind_reclaimable_health_port().await;
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(jmodguard::health::serve_listener_as_with_reason(
         listener,
@@ -4702,7 +4718,14 @@ async fn failed_auth_retry_tick_refreshes_ready_reason_before_control_error() {
     tokio::fs::create_dir_all(&root).await.unwrap();
     let db = Db::open(&root.join("core.db"), 2).unwrap();
     let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
-    let (addr, task) = held_launcher_health(&mut bot.restart).await;
+    // The tick aborts whatever `health` holds, then binds `health_bind`.
+    // Those must be different sockets: rebinding the port just closed races
+    // other listeners in this process.
+    let bind_listener = bind_reclaimable_health_port().await;
+    let addr = bind_listener.local_addr().unwrap();
+    drop(bind_listener);
+    let (held_addr, task) = held_launcher_health(&mut bot.restart).await;
+    assert_ne!(held_addr, addr);
     bot.health = Some(task);
     bot.health_bind = Some(addr.to_string());
     db.with_conn_sync(|conn| {
@@ -6126,7 +6149,39 @@ async fn exiting_bot_with_alternate() -> (
     .await;
     tokio::fs::write(root.join("events"), "").await.unwrap();
     bot.tick().await.unwrap();
-    bot.running.as_mut().unwrap().child.wait().await.unwrap();
+    // The candidate exits 78 as soon as it starts. This tick can leave that
+    // child running, or settle_exited_child can already have held it and
+    // cleared `running`.
+    if let Some(child) = bot.running.as_mut() {
+        assert_eq!(
+            child.release.as_ref().unwrap().digest,
+            candidate.digest,
+            "the immediate exit must belong to the desired candidate"
+        );
+        child.child.wait().await.unwrap();
+    } else {
+        assert!(
+            bot.restart.held,
+            "a settled token exit must be inside the rejected-token hold"
+        );
+        assert!(!bot.exited_for_restart);
+        let recorded = bot.rejected_candidate.clone().or_else(|| {
+            bot.restart_target
+                .as_ref()
+                .and_then(|target| target.release.clone())
+        });
+        assert_eq!(
+            recorded.expect("held exit recorded the candidate").digest,
+            candidate.digest
+        );
+        let events = tokio::fs::read_to_string(root.join("events"))
+            .await
+            .unwrap();
+        assert!(
+            !events.lines().any(|line| line.ends_with(".ready")),
+            "an immediate token rejection must not publish readiness"
+        );
+    }
     (root, db, bot, candidate, alternate, server)
 }
 
