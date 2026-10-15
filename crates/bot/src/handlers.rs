@@ -134,19 +134,17 @@ fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
 async fn persist_gateway_ban_observation(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
-    guild: u64,
     user: u64,
-    in_flight: crate::state::GatewayBanObservation,
+    mut in_flight: crate::state::GatewayBanObservation,
     owned_by_bot: bool,
     write: impl std::future::Future<Output = anyhow::Result<db::GatewayBanWrite>>,
 ) -> anyhow::Result<db::GatewayBanWrite> {
     let observed_at_ms = in_flight.observed.timestamp_millis();
+    // Cancellation must retry with this captured membership, never a later one.
+    in_flight.enrollment = enrollment.clone();
     let result = write.await;
     in_flight.finish(result.is_ok()).await;
-    // Audit delivery queues before looking in SQL. If it ran before this
-    // commit, this pass sees its ID; if it runs later, it sees the saved row.
-    // A failed write never consumes an ID either.
-    reconcile_pending_gateway_ban_audits(app, enrollment.clone(), guild, user).await;
+    // finish retries queued audits independently of this callback's lifetime.
     if !owned_by_bot && let Ok(db::GatewayBanWrite::Existing { row_id }) = result {
         // Another audit callback may already have split and acknowledged this
         // observation. Resolve persisted lineage/time, not the last queue entry
@@ -170,7 +168,7 @@ async fn persist_gateway_ban_observation(
 
 // Pending entries survive transient SQL errors and duplicate audit deliveries.
 // Successful reconciliation (including an already persisted ID) is the only ack.
-async fn reconcile_pending_gateway_ban_audits(
+pub(crate) async fn reconcile_pending_gateway_ban_audits(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
     guild: u64,
@@ -599,7 +597,6 @@ impl EventHandler for Handler {
             persist_gateway_ban_observation(
                 &app,
                 enrollment.clone(),
-                guild_id.get(),
                 banned_user.id.get(),
                 in_flight,
                 echo.owned_by_bot,
@@ -828,8 +825,22 @@ impl EventHandler for Handler {
                 let guild = guild_id.get();
                 let user = target.get();
                 let enrollment = crate::cases::capture(self.app(), guild).await;
-                self.app
-                    .queue_gateway_manual_ban_audit_entry(guild, user, entry_id);
+                self.app.queue_attributed_gateway_manual_ban_audit_entry(
+                    guild,
+                    user,
+                    entry_id,
+                    db::GatewayBanAuditAttribution {
+                        moderator_id: entry.user_id.get() as i64,
+                        moderator_name: ctx.cache.user(entry.user_id).map(|user| user.name.clone()),
+                        reason: entry
+                            .reason
+                            .as_deref()
+                            .map(jmodguard::ban_reason::without_tag)
+                            .filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or("No reason provided")
+                            .to_owned(),
+                    },
+                );
                 reconcile_pending_gateway_ban_audits(&self.app, enrollment, guild, user).await;
             }
             // The audit snowflake is the durable action identity. A repeat ban
@@ -1612,13 +1623,21 @@ mod tests {
             let result = super::persist_gateway_ban_observation(
                 &app,
                 Some(scope.clone()),
-                10,
                 55,
                 in_flight,
                 false,
                 async {
                     if !after_write {
-                        app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+                        app.queue_attributed_gateway_manual_ban_audit_entry(
+                            10,
+                            55,
+                            audit,
+                            crate::db::GatewayBanAuditAttribution {
+                                moderator_id: 77,
+                                moderator_name: None,
+                                reason: "second ban reason".into(),
+                            },
+                        );
                         super::reconcile_pending_gateway_ban_audits(
                             &app,
                             Some(scope.clone()),
@@ -1649,19 +1668,8 @@ mod tests {
             .await
             .unwrap();
             if !after_write {
-                let row_id = gateway_ban_row_to_attribute(result)
+                gateway_ban_row_to_attribute(result)
                     .expect("post-write split must hand its row to attribution");
-                crate::db::attribute_enrolled_ban(
-                    &app.db,
-                    Some(scope.clone()),
-                    row_id,
-                    55,
-                    77,
-                    Some("moderator"),
-                    "second ban reason",
-                )
-                .await
-                .unwrap();
             } else {
                 assert!(matches!(
                     result,
@@ -1669,7 +1677,16 @@ mod tests {
                 ));
             }
             if after_write {
-                app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+                app.queue_attributed_gateway_manual_ban_audit_entry(
+                    10,
+                    55,
+                    audit,
+                    crate::db::GatewayBanAuditAttribution {
+                        moderator_id: 77,
+                        moderator_name: None,
+                        reason: "second ban reason".into(),
+                    },
+                );
                 super::reconcile_pending_gateway_ban_audits(&app, Some(scope.clone()), 10, 55)
                     .await;
             }
@@ -1682,10 +1699,42 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows.iter().filter(|r| r.active).count(), 1);
-            if !after_write {
+            {
                 let active = rows.iter().find(|row| row.active).unwrap();
                 assert_eq!(active.moderator_id, Some(77));
                 assert_eq!(active.reason.as_deref(), Some("second ban reason"));
+                assert!(active.moderator_name.is_none());
+                // The later HTTP lookup can enrich the same actor's name,
+                // without replacing the reason supplied by the exact audit.
+                crate::db::attribute_enrolled_ban(
+                    &app.db,
+                    Some(scope.clone()),
+                    active.id,
+                    55,
+                    77,
+                    Some("moderator"),
+                    "later display reason",
+                )
+                .await
+                .unwrap();
+                crate::db::attribute_enrolled_ban(
+                    &app.db,
+                    Some(scope.clone()),
+                    active.id,
+                    55,
+                    88,
+                    Some("other actor"),
+                    "unrelated reason",
+                )
+                .await
+                .unwrap();
+                let enriched = crate::db::list_enrolled_bans(&app.db, scope.clone(), 10)
+                    .await
+                    .unwrap();
+                let enriched = enriched.iter().find(|row| row.id == active.id).unwrap();
+                assert_eq!(enriched.moderator_id, Some(77));
+                assert_eq!(enriched.moderator_name.as_deref(), Some("moderator"));
+                assert_eq!(enriched.reason.as_deref(), Some("second ban reason"));
                 assert!(
                     rows.iter()
                         .filter(|row| !row.active)
@@ -1919,7 +1968,6 @@ mod tests {
             let first = super::persist_gateway_ban_observation(
                 &app,
                 Some(enrollment.clone()),
-                10,
                 55,
                 app.begin_gateway_ban_observation(10, 55).await,
                 false,
