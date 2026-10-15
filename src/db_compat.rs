@@ -1155,6 +1155,10 @@ impl Connection {
         self.expected_writer_generation = generation;
     }
 
+    pub(crate) fn expected_writer_generation(&self) -> Option<i64> {
+        self.expected_writer_generation
+    }
+
     pub(crate) fn set_expected_launcher(&mut self, instance: Option<String>) {
         self.expected_launcher = instance;
     }
@@ -2289,6 +2293,17 @@ impl Transaction {
         self.mutation_receipt = Some(receipt);
         self.write_prepared.store(true, Ordering::Release);
         Ok(Some((admit, prune.to_string())))
+    }
+
+    /// The caller already re-checked the core lease and guild writer epoch.
+    /// Commit must not repeat those reads while this write transaction is open.
+    pub(crate) fn suppress_commit_writer_recheck(&mut self, lease: bool, epoch: bool) {
+        if lease {
+            self.commit_lease_probe = None;
+        }
+        if epoch {
+            self.expected_writer_generation = None;
+        }
     }
 }
 

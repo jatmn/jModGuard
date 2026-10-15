@@ -5810,8 +5810,31 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (f, local, scope) = ready().await;
     complete_for_checks(&local, &scope).await;
-    // ~350 ms per request is the reported remote latency. The whole write
-    // transaction, including COMMIT, has to finish inside the 5 s lifetime.
+    let owner = "ab".repeat(16);
+    // Both delayed marks take longer on the wall clock than the normal 20s
+    // claim window. The expiry still has to be a real held lease.
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms().saturating_add(120_000),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let generation = f.catalog.leased_generation().unwrap();
+    local.raise_writer_epoch(generation).await.unwrap();
+    // ~350 ms per request is the reported remote latency. Both databases are
+    // delayed, and the writer lease plus epoch check are armed. The whole
+    // guild write transaction, including COMMIT, has to finish inside 5 s.
+    let (_core_fixture, core_db) = HranaFixture::delayed_database(
+        &f.catalog_path,
+        Duration::from_millis(350),
+        Duration::from_secs(5),
+    )
+    .await;
+    core_db.arm_writer_term(&owner, generation);
     let (fixture, db) = HranaFixture::delayed_database(
         &f.store_path,
         Duration::from_millis(350),
@@ -5822,7 +5845,8 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
         db,
         expected: local.expected.clone(),
         core: None,
-    };
+    }
+    .with_core_write_fence(core_db);
     assert!(remote.db.is_remote());
 
     remote
@@ -5871,6 +5895,117 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
             Some(4_000)
         )
     );
+}
+
+async fn coverage_gap_persisted_mark(
+    store: &GuildDataStore,
+) -> (bool, Option<String>, i64, i64, i64) {
+    store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT s.reconciliation_needed,s.reconciliation_reason,s.gap_generation,s.directory_revision,(SELECT COUNT(*) FROM guild_member_audit_recovery a WHERE a.guild_id=s.guild_id)+(SELECT COUNT(*) FROM mutation_receipts) FROM guild_member_seed s WHERE s.guild_id=10",
+                (),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+        })
+        .await
+        .unwrap()
+}
+
+fn armed_coverage_gap_store(local: &GuildDataStore, catalog: &Db) -> GuildDataStore {
+    GuildDataStore {
+        db: local.db.clone(),
+        expected: local.expected.clone(),
+        core: None,
+    }
+    .with_core_write_fence(catalog.clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    local
+        .raise_writer_epoch(f.catalog.leased_generation().unwrap())
+        .await
+        .unwrap();
+    let remote = armed_coverage_gap_store(&local, &f.catalog);
+    let before = coverage_gap_persisted_mark(&local).await;
+    let path = f.store_path.clone();
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(Some(Box::new(
+        move || {
+            let conn = crate::db_compat::Connection::open(&path).unwrap();
+            conn.execute_batch_bounded(
+                "UPDATE guild_writer_epoch SET generation=generation+1 WHERE singleton=1",
+                SCHEMA_BATCH_LIMIT,
+            )
+            .unwrap();
+        },
+    )));
+    let error = remote
+        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(None);
+    assert!(super::lease_rejected(&error), "{error:#}");
+    assert_eq!(coverage_gap_persisted_mark(&local).await, before);
+    assert!(!before.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    local
+        .raise_writer_epoch(f.catalog.leased_generation().unwrap())
+        .await
+        .unwrap();
+    let remote = armed_coverage_gap_store(&local, &f.catalog);
+    let before = coverage_gap_persisted_mark(&local).await;
+    let path = f.catalog_path.clone();
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(Some(Box::new(
+        move || {
+            let conn = crate::db_compat::Connection::open(&path).unwrap();
+            conn.execute_batch_bounded(
+                "DELETE FROM meta WHERE key='active_bot_lease'",
+                SCHEMA_BATCH_LIMIT,
+            )
+            .unwrap();
+        },
+    )));
+    let error = remote
+        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(None);
+    assert!(super::lease_rejected(&error), "{error:#}");
+    assert_eq!(coverage_gap_persisted_mark(&local).await, before);
+    assert!(!before.0);
 }
 
 #[tokio::test]

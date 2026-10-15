@@ -24,6 +24,10 @@ static COVERAGE_GAP_AFTER_RECEIPT_ADMISSION: Mutex<Option<Box<dyn Fn() + Send + 
     Mutex::new(None);
 
 #[cfg(test)]
+static COVERAGE_GAP_AFTER_WRITER_FENCE: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
 static COVERAGE_GAP_HOOK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
@@ -48,6 +52,11 @@ pub(crate) fn test_set_coverage_gap_after_receipt_admission(
     hook: Option<Box<dyn Fn() + Send + Sync>>,
 ) {
     *COVERAGE_GAP_AFTER_RECEIPT_ADMISSION.lock().unwrap() = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_coverage_gap_after_writer_fence(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *COVERAGE_GAP_AFTER_WRITER_FENCE.lock().unwrap() = hook;
 }
 
 #[cfg(test)]
@@ -87,6 +96,16 @@ fn run_coverage_gap_after_revision_snapshot_hook() {}
 
 #[cfg(not(test))]
 fn run_coverage_gap_after_receipt_admission_hook() {}
+
+#[cfg(test)]
+fn run_coverage_gap_after_writer_fence_hook() {
+    if let Some(hook) = COVERAGE_GAP_AFTER_WRITER_FENCE.lock().unwrap().as_ref() {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_coverage_gap_after_writer_fence_hook() {}
 
 /// Guild whose member-sync statements are being counted. Unset until a test asks.
 static MEMBER_SYNC_WATCHED_GUILD: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -605,7 +624,72 @@ fn coverage_gap_batch_error(error: anyhow::Error) -> anyhow::Error {
     if unmatched {
         return TenantDataError::Membership.into();
     }
+    let lease = error
+        .chain()
+        .any(|cause| cause.to_string().contains("active bot lease is not held"));
+    if lease {
+        return crate::db_compat::ActiveBotLeaseRejected.into();
+    }
     error
+}
+
+fn coverage_gap_lease_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
+            .is_some()
+    })
+}
+
+fn coverage_gap_read_epoch(conn: &impl SqlExecutor) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+        (),
+        |row| Ok(row.get(0)?),
+    )
+    .optional()
+}
+
+/// Lease and epoch admission that finishes before `BEGIN IMMEDIATE`.
+///
+/// The generation and owner are the values the open transaction's batch must
+/// still observe. `None` owner means no core lease was armed.
+fn coverage_gap_writer_prelude(
+    core: Option<&Db>,
+    conn: &crate::db_compat::Connection,
+) -> Result<(Option<i64>, Option<String>)> {
+    let mut held_owner = None;
+    if let Some(core) = core
+        && let Some(owner) = core.leased_owner()
+    {
+        GuildDataStore::read_core_lease(core, &owner)?;
+        held_owner = Some(owner);
+    }
+    let generation = conn.expected_writer_generation();
+    if let Some(generation) = generation {
+        let stored = coverage_gap_read_epoch(conn)?;
+        if stored != Some(generation) {
+            return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+        }
+    }
+    Ok((generation, held_owner))
+}
+
+fn coverage_gap_writer_fence_sql(generation: Option<i64>, lease_ok: bool) -> String {
+    if generation.is_none() && lease_ok {
+        return String::new();
+    }
+    let generation_sql = match generation {
+        Some(generation) => {
+            format!("(SELECT generation FROM guild_writer_epoch WHERE singleton=1)={generation}")
+        }
+        None => "1=1".to_string(),
+    };
+    let lease_flag = i32::from(lease_ok);
+    let message = crate::db_compat::ActiveBotLeaseRejected.to_string();
+    format!(
+        "SELECT CASE WHEN {lease_flag}=1 AND {generation_sql} THEN 1 ELSE json_set('{{}}', '{message}', 1) END;"
+    )
 }
 
 fn ensure_seed_bot(
@@ -1127,6 +1211,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         let reason = reason.to_string();
+        let core = self.core.clone();
         self.db.with_conn(move |conn| {
             // Membership and placement checks are autocommit reads so they do not
             // extend the remote interactive write transaction.
@@ -1150,10 +1235,38 @@ impl GuildDataStore {
                 coverage_gap_refuse_restore(conn)?;
             }
             run_coverage_gap_after_receipt_admission_hook();
+            // Core lease snapshots and the guild epoch read finish before the
+            // write transaction. The batch fence below compares those captured
+            // values and aborts the mark if either one no longer matches, so
+            // commit does not repeat the reads.
+            let (writer_generation, held_owner) =
+                coverage_gap_writer_prelude(core.as_ref(), conn)?;
+            #[cfg(test)]
+            if let Some(core) = core.as_ref()
+                && let Some(hook) = core.take_before_final_lease_reread()
+            {
+                hook();
+            }
+            run_coverage_gap_after_writer_fence_hook();
             let mut tx = conn.transaction_primary_read()?;
+            tx.suppress_commit_writer_recheck(held_owner.is_some(), writer_generation.is_some());
             let (receipt_sql, receipt_prune) = tx
                 .stage_mutation_receipt(meta_present)?
                 .unwrap_or_default();
+            // One confirming read of the owner captured above. A lost lease
+            // becomes a false flag in the batch fence instead of a commit probe.
+            let lease_ok = if let Some(owner) = held_owner.as_deref() {
+                let Some(core) = core.as_ref() else {
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                };
+                match Self::read_core_lease(core, owner) {
+                    Ok(()) => true,
+                    Err(error) if coverage_gap_lease_rejected(&error) => false,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                true
+            };
             let restore_check = if receipt_sql.is_empty() {
                 String::new()
             } else {
@@ -1165,11 +1278,12 @@ impl GuildDataStore {
             let run_id = sql_literal(&random_id());
             let joined_at_ns = scope.enrollment.joined_at_ns;
             let expected_revision = revision_before + 1;
+            let fence_sql = coverage_gap_writer_fence_sql(writer_generation, lease_ok);
             // Receipt admission, the one-row mark check, and audit recovery
             // share one batch. The 32 MiB batch bound covers the seed row that
             // the removed COUNT used to budget on its own.
             let batch = format!(
-                "{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
+                "{fence_sql}{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
 {COVERAGE_GAP_MARK_CHECK_SQL}
 INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
 UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql});"
