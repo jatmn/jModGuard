@@ -215,6 +215,94 @@ fn write_upgrade(conn: &impl SqlExecutor, upgrade: &ServiceUpgrade) -> Result<()
     write_meta_string_conn(conn, UPGRADE_KEY, &raw)
 }
 
+const REJECTED_CANDIDATE_META: &str = "component_rejected_candidate_bot_v1";
+
+fn valid_image_digest(digest: &str) -> bool {
+    digest.starts_with("sha256:")
+        && digest.len() == 71
+        && digest[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Drop the bot's rejected-token candidate marker. Other roles have no such marker.
+pub(super) fn clear_rejected_candidate_conn(
+    conn: &impl SqlExecutor,
+    component: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    conn.execute_rows(
+        "DELETE FROM meta WHERE key=?1",
+        params![REJECTED_CANDIDATE_META],
+        1,
+    )?;
+    Ok(())
+}
+
+/// A running receipt retires the saved candidate only when that receipt is the
+/// candidate, or the candidate is no longer the selected release. A stale
+/// receipt for the installed release must not drop a candidate that is still
+/// selected.
+pub(super) fn clear_rejected_candidate_after_activation(
+    conn: &impl SqlExecutor,
+    component: &str,
+    reported_json: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    let Some(marker) = meta_string_conn(conn, REJECTED_CANDIDATE_META)?
+        .filter(|digest| valid_image_digest(digest))
+    else {
+        return Ok(());
+    };
+    let reported =
+        serde_json::from_str::<ComponentRelease>(reported_json).context("reported release")?;
+    let desired: Option<String> = conn.query_row(
+        "SELECT desired FROM component_updates WHERE component=?1",
+        params![component],
+        |row| Ok(row.get(0)?),
+    )?;
+    let still_selected = desired.as_deref().is_some_and(|raw| {
+        serde_json::from_str::<ComponentRelease>(raw)
+            .ok()
+            .is_some_and(|release| release.digest == marker)
+    });
+    if reported.digest == marker || !still_selected {
+        clear_rejected_candidate_conn(conn, component)?;
+    }
+    Ok(())
+}
+
+/// Changing the selected digest retires the saved candidate in the same
+/// transaction. Writing the same digest again leaves the marker in place.
+pub(super) fn clear_rejected_candidate_if_desired_changes(
+    conn: &impl SqlExecutor,
+    component: &str,
+    new_desired_json: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    let previous: Option<String> = conn.query_row(
+        "SELECT desired FROM component_updates WHERE component=?1",
+        params![component],
+        |row| Ok(row.get(0)?),
+    )?;
+    let previous_digest = previous.as_deref().and_then(|raw| {
+        serde_json::from_str::<ComponentRelease>(raw)
+            .ok()
+            .map(|release| release.digest)
+    });
+    let new_digest = serde_json::from_str::<ComponentRelease>(new_desired_json)
+        .ok()
+        .map(|release| release.digest);
+    if previous_digest != new_digest {
+        clear_rejected_candidate_conn(conn, component)?;
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
     anyhow::ensure!(
         read_upgrade(conn)?.is_none_or(|upgrade| !upgrade.phase.active()),
@@ -613,6 +701,54 @@ impl UpdateControl {
 
     pub async fn component(&self, role: &str) -> Result<ComponentUpdate> {
         component_update(&self.db, role).await
+    }
+
+    /// Remember the bot candidate that exited 78 before readiness.
+    /// The row is an existing `meta` key, not a schema change.
+    pub async fn remember_rejected_candidate(&self, role: &str, digest: &str) -> Result<()> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        anyhow::ensure!(valid_image_digest(digest), "invalid image digest");
+        anyhow::ensure!(
+            self.writes_locally(),
+            "read-only database cannot store a rejected-token candidate"
+        );
+        let digest = digest.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                write_meta_string_conn(&tx, REJECTED_CANDIDATE_META, &digest)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn rejected_candidate_digest(&self, role: &str) -> Result<Option<String>> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        self.db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let digest = meta_string_conn(&tx, REJECTED_CANDIDATE_META)?
+                    .filter(|digest| valid_image_digest(digest));
+                tx.finish_read()?;
+                Ok(digest)
+            })
+            .await
+    }
+
+    pub async fn clear_rejected_candidate(&self, role: &str) -> Result<()> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        if !self.writes_locally() {
+            return Ok(());
+        }
+        self.db
+            .with_conn(|conn| {
+                let tx = conn.transaction_immediate()?;
+                clear_rejected_candidate_conn(&tx, "bot")?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn upgrade(&self) -> Result<Option<ServiceUpgrade>> {
@@ -1081,8 +1217,10 @@ impl UpdateControl {
             };
             write_upgrade(&tx, &upgrade)?;
             for target in [&upgrade.bot.release, &upgrade.api.release] {
+                let desired = serde_json::to_string(target)?;
+                clear_rejected_candidate_if_desired_changes(&tx, &target.component, &desired)?;
                 tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1",
-                    params![target.component.clone(), serde_json::to_string(target)?], 1)?;
+                    params![target.component.clone(), desired], 1)?;
             }
             tx.commit()?;
             Ok(upgrade)
@@ -1120,6 +1258,7 @@ impl UpdateControl {
                 "migration may have started; select a forward recovery release instead");
             upgrade.phase = UpgradePhase::Aborted;
             write_upgrade(&tx, &upgrade)?;
+            clear_rejected_candidate_conn(&tx, "bot")?;
             tx.execute_rows("UPDATE component_updates SET desired=installed,state='running',last_error=NULL WHERE component IN ('bot','api')", (), 2)?;
             tx.commit()
         }).await

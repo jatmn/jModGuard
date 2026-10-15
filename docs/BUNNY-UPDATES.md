@@ -37,7 +37,11 @@ in-process idling cannot protect an unready selected child from their timeout.
 The bot never writes the Discord-ready marker for a rejected token.
 Fix the token and restart the container to resume immediately. As a fallback,
 the launcher retries once after 30 minutes, doubling subsequent rejected-token
-intervals up to six hours, with one warning per attempt. A ready child, or one that stays up for five
+intervals up to six hours, with one warning per attempt. A container restart
+during that hold still starts the same selected candidate when the selection
+is unchanged, instead of the previously installed bot. The marker is removed
+when that candidate becomes ready, when the selection changes, or when a
+coordinated upgrade starts. A ready child, or one that stays up for five
 minutes, resets the interval. While held, the launcher serves `/health` as 200 and `/ready` as
 503 with the reason `discord token rejected` on the bot's configured health port
 (8081 in the image); the platform uses only `/health` for liveness. Running
