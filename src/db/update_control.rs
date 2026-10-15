@@ -239,6 +239,70 @@ pub(super) fn clear_rejected_candidate_conn(
     Ok(())
 }
 
+/// A running receipt retires the saved candidate only when that receipt is the
+/// candidate, or the candidate is no longer the selected release. A stale
+/// receipt for the installed release must not drop a candidate that is still
+/// selected.
+pub(super) fn clear_rejected_candidate_after_activation(
+    conn: &impl SqlExecutor,
+    component: &str,
+    reported_json: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    let Some(marker) = meta_string_conn(conn, REJECTED_CANDIDATE_META)?
+        .filter(|digest| valid_image_digest(digest))
+    else {
+        return Ok(());
+    };
+    let reported =
+        serde_json::from_str::<ComponentRelease>(reported_json).context("reported release")?;
+    let desired: Option<String> = conn.query_row(
+        "SELECT desired FROM component_updates WHERE component=?1",
+        params![component],
+        |row| Ok(row.get(0)?),
+    )?;
+    let still_selected = desired.as_deref().is_some_and(|raw| {
+        serde_json::from_str::<ComponentRelease>(raw)
+            .ok()
+            .is_some_and(|release| release.digest == marker)
+    });
+    if reported.digest == marker || !still_selected {
+        clear_rejected_candidate_conn(conn, component)?;
+    }
+    Ok(())
+}
+
+/// Changing the selected digest retires the saved candidate in the same
+/// transaction. Writing the same digest again leaves the marker in place.
+pub(super) fn clear_rejected_candidate_if_desired_changes(
+    conn: &impl SqlExecutor,
+    component: &str,
+    new_desired_json: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    let previous: Option<String> = conn.query_row(
+        "SELECT desired FROM component_updates WHERE component=?1",
+        params![component],
+        |row| Ok(row.get(0)?),
+    )?;
+    let previous_digest = previous.as_deref().and_then(|raw| {
+        serde_json::from_str::<ComponentRelease>(raw)
+            .ok()
+            .map(|release| release.digest)
+    });
+    let new_digest = serde_json::from_str::<ComponentRelease>(new_desired_json)
+        .ok()
+        .map(|release| release.digest);
+    if previous_digest != new_digest {
+        clear_rejected_candidate_conn(conn, component)?;
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
     anyhow::ensure!(
         read_upgrade(conn)?.is_none_or(|upgrade| !upgrade.phase.active()),
@@ -1153,8 +1217,10 @@ impl UpdateControl {
             };
             write_upgrade(&tx, &upgrade)?;
             for target in [&upgrade.bot.release, &upgrade.api.release] {
+                let desired = serde_json::to_string(target)?;
+                clear_rejected_candidate_if_desired_changes(&tx, &target.component, &desired)?;
                 tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1",
-                    params![target.component.clone(), serde_json::to_string(target)?], 1)?;
+                    params![target.component.clone(), desired], 1)?;
             }
             tx.commit()?;
             Ok(upgrade)
@@ -1192,6 +1258,7 @@ impl UpdateControl {
                 "migration may have started; select a forward recovery release instead");
             upgrade.phase = UpgradePhase::Aborted;
             write_upgrade(&tx, &upgrade)?;
+            clear_rejected_candidate_conn(&tx, "bot")?;
             tx.execute_rows("UPDATE component_updates SET desired=installed,state='running',last_error=NULL WHERE component IN ('bot','api')", (), 2)?;
             tx.commit()
         }).await
