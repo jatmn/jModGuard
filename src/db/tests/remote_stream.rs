@@ -18,6 +18,7 @@ struct HranaState {
     expired_requests: usize,
     fail_next_commit: bool,
     fail_next_cas: bool,
+    fail_next_meta_probe: bool,
     reset_next_request: bool,
     commit_timeouts: usize,
     rollback_requests: usize,
@@ -55,6 +56,7 @@ impl HranaState {
             expired_requests: 0,
             fail_next_commit: false,
             fail_next_cas: false,
+            fail_next_meta_probe: false,
             reset_next_request: false,
             commit_timeouts: 0,
             rollback_requests: 0,
@@ -486,6 +488,18 @@ impl HranaFixture {
         self.state.lock().unwrap().begin_sql.clone()
     }
 
+    pub(in crate::db) fn immediate_begins(&self) -> usize {
+        self.begin_sql()
+            .iter()
+            .filter(|sql| sql.contains("IMMEDIATE"))
+            .count()
+    }
+
+    /// The next request whose SQL probes `sqlite_master` for `meta` returns 429.
+    pub(in crate::db) fn fail_next_meta_probe(&self) {
+        self.state.lock().unwrap().fail_next_meta_probe = true;
+    }
+
     fn timeout_next_cursor(&self) {
         self.state.lock().unwrap().timeout_next_cursor = true;
     }
@@ -631,10 +645,31 @@ async fn hold_immediate_begin(path: &str, input: &Json, state: &Arc<Mutex<HranaS
     }
 }
 
+fn meta_probe_is_rate_limited(state: &Mutex<HranaState>, input: &Json) -> bool {
+    let mut guard = state.lock().unwrap();
+    if !guard.fail_next_meta_probe {
+        return false;
+    }
+    let blob = input.to_string().to_ascii_lowercase();
+    let probes_meta = blob.contains("sqlite_master")
+        && (blob.contains("name='meta'") || blob.contains("name = 'meta'"));
+    if !probes_meta {
+        return false;
+    }
+    guard.fail_next_meta_probe = false;
+    true
+}
+
 async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Response<Body> {
     let path = request.uri().path().to_owned();
     let bytes = hyper::body::to_bytes(request.into_body()).await.unwrap();
     let input: Json = serde_json::from_slice(&bytes).unwrap();
+    if meta_probe_is_rate_limited(&state, &input) {
+        return body(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"message":"rate limited","code":"HTTP_429"}).to_string(),
+        );
+    }
     let provider = state.lock().unwrap().provider.clone();
     if let Some(provider) = provider {
         return provider_response(&path, &input, &state, &provider).await;
