@@ -2587,7 +2587,10 @@ async fn snapshot_rollback_stops_inside_the_read_budget() {
     let clock = install_clock(&db);
     let (selected_tx, selected_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let first_connection = Arc::new(std::sync::Mutex::new(0usize));
+    let record_connection = Arc::clone(&first_connection);
     let call = spawn_write(db.clone(), move |conn| {
+        *record_connection.lock().unwrap() = conn.pool_identity();
         let tx = conn.transaction_primary_snapshot()?;
         tx.query_row("SELECT 1", (), |_| Ok(()))?;
         selected_tx.send(()).unwrap();
@@ -2605,26 +2608,30 @@ async fn snapshot_rollback_stops_inside_the_read_budget() {
         "ROLLBACK must still be waiting on the read budget"
     );
     clock.advance(crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(50));
-    let error = call
-        .recv_timeout(Duration::from_secs(2))
+    call.recv_timeout(Duration::from_secs(2))
         .expect("stalled ROLLBACK held finish_read open")
-        .expect_err("a stalled final ROLLBACK must fail on the read budget");
-    assert!(
-        is_database_operation_timeout(&error),
-        "final ROLLBACK deadline must be the client budget: {error:#}"
-    );
-    assert!(
-        !error.to_string().contains("30s"),
-        "final ROLLBACK used the pool deadline: {error:#}"
-    );
+        .expect("a stalled final ROLLBACK must not fail the collected snapshot");
     assert!(fixture.rollback_requests() >= 1);
+    assert_eq!(
+        db.connections.idle.lock().unwrap().len(),
+        1,
+        "the timed-out rollback must not return its connection to the pool"
+    );
     fixture.state.lock().unwrap().hang_rollback = false;
+    let stale = *first_connection.lock().unwrap();
+    let mut fresh = 0usize;
     db.with_conn_sync(|conn| {
+        fresh = conn.pool_identity();
         let tx = conn.transaction_primary_snapshot()?;
         tx.query_row("SELECT 1", (), |_| Ok(()))?;
         tx.finish_read()
     })
     .expect("a later snapshot must run after the stalled ROLLBACK returns");
+    assert_ne!(fresh, 0);
+    assert_ne!(
+        fresh, stale,
+        "the next snapshot must not reuse the connection whose ROLLBACK timed out"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2632,7 +2639,10 @@ async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     let fixture = HranaFixture::start().await;
     let db = fixture.db_with_operation_timeout(Duration::from_secs(30));
     fixture.hang_rollback();
-    let call = spawn_write(db.clone(), |conn| {
+    let first_connection = Arc::new(std::sync::Mutex::new(0usize));
+    let record_connection = Arc::clone(&first_connection);
+    let call = spawn_write(db.clone(), move |conn| {
+        *record_connection.lock().unwrap() = conn.pool_identity();
         let tx = conn.transaction_primary_snapshot()?;
         tx.query_row("SELECT 1", (), |_| Ok(()))?;
         std::thread::sleep(crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(200));
@@ -2645,27 +2655,59 @@ async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     .await
     .expect("expired snapshot never sent ROLLBACK");
     let release_started = std::time::Instant::now();
-    let error = call
-        .recv_timeout(Duration::from_secs(2))
+    call.recv_timeout(Duration::from_secs(2))
         .expect("expired-budget ROLLBACK waited on the pool deadline")
-        .expect_err("a stalled ROLLBACK must still surface the short release deadline");
+        .expect("a stalled ROLLBACK must not fail the collected snapshot");
     let release = release_started.elapsed();
     assert!(
         release >= Duration::from_millis(150) && release < Duration::from_secs(2),
         "expired read budget must use the short release, not the pool deadline: {release:?}"
     );
-    assert!(
-        is_database_operation_timeout(&error),
-        "short release must stay a client deadline: {error:#}"
+    assert_eq!(
+        db.connections.idle.lock().unwrap().len(),
+        1,
+        "the short-release timeout must not return its connection to the pool"
     );
-    assert!(
-        error.to_string().contains("300ms"),
-        "expired budget must use the short release, not the time still left: {error:#}"
+    fixture.state.lock().unwrap().hang_rollback = false;
+    let stale = *first_connection.lock().unwrap();
+    let mut fresh = 0usize;
+    db.with_conn_sync(|conn| {
+        fresh = conn.pool_identity();
+        let tx = conn.transaction_primary_snapshot()?;
+        tx.query_row("SELECT 1", (), |_| Ok(()))?;
+        tx.finish_read()
+    })
+    .expect("a later snapshot must run on a fresh connection");
+    assert_ne!(fresh, stale);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_finish_reuses_the_connection_when_rollback_succeeds() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    let first_connection = Arc::new(std::sync::Mutex::new(0usize));
+    let record_connection = Arc::clone(&first_connection);
+    db.with_conn_sync(move |conn| {
+        *record_connection.lock().unwrap() = conn.pool_identity();
+        let tx = conn.transaction_primary_snapshot()?;
+        tx.query_row("SELECT 1", (), |_| Ok(()))?;
+        tx.finish_read()
+    })
+    .expect("a fast snapshot rollback must succeed");
+    let stale = *first_connection.lock().unwrap();
+    let mut fresh = 0usize;
+    db.with_conn_sync(|conn| {
+        fresh = conn.pool_identity();
+        let tx = conn.transaction_primary_snapshot()?;
+        tx.query_row("SELECT 1", (), |_| Ok(()))?;
+        tx.finish_read()
+    })
+    .expect("the next snapshot must run");
+    assert_eq!(
+        fresh, stale,
+        "a completed rollback must return the connection to the pool"
     );
-    assert!(
-        !error.to_string().contains("30s"),
-        "expired budget used the pool deadline: {error:#}"
-    );
+    assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

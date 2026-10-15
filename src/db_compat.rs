@@ -1451,6 +1451,12 @@ impl Connection {
         self.tainted.load(Ordering::Acquire)
     }
 
+    /// Stable for one pooled connection, including after it is checked out again.
+    #[cfg(test)]
+    pub(crate) fn pool_identity(&self) -> usize {
+        Arc::as_ptr(&self.tainted) as usize
+    }
+
     pub fn take_config_version(&self) -> u64 {
         self.config_version.swap(0, Ordering::AcqRel)
     }
@@ -1585,6 +1591,8 @@ pub struct Statement {
     runtime: DbRuntime,
     /// Absolute budget copied from a remote read or snapshot. Autocommit
     /// prepares and statements after a capture write leave this empty.
+    /// `query_map` is the only execution method. A new one has to honor
+    /// [`Self::query_wait`] instead of the pool deadline.
     read_deadline: Option<tokio::time::Instant>,
     client_deadline: Arc<AtomicBool>,
     stream_exhausted: Arc<AtomicBool>,
@@ -2316,10 +2324,14 @@ impl Transaction {
         match result {
             Ok(_) => Ok(()),
             // The rows were already collected. The provider closing the stream
-            // (TRANSACTION_TIMEOUT) or rejecting ROLLBACK because it already
-            // dropped the transaction does not make that snapshot indeterminate.
-            // The stream is not reused.
-            Err(error) if remote_read_rollback_is_complete(&error) => {
+            // (TRANSACTION_TIMEOUT), rejecting ROLLBACK because it already
+            // dropped the transaction, or our own rollback deadline does not
+            // make that snapshot indeterminate. A cancelled ROLLBACK can leave
+            // the server transaction open, so the stream is not reused.
+            Err(error)
+                if remote_read_rollback_is_complete(&error)
+                    || is_database_operation_timeout(&error) =>
+            {
                 if self.runtime.is_remote() {
                     self.connection_tainted.store(true, Ordering::Release);
                 }
