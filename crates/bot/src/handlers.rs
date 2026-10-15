@@ -136,13 +136,13 @@ async fn persist_gateway_ban_observation(
     enrollment: Option<db::GuildEnrollment>,
     guild: u64,
     user: u64,
-    in_flight: crate::state::GatewayBanObservation<'_>,
+    in_flight: crate::state::GatewayBanObservation,
     owned_by_bot: bool,
     write: impl std::future::Future<Output = anyhow::Result<db::GatewayBanWrite>>,
 ) -> anyhow::Result<db::GatewayBanWrite> {
     let observed_at_ms = in_flight.observed.timestamp_millis();
     let result = write.await;
-    in_flight.finish(result.is_ok());
+    in_flight.finish(result.is_ok()).await;
     // Audit delivery queues before looking in SQL. If it ran before this
     // commit, this pass sees its ID; if it runs later, it sees the saved row.
     // A failed write never consumes an ID either.
@@ -552,7 +552,8 @@ impl EventHandler for Handler {
         let _rule_hold = self.app.activation.hold_rule();
         let in_flight = self
             .app
-            .begin_gateway_ban_observation(guild_id.get(), banned_user.id.get());
+            .begin_gateway_ban_observation(guild_id.get(), banned_user.id.get())
+            .await;
         let observed = in_flight.observed;
         let observation = self.app.member_audits.observe_event(
             guild_id.get(),
@@ -587,7 +588,7 @@ impl EventHandler for Handler {
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. Id-less redeliveries retain bounded
         // observations; only a distinguishing late audit creates another row.
-        let audit_after_ms = in_flight.audit_after_ms();
+        let audit_after_ms = in_flight.audit_after_ms().await;
         let ban_write = crate::logging::log_persistence_result(
             "gateway ban row",
             persist_gateway_ban_observation(
@@ -1602,7 +1603,7 @@ mod tests {
             let pending = app.pending_gateway_manual_ban_audit_entries(10, 55);
             assert!(pending.is_empty());
             let audit = 1_212_912_311_992_320_001;
-            let mut in_flight = app.begin_gateway_ban_observation(10, 55);
+            let mut in_flight = app.begin_gateway_ban_observation(10, 55).await;
             in_flight.observed = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:30Z")
                 .unwrap()
                 .to_utc();
@@ -1725,14 +1726,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut first = app.begin_gateway_ban_observation(10, 55);
+            let mut first = app.begin_gateway_ban_observation(10, 55).await;
             let at = first.observed + chrono::Duration::seconds(2);
             first.observed = at;
             // A has already sampled the fence for its asynchronous write.
-            let cutoff = first.audit_after_ms();
+            let cutoff = first.audit_after_ms().await;
             // B's action precedes A's delayed observation, but B's callback
             // starts while A's write is outstanding and remains unpersisted.
-            let mut second = app.begin_gateway_ban_observation(10, 55);
+            let mut second = app.begin_gateway_ban_observation(10, 55).await;
             second.observed = at + chrono::Duration::seconds(1);
             let audit = (((at - chrono::Duration::seconds(1)).timestamp_millis()
                 - 1_420_070_400_000)
@@ -1755,10 +1756,10 @@ mod tests {
             )
             .await
             .unwrap();
-            first.finish(true);
+            first.finish(true).await;
             let mut second = Some(second);
             if completion == "failed" {
-                second.take().unwrap().finish(false);
+                second.take().unwrap().finish(false).await;
             } else if completion == "cancelled" {
                 drop(second.take());
             }
@@ -1795,7 +1796,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut first = app.begin_gateway_ban_observation(10, 55);
+            let mut first = app.begin_gateway_ban_observation(10, 55).await;
             // Logical times make the interleaving deterministic without sleeps.
             let at = first.observed + chrono::Duration::seconds(1);
             first.observed = at;
@@ -1803,7 +1804,7 @@ mod tests {
             crate::db::mark_enrolled_unbanned(&app.db, Some(scope.clone()), 55)
                 .await
                 .unwrap();
-            let mut second = app.begin_gateway_ban_observation(10, 55);
+            let mut second = app.begin_gateway_ban_observation(10, 55).await;
             second.observed = at + chrono::Duration::seconds(2);
             crate::db::record_gateway_ban_with_audit(
                 &app.db,
@@ -1817,12 +1818,12 @@ mod tests {
                 false,
                 crate::db::GatewayBanAuditEntries::Observed {
                     pending: vec![],
-                    audit_after_ms: second.audit_after_ms(),
+                    audit_after_ms: second.audit_after_ms().await,
                 },
             )
             .await
             .unwrap();
-            second.finish(true);
+            second.finish(true).await;
             // A remains paused before persistence; B is the sole committed row.
             app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
             super::reconcile_pending_gateway_ban_audits(&app, Some(scope.clone()), 10, 55).await;
@@ -1843,16 +1844,16 @@ mod tests {
                     true,
                     crate::db::GatewayBanAuditEntries::Observed {
                         pending: vec![],
-                        audit_after_ms: first.audit_after_ms(),
+                        audit_after_ms: first.audit_after_ms().await,
                     },
                 )
                 .await
                 .unwrap();
-                first.finish(true);
+                first.finish(true).await;
             } else if completion == "cancelled" {
                 drop(first);
             } else {
-                first.finish(false);
+                first.finish(false).await;
             }
             if completion == "restart" {
                 drop(app);
@@ -1918,7 +1919,7 @@ mod tests {
                 Some(enrollment.clone()),
                 10,
                 55,
-                app.begin_gateway_ban_observation(10, 55),
+                app.begin_gateway_ban_observation(10, 55).await,
                 false,
                 async {
                     if matches!(arrival, "before_commit" | "read_error") {

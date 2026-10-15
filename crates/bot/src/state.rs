@@ -105,52 +105,122 @@ struct GatewayBanEchoEntry {
     released: Arc<AtomicBool>,
 }
 
-/// Fixed shards bound memory even with abandoned callbacks. Hash collisions
-/// only defer attribution; they cannot authorize a match for another subject.
+/// Lock stripes stay fixed so the mutex table cannot grow. The gate itself is
+/// per guild and user: a shared stripe may delay the other member's wait, and
+/// it must not change that member's in-flight count or failure cutoff.
 struct GatewayBanFlight {
+    started_at_ms: i64,
+    subjects: HashMap<(u64, u64), GatewayBanSubject>,
+}
+
+struct GatewayBanSubject {
     active: usize,
     uncertain_through_ms: i64,
     failed_through_ms: i64,
 }
 
-pub(crate) struct GatewayBanObservation<'a> {
-    flight: &'a Mutex<GatewayBanFlight>,
+pub(crate) struct GatewayBanObservation {
+    flight: Arc<tokio::sync::Mutex<GatewayBanFlight>>,
+    guild: u64,
+    user: u64,
     pub(crate) observed: chrono::DateTime<chrono::Utc>,
     saved: bool,
+    released: bool,
 }
 
-impl GatewayBanObservation<'_> {
-    pub(crate) fn audit_after_ms(&self) -> i64 {
-        let flight = self.flight.lock();
-        if flight.active > 1 {
-            flight
-                .uncertain_through_ms
-                .max(self.observed.timestamp_millis())
-        } else {
-            flight.uncertain_through_ms
-        }
-    }
-
-    pub(crate) fn finish(mut self, saved: bool) {
-        self.saved = saved;
-    }
-}
-
-impl Drop for GatewayBanObservation<'_> {
-    fn drop(&mut self) {
-        let mut flight = self.flight.lock();
-        if !self.saved {
+fn apply_gateway_ban_release(
+    flight: &mut GatewayBanFlight,
+    guild: u64,
+    user: u64,
+    saved: bool,
+    observed_ms: i64,
+) {
+    let started_at_ms = flight.started_at_ms;
+    let idle = {
+        let Some(subject) = flight.subjects.get_mut(&(guild, user)) else {
+            return;
+        };
+        if !saved {
             // Failure or cancellation must not turn a younger row into the
             // only candidate for this callback's audit, including late SQL.
-            flight.uncertain_through_ms = flight
-                .uncertain_through_ms
-                .max(self.observed.timestamp_millis());
-            flight.failed_through_ms = flight
-                .failed_through_ms
-                .max(self.observed.timestamp_millis());
+            subject.uncertain_through_ms = subject.uncertain_through_ms.max(observed_ms);
+            subject.failed_through_ms = subject.failed_through_ms.max(observed_ms);
         }
-        flight.active -= 1;
+        subject.active = subject.active.saturating_sub(1);
+        subject.active == 0
+            && subject.failed_through_ms == 0
+            && subject.uncertain_through_ms == started_at_ms
+    };
+    if idle {
+        flight.subjects.remove(&(guild, user));
     }
+}
+
+impl GatewayBanObservation {
+    pub(crate) async fn audit_after_ms(&self) -> i64 {
+        let flight = self.flight.lock().await;
+        let subject = flight.subjects.get(&(self.guild, self.user));
+        let uncertain = subject
+            .map(|subject| subject.uncertain_through_ms)
+            .unwrap_or(flight.started_at_ms);
+        let active = subject.map(|subject| subject.active).unwrap_or(0);
+        if active > 1 {
+            uncertain.max(self.observed.timestamp_millis())
+        } else {
+            uncertain
+        }
+    }
+
+    pub(crate) async fn finish(mut self, saved: bool) {
+        self.saved = saved;
+        if self.released {
+            return;
+        }
+        let mut flight = self.flight.lock().await;
+        if self.released {
+            return;
+        }
+        apply_gateway_ban_release(
+            &mut flight,
+            self.guild,
+            self.user,
+            self.saved,
+            self.observed.timestamp_millis(),
+        );
+        self.released = true;
+    }
+}
+
+impl Drop for GatewayBanObservation {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let flight = Arc::clone(&self.flight);
+        let guild = self.guild;
+        let user = self.user;
+        let saved = self.saved;
+        let observed_ms = self.observed.timestamp_millis();
+        // An uncontended drop publishes before the caller continues. A drop
+        // that finds the database worker still inside commit must not block
+        // this runtime worker; a plain thread waits instead.
+        if let Ok(mut guard) = flight.try_lock() {
+            apply_gateway_ban_release(&mut guard, guild, user, saved, observed_ms);
+            return;
+        }
+        let _ = std::thread::Builder::new().spawn(move || {
+            let mut guard = flight.blocking_lock();
+            apply_gateway_ban_release(&mut guard, guild, user, saved, observed_ms);
+        });
+    }
+}
+
+fn gateway_ban_flight_index(guild: u64, user: u64, shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (guild, user).hash(&mut hasher);
+    hasher.finish() as usize % shards
 }
 
 #[derive(Default)]
@@ -641,7 +711,7 @@ pub struct BotState {
     pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
-    gateway_ban_flights: [Arc<Mutex<GatewayBanFlight>>; 256],
+    gateway_ban_flights: [Arc<tokio::sync::Mutex<GatewayBanFlight>>; 256],
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
@@ -732,17 +802,19 @@ impl BotState {
             slash_registrations: tokio::sync::Mutex::new(HashMap::new()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
-            gateway_ban_flights: std::array::from_fn(|_| {
-                Arc::new(Mutex::new(GatewayBanFlight {
-                    active: 0,
-                    // Unlike the startup fence for new rows, live failures must
-                    // not prevent replay against observations saved before restart.
-                    failed_through_ms: 0,
-                    // A restart lost earlier in-flight observations. New rows must
-                    // not claim audit actions from before this process started.
-                    uncertain_through_ms: chrono::Utc::now().timestamp_millis(),
-                }))
-            }),
+            gateway_ban_flights: {
+                // A restart lost earlier in-flight observations. New rows must
+                // not claim audit actions from before this process started.
+                // Unlike that startup fence, live failures must not prevent
+                // replay against observations saved before restart.
+                let started_at_ms = chrono::Utc::now().timestamp_millis();
+                std::array::from_fn(|_| {
+                    Arc::new(tokio::sync::Mutex::new(GatewayBanFlight {
+                        started_at_ms,
+                        subjects: HashMap::new(),
+                    }))
+                })
+            },
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
@@ -1098,29 +1170,47 @@ impl BotState {
         self.pending_member_gaps.lock().acknowledge(gap);
     }
 
-    pub(crate) fn begin_gateway_ban_observation(
+    pub(crate) async fn begin_gateway_ban_observation(
         &self,
         guild: u64,
         user: u64,
-    ) -> GatewayBanObservation<'_> {
-        let flight = self.gateway_ban_flight(guild, user);
-        let mut state = flight.lock();
-        state.active += 1;
-        // Register before sampling time, and before the first await.
-        let observed = chrono::Utc::now();
-        drop(state);
+    ) -> GatewayBanObservation {
+        let flight = Arc::clone(self.gateway_ban_flight(guild, user));
+        let observed = {
+            let mut state = flight.lock().await;
+            let started_at_ms = state.started_at_ms;
+            let subject = state
+                .subjects
+                .entry((guild, user))
+                .or_insert(GatewayBanSubject {
+                    active: 0,
+                    uncertain_through_ms: started_at_ms,
+                    // Unlike the startup fence for new rows, a live failure cutoff
+                    // starts clear so a saved observation can still reconcile.
+                    failed_through_ms: 0,
+                });
+            subject.active += 1;
+            // Register before sampling time. The wait above is the handler's
+            // yield; the count is published before this function returns.
+            chrono::Utc::now()
+        };
         GatewayBanObservation {
             flight,
+            guild,
+            user,
             observed,
             saved: false,
+            released: false,
         }
     }
 
-    fn gateway_ban_flight(&self, guild: u64, user: u64) -> &Arc<Mutex<GatewayBanFlight>> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (guild, user).hash(&mut hasher);
-        &self.gateway_ban_flights[hasher.finish() as usize % self.gateway_ban_flights.len()]
+    fn gateway_ban_flight(
+        &self,
+        guild: u64,
+        user: u64,
+    ) -> &Arc<tokio::sync::Mutex<GatewayBanFlight>> {
+        &self.gateway_ban_flights
+            [gateway_ban_flight_index(guild, user, self.gateway_ban_flights.len())]
     }
 
     pub(crate) async fn reconcile_gateway_manual_ban_audit_entry(
@@ -1137,9 +1227,12 @@ impl BotState {
                 // Registration and the SQL decision share exclusion through commit.
                 // Keep the guard in the DB worker: cancellation of its async waiter
                 // must not release the fence while SQL is still running.
-                let flight = flight.lock();
+                let flight = flight.blocking_lock();
                 let audit_at = (entry_id >> 22) + 1_420_070_400_000;
-                if flight.active != 0 || audit_at <= flight.failed_through_ms {
+                let blocked = flight.subjects.get(&(guild, user)).is_some_and(|subject| {
+                    subject.active != 0 || audit_at <= subject.failed_through_ms
+                });
+                if blocked {
                     return Ok(false);
                 }
                 db::reconcile_gateway_manual_ban_audit_entry_conn(
@@ -1863,33 +1956,177 @@ mod tests {
         let path = directory.join("core.db");
         let before_start = chrono::Utc::now().timestamp_millis();
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-        let mut failed = app.begin_gateway_ban_observation(10, 55);
-        assert!(failed.audit_after_ms() >= before_start);
+        let mut failed = app.begin_gateway_ban_observation(10, 55).await;
+        assert!(failed.audit_after_ms().await >= before_start);
         let failed_at = failed.observed.timestamp_millis() + 1000;
         failed.observed = chrono::DateTime::from_timestamp_millis(failed_at).unwrap();
-        failed.finish(false);
-        let retry = app.begin_gateway_ban_observation(10, 55);
-        assert_eq!(retry.audit_after_ms(), failed_at);
-        retry.finish(true);
-        let mut cancelled = app.begin_gateway_ban_observation(10, 55);
+        failed.finish(false).await;
+        let retry = app.begin_gateway_ban_observation(10, 55).await;
+        assert_eq!(retry.audit_after_ms().await, failed_at);
+        retry.finish(true).await;
+        let mut cancelled = app.begin_gateway_ban_observation(10, 55).await;
         cancelled.observed = chrono::DateTime::from_timestamp_millis(failed_at + 1).unwrap();
         drop(cancelled);
-        let retry = app.begin_gateway_ban_observation(10, 55);
-        assert_eq!(retry.audit_after_ms(), failed_at + 1);
-        retry.finish(true);
-        // Distinct targets never allocate additional shards, and successful
+        let retry = app.begin_gateway_ban_observation(10, 55).await;
+        assert_eq!(retry.audit_after_ms().await, failed_at + 1);
+        retry.finish(true).await;
+        // Distinct targets never allocate additional stripes, and successful
         // completion releases counts without discarding uncertainty cutoffs.
         for user in 1..4096 {
-            app.begin_gateway_ban_observation(10, user).finish(true);
+            app.begin_gateway_ban_observation(10, user)
+                .await
+                .finish(true)
+                .await;
         }
         assert_eq!(app.gateway_ban_flights.len(), 256);
-        assert!(app.gateway_ban_flights.iter().all(|f| f.lock().active == 0));
+        for flight in &app.gateway_ban_flights {
+            let flight = flight.lock().await;
+            assert!(flight.subjects.values().all(|subject| subject.active == 0));
+        }
         drop(app);
         let before_restart = chrono::Utc::now().timestamp_millis();
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-        let next = app.begin_gateway_ban_observation(10, 55);
-        assert!(next.audit_after_ms() >= before_restart);
-        next.finish(true);
+        let next = app.begin_gateway_ban_observation(10, 55).await;
+        assert!(next.audit_after_ms().await >= before_restart);
+        next.finish(true).await;
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn colliding_ban_subjects(shards: usize) -> (u64, u64) {
+        let guild = 10u64;
+        let left = 55u64;
+        let left_shard = gateway_ban_flight_index(guild, left, shards);
+        let right = (1..20_000u64)
+            .find(|user| {
+                *user != left && gateway_ban_flight_index(guild, *user, shards) == left_shard
+            })
+            .expect("two synthetic users share a flight stripe");
+        (left, right)
+    }
+
+    #[tokio::test]
+    async fn same_stripe_member_does_not_gate_the_other_members_audit() {
+        let (left, right) = colliding_ban_subjects(256);
+        assert_eq!(
+            gateway_ban_flight_index(10, left, 256),
+            gateway_ban_flight_index(10, right, 256)
+        );
+        let audit = 1_212_912_186_163_200_001i64;
+        for mode in ["in_flight", "failed"] {
+            let directory = std::env::temp_dir().join(format!(
+                "shared_stripe_audit_{mode}_{:032x}",
+                rand::random::<u128>()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            for user in [left, right] {
+                db::record_gateway_ban(
+                    &app.db,
+                    Some(scope.clone()),
+                    user as i64,
+                    None,
+                    None,
+                    Some("2024-03-01T00:00:00Z"),
+                    false,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            }
+            let mut other = Some(app.begin_gateway_ban_observation(10, left).await);
+            if mode == "failed" {
+                other.take().unwrap().finish(false).await;
+            }
+            app.queue_gateway_manual_ban_audit_entry(10, right, audit);
+            assert!(
+                app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, right, audit)
+                    .await
+                    .unwrap(),
+                "{mode}"
+            );
+            app.drop_gateway_manual_ban_audit_entry(10, right, audit);
+            let right_events = db::query_enrolled_events(
+                &app.db,
+                scope.clone(),
+                Some("member_ban"),
+                Some(right as i64),
+                20,
+            )
+            .await
+            .unwrap();
+            assert!(
+                right_events.iter().any(|event| event
+                    .data
+                    .as_deref()
+                    .is_some_and(|data| data.contains(&audit.to_string()))),
+                "{mode}"
+            );
+            app.queue_gateway_manual_ban_audit_entry(10, left, audit);
+            assert!(
+                !app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, left, audit)
+                    .await
+                    .unwrap(),
+                "{mode}"
+            );
+            assert_eq!(
+                app.pending_gateway_manual_ban_audit_entries(10, left),
+                vec![audit],
+                "{mode}"
+            );
+            if let Some(other) = other {
+                other.finish(true).await;
+            }
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ban_observation_waits_for_the_flight_lock_without_blocking_the_worker() {
+        let directory =
+            std::env::temp_dir().join(format!("flight_wait_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let flight = Arc::clone(app.gateway_ban_flight(10, 55));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let guard = flight.blocking_lock();
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(guard);
+        });
+        entered_rx.await.unwrap();
+        let progressed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&progressed);
+        let flag_task = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+        {
+            let begin = app.begin_gateway_ban_observation(10, 55);
+            tokio::pin!(begin);
+            tokio::select! {
+                biased;
+                _ = &mut begin => panic!("observation registered while the flight lock was held"),
+                _ = flag_task => {}
+            }
+            assert!(progressed.load(Ordering::SeqCst));
+            release_tx.send(()).unwrap();
+            let observation = begin.await;
+            observation.finish(true).await;
+        }
+        held.join().unwrap();
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }
