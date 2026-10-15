@@ -17,6 +17,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Process-local only: container restart is the explicit reset for a bad token.
 ///
+/// The hold clock is not persisted. The rejected candidate itself is durable, so
+/// a restart during the hold still starts that selection instead of the
+/// previously installed bot.
+///
 /// Intended update interaction: while a rejected-token hold is active, `tick`
 /// idles before control reads, so launcher updates and paired-upgrade steps
 /// wait until the next auth retry or a container restart. Crash backoff
@@ -477,7 +481,10 @@ struct Supervisor {
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
     // Independent replacement rejected before its activation receipt.
+    // Survives a process restart when `persisted_candidate_retry` is set.
     rejected_candidate: Option<ComponentRelease>,
+    persisted_candidate_retry: bool,
+    rejected_loaded: bool,
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
@@ -503,10 +510,87 @@ impl Supervisor {
             jmodguard::set_process_ready(false);
             self.stop_application().await?;
         }
+        self.persist_rejected_candidate().await;
         if self.restart.held {
             self.idle().await?;
         }
         Ok(self.restart.held)
+    }
+
+    async fn persist_rejected_candidate(&mut self) {
+        if self.role != "bot" || self.persisted_candidate_retry {
+            return;
+        }
+        let Some(digest) = self
+            .rejected_candidate
+            .as_ref()
+            .map(|release| release.digest.clone())
+        else {
+            return;
+        };
+        match self
+            .control
+            .remember_rejected_candidate(&self.role, &digest)
+            .await
+        {
+            Ok(()) => self.persisted_candidate_retry = true,
+            Err(error) => {
+                tracing::warn!("rejected-token candidate marker was not saved: {error:#}");
+            }
+        }
+    }
+
+    async fn clear_rejected_marker(&mut self) {
+        self.rejected_candidate = None;
+        self.persisted_candidate_retry = false;
+        if self.role != "bot" {
+            return;
+        }
+        if let Err(error) = self.control.clear_rejected_candidate(&self.role).await {
+            tracing::warn!("rejected-token candidate marker was not cleared: {error:#}");
+        }
+    }
+
+    /// A fresh process has no standby path. Load a marker that still matches
+    /// the selection; drop one whose selection changed while this process was down.
+    async fn adopt_rejected_candidate(&mut self, state: &db::ComponentUpdate) -> Result<()> {
+        if self.role != "bot" || self.rejected_loaded {
+            return Ok(());
+        }
+        self.rejected_loaded = true;
+        let Some(digest) = self.control.rejected_candidate_digest(&self.role).await? else {
+            return Ok(());
+        };
+        if state
+            .desired
+            .as_ref()
+            .is_some_and(|desired| desired.digest == digest)
+        {
+            self.rejected_candidate = state.desired.clone();
+            self.persisted_candidate_retry = true;
+            return Ok(());
+        }
+        self.clear_rejected_marker().await;
+        Ok(())
+    }
+
+    async fn installed_fallback(
+        &mut self,
+        state: &db::ComponentUpdate,
+    ) -> Result<(PathBuf, String, Option<ComponentRelease>)> {
+        if let Some(release) = state.installed.clone() {
+            let path = stage(
+                &self.registry,
+                &release,
+                &format!("jmodguard-{}", self.role),
+                &self.staging,
+            )
+            .await?;
+            let sha = release.source_sha.clone();
+            Ok((path, sha, Some(release)))
+        } else {
+            Ok((self.baked.clone(), self.base_sha.clone(), None))
+        }
     }
 
     fn receipt_not_saved(error: &anyhow::Error) -> bool {
@@ -837,6 +921,7 @@ impl Supervisor {
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
+                    self.clear_rejected_marker().await;
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("rollback receipt was not saved: {error:#}");
@@ -857,6 +942,7 @@ impl Supervisor {
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
+                    self.clear_rejected_marker().await;
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("activation receipt was not saved: {error:#}");
@@ -873,8 +959,8 @@ impl Supervisor {
         // Independent rollback artifacts cannot survive a potential core OR
         // guild migration, even after later operations replace the status row.
         self.standby = None;
-        self.rejected_candidate = None;
         self.rollback = None;
+        self.clear_rejected_marker().await;
         let op = self
             .control
             .join_upgrade(id, &self.role, &self.instance)
@@ -1189,14 +1275,21 @@ impl Supervisor {
 
     async fn normal(&mut self) -> Result<bool> {
         let state = self.control.component(&self.role).await?;
+        self.adopt_rejected_candidate(&state).await?;
         // Only an unactivated auth-rejected independent selection skips restore.
-        // Reuse candidate admission below, including current schema/launcher gates.
+        // A restarted launcher has no standby path; the durable marker is enough
+        // to retry that same selection. Reuse candidate admission below.
         let retrying_rejected = self.running.is_none()
             && self.enabled
             && self.rollback.is_none()
-            && self.standby.is_some()
             && self.rejected_candidate.is_some()
-            && self.rejected_candidate == state.desired;
+            && self.rejected_candidate == state.desired
+            && (self.standby.is_some() || self.persisted_candidate_retry);
+        if self.rollback.is_some()
+            || (self.rejected_candidate.is_some() && self.rejected_candidate != state.desired)
+        {
+            self.clear_rejected_marker().await;
+        }
         if !retrying_rejected {
             self.rejected_candidate = None;
         }
@@ -1447,7 +1540,7 @@ impl Supervisor {
         if retrying_rejected {
             // A selection can change during staging; never revive that artifact.
             if self.control.component(&self.role).await?.desired.as_ref() != Some(&candidate) {
-                self.rejected_candidate = None;
+                self.clear_rejected_marker().await;
                 return Ok(false);
             }
         } else {
@@ -1468,6 +1561,11 @@ impl Supervisor {
         {
             // Launcher gating already ran. A failed application spawn must
             // restart the captured standby and settle the failed selection.
+            // A restarted launcher no longer has that path, so stage the
+            // installed release (or the baked binary) before rolling back.
+            if self.standby.is_none() {
+                self.standby = Some(self.installed_fallback(&state).await?);
+            }
             self.rollback_independent(&state, candidate, format!("spawn: {error:#}"))
                 .await?;
         }
@@ -1506,6 +1604,8 @@ impl Supervisor {
         );
         // Keep the failed identity until the restarted prior is ready. A later
         // report_ready records the receipt; running() must not overwrite it.
+        // The rejected-candidate marker must not outlive this rollback.
+        self.clear_rejected_marker().await;
         self.rollback = Some((failed, error));
         self.stop_application().await?;
         self.start(&path, &sha, previous).await
@@ -1972,6 +2072,8 @@ async fn main() -> Result<()> {
         prepared: None,
         standby: None,
         rejected_candidate: None,
+        persisted_candidate_retry: false,
+        rejected_loaded: false,
         rollback: None,
         pending_failure: None,
         pending_startup,

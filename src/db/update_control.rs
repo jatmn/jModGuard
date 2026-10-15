@@ -8,7 +8,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 14;
+pub const LAUNCHER_REVISION: u32 = 15;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
@@ -213,6 +213,30 @@ fn write_upgrade(conn: &impl SqlExecutor, upgrade: &ServiceUpgrade) -> Result<()
     let raw = serde_json::to_string(upgrade)?;
     anyhow::ensure!(raw.len() <= 32 * 1024, "oversized upgrade record");
     write_meta_string_conn(conn, UPGRADE_KEY, &raw)
+}
+
+const REJECTED_CANDIDATE_META: &str = "component_rejected_candidate_bot_v1";
+
+fn valid_image_digest(digest: &str) -> bool {
+    digest.starts_with("sha256:")
+        && digest.len() == 71
+        && digest[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Drop the bot's rejected-token candidate marker. Other roles have no such marker.
+pub(super) fn clear_rejected_candidate_conn(
+    conn: &impl SqlExecutor,
+    component: &str,
+) -> Result<()> {
+    if component != "bot" {
+        return Ok(());
+    }
+    conn.execute_rows(
+        "DELETE FROM meta WHERE key=?1",
+        params![REJECTED_CANDIDATE_META],
+        1,
+    )?;
+    Ok(())
 }
 
 pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
@@ -613,6 +637,54 @@ impl UpdateControl {
 
     pub async fn component(&self, role: &str) -> Result<ComponentUpdate> {
         component_update(&self.db, role).await
+    }
+
+    /// Remember the bot candidate that exited 78 before readiness.
+    /// The row is an existing `meta` key, not a schema change.
+    pub async fn remember_rejected_candidate(&self, role: &str, digest: &str) -> Result<()> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        anyhow::ensure!(valid_image_digest(digest), "invalid image digest");
+        anyhow::ensure!(
+            self.writes_locally(),
+            "read-only database cannot store a rejected-token candidate"
+        );
+        let digest = digest.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                write_meta_string_conn(&tx, REJECTED_CANDIDATE_META, &digest)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn rejected_candidate_digest(&self, role: &str) -> Result<Option<String>> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        self.db
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let digest = meta_string_conn(&tx, REJECTED_CANDIDATE_META)?
+                    .filter(|digest| valid_image_digest(digest));
+                tx.finish_read()?;
+                Ok(digest)
+            })
+            .await
+    }
+
+    pub async fn clear_rejected_candidate(&self, role: &str) -> Result<()> {
+        anyhow::ensure!(role == "bot", "rejected-token candidate is bot-only");
+        if !self.writes_locally() {
+            return Ok(());
+        }
+        self.db
+            .with_conn(|conn| {
+                let tx = conn.transaction_immediate()?;
+                clear_rejected_candidate_conn(&tx, "bot")?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn upgrade(&self) -> Result<Option<ServiceUpgrade>> {
