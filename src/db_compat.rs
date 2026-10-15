@@ -592,6 +592,11 @@ impl DbRuntime {
         self.operation_timeout
     }
 
+    #[cfg(test)]
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self._thread, &other._thread)
+    }
+
     /// Drop a remote connection on this runtime. libsql sends a stream close
     /// only when a tokio runtime is current; an off-runtime drop logs that no
     /// runtime was available and never sends it.
@@ -1188,6 +1193,11 @@ impl Connection {
         self.read_only = read_only;
     }
 
+    #[cfg(test)]
+    pub(crate) fn runtime_same_owner(&self, other: &DbRuntime) -> bool {
+        self.runtime.same_owner(other)
+    }
+
     fn refuse_writer_lock(&self) -> Result<()> {
         anyhow::ensure!(
             !self.read_only,
@@ -1368,8 +1378,8 @@ impl Connection {
             capacity_dirty: AtomicBool::new(false),
             capacity_poisoned: AtomicBool::new(false),
             write_prepared: AtomicBool::new(false),
-            stream_exhausted: AtomicBool::new(false),
-            client_deadline: AtomicBool::new(false),
+            stream_exhausted: Arc::new(AtomicBool::new(false)),
+            client_deadline: Arc::new(AtomicBool::new(false)),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
             expected_lease_owner: self.expected_lease_owner.clone(),
@@ -1555,6 +1565,9 @@ impl SqlExecutor for Connection {
         Ok(Statement {
             inner,
             runtime: self.runtime.clone(),
+            read_deadline: None,
+            client_deadline: Arc::new(AtomicBool::new(false)),
+            stream_exhausted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1570,6 +1583,11 @@ impl SqlExecutor for Connection {
 pub struct Statement {
     inner: libsql::Statement,
     runtime: DbRuntime,
+    /// Absolute budget copied from a remote read or snapshot. Autocommit
+    /// prepares and statements after a capture write leave this empty.
+    read_deadline: Option<tokio::time::Instant>,
+    client_deadline: Arc<AtomicBool>,
+    stream_exhausted: Arc<AtomicBool>,
 }
 
 pub struct MappedRows<T>(std::vec::IntoIter<Result<T>>);
@@ -1589,15 +1607,40 @@ impl Statement {
         P: IntoParams + Send,
         F: FnMut(&Row) -> Result<T> + Send,
     {
-        let mapped = self.runtime.block_on_database("query", async {
+        let timeout = self.query_wait();
+        let runtime = self.runtime.clone();
+        let client_deadline = Arc::clone(&self.client_deadline);
+        let stream_exhausted = Arc::clone(&self.stream_exhausted);
+        let query = async {
             let mut cursor = self.inner.query(params).await?;
             let mut rows = Vec::new();
             while let Some(row) = cursor.next().await? {
                 rows.push(map(&row));
             }
             Ok::<_, anyhow::Error>(rows)
-        })?;
-        Ok(MappedRows(mapped.into_iter()))
+        };
+        let mapped = if let Some(timeout) = timeout {
+            runtime.block_on_database_within("query", Some(timeout), query, true)
+        } else {
+            runtime.block_on_database("query", query)
+        };
+        if let Err(error) = &mapped {
+            if is_database_operation_timeout(error) {
+                client_deadline.store(true, Ordering::Release);
+            } else if is_remote_interactive_timeout(error) {
+                stream_exhausted.store(true, Ordering::Release);
+            }
+        }
+        Ok(MappedRows(mapped?.into_iter()))
+    }
+
+    fn query_wait(&self) -> Option<Duration> {
+        let deadline = self.read_deadline?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        Some(match self.runtime.operation_limit() {
+            Some(limit) => remaining.min(limit),
+            None => remaining,
+        })
     }
 }
 
@@ -1620,10 +1663,11 @@ pub struct Transaction {
     write_prepared: AtomicBool,
     /// The provider already closed this Hrana stream. Drop must not send
     /// ROLLBACK on it; the connection is tainted and the next open uses a new one.
-    stream_exhausted: AtomicBool,
+    /// Shared with prepared statements so a stalled `query_map` can record it.
+    stream_exhausted: Arc<AtomicBool>,
     /// Our deadline cancelled an in-flight call. The stream may still accept
     /// ROLLBACK. This is not [`Self::stream_exhausted`].
-    client_deadline: AtomicBool,
+    client_deadline: Arc<AtomicBool>,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
     expected_lease_owner: Option<String>,
@@ -1795,6 +1839,28 @@ impl Transaction {
             && self.client_deadline.load(Ordering::Acquire)
             && !self.stream_exhausted.load(Ordering::Acquire)
             && (self.allows_write || self.read_deadline.is_some())
+    }
+
+    /// Rollback for a remote read or snapshot, including one whose statements
+    /// all succeeded. An already-expired budget still gets one short release
+    /// instead of the pool deadline. Writes keep the normal cleanup path.
+    fn budgeted_read_rollback(&self, operation: &'static str) -> Option<Result<()>> {
+        let wait = self.statement_wait()?;
+        let timeout = if wait.is_zero() {
+            REMOTE_LOCK_RELEASE_TIMEOUT
+        } else {
+            wait
+        };
+        Some(
+            self.runtime
+                .block_on_database_within(
+                    operation,
+                    Some(timeout),
+                    self.inner().execute_batch("ROLLBACK"),
+                    false,
+                )
+                .map(|_| ()),
+        )
     }
 
     /// Time left in a remote read or snapshot. `None` keeps the runtime deadline
@@ -2230,7 +2296,9 @@ impl Transaction {
             drop_transaction_without_runtime(inner);
             return Ok(());
         }
-        let result = if self.remote_write_needs_prompt_release() {
+        let result = if let Some(result) = self.budgeted_read_rollback("finish read transaction") {
+            result
+        } else if self.remote_write_needs_prompt_release() {
             self.release_remote_write_lock()
         } else {
             self.runtime
@@ -2332,6 +2400,14 @@ impl Drop for Transaction {
                 std::mem::forget(inner);
             }
             self.connection_tainted.store(true, Ordering::Release);
+            return;
+        }
+        if let Some(released) = self.budgeted_read_rollback("rollback transaction") {
+            let inner = self.inner.take().expect("transaction already completed");
+            drop_transaction_without_runtime(inner);
+            if released.is_err() {
+                self.connection_tainted.store(true, Ordering::Release);
+            }
             return;
         }
         if self.remote_write_needs_prompt_release() {
@@ -2506,9 +2582,17 @@ impl SqlExecutor for Transaction {
         require_read_sql(sql)?;
         let inner =
             self.map_stream(self.drive("transaction prepare", self.inner().prepare(sql)))?;
+        let read_deadline = if self.write_prepared.load(Ordering::Acquire) {
+            None
+        } else {
+            self.read_deadline
+        };
         Ok(Statement {
             inner,
             runtime: self.runtime.clone(),
+            read_deadline,
+            client_deadline: Arc::clone(&self.client_deadline),
+            stream_exhausted: Arc::clone(&self.stream_exhausted),
         })
     }
 
