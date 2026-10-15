@@ -48,6 +48,37 @@ guarantee. Do not use them to get around a refusal. Do not run an emergency full
 `VACUUM` against a nearly full production database. Plan supported maintenance
 with enough space for its temporary output; keep the provider's normal quota.
 
+## Active-bot lease admission
+
+Initial claims and expired-lease takeovers intentionally retain ordinary growth
+admission. They can insert lease/generation metadata and, on remote libSQL,
+commit-recovery receipts. Operational authority does not justify bypassing the
+storage budget or the pause raised by an underestimated write bound. A refused
+claim returns an error without changing the persisted lease/generation or arming
+the claimant; the bot cannot become active until a claim succeeds. Expiry alone
+does not give a replacement permission to act. Startup fails on this admission
+error; repeated restarts cannot solve exhausted capacity.
+
+An already-armed owner's dedicated renewal CAS updates its existing lease without
+creating a receipt or reserving ordinary growth. It can therefore keep authority
+while growth is paused or receipt headroom is exhausted, but still checks owner,
+unexpired lease, writer generation and the restore fence. Ordinary writes remain
+protected. Renewal without an armed matching generation falls back to the claim
+path and receives the same admission checks. The ordinary receipt-bearing lease
+release can also fail under pressure; another owner must still wait for expiry
+and pass its own claim admission.
+
+For an underestimated-bound pause, diagnose and correct the offending bound,
+then restart the affected process to clear its runtime latch. For exhausted
+capacity, restore enough measured allocated-size headroom for the complete claim,
+including remote receipt allowances, using supported maintenance with sufficient
+working space. Restarting alone does not reduce allocation, and deleting rows
+may only create reusable pages. A still-active owner can perform permitted
+bounded reclamation. If no bot can acquire authority, bot-owned WebUI cleanup is
+not a recovery route: arrange supported operator maintenance before retrying
+startup. Do not bypass the admission checks with raw SQL or raise the provider
+quota as a substitute for application admission.
+
 ## Owner inspection
 
 Open **Administration → Database Usage** in the WebUI as the configured bot

@@ -489,6 +489,11 @@ fn generation_value(raw: Option<&str>) -> Result<i64> {
 /// owner keeps that generation. `refuse` is checked after the lock is held.
 /// When it is set, this does not write, so a shutdown that already started
 /// cannot reclaim the lease.
+/// Claims (including the unarmed renewal fallback) intentionally use ordinary
+/// growth admission: lease/generation metadata and remote recovery receipts can
+/// allocate storage. A paused runtime or insufficient headroom returns an error
+/// without changing authority. Only an already-armed owner's dedicated renewal
+/// CAS avoids that admission; see docs/DATABASE-CAPACITY.md for recovery.
 pub async fn claim_active_bot(
     db: &Db,
     instance: &str,
