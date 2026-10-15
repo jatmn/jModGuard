@@ -361,7 +361,9 @@ pub async fn request_component_install(
             anyhow::ensure!(webui_source_reusable(&candidate, &[installed.clone(),parse_release(state.previous)?,parse_release(state.desired)?],reserved != 0), "WebUI source SHA already has a different or unknown image digest; use a new source commit");
             tx.execute_rows("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![candidate.source_sha.clone(),now], 1)?;
         }
-        tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?], 1)?;
+        let desired = serde_json::to_string(&candidate)?;
+        update_control::clear_rejected_candidate_if_desired_changes(&tx, &component, &desired)?;
+        tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component, desired], 1)?;
         tx.commit()?;
         Ok(candidate)
     }).await
@@ -496,8 +498,13 @@ pub async fn record_component_running(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if let Some(release) = release {
-            let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND (desired=?2 OR installed=?2)", params![component,release,now,observation], 1)?;
+            let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND (desired=?2 OR installed=?2)", params![component.clone(),release.clone(),now,observation], 1)?;
             anyhow::ensure!(changed == 1, "desired release changed before activation");
+            update_control::clear_rejected_candidate_after_activation(
+                &tx,
+                &component,
+                &release,
+            )?;
         } else {
             tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3 WHERE component=?1", params![component,observation,now], 1)?;
         }
@@ -563,9 +570,10 @@ pub async fn record_component_failure(
         }
         tx.execute_rows(
             "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?3 WHERE component=?1 AND desired=?2",
-            params![component, stored, error],
+            params![component.clone(), stored, error],
             1,
         )?;
+        update_control::clear_rejected_candidate_conn(&tx, &component)?;
         tx.commit()?;
         Ok(())
     })
@@ -594,7 +602,8 @@ pub async fn record_component_rollback(
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute_rows("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed], 1)?;
+        tx.execute_rows("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component.clone(),previous,now,observation,error,failed], 1)?;
+        update_control::clear_rejected_candidate_conn(&tx, &component)?;
         tx.commit()?;
         Ok(())
     }).await
@@ -774,6 +783,7 @@ pub async fn request_due_automatic_install(
             }
             tx.execute_rows("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![release.source_sha.clone(),now], 1)?;
         }
+        update_control::clear_rejected_candidate_if_desired_changes(&tx, &component, &candidate)?;
         tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL,auto_last_digest=?3,auto_last_window=?4 WHERE component=?1",params![component,candidate,release.digest.clone(),window], 1)?;
         tx.commit()?;
         Ok(Some(release))
