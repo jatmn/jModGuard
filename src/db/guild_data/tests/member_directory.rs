@@ -5945,21 +5945,25 @@ async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit() {
     let remote = armed_coverage_gap_store(&local, &f.catalog);
     let before = coverage_gap_persisted_mark(&local).await;
     let path = f.store_path.clone();
-    super::super::member_directory::test_set_coverage_gap_after_writer_fence(Some(Box::new(
-        move || {
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(
+        remote.db.path(),
+        Some(Box::new(move || {
             let conn = crate::db_compat::Connection::open(&path).unwrap();
             conn.execute_batch_bounded(
                 "UPDATE guild_writer_epoch SET generation=generation+1 WHERE singleton=1",
                 SCHEMA_BATCH_LIMIT,
             )
             .unwrap();
-        },
-    )));
+        })),
+    );
     let error = remote
         .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_writer_fence(None);
+    super::super::member_directory::test_set_coverage_gap_after_writer_fence(
+        remote.db.path(),
+        None,
+    );
     assert!(super::lease_rejected(&error), "{error:#}");
     assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     assert!(!before.0);
@@ -5987,14 +5991,15 @@ async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit() {
         .unwrap();
     let remote = armed_coverage_gap_store(&local, &f.catalog);
     let before = coverage_gap_persisted_mark(&local).await;
-    super::super::member_directory::test_set_coverage_gap_after_batch(Some(
-        delete_active_bot_lease(f.catalog_path.clone()),
-    ));
+    super::super::member_directory::test_set_coverage_gap_after_batch(
+        remote.db.path(),
+        Some(delete_active_bot_lease(f.catalog_path.clone())),
+    );
     let error = remote
         .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_batch(None);
+    super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
     assert!(super::lease_rejected(&error), "{error:#}");
     assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     assert!(!before.0);
@@ -6043,17 +6048,130 @@ async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit_over_
     }
     .with_core_write_fence(f.catalog.clone());
     let before = coverage_gap_persisted_mark(&local).await;
-    super::super::member_directory::test_set_coverage_gap_after_batch(Some(
-        delete_active_bot_lease(f.catalog_path.clone()),
-    ));
+    super::super::member_directory::test_set_coverage_gap_after_batch(
+        remote.db.path(),
+        Some(delete_active_bot_lease(f.catalog_path.clone())),
+    );
     let error = remote
         .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_batch(None);
+    super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
     assert!(super::lease_rejected(&error), "{error:#}");
     assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     assert!(!before.0);
+}
+
+#[derive(Clone, Copy)]
+enum AdmittedLeaseLoss {
+    Replaced,
+    DeletedAndCleared,
+}
+
+async fn assert_admitted_lease_loss_rolls_back(http: bool, kind: AdmittedLeaseLoss) {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use crate::db_compat::{Connection, SqlExecutor};
+    use std::time::Duration;
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    local
+        .raise_writer_epoch(f.catalog.leased_generation().unwrap())
+        .await
+        .unwrap();
+    let mut http_fixture = None;
+    let remote = if http {
+        let (fixture, db) =
+            HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5))
+                .await;
+        let remote = GuildDataStore {
+            db,
+            expected: local.expected.clone(),
+            core: None,
+        }
+        .with_core_write_fence(f.catalog.clone());
+        http_fixture = Some(fixture);
+        remote
+    } else {
+        armed_coverage_gap_store(&local, &f.catalog)
+    };
+    let before = coverage_gap_persisted_mark(&local).await;
+    let catalog = f.catalog.clone();
+    let path = f.catalog_path.clone();
+    super::super::member_directory::test_set_coverage_gap_after_batch(
+        remote.db.path(),
+        Some(Box::new(move || {
+            let conn = Connection::open(&path).unwrap();
+            match kind {
+                AdmittedLeaseLoss::Replaced => {
+                    let replacement = "cd".repeat(16);
+                    let expires = crate::control::now_ms().saturating_add(120_000);
+                    let changed = conn
+                        .execute_bounded(
+                            "UPDATE meta SET value=?1 WHERE key='active_bot_lease'",
+                            params![format!("{replacement} {expires}")],
+                            SCHEMA_BATCH_LIMIT,
+                        )
+                        .unwrap();
+                    assert_eq!(changed, 1);
+                    let generation = catalog.leased_generation().unwrap_or(1);
+                    catalog.arm_writer_term(&replacement, generation);
+                }
+                AdmittedLeaseLoss::DeletedAndCleared => {
+                    let changed = conn
+                        .execute_bounded(
+                            "DELETE FROM meta WHERE key='active_bot_lease'",
+                            params![],
+                            SCHEMA_BATCH_LIMIT,
+                        )
+                        .unwrap();
+                    assert_eq!(changed, 1);
+                    catalog.restore_lease_owner(None);
+                }
+            }
+        })),
+    );
+    let error = remote
+        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
+    assert!(super::lease_rejected(&error), "{error:#}");
+    assert_eq!(coverage_gap_persisted_mark(&local).await, before);
+    assert!(!before.0);
+    drop(http_fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_another_owner_takes_the_lease_before_commit() {
+    assert_admitted_lease_loss_rolls_back(false, AdmittedLeaseLoss::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_another_owner_takes_the_lease_before_commit_over_http() {
+    assert_admitted_lease_loss_rolls_back(true, AdmittedLeaseLoss::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_admitted_owner_is_cleared_before_commit() {
+    assert_admitted_lease_loss_rolls_back(false, AdmittedLeaseLoss::DeletedAndCleared).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_admitted_owner_is_cleared_before_commit_over_http() {
+    assert_admitted_lease_loss_rolls_back(true, AdmittedLeaseLoss::DeletedAndCleared).await;
 }
 
 #[tokio::test]
@@ -6121,8 +6239,9 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
         .await
         .unwrap();
     let local_for_hook = local.clone();
-    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(Some(Box::new(
-        move || {
+    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(
+        remote.db.path(),
+        Some(Box::new(move || {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.block_on(async {
                     local_for_hook
@@ -6142,13 +6261,16 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
                         .unwrap();
                 });
             }
-        },
-    )));
+        })),
+    );
     let error = remote
         .mark_member_reconciliation_needed(scope.clone(), "second_gap", 4_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(None);
+    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(
+        remote.db.path(),
+        None,
+    );
     assert!(
         error.to_string().contains("restore is in progress"),
         "{error:#}"
@@ -6541,20 +6663,21 @@ async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
     complete_for_checks(&store, &scope).await;
     let store_for_close = store.clone();
     let scope_for_close = scope.clone();
-    super::super::member_directory::test_set_coverage_gap_after_scope_verify(Some(Box::new(
-        move || {
+    super::super::member_directory::test_set_coverage_gap_after_scope_verify(
+        store.db.path(),
+        Some(Box::new(move || {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle
                     .block_on(store_for_close.close_membership(scope_for_close.clone()))
                     .unwrap();
             }
-        },
-    )));
+        })),
+    );
     let error = store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_scope_verify(None);
+    super::super::member_directory::test_set_coverage_gap_after_scope_verify(store.db.path(), None);
     assert!(error.is::<TenantDataError>());
     let reconciliation_needed: bool = store
         .db
@@ -6579,8 +6702,9 @@ async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let store_for_bump = store.clone();
-    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(Some(Box::new(
-        move || {
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
+        store.db.path(),
+        Some(Box::new(move || {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.block_on(async {
                     store_for_bump
@@ -6599,13 +6723,16 @@ async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
                         .unwrap();
                 });
             }
-        },
-    )));
+        })),
+    );
     let error = store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(None);
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
+        store.db.path(),
+        None,
+    );
     assert!(error.is::<TenantDataError>());
     let reconciliation_needed: bool = store
         .db
@@ -6630,8 +6757,9 @@ async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let store_for_bump = store.clone();
-    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(Some(Box::new(
-        move || {
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
+        store.db.path(),
+        Some(Box::new(move || {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.block_on(async {
                     store_for_bump
@@ -6650,13 +6778,16 @@ async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
                         .unwrap();
                 });
             }
-        },
-    )));
+        })),
+    );
     let error = store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
         .await
         .unwrap_err();
-    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(None);
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
+        store.db.path(),
+        None,
+    );
     assert!(error.is::<TenantDataError>());
     let reason: Option<String> = store
         .db

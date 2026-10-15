@@ -12,23 +12,42 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 #[cfg(test)]
-static COVERAGE_GAP_AFTER_SCOPE_VERIFY: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    Mutex::new(None);
+type CoverageGapHook = (std::path::PathBuf, Box<dyn Fn() + Send + Sync>);
 
 #[cfg(test)]
-static COVERAGE_GAP_AFTER_REVISION_SNAPSHOT: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    Mutex::new(None);
+static COVERAGE_GAP_AFTER_SCOPE_VERIFY: Mutex<Option<CoverageGapHook>> = Mutex::new(None);
 
 #[cfg(test)]
-static COVERAGE_GAP_AFTER_RECEIPT_ADMISSION: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    Mutex::new(None);
+static COVERAGE_GAP_AFTER_REVISION_SNAPSHOT: Mutex<Option<CoverageGapHook>> = Mutex::new(None);
 
 #[cfg(test)]
-static COVERAGE_GAP_AFTER_WRITER_FENCE: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    Mutex::new(None);
+static COVERAGE_GAP_AFTER_RECEIPT_ADMISSION: Mutex<Option<CoverageGapHook>> = Mutex::new(None);
 
 #[cfg(test)]
-static COVERAGE_GAP_AFTER_BATCH: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+static COVERAGE_GAP_AFTER_WRITER_FENCE: Mutex<Option<CoverageGapHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static COVERAGE_GAP_AFTER_BATCH: Mutex<Option<CoverageGapHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_coverage_gap_hook(
+    slot: &Mutex<Option<CoverageGapHook>>,
+    database: &std::path::Path,
+    hook: Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        hook.map(|hook| (database.to_path_buf(), hook));
+}
+
+#[cfg(test)]
+fn run_coverage_gap_hook(slot: &Mutex<Option<CoverageGapHook>>, database: &std::path::Path) {
+    let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((path, hook)) = guard.as_ref()
+        && path == database
+    {
+        hook();
+    }
+}
 
 #[cfg(test)]
 static COVERAGE_GAP_HOOK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -39,91 +58,84 @@ pub(crate) async fn test_coverage_gap_hook_lock() -> tokio::sync::MutexGuard<'st
 }
 
 #[cfg(test)]
-pub(crate) fn test_set_coverage_gap_after_scope_verify(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *COVERAGE_GAP_AFTER_SCOPE_VERIFY.lock().unwrap() = hook;
+pub(crate) fn test_set_coverage_gap_after_scope_verify(
+    database: &std::path::Path,
+    hook: Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    set_coverage_gap_hook(&COVERAGE_GAP_AFTER_SCOPE_VERIFY, database, hook);
 }
 
 #[cfg(test)]
 pub(crate) fn test_set_coverage_gap_after_revision_snapshot(
+    database: &std::path::Path,
     hook: Option<Box<dyn Fn() + Send + Sync>>,
 ) {
-    *COVERAGE_GAP_AFTER_REVISION_SNAPSHOT.lock().unwrap() = hook;
+    set_coverage_gap_hook(&COVERAGE_GAP_AFTER_REVISION_SNAPSHOT, database, hook);
 }
 
 #[cfg(test)]
 pub(crate) fn test_set_coverage_gap_after_receipt_admission(
+    database: &std::path::Path,
     hook: Option<Box<dyn Fn() + Send + Sync>>,
 ) {
-    *COVERAGE_GAP_AFTER_RECEIPT_ADMISSION.lock().unwrap() = hook;
+    set_coverage_gap_hook(&COVERAGE_GAP_AFTER_RECEIPT_ADMISSION, database, hook);
 }
 
 #[cfg(test)]
-pub(crate) fn test_set_coverage_gap_after_writer_fence(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *COVERAGE_GAP_AFTER_WRITER_FENCE.lock().unwrap() = hook;
+pub(crate) fn test_set_coverage_gap_after_writer_fence(
+    database: &std::path::Path,
+    hook: Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    set_coverage_gap_hook(&COVERAGE_GAP_AFTER_WRITER_FENCE, database, hook);
 }
 
 #[cfg(test)]
-pub(crate) fn test_set_coverage_gap_after_batch(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *COVERAGE_GAP_AFTER_BATCH.lock().unwrap() = hook;
+pub(crate) fn test_set_coverage_gap_after_batch(
+    database: &std::path::Path,
+    hook: Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    set_coverage_gap_hook(&COVERAGE_GAP_AFTER_BATCH, database, hook);
 }
 
 #[cfg(test)]
-fn run_coverage_gap_after_scope_verify_hook() {
-    if let Some(hook) = COVERAGE_GAP_AFTER_SCOPE_VERIFY.lock().unwrap().as_ref() {
-        hook();
-    }
+fn run_coverage_gap_after_scope_verify_hook(database: &std::path::Path) {
+    run_coverage_gap_hook(&COVERAGE_GAP_AFTER_SCOPE_VERIFY, database);
 }
 
 #[cfg(test)]
-fn run_coverage_gap_after_revision_snapshot_hook() {
-    if let Some(hook) = COVERAGE_GAP_AFTER_REVISION_SNAPSHOT
-        .lock()
-        .unwrap()
-        .as_ref()
-    {
-        hook();
-    }
+fn run_coverage_gap_after_revision_snapshot_hook(database: &std::path::Path) {
+    run_coverage_gap_hook(&COVERAGE_GAP_AFTER_REVISION_SNAPSHOT, database);
 }
 
 #[cfg(not(test))]
-fn run_coverage_gap_after_scope_verify_hook() {}
+fn run_coverage_gap_after_scope_verify_hook(_database: &std::path::Path) {}
 
 #[cfg(test)]
-fn run_coverage_gap_after_receipt_admission_hook() {
-    if let Some(hook) = COVERAGE_GAP_AFTER_RECEIPT_ADMISSION
-        .lock()
-        .unwrap()
-        .as_ref()
-    {
-        hook();
-    }
+fn run_coverage_gap_after_receipt_admission_hook(database: &std::path::Path) {
+    run_coverage_gap_hook(&COVERAGE_GAP_AFTER_RECEIPT_ADMISSION, database);
 }
 
 #[cfg(not(test))]
-fn run_coverage_gap_after_revision_snapshot_hook() {}
+fn run_coverage_gap_after_revision_snapshot_hook(_database: &std::path::Path) {}
 
 #[cfg(not(test))]
-fn run_coverage_gap_after_receipt_admission_hook() {}
+fn run_coverage_gap_after_receipt_admission_hook(_database: &std::path::Path) {}
 
 #[cfg(test)]
-fn run_coverage_gap_after_writer_fence_hook() {
-    if let Some(hook) = COVERAGE_GAP_AFTER_WRITER_FENCE.lock().unwrap().as_ref() {
-        hook();
-    }
+fn run_coverage_gap_after_writer_fence_hook(database: &std::path::Path) {
+    run_coverage_gap_hook(&COVERAGE_GAP_AFTER_WRITER_FENCE, database);
 }
 
 #[cfg(not(test))]
-fn run_coverage_gap_after_writer_fence_hook() {}
+fn run_coverage_gap_after_writer_fence_hook(_database: &std::path::Path) {}
 
 #[cfg(test)]
-fn run_coverage_gap_after_batch_hook() {
-    if let Some(hook) = COVERAGE_GAP_AFTER_BATCH.lock().unwrap().as_ref() {
-        hook();
-    }
+fn run_coverage_gap_after_batch_hook(database: &std::path::Path) {
+    run_coverage_gap_hook(&COVERAGE_GAP_AFTER_BATCH, database);
 }
 
 #[cfg(not(test))]
-fn run_coverage_gap_after_batch_hook() {}
+fn run_coverage_gap_after_batch_hook(_database: &std::path::Path) {}
 
 /// Guild whose member-sync statements are being counted. Unset until a test asks.
 static MEMBER_SYNC_WATCHED_GUILD: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -662,16 +674,19 @@ fn coverage_gap_read_epoch(conn: &impl SqlExecutor) -> Result<Option<i64>> {
 
 /// Fail-fast lease and epoch admission before `BEGIN IMMEDIATE`.
 ///
-/// These reads do not authorize the commit. The returned generation is what
-/// the batch must still see. The core lease is read again once, at commit.
+/// These reads do not authorize the commit. The generation is what the batch
+/// must still see. The owner, when one was admitted, is the only owner commit
+/// may accept.
 fn coverage_gap_writer_prelude(
     core: Option<&Db>,
     conn: &crate::db_compat::Connection,
-) -> Result<Option<i64>> {
+) -> Result<(Option<i64>, Option<String>)> {
+    let mut admitted_owner = None;
     if let Some(core) = core
         && let Some(owner) = core.leased_owner()
     {
         GuildDataStore::read_core_lease(core, &owner)?;
+        admitted_owner = Some(owner);
     }
     let generation = conn.expected_writer_generation();
     if let Some(generation) = generation {
@@ -680,7 +695,7 @@ fn coverage_gap_writer_prelude(
             return Err(crate::db_compat::ActiveBotLeaseRejected.into());
         }
     }
-    Ok(generation)
+    Ok((generation, admitted_owner))
 }
 
 fn coverage_gap_writer_fence_sql(generation: Option<i64>) -> String {
@@ -1213,11 +1228,12 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         let reason = reason.to_string();
         let core = self.core.clone();
+        let hook_database = self.db.path().to_path_buf();
         self.db.with_conn(move |conn| {
             // Membership and placement checks are autocommit reads so they do not
             // extend the remote interactive write transaction.
             verify_scope(conn, &expected, &scope, true)?;
-            run_coverage_gap_after_scope_verify_hook();
+            run_coverage_gap_after_scope_verify_hook(&hook_database);
             let revision_before: i64 = {
                 let tx = conn.transaction_primary_snapshot()?;
                 let revision = tx.query_row(
@@ -1228,34 +1244,37 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 revision
             };
-            run_coverage_gap_after_revision_snapshot_hook();
+            run_coverage_gap_after_revision_snapshot_hook(&hook_database);
             // Receipt admission is an autocommit read. A restore fence or a
             // transport error fails here, before BEGIN IMMEDIATE.
             let meta_present = coverage_gap_meta_table(conn)?;
             if meta_present {
                 coverage_gap_refuse_restore(conn)?;
             }
-            run_coverage_gap_after_receipt_admission_hook();
+            run_coverage_gap_after_receipt_admission_hook(&hook_database);
             // Pre-BEGIN lease and epoch reads fail fast. They do not authorize
-            // the commit. The batch compares the captured epoch. Commit reads
-            // the core lease once and does not repeat the epoch query.
-            let writer_generation = coverage_gap_writer_prelude(core.as_ref(), conn)?;
-            run_coverage_gap_after_writer_fence_hook();
+            // the commit. The batch compares the captured epoch. Commit requires
+            // the admitted owner and does not repeat the epoch query.
+            let (writer_generation, admitted_owner) =
+                coverage_gap_writer_prelude(core.as_ref(), conn)?;
+            run_coverage_gap_after_writer_fence_hook(&hook_database);
             let mut tx = conn.transaction_primary_read()?;
             // The shared guild probe reads the lease twice so a test can change
             // it between those reads. The second snapshot does not fit in this
-            // mark's remote lifetime, so an attached core performs that check once.
-            // A store with no core keeps whatever probe it already has.
+            // mark's remote lifetime, so commit checks the admitted owner once.
+            // A store with no admitted owner keeps whatever probe it already has.
             tx.suppress_commit_writer_recheck(false, writer_generation.is_some());
-            if let Some(core) = core.clone() {
+            if let Some(owner) = admitted_owner {
+                let Some(core) = core.clone() else {
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                };
                 tx.set_commit_lease_probe(Some(std::sync::Arc::new(move |commit| {
-                    let Some(owner) = core.leased_owner() else {
-                        return commit();
-                    };
                     #[cfg(test)]
                     if let Some(hook) = core.take_before_final_lease_reread() {
                         hook();
                     }
+                    // The owner is the one admitted before BEGIN, not whoever
+                    // holds the in-memory slot when this probe runs.
                     Self::read_core_lease(&core, &owner)?;
                     #[cfg(test)]
                     if let Some(hook) = core.take_during_leased_guild_commit() {
@@ -1291,7 +1310,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             if let Err(error) = tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH) {
                 return Err(coverage_gap_batch_error(error));
             }
-            run_coverage_gap_after_batch_hook();
+            run_coverage_gap_after_batch_hook(&hook_database);
             tx.commit()
         })
         .await
