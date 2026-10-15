@@ -762,9 +762,13 @@ impl Supervisor {
             if !reported && !rolling_back && (have_standby || matches_saved) {
                 rejected_now = child.release.clone();
             }
-            let code = status.code();
-            let elapsed = child.started.elapsed();
-            self.restart.exited(true, code, elapsed, Instant::now());
+            // A failed health bind retains this child for the next attempt.
+            // Count its rejection only when first establishing the hold.
+            if !self.restart.held {
+                let code = status.code();
+                let elapsed = child.started.elapsed();
+                self.restart.exited(true, code, elapsed, Instant::now());
+            }
             stop_child = true;
         }
         if let Some(release) = rejected_now {
@@ -772,11 +776,7 @@ impl Supervisor {
             // try_wait already reaped the child. Recover health before the
             // marker write can stall, retaining its identity until that write.
             self.disarm_child_health_watch().await;
-            if let Err(error) = self.idle().await {
-                tracing::warn!(
-                    "launcher health was not restored before the token marker: {error:#}"
-                );
-            }
+            self.idle().await?;
             // Save before clearing the child record. A crash after the stop
             // used to lose the only copy of the candidate.
             self.persist_rejected_candidate().await;
@@ -1271,20 +1271,22 @@ impl Supervisor {
 
     /// The exit may already have been reaped, so the watcher can observe
     /// `Reaped` and stop. Bind launcher health before any later control read.
-    async fn bind_health_after_observed_exit(&mut self) {
+    async fn bind_health_after_observed_exit(&mut self) -> Result<()> {
         if self.health.is_some() || self.role != "bot" {
-            return;
+            return Ok(());
         }
-        match self.hold_rejected_token().await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!("token hold was not established after the child exited: {error:#}");
-            }
+        if self.hold_rejected_token().await? {
+            return Ok(());
         }
-        if let Err(error) = self.idle().await {
-            tracing::warn!("launcher health was not restored after the child exited: {error:#}");
+        if let Some(child) = self.running.as_mut()
+            && child.child.try_wait()?.is_none()
+        {
+            // Keep watching a live child during the following control read.
+            return Ok(());
         }
+        // An ordinary exit may already have a watcher-owned listener.
+        self.disarm_child_health_watch().await;
+        self.idle().await
     }
 
     async fn start(
@@ -1866,7 +1868,7 @@ impl Supervisor {
         if let Err(error) = self.report_ready().await {
             // report_ready reaps before this read. Bind health first so a stall
             // here cannot leave /health down after the watcher sees Reaped.
-            self.bind_health_after_observed_exit().await;
+            self.bind_health_after_observed_exit().await?;
             #[cfg(test)]
             if let Some(gate) = self.exit_control_gate.take() {
                 let _ = gate.await;

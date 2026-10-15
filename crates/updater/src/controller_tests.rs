@@ -4484,15 +4484,20 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
 
 #[tokio::test]
 async fn readiness_error_then_token_exit_binds_health_before_control_read() {
-    readiness_error_then_token_exit(false).await;
+    readiness_error_then_token_exit(false, false).await;
 }
 
 #[tokio::test]
 async fn readiness_error_then_token_exit_binds_health_before_candidate_write() {
-    readiness_error_then_token_exit(true).await;
+    readiness_error_then_token_exit(true, false).await;
 }
 
-async fn readiness_error_then_token_exit(block_candidate_write: bool) {
+#[tokio::test]
+async fn readiness_error_then_token_exit_retries_failed_health_bind_before_candidate_write() {
+    readiness_error_then_token_exit(true, true).await;
+}
+
+async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first_bind: bool) {
     let root = std::env::temp_dir().join(format!("ready-token-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let db = Db::open(&root.join("core.db"), 2).unwrap();
@@ -4539,13 +4544,40 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool) {
     assert_eq!(status.code(), Some(78));
     let reserved = bind_outside_ephemeral_range().await;
     let addr = reserved.local_addr().unwrap();
-    drop(reserved);
     bot.health_bind = Some(addr.to_string());
+    let mut first_retry_at = None;
     if block_candidate_write {
         bot.standby = Some((child, bot.base_sha.clone(), None));
         let (releases, blockers) = block_sqlite_pool(&db).await;
+        if fail_first_bind {
+            // Keep the port occupied and the database blocked. Failed health
+            // recovery must return so another attempt can run once it is free.
+            let recovery = tokio::time::timeout(POLL, bot.bind_health_after_observed_exit()).await;
+            assert!(
+                recovery.is_ok(),
+                "failed health bind must return before rejected-candidate persistence"
+            );
+            let error = recovery.unwrap().unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
+                "{error:#}"
+            );
+            assert!(bot.restart.held);
+            assert!(bot.health.is_none());
+            assert_eq!(
+                bot.running.as_ref().unwrap().release.as_ref(),
+                Some(&release)
+            );
+            assert_eq!(bot.rejected_candidate.as_ref(), Some(&release));
+            assert!(bot.persisted_candidate_digest.is_none());
+            assert_eq!(bot.restart.auth_failures, 1);
+            first_retry_at = bot.restart.auth_retry_at;
+        }
+        drop(reserved);
         let recovery = tokio::spawn(async move {
-            bot.bind_health_after_observed_exit().await;
+            bot.bind_health_after_observed_exit().await.unwrap();
             bot
         });
         let healthy = tokio::time::timeout(POLL, async {
@@ -4574,11 +4606,19 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool) {
             Some(release.digest)
         );
     } else {
-        bot.bind_health_after_observed_exit().await;
+        drop(reserved);
+        bot.bind_health_after_observed_exit().await.unwrap();
     }
 
     // Inspect the boundary before allowing any control read to run.
     assert!(bot.restart.held, "token hold must precede the control read");
+    assert_eq!(
+        bot.restart.auth_failures, 1,
+        "count each rejected child once"
+    );
+    if let Some(first_retry_at) = first_retry_at {
+        assert_eq!(bot.restart.auth_retry_at, Some(first_retry_at));
+    }
     assert!(bot.running.is_none());
     assert_launcher_health(addr, "discord token rejected").await;
     bot.end_idle().await.unwrap();
