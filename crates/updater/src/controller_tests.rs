@@ -196,6 +196,7 @@ fn controller(
         health: None,
         health_bind: None,
         exit_control_gate: None,
+        readiness_error_gate: None,
         before_idle_gate: None,
         after_idle_gate: None,
         staging: root.join(format!("staged-{role}")),
@@ -4477,6 +4478,303 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
     assert_launcher_health(addr, "not ready").await;
     assert!(bot.running.is_none());
     assert!(bot.exited_for_restart);
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn readiness_recovery_holds_token_exit_between_status_checks() {
+    use std::future::Future as _;
+    let root = std::env::temp_dir().join(format!("ready-race-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let name = "ready-race";
+    let child = executable(&root, name).await;
+    let hold = root.join(format!("hold-{name}-ready"));
+    tokio::fs::write(&hold, "hold").await.unwrap();
+    let candidate = image(&mut HashMap::new(), "bot", b"ready-race");
+    bot.start(&child, &candidate.source_sha, Some(candidate.clone()))
+        .await
+        .unwrap();
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    assert!(
+        bot.report_ready()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("readiness timed out")
+    );
+    let reserved = bind_outside_ephemeral_range().await;
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    bot.health_bind = Some(addr.to_string());
+    bot.arm_child_health_watch();
+    let pid = bot.running.as_ref().unwrap().child.id().unwrap();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    bot.before_idle_gate = Some(gate);
+    {
+        let recovery = bot.bind_health_after_observed_exit();
+        tokio::pin!(recovery);
+        // Poll only recovery: the first status check sees a live child, then
+        // the gate parks it without scheduling the watcher.
+        assert!(
+            std::future::poll_fn(|cx| { std::task::Poll::Ready(recovery.as_mut().poll(cx)) })
+                .await
+                .is_pending()
+        );
+        std::fs::write(root.join(format!("exit-code-{name}")), "78").unwrap();
+        std::fs::remove_file(&hold).unwrap();
+        let deadline = Instant::now() + POLL;
+        while !child_is_zombie(pid) {
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        release.send(()).unwrap();
+        // The second check must reap/classify the exit before the watcher runs.
+        tokio::time::timeout(POLL, recovery).await.unwrap().unwrap();
+    }
+    assert!(
+        bot.restart.held,
+        "second status check must establish the token hold"
+    );
+    assert!(bot.running.is_none());
+    assert_launcher_health(addr, "discord token rejected").await;
+    bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn readiness_recovery_keeps_unsaved_candidate_through_auth_retry() {
+    let (root, db, mut bot, candidate, server) =
+        independent_exiting_bot_prepared(78, |bot| bot.fail_rejected_candidate_write = true).await;
+    bot.tick().await.unwrap();
+    // Retry into a live, unready replacement with its original standby.
+    let exit = root.join("exit-code-desired-bot");
+    tokio::fs::remove_file(&exit).await.unwrap();
+    let hold = root.join("hold-desired-bot-ready");
+    tokio::fs::write(&hold, "hold").await.unwrap();
+    bot.restart.auth_retry_at = Some(Instant::now());
+    bot.tick().await.unwrap();
+    assert!(bot.standby.is_some());
+    assert!(
+        bot.running
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    let reserved = bind_reclaimable_health_port().await;
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    bot.health_bind = Some(addr.to_string());
+    let pid = bot.running.as_ref().unwrap().child.id().unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    bot.readiness_error_gate = Some((entered, gate));
+    let normal = tokio::spawn(async move {
+        let result = bot.normal().await;
+        (bot, result)
+    });
+    tokio::time::timeout(POLL, reached).await.unwrap().unwrap();
+    publish_exit_code(&exit, 78).await;
+    tokio::fs::remove_file(&hold).await.unwrap();
+    tokio::time::timeout(POLL, async {
+        while !child_is_zombie(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    let (mut bot, result) = tokio::time::timeout(POLL, normal).await.unwrap().unwrap();
+    assert!(bot.restart.held);
+    assert!(
+        bot.standby.is_some(),
+        "token hold must not consume the standby"
+    );
+    assert!(!result.unwrap());
+    assert!(bot.running.is_none());
+    assert_eq!(bot.rejected_candidate.as_ref(), Some(&candidate));
+    assert!(
+        bot.control
+            .rejected_candidate_digest("bot")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_launcher_health(addr, "discord token rejected").await;
+
+    // Marker writes still fail: retry must use retained candidate/standby,
+    // not restore the installed or baked release.
+    tokio::fs::remove_file(&exit).await.unwrap();
+    bot.restart.auth_retry_at = Some(Instant::now());
+    bot.tick().await.unwrap();
+    assert_eq!(
+        bot.running.as_ref().unwrap().release.as_ref(),
+        Some(&candidate)
+    );
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(
+        independent_exit_starts(&root).await,
+        [
+            "desired-bot.start",
+            "desired-bot.start",
+            "desired-bot.start",
+        ]
+    );
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn readiness_error_then_token_exit_binds_health_before_control_read() {
+    readiness_error_then_token_exit(false, false).await;
+}
+
+#[tokio::test]
+async fn readiness_error_then_token_exit_binds_health_before_candidate_write() {
+    readiness_error_then_token_exit(true, false).await;
+}
+
+#[tokio::test]
+async fn readiness_error_then_token_exit_retries_failed_health_bind_before_candidate_write() {
+    readiness_error_then_token_exit(true, true).await;
+}
+
+async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first_bind: bool) {
+    let root = std::env::temp_dir().join(format!("ready-token-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let mut bot = offline_controller("bot", UpdateControl::from_application(&db), &root);
+    let name = "ready-token";
+    let child = executable(&root, name).await;
+    tokio::fs::write(root.join(format!("hold-{name}-ready")), "hold")
+        .await
+        .unwrap();
+    let release = image(&mut HashMap::new(), "bot", b"readiness-timeout");
+    bot.start(&child, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    let error = bot.report_ready().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replacement child readiness timed out"),
+        "{error:#}"
+    );
+    assert!(
+        bot.running
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    assert!(!bot.restart.held);
+
+    // Reproduce the handoff in normal(): readiness has failed, then exit 78
+    // arrives before health recovery and the following control read.
+    publish_exit_code(root.join(format!("exit-code-{name}")), 78).await;
+    // The fixture waits for readiness before checking its requested exit.
+    tokio::fs::remove_file(root.join(format!("hold-{name}-ready")))
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(78));
+    let reserved = bind_outside_ephemeral_range().await;
+    let addr = reserved.local_addr().unwrap();
+    bot.health_bind = Some(addr.to_string());
+    let mut first_retry_at = None;
+    if block_candidate_write {
+        bot.standby = Some((child, bot.base_sha.clone(), None));
+        let (releases, blockers) = block_sqlite_pool(&db).await;
+        if fail_first_bind {
+            // Keep the port occupied and the database blocked. Failed health
+            // recovery must return so another attempt can run once it is free.
+            let recovery = tokio::time::timeout(POLL, bot.bind_health_after_observed_exit()).await;
+            assert!(
+                recovery.is_ok(),
+                "failed health bind must return before rejected-candidate persistence"
+            );
+            let error = recovery.unwrap().unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
+                "{error:#}"
+            );
+            assert!(bot.restart.held);
+            assert!(bot.health.is_none());
+            assert_eq!(
+                bot.running.as_ref().unwrap().release.as_ref(),
+                Some(&release)
+            );
+            assert_eq!(bot.rejected_candidate.as_ref(), Some(&release));
+            assert!(bot.persisted_candidate_digest.is_none());
+            assert_eq!(bot.restart.auth_failures, 1);
+            first_retry_at = bot.restart.auth_retry_at;
+        }
+        drop(reserved);
+        let recovery = tokio::spawn(async move {
+            bot.bind_health_after_observed_exit().await.unwrap();
+            bot
+        });
+        let healthy = tokio::time::timeout(POLL, async {
+            while !launcher_health_responds(addr).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let still_blocked = !recovery.is_finished();
+        if healthy.is_ok() {
+            assert_launcher_health(addr, "discord token rejected").await;
+        }
+        drop(releases);
+        for blocker in blockers {
+            blocker.await.unwrap();
+        }
+        bot = tokio::time::timeout(POLL, recovery).await.unwrap().unwrap();
+        assert!(
+            healthy.is_ok(),
+            "health must bind before rejected-candidate persistence"
+        );
+        assert!(still_blocked, "candidate persistence must still be stalled");
+        assert_eq!(bot.rejected_candidate.as_ref(), Some(&release));
+        assert_eq!(
+            bot.control.rejected_candidate_digest("bot").await.unwrap(),
+            Some(release.digest)
+        );
+    } else {
+        drop(reserved);
+        bot.bind_health_after_observed_exit().await.unwrap();
+    }
+
+    // Inspect the boundary before allowing any control read to run.
+    assert!(bot.restart.held, "token hold must precede the control read");
+    assert_eq!(
+        bot.restart.auth_failures, 1,
+        "count each rejected child once"
+    );
+    if let Some(first_retry_at) = first_retry_at {
+        assert_eq!(bot.restart.auth_retry_at, Some(first_retry_at));
+    }
+    assert!(bot.running.is_none());
+    assert_launcher_health(addr, "discord token rejected").await;
     bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();

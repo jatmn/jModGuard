@@ -8,7 +8,7 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 16;
+pub const LAUNCHER_REVISION: u32 = 17;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;

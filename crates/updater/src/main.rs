@@ -711,7 +711,13 @@ struct Supervisor {
     /// Test-only stall immediately before the post-exit `upgrade` read.
     #[cfg(test)]
     exit_control_gate: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Test-only stall after the opening hold check and before `idle`.
+    /// Test-only handoff after a readiness error, before exit recovery.
+    #[cfg(test)]
+    readiness_error_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    /// Test-only stall after the opening hold check and before `idle` in tick/recovery.
     #[cfg(test)]
     before_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Test-only stall after `idle` and before the pre-control hold check.
@@ -762,15 +768,23 @@ impl Supervisor {
             if !reported && !rolling_back && (have_standby || matches_saved) {
                 rejected_now = child.release.clone();
             }
-            let code = status.code();
-            let elapsed = child.started.elapsed();
-            self.restart.exited(true, code, elapsed, Instant::now());
+            // A failed health bind retains this child for the next attempt.
+            // Count its rejection only when first establishing the hold.
+            if !self.restart.held {
+                let code = status.code();
+                let elapsed = child.started.elapsed();
+                self.restart.exited(true, code, elapsed, Instant::now());
+            }
             stop_child = true;
         }
         if let Some(release) = rejected_now {
             self.rejected_candidate = Some(release);
-            // Save before the child is reaped. A crash after the stop used to
-            // lose the only copy of the candidate.
+            // try_wait already reaped the child. Recover health before the
+            // marker write can stall, retaining its identity until that write.
+            self.disarm_child_health_watch().await;
+            self.idle().await?;
+            // Save before clearing the child record. A crash after the stop
+            // used to lose the only copy of the candidate.
             self.persist_rejected_candidate().await;
         }
         if stop_child {
@@ -1040,12 +1054,14 @@ impl Supervisor {
     async fn idle(&mut self) -> Result<()> {
         // Retain an exited bot's identity for readiness/rollback handling, but
         // take over its health socket without waiting for control reads.
-        // Token rejection must establish its hold reason before binding.
+        // Token rejection must establish its hold reason before binding, but
+        // its child record may remain while the rejected candidate is saved.
         if let Some(child) = self.running.as_mut()
             && (self.role == "api"
                 || child.child.try_wait()?.is_none_or(|status| {
-                    status.code()
-                        == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+                    !self.restart.held
+                        && status.code()
+                            == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
                 }))
         {
             return Ok(());
@@ -1261,13 +1277,30 @@ impl Supervisor {
 
     /// The exit may already have been reaped, so the watcher can observe
     /// `Reaped` and stop. Bind launcher health before any later control read.
-    async fn bind_health_after_observed_exit(&mut self) {
+    async fn bind_health_after_observed_exit(&mut self) -> Result<()> {
         if self.health.is_some() || self.role != "bot" {
-            return;
+            return Ok(());
         }
-        if let Err(error) = self.idle().await {
-            tracing::warn!("launcher health was not restored after the child exited: {error:#}");
+        if self.hold_rejected_token().await? {
+            return Ok(());
         }
+        #[cfg(test)]
+        if let Some(gate) = self.before_idle_gate.take() {
+            let _ = gate.await;
+        }
+        if let Some(child) = self.running.as_mut() {
+            let Some(status) = child.child.try_wait()? else {
+                // Keep watching a live child during the following control read.
+                return Ok(());
+            };
+            if status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+                self.hold_rejected_token().await?;
+                return Ok(());
+            }
+        }
+        // An ordinary exit may already have a watcher-owned listener.
+        self.disarm_child_health_watch().await;
+        self.idle().await
     }
 
     async fn start(
@@ -1847,9 +1880,17 @@ impl Supervisor {
         }
         let restoring_previous = self.rollback.is_some();
         if let Err(error) = self.report_ready().await {
+            #[cfg(test)]
+            if let Some((entered, gate)) = self.readiness_error_gate.take() {
+                let _ = entered.send(());
+                let _ = gate.await;
+            }
             // report_ready reaps before this read. Bind health first so a stall
             // here cannot leave /health down after the watcher sees Reaped.
-            self.bind_health_after_observed_exit().await;
+            self.bind_health_after_observed_exit().await?;
+            if self.restart.held {
+                return Ok(false);
+            }
             #[cfg(test)]
             if let Some(gate) = self.exit_control_gate.take() {
                 let _ = gate.await;
@@ -2620,6 +2661,8 @@ async fn main() -> Result<()> {
         health_bind,
         #[cfg(test)]
         exit_control_gate: None,
+        #[cfg(test)]
+        readiness_error_gate: None,
         #[cfg(test)]
         before_idle_gate: None,
         #[cfg(test)]
