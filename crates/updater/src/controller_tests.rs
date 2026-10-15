@@ -158,6 +158,16 @@ fn main() {{
     path
 }
 
+/// Publish an exit code by renaming a complete sibling onto the path the
+/// fixture child polls. Creating the watched name first lets that child parse
+/// an empty file.
+async fn publish_exit_code(path: impl AsRef<std::path::Path>, code: impl std::fmt::Display) {
+    let path = path.as_ref();
+    let pending = path.with_extension("tmp");
+    tokio::fs::write(&pending, code.to_string()).await.unwrap();
+    tokio::fs::rename(&pending, path).await.unwrap();
+}
+
 fn controller(
     role: &str,
     baked: PathBuf,
@@ -3055,7 +3065,7 @@ async fn exited_bot_serves_health_while_tick_database_is_stalled() {
     bot.idle().await.unwrap();
     assert!(bot.health.is_none(), "live child owns health");
     let exit = root.join("exit-code-health-child");
-    tokio::fs::write(&exit, "1").await.unwrap();
+    publish_exit_code(&exit, 1).await;
     tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
         .await
         .unwrap()
@@ -3262,8 +3272,7 @@ async fn running_bot_exit_during_stalled_tick_restores_health() {
         !launcher_health_responds(addr).await,
         "launcher must not own health before the live child exits"
     );
-    let exit = root.join("exit-code-health-live");
-    tokio::fs::write(&exit, "1").await.unwrap();
+    publish_exit_code(root.join("exit-code-health-live"), 1).await;
     let recovered = tokio::time::timeout(POLL, async {
         loop {
             if launcher_health_responds(addr).await {
@@ -3369,13 +3378,11 @@ async fn rejected_token_exit_during_stalled_tick_keeps_hold_reason() {
         !tick.is_finished(),
         "database step must stall while the child is running"
     );
-    let exit = root.join("exit-code-health-token");
-    tokio::fs::write(
-        &exit,
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    publish_exit_code(
+        root.join("exit-code-health-token"),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
+    .await;
     tokio::time::timeout(POLL, async {
         loop {
             if launcher_health_responds(addr).await {
@@ -3487,12 +3494,11 @@ async fn token_exit_before_idle_keeps_health_during_stalled_control() {
         !launcher_health_responds(addr).await,
         "launcher must not own health before the token exit"
     );
-    tokio::fs::write(
+    publish_exit_code(
         root.join(format!("exit-code-{name}")),
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
+    .await;
     tokio::time::timeout(POLL, async {
         loop {
             if child_is_zombie(pid) {
@@ -3642,7 +3648,7 @@ async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
         "launcher must not own health before the ordinary exit"
     );
     let exit = root.join(format!("exit-code-{name}"));
-    tokio::fs::write(&exit, "1").await.unwrap();
+    publish_exit_code(&exit, 1).await;
     tokio::time::timeout(POLL, async {
         loop {
             if child_is_zombie(pid) {
@@ -3765,9 +3771,7 @@ async fn ordinary_exit_during_blocked_pool_restores_health() {
         !launcher_health_responds(addr).await,
         "launcher must not own health before the live child exits"
     );
-    tokio::fs::write(root.join(format!("exit-code-{name}")), "1")
-        .await
-        .unwrap();
+    publish_exit_code(root.join(format!("exit-code-{name}")), 1).await;
     tokio::time::timeout(POLL, async {
         loop {
             if launcher_health_responds(addr).await {
@@ -3845,7 +3849,7 @@ async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
         .await
         .unwrap();
     let exit = root.join("exit-code-health-receipt");
-    tokio::fs::write(&exit, "1").await.unwrap();
+    publish_exit_code(&exit, 1).await;
     tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
         .await
         .unwrap()
@@ -4111,9 +4115,7 @@ async fn exit_during_invalid_upgrade(
         !launcher_health_responds(addr).await,
         "launcher must not own health before the live child exits"
     );
-    tokio::fs::write(root.join(format!("exit-code-{name}")), code)
-        .await
-        .unwrap();
+    publish_exit_code(root.join(format!("exit-code-{name}")), code).await;
     tokio::time::timeout(POLL, async {
         loop {
             if launcher_health_responds(addr).await {
@@ -4240,9 +4242,7 @@ async fn standby_child_is_not_restarted_when_control_fails() {
         .unwrap();
     bot.standby = Some((child, "b".repeat(40), None));
     bot.disarm_child_health_watch().await;
-    tokio::fs::write(root.join(format!("exit-code-{name}")), "1")
-        .await
-        .unwrap();
+    publish_exit_code(root.join(format!("exit-code-{name}")), 1).await;
     tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
         .await
         .unwrap()
@@ -4581,8 +4581,19 @@ fn child_liveness_observes_exit_without_reaping() {
 
 /// `bind(0)` draws from the ephemeral range. Reclaiming one of those ports
 /// races every other test that also binds an ephemeral port.
+///
+/// Ports are handed out once per process, climbing through 20_000..30_000.
+/// A port another process already holds is skipped and is not offered again,
+/// so a fixture that drops its listener cannot collide with the next caller.
 async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
-    for port in 20_000..20_128 {
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20_000);
+    const FIRST: u16 = 20_000;
+    const LAST: u16 = 30_000;
+    for _ in 0..(LAST - FIRST) {
+        let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !(FIRST..LAST).contains(&port) {
+            break;
+        }
         if let Ok(listener) =
             tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
         {
@@ -4841,15 +4852,11 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         "launcher must not listen while the child runs"
     );
     // Publish the complete code before its path releases the waiting child.
-    let exit_code = root.join("exit-code-health-bot");
-    let pending_exit = exit_code.with_extension("tmp");
-    tokio::fs::write(
-        &pending_exit,
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    publish_exit_code(
+        root.join("exit-code-health-bot"),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
-    tokio::fs::rename(pending_exit, exit_code).await.unwrap();
+    .await;
     let status = tokio::time::timeout(
         Duration::from_secs(5),
         bot.running.as_mut().unwrap().child.wait(),
@@ -5063,9 +5070,7 @@ async fn selected_exiting_bot(
     };
     let exit_file = root.join(format!("exit-code-{fixture}"));
     if !after_ready {
-        tokio::fs::write(&exit_file, code.to_string())
-            .await
-            .unwrap();
+        publish_exit_code(&exit_file, code).await;
     }
     // Record only replacement/recovery starts, after both baselines ran.
     tokio::fs::write(root.join("events"), "").await.unwrap();
@@ -5083,10 +5088,8 @@ async fn selected_exiting_bot(
             candidate.digest
         );
         wait_for_bot_ready(&mut bot).await;
-        // Rename publishes the whole code before the child can read it.
-        let pending = exit_file.with_extension("tmp");
-        tokio::fs::write(&pending, code.to_string()).await.unwrap();
-        tokio::fs::rename(pending, exit_file).await.unwrap();
+        // Publish the whole code before the child can read it.
+        publish_exit_code(&exit_file, code).await;
         bot.running.as_mut().unwrap().child.wait().await.unwrap();
         assert!(bot.running.as_ref().unwrap().ready_file.exists());
     } else if let Some(child) = bot.running.as_mut() {
@@ -5722,9 +5725,7 @@ async fn recovered_candidate_non_auth_exit_rolls_back() {
         .installed
         .unwrap();
     let mut bot = reopen_supervisor(bot).await;
-    tokio::fs::write(root.join("exit-code-desired-bot"), "7")
-        .await
-        .unwrap();
+    publish_exit_code(root.join("exit-code-desired-bot"), 7).await;
     bot.tick().await.unwrap();
     if bot.running.as_ref().is_some_and(|child| {
         child
@@ -6118,12 +6119,11 @@ async fn exiting_bot_with_alternate() -> (
     db::request_component_install(&db, "bot", &candidate.digest, now())
         .await
         .unwrap();
-    tokio::fs::write(
+    publish_exit_code(
         root.join("exit-code-desired-bot"),
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
+    .await;
     tokio::fs::write(root.join("events"), "").await.unwrap();
     bot.tick().await.unwrap();
     bot.running.as_mut().unwrap().child.wait().await.unwrap();
@@ -6181,12 +6181,11 @@ async fn rejected_marker_tracks_the_candidate_digest() {
         bot.persisted_candidate_digest.as_deref(),
         Some(candidate.digest.as_str())
     );
-    tokio::fs::write(
+    publish_exit_code(
         root.join("exit-code-other-bot"),
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
+    .await;
     let state = bot.control.component("bot").await.unwrap();
     bot.standby = Some(bot.installed_fallback(&state).await.unwrap());
     let registry = bot.registry.clone();
@@ -6346,16 +6345,11 @@ async fn baked_auth_rejection_after_ready_is_held() {
     assert!(bot.running.as_ref().unwrap().release.is_none());
     let ready_file = bot.running.as_ref().unwrap().ready_file.clone();
     assert!(ready_file.exists());
-    let pending = root.join("pending-exit");
-    tokio::fs::write(
-        &pending,
-        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
+    publish_exit_code(
+        root.join("exit-code-baked-bot"),
+        jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE,
     )
-    .await
-    .unwrap();
-    tokio::fs::rename(pending, root.join("exit-code-baked-bot"))
-        .await
-        .unwrap();
+    .await;
     bot.running.as_mut().unwrap().child.wait().await.unwrap();
     for _ in 0..3 {
         assert!(!bot.tick().await.unwrap());
