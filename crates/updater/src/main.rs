@@ -711,7 +711,13 @@ struct Supervisor {
     /// Test-only stall immediately before the post-exit `upgrade` read.
     #[cfg(test)]
     exit_control_gate: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Test-only stall after the opening hold check and before `idle`.
+    /// Test-only handoff after a readiness error, before exit recovery.
+    #[cfg(test)]
+    readiness_error_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    /// Test-only stall after the opening hold check and before `idle` in tick/recovery.
     #[cfg(test)]
     before_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Test-only stall after `idle` and before the pre-control hold check.
@@ -1278,11 +1284,19 @@ impl Supervisor {
         if self.hold_rejected_token().await? {
             return Ok(());
         }
-        if let Some(child) = self.running.as_mut()
-            && child.child.try_wait()?.is_none()
-        {
-            // Keep watching a live child during the following control read.
-            return Ok(());
+        #[cfg(test)]
+        if let Some(gate) = self.before_idle_gate.take() {
+            let _ = gate.await;
+        }
+        if let Some(child) = self.running.as_mut() {
+            let Some(status) = child.child.try_wait()? else {
+                // Keep watching a live child during the following control read.
+                return Ok(());
+            };
+            if status.code() == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
+                self.hold_rejected_token().await?;
+                return Ok(());
+            }
         }
         // An ordinary exit may already have a watcher-owned listener.
         self.disarm_child_health_watch().await;
@@ -1866,9 +1880,17 @@ impl Supervisor {
         }
         let restoring_previous = self.rollback.is_some();
         if let Err(error) = self.report_ready().await {
+            #[cfg(test)]
+            if let Some((entered, gate)) = self.readiness_error_gate.take() {
+                let _ = entered.send(());
+                let _ = gate.await;
+            }
             // report_ready reaps before this read. Bind health first so a stall
             // here cannot leave /health down after the watcher sees Reaped.
             self.bind_health_after_observed_exit().await?;
+            if self.restart.held {
+                return Ok(false);
+            }
             #[cfg(test)]
             if let Some(gate) = self.exit_control_gate.take() {
                 let _ = gate.await;
@@ -2639,6 +2661,8 @@ async fn main() -> Result<()> {
         health_bind,
         #[cfg(test)]
         exit_control_gate: None,
+        #[cfg(test)]
+        readiness_error_gate: None,
         #[cfg(test)]
         before_idle_gate: None,
         #[cfg(test)]
