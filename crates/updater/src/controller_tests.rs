@@ -4150,6 +4150,15 @@ async fn control_error_after_exit_during_stall_still_restarts() {
     let error = bot.tick().await.unwrap_err();
     assert!(error.to_string().contains("expected value"), "{error:#}");
     assert!(bot.running.as_ref().unwrap().child.id().is_some());
+    // Spawn returns before the child writes its start line. Wait for that
+    // event instead of assuming the process has been scheduled.
+    tokio::time::timeout(POLL, async {
+        while child_start_count(&root, name) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted child never published its start");
     assert_eq!(child_start_count(&root, name), 2);
     let bound = root.join(format!("health-bound-{name}"));
     tokio::time::timeout(POLL, async {
