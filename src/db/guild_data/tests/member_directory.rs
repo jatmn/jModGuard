@@ -5810,12 +5810,11 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (f, local, scope) = ready().await;
     complete_for_checks(&local, &scope).await;
-    // 25 ms per request leaves ample margin under the five-second transaction
-    // lifetime for the full current mark path, including capacity/receipt work.
-    // The larger-latency case (~350 ms per request) is tracked separately in #286.
+    // ~350 ms per request is the reported remote latency. The whole write
+    // transaction, including COMMIT, has to finish inside the 5 s lifetime.
     let (fixture, db) = HranaFixture::delayed_database(
         &f.store_path,
-        Duration::from_millis(25),
+        Duration::from_millis(350),
         Duration::from_secs(5),
     )
     .await;
@@ -5872,6 +5871,205 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
             Some(4_000)
         )
     );
+}
+
+#[tokio::test]
+async fn coverage_gap_receipt_admission_fails_before_begin() {
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let (_f, store, scope) = ready_with_probe(&probe).await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta(key,value) VALUES('restore_fence','1');",
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let immediate = probe.immediate();
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("restore is in progress"),
+        "{error:#}"
+    );
+    assert_eq!(
+        probe.immediate(),
+        immediate,
+        "restore admission must fail before BEGIN IMMEDIATE"
+    );
+    let status = store.member_sync_status(scope, 42, 3_001).await.unwrap();
+    assert!(!status.reconciliation_needed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    local
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta(key,value) VALUES('restore_fence','0');",
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (_fixture, db) =
+        HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5)).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+    remote
+        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .await
+        .unwrap();
+    let local_for_hook = local.clone();
+    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(Some(Box::new(
+        move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.block_on(async {
+                    local_for_hook
+                        .db
+                        .with_conn(|conn| {
+                            let mut tx = conn.transaction_primary_read()?;
+                            tx.ensure_mutation_receipt()?;
+                            tx.execute_bounded(
+                                "UPDATE meta SET value='1' WHERE key='restore_fence'",
+                                (),
+                                4096,
+                            )?;
+                            tx.commit()?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                });
+            }
+        },
+    )));
+    let error = remote
+        .mark_member_reconciliation_needed(scope.clone(), "second_gap", 4_000)
+        .await
+        .unwrap_err();
+    super::super::member_directory::test_set_coverage_gap_after_receipt_admission(None);
+    assert!(
+        error.to_string().contains("restore is in progress"),
+        "{error:#}"
+    );
+    let status = local.member_sync_status(scope, 42, 4_001).await.unwrap();
+    assert_eq!(status.reconciliation_reason.as_deref(), Some("first_gap"));
+    assert!(status.reconciliation_needed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::{Duration, Instant};
+
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let (fixture, db) =
+        HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5)).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+    fixture.fail_next_meta_probe();
+    let begins = fixture.immediate_begins();
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        remote.mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000),
+    )
+    .await
+    .expect("a 429 must return instead of backing off inside the mark")
+    .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("429"),
+        "rate limit must surface to the caller: {rendered}"
+    );
+    assert_eq!(
+        fixture.immediate_begins(),
+        begins,
+        "receipt admission must fail before BEGIN IMMEDIATE"
+    );
+    let status = local
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(!status.reconciliation_needed);
+    remote
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap();
+    let status = local.member_sync_status(scope, 42, 3_002).await.unwrap();
+    assert!(status.reconciliation_needed);
+    assert_eq!(status.reconciliation_reason.as_deref(), Some("gateway_gap"));
+}
+
+#[tokio::test]
+async fn coverage_gap_mark_rolls_back_mid_batch_and_retries() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER coverage_gap_fail BEFORE INSERT ON guild_member_audit_recovery BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END",
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected mark failure"),
+        "{error:#}"
+    );
+    let status = store
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(!status.reconciliation_needed);
+    store
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded("DROP TRIGGER coverage_gap_fail", 64 * 1024 * 1024)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap();
+    let status = store.member_sync_status(scope, 42, 3_002).await.unwrap();
+    assert!(status.reconciliation_needed);
+    assert_eq!(status.reconciliation_reason.as_deref(), Some("gateway_gap"));
+    assert_eq!(status.audit_recovery_status.as_deref(), Some("queued"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6076,8 +6274,8 @@ async fn coverage_gap_mark_batches_writes_for_remote_transport() {
         "coverage-gap mark must observe remote facade calls"
     );
     assert_eq!(
-        used, 14,
-        "coverage-gap mark remote round-trips (scope, revision snapshot, write tx, receipt, seed update, batch, commit)"
+        used, 13,
+        "coverage-gap mark facade calls (scope, revision snapshot, meta probe, write tx, bounded batch, commit)"
     );
     let status = store
         .member_sync_status(scope.clone(), 42, 122_001)

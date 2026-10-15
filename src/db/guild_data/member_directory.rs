@@ -20,6 +20,10 @@ static COVERAGE_GAP_AFTER_REVISION_SNAPSHOT: Mutex<Option<Box<dyn Fn() + Send + 
     Mutex::new(None);
 
 #[cfg(test)]
+static COVERAGE_GAP_AFTER_RECEIPT_ADMISSION: Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
 static COVERAGE_GAP_HOOK_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
@@ -37,6 +41,13 @@ pub(crate) fn test_set_coverage_gap_after_revision_snapshot(
     hook: Option<Box<dyn Fn() + Send + Sync>>,
 ) {
     *COVERAGE_GAP_AFTER_REVISION_SNAPSHOT.lock().unwrap() = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_coverage_gap_after_receipt_admission(
+    hook: Option<Box<dyn Fn() + Send + Sync>>,
+) {
+    *COVERAGE_GAP_AFTER_RECEIPT_ADMISSION.lock().unwrap() = hook;
 }
 
 #[cfg(test)]
@@ -60,8 +71,22 @@ fn run_coverage_gap_after_revision_snapshot_hook() {
 #[cfg(not(test))]
 fn run_coverage_gap_after_scope_verify_hook() {}
 
+#[cfg(test)]
+fn run_coverage_gap_after_receipt_admission_hook() {
+    if let Some(hook) = COVERAGE_GAP_AFTER_RECEIPT_ADMISSION
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
+        hook();
+    }
+}
+
 #[cfg(not(test))]
 fn run_coverage_gap_after_revision_snapshot_hook() {}
+
+#[cfg(not(test))]
+fn run_coverage_gap_after_receipt_admission_hook() {}
 
 /// Guild whose member-sync statements are being counted. Unset until a test asks.
 static MEMBER_SYNC_WATCHED_GUILD: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -534,6 +559,54 @@ fn sql_literal(value: &str) -> String {
 }
 
 const COVERAGE_GAP_MARK_GROWTH: u64 = 32 * 1024 * 1024;
+
+// RAISE() is illegal outside a trigger, and remote libSQL rejects temporary
+// objects. A failing json_set path aborts this statement only, and CASE does
+// not evaluate it when the row count matches.
+const COVERAGE_GAP_RESTORE_CHECK_SQL: &str =
+    "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{}', 'restore is in progress', 1) END;";
+const COVERAGE_GAP_MARK_CHECK_SQL: &str = "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{}', 'coverage-gap mark did not update exactly one row', 1) END;";
+
+fn coverage_gap_meta_table(conn: &impl SqlExecutor) -> Result<bool> {
+    let present: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+        (),
+        |row| Ok(row.get(0)?),
+    )?;
+    Ok(present == 1)
+}
+
+fn coverage_gap_refuse_restore(conn: &impl SqlExecutor) -> Result<()> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='restore_fence'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+        .optional()?;
+    if value.as_deref() == Some("1") {
+        anyhow::bail!("restore is in progress");
+    }
+    Ok(())
+}
+
+fn coverage_gap_batch_error(error: anyhow::Error) -> anyhow::Error {
+    let restore = error
+        .chain()
+        .any(|cause| cause.to_string().contains("restore is in progress"));
+    if restore {
+        return anyhow::anyhow!("restore is in progress");
+    }
+    let unmatched = error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("coverage-gap mark did not update exactly one row")
+    });
+    if unmatched {
+        return TenantDataError::Membership.into();
+    }
+    error
+}
 
 fn ensure_seed_bot(
     conn: &impl SqlExecutor,
@@ -1070,32 +1143,40 @@ impl GuildDataStore {
                 revision
             };
             run_coverage_gap_after_revision_snapshot_hook();
+            // Receipt admission is an autocommit read. A restore fence or a
+            // transport error fails here, before BEGIN IMMEDIATE.
+            let meta_present = coverage_gap_meta_table(conn)?;
+            if meta_present {
+                coverage_gap_refuse_restore(conn)?;
+            }
+            run_coverage_gap_after_receipt_admission_hook();
             let mut tx = conn.transaction_primary_read()?;
-            tx.ensure_mutation_receipt()?;
+            let (receipt_sql, receipt_prune) = tx
+                .stage_mutation_receipt(meta_present)?
+                .unwrap_or_default();
+            let restore_check = if receipt_sql.is_empty() {
+                String::new()
+            } else {
+                COVERAGE_GAP_RESTORE_CHECK_SQL.to_string()
+            };
             let guild_id = scope.guild_id();
             let enrollment = sql_literal(scope.enrollment.id.as_str());
             let reason_sql = sql_literal(&reason);
             let run_id = sql_literal(&random_id());
+            let joined_at_ns = scope.enrollment.joined_at_ns;
             let expected_revision = revision_before + 1;
-            let marked = tx.member_execute(
-                "UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason=?3,gap_at_ms=MAX(coalesce(gap_at_ms,0),?4),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND directory_revision=?5 AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id=?1 AND m.enrollment_id=?2 AND m.active=1 AND m.joined_at_ns=?6)",
-                params![
-                    scope.guild_id(),
-                    scope.enrollment.id.as_str(),
-                    reason.as_str(),
-                    now_ms,
-                    revision_before,
-                    scope.enrollment.joined_at_ns,
-                ],
-            )?;
-            if marked != 1 {
-                return Err(TenantDataError::Membership.into());
-            }
+            // Receipt admission, the one-row mark check, and audit recovery
+            // share one batch. The 32 MiB batch bound covers the seed row that
+            // the removed COUNT used to budget on its own.
             let batch = format!(
-                "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
+                "{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
+{COVERAGE_GAP_MARK_CHECK_SQL}
+INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
 UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql});"
             );
-            tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH)?;
+            if let Err(error) = tx.execute_batch_bounded(&batch, COVERAGE_GAP_MARK_GROWTH) {
+                return Err(coverage_gap_batch_error(error));
+            }
             tx.commit()
         })
         .await

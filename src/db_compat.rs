@@ -2236,6 +2236,60 @@ impl Transaction {
             (Err(error), _) => Err(error),
         }
     }
+
+    /// Admit this transaction's mutation receipt without a separate remote round trip.
+    ///
+    /// Local connections keep the existing restore-fence read. Remote connections
+    /// reserve receipt growth and return SQL the caller must run in this same
+    /// transaction before any other mutation. The first string is the receipt
+    /// insert. The second is receipt upkeep, which must run after the caller
+    /// has checked `changes()` so a zero-row insert still means the restore
+    /// fence refused the write. `meta_table_present` selects the fenced insert;
+    /// a missing `meta` table uses the unfenced insert. A rollback undoes both.
+    pub(crate) fn stage_mutation_receipt(
+        &mut self,
+        meta_table_present: bool,
+    ) -> Result<Option<(String, String)>> {
+        if !self.runtime.is_remote() {
+            self.ensure_mutation_receipt()?;
+            return Ok(None);
+        }
+        if self.mutation_receipt.is_some() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.allows_write,
+            "read snapshot cannot take the write lock"
+        );
+        self.reserve_growth_limit(RECEIPT_GROWTH_ALLOWANCE, self.capacity_limits.growth)?;
+        let receipt = format!(
+            "{:032x}{:032x}",
+            rand::random::<u128>(),
+            rand::random::<u128>()
+        );
+        let quoted = format!("'{}'", receipt.replace('\'', "''"));
+        let admit = if meta_table_present {
+            format!(
+                "INSERT INTO mutation_receipts (receipt_id, created_at) SELECT {quoted}, unixepoch() WHERE COALESCE((SELECT value FROM meta WHERE key='restore_fence'), '0') != '1';"
+            )
+        } else {
+            format!(
+                "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES ({quoted}, unixepoch());"
+            )
+        };
+        let prune = if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
+            "DELETE FROM mutation_receipts WHERE receipt_id IN (
+                     SELECT receipt_id FROM mutation_receipts
+                     WHERE created_at < unixepoch() - 600
+                     ORDER BY created_at LIMIT 1000
+                 );"
+        } else {
+            ""
+        };
+        self.mutation_receipt = Some(receipt);
+        self.write_prepared.store(true, Ordering::Release);
+        Ok(Some((admit, prune.to_string())))
+    }
 }
 
 #[cfg(debug_assertions)]
