@@ -769,8 +769,16 @@ impl Supervisor {
         }
         if let Some(release) = rejected_now {
             self.rejected_candidate = Some(release);
-            // Save before the child is reaped. A crash after the stop used to
-            // lose the only copy of the candidate.
+            // try_wait already reaped the child. Recover health before the
+            // marker write can stall, retaining its identity until that write.
+            self.disarm_child_health_watch().await;
+            if let Err(error) = self.idle().await {
+                tracing::warn!(
+                    "launcher health was not restored before the token marker: {error:#}"
+                );
+            }
+            // Save before clearing the child record. A crash after the stop
+            // used to lose the only copy of the candidate.
             self.persist_rejected_candidate().await;
         }
         if stop_child {
@@ -1040,12 +1048,14 @@ impl Supervisor {
     async fn idle(&mut self) -> Result<()> {
         // Retain an exited bot's identity for readiness/rollback handling, but
         // take over its health socket without waiting for control reads.
-        // Token rejection must establish its hold reason before binding.
+        // Token rejection must establish its hold reason before binding, but
+        // its child record may remain while the rejected candidate is saved.
         if let Some(child) = self.running.as_mut()
             && (self.role == "api"
                 || child.child.try_wait()?.is_none_or(|status| {
-                    status.code()
-                        == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
+                    !self.restart.held
+                        && status.code()
+                            == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
                 }))
         {
             return Ok(());

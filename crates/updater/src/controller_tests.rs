@@ -4484,6 +4484,15 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
 
 #[tokio::test]
 async fn readiness_error_then_token_exit_binds_health_before_control_read() {
+    readiness_error_then_token_exit(false).await;
+}
+
+#[tokio::test]
+async fn readiness_error_then_token_exit_binds_health_before_candidate_write() {
+    readiness_error_then_token_exit(true).await;
+}
+
+async fn readiness_error_then_token_exit(block_candidate_write: bool) {
     let root = std::env::temp_dir().join(format!("ready-token-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let db = Db::open(&root.join("core.db"), 2).unwrap();
@@ -4532,7 +4541,41 @@ async fn readiness_error_then_token_exit_binds_health_before_control_read() {
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
     bot.health_bind = Some(addr.to_string());
-    bot.bind_health_after_observed_exit().await;
+    if block_candidate_write {
+        bot.standby = Some((child, bot.base_sha.clone(), None));
+        let (releases, blockers) = block_sqlite_pool(&db).await;
+        let recovery = tokio::spawn(async move {
+            bot.bind_health_after_observed_exit().await;
+            bot
+        });
+        let healthy = tokio::time::timeout(POLL, async {
+            while !launcher_health_responds(addr).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let still_blocked = !recovery.is_finished();
+        if healthy.is_ok() {
+            assert_launcher_health(addr, "discord token rejected").await;
+        }
+        drop(releases);
+        for blocker in blockers {
+            blocker.await.unwrap();
+        }
+        bot = tokio::time::timeout(POLL, recovery).await.unwrap().unwrap();
+        assert!(
+            healthy.is_ok(),
+            "health must bind before rejected-candidate persistence"
+        );
+        assert!(still_blocked, "candidate persistence must still be stalled");
+        assert_eq!(bot.rejected_candidate.as_ref(), Some(&release));
+        assert_eq!(
+            bot.control.rejected_candidate_digest("bot").await.unwrap(),
+            Some(release.digest)
+        );
+    } else {
+        bot.bind_health_after_observed_exit().await;
+    }
 
     // Inspect the boundary before allowing any control read to run.
     assert!(bot.restart.held, "token hold must precede the control read");
