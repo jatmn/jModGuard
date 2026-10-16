@@ -7,7 +7,10 @@ jModGuard runs as **two processes** that share one database:
 | `jmodguard-bot` | Discord gateway, automod, commands, migrations (`migrate=true`) |
 | `jmodguard-api` | OAuth WebUI + JSON API (`migrate=false`; requires feature `web`) |
 
-Steady state, the API is read-only and sends mutations to the bot over the private control link. The bot writes application data only while it holds the writer lease.
+Steady state, the API is read-only and sends mutations to the bot over the private control link. The bot admits application writes under the writer lease. Guild commits use
+[per-store epoch fencing](GUILD-STORES.md#writer-handover): an already-admitted
+transaction may finish before its store hands over, even if the core lease changes
+after the final probe.
 
 ```
 jmodguard-api  ──control link──►  jmodguard-bot  ──writes──►  SQLite / libSQL

@@ -809,6 +809,86 @@ async fn guild_commit_does_not_land_when_the_lease_moves_before_the_final_reread
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_epoch_handover_waits_for_in_flight_commit() {
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let placement = f.placement(&reg, 21).await;
+    let replacement_core = Db::open(&f.catalog_path, 2).unwrap();
+    let replacement = GuildDataStore::open(f.options(), reg)
+        .unwrap()
+        .with_core_write_fence(replacement_core.clone());
+    let owner = "ab".repeat(16);
+    let refuse = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(&f.catalog, &owner, crate::control::now_ms(), refuse())
+            .await
+            .unwrap()
+    );
+    raise_held(&store, &f.catalog).await;
+
+    // Pause after the final core read, while the guild transaction holds its
+    // writer lock. A core takeover is allowed; an epoch raise must serialize.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    f.catalog.arm_during_leased_guild_commit(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let write_store = store.clone();
+    let write_placement = placement.clone();
+    let writer =
+        tokio::spawn(async move { write_store.bind_initial_placement(write_placement).await });
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    crate::db::release_active_bot(&f.catalog, &owner)
+        .await
+        .unwrap();
+    assert!(
+        claim_active_bot(
+            &replacement_core,
+            &"cd".repeat(16),
+            crate::control::now_ms(),
+            refuse()
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(replacement_core.leased_generation(), Some(2));
+
+    // Force an actual lock attempt to return instead of relying on scheduling
+    // or a sleep to infer that the replacement reached BEGIN IMMEDIATE.
+    for conn in replacement.db.connections.idle.lock().unwrap().iter() {
+        conn.execute_batch("PRAGMA busy_timeout=0").unwrap();
+    }
+    let blocked = replacement.raise_writer_epoch(2).await;
+    let epoch_before_commit = epoch_generation(&replacement).await;
+    release_tx.send(()).unwrap();
+    writer
+        .await
+        .unwrap()
+        .expect("the admitted old transaction may finish before the epoch raise");
+    let error = blocked.expect_err("epoch raise must contend with the old transaction");
+    assert!(
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<libsql::Error>(),
+            Some(libsql::Error::SqliteFailure(code, _)) if code & 0xff == 5
+        )),
+        "{error:#}"
+    );
+    assert_eq!(epoch_before_commit, 1);
+    replacement.raise_writer_epoch(2).await.unwrap();
+    assert_eq!(epoch_generation(&replacement).await, 2);
+    replacement.verify_placement(placement).await.unwrap();
+}
+
 #[tokio::test]
 async fn slow_guild_commit_still_lets_the_same_owner_renew() {
     let f = Fixture::new();
@@ -1024,6 +1104,15 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
 
 #[tokio::test]
 async fn replacement_epoch_rejects_a_stale_guild_commit() {
+    assert_replacement_epoch_fences_writes(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_epoch_rejects_a_stale_guild_commit_over_http() {
+    assert_replacement_epoch_fences_writes(true).await;
+}
+
+async fn assert_replacement_epoch_fences_writes(http: bool) {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let placement = f.placement(&reg, 31).await;
@@ -1032,6 +1121,25 @@ async fn replacement_epoch_rejects_a_stale_guild_commit() {
     let old_store = GuildDataStore::initialize(f.options(), reg.clone())
         .unwrap()
         .with_core_write_fence(old_core.clone());
+    let (_fixture, old_store) = if http {
+        let (fixture, db) = crate::db::tests::remote_stream::HranaFixture::delayed_database(
+            &f.store_path,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        (
+            Some(fixture),
+            GuildDataStore {
+                db,
+                expected: reg.clone(),
+                core: None,
+            }
+            .with_core_write_fence(old_core.clone()),
+        )
+    } else {
+        (None, old_store)
+    };
     let new_store = GuildDataStore::open(f.options(), reg.clone())
         .unwrap()
         .with_core_write_fence(new_core.clone());
@@ -1050,6 +1158,20 @@ async fn replacement_epoch_rejects_a_stale_guild_commit() {
             .await
             .unwrap()
     );
+    // A successful core claim is insufficient while this store is deferred.
+    let error = new_store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert!(matches!(
+        new_store
+            .verify_placement(placement.clone())
+            .await
+            .unwrap_err()
+            .downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Unbound)
+    ));
     raise_held(&new_store, &new_core).await;
     assert_eq!(epoch_generation(&new_store).await, 2);
     // BEGIN IMMEDIATE already holds the guild writer lock when the core

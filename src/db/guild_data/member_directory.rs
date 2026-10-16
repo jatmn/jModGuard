@@ -1253,8 +1253,10 @@ impl GuildDataStore {
             }
             run_coverage_gap_after_receipt_admission_hook(&hook_database);
             // Pre-BEGIN lease and epoch reads fail fast. They do not authorize
-            // the commit. The batch compares the captured epoch. Commit requires
-            // the admitted owner and does not repeat the epoch query.
+            // the commit. The batch compares the captured epoch under the guild
+            // writer lock, which prevents an epoch raise until this transaction ends.
+            // The final core probe requires the admitted owner; commit does not repeat
+            // the epoch query or promise instantaneous cross-database revocation.
             let (writer_generation, admitted_owner) =
                 coverage_gap_writer_prelude(core.as_ref(), conn)?;
             run_coverage_gap_after_writer_fence_hook(&hook_database);

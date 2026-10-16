@@ -5924,6 +5924,15 @@ fn armed_coverage_gap_store(local: &GuildDataStore, catalog: &Db) -> GuildDataSt
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit() {
+    assert_coverage_gap_epoch_race(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit_over_http() {
+    assert_coverage_gap_epoch_race(true).await;
+}
+
+async fn assert_coverage_gap_epoch_race(http: bool) {
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (f, local, scope) = ready().await;
     complete_for_checks(&local, &scope).await;
@@ -5942,7 +5951,25 @@ async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit() {
         .raise_writer_epoch(f.catalog.leased_generation().unwrap())
         .await
         .unwrap();
-    let remote = armed_coverage_gap_store(&local, &f.catalog);
+    let (_fixture, store) = if http {
+        let (fixture, db) = crate::db::tests::remote_stream::HranaFixture::delayed_database(
+            &f.store_path,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        (
+            Some(fixture),
+            GuildDataStore {
+                db,
+                expected: local.expected.clone(),
+                core: None,
+            },
+        )
+    } else {
+        (None, local.clone())
+    };
+    let remote = armed_coverage_gap_store(&store, &f.catalog);
     let before = coverage_gap_persisted_mark(&local).await;
     let path = f.store_path.clone();
     super::super::member_directory::test_set_coverage_gap_after_writer_fence(
@@ -5967,6 +5994,64 @@ async fn coverage_gap_mark_rolls_back_when_the_epoch_changes_before_commit() {
     assert!(super::lease_rejected(&error), "{error:#}");
     assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     assert!(!before.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_mark_requires_the_replacement_epoch_over_http() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
+    let (f, local, scope) = ready().await;
+    complete_for_checks(&local, &scope).await;
+    let (fixture, db) = crate::db::tests::remote_stream::HranaFixture::delayed_database(
+        &f.store_path,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    }
+    .with_core_write_fence(f.catalog.clone());
+    // First no epoch exists; then the old epoch remains until propagation.
+    for (index, owner) in ["ab".repeat(16), "cd".repeat(16)].into_iter().enumerate() {
+        assert!(
+            claim_active_bot(
+                &f.catalog,
+                &owner,
+                crate::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+            )
+            .await
+            .unwrap()
+        );
+        let before = coverage_gap_persisted_mark(&local).await;
+        let now = 3_000 + index as i64;
+        let error = remote
+            .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", now)
+            .await
+            .unwrap_err();
+        assert!(super::lease_rejected(&error), "{error:#}");
+        assert_eq!(coverage_gap_persisted_mark(&local).await, before);
+        let generation = f.catalog.leased_generation().unwrap();
+        assert_eq!(generation, index as i64 + 1);
+        remote.raise_writer_epoch(generation).await.unwrap();
+        remote
+            .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", now)
+            .await
+            .unwrap();
+        let after = coverage_gap_persisted_mark(&local).await;
+        assert!(after.0);
+        assert_eq!(
+            after.2,
+            before.2 + 1,
+            "one durable mark per accepted generation"
+        );
+        crate::db::release_active_bot(&f.catalog, &owner)
+            .await
+            .unwrap();
+    }
+    fixture.assert_committed_within_lifetime(4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

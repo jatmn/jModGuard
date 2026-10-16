@@ -2188,8 +2188,9 @@ impl Transaction {
         self.commit_after_lease_probe()
     }
 
-    /// Capacity check and `COMMIT`. A guild lease probe calls this after the
-    /// short core lease re-read has released the core writer lock.
+    /// Capacity check and `COMMIT`. A guild lease probe has already released
+    /// its core snapshot. The guild writer lock keeps the checked epoch unchanged
+    /// through COMMIT; a later core lease change does not revoke this transaction.
     fn commit_after_lease_probe(&mut self) -> Result<()> {
         if let Some(generation) = self.expected_writer_generation {
             self.reject_unless_writer_epoch(generation)?;
