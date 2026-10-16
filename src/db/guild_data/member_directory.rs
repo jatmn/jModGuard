@@ -1276,11 +1276,12 @@ impl GuildDataStore {
             };
             // The write lock now freezes schema changes. If admission saw no
             // meta table, refuse a newly created one rather than inserting an
-            // unfenced receipt. A retry will read its restore fence normally.
+            // unfenced receipt. Match SQLite's case-insensitive identifiers.
+            // A retry will read its restore fence normally.
             let meta_check = if meta_present {
                 String::new()
             } else {
-                format!("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta') THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_RESTORE_ERROR}', 1) END;")
+                format!("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta' COLLATE NOCASE) THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_RESTORE_ERROR}', 1) END;")
             };
             // RAISE() needs a trigger; remote libSQL forbids temporary objects.
             // The invalid JSON path aborts the batch only on a failed check.

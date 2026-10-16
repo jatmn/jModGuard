@@ -6311,7 +6311,10 @@ async fn coverage_gap_receipt_admission_fails_before_begin() {
     assert!(!status.reconciliation_needed);
 }
 
-async fn assert_restore_fence_after_admission_rolls_back(meta_present: bool) {
+async fn assert_restore_fence_after_admission_rolls_back(
+    meta_present: bool,
+    meta_name: &'static str,
+) {
     use crate::db::tests::remote_stream::HranaFixture;
     use std::time::Duration;
 
@@ -6356,7 +6359,7 @@ async fn assert_restore_fence_after_admission_rolls_back(meta_present: bool) {
                             tx.ensure_mutation_receipt()?;
                             if !meta_present {
                                 tx.execute_batch_bounded(
-                                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta(key,value) VALUES('restore_fence','0');",
+                                    &format!("CREATE TABLE {meta_name}(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta(key,value) VALUES('restore_fence','0');"),
                                     64 * 1024 * 1024,
                                 )?;
                             }
@@ -6394,12 +6397,14 @@ async fn assert_restore_fence_after_admission_rolls_back(meta_present: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
-    assert_restore_fence_after_admission_rolls_back(true).await;
+    assert_restore_fence_after_admission_rolls_back(true, "meta").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coverage_gap_meta_created_after_admission_rolls_back_the_mark() {
-    assert_restore_fence_after_admission_rolls_back(false).await;
+    for meta_name in ["meta", "META", "mEtA"] {
+        assert_restore_fence_after_admission_rolls_back(false, meta_name).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
