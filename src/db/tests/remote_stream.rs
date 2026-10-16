@@ -651,8 +651,7 @@ fn meta_probe_is_rate_limited(state: &Mutex<HranaState>, input: &Json) -> bool {
         return false;
     }
     let blob = input.to_string().to_ascii_lowercase();
-    let probes_meta = blob.contains("sqlite_master")
-        && (blob.contains("name='meta'") || blob.contains("name = 'meta'"));
+    let probes_meta = blob.contains("select value from meta where key='restore_fence'");
     if !probes_meta {
         return false;
     }

@@ -682,11 +682,21 @@ impl GuildDataStore {
             return commit();
         };
         Self::read_core_lease(core, &expected)?;
+        Self::commit_with_core_writer_lease(core, &expected, commit)
+    }
+
+    /// Final snapshot shared with coverage-gap marks, which capture their owner
+    /// before BEGIN and can afford only this one commit-time lease read.
+    fn commit_with_core_writer_lease(
+        core: &Db,
+        expected: &str,
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         #[cfg(test)]
         if let Some(hook) = core.take_before_final_lease_reread() {
             hook();
         }
-        Self::read_core_lease(core, &expected)?;
+        Self::read_core_lease(core, expected)?;
         // The guild transaction retains its writer lock and checks its epoch
         // before COMMIT. An empty core snapshot adds no fencing; release core
         // so slow guild commits cannot occupy its pool or a provider stream.

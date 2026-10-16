@@ -609,56 +609,50 @@ fn sql_literal(value: &str) -> String {
 
 const COVERAGE_GAP_MARK_GROWTH: u64 = 32 * 1024 * 1024;
 
-// RAISE() is illegal outside a trigger, and remote libSQL rejects temporary
-// objects. A failing json_set path aborts this statement only, and CASE does
-// not evaluate it when the row count matches.
-const COVERAGE_GAP_RESTORE_CHECK_SQL: &str =
-    "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{}', 'restore is in progress', 1) END;";
-const COVERAGE_GAP_MARK_CHECK_SQL: &str = "SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{}', 'coverage-gap mark did not update exactly one row', 1) END;";
+// Stable batch error markers are shared by SQL generation and classification;
+// provider error wrappers and user-facing error wording are not the contract.
+const COVERAGE_GAP_RESTORE_ERROR: &str = "jmodguard_coverage_gap_restore";
+const COVERAGE_GAP_MEMBERSHIP_ERROR: &str = "jmodguard_coverage_gap_membership";
+const COVERAGE_GAP_LEASE_ERROR: &str = "jmodguard_coverage_gap_lease";
 
-fn coverage_gap_meta_table(conn: &impl SqlExecutor) -> Result<bool> {
-    let present: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
-        (),
-        |row| Ok(row.get(0)?),
-    )?;
-    Ok(present == 1)
-}
-
-fn coverage_gap_refuse_restore(conn: &impl SqlExecutor) -> Result<()> {
-    let value: Option<String> = conn
+fn coverage_gap_receipt_admission(conn: &impl SqlExecutor) -> Result<bool> {
+    // A single autocommit query covers both table presence and the fence. A
+    // missing table is expected on guild stores; other errors fail admission.
+    match conn
         .query_row(
             "SELECT value FROM meta WHERE key='restore_fence'",
             (),
-            |row| Ok(row.get(0)?),
+            |row| Ok(row.get::<String>(0)?),
         )
-        .optional()?;
-    if value.as_deref() == Some("1") {
-        anyhow::bail!("restore is in progress");
+        .optional()
+    {
+        Ok(value) => {
+            anyhow::ensure!(value.as_deref() != Some("1"), "restore is in progress");
+            Ok(true)
+        }
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.to_string().contains("no such table: meta")) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 fn coverage_gap_batch_error(error: anyhow::Error) -> anyhow::Error {
-    let restore = error
-        .chain()
-        .any(|cause| cause.to_string().contains("restore is in progress"));
-    if restore {
-        return anyhow::anyhow!("restore is in progress");
-    }
-    let unmatched = error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("coverage-gap mark did not update exactly one row")
-    });
-    if unmatched {
-        return TenantDataError::Membership.into();
-    }
-    let lease = error
-        .chain()
-        .any(|cause| cause.to_string().contains("active bot lease is not held"));
-    if lease {
-        return crate::db_compat::ActiveBotLeaseRejected.into();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if message.contains(COVERAGE_GAP_RESTORE_ERROR) {
+            return anyhow::anyhow!("restore is in progress");
+        }
+        if message.contains(COVERAGE_GAP_MEMBERSHIP_ERROR) {
+            return TenantDataError::Membership.into();
+        }
+        if message.contains(COVERAGE_GAP_LEASE_ERROR) {
+            return crate::db_compat::ActiveBotLeaseRejected.into();
+        }
     }
     error
 }
@@ -702,9 +696,8 @@ fn coverage_gap_writer_fence_sql(generation: Option<i64>) -> String {
     let Some(generation) = generation else {
         return String::new();
     };
-    let message = crate::db_compat::ActiveBotLeaseRejected.to_string();
     format!(
-        "SELECT CASE WHEN (SELECT generation FROM guild_writer_epoch WHERE singleton=1)={generation} THEN 1 ELSE json_set('{{}}', '{message}', 1) END;"
+        "SELECT CASE WHEN (SELECT generation FROM guild_writer_epoch WHERE singleton=1)={generation} THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_LEASE_ERROR}', 1) END;"
     )
 }
 
@@ -1247,10 +1240,7 @@ impl GuildDataStore {
             run_coverage_gap_after_revision_snapshot_hook(&hook_database);
             // Receipt admission is an autocommit read. A restore fence or a
             // transport error fails here, before BEGIN IMMEDIATE.
-            let meta_present = coverage_gap_meta_table(conn)?;
-            if meta_present {
-                coverage_gap_refuse_restore(conn)?;
-            }
+            let meta_present = coverage_gap_receipt_admission(conn)?;
             run_coverage_gap_after_receipt_admission_hook(&hook_database);
             // Pre-BEGIN lease and epoch reads fail fast. They do not authorize
             // the commit. The batch compares the captured epoch under the guild
@@ -1271,18 +1261,9 @@ impl GuildDataStore {
                     return Err(crate::db_compat::ActiveBotLeaseRejected.into());
                 };
                 tx.set_commit_lease_probe(Some(std::sync::Arc::new(move |commit| {
-                    #[cfg(test)]
-                    if let Some(hook) = core.take_before_final_lease_reread() {
-                        hook();
-                    }
-                    // The owner is the one admitted before BEGIN, not whoever
-                    // holds the in-memory slot when this probe runs.
-                    Self::read_core_lease(&core, &owner)?;
-                    #[cfg(test)]
-                    if let Some(hook) = core.take_during_leased_guild_commit() {
-                        hook();
-                    }
-                    commit()
+                    // Check the owner admitted before BEGIN, even if the
+                    // in-memory slot has since been replaced or cleared.
+                    Self::commit_with_core_writer_lease(&core, &owner, commit)
                 })));
             }
             let (receipt_sql, receipt_prune) = tx
@@ -1291,8 +1272,19 @@ impl GuildDataStore {
             let restore_check = if receipt_sql.is_empty() {
                 String::new()
             } else {
-                COVERAGE_GAP_RESTORE_CHECK_SQL.to_string()
+                format!("SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_RESTORE_ERROR}', 1) END;")
             };
+            // The write lock now freezes schema changes. If admission saw no
+            // meta table, refuse a newly created one rather than inserting an
+            // unfenced receipt. A retry will read its restore fence normally.
+            let meta_check = if meta_present {
+                String::new()
+            } else {
+                format!("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta') THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_RESTORE_ERROR}', 1) END;")
+            };
+            // RAISE() needs a trigger; remote libSQL forbids temporary objects.
+            // The invalid JSON path aborts the batch only on a failed check.
+            let mark_check = format!("SELECT CASE WHEN changes()=1 THEN 1 ELSE json_set('{{}}', '{COVERAGE_GAP_MEMBERSHIP_ERROR}', 1) END;");
             let guild_id = scope.guild_id();
             let enrollment = sql_literal(scope.enrollment.id.as_str());
             let reason_sql = sql_literal(&reason);
@@ -1304,8 +1296,8 @@ impl GuildDataStore {
             // share one batch. The 32 MiB batch bound covers the seed row that
             // the removed COUNT used to budget on its own.
             let batch = format!(
-                "{fence_sql}{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
-{COVERAGE_GAP_MARK_CHECK_SQL}
+                "{meta_check}{fence_sql}{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
+{mark_check}
 INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
 UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql});"
             );
