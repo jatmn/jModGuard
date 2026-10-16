@@ -606,8 +606,11 @@ impl GuildDataStore {
     /// When the core pool has an armed writer, every guild mutation commit re-reads the core
     /// `active_bot_lease` row in fresh primary snapshots, releasing core before
     /// the guild commit. The guild transaction also requires `guild_writer_epoch` to equal the
-    /// generation snapshotted for that commit. An empty owner slot does not query and does
-    /// not change commits.
+    /// generation captured at connection checkout. The epoch is the per-store handover
+    /// boundary: a transaction may finish after its final core probe, before a replacement
+    /// can acquire the guild writer lock and advance the epoch. Core lease loss is not
+    /// instantaneous revocation across databases. An empty owner slot skips the core probe;
+    /// any captured generation still has to match the guild epoch.
     pub fn with_core_write_fence(self, core: Db) -> Self {
         self.db.follow_writer_generation(&core);
         let probe_core = core.clone();
@@ -623,6 +626,8 @@ impl GuildDataStore {
 
     /// Raise this store's epoch to `generation` when the stored value is absent or lower.
     /// A higher stored value is left unchanged and reported as a lost lease.
+    /// The writer lock orders this raise after any in-flight guild write. Once the
+    /// raise commits, old-generation writes fail their transactional epoch check.
     pub async fn raise_writer_epoch(&self, generation: i64) -> Result<()> {
         anyhow::ensure!(generation > 0, "active bot generation is corrupt");
         self.db

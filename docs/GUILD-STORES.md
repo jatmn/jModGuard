@@ -112,6 +112,36 @@ identity/policy and missing required tables/triggers; they are not a full schema
 validator or protection from an administrator who can replace SQL definitions. No new
 third-party dependency, service task, live connection or routing cache is enabled.
 
+## Writer handover
+
+The core active-bot lease admits the writer; each guild store's
+`guild_writer_epoch` is the atomic handover boundary for that store. A fresh
+core claim advances the generation. Guild operations capture that generation
+when checking out a connection and require an equal store epoch in the same
+write transaction as their data. Epoch advancement takes the same writer lock
+and never lowers the stored generation.
+
+- A replacement cannot commit guild data while its store epoch is missing or
+  belongs to an earlier generation. Startup and handle opening attempt to raise
+  it; deferred raises are retried. An unavailable store does not prevent other
+  stores from handing over, and its replacement writes remain fenced.
+- An old transaction that already holds the guild writer lock and passes its
+  final core lease probe may finish before the replacement epoch advances,
+  even if the core lease changes or expires during capacity sampling or COMMIT.
+  The epoch raise waits for that transaction to finish.
+- Once the replacement epoch commits, old-generation transactions fail their
+  epoch check and roll back. The replacement can then commit using its generation.
+
+The coverage-gap mark checks the captured epoch in its SQL batch under that
+same writer lock; it does not need another epoch query at COMMIT. Core lease
+probes still reject observed lease loss, but release core resources before the
+guild commit so unrelated core writes and lease renewal can proceed.
+
+This is per-store fencing, not instantaneous revocation across all databases
+at the core lease's expiration time. It does not undo already-dispatched Discord
+actions. A lost remote COMMIT response still requires the existing receipt
+reconciliation; a timeout is not proof that the transaction rolled back.
+
 ## Activation and recovery limits
 
 Placement revisions are metadata, not writer leases. A placement lookup cannot stop an
