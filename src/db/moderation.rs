@@ -1157,14 +1157,69 @@ fn member_ban_event_json_lacks_audit_entry_id(data: &str) -> bool {
     }
 }
 
-/// Reconcile inside an existing DB worker, allowing the bot to retain its
-/// live observation fence through the SQL decision and commit.
+/// Context delivered with the exact manual-ban audit identity.
+#[derive(Clone)]
+pub struct GatewayBanAuditAttribution {
+    pub moderator_id: i64,
+    pub moderator_name: Option<String>,
+    pub reason: String,
+}
+
+fn attribute_gateway_ban_audit_conn(
+    tx: &mut crate::db_compat::Transaction,
+    guild_id: i64,
+    user_id: i64,
+    audit_entry_id: i64,
+    attribution: Option<&GatewayBanAuditAttribution>,
+) -> Result<()> {
+    let Some(attribution) = attribution else {
+        return Ok(());
+    };
+    tx.ensure_mutation_receipt()?;
+    tx.execute_matching(
+        "UPDATE bans SET moderator_id=?1,
+           moderator_name=CASE WHEN moderator_id=?1 THEN COALESCE(?2, moderator_name) ELSE ?2 END,
+           reason=?3
+         WHERE guild_id=?4 AND user_id=?5 AND operation_id IS NULL
+           AND id IN (SELECT CAST(json_extract(data, '$.ban_id') AS INTEGER)
+             FROM events WHERE guild_id=?4 AND user_id=?5 AND event_type='member_ban'
+               AND actor_id IS NULL AND json_valid(data)
+               AND json_extract(data, '$.source')='discord'
+               AND CAST(json_extract(data, '$.audit_entry_id') AS TEXT)=CAST(?6 AS TEXT))",
+        params![
+            attribution.moderator_id,
+            attribution.moderator_name.clone(),
+            attribution.reason.clone(),
+            guild_id,
+            user_id,
+            audit_entry_id
+        ],
+    )?;
+    // HTTP lookups leave the event actor unresolved. Store the exact actor
+    // atomically with the ban attribution so later replays cannot replace it.
+    tx.execute_matching(
+        "UPDATE events SET actor_id=?1
+         WHERE guild_id=?2 AND user_id=?3 AND event_type='member_ban'
+           AND actor_id IS NULL AND json_valid(data)
+           AND json_extract(data, '$.source')='discord'
+           AND CAST(json_extract(data, '$.audit_entry_id') AS TEXT)=CAST(?4 AS TEXT)
+           AND CAST(json_extract(data, '$.ban_id') AS INTEGER) IN (
+             SELECT id FROM bans WHERE guild_id=?2 AND user_id=?3
+               AND operation_id IS NULL AND moderator_id=?1)",
+        params![attribution.moderator_id, guild_id, user_id, audit_entry_id],
+    )?;
+    Ok(())
+}
+
+/// Reconcile inside an existing DB worker after the bot has closed the audit's
+/// match window and checked its live observation fence.
 pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     conn: &mut Connection,
     enrollment: &GuildEnrollment,
     guild_id: i64,
     user_id: i64,
     audit_entry_id: i64,
+    attribution: Option<&GatewayBanAuditAttribution>,
 ) -> Result<bool> {
     if enrollment.guild_id != guild_id {
         return Err(EnrollmentChanged.into());
@@ -1176,7 +1231,18 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
     if gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, audit_entry_id)? {
-        tx.finish_read()?;
+        if attribution.is_some() {
+            attribute_gateway_ban_audit_conn(
+                &mut tx,
+                guild_id,
+                user_id,
+                audit_entry_id,
+                attribution,
+            )?;
+            tx.commit()?;
+        } else {
+            tx.finish_read()?;
+        }
         return Ok(true);
     }
     // A subject can have several id-less ban cycles. The snowflake gives the
@@ -1320,6 +1386,9 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
         "UPDATE events SET data=?1 WHERE id=?2",
         params![data, event_id],
     )?;
+    // Attribute the exact identity in the same commit, including a split from
+    // an earlier callback. No later lookup or still-running handler is needed.
+    attribute_gateway_ban_audit_conn(&mut tx, guild_id, user_id, audit_entry_id, attribution)?;
     tx.commit()?;
     Ok(true)
 }
@@ -1343,6 +1412,7 @@ pub async fn reconcile_gateway_manual_ban_audit_entry(
             guild_id,
             user_id,
             audit_entry_id,
+            None,
         )
     })
     .await
@@ -1673,8 +1743,13 @@ pub async fn attribute_enrolled_ban(
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         tx.execute_matching(
-            "UPDATE bans SET moderator_id = ?1, moderator_name = ?2, reason = ?3
-             WHERE id = ?4 AND guild_id = ?5 AND user_id = ?6 AND moderator_id IS NULL",
+            "UPDATE bans SET
+               moderator_name = CASE WHEN moderator_id IS NULL THEN ?2
+                                     ELSE COALESCE(moderator_name, ?2) END,
+               reason = CASE WHEN moderator_id IS NULL THEN ?3 ELSE reason END,
+               moderator_id = ?1
+             WHERE id = ?4 AND guild_id = ?5 AND user_id = ?6
+               AND (moderator_id IS NULL OR (moderator_id = ?1 AND moderator_name IS NULL))",
             params![
                 moderator_id,
                 moderator_name,

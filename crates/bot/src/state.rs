@@ -126,12 +126,15 @@ struct GatewayBanSubject {
 }
 
 pub(crate) struct GatewayBanObservation {
-    flight: Arc<tokio::sync::Mutex<GatewayBanFlight>>,
+    flight: Arc<Mutex<GatewayBanFlight>>,
     guild: u64,
     user: u64,
     pub(crate) observed: chrono::DateTime<chrono::Utc>,
     saved: bool,
     released: bool,
+    app: std::sync::Weak<BotState>,
+    runtime: tokio::runtime::Handle,
+    pub(crate) enrollment: Option<db::GuildEnrollment>,
 }
 
 fn apply_gateway_ban_release(
@@ -231,7 +234,7 @@ fn make_room_for_ban_subject(flight: &mut GatewayBanFlight, guild: u64, user: u6
 
 impl GatewayBanObservation {
     pub(crate) async fn audit_after_ms(&self) -> i64 {
-        let flight = self.flight.lock().await;
+        let flight = self.flight.lock();
         let subject = flight.subjects.get(&(self.guild, self.user));
         let (seeded_uncertain, _) =
             seeded_gateway_ban_cutoffs(flight.started_at_ms, flight.cutoff_floor_ms);
@@ -248,46 +251,63 @@ impl GatewayBanObservation {
 
     pub(crate) async fn finish(mut self, saved: bool) {
         self.saved = saved;
-        if self.released {
-            return;
+        self.release();
+        // The retry is already running before this await. Cancelling the
+        // callback must not strand a saved row's queued audit during the wait.
+        if let Some(retry) = self.retry() {
+            let _ = retry.await;
         }
-        let mut flight = self.flight.lock().await;
-        if self.released {
-            return;
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            apply_gateway_ban_release(
+                &mut self.flight.lock(),
+                self.guild,
+                self.user,
+                self.saved,
+                self.observed.timestamp_millis(),
+            );
+            self.released = true;
         }
-        apply_gateway_ban_release(
-            &mut flight,
-            self.guild,
-            self.user,
-            self.saved,
-            self.observed.timestamp_millis(),
-        );
-        self.released = true;
+    }
+
+    fn retry(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let app = self.app.upgrade()?;
+        let enrollment = self.enrollment.clone()?;
+        let (guild, user) = (self.guild, self.user);
+        Some(self.runtime.spawn(async move {
+            crate::handlers::reconcile_pending_gateway_ban_audits(
+                &app,
+                Some(enrollment),
+                guild,
+                user,
+            )
+            .await;
+        }))
     }
 }
 
 impl Drop for GatewayBanObservation {
     fn drop(&mut self) {
-        if self.released {
-            return;
+        if !self.released {
+            // The flight lock protects only in-memory bookkeeping. No SQL or
+            // async wait can hold it, so release never needs a cleanup thread.
+            self.release();
+            self.retry();
         }
-        self.released = true;
-        let flight = Arc::clone(&self.flight);
-        let guild = self.guild;
-        let user = self.user;
-        let saved = self.saved;
-        let observed_ms = self.observed.timestamp_millis();
-        // An uncontended drop publishes before the caller continues. A drop
-        // that finds the database worker still inside commit must not block
-        // this runtime worker; a plain thread waits instead.
-        if let Ok(mut guard) = flight.try_lock() {
-            apply_gateway_ban_release(&mut guard, guild, user, saved, observed_ms);
-            return;
-        }
-        let _ = std::thread::Builder::new().spawn(move || {
-            let mut guard = flight.blocking_lock();
-            apply_gateway_ban_release(&mut guard, guild, user, saved, observed_ms);
-        });
+    }
+}
+
+fn gateway_ban_audit_blocked(
+    flight: &GatewayBanFlight,
+    guild: u64,
+    user: u64,
+    audit_at: i64,
+) -> bool {
+    match flight.subjects.get(&(guild, user)) {
+        Some(subject) => subject.active != 0 || audit_at <= subject.failed_through_ms,
+        None => audit_at <= flight.cutoff_floor_ms,
     }
 }
 
@@ -300,38 +320,81 @@ fn gateway_ban_flight_index(guild: u64, user: u64, shards: usize) -> usize {
 
 #[derive(Default)]
 struct GatewayManualBanAuditQueue {
-    entries: HashMap<(u64, u64), VecDeque<(i64, Instant)>>,
+    entries: HashMap<(u64, u64), VecDeque<PendingGatewayBanAudit>>,
+}
+
+struct PendingGatewayBanAudit {
+    entry_id: i64,
+    expires: Instant,
+    attribution: Option<db::GatewayBanAuditAttribution>,
+    valid: Arc<AtomicBool>,
+    retrying: Arc<AtomicBool>,
+}
+
+struct GatewayBanAuditRetry(Arc<AtomicBool>);
+
+impl Drop for GatewayBanAuditRetry {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PendingGatewayBanAudit {
+    fn drop(&mut self) {
+        // Clear, expiry, eviction and acknowledgment also revoke sleeping passes.
+        self.valid.store(false, Ordering::Release);
+    }
 }
 
 impl GatewayManualBanAuditQueue {
     fn prune(&mut self, now: Instant) {
         for deque in self.entries.values_mut() {
-            deque.retain(|(_, expires)| *expires > now);
+            deque.retain(|entry| entry.expires > now);
         }
         self.entries.retain(|_, deque| !deque.is_empty());
     }
 
+    #[cfg(test)]
     fn queue(&mut self, guild: u64, user: u64, entry_id: i64) {
+        self.queue_attributed(guild, user, entry_id, None);
+    }
+
+    fn queue_attributed(
+        &mut self,
+        guild: u64,
+        user: u64,
+        entry_id: i64,
+        attribution: Option<db::GatewayBanAuditAttribution>,
+    ) {
         if entry_id <= 0 {
             return;
         }
         let now = Instant::now();
         self.prune(now);
         let deque = self.entries.entry((guild, user)).or_default();
-        if deque.iter().any(|(queued, _)| *queued == entry_id) {
+        if let Some(entry) = deque.iter_mut().find(|entry| entry.entry_id == entry_id) {
+            if entry.attribution.is_none() {
+                entry.attribution = attribution;
+            }
             return;
         }
         while deque.len() >= MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE {
             deque.pop_front();
         }
-        deque.push_back((entry_id, now + GATEWAY_MANUAL_BAN_AUDIT_TTL));
+        deque.push_back(PendingGatewayBanAudit {
+            entry_id,
+            expires: now + GATEWAY_MANUAL_BAN_AUDIT_TTL,
+            attribution,
+            valid: Arc::new(AtomicBool::new(true)),
+            retrying: Arc::new(AtomicBool::new(false)),
+        });
     }
 
     fn pending(&mut self, guild: u64, user: u64) -> Vec<i64> {
         self.prune(Instant::now());
         self.entries
             .get(&(guild, user))
-            .map(|entries| entries.iter().map(|(id, _)| *id).collect())
+            .map(|entries| entries.iter().map(|entry| entry.entry_id).collect())
             .unwrap_or_default()
     }
 
@@ -349,7 +412,7 @@ impl GatewayManualBanAuditQueue {
         let Some(deque) = self.entries.get_mut(&key) else {
             return;
         };
-        deque.retain(|(queued, _)| *queued != entry_id);
+        deque.retain(|entry| entry.entry_id != entry_id);
         if deque.is_empty() {
             self.entries.remove(&key);
         }
@@ -786,7 +849,7 @@ pub struct BotState {
     pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
-    gateway_ban_flights: [Arc<tokio::sync::Mutex<GatewayBanFlight>>; 256],
+    gateway_ban_flights: [Arc<Mutex<GatewayBanFlight>>; 256],
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
@@ -884,7 +947,7 @@ impl BotState {
                 // replay against observations saved before restart.
                 let started_at_ms = chrono::Utc::now().timestamp_millis();
                 std::array::from_fn(|_| {
-                    Arc::new(tokio::sync::Mutex::new(GatewayBanFlight {
+                    Arc::new(Mutex::new(GatewayBanFlight {
                         started_at_ms,
                         cutoff_floor_ms: 0,
                         subjects: HashMap::new(),
@@ -1247,16 +1310,18 @@ impl BotState {
     }
 
     pub(crate) async fn begin_gateway_ban_observation(
-        &self,
+        self: &Arc<Self>,
         guild: u64,
         user: u64,
     ) -> GatewayBanObservation {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
-        // The audit match window is five seconds. Sample before the stripe
-        // wait so a stalled lock cannot push this observation outside it.
-        let observed = chrono::Utc::now();
+        let observed;
         {
-            let mut state = flight.lock().await;
+            // Timestamp and registration are one short critical section. SQL
+            // never holds this lock, and no eligible arrival can remain hidden
+            // while reconciliation decides that its match window has closed.
+            let mut state = flight.lock();
+            observed = chrono::Utc::now();
             make_room_for_ban_subject(&mut state, guild, user);
             let started_at_ms = state.started_at_ms;
             let floor = state.cutoff_floor_ms;
@@ -1281,14 +1346,13 @@ impl BotState {
             observed,
             saved: false,
             released: false,
+            app: Arc::downgrade(self),
+            runtime: tokio::runtime::Handle::current(),
+            enrollment: None,
         }
     }
 
-    fn gateway_ban_flight(
-        &self,
-        guild: u64,
-        user: u64,
-    ) -> &Arc<tokio::sync::Mutex<GatewayBanFlight>> {
+    fn gateway_ban_flight(&self, guild: u64, user: u64) -> &Arc<Mutex<GatewayBanFlight>> {
         &self.gateway_ban_flights
             [gateway_ban_flight_index(guild, user, self.gateway_ban_flights.len())]
     }
@@ -1302,32 +1366,116 @@ impl BotState {
     ) -> Result<bool> {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
         let enrollment = enrollment.ok_or(db::EnrollmentChanged)?;
-        self.db
-            .with_conn(move |conn| {
-                // Registration and the SQL decision share exclusion through commit.
-                // Keep the guard in the DB worker: cancellation of its async waiter
-                // must not release the fence while SQL is still running.
-                let flight = flight.blocking_lock();
-                let audit_at = (entry_id >> 22) + 1_420_070_400_000;
-                let blocked = match flight.subjects.get(&(guild, user)) {
-                    Some(subject) => subject.active != 0 || audit_at <= subject.failed_through_ms,
-                    None => audit_at <= flight.cutoff_floor_ms,
-                };
-                if blocked {
-                    return Ok(false);
-                }
-                db::reconcile_gateway_manual_ban_audit_entry_conn(
-                    conn,
-                    &enrollment,
-                    guild as i64,
-                    user as i64,
-                    entry_id,
+        let Some((attribution, valid, expires, retrying)) = self
+            .gateway_manual_ban_audit_entries
+            .lock()
+            .entries
+            .get(&(guild, user))
+            .and_then(|entries| entries.iter().find(|entry| entry.entry_id == entry_id))
+            .map(|entry| {
+                (
+                    entry.attribution.clone(),
+                    Arc::clone(&entry.valid),
+                    entry.expires,
+                    Arc::clone(&entry.retrying),
                 )
             })
-            .await
+        else {
+            return Ok(false);
+        };
+        let audit_at = (entry_id >> 22) + 1_420_070_400_000;
+        let mut retry = None;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if !valid.load(Ordering::Acquire) || expires <= Instant::now() {
+                return Ok(false);
+            }
+            let blocked = gateway_ban_audit_blocked(&flight.lock(), guild, user, audit_at);
+            // The callback's pre-write pass cannot wait for its own observation.
+            // An established error-retry owner stays alive through temporary
+            // activity, so another completion cannot lose its only retry.
+            if blocked && retry.is_none() {
+                return Ok(false);
+            }
+            let remaining_ms = audit_at + 5_001 - chrono::Utc::now().timestamp_millis();
+            if remaining_ms > 0 {
+                tokio::time::sleep(
+                    Duration::from_millis(remaining_ms as u64)
+                        .min(expires.saturating_duration_since(Instant::now())),
+                )
+                .await;
+                continue;
+            }
+            if !blocked {
+                let result = self
+                    .db
+                    .with_conn({
+                        let flight = Arc::clone(&flight);
+                        let valid = Arc::clone(&valid);
+                        let enrollment = enrollment.clone();
+                        let attribution = attribution.clone();
+                        move |conn| {
+                            {
+                                let state = flight.lock();
+                                if !valid.load(Ordering::Acquire)
+                                    || expires <= Instant::now()
+                                    || gateway_ban_audit_blocked(&state, guild, user, audit_at)
+                                    || chrono::Utc::now().timestamp_millis() <= audit_at + 5_000
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            // The inclusive match window is closed. SQL serializes
+                            // concurrent passes without holding the registration lock.
+                            db::reconcile_gateway_manual_ban_audit_entry_conn(
+                                conn,
+                                &enrollment,
+                                guild as i64,
+                                user as i64,
+                                entry_id,
+                                attribution.as_ref(),
+                            )
+                        }
+                    })
+                    .await;
+                match result {
+                    Ok(true) => return Ok(true),
+                    Ok(false) if retry.is_none() => return Ok(false),
+                    Ok(false) => {}
+                    Err(error) => {
+                        let transient = matches!(
+                            db::startup_retry_kind(&error, self.db.is_remote()),
+                            Some(
+                                db::StartupRetryKind::SqliteLock
+                                    | db::StartupRetryKind::InteractiveTransaction
+                                    | db::StartupRetryKind::Transport
+                            )
+                        ) || db::is_database_operation_timeout(&error)
+                            || db::is_database_commit_indeterminate(&error);
+                        if !transient {
+                            return Err(error);
+                        }
+                        if retry.is_none() {
+                            if retrying
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                return Err(error);
+                            }
+                            retry = Some(GatewayBanAuditRetry(Arc::clone(&retrying)));
+                        }
+                        tracing::warn!("gateway manual ban audit will retry: {error:#}");
+                    }
+                }
+            }
+            tokio::time::sleep(backoff.min(expires.saturating_duration_since(Instant::now())))
+                .await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
     }
 
     /// Retain audit identities until their own persisted ban can be reconciled.
+    #[cfg(test)]
     pub(crate) fn queue_gateway_manual_ban_audit_entry(
         &self,
         guild_id: u64,
@@ -1337,6 +1485,18 @@ impl BotState {
         self.gateway_manual_ban_audit_entries
             .lock()
             .queue(guild_id, user_id, entry_id);
+    }
+
+    pub(crate) fn queue_attributed_gateway_manual_ban_audit_entry(
+        &self,
+        guild: u64,
+        user: u64,
+        entry_id: i64,
+        attribution: db::GatewayBanAuditAttribution,
+    ) {
+        self.gateway_manual_ban_audit_entries
+            .lock()
+            .queue_attributed(guild, user, entry_id, Some(attribution));
     }
 
     pub(crate) fn pending_gateway_manual_ban_audit_entries(
@@ -2061,7 +2221,7 @@ mod tests {
         }
         assert_eq!(app.gateway_ban_flights.len(), 256);
         for flight in &app.gateway_ban_flights {
-            let flight = flight.lock().await;
+            let flight = flight.lock();
             assert!(flight.subjects.values().all(|subject| subject.active == 0));
         }
         drop(app);
@@ -2169,53 +2329,12 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn ban_observation_waits_for_the_flight_lock_without_blocking_the_worker() {
-        let directory =
-            std::env::temp_dir().join(format!("flight_wait_{:032x}", rand::random::<u128>()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let app = BotState::new(
-            Default::default(),
-            Db::open(&directory.join("core.db"), 2).unwrap(),
-        )
-        .unwrap();
-        let flight = Arc::clone(app.gateway_ban_flight(10, 55));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let held = std::thread::spawn(move || {
-            let guard = flight.blocking_lock();
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
-            drop(guard);
-        });
-        entered_rx.await.unwrap();
-        let progressed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&progressed);
-        let flag_task = tokio::spawn(async move {
-            flag.store(true, Ordering::SeqCst);
-        });
-        {
-            let begin = app.begin_gateway_ban_observation(10, 55);
-            tokio::pin!(begin);
-            tokio::select! {
-                biased;
-                _ = &mut begin => panic!("observation registered while the flight lock was held"),
-                _ = flag_task => {}
-            }
-            assert!(progressed.load(Ordering::SeqCst));
-            release_tx.send(()).unwrap();
-            let observation = begin.await;
-            observation.finish(true).await;
-        }
-        held.join().unwrap();
-        drop(app);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
     #[tokio::test]
-    async fn stripe_lock_stall_keeps_the_audit_moderator_and_reason() {
-        let directory =
-            std::env::temp_dir().join(format!("flight_stall_{:032x}", rand::random::<u128>()));
+    async fn cancelled_saved_ban_retries_its_queued_audit_after_release() {
+        let directory = std::env::temp_dir().join(format!(
+            "cancelled_saved_ban_{:032x}",
+            rand::random::<u128>()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         let app = BotState::new(
             Default::default(),
@@ -2223,76 +2342,516 @@ mod tests {
         )
         .unwrap();
         let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
-        let flight = Arc::clone(app.gateway_ban_flight(10, 55));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let held = std::thread::spawn(move || {
-            let guard = flight.blocking_lock();
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(15));
-            drop(guard);
-        });
-        entered_rx.await.unwrap();
-        let audit_at = chrono::Utc::now().timestamp_millis();
-        let observation = {
-            let begin = app.begin_gateway_ban_observation(10, 55);
-            tokio::pin!(begin);
-            tokio::select! {
-                biased;
-                _ = &mut begin => panic!("observation finished while the stripe lock was held"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5_200)).await;
-            release_tx.send(()).unwrap();
-            begin.await
-        };
-        assert!(chrono::Utc::now().timestamp_millis() - audit_at > 5_000);
-        let observed_at = observation.observed.to_rfc3339();
-        observation.finish(true).await;
-        let write = db::record_gateway_ban(
+        let mut observation = app.begin_gateway_ban_observation(10, 55).await;
+        observation.enrollment = Some(scope.clone());
+        // A post-startup audit, distinct from the process's uncertainty cutoff.
+        observation.observed += chrono::Duration::seconds(1);
+        let audit = audit_id_at(observation.observed.timestamp_millis());
+        db::record_gateway_ban_with_audit(
             &app.db,
             Some(scope.clone()),
             55,
-            Some("member"),
             None,
-            Some(&observed_at),
+            None,
+            Some(&observation.observed.to_rfc3339()),
+            false,
+            None,
+            false,
+            db::GatewayBanAuditEntries::Observed {
+                pending: vec![],
+                audit_after_ms: observation.audit_after_ms().await,
+            },
+        )
+        .await
+        .unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+        assert!(
+            !app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, 55, audit,)
+                .await
+                .unwrap()
+        );
+        {
+            let finish = observation.finish(true);
+            tokio::pin!(finish);
+            tokio::select! {
+                biased;
+                _ = &mut finish => panic!("audit matched before its window closed"),
+                _ = std::future::ready(()) => {}
+            }
+            // Cancel after release while the detached retry waits for the window.
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !app
+                .pending_gateway_manual_ban_audit_entries(10, 55)
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("release must retry without another gateway event");
+        assert!(
+            db::gateway_manual_ban_audit_entry_is_known(&app.db, Some(scope), 10, 55, audit,)
+                .await
+                .unwrap()
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleared_audit_cannot_reconcile_a_later_ban() {
+        for requeue in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("cleared_audit_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            let observed = chrono::Utc::now() + chrono::Duration::seconds(1);
+            let audit = audit_id_at(observed.timestamp_millis());
+            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            let reconcile =
+                app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, 55, audit);
+            tokio::pin!(reconcile);
+            tokio::select! {
+                biased;
+                _ = &mut reconcile => panic!("audit must wait for its match window"),
+                _ = std::future::ready(()) => {}
+            }
+            // Unban removes the pending audit while its pass is asleep.
+            app.clear_gateway_manual_ban_audit_entries(10, 55);
+            if requeue {
+                // A replay must not revive the old pass's captured work.
+                app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            }
+            db::record_gateway_ban(
+                &app.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some(&observed.to_rfc3339()),
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !reconcile.await.unwrap(),
+                "cleared pass must not bind a later ban"
+            );
+            assert!(
+                !db::gateway_manual_ban_audit_entry_is_known(
+                    &app.db,
+                    Some(scope.clone()),
+                    10,
+                    55,
+                    audit,
+                )
+                .await
+                .unwrap()
+            );
+            if requeue {
+                assert!(
+                    app.reconcile_gateway_manual_ban_audit_entry(Some(scope), 10, 55, audit,)
+                        .await
+                        .unwrap(),
+                    "fresh replay remains eligible"
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_audit_failure_retries_until_recovery_clear_or_expiry() {
+        for outcome in ["recover", "clear", "expire"] {
+            let directory =
+                std::env::temp_dir().join(format!("audit_retry_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            let audit = 1_212_912_186_163_200_001;
+            db::record_gateway_ban(
+                &app.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some("2024-03-01T00:00:00Z"),
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            if outcome == "expire" {
+                app.gateway_manual_ban_audit_entries
+                    .lock()
+                    .entries
+                    .get_mut(&(10, 55))
+                    .unwrap()[0]
+                    .expires = Instant::now() + Duration::from_secs(6);
+            }
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = {
+                let app = Arc::clone(&app);
+                tokio::spawn(async move {
+                    app.db
+                        .with_conn(move |conn| {
+                            let tx = conn.transaction_immediate()?;
+                            let _ = entered_tx.send(());
+                            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                            tx.commit()
+                        })
+                        .await
+                        .unwrap();
+                })
+            };
+            entered_rx.await.unwrap();
+            let callback = {
+                let app = Arc::clone(&app);
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    crate::handlers::reconcile_pending_gateway_ban_audits(
+                        &app,
+                        Some(scope),
+                        10,
+                        55,
+                    )
+                    .await;
+                })
+            };
+            // Hold past SQLite's five-second busy deadline: the first attempt must fail.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let stopped_after_error = callback.is_finished();
+            if outcome == "clear" {
+                app.clear_gateway_manual_ban_audit_entries(10, 55);
+                app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            }
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), callback)
+                .await
+                .unwrap()
+                .unwrap();
+            if outcome != "expire" {
+                assert!(
+                    !stopped_after_error,
+                    "transient failure must retain an independent retry"
+                );
+            }
+            let known = db::gateway_manual_ban_audit_entry_is_known(
+                &app.db,
+                Some(scope.clone()),
+                10,
+                55,
+                audit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(known, outcome == "recover", "{outcome}");
+            if outcome == "clear" {
+                assert_eq!(
+                    app.pending_gateway_manual_ban_audit_entries(10, 55),
+                    vec![audit]
+                );
+                assert!(
+                    app.reconcile_gateway_manual_ban_audit_entry(Some(scope), 10, 55, audit)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                assert!(
+                    app.pending_gateway_manual_ban_audit_entries(10, 55)
+                        .is_empty()
+                );
+            }
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_audit_callback_reconciles_without_another_event() {
+        let directory =
+            std::env::temp_dir().join(format!("cancelled_audit_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let mut observation = app.begin_gateway_ban_observation(10, 55).await;
+        observation.enrollment = Some(scope.clone());
+        observation.observed += chrono::Duration::seconds(1);
+        let audit = audit_id_at(observation.observed.timestamp_millis());
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&observation.observed.to_rfc3339()),
             false,
             None,
             false,
         )
         .await
         .unwrap();
-        let db::GatewayBanWrite::Recorded { row_id } = write else {
-            panic!("stall must still insert the ban row");
-        };
-        let matched = app
-            .reconcile_gateway_manual_ban_audit_entry(
+        // The observation's retry has already completed with an empty queue.
+        observation.finish(true).await;
+        {
+            let callback = crate::handlers::reconcile_received_gateway_ban_audit(
+                &app,
                 Some(scope.clone()),
                 10,
                 55,
-                audit_id_at(audit_at),
-            )
-            .await
-            .unwrap();
-        if matched {
-            db::attribute_enrolled_ban(
+                audit,
+                db::GatewayBanAuditAttribution {
+                    moderator_id: 77,
+                    moderator_name: Some("moderator".to_owned()),
+                    reason: "manual ban".to_owned(),
+                },
+            );
+            tokio::pin!(callback);
+            tokio::select! {
+                biased;
+                _ = &mut callback => panic!("audit must wait for its match window"),
+                _ = std::future::ready(()) => {}
+            }
+            // Dropping the callback must leave its queued reconciliation running.
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !app
+                .pending_gateway_manual_ban_audit_entries(10, 55)
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("audit callback cancellation must not strand its audit");
+        assert!(
+            db::gateway_manual_ban_audit_entry_is_known(&app.db, Some(scope), 10, 55, audit,)
+                .await
+                .unwrap()
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_waits_for_delayed_callbacks_before_matching_an_older_ban() {
+        let directory =
+            std::env::temp_dir().join(format!("audit_window_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let observed = chrono::Utc::now();
+        let audit = audit_id_at(observed.timestamp_millis());
+        // Delayed delivery of the older callback made its saved observation
+        // fall inside the newer action's audit window.
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&observed.to_rfc3339()),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+        let reconcile = {
+            let app = Arc::clone(&app);
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                app.reconcile_gateway_manual_ban_audit_entry(Some(scope), 10, 55, audit)
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !reconcile.is_finished(),
+            "reconciliation must wait for delayed callbacks"
+        );
+        assert!(
+            !db::gateway_manual_ban_audit_entry_is_known(
                 &app.db,
                 Some(scope.clone()),
-                row_id,
+                10,
                 55,
-                77,
-                Some("moderator"),
-                "manual reason",
+                audit
             )
             .await
+            .unwrap(),
+            "an open match window must not permanently select the older ban"
+        );
+        let mut later = app.begin_gateway_ban_observation(10, 55).await;
+        later.enrollment = Some(scope.clone());
+        assert!(later.observed.timestamp_millis() - observed.timestamp_millis() <= 5_000);
+        db::record_gateway_ban_with_audit(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&later.observed.to_rfc3339()),
+            false,
+            None,
+            true,
+            db::GatewayBanAuditEntries::Observed {
+                pending: vec![],
+                audit_after_ms: later.audit_after_ms().await,
+            },
+        )
+        .await
+        .unwrap();
+        later.finish(true).await;
+        assert!(!reconcile.await.unwrap());
+        assert!(
+            !db::gateway_manual_ban_audit_entry_is_known(&app.db, Some(scope), 10, 55, audit)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            app.pending_gateway_manual_ban_audit_entries(10, 55),
+            vec![audit]
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_stall_does_not_delay_ban_observation_or_lose_attribution() {
+        let directory =
+            std::env::temp_dir().join(format!("sql_flight_stall_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let old_time = chrono::Utc::now() - chrono::Duration::seconds(10);
+        db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&old_time.to_rfc3339()),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = {
+            let app = Arc::clone(&app);
+            tokio::spawn(async move {
+                app.db
+                    .with_conn(move |conn| {
+                        let tx = conn.transaction_immediate()?;
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                        tx.commit()
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, 55, audit_id_at(old_time.timestamp_millis()));
+        let reconciliation = {
+            let app = Arc::clone(&app);
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                app.reconcile_gateway_manual_ban_audit_entry(
+                    Some(scope),
+                    10,
+                    55,
+                    audit_id_at(old_time.timestamp_millis()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut observation = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.begin_gateway_ban_observation(10, 55),
+        )
+        .await
+        .expect("SQL must not hold the callback registration lock");
+        observation.enrollment = Some(scope.clone());
+        let audit = audit_id_at(observation.observed.timestamp_millis());
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        assert!(
+            chrono::Utc::now().timestamp_millis() - observation.observed.timestamp_millis() > 5_000
+        );
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        db::record_gateway_ban_with_audit(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(&observation.observed.to_rfc3339()),
+            false,
+            None,
+            true,
+            db::GatewayBanAuditEntries::Observed {
+                pending: vec![],
+                audit_after_ms: observation.audit_after_ms().await,
+            },
+        )
+        .await
+        .unwrap();
+        app.queue_attributed_gateway_manual_ban_audit_entry(
+            10,
+            55,
+            audit,
+            db::GatewayBanAuditAttribution {
+                moderator_id: 77,
+                moderator_name: Some("moderator".into()),
+                reason: "manual reason".into(),
+            },
+        );
+        observation.finish(true).await;
+        // A busy-error retry now waits for the active observation to finish.
+        // Join only after releasing it, preserving the original arrival time.
+        let _ = tokio::time::timeout(Duration::from_secs(8), reconciliation)
+            .await
+            .expect("reconciliation must finish after the observation releases")
             .unwrap();
-        }
         let rows = db::list_enrolled_bans(&app.db, scope, 10).await.unwrap();
-        let row = rows.iter().find(|row| row.active).expect("active ban");
+        let row = rows.iter().find(|row| row.active).unwrap();
         assert_eq!(row.moderator_id, Some(77));
         assert_eq!(row.moderator_name.as_deref(), Some("moderator"));
         assert_eq!(row.reason.as_deref(), Some("manual reason"));
-        held.join().unwrap();
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2330,7 +2889,8 @@ mod tests {
         )
         .unwrap();
         let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
-        let base = (chrono::Utc::now().timestamp() + 120) * 1000;
+        let base = (chrono::Utc::now().timestamp() - 1_000) * 1000;
+        app.gateway_ban_flights[stripe].lock().started_at_ms = base - 1;
         for (offset, user) in users.iter().enumerate() {
             let mut observation = app.begin_gateway_ban_observation(10, *user).await;
             observation.observed =
@@ -2338,7 +2898,7 @@ mod tests {
             observation.finish(false).await;
         }
         let floor = {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert_eq!(flight.subjects.len(), MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE);
             assert!(!flight.subjects.contains_key(&(10, users[0])));
             assert!(flight.subjects.contains_key(&(10, *users.last().unwrap())));
@@ -2362,6 +2922,7 @@ mod tests {
         .await
         .unwrap();
         let early_audit = audit_id_at(base);
+        app.queue_gateway_manual_ban_audit_entry(10, users[0], early_audit);
         assert!(
             !app.reconcile_gateway_manual_ban_audit_entry(
                 Some(scope.clone()),
@@ -2389,6 +2950,7 @@ mod tests {
         )
         .await
         .unwrap();
+        app.queue_gateway_manual_ban_audit_entry(10, users[0], audit_id_at(later_ms));
         assert!(
             app.reconcile_gateway_manual_ban_audit_entry(
                 Some(scope.clone()),
@@ -2410,6 +2972,7 @@ mod tests {
         old_audit: i64,
         floor: i64,
     ) {
+        app.queue_gateway_manual_ban_audit_entry(10, user, old_audit);
         assert!(
             !app.reconcile_gateway_manual_ban_audit_entry(Some(scope.clone()), 10, user, old_audit)
                 .await
@@ -2450,7 +3013,7 @@ mod tests {
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
         let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
         let started_at_ms = {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             flight.started_at_ms
         };
         // Just after this process start, one millisecond apart. The floor is
@@ -2464,14 +3027,14 @@ mod tests {
         }
         let evicted = users[0];
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert!(!flight.subjects.contains_key(&(10, evicted)));
             assert!(flight.cutoff_floor_ms > started_at_ms);
             assert!(flight.cutoff_floor_ms >= base);
         }
         let again = app.begin_gateway_ban_observation(10, evicted).await;
         let (floor, started_at_ms) = {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             let subject = flight
                 .subjects
                 .get(&(10, evicted))
@@ -2513,7 +3076,7 @@ mod tests {
         again.finish(true).await;
         assert_failed_audit_stays_off_the_reban(&app, &scope, evicted, old_audit, floor).await;
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert!(
                 !flight.subjects.contains_key(&(10, evicted)),
                 "a re-ban that only repeats the seed is idle"
@@ -2523,24 +3086,24 @@ mod tests {
         // A failed release at the seed stays idle. One millisecond past it does not.
         let mut at_seed = app.begin_gateway_ban_observation(10, evicted).await;
         let seed_floor = {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             flight.cutoff_floor_ms
         };
         at_seed.observed = chrono::DateTime::from_timestamp_millis(seed_floor).unwrap();
         at_seed.finish(false).await;
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert!(!flight.subjects.contains_key(&(10, evicted)));
         }
         let mut past_seed = app.begin_gateway_ban_observation(10, evicted).await;
         let past_floor = {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             flight.cutoff_floor_ms
         };
         past_seed.observed = chrono::DateTime::from_timestamp_millis(past_floor + 1).unwrap();
         past_seed.finish(false).await;
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             let subject = flight
                 .subjects
                 .get(&(10, evicted))
@@ -2561,7 +3124,7 @@ mod tests {
         }
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert_eq!(flight.cutoff_floor_ms, 0);
             assert!(!flight.subjects.contains_key(&(10, evicted)));
         }
@@ -2616,7 +3179,7 @@ mod tests {
             held.push(app.begin_gateway_ban_observation(10, *user).await);
         }
         {
-            let flight = app.gateway_ban_flights[stripe].lock().await;
+            let flight = app.gateway_ban_flights[stripe].lock();
             assert!(flight.subjects.len() > MAX_GATEWAY_BAN_SUBJECTS_PER_STRIPE);
             for user in &users {
                 assert!(
@@ -2629,6 +3192,7 @@ mod tests {
             }
         }
         for user in &users {
+            app.queue_gateway_manual_ban_audit_entry(10, *user, audit);
             assert!(
                 !app.reconcile_gateway_manual_ban_audit_entry(
                     Some(scope.clone()),
