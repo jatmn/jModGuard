@@ -328,6 +328,15 @@ struct PendingGatewayBanAudit {
     expires: Instant,
     attribution: Option<db::GatewayBanAuditAttribution>,
     valid: Arc<AtomicBool>,
+    retrying: Arc<AtomicBool>,
+}
+
+struct GatewayBanAuditRetry(Arc<AtomicBool>);
+
+impl Drop for GatewayBanAuditRetry {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for PendingGatewayBanAudit {
@@ -377,6 +386,7 @@ impl GatewayManualBanAuditQueue {
             expires: now + GATEWAY_MANUAL_BAN_AUDIT_TTL,
             attribution,
             valid: Arc::new(AtomicBool::new(true)),
+            retrying: Arc::new(AtomicBool::new(false)),
         });
     }
 
@@ -1356,7 +1366,7 @@ impl BotState {
     ) -> Result<bool> {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
         let enrollment = enrollment.ok_or(db::EnrollmentChanged)?;
-        let Some((attribution, valid, expires)) = self
+        let Some((attribution, valid, expires, retrying)) = self
             .gateway_manual_ban_audit_entries
             .lock()
             .entries
@@ -1367,56 +1377,101 @@ impl BotState {
                     entry.attribution.clone(),
                     Arc::clone(&entry.valid),
                     entry.expires,
+                    Arc::clone(&entry.retrying),
                 )
             })
         else {
             return Ok(false);
         };
         let audit_at = (entry_id >> 22) + 1_420_070_400_000;
+        let mut retry = None;
+        let mut backoff = Duration::from_secs(1);
         loop {
-            let remaining_ms = {
-                let state = flight.lock();
-                // In particular, the callback's pre-write pass must not wait
-                // on its own active observation before it can save the row.
-                if !valid.load(Ordering::Acquire)
-                    || expires <= Instant::now()
-                    || gateway_ban_audit_blocked(&state, guild, user, audit_at)
-                {
-                    return Ok(false);
-                }
-                audit_at + 5_001 - chrono::Utc::now().timestamp_millis()
-            };
-            if remaining_ms <= 0 {
-                break;
+            if !valid.load(Ordering::Acquire) || expires <= Instant::now() {
+                return Ok(false);
             }
-            tokio::time::sleep(Duration::from_millis(remaining_ms as u64)).await;
-        }
-        self.db
-            .with_conn(move |conn| {
-                {
-                    let state = flight.lock();
-                    if !valid.load(Ordering::Acquire)
-                        || expires <= Instant::now()
-                        || gateway_ban_audit_blocked(&state, guild, user, audit_at)
-                        || chrono::Utc::now().timestamp_millis() <= audit_at + 5_000
-                    {
-                        return Ok(false);
+            let blocked = gateway_ban_audit_blocked(&flight.lock(), guild, user, audit_at);
+            // The callback's pre-write pass cannot wait for its own observation.
+            // An established error-retry owner stays alive through temporary
+            // activity, so another completion cannot lose its only retry.
+            if blocked && retry.is_none() {
+                return Ok(false);
+            }
+            let remaining_ms = audit_at + 5_001 - chrono::Utc::now().timestamp_millis();
+            if remaining_ms > 0 {
+                tokio::time::sleep(
+                    Duration::from_millis(remaining_ms as u64)
+                        .min(expires.saturating_duration_since(Instant::now())),
+                )
+                .await;
+                continue;
+            }
+            if !blocked {
+                let result = self
+                    .db
+                    .with_conn({
+                        let flight = Arc::clone(&flight);
+                        let valid = Arc::clone(&valid);
+                        let enrollment = enrollment.clone();
+                        let attribution = attribution.clone();
+                        move |conn| {
+                            {
+                                let state = flight.lock();
+                                if !valid.load(Ordering::Acquire)
+                                    || expires <= Instant::now()
+                                    || gateway_ban_audit_blocked(&state, guild, user, audit_at)
+                                    || chrono::Utc::now().timestamp_millis() <= audit_at + 5_000
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            // The inclusive match window is closed. SQL serializes
+                            // concurrent passes without holding the registration lock.
+                            db::reconcile_gateway_manual_ban_audit_entry_conn(
+                                conn,
+                                &enrollment,
+                                guild as i64,
+                                user as i64,
+                                entry_id,
+                                attribution.as_ref(),
+                            )
+                        }
+                    })
+                    .await;
+                match result {
+                    Ok(true) => return Ok(true),
+                    Ok(false) if retry.is_none() => return Ok(false),
+                    Ok(false) => {}
+                    Err(error) => {
+                        let transient = matches!(
+                            db::startup_retry_kind(&error, self.db.is_remote()),
+                            Some(
+                                db::StartupRetryKind::SqliteLock
+                                    | db::StartupRetryKind::InteractiveTransaction
+                                    | db::StartupRetryKind::Transport
+                            )
+                        ) || db::is_database_operation_timeout(&error)
+                            || db::is_database_commit_indeterminate(&error);
+                        if !transient {
+                            return Err(error);
+                        }
+                        if retry.is_none() {
+                            if retrying
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                return Err(error);
+                            }
+                            retry = Some(GatewayBanAuditRetry(Arc::clone(&retrying)));
+                        }
+                        tracing::warn!("gateway manual ban audit will retry: {error:#}");
                     }
                 }
-                // SQL includes the end of the five-second window. Once it has
-                // closed and registered callbacks have finished, later arrivals
-                // cannot be matching candidates, even during a slow commit.
-                // The database transaction serializes concurrent SQL passes.
-                db::reconcile_gateway_manual_ban_audit_entry_conn(
-                    conn,
-                    &enrollment,
-                    guild as i64,
-                    user as i64,
-                    entry_id,
-                    attribution.as_ref(),
-                )
-            })
-            .await
+            }
+            tokio::time::sleep(backoff.min(expires.saturating_duration_since(Instant::now())))
+                .await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
     }
 
     /// Retain audit identities until their own persisted ban can be reconciled.
@@ -2414,6 +2469,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_audit_failure_retries_until_recovery_clear_or_expiry() {
+        for outcome in ["recover", "clear", "expire"] {
+            let directory =
+                std::env::temp_dir().join(format!("audit_retry_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let app = BotState::new(
+                Default::default(),
+                Db::open(&directory.join("core.db"), 2).unwrap(),
+            )
+            .unwrap();
+            let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+            let audit = 1_212_912_186_163_200_001;
+            db::record_gateway_ban(
+                &app.db,
+                Some(scope.clone()),
+                55,
+                None,
+                None,
+                Some("2024-03-01T00:00:00Z"),
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            if outcome == "expire" {
+                app.gateway_manual_ban_audit_entries
+                    .lock()
+                    .entries
+                    .get_mut(&(10, 55))
+                    .unwrap()[0]
+                    .expires = Instant::now() + Duration::from_secs(6);
+            }
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = {
+                let app = Arc::clone(&app);
+                tokio::spawn(async move {
+                    app.db
+                        .with_conn(move |conn| {
+                            let tx = conn.transaction_immediate()?;
+                            let _ = entered_tx.send(());
+                            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                            tx.commit()
+                        })
+                        .await
+                        .unwrap();
+                })
+            };
+            entered_rx.await.unwrap();
+            let callback = {
+                let app = Arc::clone(&app);
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    crate::handlers::reconcile_pending_gateway_ban_audits(
+                        &app,
+                        Some(scope),
+                        10,
+                        55,
+                    )
+                    .await;
+                })
+            };
+            // Hold past SQLite's five-second busy deadline: the first attempt must fail.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let stopped_after_error = callback.is_finished();
+            if outcome == "clear" {
+                app.clear_gateway_manual_ban_audit_entries(10, 55);
+                app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+            }
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), callback)
+                .await
+                .unwrap()
+                .unwrap();
+            if outcome != "expire" {
+                assert!(
+                    !stopped_after_error,
+                    "transient failure must retain an independent retry"
+                );
+            }
+            let known = db::gateway_manual_ban_audit_entry_is_known(
+                &app.db,
+                Some(scope.clone()),
+                10,
+                55,
+                audit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(known, outcome == "recover", "{outcome}");
+            if outcome == "clear" {
+                assert_eq!(
+                    app.pending_gateway_manual_ban_audit_entries(10, 55),
+                    vec![audit]
+                );
+                assert!(
+                    app.reconcile_gateway_manual_ban_audit_entry(Some(scope), 10, 55, audit)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                assert!(
+                    app.pending_gateway_manual_ban_audit_entries(10, 55)
+                        .is_empty()
+                );
+            }
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_audit_callback_reconciles_without_another_event() {
         let directory =
             std::env::temp_dir().join(format!("cancelled_audit_{:032x}", rand::random::<u128>()));
@@ -2643,9 +2813,6 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         blocker.await.unwrap().unwrap();
-        // The five-second SQLite busy deadline may expire; it must not block
-        // the runtime or alter the next callback's original observation time.
-        let _ = reconciliation.await.unwrap();
         db::record_gateway_ban_with_audit(
             &app.db,
             Some(scope.clone()),
@@ -2674,6 +2841,12 @@ mod tests {
             },
         );
         observation.finish(true).await;
+        // A busy-error retry now waits for the active observation to finish.
+        // Join only after releasing it, preserving the original arrival time.
+        let _ = tokio::time::timeout(Duration::from_secs(8), reconciliation)
+            .await
+            .expect("reconciliation must finish after the observation releases")
+            .unwrap();
         let rows = db::list_enrolled_bans(&app.db, scope, 10).await.unwrap();
         let row = rows.iter().find(|row| row.active).unwrap();
         assert_eq!(row.moderator_id, Some(77));

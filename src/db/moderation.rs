@@ -1177,11 +1177,14 @@ fn attribute_gateway_ban_audit_conn(
     };
     tx.ensure_mutation_receipt()?;
     tx.execute_matching(
-        "UPDATE bans SET moderator_id=?1, moderator_name=?2, reason=?3
-         WHERE guild_id=?4 AND user_id=?5 AND moderator_id IS NULL
+        "UPDATE bans SET moderator_id=?1,
+           moderator_name=CASE WHEN moderator_id=?1 THEN COALESCE(?2, moderator_name) ELSE ?2 END,
+           reason=?3
+         WHERE guild_id=?4 AND user_id=?5 AND operation_id IS NULL
            AND id IN (SELECT CAST(json_extract(data, '$.ban_id') AS INTEGER)
              FROM events WHERE guild_id=?4 AND user_id=?5 AND event_type='member_ban'
-               AND json_valid(data)
+               AND actor_id IS NULL AND json_valid(data)
+               AND json_extract(data, '$.source')='discord'
                AND CAST(json_extract(data, '$.audit_entry_id') AS TEXT)=CAST(?6 AS TEXT))",
         params![
             attribution.moderator_id,
@@ -1191,6 +1194,19 @@ fn attribute_gateway_ban_audit_conn(
             user_id,
             audit_entry_id
         ],
+    )?;
+    // HTTP lookups leave the event actor unresolved. Store the exact actor
+    // atomically with the ban attribution so later replays cannot replace it.
+    tx.execute_matching(
+        "UPDATE events SET actor_id=?1
+         WHERE guild_id=?2 AND user_id=?3 AND event_type='member_ban'
+           AND actor_id IS NULL AND json_valid(data)
+           AND json_extract(data, '$.source')='discord'
+           AND CAST(json_extract(data, '$.audit_entry_id') AS TEXT)=CAST(?4 AS TEXT)
+           AND CAST(json_extract(data, '$.ban_id') AS INTEGER) IN (
+             SELECT id FROM bans WHERE guild_id=?2 AND user_id=?3
+               AND operation_id IS NULL AND moderator_id=?1)",
+        params![attribution.moderator_id, guild_id, user_id, audit_entry_id],
     )?;
     Ok(())
 }

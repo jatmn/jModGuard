@@ -137,13 +137,21 @@ async fn persist_gateway_ban_observation(
     user: u64,
     mut in_flight: crate::state::GatewayBanObservation,
     owned_by_bot: bool,
-    write: impl std::future::Future<Output = anyhow::Result<db::GatewayBanWrite>>,
+    write: impl std::future::Future<Output = anyhow::Result<db::GatewayBanWrite>> + Send + 'static,
 ) -> anyhow::Result<db::GatewayBanWrite> {
     let observed_at_ms = in_flight.observed.timestamp_millis();
     // Cancellation must retry with this captured membership, never a later one.
     in_flight.enrollment = enrollment.clone();
-    let result = write.await;
-    in_flight.finish(result.is_ok()).await;
+    // Keep the write future and its observation in one task. Cancelling the
+    // gateway callback must not discard a result that SQL may already commit.
+    let persistence = tokio::spawn(async move {
+        let result = write.await;
+        in_flight.finish(result.is_ok()).await;
+        result
+    });
+    let result = persistence
+        .await
+        .map_err(|error| anyhow::anyhow!("gateway ban persistence task failed: {error}"))?;
     // finish retries queued audits independently of this callback's lifetime.
     if !owned_by_bot && let Ok(db::GatewayBanWrite::Existing { row_id }) = result {
         // Another audit callback may already have split and acknowledged this
@@ -612,6 +620,11 @@ impl EventHandler for Handler {
         // member_ban event before the audit wait, so an unban during that
         // wait can mark the row inactive. Id-less redeliveries retain bounded
         // observations; only a distinguishing late audit creates another row.
+        let write_app = Arc::clone(&app);
+        let write_enrollment = enrollment.clone();
+        let write_user = banned_user.clone();
+        let write_observed_at = observed_at.clone();
+        let write_operation_id = echo.operation_id.clone();
         let ban_write = crate::logging::log_persistence_result(
             "gateway ban row",
             persist_gateway_ban_observation(
@@ -620,21 +633,24 @@ impl EventHandler for Handler {
                 banned_user.id.get(),
                 in_flight,
                 echo.owned_by_bot,
-                db::record_gateway_ban_with_audit(
-                    &app.db,
-                    enrollment.clone(),
-                    banned_user.id.get() as i64,
-                    Some(&banned_user.name),
-                    banned_user.global_name.as_deref(),
-                    Some(&observed_at),
-                    echo.owned_by_bot,
-                    echo.operation_id.as_deref(),
-                    member_was_banned,
-                    db::GatewayBanAuditEntries::Observed {
-                        pending: pending_audits,
-                        audit_after_ms,
-                    },
-                ),
+                async move {
+                    db::record_gateway_ban_with_audit(
+                        &write_app.db,
+                        write_enrollment,
+                        write_user.id.get() as i64,
+                        Some(&write_user.name),
+                        write_user.global_name.as_deref(),
+                        Some(&write_observed_at),
+                        echo.owned_by_bot,
+                        write_operation_id.as_deref(),
+                        member_was_banned,
+                        db::GatewayBanAuditEntries::Observed {
+                            pending: pending_audits,
+                            audit_after_ms,
+                        },
+                    )
+                    .await
+                },
             )
             .await,
         );
@@ -1593,7 +1609,11 @@ mod tests {
         gateway_ban_row_to_attribute, log_message_diagnostic,
         record_unresolved_gateway_observation, select_update_authors,
     };
-    use crate::{db::Db, logging, state::BotState};
+    use crate::{
+        db::{self, Db},
+        logging,
+        state::BotState,
+    };
     use serenity::model::channel::Message;
     use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
@@ -1603,6 +1623,205 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[tokio::test]
+    async fn exact_audit_replaces_inferred_attribution_but_not_confirmed_facts() {
+        let directory =
+            std::env::temp_dir().join(format!("exact_attribution_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let audit = 1_212_912_186_163_200_001;
+        let write = db::record_gateway_ban(
+            &app.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some("2024-03-01T00:00:00Z"),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let row_id = gateway_ban_row_to_attribute(write).unwrap();
+        db::attribute_enrolled_ban(
+            &app.db,
+            Some(scope.clone()),
+            row_id,
+            55,
+            88,
+            Some("inferred actor"),
+            "inferred reason",
+        )
+        .await
+        .unwrap();
+        db::mark_enrolled_unbanned(&app.db, Some(scope.clone()), 55)
+            .await
+            .unwrap();
+        super::reconcile_received_gateway_ban_audit(
+            &app,
+            Some(scope.clone()),
+            10,
+            55,
+            audit,
+            db::GatewayBanAuditAttribution {
+                moderator_id: 77,
+                moderator_name: None,
+                reason: "exact reason".into(),
+            },
+        )
+        .await;
+        let rows = db::list_enrolled_bans(&app.db, scope.clone(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].moderator_id,
+            Some(77),
+            "exact audit must replace inferred actor"
+        );
+        assert_eq!(rows[0].reason.as_deref(), Some("exact reason"));
+        assert!(
+            rows[0].moderator_name.is_none(),
+            "old actor's name must not follow the new actor"
+        );
+        assert!(!rows[0].active, "attribution must not undo unban");
+        // Neither a conflicting replay nor a later heuristic may replace confirmed facts.
+        super::reconcile_received_gateway_ban_audit(
+            &app,
+            Some(scope.clone()),
+            10,
+            55,
+            audit,
+            db::GatewayBanAuditAttribution {
+                moderator_id: 99,
+                moderator_name: Some("replay".into()),
+                reason: "changed replay".into(),
+            },
+        )
+        .await;
+        db::attribute_enrolled_ban(
+            &app.db,
+            Some(scope.clone()),
+            row_id,
+            55,
+            88,
+            Some("late inferred actor"),
+            "late inferred reason",
+        )
+        .await
+        .unwrap();
+        db::attribute_enrolled_ban(
+            &app.db,
+            Some(scope.clone()),
+            row_id,
+            55,
+            77,
+            Some("confirmed name"),
+            "display reason",
+        )
+        .await
+        .unwrap();
+        let rows = db::list_enrolled_bans(&app.db, scope.clone(), 10)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].moderator_id, Some(77));
+        assert_eq!(rows[0].moderator_name.as_deref(), Some("confirmed name"));
+        assert_eq!(rows[0].reason.as_deref(), Some("exact reason"));
+        let events = db::query_enrolled_events(&app.db, scope, Some("member_ban"), Some(55), 10)
+            .await
+            .unwrap();
+        assert_eq!(events[0].actor_id, Some(77));
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_callback_keeps_write_result_and_observation_together() {
+        let directory =
+            std::env::temp_dir().join(format!("cancelled_write_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let scope = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let audit = 1_212_912_186_163_200_001;
+        let mut observation = app.begin_gateway_ban_observation(10, 55).await;
+        observation.observed = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        app.queue_attributed_gateway_manual_ban_audit_entry(
+            10,
+            55,
+            audit,
+            db::GatewayBanAuditAttribution {
+                moderator_id: 77,
+                moderator_name: None,
+                reason: "committed reason".into(),
+            },
+        );
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let callback = {
+            let app = std::sync::Arc::clone(&app);
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                let write_app = std::sync::Arc::clone(&app);
+                let write_scope = scope.clone();
+                super::persist_gateway_ban_observation(
+                    &app,
+                    Some(scope),
+                    55,
+                    observation,
+                    false,
+                    async move {
+                        let result = db::record_gateway_ban(
+                            &write_app.db,
+                            Some(write_scope),
+                            55,
+                            None,
+                            None,
+                            Some("2024-03-01T00:00:00Z"),
+                            false,
+                            None,
+                            false,
+                        )
+                        .await;
+                        let _ = committed_tx.send(());
+                        let _ = release_rx.await;
+                        result
+                    },
+                )
+                .await
+            })
+        };
+        committed_rx.await.unwrap();
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !app
+                .pending_gateway_manual_ban_audit_entries(10, 55)
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("caller cancellation must not discard a committed write result");
+        let rows = db::list_enrolled_bans(&app.db, scope, 10).await.unwrap();
+        assert_eq!(rows[0].moderator_id, Some(77));
+        assert_eq!(rows[0].reason.as_deref(), Some("committed reason"));
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -1648,43 +1867,47 @@ mod tests {
                 55,
                 in_flight,
                 false,
-                async {
-                    if !after_write {
-                        app.queue_attributed_gateway_manual_ban_audit_entry(
-                            10,
-                            55,
-                            audit,
-                            crate::db::GatewayBanAuditAttribution {
-                                moderator_id: 77,
-                                moderator_name: None,
-                                reason: "second ban reason".into(),
-                            },
-                        );
-                        super::reconcile_pending_gateway_ban_audits(
-                            &app,
+                {
+                    let app = std::sync::Arc::clone(&app);
+                    let scope = scope.clone();
+                    async move {
+                        if !after_write {
+                            app.queue_attributed_gateway_manual_ban_audit_entry(
+                                10,
+                                55,
+                                audit,
+                                crate::db::GatewayBanAuditAttribution {
+                                    moderator_id: 77,
+                                    moderator_name: None,
+                                    reason: "second ban reason".into(),
+                                },
+                            );
+                            super::reconcile_pending_gateway_ban_audits(
+                                &app,
+                                Some(scope.clone()),
+                                10,
+                                55,
+                            )
+                            .await;
+                            assert_eq!(
+                                app.pending_gateway_manual_ban_audit_entries(10, 55),
+                                vec![audit]
+                            );
+                        }
+                        crate::db::record_gateway_ban_with_audit(
+                            &app.db,
                             Some(scope.clone()),
-                            10,
                             55,
+                            None,
+                            None,
+                            Some("2024-03-01T00:00:30Z"),
+                            false,
+                            None,
+                            true,
+                            crate::db::GatewayBanAuditEntries::Pending(pending),
                         )
-                        .await;
-                        assert_eq!(
-                            app.pending_gateway_manual_ban_audit_entries(10, 55),
-                            vec![audit]
-                        );
+                        .await
                     }
-                    crate::db::record_gateway_ban_with_audit(
-                        &app.db,
-                        Some(scope.clone()),
-                        55,
-                        None,
-                        None,
-                        Some("2024-03-01T00:00:30Z"),
-                        false,
-                        None,
-                        true,
-                        crate::db::GatewayBanAuditEntries::Pending(pending),
-                    )
-                    .await
                 },
             )
             .await
@@ -1993,57 +2216,61 @@ mod tests {
                 55,
                 app.begin_gateway_ban_observation(10, 55).await,
                 false,
-                async {
-                    if matches!(arrival, "before_commit" | "read_error") {
-                        if arrival == "read_error" {
-                            app.db
-                                .with_conn(|conn| {
-                                    conn.execute_batch_bounded(
-                                        "ALTER TABLE events RENAME TO unavailable_events",
-                                        4096,
-                                    )?;
-                                    Ok(())
-                                })
-                                .await
-                                .unwrap();
+                {
+                    let app = std::sync::Arc::clone(&app);
+                    let enrollment = enrollment.clone();
+                    async move {
+                        if matches!(arrival, "before_commit" | "read_error") {
+                            if arrival == "read_error" {
+                                app.db
+                                    .with_conn(|conn| {
+                                        conn.execute_batch_bounded(
+                                            "ALTER TABLE events RENAME TO unavailable_events",
+                                            4096,
+                                        )?;
+                                        Ok(())
+                                    })
+                                    .await
+                                    .unwrap();
+                            }
+                            app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
+                            super::reconcile_pending_gateway_ban_audits(
+                                &app,
+                                Some(enrollment.clone()),
+                                10,
+                                55,
+                            )
+                            .await;
+                            assert_eq!(
+                                app.pending_gateway_manual_ban_audit_entries(10, 55),
+                                vec![audit]
+                            );
+                            if arrival == "read_error" {
+                                app.db
+                                    .with_conn(|conn| {
+                                        conn.execute_batch_bounded(
+                                            "ALTER TABLE unavailable_events RENAME TO events",
+                                            4096,
+                                        )?;
+                                        Ok(())
+                                    })
+                                    .await
+                                    .unwrap();
+                            }
                         }
-                        app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
-                        super::reconcile_pending_gateway_ban_audits(
-                            &app,
+                        crate::db::record_gateway_ban(
+                            &app.db,
                             Some(enrollment.clone()),
-                            10,
                             55,
+                            None,
+                            None,
+                            Some("2024-03-01T00:00:00Z"),
+                            false,
+                            None,
+                            false,
                         )
-                        .await;
-                        assert_eq!(
-                            app.pending_gateway_manual_ban_audit_entries(10, 55),
-                            vec![audit]
-                        );
-                        if arrival == "read_error" {
-                            app.db
-                                .with_conn(|conn| {
-                                    conn.execute_batch_bounded(
-                                        "ALTER TABLE unavailable_events RENAME TO events",
-                                        4096,
-                                    )?;
-                                    Ok(())
-                                })
-                                .await
-                                .unwrap();
-                        }
+                        .await
                     }
-                    crate::db::record_gateway_ban(
-                        &app.db,
-                        Some(enrollment.clone()),
-                        55,
-                        None,
-                        None,
-                        Some("2024-03-01T00:00:00Z"),
-                        false,
-                        None,
-                        false,
-                    )
-                    .await
                 },
             )
             .await
