@@ -6261,6 +6261,7 @@ async fn coverage_gap_mark_rolls_back_when_the_admitted_owner_is_cleared_before_
 
 #[tokio::test]
 async fn coverage_gap_receipt_admission_fails_before_begin() {
+    let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
     let (_f, store, scope) = ready_with_probe(&probe).await;
     complete_for_checks(&store, &scope).await;
@@ -6275,6 +6276,18 @@ async fn coverage_gap_receipt_admission_fails_before_begin() {
         })
         .await
         .unwrap();
+    let queries_before_admission = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let queries_for_hook = queries_before_admission.clone();
+    let probe_for_hook = probe.clone();
+    super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
+        store.db.path(),
+        Some(Box::new(move || {
+            queries_for_hook.store(
+                probe_for_hook.queries(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        })),
+    );
     let immediate = probe.immediate();
     let error = store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
@@ -6289,19 +6302,27 @@ async fn coverage_gap_receipt_admission_fails_before_begin() {
         immediate,
         "restore admission must fail before BEGIN IMMEDIATE"
     );
+    assert_eq!(
+        probe.queries() - queries_before_admission.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "receipt admission must read the restore fence in a single query"
+    );
     let status = store.member_sync_status(scope, 42, 3_001).await.unwrap();
     assert!(!status.reconciliation_needed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
+async fn assert_restore_fence_after_admission_rolls_back(
+    meta_present: bool,
+    meta_name: &'static str,
+) {
     use crate::db::tests::remote_stream::HranaFixture;
     use std::time::Duration;
 
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (f, local, scope) = ready().await;
     complete_for_checks(&local, &scope).await;
-    local
+    if meta_present {
+        local
         .db
         .with_conn(|conn| {
             conn.execute_batch_bounded(
@@ -6312,6 +6333,7 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
         })
         .await
         .unwrap();
+    }
     let (_fixture, db) =
         HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5)).await;
     let remote = GuildDataStore {
@@ -6323,6 +6345,7 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
         .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
         .await
         .unwrap();
+    let before = coverage_gap_persisted_mark(&local).await;
     let local_for_hook = local.clone();
     super::super::member_directory::test_set_coverage_gap_after_receipt_admission(
         remote.db.path(),
@@ -6331,9 +6354,15 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
                 handle.block_on(async {
                     local_for_hook
                         .db
-                        .with_conn(|conn| {
+                        .with_conn(move |conn| {
                             let mut tx = conn.transaction_primary_read()?;
                             tx.ensure_mutation_receipt()?;
+                            if !meta_present {
+                                tx.execute_batch_bounded(
+                                    &format!("CREATE TABLE {meta_name}(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta(key,value) VALUES('restore_fence','0');"),
+                                    64 * 1024 * 1024,
+                                )?;
+                            }
                             tx.execute_bounded(
                                 "UPDATE meta SET value='1' WHERE key='restore_fence'",
                                 (),
@@ -6360,9 +6389,22 @@ async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
         error.to_string().contains("restore is in progress"),
         "{error:#}"
     );
+    assert_eq!(coverage_gap_persisted_mark(&local).await, before);
     let status = local.member_sync_status(scope, 42, 4_001).await.unwrap();
     assert_eq!(status.reconciliation_reason.as_deref(), Some("first_gap"));
     assert!(status.reconciliation_needed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_restore_fence_after_admission_rolls_back_the_mark() {
+    assert_restore_fence_after_admission_rolls_back(true, "meta").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_gap_meta_created_after_admission_rolls_back_the_mark() {
+    for meta_name in ["meta", "META", "mEtA"] {
+        assert_restore_fence_after_admission_rolls_back(false, meta_name).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
