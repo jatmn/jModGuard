@@ -4,6 +4,7 @@
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::gateway::ActivityData;
+use serenity::http::{LightMethod, RatelimitInfo};
 use serenity::model::channel::{GuildChannel, Message, PartialGuildChannel};
 use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent, ResumedEvent};
 use serenity::model::gateway::Ready;
@@ -13,6 +14,7 @@ use serenity::model::prelude::{ChannelId, User};
 use serenity::model::voice::VoiceState;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::automod::{MsgCtx, execute_pending};
 use crate::commands;
@@ -29,6 +31,197 @@ impl Handler {
     fn app(&self) -> &Arc<BotState> {
         &self.app
     }
+
+    // Serenity spawns this hook and does not await it before sleeping. The sleep
+    // covers both a real provider throttle and a pre-emptive empty bucket. This
+    // function awaits the pacing write before it returns. A late commit cannot
+    // shorten `request_after_ms` because the SQL keeps the max.
+    pub(crate) async fn record_rate_limit_wait(&self, wait: RateLimitWait) {
+        let _logged = note_rate_limit_wait(&self.app, &wait, Instant::now());
+        if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
+            return;
+        }
+        let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
+        self.app.arm_member_sync_rate_limit(deadline);
+        self.app.persist_pending_member_sync_rate_limit().await;
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RateLimitWait {
+    pub timeout: Duration,
+    #[allow(dead_code)]
+    pub limit: i64,
+    pub method: LightMethod,
+    pub path: String,
+    pub global: bool,
+}
+
+pub(crate) fn member_sync_deadline_ms(now_ms: i64, timeout: Duration) -> i64 {
+    now_ms.saturating_add(timeout.as_millis().min(i64::MAX as u128) as i64)
+}
+
+pub(crate) fn member_sync_rate_limit_route(global: bool, path: &str) -> bool {
+    global || path.contains("/members") || path.contains("/bans") || path.contains("/audit-logs")
+}
+
+fn scrub_rate_limit_query(query: &str, token: &str) -> String {
+    query
+        .split('&')
+        .map(|piece| {
+            if let Some((key, value)) = piece.split_once('=') {
+                let value = if value == token { "{token}" } else { value };
+                format!("{key}={value}")
+            } else if piece == token {
+                "{token}".to_string()
+            } else {
+                piece.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+pub(crate) fn redact_rate_limit_path(path: &str) -> String {
+    let (route_plus_query, fragment_opt) = match path.split_once('#') {
+        Some((route_plus_query, fragment)) => (route_plus_query, Some(fragment)),
+        None => (path, None),
+    };
+    let (route, query_opt) = match route_plus_query.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (route_plus_query, None),
+    };
+
+    let (origin, path_part) = if let Some(rest) = route.strip_prefix("https://") {
+        match rest.find('/') {
+            Some(slash_idx) => (
+                route[..8 + slash_idx].to_string(),
+                route[8 + slash_idx..].to_string(),
+            ),
+            None => return path.to_string(),
+        }
+    } else if let Some(rest) = route.strip_prefix("http://") {
+        match rest.find('/') {
+            Some(slash_idx) => (
+                route[..7 + slash_idx].to_string(),
+                route[7 + slash_idx..].to_string(),
+            ),
+            None => return path.to_string(),
+        }
+    } else {
+        (String::new(), route.to_string())
+    };
+
+    if !path_part.starts_with('/') {
+        return path.to_string();
+    }
+
+    let segments: Vec<&str> = path_part.split('/').collect();
+    let mut token_segment_idx: Option<usize> = None;
+    let mut original_token: Option<&str> = None;
+    let mut idx = 0;
+    while idx < segments.len() {
+        if segments[idx] == "webhooks" {
+            let candidate = idx + 2;
+            if candidate < segments.len() && !segments[candidate].is_empty() {
+                token_segment_idx = Some(candidate);
+                original_token = Some(segments[candidate]);
+                break;
+            }
+        } else if segments[idx] == "interactions" {
+            let token_candidate = idx + 2;
+            let callback_candidate = idx + 3;
+            if callback_candidate < segments.len()
+                && segments[callback_candidate] == "callback"
+                && token_candidate < segments.len()
+                && !segments[token_candidate].is_empty()
+            {
+                token_segment_idx = Some(token_candidate);
+                original_token = Some(segments[token_candidate]);
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    let Some(token_segment_idx) = token_segment_idx else {
+        return path.to_string();
+    };
+    let token = original_token.unwrap();
+
+    let mut redacted_segments = segments;
+    redacted_segments[token_segment_idx] = "{token}";
+    let redacted_path = redacted_segments.join("/");
+
+    let mut result = format!("{origin}{redacted_path}");
+    if let Some(query) = query_opt {
+        result.push('?');
+        result.push_str(&scrub_rate_limit_query(query, token));
+    }
+    if let Some(fragment) = fragment_opt {
+        result.push('#');
+        if fragment == token {
+            result.push_str("{token}");
+        } else {
+            result.push_str(fragment);
+        }
+    }
+    result
+}
+
+pub(crate) fn rate_limit_throttle_key(
+    method: LightMethod,
+    global: bool,
+    redacted_path: &str,
+) -> String {
+    let scope = if global { "global" } else { "route" };
+    format!(
+        "{method:?} {scope} {}",
+        normalize_rate_limit_route(redacted_path)
+    )
+}
+
+fn normalize_rate_limit_route(path: &str) -> String {
+    let without_fragment = path.split_once('#').map(|(head, _)| head).unwrap_or(path);
+    let route = without_fragment
+        .split_once('?')
+        .map(|(head, _)| head)
+        .unwrap_or(without_fragment);
+    let mut out = String::with_capacity(route.len());
+    for (index, segment) in route.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            out.push_str("{id}");
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+pub(crate) fn note_rate_limit_wait(
+    app: &crate::state::BotState,
+    wait: &RateLimitWait,
+    now: Instant,
+) -> bool {
+    let path = redact_rate_limit_path(&wait.path);
+    let key = rate_limit_throttle_key(wait.method, wait.global, &path);
+    let mut logged_at = app.rate_limit_wait_logged_at.lock();
+    logged_at.retain(|_, logged| now.saturating_duration_since(*logged) < Duration::from_secs(60));
+    if logged_at.contains_key(&key) {
+        return false;
+    }
+    logged_at.insert(key, now);
+    tracing::warn!(
+        method = ?wait.method,
+        path = %path,
+        global = wait.global,
+        timeout_ms = u64::try_from(wait.timeout.as_millis()).unwrap_or(u64::MAX),
+        "rate-limit wait"
+    );
+    true
 }
 
 pub(crate) fn clear_remembered_if_bot_roles_changed(
@@ -304,6 +497,17 @@ fn warn_empty_content_once() {
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn ratelimit(&self, data: RatelimitInfo) {
+        self.record_rate_limit_wait(RateLimitWait {
+            timeout: data.timeout,
+            limit: data.limit,
+            method: data.method,
+            path: data.path,
+            global: data.global,
+        })
+        .await;
+    }
+
     async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
         if !self.app.activation.allows_rule_trigger() {
             return;
@@ -3367,6 +3571,1116 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(actor, Some(42));
         drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::{
+        Handler, RateLimitWait, member_sync_deadline_ms, note_rate_limit_wait,
+        redact_rate_limit_path,
+    };
+    use crate::config::BotProcessConfig;
+    use crate::db::Db;
+    use crate::logging::persistence_log_tests::CapturedLog;
+    use crate::state::BotState;
+    use jmodguard::db::SqlExecutor;
+    use serenity::http::LightMethod;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use tracing::instrument::WithSubscriber;
+
+    fn wait(timeout: Duration, method: LightMethod, path: &str, global: bool) -> RateLimitWait {
+        RateLimitWait {
+            timeout,
+            limit: 5,
+            method,
+            path: path.into(),
+            global,
+        }
+    }
+
+    async fn test_state() -> (std::path::PathBuf, Arc<BotState>, Handler) {
+        let directory =
+            std::env::temp_dir().join(format!("rate_limit_hook_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("core.db");
+        let mut cfg = BotProcessConfig::default();
+        cfg.db.path = db_path;
+        let app = BotState::new(cfg, Db::open(&directory.join("core.db"), 2).unwrap()).unwrap();
+        let handler = Handler {
+            app: Arc::clone(&app),
+        };
+        (directory, app, handler)
+    }
+
+    fn rate_limit_wait_lines(text: &str) -> usize {
+        text.lines()
+            .filter(|line| line.contains("rate-limit wait"))
+            .count()
+    }
+
+    async fn pacing_deadline(app: &BotState, bot_id: i64) -> Option<i64> {
+        app.db
+            .with_conn(move |conn| {
+                let present: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM member_sync_pacing WHERE bot_id=?1",
+                    [bot_id],
+                    |row| Ok(row.get(0)?),
+                )?;
+                if present == 0 {
+                    return Ok(None);
+                }
+                conn.query_row(
+                    "SELECT request_after_ms FROM member_sync_pacing WHERE bot_id=?1",
+                    [bot_id],
+                    |row| Ok(row.get(0)?),
+                )
+                .map(Some)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_saves_simulated_member_deadline() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let member_wait = wait(
+            Duration::from_secs(60),
+            LightMethod::Get,
+            "/guilds/1/members",
+            false,
+        );
+        let before = chrono::Utc::now().timestamp_millis();
+        handler
+            .record_rate_limit_wait(member_wait.clone())
+            .with_subscriber(log.dispatch())
+            .await;
+        let after = chrono::Utc::now().timestamp_millis();
+        let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(stored >= before + 60_000 && stored <= after + 60_000);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 1);
+        assert!(text.contains("WARN"));
+        assert!(text.contains("/guilds/1/members"));
+        assert!(text.contains("Get"));
+        assert!(!text.contains("429"));
+        let first_stored = stored;
+        handler
+            .record_rate_limit_wait(member_wait)
+            .with_subscriber(log.dispatch())
+            .await;
+        assert_eq!(rate_limit_wait_lines(&log.text()), 1);
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) >= first_stored);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_deadline_blocks_claims_after_reopen() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let deadline = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        let db_path = app.db.path().to_path_buf();
+        drop(handler);
+        drop(app);
+
+        let reopened = Db::open(&db_path, 2).unwrap();
+        assert!(
+            crate::db::claim_member_sync_request(
+                &reopened,
+                42,
+                "after-restart".into(),
+                deadline - 1,
+                15_000,
+                90_000,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            crate::db::claim_member_sync_request(
+                &reopened,
+                42,
+                "after-restart".into(),
+                deadline,
+                15_000,
+                90_000,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_filter_matches_the_replaced_callback() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(5),
+                LightMethod::Get,
+                "/channels/1/messages",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        assert_eq!(
+            app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+        assert_eq!(rate_limit_wait_lines(&log.text()), 1);
+
+        let mut previous = 0;
+        for (timeout_secs, path, global) in [
+            (30u64, "/guilds/1/members", false),
+            (60, "/guilds/1/bans", false),
+            (90, "/guilds/1/audit-logs", false),
+            (120, "/gateway/bot", true),
+        ] {
+            handler
+                .record_rate_limit_wait(wait(
+                    Duration::from_secs(timeout_secs),
+                    LightMethod::Get,
+                    path,
+                    global,
+                ))
+                .with_subscriber(dispatch.clone())
+                .await;
+            let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+            assert!(
+                stored > previous,
+                "{path} must extend the member-sync deadline"
+            );
+            assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+            previous = stored;
+        }
+        // `thread-members` does not contain the `/members` needle, so the old
+        // callback did not arm the gate for it. The wait is still logged.
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(150),
+                LightMethod::Get,
+                "/channels/1/thread-members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        assert_eq!(
+            app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+            previous
+        );
+        assert_eq!(pacing_deadline(&app, 42).await, Some(previous));
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 6);
+        assert!(!text.contains("429"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limit_wait_log_throttles_per_route() {
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+        let members = wait(
+            Duration::from_secs(1),
+            LightMethod::Get,
+            "/guilds/1/members",
+            false,
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(&app, &members, t0));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &members,
+                t0 + Duration::from_secs(30)
+            ));
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    "/guilds/1/members",
+                    false,
+                ),
+                t0,
+            ));
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/channels/1/messages",
+                    false,
+                ),
+                t0,
+            ));
+            assert!(note_rate_limit_wait(
+                &app,
+                &members,
+                t0 + Duration::from_secs(60),
+            ));
+        });
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 4);
+        assert!(!text.contains("429"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_routes_commit_the_max_deadline() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let handler = Arc::new(handler);
+        let tasks = [
+            (Duration::from_secs(30), "/guilds/1/members"),
+            (Duration::from_secs(90), "/guilds/1/bans"),
+            (Duration::from_secs(120), "/channels/9/messages"),
+        ];
+        let mut joins = Vec::new();
+        for (timeout, path) in tasks {
+            let handler = Arc::clone(&handler);
+            let dispatch = dispatch.clone();
+            joins.push(tokio::spawn(async move {
+                handler
+                    .record_rate_limit_wait(wait(timeout, LightMethod::Get, path, false))
+                    .with_subscriber(dispatch)
+                    .await;
+            }));
+        }
+        for join in joins {
+            join.await.unwrap();
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        let bans_deadline = member_sync_deadline_ms(now_ms, Duration::from_secs(90));
+        let messages_deadline = member_sync_deadline_ms(now_ms, Duration::from_secs(120));
+        assert!(stored >= member_sync_deadline_ms(now_ms, Duration::from_secs(30)));
+        assert!(stored <= bans_deadline + 2_000);
+        assert!(stored < messages_deadline - 10_000);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+        assert_eq!(rate_limit_wait_lines(&log.text()), 3);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_write_back_cannot_shorten_the_deadline() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        let high = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(10),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        assert_eq!(
+            app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+            high
+        );
+        assert_eq!(pacing_deadline(&app, 42).await, Some(high));
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(120),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(dispatch)
+            .await;
+        let newer = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(newer > high);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(newer));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_pacing_write_rolls_back_and_retry_persists() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(30),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let kept = pacing_deadline(&app, 42).await.unwrap();
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let advanced = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(advanced > kept);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
+        let text = log.text();
+        assert!(text.contains("failed to persist Discord retry deadline"));
+        assert!(text.contains("fixture pacing failure"));
+        assert!(text.contains("/guilds/1/bans"));
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536)
+            })
+            .await
+            .unwrap();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let final_deadline = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(final_deadline > kept);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(final_deadline));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_bot_id_does_not_persist_or_log_a_pacing_error() {
+        let (directory, app, handler) = test_state().await;
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > 0);
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+        assert_eq!(pacing_deadline(&app, 0).await, None);
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 1);
+        assert!(!text.contains("failed to persist"));
+        assert!(!text.contains("429"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_deadline_is_persisted_when_the_member_sync_loop_publishes_the_bot_id() {
+        use serenity::all::{Cache, CurrentUser, UserUpdateEvent};
+        use std::sync::Arc;
+
+        let (directory, app, handler) = test_state().await;
+        assert_eq!(app.member_sync_bot_id.load(Ordering::Relaxed), 0);
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(stored > 0);
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+        assert!(!log.text().contains("failed to persist"));
+
+        let cache = Arc::new(Cache::new());
+        let mut user = CurrentUser::default();
+        user.id = serenity::model::id::UserId::new(42);
+        let mut event: UserUpdateEvent =
+            serde_json::from_value(serde_json::to_value(user).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let worker = tokio::spawn(crate::member_sync::run(
+            app.clone(),
+            Arc::new(serenity::http::Http::new("unused")),
+            cache,
+        ));
+        let poll = tokio::time::timeout(Duration::from_secs(5), async {
+            while pacing_deadline(&app, 42).await != Some(stored) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        assert!(poll.is_ok());
+        assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+        assert_eq!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Relaxed)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_pacing_write_retries_when_the_bot_id_is_published_again() {
+        let (directory, app, handler) = test_state().await;
+        let log = CapturedLog::default();
+        app.publish_member_sync_bot_id(42).await;
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(30),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let kept = pacing_deadline(&app, 42).await.unwrap();
+
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let advanced = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(advanced > kept);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
+        let text = log.text();
+        assert!(text.contains("failed to persist Discord retry deadline"));
+        assert!(text.contains("fixture pacing failure"));
+
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536)
+            })
+            .await
+            .unwrap();
+
+        app.publish_member_sync_bot_id(42).await;
+        assert_eq!(
+            pacing_deadline(&app, 42).await,
+            Some(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed))
+        );
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > kept);
+        assert_eq!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Relaxed)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_wait_logs_after_a_local_wait_on_the_same_route() {
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+        let members = wait(
+            Duration::from_secs(1),
+            LightMethod::Get,
+            "/guilds/1/members",
+            false,
+        );
+        let global_members = wait(
+            Duration::from_secs(1),
+            LightMethod::Get,
+            "/guilds/1/members",
+            true,
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(&app, &members, t0));
+            assert!(note_rate_limit_wait(
+                &app,
+                &global_members,
+                t0 + Duration::from_secs(30)
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &global_members,
+                t0 + Duration::from_secs(40)
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &members,
+                t0 + Duration::from_secs(30)
+            ));
+        });
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 2);
+        assert!(text.contains("global=true"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_resource_ids_share_one_throttle_key() {
+        use serenity::http::Route;
+        use serenity::model::id::InteractionId;
+
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/1/members",
+                    false,
+                ),
+                t0,
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/999/members",
+                    false,
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+        });
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], "Get route /guilds/{id}/members");
+        assert!(!keys[0].contains("/guilds/1"));
+        assert!(!keys[0].contains("/guilds/999"));
+        assert!(log.text().contains("/guilds/1/members"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/3/bans",
+                    false,
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+        });
+
+        let post_path_a = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        let post_path_b = Route::InteractionResponse {
+            interaction_id: InteractionId::new(201),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_path_a,
+                    false
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_path_b,
+                    false
+                ),
+                t0 + Duration::from_secs(2),
+            ));
+        });
+        let text = log.text();
+        assert!(!text.contains(TOKEN_A));
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let interaction_key =
+            "Post route https://discord.com/api/v10/interactions/{id}/{token}/callback";
+        assert!(keys.iter().any(|key| key == interaction_key));
+        assert!(
+            keys.iter()
+                .all(|key| !key.contains("/interactions/200/")
+                    && !key.contains("/interactions/201/"))
+        );
+        for key in &keys {
+            assert!(!key.contains(TOKEN_A));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn deadline_millis_clamps_to_i64() {
+        assert_eq!(member_sync_deadline_ms(10, Duration::MAX), i64::MAX);
+        assert_eq!(member_sync_deadline_ms(10, Duration::from_millis(5)), 15);
+        assert_eq!(
+            member_sync_deadline_ms(i64::MAX, Duration::from_millis(1)),
+            i64::MAX
+        );
+    }
+
+    const TOKEN_A: &str = "synthetic_token_r4303412353";
+    const TOKEN_B: &str = "synthetic_token_r4303412353_other";
+
+    #[test]
+    fn redact_rate_limit_path_keeps_safe_routes_and_edges() {
+        use serenity::http::Route;
+        use serenity::model::id::{ApplicationId, InteractionId, MessageId, WebhookId};
+
+        let serenity_pairs = [
+            (
+                Route::WebhookOriginalInteractionResponse {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/@original".to_string(),
+            ),
+            (
+                Route::InteractionResponse {
+                    interaction_id: InteractionId::new(200),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/interactions/200/{token}/callback".to_string(),
+            ),
+            (
+                Route::WebhookWithToken {
+                    webhook_id: WebhookId::new(300),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300/{token}".to_string(),
+            ),
+            (
+                Route::WebhookFollowupMessages {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}".to_string(),
+            ),
+            (
+                Route::WebhookMessage {
+                    webhook_id: WebhookId::new(300),
+                    token: TOKEN_A,
+                    message_id: MessageId::new(55),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300/{token}/messages/55".to_string(),
+            ),
+            (
+                Route::WebhookFollowupMessage {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                    message_id: MessageId::new(55),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/55".to_string(),
+            ),
+            (
+                Route::Webhook {
+                    webhook_id: WebhookId::new(300),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300".to_string(),
+            ),
+        ];
+        for (input, expected) in serenity_pairs {
+            assert!(
+                input.contains(TOKEN_A) || !expected.contains("{token}"),
+                "Serenity must expand live tokens in route paths"
+            );
+            let redacted = redact_rate_limit_path(&input);
+            assert_eq!(redacted, expected);
+            assert!(!redacted.contains(TOKEN_A));
+            if expected.contains("messages/55") {
+                assert!(redacted.contains("55"));
+            }
+        }
+
+        let pairs = [
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original",
+                "/webhooks/100/{token}/messages/@original",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback",
+                "/interactions/200/{token}/callback",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/55",
+                "/webhooks/100/{token}/messages/55",
+            ),
+            (
+                "/webhooks/300/synthetic_token_r4303412353/slack",
+                "/webhooks/300/{token}/slack",
+            ),
+            (
+                "/webhooks/300/synthetic_token_r4303412353/github",
+                "/webhooks/300/{token}/github",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original/extra",
+                "/webhooks/100/{token}/messages/@original/extra",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback/extra",
+                "/interactions/200/{token}/callback/extra",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/",
+                "/webhooks/100/{token}/",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original/",
+                "/webhooks/100/{token}/messages/@original/",
+            ),
+            (
+                "/webhooks//synthetic_token_r4303412353/messages/@original",
+                "/webhooks//{token}/messages/@original",
+            ),
+            (
+                "https://discord.com/api/v10/webhooks/100/synthetic_token_r4303412353/messages/@original?wait=true",
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/@original?wait=true",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353?wait=true&token=synthetic_token_r4303412353",
+                "/webhooks/100/{token}?wait=true&token={token}",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback?wait=true",
+                "/interactions/200/{token}/callback?wait=true",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original?",
+                "/webhooks/100/{token}/messages/@original?",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original#frag",
+                "/webhooks/100/{token}/messages/@original#frag",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353#synthetic_token_r4303412353",
+                "/webhooks/100/{token}#{token}",
+            ),
+            (
+                "http://discord.com:443/api/v10/webhooks/100/synthetic_token_r4303412353/messages/@original",
+                "http://discord.com:443/api/v10/webhooks/100/{token}/messages/@original",
+            ),
+        ];
+        for (input, expected) in pairs {
+            let redacted = redact_rate_limit_path(input);
+            assert_eq!(redacted, expected);
+            assert!(!redacted.contains(TOKEN_A));
+            if expected.contains("messages/55") || input.contains("/messages/55") {
+                assert!(redacted.contains("55"));
+            }
+        }
+
+        let unchanged = [
+            "",
+            "/guilds/1/members",
+            "/guilds/1/bans",
+            "/guilds/1/audit-logs",
+            "/channels/1/messages",
+            "/channels/1/thread-members",
+            "/gateway/bot",
+            "/channels/1/webhooks",
+            "/guilds/1/webhooks",
+            "/webhooks/300",
+            "/webhooks/300/",
+            "/interactions/200",
+            "/interactions/200/",
+            "/interactions/200/callback",
+            "/interactions/200/synthetic_token_r4303412353",
+            "webhooks/100/synthetic_token_r4303412353",
+            "https://discord.com/api/v10",
+            "https://discord.com/api/v10/guilds/1/members",
+            "https://discord.com/api/v10/channels/1/webhooks",
+            "/guilds/1/members?limit=1000",
+            "/guilds/1/members?token=synthetic_token_r4303412353",
+        ];
+        for input in unchanged {
+            assert_eq!(redact_rate_limit_path(input), input);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limit_wait_log_redacts_interaction_tokens() {
+        use serenity::http::Route;
+        use serenity::model::id::{ApplicationId, InteractionId};
+
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+
+        let patch_path = Route::WebhookOriginalInteractionResponse {
+            application_id: ApplicationId::new(100),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        let post_path = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        assert!(patch_path.contains(TOKEN_A));
+        assert!(post_path.contains(TOKEN_A));
+
+        let patch_b_path = Route::WebhookOriginalInteractionResponse {
+            application_id: ApplicationId::new(100),
+            token: TOKEN_B,
+        }
+        .path()
+        .into_owned();
+        let post_b_path = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_B,
+        }
+        .path()
+        .into_owned();
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_path,
+                    false
+                ),
+                t0,
+            ));
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(Duration::from_secs(1), LightMethod::Post, &post_path, false),
+                t0,
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_b_path,
+                    false
+                ),
+                t0 + Duration::from_secs(30),
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_b_path,
+                    false
+                ),
+                t0 + Duration::from_secs(30),
+            ));
+        });
+
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 2);
+        assert!(text.contains("WARN"));
+        assert!(text.contains("Patch"));
+        assert!(text.contains("Post"));
+        assert!(text.contains("{token}"));
+        assert!(text.contains("/messages/@original"));
+        assert!(text.contains("/callback"));
+        assert!(!text.contains(TOKEN_A));
+        assert!(!text.contains(TOKEN_B));
+        assert!(!text.contains("429"));
+
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2);
+        let expected_keys = [
+            "Patch route https://discord.com/api/v10/webhooks/{id}/{token}/messages/@original"
+                .to_string(),
+            "Post route https://discord.com/api/v10/interactions/{id}/{token}/callback".to_string(),
+        ];
+        for key in &expected_keys {
+            assert!(keys.contains(key));
+            assert!(!key.contains(TOKEN_A));
+            assert!(!key.contains(TOKEN_B));
+        }
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_path,
+                    false
+                ),
+                t0 + Duration::from_secs(60),
+            ));
+        });
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 3);
+        assert!(!text.contains(TOKEN_A));
+        assert!(!text.contains(TOKEN_B));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_token_segment_does_not_arm_member_sync() {
+        const RAW_TOKEN: &str = "synthetic_token_r4303412353";
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+
+        for path in [
+            "https://discord.com/api/v10/webhooks/42/members",
+            "https://discord.com/api/v10/webhooks/42/bans",
+            "https://discord.com/api/v10/webhooks/42/audit-logs",
+        ] {
+            handler
+                .record_rate_limit_wait(wait(
+                    Duration::from_secs(30),
+                    LightMethod::Get,
+                    path,
+                    false,
+                ))
+                .with_subscriber(dispatch.clone())
+                .await;
+            assert_eq!(
+                app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(pacing_deadline(&app, 42).await, None);
+        }
+
+        let text = log.text();
+        assert!(!text.contains("/webhooks/42/members"));
+        assert!(!text.contains("/webhooks/42/bans"));
+        assert!(!text.contains("/webhooks/42/audit-logs"));
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        let members_deadline = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(members_deadline > 0);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(members_deadline));
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                &format!("https://discord.com/api/v10/webhooks/42/{}", RAW_TOKEN),
+                true,
+            ))
+            .with_subscriber(dispatch)
+            .await;
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > members_deadline);
+        let text = log.text();
+        assert!(!text.contains(RAW_TOKEN));
+        assert!(!text.contains("/webhooks/42/members"));
+        assert!(!text.contains("/webhooks/42/bans"));
+        assert!(!text.contains("/webhooks/42/audit-logs"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

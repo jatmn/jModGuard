@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::automod::AutomodEngine;
@@ -860,6 +860,11 @@ pub struct BotState {
     /// Wakes the member-sync loop before its saved attempt, without dropping
     /// that cache. Dashboard sync controls use this.
     pub(crate) member_sync_wake: tokio::sync::Notify,
+    pub(crate) member_sync_rate_limit_until_ms: AtomicI64,
+    pub(crate) member_sync_rate_limit_epoch: AtomicU64,
+    pub(crate) member_sync_rate_limit_persisted_epoch: AtomicU64,
+    pub(crate) member_sync_bot_id: AtomicI64,
+    pub(crate) rate_limit_wait_logged_at: parking_lot::Mutex<HashMap<String, Instant>>,
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
@@ -959,6 +964,11 @@ impl BotState {
             gateway_ready_generation: AtomicU64::new(0),
             member_scope_epoch: AtomicU64::new(0),
             member_sync_wake: tokio::sync::Notify::new(),
+            member_sync_rate_limit_until_ms: AtomicI64::new(0),
+            member_sync_rate_limit_epoch: AtomicU64::new(0),
+            member_sync_rate_limit_persisted_epoch: AtomicU64::new(0),
+            member_sync_bot_id: AtomicI64::new(0),
+            rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
             control_actor_lookup: Mutex::new(None),
@@ -968,6 +978,52 @@ impl BotState {
             #[cfg(test)]
             gateway_ban_path_phases: Mutex::new(Vec::new()),
         }))
+    }
+
+    pub(crate) fn arm_member_sync_rate_limit(&self, deadline: i64) {
+        let previous = self
+            .member_sync_rate_limit_until_ms
+            .fetch_max(deadline, Ordering::Relaxed);
+        if deadline > previous {
+            self.member_sync_rate_limit_epoch
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) async fn persist_pending_member_sync_rate_limit(&self) {
+        let bot_id = self.member_sync_bot_id.load(Ordering::Relaxed);
+        if bot_id <= 0 {
+            return;
+        }
+        let epoch = self.member_sync_rate_limit_epoch.load(Ordering::Acquire);
+        if epoch
+            == self
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let stored = self.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        if stored <= 0 {
+            return;
+        }
+        match crate::db::extend_member_sync_request_after(&self.db, bot_id, stored).await {
+            Ok(()) => {
+                self.member_sync_rate_limit_persisted_epoch
+                    .fetch_max(epoch, Ordering::Release);
+            }
+            Err(error) => {
+                tracing::warn!("failed to persist Discord retry deadline: {error:#}");
+            }
+        }
+    }
+
+    pub(crate) async fn publish_member_sync_bot_id(&self, bot_id: i64) {
+        if bot_id <= 0 {
+            return;
+        }
+        self.member_sync_bot_id.store(bot_id, Ordering::Relaxed);
+        self.persist_pending_member_sync_rate_limit().await;
     }
 
     pub fn install_discord_cache(&self, cache: Arc<serenity::cache::Cache>) {
