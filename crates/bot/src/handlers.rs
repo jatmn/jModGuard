@@ -3635,12 +3635,12 @@ mod rate_limit_tests {
         assert_eq!(pacing_deadline(&app, 42).await, None);
         assert_eq!(rate_limit_wait_lines(&log.text()), 1);
 
+        let mut previous = 0;
         for (timeout_secs, path, global) in [
             (30u64, "/guilds/1/members", false),
             (60, "/guilds/1/bans", false),
             (90, "/guilds/1/audit-logs", false),
             (120, "/gateway/bot", true),
-            (150, "/channels/1/thread-members", false),
         ] {
             handler
                 .record_rate_limit_wait(wait(
@@ -3652,9 +3652,32 @@ mod rate_limit_tests {
                 .with_subscriber(dispatch.clone())
                 .await;
             let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
-            assert!(stored > 0);
+            assert!(
+                stored > previous,
+                "{path} must extend the member-sync deadline"
+            );
             assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+            previous = stored;
         }
+        // `thread-members` does not contain the `/members` needle, so the old
+        // callback did not arm the gate for it. The wait is still logged.
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(150),
+                LightMethod::Get,
+                "/channels/1/thread-members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        assert_eq!(
+            app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+            previous
+        );
+        assert_eq!(pacing_deadline(&app, 42).await, Some(previous));
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 6);
+        assert!(!text.contains("429"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3870,9 +3893,11 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             .await;
         assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > 0);
         assert_eq!(pacing_deadline(&app, 42).await, None);
+        assert_eq!(pacing_deadline(&app, 0).await, None);
         let text = log.text();
         assert_eq!(rate_limit_wait_lines(&text), 1);
         assert!(!text.contains("failed to persist"));
+        assert!(!text.contains("429"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
