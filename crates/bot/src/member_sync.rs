@@ -865,32 +865,18 @@ async fn finish_request(
 
 /// Run behind the Gateway cache so only confirmed guilds and the current bot
 /// identity are admitted. Each loop considers one guild in round-robin order.
-pub async fn run(
-    app: Arc<BotState>,
-    http: Arc<Http>,
-    cache: Arc<serenity::cache::Cache>,
-    rate_limit_until_ms: Arc<AtomicI64>,
-    sync_bot_id: Arc<AtomicI64>,
-) {
-    run_loop(
-        app,
-        http,
-        cache,
-        rate_limit_until_ms,
-        sync_bot_id,
-        Arc::new(LoopProbe::default()),
-    )
-    .await;
+pub async fn run(app: Arc<BotState>, http: Arc<Http>, cache: Arc<serenity::cache::Cache>) {
+    run_loop(app, http, cache, Arc::new(LoopProbe::default())).await;
 }
 
 async fn run_loop(
     app: Arc<BotState>,
     http: Arc<Http>,
     cache: Arc<serenity::cache::Cache>,
-    rate_limit_until_ms: Arc<AtomicI64>,
-    sync_bot_id: Arc<AtomicI64>,
     probe: Arc<LoopProbe>,
 ) {
+    let rate_limit_until_ms = &app.member_sync_rate_limit_until_ms;
+    let sync_bot_id = &app.member_sync_bot_id;
     // A READY generation is acknowledged per enrollment only after its
     // directory status and any required coverage gap have been recorded.
     let mut ready_coverage = ReadyCoverage::default();
@@ -1199,7 +1185,7 @@ async fn run_loop(
                     if rate_limit_until_ms.load(Ordering::Relaxed)
                         > chrono::Utc::now().timestamp_millis()
                     {
-                        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                        finish_request(&app, request_claim, rate_limit_until_ms).await;
                         cleaned = true;
                         break;
                     }
@@ -1267,7 +1253,7 @@ async fn run_loop(
                             }
                         }
                     }
-                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    finish_request(&app, request_claim, rate_limit_until_ms).await;
                     break;
                 }
                 let pending = match store
@@ -1292,7 +1278,7 @@ async fn run_loop(
                     if rate_limit_until_ms.load(Ordering::Relaxed)
                         > chrono::Utc::now().timestamp_millis()
                     {
-                        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                        finish_request(&app, request_claim, rate_limit_until_ms).await;
                         cleaned = true;
                         break;
                     }
@@ -1350,7 +1336,7 @@ async fn run_loop(
                             }
                         }
                     }
-                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    finish_request(&app, request_claim, rate_limit_until_ms).await;
                     break;
                 }
                 let candidate = match store
@@ -1374,7 +1360,7 @@ async fn run_loop(
                 if rate_limit_until_ms.load(Ordering::Relaxed)
                     > chrono::Utc::now().timestamp_millis()
                 {
-                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    finish_request(&app, request_claim, rate_limit_until_ms).await;
                     cleaned = true;
                     break;
                 }
@@ -1434,7 +1420,7 @@ async fn run_loop(
                         }
                     }
                 }
-                finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                finish_request(&app, request_claim, rate_limit_until_ms).await;
                 break;
             }
             cleanup_turn = false;
@@ -1456,7 +1442,7 @@ async fn run_loop(
             continue;
         };
         if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
-            finish_request(&app, request_claim, &rate_limit_until_ms).await;
+            finish_request(&app, request_claim, rate_limit_until_ms).await;
             defer_until = Some(deadline_instant(
                 tokio::time::Instant::now(),
                 chrono::Utc::now().timestamp_millis(),
@@ -1553,7 +1539,7 @@ async fn run_loop(
                     Err(error) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         let (reason, denied) =
-                            retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
+                            retry_reason_with_rate_limit(&error, rate_limit_until_ms);
                         let delay = if denied {
                             Duration::from_secs(3600)
                         } else {
@@ -1679,7 +1665,7 @@ async fn run_loop(
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     tracing::warn!(guild_id = gid, "member sync request failed: {error:#}");
                     let (reason, denied) =
-                        retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
+                        retry_reason_with_rate_limit(&error, rate_limit_until_ms);
                     let delay = if denied {
                         Duration::from_secs(3600)
                     } else {
@@ -1715,7 +1701,7 @@ async fn run_loop(
             }
             break;
         }
-        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+        finish_request(&app, request_claim, rate_limit_until_ms).await;
         if defer_until.is_none() {
             let now = tokio::time::Instant::now();
             defer_until = Some(if next_request > now {
@@ -1907,13 +1893,9 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
             cache.update(&mut event);
         }
-        let worker = tokio::spawn(run(
-            app.clone(),
-            Arc::new(Http::new("unused")),
-            cache,
-            Arc::new(AtomicI64::new(i64::MAX)), // Suppress all Discord requests.
-            Arc::new(AtomicI64::new(0)),
-        ));
+        app.member_sync_rate_limit_until_ms
+            .store(i64::MAX, Ordering::Relaxed);
+        let worker = tokio::spawn(run(app.clone(), Arc::new(Http::new("unused")), cache));
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = store
@@ -2426,8 +2408,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
@@ -2474,8 +2454,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(GUILD as u64),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| {
@@ -2527,8 +2505,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) >= 1).await;
@@ -2549,8 +2525,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
@@ -2601,8 +2575,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) == 1).await;
@@ -2643,8 +2615,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) == 1).await;
@@ -2692,8 +2662,6 @@ mod tests {
             app.clone(),
             Arc::new(Http::new("unused")),
             gateway_cache(10),
-            Arc::new(AtomicI64::new(0)),
-            Arc::new(AtomicI64::new(0)),
             probe.clone(),
         ));
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
