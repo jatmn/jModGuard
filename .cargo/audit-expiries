@@ -1,0 +1,3 @@
+# UTC expiry for each cargo-audit ignore. ci-preflight fails on this date.
+# .cargo/audit.toml cannot store the date; cargo-audit rejects unknown fields.
+RUSTSEC-2026-0258 2027-01-15
