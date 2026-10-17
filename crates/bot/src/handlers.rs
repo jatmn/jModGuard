@@ -1,7 +1,6 @@
 //! Discord gateway event handlers: basic member/message reports,
 //! automod pipeline, and command dispatch.
 
-use anyhow::Result;
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::gateway::ActivityData;
@@ -15,7 +14,6 @@ use serenity::model::prelude::{ChannelId, User};
 use serenity::model::voice::VoiceState;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::automod::{MsgCtx, execute_pending};
@@ -35,9 +33,9 @@ impl Handler {
     }
 
     // Serenity spawns this hook and does not await it before sleeping. The sleep
-    // covers both a real provider throttle and a pre-emptive empty bucket. The
-    // pacing row is committed on this poll; a late commit cannot shorten
-    // `request_after_ms` because the SQL keeps the max.
+    // covers both a real provider throttle and a pre-emptive empty bucket. This
+    // function awaits the pacing write before it returns. A late commit cannot
+    // shorten `request_after_ms` because the SQL keeps the max.
     pub(crate) async fn record_rate_limit_wait(&self, wait: RateLimitWait) {
         let _logged = note_rate_limit_wait(&self.app, &wait, Instant::now());
         if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
@@ -3581,7 +3579,7 @@ mod tests {
 mod rate_limit_tests {
     use super::{
         Handler, RateLimitWait, member_sync_deadline_ms, note_rate_limit_wait,
-        rate_limit_throttle_key, redact_rate_limit_path,
+        redact_rate_limit_path,
     };
     use crate::config::BotProcessConfig;
     use crate::db::Db;
@@ -4218,10 +4216,7 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(keys.len(), 1);
-        assert_eq!(
-            keys[0],
-            rate_limit_throttle_key(LightMethod::Get, false, "/guilds/1/members")
-        );
+        assert_eq!(keys[0], "Get route /guilds/{id}/members");
         assert!(!keys[0].contains("/guilds/1"));
         assert!(!keys[0].contains("/guilds/999"));
         assert!(log.text().contains("/guilds/1/members"));
@@ -4281,12 +4276,14 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let interaction_key = rate_limit_throttle_key(
-            LightMethod::Post,
-            false,
-            "https://discord.com/api/v10/interactions/200/{token}/callback",
+        let interaction_key =
+            "Post route https://discord.com/api/v10/interactions/{id}/{token}/callback";
+        assert!(keys.iter().any(|key| key == interaction_key));
+        assert!(
+            keys.iter()
+                .all(|key| !key.contains("/interactions/200/")
+                    && !key.contains("/interactions/201/"))
         );
-        assert!(keys.iter().any(|key| key == &interaction_key));
         for key in &keys {
             assert!(!key.contains(TOKEN_A));
         }
