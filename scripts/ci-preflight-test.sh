@@ -170,3 +170,5 @@ if [ -f "$install_log" ]; then
 fi
 
 echo 'ci-preflight test: ensure_cargo_tool selection verified'
+
+bash "$root/scripts/ci-preflight.sh" --audit-expiry-self-check
