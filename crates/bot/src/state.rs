@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::automod::AutomodEngine;
@@ -860,6 +860,9 @@ pub struct BotState {
     /// Wakes the member-sync loop before its saved attempt, without dropping
     /// that cache. Dashboard sync controls use this.
     pub(crate) member_sync_wake: tokio::sync::Notify,
+    pub(crate) member_sync_rate_limit_until_ms: AtomicI64,
+    pub(crate) member_sync_bot_id: AtomicI64,
+    pub(crate) rate_limit_wait_logged_at: parking_lot::Mutex<HashMap<String, Instant>>,
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
@@ -959,6 +962,9 @@ impl BotState {
             gateway_ready_generation: AtomicU64::new(0),
             member_scope_epoch: AtomicU64::new(0),
             member_sync_wake: tokio::sync::Notify::new(),
+            member_sync_rate_limit_until_ms: AtomicI64::new(0),
+            member_sync_bot_id: AtomicI64::new(0),
+            rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
             control_actor_lookup: Mutex::new(None),
