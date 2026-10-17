@@ -4,7 +4,7 @@
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
-# UTC calendar dates are YYYY-MM-DD. cargo-audit has no expiry field.
+# UTC calendar dates are YYYY-MM-DD. Expiry dates live in `.cargo/audit-expiries`.
 audit_ignore_is_expired() {
   local today=$1 expiry=$2
   (
@@ -13,11 +13,361 @@ audit_ignore_is_expired() {
   )
 }
 
+audit_date_is_ymd() {
+  local value=$1 normalized
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  normalized="$(TZ=UTC date -u -d "${value}T00:00:00Z" +%Y-%m-%d 2>/dev/null)" || return 1
+  [[ "$normalized" == "$value" ]]
+}
+
+audit_accept_today() {
+  local status=$1 raw=$2
+  [[ "$status" == 0 ]] || return 1
+  audit_date_is_ymd "$raw" || return 1
+  printf '%s\n' "$raw"
+  return 0
+}
+
+audit_read_expiries() {
+  local file=$1
+  local line id date seen=""
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    if [[ ! "$line" =~ ^([A-Z][A-Z0-9]*(-[0-9A-Z]+)+)[[:space:]]([0-9]{4}-[0-9]{2}-[0-9]{2})$ ]]; then
+      return 1
+    fi
+    id="${BASH_REMATCH[1]}"
+    date="${BASH_REMATCH[3]}"
+    audit_date_is_ymd "$date" || return 1
+    case " $seen " in
+      *" $id "*) return 1 ;;
+    esac
+    seen="${seen} ${id}"
+    printf '%s %s\n' "$id" "$date"
+  done <"$file"
+}
+
+audit_classify_report() {
+  local report=$1 ignores_out=$2
+  REPORT="$report" IGNORES_OUT="$ignores_out" node --input-type=commonjs - <<'JS'
+const fs = require("fs");
+
+const idRe = /^[A-Z][A-Z0-9]*(-[0-9A-Z]+)+$/;
+
+let report;
+try {
+  report = JSON.parse(fs.readFileSync(process.env.REPORT, "utf8"));
+} catch {
+  process.exit(1);
+}
+
+if (!report || Array.isArray(report) || typeof report !== "object") {
+  process.exit(1);
+}
+
+const vulnerabilities = report.vulnerabilities;
+if (
+  vulnerabilities == null ||
+  Array.isArray(vulnerabilities) ||
+  typeof vulnerabilities !== "object"
+) {
+  process.exit(1);
+}
+
+if (typeof vulnerabilities.found !== "boolean") {
+  process.exit(1);
+}
+
+const count = vulnerabilities.count;
+if (
+  !Number.isInteger(count) ||
+  count < 0
+) {
+  process.exit(1);
+}
+
+if (!Array.isArray(vulnerabilities.list)) {
+  process.exit(1);
+}
+
+for (const entry of vulnerabilities.list) {
+  const advId = entry.advisory?.id;
+  const pkg = entry.package;
+  if (!advId || !pkg?.name || !pkg?.version) {
+    process.exit(1);
+  }
+  console.error(`ci-preflight: advisory ${advId} ${pkg.name} ${pkg.version}`);
+}
+
+const ignoreSetting = report.settings?.ignore;
+const ignores = ignoreSetting == null ? [] : ignoreSetting;
+if (!Array.isArray(ignores)) {
+  process.exit(1);
+}
+
+const seen = new Set();
+for (const id of ignores) {
+  if (typeof id !== "string" || !idRe.test(id)) {
+    process.exit(1);
+  }
+  if (seen.has(id)) {
+    process.exit(1);
+  }
+  seen.add(id);
+}
+
+fs.writeFileSync(process.env.IGNORES_OUT, ignores.join("\n") + (ignores.length ? "\n" : ""), "utf8");
+
+const warnings = report.warnings || {};
+for (const kind of ["yanked", "unmaintained"]) {
+  for (const entry of warnings[kind] || []) {
+    const pkg = entry.package;
+    if (!pkg?.name || !pkg?.version) {
+      process.exit(1);
+    }
+    const adv = entry.advisory?.id;
+    if (adv) {
+      console.error(
+        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version} ${adv}`
+      );
+    } else {
+      console.error(
+        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version}`
+      );
+    }
+  }
+}
+
+if (!vulnerabilities.found && count === 0) {
+  process.stdout.write("-1");
+} else {
+  process.stdout.write(String(count));
+}
+JS
+}
+
+decide_audit_report() {
+  local report=$1 expiries=$2 audit_rc=$3 today_rc=$4 today_raw=$5 fail_closed=$6
+  local ignores_tmp count classify_rc
+  local -A expiry_map=()
+  local id date line ignore_count=0 expiry_count=0 restore_errexit=0
+  ignores_tmp="$(mktemp)"
+  case "$-" in
+    *e*) restore_errexit=1 ;;
+  esac
+  set +e
+  dar_fin() {
+    if [ "$restore_errexit" -eq 1 ]; then
+      set -e
+    fi
+  }
+  count="$(audit_classify_report "$report" "$ignores_tmp")"
+  classify_rc=$?
+  if [ "$classify_rc" -ne 0 ]; then
+    rm -f "$ignores_tmp"
+    echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
+    dar_fin
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    id="${line%% *}"
+    date="${line#* }"
+    expiry_map["$id"]="$date"
+    expiry_count=$((expiry_count + 1))
+  done < <(audit_read_expiries "$expiries")
+  local read_rc=$?
+  if [ "$read_rc" -ne 0 ]; then
+    rm -f "$ignores_tmp"
+    echo 'ci-preflight: cargo audit expiry file is invalid' >&2
+    dar_fin
+    return 1
+  fi
+
+  while IFS= read -r id || [ -n "$id" ]; do
+    [ -n "$id" ] || continue
+    ignore_count=$((ignore_count + 1))
+    date="${expiry_map[$id]:-}"
+    if [ -z "$date" ]; then
+      rm -f "$ignores_tmp"
+      echo "ci-preflight: cargo audit ignore ${id} has no expiry in .cargo/audit-expiries" >&2
+      dar_fin
+      return 1
+    fi
+  done <"$ignores_tmp"
+
+  for id in "${!expiry_map[@]}"; do
+    if ! grep -Fxq "$id" "$ignores_tmp" 2>/dev/null; then
+      rm -f "$ignores_tmp"
+      echo "ci-preflight: cargo audit expiry ${id} is not ignored" >&2
+      dar_fin
+      return 1
+    fi
+  done
+
+  if [ "$ignore_count" -gt 0 ] || [ "$expiry_count" -gt 0 ]; then
+    if [ "$today_rc" -ne 0 ] || ! audit_date_is_ymd "$today_raw"; then
+      rm -f "$ignores_tmp"
+      echo 'ci-preflight: cargo audit exception expiry date is unavailable' >&2
+      dar_fin
+      return 1
+    fi
+    while IFS= read -r id || [ -n "$id" ]; do
+      [ -n "$id" ] || continue
+      date="${expiry_map[$id]}"
+      if [ "$id" = RUSTSEC-2026-0258 ]; then
+        echo "ci-preflight: advisory ${id} ignored (expires ${date}; see #349)" >&2
+        if audit_ignore_is_expired "$today_raw" "$date"; then
+          echo "ci-preflight: cargo audit exception ${id} expired on ${date}; see #349; re-review the exception" >&2
+          rm -f "$ignores_tmp"
+          dar_fin
+          return 1
+        fi
+      else
+        echo "ci-preflight: advisory ${id} ignored (expires ${date})" >&2
+        if audit_ignore_is_expired "$today_raw" "$date"; then
+          echo "ci-preflight: cargo audit exception ${id} expired on ${date}; re-review the exception" >&2
+          rm -f "$ignores_tmp"
+          dar_fin
+          return 1
+        fi
+      fi
+    done <"$ignores_tmp"
+  fi
+
+  rm -f "$ignores_tmp"
+
+  if [ "$count" = -1 ]; then
+    if [ "$audit_rc" -eq 0 ]; then
+      dar_fin
+      return 0
+    fi
+    echo 'ci-preflight: cargo audit failed to run (unexpected exit 1 without advisories)' >&2
+    dar_fin
+    return 1
+  fi
+
+  if [ "$fail_closed" = 1 ]; then
+    echo "ci-preflight: cargo audit failed closed (scheduled CI; ${count} advisories)" >&2
+    dar_fin
+    return 1
+  fi
+
+  echo "ci-preflight: cargo audit reported ${count} advisories; pull requests and ordinary main pushes do not fail the supply-chain check" >&2
+  dar_fin
+  return 0
+}
+
 if [ "${1:-}" = "--audit-expiry-self-check" ]; then
   fail() { echo "ci-preflight: audit expiry self-check: $*" >&2; exit 1; }
-  audit_ignore_is_expired 2027-01-14 2027-01-15 && fail "2027-01-14 must stay valid"
-  audit_ignore_is_expired 2027-01-15 2027-01-15 || fail "2027-01-15 must expire"
-  audit_ignore_is_expired 2027-01-16 2027-01-15 || fail "2027-01-16 must expire"
+  self_root="$(cd "$(dirname "$0")/.." && pwd)"
+  real_expiries="${self_root}/.cargo/audit-expiries"
+
+  audit_ignore_is_expired 2024-05-01 2024-05-02 && fail "2024-05-01 must stay valid before 2024-05-02"
+  audit_ignore_is_expired 2024-05-02 2024-05-02 || fail "2024-05-02 must expire on 2024-05-02"
+  audit_ignore_is_expired 2024-05-03 2024-05-02 || fail "2024-05-03 must expire after 2024-05-02"
+
+  audit_accept_today 1 2024-05-02 >/dev/null 2>&1 && fail "audit_accept_today must fail for status 1"
+  audit_accept_today 0 not-a-date >/dev/null 2>&1 && fail "audit_accept_today must fail for not-a-date"
+  audit_accept_today 0 2027-13-40 >/dev/null 2>&1 && fail "audit_accept_today must fail for 2027-13-40"
+  out="$(audit_accept_today 0 2024-05-02)" || fail "audit_accept_today must accept 2024-05-02"
+  [ "$out" = 2024-05-02 ] || fail "audit_accept_today must echo 2024-05-02"
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  write_report() {
+    printf '%s' "$1" >"$tmp/report.json"
+  }
+
+  decide_expect() {
+    local expect_rc=$1
+    local report_json=$2 expiries_file=$3 audit_rc=$4 today_rc=$5 today_raw=$6 fail_closed=$7
+    local rc
+    write_report "$report_json"
+    : >"$tmp/decide.err"
+    set +e
+    decide_audit_report "$tmp/report.json" "$expiries_file" "$audit_rc" "$today_rc" "$today_raw" "$fail_closed" 2>"$tmp/decide.err"
+    rc=$?
+    set -e
+    if [ "$rc" -ne "$expect_rc" ]; then
+      cat "$tmp/decide.err" >&2
+      fail "decide_audit_report expected rc ${expect_rc}, got ${rc}"
+    fi
+  }
+
+  printf '\n' >"$tmp/empty-expiries"
+
+  decide_expect 1 '{' "$tmp/empty-expiries" 0 0 2024-05-02 0
+  grep -Fq 'operational error' "$tmp/decide.err" || fail 'malformed JSON must print operational error'
+
+  decide_expect 1 '{}' "$tmp/empty-expiries" 0 0 2024-05-02 0
+  grep -Fq 'operational error' "$tmp/decide.err" || fail 'missing vulnerabilities must print operational error'
+
+  decide_expect 1 '{"vulnerabilities":null}' "$tmp/empty-expiries" 0 0 2024-05-02 0
+  grep -Fq 'operational error' "$tmp/decide.err" || fail 'null vulnerabilities must print operational error'
+
+  decide_expect 1 '{"vulnerabilities":[]}' "$tmp/empty-expiries" 0 0 2024-05-02 0
+  grep -Fq 'operational error' "$tmp/decide.err" || fail 'array vulnerabilities must print operational error'
+
+  decide_expect 0 '{"vulnerabilities":{"found":false,"count":0,"list":[]}}' "$tmp/empty-expiries" 0 0 2024-05-02 0
+  decide_expect 0 '{"vulnerabilities":{"found":false,"count":0,"list":[]}}' "$tmp/empty-expiries" 0 0 2024-05-02 1
+
+  one_adv='{"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2020-0001"},"package":{"name":"crate","version":"1.0.0"}}]},"settings":{"ignore":[]}}'
+  decide_expect 0 "$one_adv" "$tmp/empty-expiries" 0 0 2024-05-02 0
+  grep -Fq 'pull requests and ordinary main pushes do not fail' "$tmp/decide.err" || fail 'one advisory fail-open must print PR sentence'
+  decide_expect 1 "$one_adv" "$tmp/empty-expiries" 0 0 2024-05-02 1
+  grep -Fq 'failed closed' "$tmp/decide.err" || fail 'one advisory fail-closed must print failed closed'
+
+  decide_expect 1 '{"vulnerabilities":{"found":false,"count":0,"list":[]}}' "$tmp/empty-expiries" 1 0 2024-05-02 0
+  grep -Fq 'unexpected exit 1 without advisories' "$tmp/decide.err" || fail 'exit 1 empty report must print unexpected exit 1'
+
+  printf 'RUSTSEC-2026-0001 2099-01-01\n' >"$tmp/partial-expiries"
+  two_ignore='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0001","RUSTSEC-2026-0002"]}}'
+  decide_expect 1 "$two_ignore" "$tmp/partial-expiries" 0 0 2024-05-02 0
+  grep -Fq 'RUSTSEC-2026-0002' "$tmp/decide.err" || fail 'missing expiry must name RUSTSEC-2026-0002'
+  grep -Fq 'has no expiry' "$tmp/decide.err" || fail 'missing expiry must print has no expiry'
+
+  printf 'RUSTSEC-2026-9999 2099-01-01\n' >"$tmp/orphan-expiry"
+  no_ignore='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":[]}}'
+  decide_expect 1 "$no_ignore" "$tmp/orphan-expiry" 0 0 2024-05-02 0
+  grep -Fq 'is not ignored' "$tmp/decide.err" || fail 'orphan expiry must print is not ignored'
+
+  printf 'RUSTSEC-2026-0001 2099-06-01\nRUSTSEC-2026-0002 2099-12-01\n' >"$tmp/two-future"
+  two_ignore_ok='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0001","RUSTSEC-2026-0002"]}}'
+  decide_expect 0 "$two_ignore_ok" "$tmp/two-future" 0 0 2024-05-02 0
+  grep -Fq 'RUSTSEC-2026-0001 ignored (expires 2099-06-01)' "$tmp/decide.err" || fail 'two future: first ignore line'
+  grep -Fq 'RUSTSEC-2026-0002 ignored (expires 2099-12-01)' "$tmp/decide.err" || fail 'two future: second ignore line'
+
+  printf 'RUSTSEC-2026-0001 2024-05-01\nRUSTSEC-2026-0002 2099-12-01\n' >"$tmp/today-expire"
+  decide_expect 1 "$two_ignore_ok" "$tmp/today-expire" 0 0 2024-05-02 0
+  grep -Fq 'expired on' "$tmp/decide.err" || fail 'today equal earlier expiry must print expired on'
+  grep -Fq 'RUSTSEC-2026-0001' "$tmp/decide.err" || fail 'today equal earlier expiry must name id'
+  grep -Fq '2024-05-01' "$tmp/decide.err" || fail 'today equal earlier expiry must name date'
+
+  printf 'RUSTSEC-2026-0001 2099-01-01\n' >"$tmp/one-future"
+  one_ignore='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0001"]}}'
+  decide_expect 1 "$one_ignore" "$tmp/one-future" 0 1 '' 0
+  grep -Fq 'expiry date is unavailable' "$tmp/decide.err" || fail 'today_rc 1 must print expiry date is unavailable'
+  decide_expect 1 "$one_ignore" "$tmp/one-future" 0 0 'yesterday' 0
+  grep -Fq 'expiry date is unavailable' "$tmp/decide.err" || fail 'non-calendar today must print expiry date is unavailable'
+
+  decide_expect 0 '{"vulnerabilities":{"found":false,"count":0,"list":[]}}' "$tmp/empty-expiries" 0 1 '' 0
+
+  rustsec_expiry="$(awk '/^RUSTSEC-2026-0258 / {print $2; exit}' "$real_expiries")"
+  [ -n "$rustsec_expiry" ] || fail 'real audit-expiries must list RUSTSEC-2026-0258'
+  day_before="$(TZ=UTC date -u -d "${rustsec_expiry}T00:00:00Z - 1 day" +%Y-%m-%d)"
+  rustsec_ok='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0258"]}}'
+  decide_expect 0 "$rustsec_ok" "$real_expiries" 0 0 "$day_before" 0
+  grep -Fq "ignored (expires ${rustsec_expiry}; see #349)" "$tmp/decide.err" || fail 'documented date: day before must print ignored with see #349'
+  decide_expect 1 "$rustsec_ok" "$real_expiries" 0 0 "$rustsec_expiry" 0
+  grep -Fq "expired on ${rustsec_expiry}; see #349; re-review the exception" "$tmp/decide.err" || fail 'documented date: expiry day must print expired with see #349'
+
   echo "ci-preflight: audit expiry self-check passed"
   exit 0
 fi
@@ -277,7 +627,7 @@ EOF
 # failures (for example advisory DB fetch/load). Classify from JSON stdout and
 # stderr instead of trusting exit 1 alone.
 run_cargo_audit_gate() {
-  local audit_out audit_err audit_rc advisory_count node_rc ignore_0258
+  local audit_out audit_err audit_rc today_raw today_rc fail_closed decide_rc
   audit_out="$(mktemp)"
   audit_err="$(mktemp)"
   set +e
@@ -308,114 +658,23 @@ run_cargo_audit_gate() {
     fi
   fi
 
+  today_raw=""
+  today_rc=1
+  if today_raw="$(date -u +%Y-%m-%d 2>/dev/null)"; then
+    today_rc=0
+  fi
+
+  fail_closed=0
+  if [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-}" = "1" ]; then
+    fail_closed=1
+  fi
+
   set +e
-  advisory_count="$(
-    AUDIT_OUT="$audit_out" node --input-type=commonjs - <<'JS'
-const fs = require("fs");
-let report;
-try {
-  report = JSON.parse(fs.readFileSync(process.env.AUDIT_OUT, "utf8"));
-} catch {
-  process.exit(1);
-}
-
-const vulnerabilities = report.vulnerabilities || {};
-for (const entry of vulnerabilities.list || []) {
-  const id = entry.advisory?.id;
-  const pkg = entry.package;
-  if (!id || !pkg?.name || !pkg?.version) {
-    process.exit(1);
-  }
-  console.error(`ci-preflight: advisory ${id} ${pkg.name} ${pkg.version}`);
-}
-
-for (const id of report.settings?.ignore || []) {
-  if (id === "RUSTSEC-2026-0258") {
-    console.error(
-      "ci-preflight: advisory RUSTSEC-2026-0258 ignored (expires 2027-01-15; see #349)"
-    );
-  } else {
-    console.error(`ci-preflight: advisory ${id} ignored`);
-  }
-}
-
-const warnings = report.warnings || {};
-for (const kind of ["yanked", "unmaintained"]) {
-  for (const entry of warnings[kind] || []) {
-    const pkg = entry.package;
-    if (!pkg?.name || !pkg?.version) {
-      process.exit(1);
-    }
-    const adv = entry.advisory?.id;
-    if (adv) {
-      console.error(
-        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version} ${adv}`
-      );
-    } else {
-      console.error(
-        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version}`
-      );
-    }
-  }
-}
-
-let count = vulnerabilities.count;
-if (count == null) {
-  count = (vulnerabilities.list || []).length;
-}
-if (vulnerabilities.found || count) {
-  process.stdout.write(String(Number(count)));
-} else {
-  process.stdout.write("-1");
-}
-JS
-  )"
-  node_rc=$?
+  decide_audit_report "$audit_out" "$root/.cargo/audit-expiries" "$audit_rc" "$today_rc" "$today_raw" "$fail_closed"
+  decide_rc=$?
   set -e
-
-  if [ "$node_rc" -ne 0 ] && [ "$audit_rc" -eq 0 ]; then
-    echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
-    rm -f "$audit_out" "$audit_err"
-    return 1
-  fi
-
-  if [ "$node_rc" -ne 0 ]; then
-    advisory_count=-1
-  fi
-
-  ignore_0258=0
-  if AUDIT_OUT="$audit_out" node --input-type=commonjs -e '
-const report = JSON.parse(require("fs").readFileSync(process.env.AUDIT_OUT, "utf8"));
-process.exit((report.settings?.ignore || []).includes("RUSTSEC-2026-0258") ? 0 : 1);
-' 2>/dev/null; then
-    ignore_0258=1
-  fi
-
-  if [ "$ignore_0258" -eq 1 ] && audit_ignore_is_expired "$(date -u +%Y-%m-%d)" 2027-01-15; then
-    echo 'ci-preflight: cargo audit exception RUSTSEC-2026-0258 expired on 2027-01-15; see #349; re-review the exception' >&2
-    rm -f "$audit_out" "$audit_err"
-    return 1
-  fi
-
-  if [ "$advisory_count" -lt 0 ]; then
-    if [ "$audit_rc" -eq 0 ]; then
-      rm -f "$audit_out" "$audit_err"
-      return 0
-    fi
-    echo 'ci-preflight: cargo audit failed to run (unexpected exit 1 without advisories)' >&2
-    rm -f "$audit_out" "$audit_err"
-    return 1
-  fi
-
-  if [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" = "1" ]; then
-    echo "ci-preflight: cargo audit failed closed (scheduled CI; ${advisory_count} advisories)" >&2
-    rm -f "$audit_out" "$audit_err"
-    return 1
-  fi
-
-  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the supply-chain check" >&2
   rm -f "$audit_out" "$audit_err"
-  return 0
+  return "$decide_rc"
 }
 
 whitespace_check() {

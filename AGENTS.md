@@ -250,9 +250,10 @@ and ordinary main pushes ignore reported CVE advisories but still fail when
 `cargo audit` cannot run). `npm audit --prefix tools/eslint --audit-level=high`
 always fails the `frontend` group on a high or critical advisory and on an
 advisory-endpoint failure. There is no fail-open switch for cargo-audit; the only
-cargo-audit ignore is `RUSTSEC-2026-0258` in `.cargo/audit.toml`, expiring
-2027-01-15 (see #349). Any other unfixable transitive advisory is handled by
-pinning or dropping that package. GitHub-hosted Dependabot Updates dynamic workflows
+cargo-audit ignore is `RUSTSEC-2026-0258` in `.cargo/audit.toml` (see #349).
+Its UTC expiry is in `.cargo/audit-expiries` (2027-01-15); every ignored
+advisory needs an expiry line there. Any other unfixable transitive advisory is
+handled by pinning or dropping that package. GitHub-hosted Dependabot Updates dynamic workflows
 are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled. This repository has no GitHub Actions self-hosted
 runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
 them after 24 hours. Do not register leftover Proxmox GHA runners or label

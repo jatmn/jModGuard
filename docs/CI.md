@@ -66,8 +66,11 @@ Both npm audits fail on high/critical findings or endpoint errors, including
 non-blocking for PRs/ordinary main pushes; operational audit failures always fail.
 Scheduled runs set `JMODGUARD_AUDIT_FAIL_CLOSED=1`, run all gates, and withhold
 Nightly publication when an advisory is outstanding. `RUSTSEC-2026-0258` is the
-one ignored cargo-audit advisory until 2027-01-15; preflight fails on that date
-while the ignore remains. Scheduled runs still fail closed on every other advisory.
+one ignored cargo-audit advisory (see #349); its UTC expiry is in
+`.cargo/audit-expiries` (2027-01-15). Every ignored advisory needs an expiry
+there; any other unfixable advisory is handled by pinning or dropping that
+package. Preflight fails on the expiry date while the ignore remains. Scheduled
+runs still fail closed on every other advisory.
 
 ## Publication and trust
 

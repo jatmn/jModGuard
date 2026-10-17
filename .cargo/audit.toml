@@ -2,8 +2,9 @@
 # The libsql remote connector only offers HTTP/1.1 (src/remote_https.rs,
 # enforced by https_client_config_advertises_http11_alpn), so the h2 0.3
 # code path never runs. Upstream fix: tursodatabase/libsql#2224.
-# Tracked in #349. This ignore expires 2027-01-15; ci-preflight fails on
-# that date until the exception is removed or re-reviewed.
+# Tracked in #349. Expiry UTC date is in `.cargo/audit-expiries` (2027-01-15);
+# ci-preflight fails on that date until the exception is removed or re-reviewed.
+# Every ignored advisory needs an expiry line there; cargo-audit cannot store dates.
 
 [advisories]
 ignore = ["RUSTSEC-2026-0258"]
