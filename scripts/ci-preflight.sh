@@ -4,6 +4,24 @@
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
+# UTC calendar dates are YYYY-MM-DD. cargo-audit has no expiry field.
+audit_ignore_is_expired() {
+  local today=$1 expiry=$2
+  (
+    LC_ALL=C
+    [[ "$today" == "$expiry" || "$today" > "$expiry" ]]
+  )
+}
+
+if [ "${1:-}" = "--audit-expiry-self-check" ]; then
+  fail() { echo "ci-preflight: audit expiry self-check: $*" >&2; exit 1; }
+  audit_ignore_is_expired 2027-01-14 2027-01-15 && fail "2027-01-14 must stay valid"
+  audit_ignore_is_expired 2027-01-15 2027-01-15 || fail "2027-01-15 must expire"
+  audit_ignore_is_expired 2027-01-16 2027-01-15 || fail "2027-01-16 must expire"
+  echo "ci-preflight: audit expiry self-check passed"
+  exit 0
+fi
+
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
@@ -259,7 +277,7 @@ EOF
 # failures (for example advisory DB fetch/load). Classify from JSON stdout and
 # stderr instead of trusting exit 1 alone.
 run_cargo_audit_gate() {
-  local audit_out audit_err audit_rc advisory_count
+  local audit_out audit_err audit_rc advisory_count node_rc ignore_0258
   audit_out="$(mktemp)"
   audit_err="$(mktemp)"
   set +e
@@ -270,34 +288,77 @@ run_cargo_audit_gate() {
     cat "$audit_err" >&2
   fi
 
-  if [ "$audit_rc" -eq 0 ]; then
-    rm -f "$audit_out" "$audit_err"
-    return 0
-  fi
-
   if [ "$audit_rc" -eq 2 ]; then
     echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
     rm -f "$audit_out" "$audit_err"
     return 1
   fi
 
-  if [ "$audit_rc" -ne 1 ]; then
+  if [ "$audit_rc" -ne 0 ] && [ "$audit_rc" -ne 1 ]; then
     echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
     rm -f "$audit_out" "$audit_err"
     return 1
   fi
 
-  if grep -qE '^error:' "$audit_err" || [ ! -s "$audit_out" ]; then
-    echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
-    rm -f "$audit_out" "$audit_err"
-    return 1
+  if [ "$audit_rc" -eq 1 ]; then
+    if grep -qE '^error:' "$audit_err" || [ ! -s "$audit_out" ]; then
+      echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
+      rm -f "$audit_out" "$audit_err"
+      return 1
+    fi
   fi
 
+  set +e
   advisory_count="$(
     AUDIT_OUT="$audit_out" node --input-type=commonjs - <<'JS'
 const fs = require("fs");
-const report = JSON.parse(fs.readFileSync(process.env.AUDIT_OUT, "utf8"));
+let report;
+try {
+  report = JSON.parse(fs.readFileSync(process.env.AUDIT_OUT, "utf8"));
+} catch {
+  process.exit(1);
+}
+
 const vulnerabilities = report.vulnerabilities || {};
+for (const entry of vulnerabilities.list || []) {
+  const id = entry.advisory?.id;
+  const pkg = entry.package;
+  if (!id || !pkg?.name || !pkg?.version) {
+    process.exit(1);
+  }
+  console.error(`ci-preflight: advisory ${id} ${pkg.name} ${pkg.version}`);
+}
+
+for (const id of report.settings?.ignore || []) {
+  if (id === "RUSTSEC-2026-0258") {
+    console.error(
+      "ci-preflight: advisory RUSTSEC-2026-0258 ignored (expires 2027-01-15; see #349)"
+    );
+  } else {
+    console.error(`ci-preflight: advisory ${id} ignored`);
+  }
+}
+
+const warnings = report.warnings || {};
+for (const kind of ["yanked", "unmaintained"]) {
+  for (const entry of warnings[kind] || []) {
+    const pkg = entry.package;
+    if (!pkg?.name || !pkg?.version) {
+      process.exit(1);
+    }
+    const adv = entry.advisory?.id;
+    if (adv) {
+      console.error(
+        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version} ${adv}`
+      );
+    } else {
+      console.error(
+        `ci-preflight: warning ${kind} ${pkg.name} ${pkg.version}`
+      );
+    }
+  }
+}
+
 let count = vulnerabilities.count;
 if (count == null) {
   count = (vulnerabilities.list || []).length;
@@ -308,9 +369,39 @@ if (vulnerabilities.found || count) {
   process.stdout.write("-1");
 }
 JS
-  )" || advisory_count=-1
+  )"
+  node_rc=$?
+  set -e
+
+  if [ "$node_rc" -ne 0 ] && [ "$audit_rc" -eq 0 ]; then
+    echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  if [ "$node_rc" -ne 0 ]; then
+    advisory_count=-1
+  fi
+
+  ignore_0258=0
+  if AUDIT_OUT="$audit_out" node --input-type=commonjs -e '
+const report = JSON.parse(require("fs").readFileSync(process.env.AUDIT_OUT, "utf8"));
+process.exit((report.settings?.ignore || []).includes("RUSTSEC-2026-0258") ? 0 : 1);
+' 2>/dev/null; then
+    ignore_0258=1
+  fi
+
+  if [ "$ignore_0258" -eq 1 ] && audit_ignore_is_expired "$(date -u +%Y-%m-%d)" 2027-01-15; then
+    echo 'ci-preflight: cargo audit exception RUSTSEC-2026-0258 expired on 2027-01-15; see #349; re-review the exception' >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
 
   if [ "$advisory_count" -lt 0 ]; then
+    if [ "$audit_rc" -eq 0 ]; then
+      rm -f "$audit_out" "$audit_err"
+      return 0
+    fi
     echo 'ci-preflight: cargo audit failed to run (unexpected exit 1 without advisories)' >&2
     rm -f "$audit_out" "$audit_err"
     return 1
