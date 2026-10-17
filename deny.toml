@@ -1,5 +1,6 @@
 # Supply-chain policy for cargo-deny (licenses, bans, sources).
-# Advisories are not part of this file. GitHub Actions runs cargo-audit:
+# Advisories are not part of this file; the single cargo-audit exception is
+# `.cargo/audit.toml`. GitHub Actions runs cargo-audit:
 # pull requests and ordinary main pushes do not fail the supply-chain check on a new
 # CVE advisories on the fail-open path; cargo-audit operational failures still fail the job.
 # Scheduled builds fail closed so the advisory is visible.
