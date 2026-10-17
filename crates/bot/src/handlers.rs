@@ -40,7 +40,7 @@ impl Handler {
     // `request_after_ms` because the SQL keeps the max.
     pub(crate) async fn record_rate_limit_wait(&self, wait: RateLimitWait) {
         let _logged = note_rate_limit_wait(&self.app, &wait, Instant::now());
-        if !member_sync_rate_limit_route(wait.global, &wait.path) {
+        if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
             return;
         }
         let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
@@ -78,12 +78,117 @@ pub(crate) fn member_sync_rate_limit_route(global: bool, path: &str) -> bool {
     global || path.contains("/members") || path.contains("/bans") || path.contains("/audit-logs")
 }
 
+fn scrub_rate_limit_query(query: &str, token: &str) -> String {
+    query
+        .split('&')
+        .map(|piece| {
+            if let Some((key, value)) = piece.split_once('=') {
+                let value = if value == token { "{token}" } else { value };
+                format!("{key}={value}")
+            } else if piece == token {
+                "{token}".to_string()
+            } else {
+                piece.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+pub(crate) fn redact_rate_limit_path(path: &str) -> String {
+    let (route_plus_query, fragment_opt) = match path.split_once('#') {
+        Some((route_plus_query, fragment)) => (route_plus_query, Some(fragment)),
+        None => (path, None),
+    };
+    let (route, query_opt) = match route_plus_query.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (route_plus_query, None),
+    };
+
+    let (origin, path_part) = if let Some(rest) = route.strip_prefix("https://") {
+        match rest.find('/') {
+            Some(slash_idx) => (
+                route[..8 + slash_idx].to_string(),
+                route[8 + slash_idx..].to_string(),
+            ),
+            None => return path.to_string(),
+        }
+    } else if let Some(rest) = route.strip_prefix("http://") {
+        match rest.find('/') {
+            Some(slash_idx) => (
+                route[..7 + slash_idx].to_string(),
+                route[7 + slash_idx..].to_string(),
+            ),
+            None => return path.to_string(),
+        }
+    } else {
+        (String::new(), route.to_string())
+    };
+
+    if !path_part.starts_with('/') {
+        return path.to_string();
+    }
+
+    let segments: Vec<&str> = path_part.split('/').collect();
+    let mut token_segment_idx: Option<usize> = None;
+    let mut original_token: Option<&str> = None;
+    let mut idx = 0;
+    while idx < segments.len() {
+        if segments[idx] == "webhooks" {
+            let candidate = idx + 2;
+            if candidate < segments.len() && !segments[candidate].is_empty() {
+                token_segment_idx = Some(candidate);
+                original_token = Some(segments[candidate]);
+                break;
+            }
+        } else if segments[idx] == "interactions" {
+            let token_candidate = idx + 2;
+            let callback_candidate = idx + 3;
+            if callback_candidate < segments.len()
+                && segments[callback_candidate] == "callback"
+                && token_candidate < segments.len()
+                && !segments[token_candidate].is_empty()
+            {
+                token_segment_idx = Some(token_candidate);
+                original_token = Some(segments[token_candidate]);
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    let Some(token_segment_idx) = token_segment_idx else {
+        return path.to_string();
+    };
+    let token = original_token.unwrap();
+
+    let mut redacted_segments = segments;
+    redacted_segments[token_segment_idx] = "{token}";
+    let redacted_path = redacted_segments.join("/");
+
+    let mut result = format!("{origin}{redacted_path}");
+    if let Some(query) = query_opt {
+        result.push('?');
+        result.push_str(&scrub_rate_limit_query(query, token));
+    }
+    if let Some(fragment) = fragment_opt {
+        result.push('#');
+        if fragment == token {
+            result.push_str("{token}");
+        } else {
+            result.push_str(fragment);
+        }
+    }
+    result
+}
+
 pub(crate) fn note_rate_limit_wait(
     app: &crate::state::BotState,
     wait: &RateLimitWait,
     now: Instant,
 ) -> bool {
-    let key = format!("{:?} {}", wait.method, wait.path);
+    let path = redact_rate_limit_path(&wait.path);
+    let key = format!("{:?} {}", wait.method, path);
     let mut logged_at = app.rate_limit_wait_logged_at.lock();
     logged_at.retain(|_, logged| now.saturating_duration_since(*logged) < Duration::from_secs(60));
     if logged_at.contains_key(&key) {
@@ -92,7 +197,7 @@ pub(crate) fn note_rate_limit_wait(
     logged_at.insert(key, now);
     tracing::warn!(
         method = ?wait.method,
-        path = %wait.path,
+        path = %path,
         global = wait.global,
         timeout_ms = u64::try_from(wait.timeout.as_millis()).unwrap_or(u64::MAX),
         "rate-limit wait"
@@ -3463,7 +3568,10 @@ mod tests {
 
 #[cfg(test)]
 mod rate_limit_tests {
-    use super::{Handler, RateLimitWait, member_sync_deadline_ms, note_rate_limit_wait};
+    use super::{
+        Handler, RateLimitWait, member_sync_deadline_ms, note_rate_limit_wait,
+        redact_rate_limit_path,
+    };
     use crate::config::BotProcessConfig;
     use crate::db::Db;
     use crate::logging::persistence_log_tests::CapturedLog;
@@ -3909,5 +4017,388 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             member_sync_deadline_ms(i64::MAX, Duration::from_millis(1)),
             i64::MAX
         );
+    }
+
+    const TOKEN_A: &str = "synthetic_token_r4303412353";
+    const TOKEN_B: &str = "synthetic_token_r4303412353_other";
+
+    #[test]
+    fn redact_rate_limit_path_keeps_safe_routes_and_edges() {
+        use serenity::http::Route;
+        use serenity::model::id::{ApplicationId, InteractionId, MessageId, WebhookId};
+
+        let serenity_pairs = [
+            (
+                Route::WebhookOriginalInteractionResponse {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/@original".to_string(),
+            ),
+            (
+                Route::InteractionResponse {
+                    interaction_id: InteractionId::new(200),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/interactions/200/{token}/callback".to_string(),
+            ),
+            (
+                Route::WebhookWithToken {
+                    webhook_id: WebhookId::new(300),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300/{token}".to_string(),
+            ),
+            (
+                Route::WebhookFollowupMessages {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}".to_string(),
+            ),
+            (
+                Route::WebhookMessage {
+                    webhook_id: WebhookId::new(300),
+                    token: TOKEN_A,
+                    message_id: MessageId::new(55),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300/{token}/messages/55".to_string(),
+            ),
+            (
+                Route::WebhookFollowupMessage {
+                    application_id: ApplicationId::new(100),
+                    token: TOKEN_A,
+                    message_id: MessageId::new(55),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/55".to_string(),
+            ),
+            (
+                Route::Webhook {
+                    webhook_id: WebhookId::new(300),
+                }
+                .path()
+                .into_owned(),
+                "https://discord.com/api/v10/webhooks/300".to_string(),
+            ),
+        ];
+        for (input, expected) in serenity_pairs {
+            assert!(
+                input.contains(TOKEN_A) || !expected.contains("{token}"),
+                "Serenity must expand live tokens in route paths"
+            );
+            let redacted = redact_rate_limit_path(&input);
+            assert_eq!(redacted, expected);
+            assert!(!redacted.contains(TOKEN_A));
+            if expected.contains("messages/55") {
+                assert!(redacted.contains("55"));
+            }
+        }
+
+        let pairs = [
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original",
+                "/webhooks/100/{token}/messages/@original",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback",
+                "/interactions/200/{token}/callback",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/55",
+                "/webhooks/100/{token}/messages/55",
+            ),
+            (
+                "/webhooks/300/synthetic_token_r4303412353/slack",
+                "/webhooks/300/{token}/slack",
+            ),
+            (
+                "/webhooks/300/synthetic_token_r4303412353/github",
+                "/webhooks/300/{token}/github",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original/extra",
+                "/webhooks/100/{token}/messages/@original/extra",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback/extra",
+                "/interactions/200/{token}/callback/extra",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/",
+                "/webhooks/100/{token}/",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original/",
+                "/webhooks/100/{token}/messages/@original/",
+            ),
+            (
+                "/webhooks//synthetic_token_r4303412353/messages/@original",
+                "/webhooks//{token}/messages/@original",
+            ),
+            (
+                "https://discord.com/api/v10/webhooks/100/synthetic_token_r4303412353/messages/@original?wait=true",
+                "https://discord.com/api/v10/webhooks/100/{token}/messages/@original?wait=true",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353?wait=true&token=synthetic_token_r4303412353",
+                "/webhooks/100/{token}?wait=true&token={token}",
+            ),
+            (
+                "/interactions/200/synthetic_token_r4303412353/callback?wait=true",
+                "/interactions/200/{token}/callback?wait=true",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original?",
+                "/webhooks/100/{token}/messages/@original?",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353/messages/@original#frag",
+                "/webhooks/100/{token}/messages/@original#frag",
+            ),
+            (
+                "/webhooks/100/synthetic_token_r4303412353#synthetic_token_r4303412353",
+                "/webhooks/100/{token}#{token}",
+            ),
+            (
+                "http://discord.com:443/api/v10/webhooks/100/synthetic_token_r4303412353/messages/@original",
+                "http://discord.com:443/api/v10/webhooks/100/{token}/messages/@original",
+            ),
+        ];
+        for (input, expected) in pairs {
+            let redacted = redact_rate_limit_path(input);
+            assert_eq!(redacted, expected);
+            assert!(!redacted.contains(TOKEN_A));
+            if expected.contains("messages/55") || input.contains("/messages/55") {
+                assert!(redacted.contains("55"));
+            }
+        }
+
+        let unchanged = [
+            "",
+            "/guilds/1/members",
+            "/guilds/1/bans",
+            "/guilds/1/audit-logs",
+            "/channels/1/messages",
+            "/channels/1/thread-members",
+            "/gateway/bot",
+            "/channels/1/webhooks",
+            "/guilds/1/webhooks",
+            "/webhooks/300",
+            "/webhooks/300/",
+            "/interactions/200",
+            "/interactions/200/",
+            "/interactions/200/callback",
+            "/interactions/200/synthetic_token_r4303412353",
+            "webhooks/100/synthetic_token_r4303412353",
+            "https://discord.com/api/v10",
+            "https://discord.com/api/v10/guilds/1/members",
+            "https://discord.com/api/v10/channels/1/webhooks",
+            "/guilds/1/members?limit=1000",
+            "/guilds/1/members?token=synthetic_token_r4303412353",
+        ];
+        for input in unchanged {
+            assert_eq!(redact_rate_limit_path(input), input);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limit_wait_log_redacts_interaction_tokens() {
+        use serenity::http::Route;
+        use serenity::model::id::{ApplicationId, InteractionId};
+
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+
+        let patch_path = Route::WebhookOriginalInteractionResponse {
+            application_id: ApplicationId::new(100),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        let post_path = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        assert!(patch_path.contains(TOKEN_A));
+        assert!(post_path.contains(TOKEN_A));
+
+        let patch_b_path = Route::WebhookOriginalInteractionResponse {
+            application_id: ApplicationId::new(100),
+            token: TOKEN_B,
+        }
+        .path()
+        .into_owned();
+        let post_b_path = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_B,
+        }
+        .path()
+        .into_owned();
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_path,
+                    false
+                ),
+                t0,
+            ));
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(Duration::from_secs(1), LightMethod::Post, &post_path, false),
+                t0,
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_b_path,
+                    false
+                ),
+                t0 + Duration::from_secs(30),
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_b_path,
+                    false
+                ),
+                t0 + Duration::from_secs(30),
+            ));
+        });
+
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 2);
+        assert!(text.contains("WARN"));
+        assert!(text.contains("Patch"));
+        assert!(text.contains("Post"));
+        assert!(text.contains("{token}"));
+        assert!(text.contains("/messages/@original"));
+        assert!(text.contains("/callback"));
+        assert!(!text.contains(TOKEN_A));
+        assert!(!text.contains(TOKEN_B));
+        assert!(!text.contains("429"));
+
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2);
+        let expected_keys = [
+            "Patch https://discord.com/api/v10/webhooks/100/{token}/messages/@original".to_string(),
+            "Post https://discord.com/api/v10/interactions/200/{token}/callback".to_string(),
+        ];
+        for key in &expected_keys {
+            assert!(keys.contains(key));
+            assert!(!key.contains(TOKEN_A));
+            assert!(!key.contains(TOKEN_B));
+        }
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Patch,
+                    &patch_path,
+                    false
+                ),
+                t0 + Duration::from_secs(60),
+            ));
+        });
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 3);
+        assert!(!text.contains(TOKEN_A));
+        assert!(!text.contains(TOKEN_B));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_token_segment_does_not_arm_member_sync() {
+        const RAW_TOKEN: &str = "synthetic_token_r4303412353";
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+
+        for path in [
+            "https://discord.com/api/v10/webhooks/42/members",
+            "https://discord.com/api/v10/webhooks/42/bans",
+            "https://discord.com/api/v10/webhooks/42/audit-logs",
+        ] {
+            handler
+                .record_rate_limit_wait(wait(
+                    Duration::from_secs(30),
+                    LightMethod::Get,
+                    path,
+                    false,
+                ))
+                .with_subscriber(dispatch.clone())
+                .await;
+            assert_eq!(
+                app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(pacing_deadline(&app, 42).await, None);
+        }
+
+        let text = log.text();
+        assert!(!text.contains("/webhooks/42/members"));
+        assert!(!text.contains("/webhooks/42/bans"));
+        assert!(!text.contains("/webhooks/42/audit-logs"));
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(dispatch.clone())
+            .await;
+        let members_deadline = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(members_deadline > 0);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(members_deadline));
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                &format!("https://discord.com/api/v10/webhooks/42/{}", RAW_TOKEN),
+                true,
+            ))
+            .with_subscriber(dispatch)
+            .await;
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > members_deadline);
+        let text = log.text();
+        assert!(!text.contains(RAW_TOKEN));
+        assert!(!text.contains("/webhooks/42/members"));
+        assert!(!text.contains("/webhooks/42/bans"));
+        assert!(!text.contains("/webhooks/42/audit-logs"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
