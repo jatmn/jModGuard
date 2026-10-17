@@ -152,10 +152,11 @@ JS
 
 decide_audit_report() {
   local report=$1 expiries=$2 audit_rc=$3 today_rc=$4 today_raw=$5 fail_closed=$6
-  local ignores_tmp count classify_rc
+  local ignores_tmp expiries_tmp count classify_rc
   local -A expiry_map=()
-  local id date line ignore_count=0 expiry_count=0 restore_errexit=0
+  local id date line ignore_count=0 expiry_count=0 expired=0 restore_errexit=0
   ignores_tmp="$(mktemp)"
+  expiries_tmp="$(mktemp)"
   case "$-" in
     *e*) restore_errexit=1 ;;
   esac
@@ -168,26 +169,28 @@ decide_audit_report() {
   count="$(audit_classify_report "$report" "$ignores_tmp")"
   classify_rc=$?
   if [ "$classify_rc" -ne 0 ]; then
-    rm -f "$ignores_tmp"
+    rm -f "$ignores_tmp" "$expiries_tmp"
     echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
     dar_fin
     return 1
   fi
 
-  while IFS= read -r line; do
+  # The parser prints valid lines before it returns 1. A process substitution
+  # would keep that prefix and hide the failure, so keep the exit status.
+  if ! audit_read_expiries "$expiries" >"$expiries_tmp"; then
+    rm -f "$ignores_tmp" "$expiries_tmp"
+    echo 'ci-preflight: cargo audit expiry file is invalid' >&2
+    dar_fin
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
     id="${line%% *}"
     date="${line#* }"
     expiry_map["$id"]="$date"
     expiry_count=$((expiry_count + 1))
-  done < <(audit_read_expiries "$expiries")
-  local read_rc=$?
-  if [ "$read_rc" -ne 0 ]; then
-    rm -f "$ignores_tmp"
-    echo 'ci-preflight: cargo audit expiry file is invalid' >&2
-    dar_fin
-    return 1
-  fi
+  done <"$expiries_tmp"
+  rm -f "$expiries_tmp"
 
   while IFS= read -r id || [ -n "$id" ]; do
     [ -n "$id" ] || continue
@@ -224,20 +227,21 @@ decide_audit_report() {
         echo "ci-preflight: advisory ${id} ignored (expires ${date}; see #349)" >&2
         if audit_ignore_is_expired "$today_raw" "$date"; then
           echo "ci-preflight: cargo audit exception ${id} expired on ${date}; see #349; re-review the exception" >&2
-          rm -f "$ignores_tmp"
-          dar_fin
-          return 1
+          expired=1
         fi
       else
         echo "ci-preflight: advisory ${id} ignored (expires ${date})" >&2
         if audit_ignore_is_expired "$today_raw" "$date"; then
           echo "ci-preflight: cargo audit exception ${id} expired on ${date}; re-review the exception" >&2
-          rm -f "$ignores_tmp"
-          dar_fin
-          return 1
+          expired=1
         fi
       fi
     done <"$ignores_tmp"
+    if [ "$expired" -eq 1 ]; then
+      rm -f "$ignores_tmp"
+      dar_fin
+      return 1
+    fi
   fi
 
   rm -f "$ignores_tmp"
@@ -345,10 +349,33 @@ if [ "${1:-}" = "--audit-expiry-self-check" ]; then
   grep -Fq 'RUSTSEC-2026-0002 ignored (expires 2099-12-01)' "$tmp/decide.err" || fail 'two future: second ignore line'
 
   printf 'RUSTSEC-2026-0001 2024-05-01\nRUSTSEC-2026-0002 2099-12-01\n' >"$tmp/today-expire"
-  decide_expect 1 "$two_ignore_ok" "$tmp/today-expire" 0 0 2024-05-02 0
+  decide_expect 1 "$two_ignore_ok" "$tmp/today-expire" 0 0 2024-05-01 0
   grep -Fq 'expired on' "$tmp/decide.err" || fail 'today equal earlier expiry must print expired on'
   grep -Fq 'RUSTSEC-2026-0001' "$tmp/decide.err" || fail 'today equal earlier expiry must name id'
   grep -Fq '2024-05-01' "$tmp/decide.err" || fail 'today equal earlier expiry must name date'
+
+  printf 'RUSTSEC-2026-0001 2024-05-01\nRUSTSEC-2026-0002 2024-05-02\n' >"$tmp/both-expired"
+  decide_expect 1 "$two_ignore_ok" "$tmp/both-expired" 0 0 2024-05-02 0
+  grep -Fq 'exception RUSTSEC-2026-0001 expired on 2024-05-01' "$tmp/decide.err" || fail 'both expired must name the first id'
+  grep -Fq 'exception RUSTSEC-2026-0002 expired on 2024-05-02' "$tmp/decide.err" || fail 'both expired must name the second id'
+
+  # Pullfrog repro: a valid prefix must not survive a later parser failure.
+  rustsec_only='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0258"]}}'
+  printf '%s\n' 'RUSTSEC-2026-0258 2027-01-15' 'RUSTSEC-2026-0258 2026-01-15' >"$tmp/dup-expiries"
+  decide_expect 1 "$rustsec_only" "$tmp/dup-expiries" 0 0 2026-10-17 0
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'duplicate expiry id must print expiry file is invalid when fail-open'
+  decide_expect 1 "$rustsec_only" "$tmp/dup-expiries" 0 0 2026-10-17 1
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'duplicate expiry id must print expiry file is invalid when fail-closed'
+  printf '%s\n' 'RUSTSEC-2026-0258 2027-01-15' 'INVALID-LINE' >"$tmp/malformed-expiries"
+  decide_expect 1 "$rustsec_only" "$tmp/malformed-expiries" 0 0 2026-10-17 0
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'malformed expiry line must print expiry file is invalid when fail-open'
+  decide_expect 1 "$rustsec_only" "$tmp/malformed-expiries" 0 0 2026-10-17 1
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'malformed expiry line must print expiry file is invalid when fail-closed'
+  printf '%s\n' 'RUSTSEC-2026-0258 2027-01-15' 'RUSTSEC-2026-0002 2026-13-40' >"$tmp/bad-date-expiries"
+  decide_expect 1 "$rustsec_only" "$tmp/bad-date-expiries" 0 0 2026-10-17 0
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'invalid expiry date must print expiry file is invalid when fail-open'
+  decide_expect 1 "$rustsec_only" "$tmp/bad-date-expiries" 0 0 2026-10-17 1
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'invalid expiry date must print expiry file is invalid when fail-closed'
 
   printf 'RUSTSEC-2026-0001 2099-01-01\n' >"$tmp/one-future"
   one_ignore='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0001"]}}'
@@ -361,12 +388,35 @@ if [ "${1:-}" = "--audit-expiry-self-check" ]; then
 
   rustsec_expiry="$(awk '/^RUSTSEC-2026-0258 / {print $2; exit}' "$real_expiries")"
   [ -n "$rustsec_expiry" ] || fail 'real audit-expiries must list RUSTSEC-2026-0258'
+  data_lines="$(grep -cE '^RUSTSEC-' "$real_expiries" || true)"
+  [ "$data_lines" = 1 ] || fail 'audit-expiries must contain exactly one advisory line'
+  grep -F "$rustsec_expiry" "$self_root/AGENTS.md" >/dev/null || fail 'AGENTS.md must document the enforced expiry'
+  grep -F "$rustsec_expiry" "$self_root/docs/CI.md" >/dev/null || fail 'docs/CI.md must document the enforced expiry'
+  grep -F "$rustsec_expiry" "$self_root/.cargo/audit.toml" >/dev/null || fail 'audit.toml must document the enforced expiry'
   day_before="$(TZ=UTC date -u -d "${rustsec_expiry}T00:00:00Z - 1 day" +%Y-%m-%d)"
   rustsec_ok='{"vulnerabilities":{"found":false,"count":0,"list":[]},"settings":{"ignore":["RUSTSEC-2026-0258"]}}'
   decide_expect 0 "$rustsec_ok" "$real_expiries" 0 0 "$day_before" 0
   grep -Fq "ignored (expires ${rustsec_expiry}; see #349)" "$tmp/decide.err" || fail 'documented date: day before must print ignored with see #349'
   decide_expect 1 "$rustsec_ok" "$real_expiries" 0 0 "$rustsec_expiry" 0
   grep -Fq "expired on ${rustsec_expiry}; see #349; re-review the exception" "$tmp/decide.err" || fail 'documented date: expiry day must print expired with see #349'
+
+  write_report '{"vulnerabilities":{"found":false,"count":0,"list":[]}}'
+  set -e
+  decide_audit_report "$tmp/report.json" "$tmp/empty-expiries" 0 0 2024-05-02 0
+  case $- in
+    *e*) ;;
+    *) fail 'decide_audit_report disabled errexit on success' ;;
+  esac
+  set +e
+  decide_audit_report "$tmp/report.json" "$tmp/missing-expiries" 0 0 2024-05-02 0 2>"$tmp/decide.err"
+  errexit_rc=$?
+  set -e
+  [ "$errexit_rc" -ne 0 ] || fail 'missing expiry file must fail'
+  grep -Fq 'expiry file is invalid' "$tmp/decide.err" || fail 'missing expiry file must print expiry file is invalid'
+  case $- in
+    *e*) ;;
+    *) fail 'decide_audit_report left errexit disabled after failure' ;;
+  esac
 
   echo "ci-preflight: audit expiry self-check passed"
   exit 0
