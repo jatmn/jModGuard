@@ -44,19 +44,8 @@ impl Handler {
             return;
         }
         let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
-        self.app
-            .member_sync_rate_limit_until_ms
-            .fetch_max(deadline, Ordering::Relaxed);
-        let bot_id = self.app.member_sync_bot_id.load(Ordering::Relaxed);
-        if bot_id > 0 {
-            let stored = self
-                .app
-                .member_sync_rate_limit_until_ms
-                .load(Ordering::Relaxed);
-            if let Err(error) = persist_member_sync_rate_limit(&self.app.db, bot_id, stored) {
-                tracing::warn!("failed to persist Discord retry deadline: {error:#}");
-            }
-        }
+        self.app.arm_member_sync_rate_limit(deadline);
+        self.app.persist_pending_member_sync_rate_limit().await;
     }
 }
 
@@ -182,13 +171,45 @@ pub(crate) fn redact_rate_limit_path(path: &str) -> String {
     result
 }
 
+pub(crate) fn rate_limit_throttle_key(
+    method: LightMethod,
+    global: bool,
+    redacted_path: &str,
+) -> String {
+    let scope = if global { "global" } else { "route" };
+    format!(
+        "{method:?} {scope} {}",
+        normalize_rate_limit_route(redacted_path)
+    )
+}
+
+fn normalize_rate_limit_route(path: &str) -> String {
+    let without_fragment = path.split_once('#').map(|(head, _)| head).unwrap_or(path);
+    let route = without_fragment
+        .split_once('?')
+        .map(|(head, _)| head)
+        .unwrap_or(without_fragment);
+    let mut out = String::with_capacity(route.len());
+    for (index, segment) in route.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            out.push_str("{id}");
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
 pub(crate) fn note_rate_limit_wait(
     app: &crate::state::BotState,
     wait: &RateLimitWait,
     now: Instant,
 ) -> bool {
     let path = redact_rate_limit_path(&wait.path);
-    let key = format!("{:?} {}", wait.method, path);
+    let key = rate_limit_throttle_key(wait.method, wait.global, &path);
     let mut logged_at = app.rate_limit_wait_logged_at.lock();
     logged_at.retain(|_, logged| now.saturating_duration_since(*logged) < Duration::from_secs(60));
     if logged_at.contains_key(&key) {
@@ -203,16 +224,6 @@ pub(crate) fn note_rate_limit_wait(
         "rate-limit wait"
     );
     true
-}
-
-fn persist_member_sync_rate_limit(db: &db::Db, bot_id: i64, deadline_ms: i64) -> Result<()> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(db::extend_member_sync_request_after(
-            db,
-            bot_id,
-            deadline_ms,
-        ))
-    })
 }
 
 pub(crate) fn clear_remembered_if_bot_roles_changed(
@@ -3570,7 +3581,7 @@ mod tests {
 mod rate_limit_tests {
     use super::{
         Handler, RateLimitWait, member_sync_deadline_ms, note_rate_limit_wait,
-        redact_rate_limit_path,
+        rate_limit_throttle_key, redact_rate_limit_path,
     };
     use crate::config::BotProcessConfig;
     use crate::db::Db;
@@ -4009,6 +4020,279 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_deadline_is_persisted_when_the_member_sync_loop_publishes_the_bot_id() {
+        use serenity::all::{Cache, CurrentUser, UserUpdateEvent};
+        use std::sync::Arc;
+
+        let (directory, app, handler) = test_state().await;
+        assert_eq!(app.member_sync_bot_id.load(Ordering::Relaxed), 0);
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(60),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(stored > 0);
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+        assert!(!log.text().contains("failed to persist"));
+
+        let cache = Arc::new(Cache::new());
+        let mut user = CurrentUser::default();
+        user.id = serenity::model::id::UserId::new(42);
+        let mut event: UserUpdateEvent =
+            serde_json::from_value(serde_json::to_value(user).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let worker = tokio::spawn(crate::member_sync::run(
+            app.clone(),
+            Arc::new(serenity::http::Http::new("unused")),
+            cache,
+        ));
+        let poll = tokio::time::timeout(Duration::from_secs(5), async {
+            while pacing_deadline(&app, 42).await != Some(stored) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        assert!(poll.is_ok());
+        assert_eq!(pacing_deadline(&app, 42).await, Some(stored));
+        assert_eq!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Relaxed)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_pacing_write_retries_when_the_bot_id_is_published_again() {
+        let (directory, app, handler) = test_state().await;
+        let log = CapturedLog::default();
+        app.publish_member_sync_bot_id(42).await;
+        assert_eq!(pacing_deadline(&app, 42).await, None);
+
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(30),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let kept = pacing_deadline(&app, 42).await.unwrap();
+
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let advanced = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        assert!(advanced > kept);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
+        let text = log.text();
+        assert!(text.contains("failed to persist Discord retry deadline"));
+        assert!(text.contains("fixture pacing failure"));
+
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536)
+            })
+            .await
+            .unwrap();
+
+        app.publish_member_sync_bot_id(42).await;
+        assert_eq!(
+            pacing_deadline(&app, 42).await,
+            Some(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed))
+        );
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > kept);
+        assert_eq!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Relaxed)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_wait_logs_after_a_local_wait_on_the_same_route() {
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+        let members = wait(
+            Duration::from_secs(1),
+            LightMethod::Get,
+            "/guilds/1/members",
+            false,
+        );
+        let global_members = wait(
+            Duration::from_secs(1),
+            LightMethod::Get,
+            "/guilds/1/members",
+            true,
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(&app, &members, t0));
+            assert!(note_rate_limit_wait(
+                &app,
+                &global_members,
+                t0 + Duration::from_secs(30)
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &global_members,
+                t0 + Duration::from_secs(40)
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &members,
+                t0 + Duration::from_secs(30)
+            ));
+        });
+        let text = log.text();
+        assert_eq!(rate_limit_wait_lines(&text), 2);
+        assert!(text.contains("global=true"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_resource_ids_share_one_throttle_key() {
+        use serenity::http::Route;
+        use serenity::model::id::InteractionId;
+
+        let (directory, app, _handler) = test_state().await;
+        let log = CapturedLog::default();
+        let dispatch = log.dispatch();
+        let t0 = Instant::now();
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/1/members",
+                    false,
+                ),
+                t0,
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/999/members",
+                    false,
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+        });
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0],
+            rate_limit_throttle_key(LightMethod::Get, false, "/guilds/1/members")
+        );
+        assert!(!keys[0].contains("/guilds/1"));
+        assert!(!keys[0].contains("/guilds/999"));
+        assert!(log.text().contains("/guilds/1/members"));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Get,
+                    "/guilds/3/bans",
+                    false,
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+        });
+
+        let post_path_a = Route::InteractionResponse {
+            interaction_id: InteractionId::new(200),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        let post_path_b = Route::InteractionResponse {
+            interaction_id: InteractionId::new(201),
+            token: TOKEN_A,
+        }
+        .path()
+        .into_owned();
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_path_a,
+                    false
+                ),
+                t0 + Duration::from_secs(1),
+            ));
+            assert!(!note_rate_limit_wait(
+                &app,
+                &wait(
+                    Duration::from_secs(1),
+                    LightMethod::Post,
+                    &post_path_b,
+                    false
+                ),
+                t0 + Duration::from_secs(2),
+            ));
+        });
+        let text = log.text();
+        assert!(!text.contains(TOKEN_A));
+        let keys = app
+            .rate_limit_wait_logged_at
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let interaction_key = rate_limit_throttle_key(
+            LightMethod::Post,
+            false,
+            "https://discord.com/api/v10/interactions/200/{token}/callback",
+        );
+        assert!(keys.iter().any(|key| key == &interaction_key));
+        for key in &keys {
+            assert!(!key.contains(TOKEN_A));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn deadline_millis_clamps_to_i64() {
         assert_eq!(member_sync_deadline_ms(10, Duration::MAX), i64::MAX);
@@ -4309,8 +4593,9 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             .collect::<Vec<_>>();
         assert_eq!(keys.len(), 2);
         let expected_keys = [
-            "Patch https://discord.com/api/v10/webhooks/100/{token}/messages/@original".to_string(),
-            "Post https://discord.com/api/v10/interactions/200/{token}/callback".to_string(),
+            "Patch route https://discord.com/api/v10/webhooks/{id}/{token}/messages/@original"
+                .to_string(),
+            "Post route https://discord.com/api/v10/interactions/{id}/{token}/callback".to_string(),
         ];
         for key in &expected_keys {
             assert!(keys.contains(key));

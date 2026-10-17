@@ -876,7 +876,6 @@ async fn run_loop(
     probe: Arc<LoopProbe>,
 ) {
     let rate_limit_until_ms = &app.member_sync_rate_limit_until_ms;
-    let sync_bot_id = &app.member_sync_bot_id;
     // A READY generation is acknowledged per enrollment only after its
     // directory status and any required coverage gap have been recorded.
     let mut ready_coverage = ReadyCoverage::default();
@@ -909,7 +908,7 @@ async fn run_loop(
             defer_until = Some(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
-        sync_bot_id.store(bot_id, Ordering::Relaxed);
+        app.publish_member_sync_bot_id(bot_id).await;
         let mut guilds = cache.guilds();
         guilds.sort_unstable();
         if guilds.is_empty() {
