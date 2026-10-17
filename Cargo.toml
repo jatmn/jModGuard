@@ -5,14 +5,14 @@ members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/updater", 
 default-members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/updater", "crates/integration-tests"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 [package]
 name = "jmodguard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Shared jModGuard configuration, data model and database access"
 license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
