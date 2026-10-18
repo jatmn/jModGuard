@@ -75,14 +75,19 @@ function run(command, args, options = {}) {
   assert.ifError(result.error);
   return result.stdout.trim();
 }
+const configure = jobs.get("checks").match(/^      - name: Configure runner\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
+assert.ok(configure, "missing Configure runner step");
+assert.match(configure, /^        run: bash scripts\/ci-setup\.sh "\$NEED_RUST"$/m);
+const configureEnv = configure.match(/^        env:\n((?:          [^\n]+\n)+)/m)?.[1];
+assert.ok(configureEnv, "Configure runner must receive its setup flags");
 for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
-  const evaluate = key => {
-    const match = jobs.get("checks").match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
+  const evaluate = (key, block = jobs.get("checks")) => {
+    const match = block.match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
     assert.ok(match, `missing ${key} workflow binding`);
     return Function("matrix", "startsWith", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix));
   };
   const rustTests = ["rust-api", "rust-bot", "rust-core"].includes(lane);
-  assert.equal(evaluate("NEED_NEXTEST"), rustTests);
+  assert.equal(evaluate("NEED_NEXTEST", configureEnv), rustTests);
   assert.equal(evaluate("shared-key"), rustTests ? "rust" : lane, "retain the existing dependency cache");
   assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
 }
@@ -104,6 +109,26 @@ try {
   assert.equal(setup.DYLINT_DRIVER_PATH, path.join(prefix, "dylint-drivers"));
   assert.ok(fs.statSync(setup.DYLINT_DRIVER_PATH).isDirectory(), "cold driver cache must exist");
   fs.writeFileSync(path.join(setup.DYLINT_DRIVER_PATH, "probe"), "usable");
+
+  // A failed downloader must have finite deadlines and stop setup before
+  // publishing an unusable nextest path. The network failure is simulated.
+  const bin = path.join(scratch, "bin"), curlArgs = path.join(scratch, "curl-args");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "curl"), '#!/bin/sh\nprintf "%s\\n" "$@" > "$CURL_ARGS"\nexit 28\n', { mode: 0o755 });
+  const githubPath = path.join(scratch, "github-path");
+  const failedSetup = spawnSync("bash", [setupScript, "false"], { cwd: root, encoding: "utf8", env: {
+    ...process.env, PATH: `${bin}:${process.env.PATH}`, CURL_ARGS: curlArgs,
+    GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", NEED_NEXTEST: "true",
+    RUNNER_TEMP: scratch, GITHUB_ENV: envFile, GITHUB_PATH: githubPath,
+  } });
+  assert.ifError(failedSetup.error);
+  assert.equal(failedSetup.status, 28, "download failure must stop setup");
+  const args = fs.readFileSync(curlArgs, "utf8").trim().split("\n");
+  for (const option of ["--connect-timeout", "--max-time", "--retry-max-time"]) {
+    const index = args.indexOf(option), seconds = Number(args[index + 1]);
+    assert.ok(index >= 0 && seconds > 0 && seconds <= 120, `${option} must bound download delays`);
+  }
+  assert.ok(!fs.existsSync(githubPath), "failed setup must not publish nextest");
 
   // Real Git fixture: docs-only H selects contracts, then R adds Rust changes.
   // Resolve checkout/diff bindings from the actual reusable workflow, not a

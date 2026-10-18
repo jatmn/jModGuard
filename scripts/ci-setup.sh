@@ -24,6 +24,7 @@ if [[ "${NEED_NEXTEST:-false}" == true ]]; then
   # Prebuilt, checksum-pinned runner: avoid compiling tools or launching Cargo per test.
   nextest_archive="$RUNNER_TEMP/jmodguard/nextest.tar.gz"
   curl --fail --silent --show-error --location --retry 3 \
+    --connect-timeout 10 --max-time 60 --retry-max-time 120 \
     https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz \
     --output "$nextest_archive"
   echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $nextest_archive" | sha256sum --check
