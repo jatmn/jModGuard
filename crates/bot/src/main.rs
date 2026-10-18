@@ -391,6 +391,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut cursor = 0;
+            let mut poll = tokio::time::interval(Duration::from_secs(5));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal() => break,
+                    _ = poll.tick() => {
+                        if app.activation.may_record()
+                            && let Err(error) = jmodguard_bot::gateway_ban_persistence::drain(&app, &mut cursor).await {
+                            tracing::warn!("gateway ban inbox recovery will retry: {error:#}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // --- config_version poll (cross-process cache invalidation) --------------
     let poll_secs = cfg.bot.config_poll_secs.max(1);
     {

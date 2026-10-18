@@ -160,6 +160,7 @@ pub(super) fn wipe_directory_guild_data_conn(
         "DELETE FROM bans WHERE guild_id=?1",
         "DELETE FROM nickname_reconcile WHERE guild_id=?1",
         "DELETE FROM bot_actions WHERE guild_id=?1",
+        "DELETE FROM gateway_ban_deliveries WHERE guild_id=?1",
     ]
     .into_iter()
     .enumerate()

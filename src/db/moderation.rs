@@ -512,7 +512,7 @@ pub enum BanRecord {
 pub const GATEWAY_BAN_REASON: &str = "Reason unavailable";
 
 /// How a gateway ban delivery relates to the active mirror.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GatewayBanWrite {
     /// The bot's echo stored the missing active row. No `member_ban` event.
     OwnedByBot { row_id: i64 },
@@ -798,6 +798,7 @@ pub async fn record_gateway_ban_with_audit(
             gateway_audit_entry_id,
             pending_audit_entries,
             audit_after_ms,
+            None,
         )
     })
     .await
@@ -1001,7 +1002,7 @@ fn gateway_ban_row_for_audit_entry(
     .optional()
 }
 
-fn gateway_audit_entry_id_known_for_user(
+pub(super) fn gateway_audit_entry_id_known_for_user(
     conn: &impl SqlExecutor,
     guild_id: i64,
     user_id: i64,
@@ -1158,7 +1159,7 @@ fn member_ban_event_json_lacks_audit_entry_id(data: &str) -> bool {
 }
 
 /// Context delivered with the exact manual-ban audit identity.
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayBanAuditAttribution {
     pub moderator_id: i64,
     pub moderator_name: Option<String>,
@@ -1287,6 +1288,14 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries WHERE guild_id=?1 AND user_id=?2 AND kind='ban' AND applied=0 AND enrollment_id=?3)",
+        params![guild_id,user_id,enrollment.id.clone()], |row| Ok(row.get(0)?),
+    )?;
+    if pending {
+        tx.finish_read()?;
+        return Ok(false);
+    }
     if gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, audit_entry_id)? {
         if attribution.is_some() {
             attribute_gateway_ban_audit_conn(
@@ -1307,6 +1316,23 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     // gateway observation after that action; ambiguity (including an attributed neighbor)
     // must leave the identity unresolved rather than select the oldest row.
     let audit_at_ms = (audit_entry_id >> 22) + 1_420_070_400_000;
+    // A saved observation remembers known competing callbacks. After a crash,
+    // absence of a peer's inbox row cannot make this one a unique candidate.
+    let missing_peer: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries d,
+             json_each(d.payload, '$.payload.Ban.overlapping_deliveries') peer
+         WHERE d.guild_id=?1 AND d.user_id=?2 AND d.enrollment_id=?3 AND d.kind='ban'
+           AND json_extract(peer.value, '$.observed_at_ms') BETWEEN ?4 AND ?4+5000
+           AND NOT EXISTS(SELECT 1 FROM gateway_ban_deliveries p
+               WHERE p.id=json_extract(peer.value, '$.id') AND p.guild_id=d.guild_id AND p.user_id=d.user_id
+                 AND p.enrollment_id=d.enrollment_id AND p.kind='ban' AND p.applied=1))",
+        params![guild_id, user_id, enrollment.id.clone(), audit_at_ms],
+        |row| Ok(row.get(0)?),
+    )?;
+    if missing_peer {
+        tx.finish_read()?;
+        return Ok(false);
+    }
     let pending = {
         let mut statement = tx.prepare(
             "SELECT id, data, created_at FROM events
@@ -1548,7 +1574,7 @@ pub async fn gateway_manual_ban_audit_entry_is_known(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_gateway_ban_conn(
+pub(super) fn record_gateway_ban_conn(
     conn: &mut Connection,
     enrollment: &GuildEnrollment,
     guild_id: i64,
@@ -1563,10 +1589,50 @@ fn record_gateway_ban_conn(
     gateway_audit_entry_id: Option<i64>,
     pending_audit_entries: Vec<i64>,
     audit_after_ms: i64,
+    delivery_id: Option<&str>,
 ) -> Result<GatewayBanWrite> {
     let mut tx = conn.transaction_primary_read()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+    if let Some(id) = delivery_id
+        && let Some(result) = tx
+            .query_row(
+                "SELECT ban_result FROM gateway_ban_deliveries WHERE id=?1 AND applied=1",
+                params![id],
+                |row| Ok(row.get::<Option<String>>(0)?),
+            )
+            .optional()?
+            .flatten()
+    {
+        let result = serde_json::from_str(&result)?;
+        tx.finish_read()?;
+        return Ok(result);
+    }
+    if delivery_id.is_some()
+        && owned_by_bot
+        && let Some(operation) = operation_id.as_deref()
+        && let Some(row_id) = tx.query_row(
+            "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3 ORDER BY id LIMIT 1",
+            params![guild_id, user_id, operation], |row| Ok(row.get::<i64>(0)?),
+        ).optional()? {
+        return finish_gateway_ban_write(tx, delivery_id, GatewayBanWrite::Existing { row_id }, false);
+    }
+    let historical = if delivery_id.is_some() {
+        let at = chrono::DateTime::parse_from_rfc3339(&now)?.timestamp_millis();
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries
+                 WHERE guild_id=?1 AND user_id=?2 AND kind='unban' AND observed_at_ms>=?3 AND enrollment_id=?5)
+              OR EXISTS(SELECT 1 FROM bans WHERE guild_id=?1 AND user_id=?2
+                 AND julianday(created_at)>julianday(?4))
+              OR EXISTS(SELECT 1 FROM events WHERE guild_id=?1 AND user_id=?2
+                 AND event_type='member_unban' AND julianday(created_at)>=julianday(?4))",
+            params![guild_id, user_id, at, now.clone(), enrollment.id.clone()],
+            |row| Ok(row.get::<bool>(0)?),
+        )?
+    } else {
+        false
+    };
+
     if !owned_by_bot
         && let Some(incoming) = gateway_audit_entry_id.filter(|id| *id > 0)
         && gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, incoming)?
@@ -1578,10 +1644,14 @@ fn record_gateway_ban_conn(
                     "known audit entry {incoming} has no ban row for guild {guild_id} user {user_id}"
                 )
             })?;
-        tx.finish_read()?;
-        return Ok(GatewayBanWrite::Existing { row_id });
+        return finish_gateway_ban_write(
+            tx,
+            delivery_id,
+            GatewayBanWrite::Existing { row_id },
+            false,
+        );
     }
-    if let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
+    if !historical && let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
         let keep = if owned_by_bot {
             bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
         } else {
@@ -1644,12 +1714,6 @@ fn record_gateway_ban_conn(
                         observations.push(
                             serde_json::json!({"at_ms": at, "audit_after_ms": audit_after_ms}),
                         );
-                        if observations.len() > 8 {
-                            let lost = observations.remove(0)["at_ms"].as_i64().unwrap_or(at);
-                            event["observations_lost_through"] = serde_json::json!(
-                                lost.max(event["observations_lost_through"].as_i64().unwrap_or(0))
-                            );
-                        }
                         event["gateway_observations"] = serde_json::json!(observations);
                         tx.ensure_mutation_receipt()?;
                         tx.execute_matching(
@@ -1659,8 +1723,12 @@ fn record_gateway_ban_conn(
                                 id
                             ],
                         )?;
-                        tx.commit()?;
-                        return Ok(GatewayBanWrite::Existing { row_id: mirror.id });
+                        return finish_gateway_ban_write(
+                            tx,
+                            delivery_id,
+                            GatewayBanWrite::Existing { row_id: mirror.id },
+                            true,
+                        );
                     }
                     let candidate = if at == original {
                         &mut event
@@ -1681,13 +1749,21 @@ fn record_gateway_ban_conn(
                                 id
                             ],
                         )?;
-                        tx.commit()?;
-                        return Ok(GatewayBanWrite::Existing { row_id: mirror.id });
+                        return finish_gateway_ban_write(
+                            tx,
+                            delivery_id,
+                            GatewayBanWrite::Existing { row_id: mirror.id },
+                            true,
+                        );
                     }
                 }
             }
-            tx.finish_read()?;
-            return Ok(GatewayBanWrite::Existing { row_id: mirror.id });
+            return finish_gateway_ban_write(
+                tx,
+                delivery_id,
+                GatewayBanWrite::Existing { row_id: mirror.id },
+                false,
+            );
         }
         tx.ensure_mutation_receipt()?;
         tx.execute_matching(
@@ -1699,7 +1775,7 @@ fn record_gateway_ban_conn(
     }
     match tx.execute_rows(
         "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name, operation_id)
-         VALUES (?1, ?2, NULL, ?3, ?4, 1, ?5, ?6, NULL, ?7)",
+         VALUES (?1, ?2, NULL, ?3, ?4, ?8, ?5, ?6, NULL, ?7)",
         params![
             guild_id,
             user_id,
@@ -1707,12 +1783,13 @@ fn record_gateway_ban_conn(
             now.clone(),
             user_name,
             user_display_name,
-            operation_id
+            operation_id,
+            !historical
         ],
         1,
     ) {
         Ok(_) => {}
-        Err(error) if active_ban_conflict(&error) => {
+        Err(error) if delivery_id.is_none() && active_ban_conflict(&error) => {
             drop(tx);
             return existing_active_ban(conn, enrollment, guild_id, user_id);
         }
@@ -1720,8 +1797,12 @@ fn record_gateway_ban_conn(
     }
     let row_id = tx.last_insert_rowid();
     if owned_by_bot {
-        tx.commit()?;
-        return Ok(GatewayBanWrite::OwnedByBot { row_id });
+        return finish_gateway_ban_write(
+            tx,
+            delivery_id,
+            GatewayBanWrite::OwnedByBot { row_id },
+            true,
+        );
     }
     let mut event = serde_json::json!({
         "reason": reason,
@@ -1740,8 +1821,28 @@ fn record_gateway_ban_conn(
         params![guild_id, user_id, data, now],
         |row| Ok(row.get::<i64>(0)?),
     )?;
-    tx.commit()?;
-    Ok(GatewayBanWrite::Recorded { row_id })
+    finish_gateway_ban_write(tx, delivery_id, GatewayBanWrite::Recorded { row_id }, true)
+}
+
+fn finish_gateway_ban_write(
+    mut tx: crate::db_compat::Transaction,
+    delivery: Option<&str>,
+    result: GatewayBanWrite,
+    mutated: bool,
+) -> Result<GatewayBanWrite> {
+    if let Some(id) = delivery {
+        tx.ensure_mutation_receipt()?;
+        tx.execute_matching(
+            "UPDATE gateway_ban_deliveries SET applied=1,ban_result=?1 WHERE id=?2",
+            params![serde_json::to_string(&result)?, id],
+        )?;
+    }
+    if mutated || delivery.is_some() {
+        tx.commit()?;
+    } else {
+        tx.finish_read()?;
+    }
+    Ok(result)
 }
 
 fn active_ban_id(conn: &impl SqlExecutor, guild_id: i64, user_id: i64) -> Result<Option<i64>> {
@@ -1864,14 +1965,21 @@ pub async fn mark_enrolled_unbanned(
     // `GUILD_BAN_REMOVE` on the bot also calls this to heal drift.
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
+    let observed_at = now_str();
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
+        super::gateway_ban_deliveries::record_unban_boundary_conn(
+            &tx,
+            &enrollment,
+            user_id,
+            &observed_at,
+        )?;
         tx.execute_matching(
-            "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1",
-            params![guild_id, user_id],
+            "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1 AND julianday(created_at) <= julianday(?3)",
+            params![guild_id, user_id, observed_at],
         )?;
         tx.commit()?;
         Ok(())

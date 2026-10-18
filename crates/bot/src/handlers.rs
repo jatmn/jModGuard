@@ -308,7 +308,7 @@ fn audit_case_action(
     }
 }
 
-fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bool {
+pub(crate) fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bool {
     // Directory state is only a snapshot. Equal saved state does not identify
     // this delivered action after a missed opposite Gateway event, so recording
     // depends only on whether this delivery is the bot's own suppressed echo.
@@ -324,7 +324,7 @@ fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
     }
 }
 
-async fn persist_gateway_ban_observation(
+pub(crate) async fn persist_gateway_ban_observation(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
     user: u64,
@@ -375,15 +375,28 @@ pub(crate) async fn reconcile_received_gateway_ban_audit(
     user: u64,
     entry_id: i64,
     attribution: db::GatewayBanAuditAttribution,
-) {
+) -> bool {
     app.queue_attributed_gateway_manual_ban_audit_entry(guild, user, entry_id, attribution);
     let app = Arc::clone(app);
-    // Arm the pass before awaiting it: dropping this callback detaches the task.
     let reconcile = tokio::spawn(async move {
-        reconcile_pending_gateway_ban_audits(&app, enrollment, guild, user).await;
+        let matched = app
+            .reconcile_gateway_manual_ban_audit_entry(enrollment, guild, user, entry_id)
+            .await?;
+        if matched {
+            app.drop_gateway_manual_ban_audit_entry(guild, user, entry_id);
+        }
+        Ok::<_, anyhow::Error>(matched)
     });
-    if let Err(error) = reconcile.await {
-        tracing::warn!("gateway manual ban audit task failed: {error:#}");
+    match reconcile.await {
+        Ok(Ok(matched)) => matched,
+        Ok(Err(error)) => {
+            tracing::warn!("gateway manual ban audit reconcile deferred: {error:#}");
+            false
+        }
+        Err(error) => {
+            tracing::warn!("gateway manual ban audit task failed: {error:#}");
+            false
+        }
     }
 }
 
@@ -792,101 +805,35 @@ impl EventHandler for Handler {
             observed.timestamp_millis(),
         );
         let app = Arc::clone(self.app());
-        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let member_was_banned = gateway_ban_directory_precheck_then_observe(
-            &app,
-            guild_id.get(),
-            &banned_user,
-            observed.timestamp_millis(),
-        )
-        .await;
-        reconcile_pending_gateway_ban_audits(
-            &app,
-            enrollment.clone(),
-            guild_id.get(),
-            banned_user.id.get(),
-        )
-        .await;
-        // Sample the fence and the queued audits before resolve. Any wait after
-        // resolve lets a failed dispatch clear this echo, and persistence would
-        // keep the stale ownership decision.
-        let audit_after_ms = in_flight.audit_after_ms().await;
-        let pending_audits =
-            app.pending_gateway_manual_ban_audit_entries(guild_id.get(), banned_user.id.get());
-        let echo = echo.resolve();
+        let joined = ctx
+            .cache
+            .guild(guild_id)
+            .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
         let observed_at = observed.to_rfc3339();
-        // A bot echo is not a second ban and not a manual moderation record.
-        // Consumed echoes stay remembered until expiry, unban or release.
-        // If Discord applied the ban but the command never stored a row, that
-        // owned echo still inserts the one active row, marked with this
-        // attempt's operation id, and does not add a member_ban event. A
-        // manual delivery inserts one row and one
-        // member_ban event before the audit wait, so an unban during that
-        // wait can mark the row inactive. Id-less redeliveries retain bounded
-        // observations; only a distinguishing late audit creates another row.
-        let write_app = Arc::clone(&app);
-        let write_enrollment = enrollment.clone();
-        let write_user = banned_user.clone();
-        let write_observed_at = observed_at.clone();
-        let write_operation_id = echo.operation_id.clone();
-        let ban_write = crate::logging::log_persistence_result(
-            "gateway ban row",
-            persist_gateway_ban_observation(
-                &app,
-                enrollment.clone(),
-                banned_user.id.get(),
-                in_flight,
-                echo.owned_by_bot,
-                async move {
-                    db::record_gateway_ban_with_audit(
-                        &write_app.db,
-                        write_enrollment,
-                        write_user.id.get() as i64,
-                        Some(&write_user.name),
-                        write_user.global_name.as_deref(),
-                        Some(&write_observed_at),
-                        echo.owned_by_bot,
-                        write_operation_id.as_deref(),
-                        member_was_banned,
-                        db::GatewayBanAuditEntries::Observed {
-                            pending: pending_audits,
-                            audit_after_ms,
-                        },
-                    )
-                    .await
-                },
-            )
-            .await,
+        // The detached owner receives the actual payload before any SQL await.
+        // It retries storage; the durable inbox completes partial work on restart.
+        let persistence = crate::gateway_ban_persistence::receive_ban(
+            Arc::clone(&app),
+            in_flight,
+            guild_id.get(),
+            banned_user.clone(),
+            echo,
+            joined,
         );
-        let ban_row_id = ban_write.and_then(gateway_ban_row_to_attribute);
-        // Every unsuppressed delivery is a distinct unresolved observation.
-        // A matching saved status is not an action identity: an opposite event
-        // may have been missed while Gateway coverage was unavailable.
-        if record_unresolved_gateway_observation(echo.suppress_case) {
-            let recorded = crate::cases::record(
-                &app,
-                enrollment.clone(),
-                crate::db::guild_data::CaseAction::Ban,
-                crate::db::guild_data::CaseOutcome::Succeeded,
-                banned_user.id.get(),
-                None,
-                Some("banned".into()),
-                crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::db::guild_data::CaseSource::GatewayObservation {
-                    observation_id: crate::db::guild_data::CaseId::new(),
-                },
-            )
-            .await;
-            if recorded.is_none() {
-                crate::member_directory::mark_user_gap(
-                    &app,
-                    guild_id.get(),
-                    banned_user.id.get() as i64,
-                    "ban case persistence unavailable",
-                )
-                .await;
+        let (enrollment, ban_row_id) = match persistence.await {
+            Ok(Ok((enrollment, write))) => (
+                Some(enrollment),
+                write.and_then(gateway_ban_row_to_attribute),
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!("gateway ban persistence deferred or membership retired: {error:#}");
+                (None, None)
             }
-        }
+            Err(error) => {
+                tracing::error!("gateway ban persistence owner failed: {error:#}");
+                (None, None)
+            }
+        };
         // Resolve the audit context even when no dedicated ban log channel is
         // configured, so the WebUI can retain the known moderator and reason.
         let audit = if let (Some(observation), Ok(_permit)) =
@@ -959,8 +906,6 @@ impl EventHandler for Handler {
         // A ban after this unban is a new ban, even inside the echo window.
         self.app
             .clear_gateway_ban_echo(guild_id.get(), unbanned_user.id.get());
-        self.app
-            .clear_gateway_manual_ban_audit_entries(guild_id.get(), unbanned_user.id.get());
         let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
@@ -970,7 +915,24 @@ impl EventHandler for Handler {
             observed.timestamp_millis(),
         );
         let app = Arc::clone(self.app());
-        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
+        let joined = ctx
+            .cache
+            .guild(guild_id)
+            .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
+        let suppressed = app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Unban,
+            guild_id.get(),
+            unbanned_user.id.get(),
+        );
+        let persistence = crate::gateway_ban_persistence::receive_unban(
+            Arc::clone(&app),
+            guild_id.get(),
+            unbanned_user.id.get(),
+            observed,
+            joined,
+            suppressed,
+            None,
+        );
         crate::member_directory::observe_unban(
             &app,
             guild_id.get(),
@@ -978,48 +940,10 @@ impl EventHandler for Handler {
             observed.timestamp_millis(),
         )
         .await;
-        let _ =
-            db::mark_enrolled_unbanned(&app.db, enrollment.clone(), unbanned_user.id.get() as i64)
-                .await;
-        let observed_at = observed.to_rfc3339();
-        let suppressed = app.consume_gateway_case_suppression(
-            crate::state::GatewayCaseAction::Unban,
-            guild_id.get(),
-            unbanned_user.id.get(),
-        );
-        if !suppressed {
-            let _ = db::record_gateway_unban_event(
-                &app.db,
-                enrollment.clone(),
-                unbanned_user.id.get() as i64,
-                Some(&observed_at),
-            )
-            .await;
-        }
-        if record_unresolved_gateway_observation(suppressed) {
-            let recorded = crate::cases::record(
-                &app,
-                enrollment,
-                crate::db::guild_data::CaseAction::Unban,
-                crate::db::guild_data::CaseOutcome::Succeeded,
-                unbanned_user.id.get(),
-                None,
-                Some("unbanned".into()),
-                crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::db::guild_data::CaseSource::GatewayObservation {
-                    observation_id: crate::db::guild_data::CaseId::new(),
-                },
-            )
-            .await;
-            if recorded.is_none() {
-                crate::member_directory::mark_user_gap(
-                    &app,
-                    guild_id.get(),
-                    unbanned_user.id.get() as i64,
-                    "unban case persistence unavailable",
-                )
-                .await;
-            }
+        match persistence.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("gateway unban persistence deferred: {error:#}"),
+            Err(error) => tracing::error!("gateway unban persistence owner failed: {error:#}"),
         }
         let mut extra = BTreeMap::new();
         extra.insert("time".into(), observed.to_rfc3339());
@@ -1064,10 +988,12 @@ impl EventHandler for Handler {
             if matches!(action, crate::db::guild_data::CaseAction::Ban) {
                 let guild = guild_id.get();
                 let user = target.get();
-                let enrollment = crate::cases::capture(self.app(), guild).await;
-                reconcile_received_gateway_ban_audit(
-                    &self.app,
-                    enrollment,
+                let joined = ctx
+                    .cache
+                    .guild(guild_id)
+                    .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
+                let persistence = crate::gateway_ban_persistence::receive_audit(
+                    Arc::clone(&self.app),
                     guild,
                     user,
                     entry_id,
@@ -1082,12 +1008,28 @@ impl EventHandler for Handler {
                             .unwrap_or("No reason provided")
                             .to_owned(),
                     },
-                )
-                .await;
+                    entry
+                        .reason
+                        .as_ref()
+                        .map(|reason| jmodguard::ban_reason::without_tag(reason).to_owned()),
+                    joined,
+                    None,
+                );
+                match persistence.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!("gateway ban audit persistence deferred: {error:#}")
+                    }
+                    Err(error) => {
+                        tracing::error!("gateway ban audit persistence owner failed: {error:#}")
+                    }
+                }
             }
             // The audit snowflake is the durable action identity. A repeat ban
             // or unban has a different ID; a replay of this entry is idempotent.
-            if let Some(enrollment) = crate::cases::capture(self.app(), guild_id.get()).await {
+            if matches!(action, crate::db::guild_data::CaseAction::Unban)
+                && let Some(enrollment) = crate::cases::capture(self.app(), guild_id.get()).await
+            {
                 let data = crate::db::guild_data::CaseData {
                     ban_attempt_tag: None,
                     source: crate::db::guild_data::CaseSource::DiscordAudit { entry_id },
@@ -2230,7 +2172,7 @@ mod tests {
             let at = first.observed + chrono::Duration::seconds(2);
             first.observed = at;
             // A has already sampled the fence for its asynchronous write.
-            let cutoff = first.audit_after_ms().await;
+            let cutoff = first.audit_after_ms();
             // B's action precedes A's delayed observation, but B's callback
             // starts while A's write is outstanding and remains unpersisted.
             let mut second = app.begin_gateway_ban_observation(10, 55).await;
@@ -2296,34 +2238,27 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut first = app.begin_gateway_ban_observation(10, 55).await;
-            // Logical times make the interleaving deterministic without sleeps.
-            let at = first.observed + chrono::Duration::seconds(1);
-            first.observed = at;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let first = app.begin_gateway_ban_observation(10, 55).await;
+            let at = first.observed;
+            let user: serenity::model::user::User = serde_json::from_value(serde_json::json!({"id":"55","username":"received-name","discriminator":"0","avatar":null})).unwrap();
             let audit = ((at.timestamp_millis() - 1_420_070_400_000) << 22) + 1;
             crate::db::mark_enrolled_unbanned(&app.db, Some(scope.clone()), 55)
                 .await
                 .unwrap();
-            let mut second = app.begin_gateway_ban_observation(10, 55).await;
-            second.observed = at + chrono::Duration::seconds(2);
-            crate::db::record_gateway_ban_with_audit(
-                &app.db,
-                Some(scope.clone()),
-                55,
-                None,
-                None,
-                Some(&second.observed.to_rfc3339()),
-                false,
-                None,
-                false,
-                crate::db::GatewayBanAuditEntries::Observed {
-                    pending: vec![],
-                    audit_after_ms: second.audit_after_ms().await,
-                },
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let second = app.begin_gateway_ban_observation(10, 55).await;
+            crate::gateway_ban_persistence::receive_ban(
+                std::sync::Arc::clone(&app),
+                second,
+                10,
+                user.clone(),
+                app.consume_gateway_ban_echo(10, 55),
+                Some(100),
             )
             .await
+            .unwrap()
             .unwrap();
-            second.finish(true).await;
             // A remains paused before persistence; B is the sole committed row.
             app.queue_gateway_manual_ban_audit_entry(10, 55, audit);
             super::reconcile_pending_gateway_ban_audits(&app, Some(scope.clone()), 10, 55).await;
@@ -2332,24 +2267,17 @@ mod tests {
                 vec![audit]
             );
             if completion == "saved" {
-                crate::db::record_gateway_ban_with_audit(
-                    &app.db,
-                    Some(scope.clone()),
-                    55,
-                    None,
-                    None,
-                    Some(&first.observed.to_rfc3339()),
-                    false,
-                    None,
-                    true,
-                    crate::db::GatewayBanAuditEntries::Observed {
-                        pending: vec![],
-                        audit_after_ms: first.audit_after_ms().await,
-                    },
+                crate::gateway_ban_persistence::receive_ban(
+                    std::sync::Arc::clone(&app),
+                    first,
+                    10,
+                    user,
+                    app.consume_gateway_ban_echo(10, 55),
+                    Some(100),
                 )
                 .await
+                .unwrap()
                 .unwrap();
-                first.finish(true).await;
             } else if completion == "cancelled" {
                 drop(first);
             } else {

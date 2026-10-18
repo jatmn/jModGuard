@@ -118,6 +118,7 @@ struct GatewayBanFlight {
 
 struct GatewayBanSubject {
     active: usize,
+    active_ids: Vec<db::GatewayBanPeer>,
     uncertain_through_ms: i64,
     failed_through_ms: i64,
     pending_failure_ms: Option<i64>,
@@ -125,6 +126,7 @@ struct GatewayBanSubject {
 }
 
 pub(crate) struct GatewayBanObservation {
+    pub(crate) delivery_id: db::guild_data::CaseId,
     flight: Arc<Mutex<GatewayBanFlight>>,
     guild: u64,
     user: u64,
@@ -142,6 +144,7 @@ fn apply_gateway_ban_release(
     user: u64,
     saved: bool,
     observed_ms: i64,
+    delivery_id: &str,
 ) {
     let idle = {
         let Some(subject) = flight.subjects.get_mut(&(guild, user)) else {
@@ -159,6 +162,7 @@ fn apply_gateway_ban_release(
                     .max(observed_ms),
             );
         }
+        subject.active_ids.retain(|peer| peer.id != delivery_id);
         subject.active = subject.active.saturating_sub(1);
         subject.active == 0 && subject.pending_failure_ms.is_none()
     };
@@ -174,20 +178,41 @@ fn seeded_gateway_ban_cutoffs(started_at_ms: i64, retired_cutoff_ms: i64) -> (i6
 }
 
 impl GatewayBanObservation {
-    pub(crate) async fn audit_after_ms(&self) -> i64 {
+    pub(crate) fn overlapping_deliveries(
+        &self,
+        enrollment: &db::GuildEnrollment,
+    ) -> Vec<db::GatewayBanPeer> {
+        self.flight
+            .lock()
+            .subjects
+            .get(&(self.guild, self.user))
+            .map(|subject| {
+                subject
+                    .active_ids
+                    .iter()
+                    .filter(|peer| {
+                        peer.id != self.delivery_id.as_str()
+                            && peer.observed_at_ms >= enrollment.joined_at_ns / 1_000_000
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Retained deliveries cannot disappear on an ordinary write failure.
+    /// Live registrations and durable unapplied rows gate matching until all
+    /// observations are available; overlap alone must not permanently reject
+    /// their own audits. Preserve actual missing-history/startup uncertainty.
+    pub(crate) fn audit_after_ms(&self) -> i64 {
         let flight = self.flight.lock();
-        let subject = flight.subjects.get(&(self.guild, self.user));
-        let (seeded_uncertain, _) =
-            seeded_gateway_ban_cutoffs(flight.started_at_ms, flight.retired_cutoff_ms);
-        let uncertain = subject
+        flight
+            .subjects
+            .get(&(self.guild, self.user))
             .map(|subject| subject.uncertain_through_ms)
-            .unwrap_or(seeded_uncertain);
-        let active = subject.map(|subject| subject.active).unwrap_or(0);
-        if active > 1 {
-            uncertain.max(self.observed.timestamp_millis())
-        } else {
-            uncertain
-        }
+            .unwrap_or_else(|| {
+                seeded_gateway_ban_cutoffs(flight.started_at_ms, flight.retired_cutoff_ms).0
+            })
     }
 
     pub(crate) async fn finish(mut self, saved: bool) {
@@ -208,6 +233,7 @@ impl GatewayBanObservation {
                 self.user,
                 self.saved,
                 self.observed.timestamp_millis(),
+                self.delivery_id.as_str(),
             );
             self.released = true;
             self.persist_failure();
@@ -412,6 +438,7 @@ impl GatewayManualBanAuditQueue {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn clear(&mut self, guild: u64, user: u64) {
         self.entries.remove(&(guild, user));
     }
@@ -1385,6 +1412,7 @@ impl BotState {
         user: u64,
     ) -> GatewayBanObservation {
         let flight = Arc::clone(self.gateway_ban_flight(guild, user));
+        let delivery_id = db::guild_data::CaseId::new();
         let observed;
         {
             // Timestamp and registration are one short critical section. SQL
@@ -1401,6 +1429,7 @@ impl BotState {
                 .entry((guild, user))
                 .or_insert(GatewayBanSubject {
                     active: 0,
+                    active_ids: Vec::new(),
                     uncertain_through_ms,
                     // The retired seed protects new writes after clock rollback.
                     // Existing saved observations use only their own fences.
@@ -1409,8 +1438,13 @@ impl BotState {
                     persisting_failure: false,
                 });
             subject.active += 1;
+            subject.active_ids.push(db::GatewayBanPeer {
+                id: delivery_id.as_str().to_owned(),
+                observed_at_ms: observed.timestamp_millis(),
+            });
         }
         GatewayBanObservation {
+            delivery_id,
             flight,
             guild,
             user,
@@ -1580,6 +1614,7 @@ impl BotState {
             .pending(guild_id, user_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_gateway_manual_ban_audit_entries(&self, guild_id: u64, user_id: u64) {
         self.gateway_manual_ban_audit_entries
             .lock()
@@ -2269,18 +2304,18 @@ mod tests {
         let before_start = chrono::Utc::now().timestamp_millis();
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
         let mut failed = app.begin_gateway_ban_observation(10, 55).await;
-        assert!(failed.audit_after_ms().await >= before_start);
+        assert!(failed.audit_after_ms() >= before_start);
         let failed_at = failed.observed.timestamp_millis() + 1000;
         failed.observed = chrono::DateTime::from_timestamp_millis(failed_at).unwrap();
         failed.finish(false).await;
         let retry = app.begin_gateway_ban_observation(10, 55).await;
-        assert_eq!(retry.audit_after_ms().await, failed_at);
+        assert_eq!(retry.audit_after_ms(), failed_at);
         retry.finish(true).await;
         let mut cancelled = app.begin_gateway_ban_observation(10, 55).await;
         cancelled.observed = chrono::DateTime::from_timestamp_millis(failed_at + 1).unwrap();
         drop(cancelled);
         let retry = app.begin_gateway_ban_observation(10, 55).await;
-        assert_eq!(retry.audit_after_ms().await, failed_at + 1);
+        assert_eq!(retry.audit_after_ms(), failed_at + 1);
         retry.finish(true).await;
         // Distinct targets never allocate additional stripes, and successful
         // completion releases counts without discarding uncertainty cutoffs.
@@ -2299,7 +2334,7 @@ mod tests {
         let before_restart = chrono::Utc::now().timestamp_millis();
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
         let next = app.begin_gateway_ban_observation(10, 55).await;
-        assert!(next.audit_after_ms().await >= before_restart);
+        assert!(next.audit_after_ms() >= before_restart);
         next.finish(true).await;
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
@@ -2430,7 +2465,7 @@ mod tests {
             false,
             db::GatewayBanAuditEntries::Observed {
                 pending: vec![],
-                audit_after_ms: observation.audit_after_ms().await,
+                audit_after_ms: observation.audit_after_ms(),
             },
         )
         .await
@@ -2794,7 +2829,7 @@ mod tests {
             true,
             db::GatewayBanAuditEntries::Observed {
                 pending: vec![],
-                audit_after_ms: later.audit_after_ms().await,
+                audit_after_ms: later.audit_after_ms(),
             },
         )
         .await
@@ -2896,7 +2931,7 @@ mod tests {
             true,
             db::GatewayBanAuditEntries::Observed {
                 pending: vec![],
-                audit_after_ms: observation.audit_after_ms().await,
+                audit_after_ms: observation.audit_after_ms(),
             },
         )
         .await
@@ -2980,7 +3015,7 @@ mod tests {
             false,
             db::GatewayBanAuditEntries::Observed {
                 pending: vec![],
-                audit_after_ms: saved.audit_after_ms().await,
+                audit_after_ms: saved.audit_after_ms(),
             },
         )
         .await
@@ -3081,7 +3116,7 @@ mod tests {
         );
         // Even a future registration after clock rollback inherits a safe seed.
         let again = app.begin_gateway_ban_observation(10, 55).await;
-        assert!(again.audit_after_ms().await > base);
+        assert!(again.audit_after_ms() > base);
         again.finish(true).await;
         drop(app);
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();

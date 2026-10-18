@@ -247,6 +247,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.app.release_gateway_case_suppression(suppression);
             }
             lease_held(env)?;
+            let mirror = discord.as_ref().ok().map(|_| {
+                crate::gateway_ban_persistence::receive_unban(
+                    std::sync::Arc::clone(env.app),
+                    env.guild_id.get(),
+                    target.get(),
+                    chrono::Utc::now(),
+                    enrollment.as_ref().map(|e| e.joined_at_ns),
+                    true,
+                    enrollment.clone(),
+                )
+            });
             crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
@@ -259,16 +270,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             discord?;
-            if let Err(e) =
-                db::mark_enrolled_unbanned(&env.app.db, enrollment.clone(), target.get() as i64)
-                    .await
-            {
-                tracing::warn!(
-                    "local ban mirror update failed after Discord unban \
-                     (guild={} user={}): {e:#}",
-                    env.guild_id,
-                    target
-                );
+            if let Some(mirror) = mirror {
+                match mirror.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!("confirmed unban mirror deferred: {error:#}"),
+                    Err(error) => {
+                        tracing::error!("confirmed unban persistence owner failed: {error:#}")
+                    }
+                }
             }
             log_mod(
                 env,

@@ -166,8 +166,8 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
 for component in bot api webui; do
   readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" .)
   for field in min-schema max-schema result-schema; do
-    contains_arg "io.jmodguard.${field}=19" "${schema_args[@]}" \
-      || fail "${component} must advertise current schema19 (${field})"
+    contains_arg "io.jmodguard.${field}=20" "${schema_args[@]}" \
+      || fail "${component} must advertise current schema20 (${field})"
   done
 done
 
@@ -197,7 +197,7 @@ rm -rf "$launcher_source"
 # Publishing an older source must keep its schema, not the publisher's schema.
 schema_source="$(mktemp -d)"
 mkdir -p "$schema_source/src"
-sed '/include_str!("..\/migrations\/001[6789]_/d' src/db.rs >"$schema_source/src/db.rs"
+sed -e '/include_str!("..\/migrations\/001[6789]_/d' -e '/include_str!("..\/migrations\/0020_/d' src/db.rs >"$schema_source/src/db.rs"
 readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source")
 contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
 
@@ -207,7 +207,7 @@ for field in min-schema max-schema result-schema; do
 done
 # The pre-fix schema16 source had literal schema15 launcher observations.
 # Republishing it may produce a dashboard image, never an eligible launcher.
-sed '/include_str!("..\/migrations\/001[789]_/d' src/db.rs >"$schema_source/src/db.rs"
+sed -e '/include_str!("..\/migrations\/001[789]_/d' -e '/include_str!("..\/migrations\/0020_/d' src/db.rs >"$schema_source/src/db.rs"
 mkdir -p "$schema_source/crates/updater/src"
 printf 'min_schema: 15,\nmax_schema: 15,\n' >"$schema_source/crates/updater/src/main.rs"
 for component in bot api; do

@@ -97,32 +97,63 @@ extract_handler() {
   ' "$root/crates/bot/src/handlers.rs"
 }
 
+extract_persistence() {
+  local receiver="$1"
+  awk -v receiver="$receiver" '
+    $0 ~ "^pub\\(crate\\) fn " receiver "\\(" { grab = 1 }
+    grab { print }
+    grab && /^}/ { exit }
+  ' "$root/crates/bot/src/gateway_ban_persistence.rs"
+}
+
 for event in guild_ban_addition guild_ban_removal; do
   function="$(extract_handler "$event")"
   [[ -n "$function" ]] || fail "Missing gateway handler: $event"
   suppression='consume_gateway_case_suppression'
+  receiver='receive_unban'
+  case_guard='record_unresolved_gateway_observation(suppressed)'
   if [[ "$event" == guild_ban_addition ]]; then
     suppression='consume_gateway_ban_echo'
+    receiver='receive_ban'
+    case_guard='record_unresolved_gateway_observation(echo.suppress_case)'
   fi
   printf '%s\n' "$function" | grep -Fq "$suppression" \
-    || fail "Gateway $event must suppress bot echoes and retain external cases"
-  printf '%s\n' "$function" | grep -Fq 'cases::record' \
-    || fail "Gateway $event must suppress bot echoes and retain external cases"
+    || fail "Gateway $event must capture bot echo suppression"
+  printf '%s\n' "$function" | grep -Fq "gateway_ban_persistence::$receiver(" \
+    || fail "Gateway $event must delegate to its retained persistence owner"
+  owner="$(extract_persistence "$receiver")"
+  for required in 'tokio::spawn(async move' "$case_guard" 'gateway_case(' 'save(&app.db, delivery).await?'; do
+    printf '%s\n' "$owner" | grep -Fq "$required" \
+      || fail "Gateway $event retained owner must suppress echoes and durably retain external cases: $required"
+  done
 done
-echo 'Gateway ban events suppress bot echoes and retain external cases'
+sed -n '/^async fn apply(/,/^}/p' "$root/crates/bot/src/gateway_ban_persistence.rs" \
+  | grep -Fq '.record_selected_case(delivery.enrollment.clone(), case)' \
+  || fail 'Saved gateway deliveries must record their original selected case'
+echo 'Gateway ban events suppress bot echoes and durably retain external cases'
 
-# Capture BanAdd ownership before any await can race an unban. Record an
-# external case before audit enrichment can expire the suppression.
+# Capture ownership before any await; await the retained owner's durable payload
+# before audit lookup can enrich the handler. Case projection may finish later.
 extract_handler guild_ban_addition | awk '
   /consume_gateway_ban_echo/ { suppression = NR }
   /\.await/ && !first_await { first_await = NR }
-  /\.await/ && !mirror { last_initial_await = NR }
-  /let echo = echo\.resolve\(\);/ { resolved = NR }
-  /db::record_gateway_ban_with_audit\(/ { mirror = NR }
-  /crate::cases::record\(/ { external_case = NR }
+  /gateway_ban_persistence::receive_ban\(/ { owner = NR }
+  /persistence.await/ { saved = NR }
   /logging::lookup_member_audit\(/ { audit = NR }
-  END { exit !(suppression && first_await && resolved && mirror && external_case && audit && suppression < first_await && last_initial_await < resolved && resolved < mirror && external_case < audit) }
-' || fail 'Gateway ban capture must precede awaits, resolution must precede persistence, and case routing must precede audit lookup'
+  END { exit !(suppression && first_await && owner && saved && audit && suppression < first_await && owner < saved && saved < audit) }
+' || fail 'Gateway ban capture must precede awaits and durable ownership must precede audit lookup'
+
+# Resolve the captured echo after initial SQL waits, then freeze its ownership
+# and external case in the payload before the first save. No intervening await.
+extract_persistence receive_ban | awk '
+  /let echo = echo\.resolve\(\);/ { resolved = NR }
+  /let delivery = db::GatewayBanDelivery/ { payload = NR }
+  /case:.*record_unresolved_gateway_observation/ { external_case = NR }
+  /let delivery = save\(/ { saved = NR }
+  /\.await/ && !resolved { last_initial_await = NR }
+  /\.await/ && resolved && !saved { intervening_await = 1 }
+  END { exit !(last_initial_await && resolved && payload && external_case && saved && last_initial_await < resolved && resolved < payload && payload < external_case && external_case < saved && !intervening_await) }
+' || fail 'Retained ban owner must resolve ownership after initial waits and save its immutable external case'
 
 check_tree() {
   local package="$1"
