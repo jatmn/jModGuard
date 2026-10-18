@@ -75,10 +75,16 @@ function run(command, args, options = {}) {
   assert.ifError(result.error);
   return result.stdout.trim();
 }
-for (const lane of ["rust", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
-  const install = jobs.get("checks").match(/NEED_NEXTEST: \$\{\{ (.+) \}\}/);
-  assert.ok(install, "hosted Rust tests need the parallel runner");
-  assert.equal(Function("matrix", `return (${install[1]});`)({ lane }), lane === "rust");
+for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
+  const evaluate = key => {
+    const match = jobs.get("checks").match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
+    assert.ok(match, `missing ${key} workflow binding`);
+    return Function("matrix", "startsWith", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix));
+  };
+  const rustTests = ["rust-api", "rust-bot", "rust-core"].includes(lane);
+  assert.equal(evaluate("NEED_NEXTEST"), rustTests);
+  assert.equal(evaluate("shared-key"), rustTests ? "rust" : lane, "retain the existing dependency cache");
+  assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
 }
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "ci-workflow-"));
 try {
@@ -149,7 +155,7 @@ try {
     assert.equal(binding(jobs.get("checks"), "ref", context), source);
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_BASE", context), "");
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_HEAD", context), source);
-    assert.equal(matrix().include.length, 6, "a different source requires all six existing lanes");
+    assert.equal(matrix().include.length, 8, "a different source requires all eight lanes");
     assert.equal(git("rev-parse", "HEAD"), source);
     // The provider gate result is simulated; the production job guard must
     // withhold the entire bot/API/WebUI matrix for every unsuccessful R check.

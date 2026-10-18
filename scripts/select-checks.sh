@@ -328,14 +328,16 @@ if [ "$dylint_full" -eq 0 ]; then
   done
 fi
 
-# Related Rust checks share one runner/target directory instead of compiling
-# the same dependency graph independently for every service.
+# Balance the measured Rust work across runners without combining package
+# feature configurations. Bot/integration share their service builds locally.
 SELECTED="$selected" LINT_PACKAGES="$dylint_packages" node --input-type=module - <<'JS'
 const selected = new Set(process.env.SELECTED.trim().split(/\s+/));
 const lanes = {
   quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog"],
   frontend: ["frontend"],
-  rust: ["api", "bot", "runtime", "updater", "core", "integration", "boundaries"],
+  "rust-api": ["api", "boundaries"],
+  "rust-bot": ["bot", "integration"],
+  "rust-core": ["runtime", "updater", "core"],
   dylint: ["dylint"],
   "supply-chain": ["supply-chain"],
   "remote-database": ["remote-database"],
@@ -345,7 +347,7 @@ const include = Object.entries(lanes).flatMap(([lane, candidates]) => {
   if (!groups.length) return [];
   const rust = groups.some(group => !["contracts", "frontend", "publish-tests", "bootstrap", "pullfrog"].includes(group));
   return [{ lane, groups: groups.join(" "), rust,
-    timeout: lane === "dylint" || lane === "rust" ? 90 : lane === "remote-database" ? 45 : 30,
+    timeout: lane === "dylint" || lane.startsWith("rust-") ? 90 : lane === "remote-database" ? 45 : 30,
     dylint_packages: lane === "dylint" ? process.env.LINT_PACKAGES : "" }];
 });
 console.log(JSON.stringify({ include }));

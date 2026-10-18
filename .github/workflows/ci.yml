@@ -94,14 +94,14 @@ jobs:
       - name: Configure runner
         env:
           NEED_RUST: ${{ matrix.rust }}
-          NEED_NEXTEST: ${{ matrix.lane == 'rust' }}
+          NEED_NEXTEST: ${{ startsWith(matrix.lane, 'rust-') }}
         run: bash scripts/ci-setup.sh "$NEED_RUST"
       - name: Cache Rust dependencies
         if: matrix.rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ${{ matrix.lane }}
-          cache-targets: ${{ matrix.lane == 'rust' || matrix.lane == 'dylint' || matrix.lane == 'remote-database' }}
+          shared-key: ${{ startsWith(matrix.lane, 'rust-') && 'rust' || matrix.lane }}
+          cache-targets: ${{ startsWith(matrix.lane, 'rust-') || matrix.lane == 'dylint' || matrix.lane == 'remote-database' }}
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Cache pinned lint and audit tools

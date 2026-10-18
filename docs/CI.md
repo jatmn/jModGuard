@@ -29,9 +29,14 @@ changes select every group. Proven empty diffs run contracts only.
 | Cargo manifests/lockfile, toolchain or vendor | Relevant Rust gates, with global inputs selecting all Rust gates |
 | Unknown paths or CI orchestration | All checks |
 
-Selected groups run in up to six jobs: quick contracts/shell checks/formatting,
-frontend, shared Rust compilation/tests, Dylint, supply chain and remote databases.
-Related service groups share a single Cargo target directory on one runner. A
+Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
+frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work is
+split into API/boundaries, bot/integration, and core/updater/runtime. Each selected
+group still runs its existing independent package commands and feature variants.
+Bot and integration share their service builds on one runner; each job has its own
+Cargo target directory. The Rust jobs restore the existing shared dependency cache.
+This reduces elapsed time using more simultaneous runners; some compilation is
+repeated across jobs. A
 Rust toolchain is not installed for documentation-only contracts. PR runs cancel
 superseded runs; trusted publication runs queue without replacement or cancellation
 (up to GitHub’s limit of 100 waiting runs). npm and
@@ -55,7 +60,7 @@ Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned. The local complete gate 
 bash scripts/ci-preflight.sh
 ```
 
-The hosted Rust lane installs checksum-pinned cargo-nextest 0.9.148. Preflight uses
+The hosted Rust jobs install checksum-pinned cargo-nextest 0.9.148. Preflight uses
 it to run tests in parallel, in a separate process per test, without launching
 Cargo for every test. Its concurrency follows the runner's available CPUs; the
 existing 180-second per-test limit remains. Doctests still use the timed Cargo

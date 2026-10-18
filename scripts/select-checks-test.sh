@@ -164,8 +164,29 @@ assert.equal(docs.length, 1);
 assert.equal(docs[0].groups, "contracts");
 assert.equal(docs[0].rust, false);
 const core = read("core").include;
-assert.equal(core.filter(j => j.lane === "rust").length, 1);
-assert.equal(core.find(j => j.lane === "rust").groups, "api bot updater core integration boundaries");
+assert.deepEqual(core.filter(j => j.lane.startsWith("rust-")).map(j => [j.lane, j.groups]), [
+  ["rust-api", "api boundaries"],
+  ["rust-bot", "bot integration"],
+  ["rust-core", "updater core"],
+]);
 assert.equal(new Set(core.flatMap(j => j.groups.split(" "))).size, core.flatMap(j => j.groups.split(" ")).length);
 JS
+# Matrix scheduling must neither omit nor duplicate a selected gate, including
+# narrow service changes and the full fallback plan.
+for path in docs/INSTALL.md crates/api/src/lib.rs crates/bot/src/main.rs crates/runtime/src/lib.rs crates/updater/src/main.rs crates/integration-tests/src/lib.rs src/db.rs Cargo.lock mystery.bin; do
+  bash "$selector" plan --files "$path" >"$scratch/plan"
+  bash "$selector" matrix --files "$path" >"$scratch/matrix.json"
+  node --input-type=module - "$scratch" <<'JS'
+import fs from "node:fs";
+import assert from "node:assert/strict";
+const root = process.argv[2];
+const expected = fs.readFileSync(`${root}/plan`, "utf8").trim().split(/\s+/).sort();
+const jobs = JSON.parse(fs.readFileSync(`${root}/matrix.json`, "utf8")).include;
+assert.deepEqual(jobs.flatMap(job => job.groups.split(" ")).sort(), expected);
+for (const job of jobs.filter(job => job.lane.startsWith("rust-"))) {
+  assert.equal(job.rust, true);
+  assert.equal(job.timeout, 90);
+}
+JS
+done
 echo 'select-checks-test: ok'
