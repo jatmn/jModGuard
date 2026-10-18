@@ -75,6 +75,11 @@ function run(command, args, options = {}) {
   assert.ifError(result.error);
   return result.stdout.trim();
 }
+for (const lane of ["rust", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
+  const install = jobs.get("checks").match(/NEED_NEXTEST: \$\{\{ (.+) \}\}/);
+  assert.ok(install, "hosted Rust tests need the parallel runner");
+  assert.equal(Function("matrix", `return (${install[1]});`)({ lane }), lane === "rust");
+}
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "ci-workflow-"));
 try {
   // Cold hosted setup must establish the driver precondition it advertises.

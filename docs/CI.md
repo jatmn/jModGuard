@@ -55,6 +55,14 @@ Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned. The local complete gate 
 bash scripts/ci-preflight.sh
 ```
 
+The hosted Rust lane installs checksum-pinned cargo-nextest 0.9.148. Preflight uses
+it to run tests in parallel, in a separate process per test, without launching
+Cargo for every test. Its concurrency follows the runner's available CPUs; the
+existing 180-second per-test limit remains. Doctests still use the timed Cargo
+path, and the ignored two-process smoke still runs after building both services.
+Local preflight uses nextest when installed, with the existing GNU timeout
+fallback for unavailable nextest or unsupported arguments.
+
 CI passes selected groups as repeated `--only` arguments. Local hooks always run
 the full gate. Separate `bash scripts/ci-remote-database.sh` starts disposable
 loopback-only libSQL containers for the existing remote database, guild store,

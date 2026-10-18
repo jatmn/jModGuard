@@ -94,6 +94,7 @@ jobs:
       - name: Configure runner
         env:
           NEED_RUST: ${{ matrix.rust }}
+          NEED_NEXTEST: ${{ matrix.lane == 'rust' }}
         run: bash scripts/ci-setup.sh "$NEED_RUST"
       - name: Cache Rust dependencies
         if: matrix.rust
