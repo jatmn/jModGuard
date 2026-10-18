@@ -1211,6 +1211,63 @@ fn attribute_gateway_ban_audit_conn(
     Ok(())
 }
 
+/// Persist a user's failed-observation fence before its in-memory history is
+/// released. This only raises ambiguity cutoffs; it never invents a saved ban or
+/// changes confirmed audit facts. Repeating after an uncertain commit is safe.
+/// The caller keeps the live fence until commit and waits for earlier writes and
+/// the five-second matching window to finish before retiring it.
+pub async fn persist_gateway_ban_failure_fence(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    user_id: i64,
+    cutoff_ms: i64,
+) -> Result<()> {
+    const PENDING: &str = "guild_id=?1 AND user_id=?2 AND event_type='member_ban'
+        AND json_valid(data) AND json_extract(data, '$.ban_id') IS NOT NULL
+        AND (COALESCE(json_extract(data, '$.audit_after_ms'), 0) < ?3
+          OR EXISTS (SELECT 1 FROM json_each(events.data, '$.gateway_observations')
+                     WHERE COALESCE(json_extract(value, '$.audit_after_ms'), 0) < ?3))";
+    loop {
+        let enrollment = enrollment.clone();
+        let changed = db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+            super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+            let pending: bool = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM events INDEXED BY idx_events_user WHERE {PENDING})"),
+                params![enrollment.guild_id, user_id, cutoff_ms],
+                |row| Ok(row.get(0)?),
+            )?;
+            if !pending {
+                tx.finish_read()?;
+                return Ok(0);
+            }
+            tx.ensure_mutation_receipt()?;
+            // Bound both the growth reservation and remote transaction lifetime.
+            // A per-event Hrana request loop cannot flush a long user history.
+            // Confirmed parents can still contain unresolved split observations.
+            let changed = tx.execute_matching(
+                &format!("UPDATE events SET data=json_set(
+                    CASE WHEN json_type(data, '$.gateway_observations')='array' THEN
+                        json_set(data, '$.gateway_observations',
+                            (SELECT json_group_array(json_set(value, '$.audit_after_ms',
+                                MAX(COALESCE(json_extract(value, '$.audit_after_ms'), 0), ?3)))
+                             FROM json_each(events.data, '$.gateway_observations')))
+                    ELSE data END,
+                    '$.audit_after_ms', MAX(COALESCE(json_extract(data, '$.audit_after_ms'), 0), ?3))
+                    WHERE id IN (SELECT id FROM events INDEXED BY idx_events_user
+                                 WHERE {PENDING} LIMIT 32)"),
+                params![enrollment.guild_id, user_id, cutoff_ms],
+            )?;
+            tx.commit()?;
+            Ok(changed)
+        }).await?;
+        if changed < 32 {
+            return Ok(());
+        }
+    }
+}
+
 /// Reconcile inside an existing DB worker after the bot has closed the audit's
 /// match window and checked its live observation fence.
 pub fn reconcile_gateway_manual_ban_audit_entry_conn(
