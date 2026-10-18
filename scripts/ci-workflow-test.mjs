@@ -46,6 +46,7 @@ for (const name of ["plan", "ci"]) {
   assert.match(jobs.get(name), /!github\.event\.repository\.private \|\| vars\.JMODGUARD_ENABLE_PRIVATE_CI == 'true'/);
 }
 assert.match(workflow, /^  pull_request:/m);
+assert.match(workflow, /^    types: \[opened, synchronize, reopened\]$/m);
 assert.match(workflow, /^  workflow_call:/m);
 assert.doesNotMatch(workflow, /(?:contents|packages|pull-requests): write/);
 assert.match(workflow, /cancel-in-progress: \$\{\{ github.event_name == 'pull_request' \}\}/);
@@ -80,6 +81,26 @@ assert.ok(configure, "missing Configure runner step");
 assert.match(configure, /^        run: bash scripts\/ci-setup\.sh "\$NEED_RUST"$/m);
 const configureEnv = configure.match(/^        env:\n((?:          [^\n]+\n)+)/m)?.[1];
 assert.ok(configureEnv, "Configure runner must receive its setup flags");
+const compilerCache = jobs.get("checks").match(/^      - name: Cache Rust compiler outputs\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
+assert.ok(compilerCache, "missing compiler cache setup");
+assert.match(compilerCache, /version: v0\.18\.0/);
+const compilerGuard = compilerCache.match(/^        if: (.+)$/m)?.[1];
+assert.ok(compilerGuard);
+const selectedChecks = jobs.get("checks").match(/^      - name: Run selected checks\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
+assert.ok(selectedChecks);
+assert.doesNotMatch(jobs.get("checks").slice(0, jobs.get("checks").indexOf("      - name: Run selected checks")), /RUSTC_WRAPPER:/);
+assert.match(selectedChecks, /SCCACHE_GHA_ENABLED: 'true'/);
+const cacheMode = selectedChecks.match(/SCCACHE_GHA_RW_MODE: \$\{\{ (.+) \}\}/)?.[1];
+assert.ok(cacheMode);
+for (const [event, ref, expected] of [
+  ["pull_request", "refs/pull/353/merge", "READ_WRITE"],
+  ["push", "refs/heads/main", "READ_WRITE"],
+  ["push", "refs/heads/feature", "READ_ONLY"],
+  ["schedule", "refs/heads/main", "READ_ONLY"],
+  ["workflow_dispatch", "refs/heads/main", "READ_ONLY"],
+]) {
+  assert.equal(Function("github", `return (${cacheMode});`)({ event_name: event, ref }), expected);
+}
 for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
   const evaluate = (key, block = jobs.get("checks")) => {
     const match = block.match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
@@ -87,9 +108,22 @@ for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "d
     return Function("matrix", "startsWith", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix));
   };
   const rustTests = ["rust-api", "rust-bot", "rust-core"].includes(lane);
+  assert.equal(Function("matrix", "startsWith", `return (${compilerGuard});`)({ lane }, (value, prefix) => value.startsWith(prefix)), rustTests);
+  assert.equal(evaluate("RUSTC_WRAPPER", selectedChecks), rustTests ? "sccache" : "");
   assert.equal(evaluate("NEED_NEXTEST", configureEnv), rustTests);
   assert.equal(evaluate("shared-key"), rustTests ? "rust" : lane, "retain the existing dependency cache");
   assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
+}
+const socket = fs.readFileSync(path.join(root, ".github/workflows/socket.yml"), "utf8");
+assert.match(socket, /^  push:\n    branches: \[main\]$/m);
+assert.match(socket, /JMODGUARD_DIFF_BASE: \$\{\{ github.event.pull_request.base.sha \|\| github.event.before \}\}/);
+assert.match(socket, /JMODGUARD_DIFF_HEAD: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/);
+assert.match(socket, /scan="\$\(bash scripts\/select-checks.sh socket\)"/);
+const socketSteps = [...socket.matchAll(/^      - ([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)].map(match => match[1]);
+for (const marker of ["uses: actions/setup-python@", "name: Install Socket CLI", "name: Run Socket Security Scan"]) {
+  const step = socketSteps.find(step => step.startsWith(marker));
+  assert.ok(step, `missing ${marker}`);
+  assert.match(step, /^        if: steps.changes.outputs.scan == 'true'$/m);
 }
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "ci-workflow-"));
 try {
@@ -129,6 +163,18 @@ try {
     assert.ok(index >= 0 && seconds > 0 && seconds <= 120, `${option} must bound download delays`);
   }
   assert.ok(!fs.existsSync(githubPath), "failed setup must not publish nextest");
+
+  const selectScan = socketSteps.find(step => step.startsWith("name: Select dependency scan"));
+  const selectRun = selectScan?.match(/^        run: \|\n([\s\S]*)/m)?.[1];
+  assert.ok(selectRun);
+  fs.writeFileSync(path.join(bin, "bash"), '#!/bin/sh\nexit 19\n', { mode: 0o755 });
+  const scanOutput = path.join(scratch, "scan-output");
+  const failedSelector = spawnSync("/bin/bash", ["-e", "-c", selectRun], { cwd: root, env: {
+    ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_OUTPUT: scanOutput,
+  } });
+  assert.ifError(failedSelector.error);
+  assert.equal(failedSelector.status, 19, "selector failure must fail the scan job");
+  assert.ok(!fs.existsSync(scanOutput), "failed selection must not publish a skip decision");
 
   // Real Git fixture: docs-only H selects contracts, then R adds Rust changes.
   // Resolve checkout/diff bindings from the actual reusable workflow, not a

@@ -88,6 +88,19 @@ expect "$all" mystery.bin
 expect "contracts publish-tests supply-chain" scripts/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 
+expect_scan() {
+  local expected="$1"
+  shift
+  [[ "$(bash "$selector" socket --files "$@")" == "$expected" ]] || fail "dependency scan selection for $*"
+}
+for path in docs/INSTALL.md README.md frontend/app.js crates/api/src/lib.rs crates/bot/src/main.rs src/db.rs tools/webui/build.mjs; do
+  expect_scan false "$path"
+done
+for path in Cargo.lock crates/api/Cargo.toml tools/webui/package-lock.json tools/eslint/package.json docs/example/package.json .github/workflows/socket.yml .gitignore docs/example/.gitignore mystery.bin; do
+  expect_scan true "$path"
+done
+expect_scan true docs/INSTALL.md tools/webui/package-lock.json
+
 # Exercise actual Git ranges, deletions/renames, and job selection.
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -127,7 +140,27 @@ git init -q --initial-branch=main "$scratch/repo"
     bash "$selector" plan >"$scratch/empty"
   JMODGUARD_DIFF_BASE=0000000000000000000000000000000000000000 GITHUB_EVENT_NAME=push \
     bash "$selector" plan >"$scratch/missing"
+  JMODGUARD_DIFF_BASE=0000000000000000000000000000000000000000 GITHUB_EVENT_NAME=push \
+    bash "$selector" socket >"$scratch/scan-missing"
+  # A later docs commit must not hide a dependency change in the same PR.
+  mkdir -p tools/webui
+  echo '{}' >tools/webui/package.json
+  git add .
+  git commit -qm manifest
+  echo more >>docs/new.md
+  git commit -qam docs-after-manifest
+  JMODGUARD_DIFF_BASE="$base" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)" GITHUB_EVENT_NAME=pull_request \
+    bash "$selector" socket >"$scratch/scan-history"
+  # Deleting or renaming a manifest still needs a scan.
+  manifest_head="$(git rev-parse HEAD)"
+  git mv tools/webui/package.json docs/former-manifest.txt
+  git commit -qm move-manifest
+  JMODGUARD_DIFF_BASE="$manifest_head" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)" GITHUB_EVENT_NAME=push \
+    bash "$selector" socket >"$scratch/scan-rename"
 )
+for scan in missing history rename; do
+  [[ "$(cat "$scratch/scan-$scan")" == true ]] || fail "scan $scan omitted dependency changes"
+done
 expected="$(printf '%s\n' $core frontend | sort)"
 for event in pull_request push rename; do
   [[ "$(sort "$scratch/$event")" == "$expected" ]] || fail "$event omitted touched consumers"

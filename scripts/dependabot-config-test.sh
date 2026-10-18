@@ -103,6 +103,7 @@ do
   require_contains "$socket_workflow" "$needle"
 done
 require_line "$socket_workflow" '    types: [opened, synchronize, reopened]'
+require_line "$socket_workflow" '    branches: [main]'
 require_line "$socket_workflow" "          EVENT_ACTION: \${{ github.event_name == 'pull_request' && github.event.action == 'reopened' && 'synchronize' || '' }}"
 require_missing_key_skip "$socket_workflow"
 require_absent "$socket_workflow" "issue_comment:"
@@ -112,9 +113,8 @@ require_contains "$socket_workflow" "head.repo.full_name == github.repository"
 require_contains "$socket_workflow" "skipping the Socket scan"
 require_contains "$socket_workflow" 'group: socket-scan-${{ github.ref }}'
 require_contains "$socket_workflow" "cancel-in-progress: true"
-# The group is the branch or pull-request ref. Including github.sha gives every
-# commit its own group, so cancel-in-progress cannot stop the scan it replaces.
-require_absent "$socket_workflow" "github.sha"
+# The exact ref-based group above cancels superseded scans. github.sha is valid
+# in the diff's head binding and must not be banned throughout the workflow.
 for doc in AGENTS.md development.md docs/CI.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
   require_contains "$doc" "SOCKET_SECURITY_API_KEY"
   require_contains "$doc" "not stored in git."

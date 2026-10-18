@@ -4,7 +4,7 @@
 `.github/workflows/publish.yml` queues trusted events and calls the same validation
 workflow before release/publication. CI and publication stay inactive while the repository is private. The owner can
 set repository variable `JMODGUARD_ENABLE_PRIVATE_CI=true` for an explicit trial;
-it is not needed after publication. Existing Pullfrog/Socket behavior is unchanged.
+it is not needed after publication. Pullfrog and Socket retain their separate triggers.
 
 There are no registered GitHub Actions self-hosted runners. Pullfrog and Socket
 remain separate workflows; neither replaces CI or publishes images.
@@ -17,6 +17,8 @@ all changes in the PR, including an earlier code edit followed by a docs commit.
 Main pushes use the entire event `before..after` range. Renames select both the
 old and new paths; deletions count. Missing commits, unknown paths and CI control
 changes select every group. Proven empty diffs run contracts only.
+Opening a draft PR already runs CI; marking it ready does not repeat the same
+commit's checks. New commits and reopened PRs still run affected checks.
 
 | Touched surface | Checks |
 |---|---|
@@ -34,14 +36,20 @@ frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work 
 split into API/boundaries, bot/integration, and core/updater/runtime. Each selected
 group still runs its existing independent package commands and feature variants.
 Bot and integration share their service builds on one runner; each job has its own
-Cargo target directory. The Rust jobs restore the existing shared dependency cache.
-This reduces elapsed time using more simultaneous runners; some compilation is
-repeated across jobs. A
-Rust toolchain is not installed for documentation-only contracts. PR runs cancel
+Cargo target directory. The Rust jobs restore the existing shared dependency cache
+and use pinned sccache 0.18.0 to share compiler outputs through GitHub's cache.
+Source, feature, compiler and embedded-file changes invalidate compiler entries;
+cache hits never skip tests. Linking and check-only compiler calls still run,
+and simultaneous cold misses can compile the same input before either saves it.
+A Rust toolchain is not installed for documentation-only contracts. PR runs cancel
 superseded runs; trusted publication runs queue without replacement or cancellation
 (up to GitHub’s limit of 100 waiting runs). npm and
 Rust caches reduce repeated downloads/compilation. PRs do not save the shared
 Rust target cache; GitHub isolates fork/PR caches from default-branch writes.
+Compiler-cache writes from PRs stay in that PR's merge-ref scope, which main and
+other PRs cannot restore. Main pushes populate the shared compiler baseline;
+scheduled/manual/tag validations use it read-only. Compiler-cache statistics
+are included in each Rust job's log and summary.
 Cache entries contain no credentials.
 
 Require **CI passed** in branch rules. It is always evaluated for an eligible
@@ -159,6 +167,12 @@ Set the
 repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
 relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+Socket runs once per PR update and on main pushes, without a duplicate feature-
+branch push scan. `select-checks.sh socket` uses the same complete Git diff to
+select Cargo/npm manifests, lockfiles, npm/ignore configuration and scanner changes.
+Known unrelated source/documentation changes skip Python/CLI setup and the scan;
+unknown paths or unavailable history still scan. This uses no GitHub path-filter
+file limit and includes deleted or renamed dependency inputs.
 A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. The CI passed check remains the merge gate.
 After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 
