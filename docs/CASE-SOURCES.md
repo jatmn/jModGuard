@@ -117,7 +117,10 @@ captured membership, and stable source IDs; a periodic bot pass resumes pending
 mirror, audit, and selected-case work after restart. Ban mirror results commit
 with their delivery receipt, so lost responses cannot create another row. Later
 unbans and newer bans win over delayed historical inserts. Audit cache expiry,
-eviction, and unban do not remove the saved pending audit.
+eviction, and unban do not remove the saved pending audit. Failed writes retain
+that same delivery owner; they do not retire a failure cutoff or start a new
+write under another membership. Active registrations and saved peer identities
+keep a competing observation from becoming a false unique audit match.
 
 Gateway observation cases and Discord audit cases retain their distinct source
 contracts; the mirror matcher does not merge these cases. Partial guild-store

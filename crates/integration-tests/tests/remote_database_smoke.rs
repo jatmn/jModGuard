@@ -157,7 +157,6 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
     exercise_moderation_scopes(&bot, &api).await;
-    exercise_gateway_ban_failure_fence(&bot).await;
     exercise_received_gateway_ban_delivery(&bot).await;
     exercise_configuration_reads(&bot, &api).await;
     exercise_guild_store_catalog(&bot, &api).await;
@@ -175,46 +174,6 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     }).await.unwrap();
 
     exercise_remote_capacity_race(&bot, &api).await;
-}
-
-// Exercise the actual fence handoff on remote SQL, including a lost commit
-// response. Original and split observations must retain the same durable cutoff.
-async fn exercise_gateway_ban_failure_fence(bot: &Db) {
-    use jmodguard::db;
-    let scope = db::enroll_guild(bot, 43_335, 100).await.unwrap().unwrap();
-    for second in [0, 1] {
-        db::record_gateway_ban(
-            bot,
-            Some(scope.clone()),
-            55,
-            None,
-            None,
-            Some(&format!("2024-03-01T00:00:0{second}Z")),
-            false,
-            None,
-            true,
-        )
-        .await
-        .unwrap();
-    }
-    let cutoff = 1_709_251_201_000;
-    test_drop_next_commit_response();
-    db::persist_gateway_ban_failure_fence(bot, scope.clone(), 55, cutoff)
-        .await
-        .unwrap();
-    db::persist_gateway_ban_failure_fence(bot, scope.clone(), 55, cutoff)
-        .await
-        .unwrap();
-    let events = db::query_enrolled_events(bot, scope, Some("member_ban"), Some(55), 20)
-        .await
-        .unwrap();
-    assert_eq!(events.len(), 1);
-    let data: serde_json::Value = serde_json::from_str(events[0].data.as_deref().unwrap()).unwrap();
-    assert_eq!(data["audit_after_ms"].as_i64(), Some(cutoff));
-    assert_eq!(
-        data["gateway_observations"][0]["audit_after_ms"].as_i64(),
-        Some(cutoff)
-    );
 }
 
 // This uses two independently opened Db pools and the normal 900 MB application

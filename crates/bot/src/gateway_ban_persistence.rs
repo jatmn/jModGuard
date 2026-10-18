@@ -875,7 +875,7 @@ mod tests {
             .await
             .unwrap();
         // A separate process state has no live registration for the unsaved B.
-        // Keep the old guard alive so Drop cannot synthesize a failure fence.
+        // The old guard is still live; only persisted peer identity is visible here.
         let restarted = BotState::new(
             Default::default(),
             db::Db::open(&dir.join("core.db"), 2).unwrap(),
