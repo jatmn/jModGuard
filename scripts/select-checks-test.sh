@@ -88,6 +88,19 @@ expect "$all" mystery.bin
 expect "contracts publish-tests supply-chain" scripts/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 
+expect_scan() {
+  local expected="$1"
+  shift
+  [[ "$(bash "$selector" socket --files "$@")" == "$expected" ]] || fail "dependency scan selection for $*"
+}
+for path in docs/INSTALL.md README.md frontend/app.js crates/api/src/lib.rs crates/bot/src/main.rs src/db.rs tools/webui/build.mjs; do
+  expect_scan false "$path"
+done
+for path in Cargo.lock crates/api/Cargo.toml tools/webui/package-lock.json tools/eslint/package.json docs/example/package.json .github/workflows/socket.yml .gitignore docs/example/.gitignore mystery.bin; do
+  expect_scan true "$path"
+done
+expect_scan true docs/INSTALL.md tools/webui/package-lock.json
+
 # Exercise actual Git ranges, deletions/renames, and job selection.
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -127,7 +140,27 @@ git init -q --initial-branch=main "$scratch/repo"
     bash "$selector" plan >"$scratch/empty"
   JMODGUARD_DIFF_BASE=0000000000000000000000000000000000000000 GITHUB_EVENT_NAME=push \
     bash "$selector" plan >"$scratch/missing"
+  JMODGUARD_DIFF_BASE=0000000000000000000000000000000000000000 GITHUB_EVENT_NAME=push \
+    bash "$selector" socket >"$scratch/scan-missing"
+  # A later docs commit must not hide a dependency change in the same PR.
+  mkdir -p tools/webui
+  echo '{}' >tools/webui/package.json
+  git add .
+  git commit -qm manifest
+  echo more >>docs/new.md
+  git commit -qam docs-after-manifest
+  JMODGUARD_DIFF_BASE="$base" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)" GITHUB_EVENT_NAME=pull_request \
+    bash "$selector" socket >"$scratch/scan-history"
+  # Deleting or renaming a manifest still needs a scan.
+  manifest_head="$(git rev-parse HEAD)"
+  git mv tools/webui/package.json docs/former-manifest.txt
+  git commit -qm move-manifest
+  JMODGUARD_DIFF_BASE="$manifest_head" JMODGUARD_DIFF_HEAD="$(git rev-parse HEAD)" GITHUB_EVENT_NAME=push \
+    bash "$selector" socket >"$scratch/scan-rename"
 )
+for scan in missing history rename; do
+  [[ "$(cat "$scratch/scan-$scan")" == true ]] || fail "scan $scan omitted dependency changes"
+done
 expected="$(printf '%s\n' $core frontend | sort)"
 for event in pull_request push rename; do
   [[ "$(sort "$scratch/$event")" == "$expected" ]] || fail "$event omitted touched consumers"
@@ -164,8 +197,29 @@ assert.equal(docs.length, 1);
 assert.equal(docs[0].groups, "contracts");
 assert.equal(docs[0].rust, false);
 const core = read("core").include;
-assert.equal(core.filter(j => j.lane === "rust").length, 1);
-assert.equal(core.find(j => j.lane === "rust").groups, "api bot updater core integration boundaries");
+assert.deepEqual(core.filter(j => j.lane.startsWith("rust-")).map(j => [j.lane, j.groups]), [
+  ["rust-api", "api boundaries"],
+  ["rust-bot", "bot integration"],
+  ["rust-core", "updater core"],
+]);
 assert.equal(new Set(core.flatMap(j => j.groups.split(" "))).size, core.flatMap(j => j.groups.split(" ")).length);
 JS
+# Matrix scheduling must neither omit nor duplicate a selected gate, including
+# narrow service changes and the full fallback plan.
+for path in docs/INSTALL.md crates/api/src/lib.rs crates/bot/src/main.rs crates/runtime/src/lib.rs crates/updater/src/main.rs crates/integration-tests/src/lib.rs src/db.rs Cargo.lock mystery.bin; do
+  bash "$selector" plan --files "$path" >"$scratch/plan"
+  bash "$selector" matrix --files "$path" >"$scratch/matrix.json"
+  node --input-type=module - "$scratch" <<'JS'
+import fs from "node:fs";
+import assert from "node:assert/strict";
+const root = process.argv[2];
+const expected = fs.readFileSync(`${root}/plan`, "utf8").trim().split(/\s+/).sort();
+const jobs = JSON.parse(fs.readFileSync(`${root}/matrix.json`, "utf8")).include;
+assert.deepEqual(jobs.flatMap(job => job.groups.split(" ")).sort(), expected);
+for (const job of jobs.filter(job => job.lane.startsWith("rust-"))) {
+  assert.equal(job.rust, true);
+  assert.equal(job.timeout, 90);
+}
+JS
+done
 echo 'select-checks-test: ok'

@@ -10,8 +10,10 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/select-checks.sh plan [--files PATH]...
        bash scripts/select-checks.sh matrix [--files PATH]...
+       bash scripts/select-checks.sh socket [--files PATH]...
 
 plan prints selected check groups. matrix emits GitHub Actions job entries.
+socket prints whether dependency inputs require a Socket scan.
 PRs compare the event base/head with merge-base semantics. Pushes compare
 all commits in the event before/after range. Missing history selects all checks.
 Selection reasons go to stderr; stdout is machine-readable.
@@ -22,7 +24,7 @@ mode=""
 files=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    plan|matrix) mode="$1"; shift ;;
+    plan|matrix|socket) mode="$1"; shift ;;
     --files)
       shift
       [ "$#" -ge 1 ] || { usage >&2; exit 2; }
@@ -45,6 +47,7 @@ groups=(
 selected=""
 full=0
 dylint_full=0
+dependency_scan=0
 
 add() {
   case " ${selected} " in
@@ -101,6 +104,12 @@ updater_consumers() {
 classify() {
   local path="$1"
   local top="${path%%/*}"
+  # Inspect dependency inputs before surface classification: a manifest under
+  # docs or a service directory still changes the repository-wide scan.
+  case "/$path" in
+    */Cargo.toml|*/Cargo.lock|*/package.json|*/package-lock.json|*/npm-shrinkwrap.json|*/yarn.lock|*/pnpm-lock.yaml|*/bun.lock|*/bun.lockb|*/.npmrc|*/.gitignore|/.github/workflows/socket.yml)
+      dependency_scan=1 ;;
+  esac
   case "$path" in
     .github/workflows/ci.yml|.github/workflows/publish.yml|scripts/select-checks.sh|scripts/select-checks-test.sh|scripts/ci-workflow-test.mjs|scripts/ci-preflight.sh|scripts/ci-setup.sh)
       all_groups "CI control changed: $path"
@@ -291,6 +300,15 @@ ensure_supply_chain() {
 ensure_supply_chain
 echo "select-checks: selected:${selected}" >&2
 
+if [ "$mode" = socket ]; then
+  if [ "$full" -eq 1 ] || [ "$dependency_scan" -eq 1 ]; then
+    echo true
+  else
+    echo false
+  fi
+  exit 0
+fi
+
 if [ "$mode" = "plan" ]; then
   for group in "${groups[@]}"; do
     case " ${selected} " in
@@ -328,14 +346,16 @@ if [ "$dylint_full" -eq 0 ]; then
   done
 fi
 
-# Related Rust checks share one runner/target directory instead of compiling
-# the same dependency graph independently for every service.
+# Balance the measured Rust work across runners without combining package
+# feature configurations. Bot/integration share their service builds locally.
 SELECTED="$selected" LINT_PACKAGES="$dylint_packages" node --input-type=module - <<'JS'
 const selected = new Set(process.env.SELECTED.trim().split(/\s+/));
 const lanes = {
   quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog"],
   frontend: ["frontend"],
-  rust: ["api", "bot", "runtime", "updater", "core", "integration", "boundaries"],
+  "rust-api": ["api", "boundaries"],
+  "rust-bot": ["bot", "integration"],
+  "rust-core": ["runtime", "updater", "core"],
   dylint: ["dylint"],
   "supply-chain": ["supply-chain"],
   "remote-database": ["remote-database"],
@@ -345,7 +365,7 @@ const include = Object.entries(lanes).flatMap(([lane, candidates]) => {
   if (!groups.length) return [];
   const rust = groups.some(group => !["contracts", "frontend", "publish-tests", "bootstrap", "pullfrog"].includes(group));
   return [{ lane, groups: groups.join(" "), rust,
-    timeout: lane === "dylint" || lane === "rust" ? 90 : lane === "remote-database" ? 45 : 30,
+    timeout: lane === "dylint" || lane.startsWith("rust-") ? 90 : lane === "remote-database" ? 45 : 30,
     dylint_packages: lane === "dylint" ? process.env.LINT_PACKAGES : "" }];
 });
 console.log(JSON.stringify({ include }));

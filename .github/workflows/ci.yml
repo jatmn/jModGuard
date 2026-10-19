@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
   workflow_call:
     inputs:
       source_sha:
@@ -94,13 +94,14 @@ jobs:
       - name: Configure runner
         env:
           NEED_RUST: ${{ matrix.rust }}
+          NEED_NEXTEST: ${{ startsWith(matrix.lane, 'rust-') }}
         run: bash scripts/ci-setup.sh "$NEED_RUST"
       - name: Cache Rust dependencies
         if: matrix.rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ${{ matrix.lane }}
-          cache-targets: ${{ matrix.lane == 'rust' || matrix.lane == 'dylint' || matrix.lane == 'remote-database' }}
+          shared-key: ${{ startsWith(matrix.lane, 'rust-') && 'rust' || matrix.lane }}
+          cache-targets: ${{ startsWith(matrix.lane, 'rust-') || matrix.lane == 'dylint' || matrix.lane == 'remote-database' }}
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Cache pinned lint and audit tools
@@ -109,8 +110,19 @@ jobs:
         with:
           path: ~/.cache/jmodguard-ci
           key: ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.lane }}-${{ hashFiles('rust-toolchain.toml', 'dylint.toml', 'scripts/dylint.sh', 'scripts/ci-ensure-cargo-tool.sh') }}
+      - name: Cache Rust compiler outputs
+        if: startsWith(matrix.lane, 'rust-')
+        timeout-minutes: 3
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
       - name: Run selected checks
         env:
+          # Set the wrapper after dependency restoration to preserve its cache key.
+          RUSTC_WRAPPER: ${{ startsWith(matrix.lane, 'rust-') && 'sccache' || '' }}
+          SCCACHE_GHA_ENABLED: 'true'
+          # PR writes are merge-ref scoped; main cannot restore those entries.
+          SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'READ_WRITE' || 'READ_ONLY' }}
           CHECK_GROUPS: ${{ matrix.groups }}
           JMODGUARD_DIFF_BASE: ${{ inputs.source_sha == '' && (github.event.pull_request.base.sha || github.event.before) || '' }}
           JMODGUARD_DIFF_HEAD: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}

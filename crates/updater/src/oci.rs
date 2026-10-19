@@ -441,9 +441,15 @@ mod tests {
     #[tokio::test]
     async fn registry_transport_errors_omit_urls() {
         // Exercise the same request owner used by API discovery and launcher downloads.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port without listening so another test cannot claim it
+        // and turn the expected connection refusal into an HTTP response.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        assert!(
+            tokio::net::TcpListener::bind(addr).await.is_err(),
+            "the refused endpoint must stay reserved until the request completes"
+        );
         let registry = super::Registry::new(&format!("http://{addr}")).unwrap();
         let error = registry
             .get_limited(
