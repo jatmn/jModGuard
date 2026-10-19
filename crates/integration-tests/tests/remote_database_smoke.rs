@@ -157,6 +157,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
     exercise_moderation_scopes(&bot, &api).await;
+    exercise_received_gateway_ban_delivery(&bot).await;
     exercise_configuration_reads(&bot, &api).await;
     exercise_guild_store_catalog(&bot, &api).await;
 
@@ -985,4 +986,97 @@ async fn place_before_remote_erasure(db: &Db, guild: i64) {
         .await
         .unwrap();
     assign_initial_placement(db, guild, store).await.unwrap();
+}
+
+async fn exercise_received_gateway_ban_delivery(bot: &Db) {
+    use jmodguard::db::{self, SqlExecutor, params};
+    let scope = db::enroll_guild(bot, 8844, 100).await.unwrap().unwrap();
+    let at = chrono::Utc::now().timestamp_millis() - 20_000;
+    let delivery = db::GatewayBanDelivery {
+        id: "remote-received-ban".into(),
+        enrollment: scope.clone(),
+        user_id: 55,
+        observed_at: chrono::DateTime::from_timestamp_millis(at)
+            .unwrap()
+            .to_rfc3339(),
+        payload: db::GatewayBanPayload::Ban {
+            user_name: "received user".into(),
+            user_display_name: None,
+            owned_by_bot: false,
+            operation_id: None,
+            member_was_banned: false,
+            pending_audits: vec![],
+            overlapping_deliveries: vec![],
+            audit_after_ms: 0,
+        },
+        case: None,
+    };
+    test_drop_next_commit_response();
+    db::save_gateway_ban_delivery(bot, delivery.clone())
+        .await
+        .unwrap();
+    db::save_gateway_ban_delivery(bot, delivery.clone())
+        .await
+        .unwrap();
+    test_drop_next_commit_response();
+    let result = db::apply_gateway_ban_delivery(bot, delivery.id.clone())
+        .await
+        .unwrap();
+    db::mark_enrolled_unbanned(bot, Some(scope.clone()), 55)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::apply_gateway_ban_delivery(bot, delivery.id.clone())
+            .await
+            .unwrap(),
+        result
+    );
+    let (bans, active, events) = bot.with_conn(|conn| conn.query_row(
+        "SELECT (SELECT count(*) FROM bans WHERE guild_id=8844), (SELECT count(*) FROM bans WHERE guild_id=8844 AND active=1), (SELECT count(*) FROM events WHERE guild_id=8844)",
+        params![], |row| Ok((row.get::<i64>(0)?,row.get::<i64>(1)?,row.get::<i64>(2)?)),
+    )).await.unwrap();
+    assert_eq!((bans, active, events), (1, 0, 1));
+    let entry_id = ((at - 1_420_070_400_000) << 22) + 1;
+    let attribution = db::GatewayBanAuditAttribution {
+        moderator_id: 77,
+        moderator_name: Some("moderator".into()),
+        reason: "late recovered audit".into(),
+    };
+    let audit = db::GatewayBanDelivery {
+        id: "remote-received-audit".into(),
+        enrollment: scope.clone(),
+        user_id: 55,
+        observed_at: delivery.observed_at,
+        payload: db::GatewayBanPayload::Audit {
+            entry_id,
+            attribution: attribution.clone(),
+        },
+        case: None,
+    };
+    test_drop_next_commit_response();
+    db::save_gateway_ban_delivery(bot, audit.clone())
+        .await
+        .unwrap();
+    test_drop_next_commit_response();
+    let matched = bot
+        .with_conn(move |conn| {
+            db::reconcile_gateway_manual_ban_audit_entry_conn(
+                conn,
+                &scope,
+                8844,
+                55,
+                entry_id,
+                Some(&attribution),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(matched);
+    test_drop_next_commit_response();
+    db::acknowledge_gateway_ban_audit(bot, audit.clone())
+        .await
+        .unwrap();
+    db::acknowledge_gateway_ban_audit(bot, audit).await.unwrap();
+    let count = bot.with_conn(move |conn| conn.query_row("SELECT count(*) FROM events WHERE guild_id=8844 AND actor_id=77 AND CAST(json_extract(data,'$.audit_entry_id') AS INTEGER)=?1",params![entry_id],|row|Ok(row.get::<i64>(0)?))).await.unwrap();
+    assert_eq!(count, 1);
 }

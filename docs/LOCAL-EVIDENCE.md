@@ -5,7 +5,7 @@ verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.
 It is a library backend for a dedicated local filesystem. Bot and API now serve available
 objects through [tenant runtime](TENANT-RUNTIME.md). Exact-image spam now retains hash-only evidence; this backend
 continues to serve previously available journal objects.
-There is no background capture worker. Core is at migration 0019; the current
+There is no background capture worker. Core is at migration 0020; the current
 guild schema is 9.
 
 ## Resource contract

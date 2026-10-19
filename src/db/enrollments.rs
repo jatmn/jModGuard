@@ -28,6 +28,37 @@ pub async fn guild_enrollment(db: &Db, guild: i64) -> Result<Option<GuildEnrollm
     .await
 }
 
+/// Latest trusted membership observation, including confirmed retirement.
+/// The boolean is the active state; an inactive identity cannot authorize writes.
+pub async fn guild_membership_observation(
+    db: &Db,
+    guild: i64,
+) -> Result<Option<(GuildEnrollment, bool)>> {
+    anyhow::ensure!(guild > 0, "invalid guild id");
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let result = tx
+            .query_row(
+                "SELECT id,joined_at_ns,active FROM guild_enrollments WHERE guild_id=?1",
+                params![guild],
+                |row| {
+                    Ok((
+                        GuildEnrollment {
+                            guild_id: guild,
+                            id: row.get(0)?,
+                            joined_at_ns: row.get(1)?,
+                        },
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        tx.finish_read()?;
+        Ok(result)
+    })
+    .await
+}
+
 /// Matching reconnects preserve identity; only a newer join replaces a retired join.
 pub async fn enroll_guild(
     db: &Db,

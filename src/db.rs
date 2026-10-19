@@ -45,6 +45,8 @@ pub use configuration::*;
 pub use known_bad_images::*;
 mod nickname_jobs;
 pub use nickname_jobs::*;
+mod gateway_ban_deliveries;
+pub use gateway_ban_deliveries::*;
 mod moderation;
 pub use moderation::*;
 pub mod guild_data;
@@ -83,6 +85,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0017_hot_query_indexes.sql"),
     include_str!("../migrations/0018_one_active_ban.sql"),
     include_str!("../migrations/0019_known_bad_images.sql"),
+    include_str!("../migrations/0020_gateway_ban_deliveries.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

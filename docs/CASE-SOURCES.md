@@ -107,3 +107,24 @@ No live Discord/Bunny proof, resource measurement, runtime permission enforcemen
 complete tenant isolation is claimed. Local tests cover bot-owned audit association,
 foreign executors, unmarked gateway records, failed/timeout skips, audit-before-record
 races, deferred-pair quarantine, and transient link retry. Missing `VIEW_AUDIT_LOG` leaves application-only cases.
+
+## Gateway ban persistence
+
+Received bans, unbans, and manual-ban audits are retained in memory until their
+full payload is confirmed in the core gateway delivery inbox. Failed saves retry
+without sending Discord actions. The inbox preserves original observation time,
+captured membership, and stable source IDs; a periodic bot pass resumes pending
+mirror, audit, and selected-case work after restart. Ban mirror results commit
+with their delivery receipt, so lost responses cannot create another row. Later
+unbans and newer bans win over delayed historical inserts. Audit cache expiry,
+eviction, and unban do not remove the saved pending audit. Failed writes retain
+that same delivery owner; they do not retire a failure cutoff or start a new
+write under another membership. Active registrations and saved peer identities
+keep a competing observation from becoming a false unique audit match.
+
+Gateway observation cases and Discord audit cases retain their distinct source
+contracts; the mirror matcher does not merge these cases. Partial guild-store
+writes retry the same immutable CaseData/source. Membership retirement still
+refuses old work and guild erasure removes its inbox. A process crash before the
+first successful save can lose an event held only in memory; there is no separate
+filesystem spool. No live Discord verification is implied.

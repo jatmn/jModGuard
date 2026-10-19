@@ -85,7 +85,7 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
 1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
 Open requires 9 after the rolling-snapshot extension. Rollback needs matching pre-upgrade
-database/binary. Core is at migration 0019. Exact-image spam retains hashes instead of capturing
+database/binary. Core is at migration 0020. Exact-image spam retains hashes instead of capturing
 attachment bytes; existing journal-available objects remain authorized.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal

@@ -3700,7 +3700,7 @@ async fn existing_observation_retry_and_late_audit_do_not_reactivate_a_newer_ban
 }
 
 #[tokio::test]
-async fn existing_observations_are_bounded_and_lost_candidates_stay_ambiguous() {
+async fn existing_observations_are_retained_and_legacy_lost_candidates_stay_ambiguous() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     for second in 0..20 {
@@ -3724,9 +3724,9 @@ async fn existing_observations_are_bounded_and_lost_candidates_stay_ambiguous() 
         .unwrap();
     assert_eq!(events.len(), 1);
     let data: serde_json::Value = serde_json::from_str(events[0].data.as_deref().unwrap()).unwrap();
-    assert_eq!(data["gateway_observations"].as_array().unwrap().len(), 8);
-    // The dropped observation at 10 seconds cannot leave its surviving
-    // neighbors looking uniquely attributable. Nor can the remaining cluster.
+    assert_eq!(data["gateway_observations"].as_array().unwrap().len(), 19);
+    assert!(data.get("observations_lost_through").is_none());
+    // Retained observations must still refuse an ambiguous cluster.
     for second in [10, 14] {
         let audit = 1_212_912_186_163_200_001 + ((second * 1000) << 22);
         assert!(
@@ -3735,6 +3735,29 @@ async fn existing_observations_are_bounded_and_lost_candidates_stay_ambiguous() 
                 .unwrap()
         );
     }
+    // Older databases can already contain a truncated observation history.
+    // Preserve its loss fence; retaining new observations does not erase it.
+    let mut legacy = data;
+    let observations = legacy["gateway_observations"].as_array_mut().unwrap();
+    observations.drain(..11);
+    legacy["observations_lost_through"] = serde_json::json!(1_709_251_211_000_i64);
+    f.db.with_conn(move |conn| {
+        let tx = conn.transaction()?;
+        tx.execute_matching(
+            "UPDATE events SET data=?1 WHERE guild_id=10 AND user_id=55",
+            params![legacy.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let audit = 1_212_912_186_163_200_001 + ((10 * 1000) << 22);
+    assert!(
+        !reconcile_gateway_manual_ban_audit_entry(&f.db, Some(scope.clone()), 10, 55, audit)
+            .await
+            .unwrap()
+    );
     assert_eq!(list_enrolled_bans(&f.db, scope, 10).await.unwrap().len(), 1);
 }
 

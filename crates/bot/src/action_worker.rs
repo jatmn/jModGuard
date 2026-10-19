@@ -398,6 +398,20 @@ async fn execute_inner(
                 });
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 let outcome = discord.unban(job.guild_id, *user_id, reason).await;
+                if outcome.state == "succeeded"
+                    && let (Some(id), Some(joined_at_ns)) = (&job.enrollment_id, job.joined_at_ns)
+                {
+                    crate::gateway_ban_persistence::retain_confirmed_unban(
+                        db.clone(),
+                        db::GuildEnrollment {
+                            guild_id: job.guild_id,
+                            id: id.clone(),
+                            joined_at_ns,
+                        },
+                        *user_id,
+                    );
+                }
+
                 if (outcome.state == "failed" || outcome.code == "already_unbanned")
                     && let (Some(app), Some(suppression)) = (app, suppression)
                 {

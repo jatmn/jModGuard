@@ -85,11 +85,10 @@ fn get(addr: &str, path: &str) -> String {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     use std::io::Write;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
+    // The startup listener can answer after its first read. Do not let
+    // formatting split the request into separately scheduled socket writes.
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
     let mut body = String::new();
     let _ = stream.read_to_string(&mut body);
     body
