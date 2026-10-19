@@ -4037,6 +4037,13 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             .await;
         let stored = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
         assert!(stored > 0);
+        let epoch = app.member_sync_rate_limit_epoch.load(Ordering::Acquire);
+        assert!(epoch > 0);
+        assert_eq!(
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire),
+            0
+        );
         assert_eq!(pacing_deadline(&app, 42).await, None);
         assert!(!log.text().contains("failed to persist"));
 
@@ -4053,7 +4060,14 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             cache,
         ));
         let poll = tokio::time::timeout(Duration::from_secs(5), async {
-            while pacing_deadline(&app, 42).await != Some(stored) {
+            // The committed row can be visible before the worker resumes to
+            // acknowledge it. Wait for that acknowledgement before aborting.
+            while app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+                != epoch
+                || pacing_deadline(&app, 42).await != Some(stored)
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
