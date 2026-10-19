@@ -37,23 +37,35 @@ async fn capture(
 ) -> Result<db::GuildEnrollment> {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match db::guild_enrollment(&app.db, guild as i64).await {
-            Ok(Some(enrollment)) => {
+        match db::guild_membership_observation(&app.db, guild as i64).await {
+            Ok(Some((enrollment, active))) => {
+                let same_join = joined.is_some_and(|joined| {
+                    crate::enrollment_repair::membership_joined_at_matches(
+                        joined,
+                        enrollment.joined_at_ns,
+                    ) || crate::enrollment_repair::membership_joined_at_matches(
+                        enrollment.joined_at_ns,
+                        joined,
+                    )
+                });
+                if !active {
+                    // Only a positively observed newer join can still be awaiting
+                    // enrollment after this retirement. Precision differences for
+                    // the same join are not evidence of a replacement membership.
+                    anyhow::ensure!(
+                        !same_join && joined.is_some_and(|joined| joined > enrollment.joined_at_ns),
+                        db::EnrollmentChanged
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
                 anyhow::ensure!(
                     enrollment.joined_at_ns <= observed.timestamp_nanos_opt().unwrap_or(i64::MAX),
                     db::EnrollmentChanged
                 );
-                if let Some(joined) = joined {
-                    anyhow::ensure!(
-                        crate::enrollment_repair::membership_joined_at_matches(
-                            joined,
-                            enrollment.joined_at_ns
-                        ) || crate::enrollment_repair::membership_joined_at_matches(
-                            enrollment.joined_at_ns,
-                            joined
-                        ),
-                        db::EnrollmentChanged
-                    );
+                if joined.is_some() {
+                    anyhow::ensure!(same_join, db::EnrollmentChanged);
                 }
                 return Ok(enrollment);
             }
@@ -436,6 +448,163 @@ mod tests {
                 },
             },
             case: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn same_millisecond_peers_remain_ambiguous_after_apply_and_restart() {
+        let (dir, app, scope) = setup().await;
+        let at = chrono::Utc::now().timestamp_millis() - 20_000;
+        let mut first = ban(&scope, at);
+        let mut second = ban(&scope, at);
+        let peer_ids = [second.id.clone(), first.id.clone()];
+        for (delivery, peer) in [&mut first, &mut second].into_iter().zip(peer_ids) {
+            if let db::GatewayBanPayload::Ban {
+                overlapping_deliveries,
+                ..
+            } = &mut delivery.payload
+            {
+                overlapping_deliveries.push(db::GatewayBanPeer {
+                    id: peer,
+                    observed_at_ms: at,
+                });
+            }
+        }
+        for delivery in [&first, &second] {
+            db::save_gateway_ban_delivery(&app.db, delivery.clone())
+                .await
+                .unwrap();
+            db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            count(&app, "events").await,
+            1,
+            "both deliveries share the same mirror candidate"
+        );
+        drop(app);
+        let app = BotState::new(
+            Default::default(),
+            db::Db::open(&dir.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let received = audit(&scope, at);
+        let db::GatewayBanPayload::Audit {
+            entry_id,
+            attribution,
+        } = received.payload
+        else {
+            unreachable!()
+        };
+        let enrollment = scope.clone();
+        assert!(
+            !app.db
+                .with_conn(
+                    move |conn| db::reconcile_gateway_manual_ban_audit_entry_conn(
+                        conn,
+                        &enrollment,
+                        10,
+                        55,
+                        entry_id,
+                        Some(&attribution)
+                    )
+                )
+                .await
+                .unwrap(),
+            "distinct same-millisecond deliveries must not become a unique audit candidate"
+        );
+        let rows = db::query_enrolled_events(&app.db, scope, Some("member_ban"), Some(55), 10)
+            .await
+            .unwrap();
+        assert!(rows[0].actor_id.is_none());
+        assert!(!rows[0].data.as_ref().unwrap().contains("audit_entry_id"));
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_membership_stops_initial_capture_and_releases_observation() {
+        // Include a cached full-precision join corresponding to a stored truncated join.
+        for joined in [None, Some(100), Some(1_000_000_123)] {
+            let (dir, app, scope) = setup().await;
+            let retired_join = if joined == Some(1_000_000_123) {
+                1_000_000_000
+            } else {
+                scope.joined_at_ns
+            };
+            db::retire_guild_enrollment(&app.db, 10, retired_join)
+                .await
+                .unwrap();
+            let observation = app.begin_gateway_ban_observation(10, 55).await;
+            let user = serde_json::from_value(serde_json::json!({"id":"55","username":"received-name","discriminator":"0","avatar":null})).unwrap();
+            let mut task = receive_ban(
+                Arc::clone(&app),
+                observation,
+                10,
+                user,
+                app.consume_gateway_ban_echo(10, 55),
+                joined,
+            );
+            let result = tokio::time::timeout(Duration::from_millis(1500), &mut task).await;
+            if result.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            let error = result
+                .expect("a confirmed retired membership must stop its retained owner")
+                .unwrap()
+                .unwrap_err();
+            assert!(error.downcast_ref::<db::EnrollmentChanged>().is_some());
+            let next = app.begin_gateway_ban_observation(10, 55).await;
+            assert!(
+                next.overlapping_deliveries(&scope).is_empty(),
+                "terminal capture must release its registration"
+            );
+            drop(next);
+            assert_eq!(count(&app, "gateway_ban_deliveries").await, 0);
+            drop(app);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_capture_waits_for_missing_or_newer_pending_enrollment() {
+        for older_retirement in [false, true] {
+            let (dir, app, _) = setup().await;
+            if older_retirement {
+                db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
+            } else {
+                sql(&app, "DELETE FROM guild_enrollments").await;
+            }
+            let observation = app.begin_gateway_ban_observation(10, 55).await;
+            let user = serde_json::from_value(serde_json::json!({"id":"55","username":"received-name","discriminator":"0","avatar":null})).unwrap();
+            let mut task = receive_ban(
+                Arc::clone(&app),
+                observation,
+                10,
+                user,
+                app.consume_gateway_ban_echo(10, 55),
+                Some(2_000_000_001),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !task.is_finished(),
+                "a missing initial enrollment must remain retryable"
+            );
+            let scope = db::enroll_guild(&app.db, 10, 2_000_000_001)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+            if result.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            assert_eq!(result.unwrap().unwrap().unwrap().0, scope);
+            assert_eq!(count(&app, "events").await, 1);
+            drop(app);
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 

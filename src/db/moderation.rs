@@ -1261,14 +1261,17 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     let audit_at_ms = (audit_entry_id >> 22) + 1_420_070_400_000;
     // A saved observation remembers known competing callbacks. After a crash,
     // absence of a peer's inbox row cannot make this one a unique candidate.
+    // Same-millisecond peers stay ambiguous even after application: the mirror
+    // coalesces equal timestamps, not distinct received delivery identities.
     let missing_peer: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries d,
              json_each(d.payload, '$.payload.Ban.overlapping_deliveries') peer
          WHERE d.guild_id=?1 AND d.user_id=?2 AND d.enrollment_id=?3 AND d.kind='ban'
            AND json_extract(peer.value, '$.observed_at_ms') BETWEEN ?4 AND ?4+5000
-           AND NOT EXISTS(SELECT 1 FROM gateway_ban_deliveries p
+           AND (json_extract(peer.value, '$.observed_at_ms')=d.observed_at_ms
+             OR NOT EXISTS(SELECT 1 FROM gateway_ban_deliveries p
                WHERE p.id=json_extract(peer.value, '$.id') AND p.guild_id=d.guild_id AND p.user_id=d.user_id
-                 AND p.enrollment_id=d.enrollment_id AND p.kind='ban' AND p.applied=1))",
+                 AND p.enrollment_id=d.enrollment_id AND p.kind='ban' AND p.applied=1)))",
         params![guild_id, user_id, enrollment.id.clone(), audit_at_ms],
         |row| Ok(row.get(0)?),
     )?;
