@@ -380,6 +380,9 @@ enum Report {
 #[derive(Debug, PartialEq)]
 enum CompleteOutcome {
     Dropped,
+    /// Comparison finished on hashes already stored for every live post, and
+    /// there was no match. The job's failure must not open an incomplete notice.
+    NoMatch,
     Report(Report),
     Suppressed(AnalysisGate),
 }
@@ -871,14 +874,23 @@ impl Detector {
             None => AdmitOutcome::Admitted,
         }
     }
-    fn reserve(&self, job: &Job, policy: &Policy, now: Instant) -> ReserveOutcome {
-        let files = job
+    fn reserve(&self, job: &mut Job, policy: &Policy, now: Instant) -> ReserveOutcome {
+        let mut s = self.state.lock();
+        // The job cloned its posts at admission. Another job may have stored
+        // hashes since then. Count only attachments that are still missing.
+        if let Some(bucket) = s
+            .guilds
+            .get(&job.guild)
+            .and_then(|guild| guild.authors.get(&job.author))
+        {
+            copy_stored_hashes(job, bucket, policy, now);
+        }
+        let (requests, bytes) = job
             .posts
             .iter()
-            .filter(|p| p.hashes.is_none())
-            .flat_map(|p| &p.files);
-        let (requests, bytes) = files.fold((0, 0), |(n, b), f| (n + 1, b + f.size));
-        let mut s = self.state.lock();
+            .filter(|post| post.hashes.is_none())
+            .flat_map(|post| &post.files)
+            .fold((0u64, 0u64), |(n, b), file| (n + 1, b + file.size));
         if !s.budget.fits(
             now,
             requests,
@@ -978,10 +990,13 @@ impl Detector {
         }
         let posts: Vec<_> = b.posts.iter().filter(|p| live(p, policy, now)).collect();
         let compared = common_images(&posts, policy, self.limits.comparison_steps);
+        let covered = posts.iter().all(|post| post.hashes.is_some());
         // Hashes that already prove the common set win over a download or budget failure
-        // on some other file. The failure notice is used only when no match was proven.
+        // on some other file. The failure notice is used only when no match was proven
+        // and at least one live post still has no hash.
         let report = match compared {
             Ok(Some(matched)) => Report::Verified(matched),
+            Ok(None) if failed && covered => return CompleteOutcome::NoMatch,
             Ok(None) if !failed => return CompleteOutcome::Dropped,
             Ok(None) => Report::Unverified(job_gate),
             Err(()) => Report::Unverified(AnalysisGate::ComparisonSteps {
@@ -1021,6 +1036,61 @@ impl Detector {
         {
             bucket.reported_until = now;
         }
+    }
+
+    /// Give back an incomplete-notice reservation when delivery did not succeed.
+    /// A verified window does not carry `blocked_notice`, so it is left alone.
+    fn release_incomplete_notice(
+        &self,
+        guild: u64,
+        author: u64,
+        reservation: ReportWindow,
+        now: Instant,
+    ) {
+        let mut state = self.state.lock();
+        let Some(guild_state) = state.guilds.get_mut(&guild) else {
+            return;
+        };
+        let same_reservation = |token: (u64, u64), blocked: bool, until: Instant| {
+            token == reservation.token && blocked && until == reservation.until
+        };
+        if let Some(bucket) = guild_state.authors.get_mut(&author) {
+            if same_reservation(bucket.token, bucket.blocked_notice, bucket.reported_until) {
+                bucket.blocked_notice = false;
+                bucket.reported_until = now;
+            }
+            return;
+        }
+        if let Some(watermark) = guild_state.watermarks.get_mut(&author)
+            && same_reservation(
+                watermark.token,
+                watermark.blocked_notice,
+                watermark.reported_until,
+            )
+        {
+            watermark.blocked_notice = false;
+            watermark.reported_until = now;
+        }
+    }
+}
+
+fn copy_stored_hashes(job: &mut Job, bucket: &Bucket, policy: &Policy, now: Instant) {
+    if bucket.token != job.token {
+        return;
+    }
+    for post in &mut job.posts {
+        if post.hashes.is_some() {
+            continue;
+        }
+        let Some(stored) = bucket
+            .posts
+            .iter()
+            .find(|live_post| live_post.serial == post.serial && live(live_post, policy, now))
+            .and_then(|live_post| live_post.hashes.clone())
+        else {
+            continue;
+        };
+        post.hashes = Some(stored);
     }
 }
 
@@ -1675,7 +1745,7 @@ async fn run_job(
     let job_timeout = Duration::from_secs(timeout_secs);
     let mut job_gate = AnalysisGate::Transport;
     let mut failed = false;
-    match detector.reserve(&job, &policy, started) {
+    match detector.reserve(&mut job, &policy, started) {
         ReserveOutcome::Ok => {}
         ReserveOutcome::Stale => return,
         ReserveOutcome::Miss(gate) => {
@@ -1770,6 +1840,7 @@ async fn run_job(
             }
             return;
         }
+        CompleteOutcome::NoMatch => return,
         CompleteOutcome::Suppressed(gate) => {
             warn_incomplete_analysis(&gate, guild, author);
             return;
@@ -1787,7 +1858,19 @@ async fn run_job(
         Report::Unverified(gate) => {
             warn_incomplete_analysis(&gate, guild, author);
             let vars = report_vars(Report::Unverified(gate), author, channel, &policy);
-            crate::logging::emit(app, ctx, GuildId::new(guild), "automod", vars).await;
+            // Reserve the window before delivery so overlapping jobs do not each
+            // send. Give it back when this notice is not actually sent.
+            let delivery = crate::logging::emit_to(
+                app,
+                ctx.http.as_ref(),
+                GuildId::new(guild),
+                "automod",
+                vars,
+            )
+            .await;
+            if delivery != crate::logging::Delivery::Sent {
+                detector.release_incomplete_notice(guild, author, report_window, Instant::now());
+            }
         }
         Report::Verified(image_match) => {
             let messages = &image_match.messages;
@@ -2620,11 +2703,12 @@ mod tests {
         })
         .unwrap();
         let mut j = job(&d, now);
+        clear_stored_hashes(&d);
         for p in &mut j.posts {
             p.hashes = None;
         }
         assert!(matches!(
-            d.reserve(&j, &policy(), now),
+            d.reserve(&mut j, &policy(), now),
             ReserveOutcome::Miss(_)
         )); // six files, five request budget
         assert!(matches!(
@@ -4058,30 +4142,73 @@ mod tests {
     fn failed_job_with_none_hashes_does_not_clear_stored_some() {
         let now = Instant::now();
         let d = Detector::new(Limits::default()).unwrap();
-        let stored = complete_report(&d, job(&d, now), &policy(), false, now).unwrap();
-        assert!(matches!(stored, Report::Verified(_)));
+        // Two channels do not open a verified window, so complete reaches the merge.
+        assert!(admit(&d, 10, 100, now).is_none());
+        assert!(matches!(
+            d.admit(
+                1,
+                2,
+                post(11, 101, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            ),
+            AdmitOutcome::Admitted
+        ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let stored = posts[0].hashes.clone().expect("admission stored hashes");
+        let store = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .iter()
+                .cloned()
+                .map(|mut post| {
+                    post.hashes = Some(stored.clone());
+                    post
+                })
+                .collect(),
+        };
+        assert_eq!(
+            d.complete(store, &policy(), false, transport_gate(), now),
+            CompleteOutcome::Dropped
+        );
+        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
         let failed_job = Job {
             guild: 1,
             author: 2,
             token: (0, 0),
             posts: posts
                 .into_iter()
-                .map(|mut post| {
-                    post.hashes = None;
+                .enumerate()
+                .map(|(index, mut post)| {
+                    post.hashes = if index == 0 {
+                        None
+                    } else {
+                        Some(vec![[9; 32]])
+                    };
                     post
                 })
                 .collect(),
         };
         assert_eq!(
             d.complete(failed_job, &policy(), true, transport_gate(), now),
-            CompleteOutcome::Dropped
+            CompleteOutcome::NoMatch
         );
-        assert!(
-            d.state.lock().guilds[&1].authors[&2].posts[0]
-                .hashes
-                .is_some()
-        );
+        let (first_hashes, second_hashes, blocked) = {
+            let state = d.state.lock();
+            let bucket = &state.guilds[&1].authors[&2];
+            (
+                bucket.posts[0].hashes.clone(),
+                bucket.posts[1].hashes.clone(),
+                bucket.blocked_notice,
+            )
+        };
+        assert_eq!(first_hashes.as_ref(), Some(&stored));
+        assert_eq!(second_hashes, Some(vec![[9; 32]]));
+        assert!(!blocked);
     }
 
     #[test]
@@ -4132,12 +4259,13 @@ mod tests {
         })
         .unwrap();
         let mut j = job(&d, now);
+        clear_stored_hashes(&d);
         for p in &mut j.posts {
             p.hashes = None;
         }
         let before = d.state.lock().guilds[&1].authors[&2].budget.requests;
         assert!(matches!(
-            d.reserve(&j, &policy(), now),
+            d.reserve(&mut j, &policy(), now),
             ReserveOutcome::Miss(AnalysisGate::AuthorBudget { .. })
         ));
         assert_eq!(
@@ -4158,6 +4286,7 @@ mod tests {
         })
         .unwrap();
         let mut author_job = job(&d, now);
+        clear_stored_hashes(&d);
         for post in &mut author_job.posts {
             post.hashes = None;
         }
@@ -4174,7 +4303,7 @@ mod tests {
             author.budget.start = expired;
         }
         assert!(matches!(
-            d.reserve(&author_job, &policy(), now),
+            d.reserve(&mut author_job, &policy(), now),
             ReserveOutcome::Miss(AnalysisGate::AuthorBudget {
                 requests: 0,
                 request_limit: 1
@@ -4189,6 +4318,7 @@ mod tests {
         })
         .unwrap();
         let mut process_job = job(&process, now);
+        clear_stored_hashes(&process);
         for post in &mut process_job.posts {
             post.hashes = None;
         }
@@ -4199,7 +4329,7 @@ mod tests {
             state.budget.start = expired;
         }
         assert!(matches!(
-            process.reserve(&process_job, &policy(), now),
+            process.reserve(&mut process_job, &policy(), now),
             ReserveOutcome::Miss(AnalysisGate::ProcessBudget {
                 requests: 0,
                 bytes: 0,
@@ -4243,14 +4373,51 @@ mod tests {
                 1,
                 2,
             );
+            warn_incomplete_analysis(
+                &AnalysisGate::GuildBudget {
+                    requests: 7,
+                    request_limit: 40,
+                },
+                1,
+                2,
+            );
+            warn_incomplete_analysis(
+                &AnalysisGate::AuthorBudget {
+                    requests: 3,
+                    request_limit: 20,
+                },
+                1,
+                2,
+            );
             warn_incomplete_analysis(&AnalysisGate::ComparisonSteps { steps: 99 }, 1, 2);
         });
         let output = String::from_utf8(buffer.lock().clone()).unwrap();
-        assert!(output.contains("process_budget"));
-        assert!(output.contains("comparison_steps"));
-        assert!(output.contains("process") && output.contains("job"));
-        assert!(output.contains("119") && output.contains("99"));
+        let line_for = |gate: &str| {
+            output
+                .lines()
+                .find(|line| line.contains(gate))
+                .unwrap_or_else(|| panic!("missing {gate} warning in {output}"))
+                .to_string()
+        };
+        let process_line = line_for("process_budget");
+        let guild_line = line_for("guild_budget");
+        let author_line = line_for("author_budget");
+        let job_line = line_for("comparison_steps");
+        let scope_is = |line: &str, scope: &str| line.contains(&format!("scope=\"{scope}\""));
+        assert!(scope_is(&process_line, "process"), "{process_line}");
+        assert!(!scope_is(&process_line, "job"), "{process_line}");
+        assert!(!scope_is(&process_line, "guild"), "{process_line}");
+        assert!(!scope_is(&process_line, "author"), "{process_line}");
+        assert!(scope_is(&guild_line, "guild"), "{guild_line}");
+        assert!(!scope_is(&guild_line, "process"), "{guild_line}");
+        assert!(scope_is(&author_line, "author"), "{author_line}");
+        assert!(!scope_is(&author_line, "job"), "{author_line}");
+        assert!(scope_is(&job_line, "job"), "{job_line}");
+        assert!(!scope_is(&job_line, "process"), "{job_line}");
+        assert!(process_line.contains("119"), "{process_line}");
+        assert!(job_line.contains("99"), "{job_line}");
         assert!(!output.contains("cdn.discordapp.com"));
+        assert!(!output.contains("http://"));
     }
 
     #[test]
@@ -4893,7 +5060,7 @@ mod tests {
         };
         assert!(matches!(
             d.complete(failed, &policy(), true, transport_gate(), now),
-            CompleteOutcome::Dropped | CompleteOutcome::Report(Report::Unverified(_))
+            CompleteOutcome::NoMatch
         ));
         assert_eq!(
             d.state.lock().guilds[&1].authors[&2].posts[0].hashes,
@@ -4991,6 +5158,17 @@ mod tests {
                 .is_some()
         );
         let mut pending = job(&d, now);
+        {
+            let mut state = d.state.lock();
+            let newest = state
+                .guilds
+                .get_mut(&1)
+                .unwrap()
+                .authors
+                .get_mut(&2)
+                .unwrap();
+            newest.posts.last_mut().unwrap().hashes = None;
+        }
         for post in &mut pending.posts {
             post.hashes = None;
         }
@@ -5122,7 +5300,7 @@ mod tests {
         }
         clear_stored_hashes(&d);
         assert!(matches!(
-            d.reserve(&job, &policy(), now),
+            d.reserve(&mut job, &policy(), now),
             ReserveOutcome::Ok
         ));
         let charged = d.author_budget_requests(1, 2);
@@ -5143,6 +5321,7 @@ mod tests {
         let now = Instant::now();
         let d = Detector::new(Limits::default()).unwrap();
         let mut job = job(&d, now);
+        clear_stored_hashes(&d);
         for (index, post) in job.posts.iter_mut().enumerate() {
             if index == 0 {
                 post.hashes = Some(vec![[1; 32], [2; 32]]);
@@ -5152,7 +5331,7 @@ mod tests {
         }
         let before = d.process_budget_requests();
         assert!(matches!(
-            d.reserve(&job, &policy(), now),
+            d.reserve(&mut job, &policy(), now),
             ReserveOutcome::Ok
         ));
         let files_without_hashes = job
@@ -5187,6 +5366,393 @@ mod tests {
         assert!(admit(&d, 30, 130, now + KEEP + Duration::from_secs(2)).is_none());
     }
 
+    #[test]
+    fn reserve_counts_hashes_stored_since_admission() {
+        let now = Instant::now();
+        let covered = Detector::new(Limits {
+            requests_per_minute: 2,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 2,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut stale = job(&covered, now);
+        for post in &mut stale.posts {
+            post.hashes = None;
+        }
+        let before = covered.author_budget_requests(1, 2);
+        assert!(matches!(
+            covered.reserve(&mut stale, &policy(), now),
+            ReserveOutcome::Ok
+        ));
+        assert!(stale.posts.iter().all(|post| post.hashes.is_some()));
+        assert_eq!(covered.author_budget_requests(1, 2), before);
+
+        let partial = Detector::new(Limits {
+            requests_per_minute: 4,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 4,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut partial_job = job(&partial, now);
+        {
+            let mut state = partial.state.lock();
+            let posts = &mut state
+                .guilds
+                .get_mut(&1)
+                .unwrap()
+                .authors
+                .get_mut(&2)
+                .unwrap()
+                .posts;
+            for (index, post) in posts.iter_mut().enumerate() {
+                if index == 0 {
+                    post.hashes = Some(vec![[1; 32], [2; 32]]);
+                } else {
+                    post.hashes = None;
+                }
+            }
+        }
+        for post in &mut partial_job.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            partial.reserve(&mut partial_job, &policy(), now),
+            ReserveOutcome::Ok
+        ));
+        assert!(partial_job.posts[0].hashes.is_some());
+        assert!(partial_job.posts[1].hashes.is_none());
+        assert!(partial_job.posts[2].hashes.is_none());
+        assert_eq!(partial.author_budget_requests(1, 2), 4);
+
+        let tight = Detector::new(Limits {
+            requests_per_minute: 100,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 3,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut tight_job = job(&tight, now);
+        {
+            let mut state = tight.state.lock();
+            let posts = &mut state
+                .guilds
+                .get_mut(&1)
+                .unwrap()
+                .authors
+                .get_mut(&2)
+                .unwrap()
+                .posts;
+            for (index, post) in posts.iter_mut().enumerate() {
+                if index == 0 {
+                    post.hashes = Some(vec![[1; 32], [2; 32]]);
+                } else {
+                    post.hashes = None;
+                }
+            }
+        }
+        for post in &mut tight_job.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            tight.reserve(&mut tight_job, &policy(), now),
+            ReserveOutcome::Miss(AnalysisGate::AuthorBudget { .. })
+        ));
+        assert_eq!(tight.author_budget_requests(1, 2), 0);
+        assert!(tight_job.posts[0].hashes.is_some());
+        assert!(tight_job.posts[1].hashes.is_none());
+    }
+
+    #[test]
+    fn budget_miss_does_not_notify_when_live_hashes_cover_posts() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let policy = policy();
+        for (id, channel, values) in [(10, 100, [1, 2]), (11, 101, [3, 4]), (12, 102, [5, 6])] {
+            let mut observed = post(id, channel, now, &values);
+            observed.revision = d.revision();
+            let _ = d.admit(1, 2, observed, (0, 0), &policy, now, false);
+        }
+        let stored: Vec<_> = d.state.lock().guilds[&1].authors[&2]
+            .posts
+            .iter()
+            .map(|post| post.hashes.clone())
+            .collect();
+        assert!(stored.iter().all(|hashes| hashes.is_some()));
+        let mut stale = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: d.state.lock().guilds[&1].authors[&2].posts.clone(),
+        };
+        for post in &mut stale.posts {
+            post.hashes = None;
+        }
+        assert_eq!(
+            d.complete(stale, &policy, true, transport_gate(), now),
+            CompleteOutcome::NoMatch
+        );
+        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2]
+                .posts
+                .iter()
+                .map(|post| post.hashes.clone())
+                .collect::<Vec<_>>(),
+            stored
+        );
+        let mut again = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        for post in &mut again {
+            post.hashes = None;
+        }
+        assert_eq!(
+            d.complete(
+                Job {
+                    guild: 1,
+                    author: 2,
+                    token: (0, 0),
+                    posts: again,
+                },
+                &policy,
+                true,
+                transport_gate(),
+                now,
+            ),
+            CompleteOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn budget_miss_still_notifies_when_a_live_hash_is_missing() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let policy = policy();
+        for (id, channel, values) in [(10, 100, [1, 2]), (11, 101, [3, 4]), (12, 102, [5, 6])] {
+            let mut observed = post(id, channel, now, &values);
+            observed.revision = d.revision();
+            let _ = d.admit(1, 2, observed, (0, 0), &policy, now, false);
+        }
+        let kept = d.state.lock().guilds[&1].authors[&2].posts[0]
+            .hashes
+            .clone();
+        {
+            let mut state = d.state.lock();
+            state
+                .guilds
+                .get_mut(&1)
+                .unwrap()
+                .authors
+                .get_mut(&2)
+                .unwrap()
+                .posts[2]
+                .hashes = None;
+        }
+        let mut stale = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: d.state.lock().guilds[&1].authors[&2].posts.clone(),
+        };
+        for post in &mut stale.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            d.complete(stale, &policy, true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        let bucket = &d.state.lock().guilds[&1].authors[&2];
+        assert!(bucket.blocked_notice);
+        assert_eq!(bucket.posts[0].hashes, kept);
+        assert!(bucket.posts[2].hashes.is_none());
+    }
+
+    #[test]
+    fn release_incomplete_notice_does_not_clear_verified_window() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let window = complete_verified_window(&d, now);
+        let until = d.state.lock().guilds[&1].authors[&2].reported_until;
+        d.release_incomplete_notice(1, 2, window, now + Duration::from_secs(1));
+        assert_eq!(d.state.lock().guilds[&1].authors[&2].reported_until, until);
+        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+    }
+
+    #[test]
+    fn release_incomplete_notice_clears_parked_watermark() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+        }
+        clear_stored_hashes(&d);
+        assert!(matches!(
+            d.complete(pending, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        let until = d.state.lock().guilds[&1].authors[&2].reported_until;
+        let reservation = ReportWindow {
+            token: (0, 0),
+            until,
+        };
+        let wrong = ReportWindow {
+            token: (0, 0),
+            until: until + Duration::from_secs(1),
+        };
+        d.release_incomplete_notice(1, 2, wrong, now);
+        assert!(d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        d.invalidate_author(1, 2);
+        assert!(d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        d.release_incomplete_notice(1, 2, reservation, now + Duration::from_secs(1));
+        assert!(!d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        let mut restored = post(20, 120, now, &[1, 2]);
+        restored.revision = d.revision();
+        let _ = d.admit(
+            1,
+            2,
+            restored,
+            (0, 0),
+            &policy(),
+            now + Duration::from_secs(1),
+            false,
+        );
+        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+    }
+
+    fn budget_miss_limits() -> Limits {
+        Limits {
+            requests_per_minute: 100,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 5,
+            ..Limits::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn undelivered_incomplete_notice_can_be_retried() {
+        let (app, policy, token) = image_run_job_test_app(budget_miss_limits()).await;
+        let now = Instant::now();
+        let mut first = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut first.posts {
+            post.hashes = None;
+        }
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let permit = app.image_spam.try_acquire_job_slot();
+        run_job(&app, &ctx, first, policy.clone(), 102, permit).await;
+        assert!(
+            !app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice,
+            "a notice that was not sent must not suppress the window"
+        );
+        let mut second =
+            admit_channel_with_token(&app.image_spam, 13, 103, Instant::now(), token, &policy)
+                .expect("undelivered window still starts a job");
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut second.posts {
+            post.hashes = None;
+        }
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::logging::with_automod_vars_capture(Arc::clone(&capture), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            run_job(&app, &ctx, second, policy.clone(), 103, permit).await;
+        })
+        .await;
+        let notices = capture.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1, "the later incomplete check must emit");
+        assert_incomplete_automod(&notices[0], "Stopped at the author request budget");
+        assert!(app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice);
+        let mut third =
+            admit_channel_with_token(&app.image_spam, 14, 104, Instant::now(), token, &policy)
+                .expect("delivered window still starts a job");
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut third.posts {
+            post.hashes = None;
+        }
+        let repeat = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::logging::with_automod_vars_capture(Arc::clone(&repeat), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            run_job(&app, &ctx, third, policy, 104, permit).await;
+        })
+        .await;
+        assert!(
+            repeat.lock().unwrap().is_empty(),
+            "a delivered incomplete notice still suppresses the next one"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_incomplete_notice_is_not_remembered() {
+        let (app, _, _) = image_run_job_test_app(budget_miss_limits()).await;
+        crate::db::delete_log_channel(&app.db, 1, "automod")
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let now = Instant::now();
+        let mut first = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut first.posts {
+            post.hashes = None;
+        }
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let missed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::logging::with_automod_vars_capture(Arc::clone(&missed), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            run_job(&app, &ctx, first, policy.clone(), 102, permit).await;
+        })
+        .await;
+        assert!(
+            missed.lock().unwrap().is_empty(),
+            "an unconfigured automod channel must not count as sent"
+        );
+        assert!(!app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice);
+        crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        // A new configuration token retires the previous posts, so this is a new window.
+        let later = Instant::now();
+        assert!(
+            admit_channel_with_token(&app.image_spam, 30, 300, later, token, &policy).is_none()
+        );
+        assert!(
+            admit_channel_with_token(&app.image_spam, 31, 301, later, token, &policy).is_none()
+        );
+        let mut second = admit_channel_with_token(&app.image_spam, 32, 302, later, token, &policy)
+            .expect("channel configured later can still notify");
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut second.posts {
+            post.hashes = None;
+        }
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::logging::with_automod_vars_capture(Arc::clone(&sent), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            run_job(&app, &ctx, second, policy, 302, permit).await;
+        })
+        .await;
+        let notices = sent.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1);
+        assert_incomplete_automod(&notices[0], "Stopped at the author request budget");
+    }
+
     #[tokio::test]
     async fn incomplete_window_followup_can_still_verify_with_sha256_notice() {
         let fixture = LoopbackFixture::start();
@@ -5200,17 +5766,36 @@ mod tests {
             .expect("follow-up job");
         clear_stored_hashes(&app.image_spam);
         rewrite_job_downloads_shared_pair(&mut followup, &fixture);
-        let permit = app.image_spam.try_acquire_job_slot();
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = delete_context(Arc::new(
             serenity::http::HttpBuilder::new("token")
                 .ratelimiter_disabled(true)
                 .build(),
         ))
         .await;
-        run_job(&app, &ctx, followup, policy.clone(), 103, permit).await;
+        crate::logging::with_automod_vars_capture(Arc::clone(&capture), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            run_job(&app, &ctx, followup, policy.clone(), 103, permit).await;
+        })
+        .await;
         for post in &app.image_spam.state.lock().guilds[&1].authors[&2].posts {
             assert!(post.hashes.is_some(), "downloads must store hashes");
         }
+        let notices = capture.lock().unwrap().clone();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the follow-up run_job must emit the verified notice"
+        );
+        let notice = automod_notice(&notices[0]);
+        assert!(
+            notice.contains("Verified identical image bytes"),
+            "{notice}"
+        );
+        assert!(notice.contains("sha256"), "{notice}");
+        assert!(!notice.contains("Exact image check incomplete"), "{notice}");
+        assert!(!notice.contains("http://"), "{notice}");
+        assert!(!notice.contains("cdn.discordapp.com"), "{notice}");
         let bucket_posts = app.image_spam.state.lock().guilds[&1].authors[&2]
             .posts
             .clone();
@@ -5221,7 +5806,14 @@ mod tests {
         let image_match = common_images(&post_refs, &policy, 100_000)
             .expect("compare")
             .expect("proving match after follow-up download");
-        let vars = report_vars(Report::Verified(image_match), 2, 103, &policy);
-        assert!(vars["content"].contains("sha256"));
+        assert!(!image_match.proving.is_empty());
+        for hash in &image_match.proving {
+            let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert!(
+                notices[0]["content"].contains(&hex),
+                "emitted evidence missing {hex}: {}",
+                notices[0]["content"]
+            );
+        }
     }
 }
