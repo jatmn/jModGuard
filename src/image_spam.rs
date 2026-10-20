@@ -226,6 +226,17 @@ impl Attachment {
             .map_err(|_| anyhow::anyhow!("invalid attachment URI"))?;
         Ok(Self { id, size, uri })
     }
+
+    /// Test-only URI substitution for the loopback download fixture.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_request_uri_for_test(&mut self, uri: hyper::Uri) {
+        self.uri = uri;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_request_uri_str_for_test(&mut self, uri: &str) {
+        self.uri = uri.parse().expect("test uri");
+    }
 }
 
 pub type Hash = [u8; 32];

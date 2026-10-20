@@ -401,6 +401,30 @@ pub(crate) struct MatchProof<'a> {
 }
 
 impl Detector {
+    #[cfg(test)]
+    pub(crate) fn author_budget_requests(&self, guild: u64, author: u64) -> u64 {
+        self.state
+            .lock()
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+            .map(|b| b.budget.requests)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_budget_requests(&self) -> u64 {
+        self.state.lock().budget.requests
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_job_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .expect("test job slot")
+    }
+
     pub fn new(limits: Limits) -> anyhow::Result<Self> {
         limits.validate()?;
         Ok(Self {
@@ -4148,5 +4172,761 @@ mod tests {
             AdmitOutcome::Admitted | AdmitOutcome::Matched(_)
         ));
         assert!(d.state.lock().guilds[&1].authors[&2].blocked_notice);
+    }
+
+    struct LoopbackFixture {
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+        addr: std::net::SocketAddr,
+    }
+
+    impl LoopbackFixture {
+        fn start() -> Self {
+            use hyper::{
+                Body, Response, Server,
+                service::{make_service_fn, service_fn},
+            };
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let hits = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&hits);
+            let server =
+                Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(move |_| {
+                    let hits = Arc::clone(&seen);
+                    async move {
+                        Ok::<_, std::convert::Infallible>(service_fn(
+                            move |request: hyper::Request<Body>| {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                async move {
+                                    let response = match request.uri().path() {
+                                        "/too_many" => Response::builder()
+                                            .status(429)
+                                            .body(Body::empty())
+                                            .unwrap(),
+                                        "/redirect" => Response::builder()
+                                            .status(302)
+                                            .header("location", "/ok")
+                                            .body(Body::empty())
+                                            .unwrap(),
+                                        "/encoding" => Response::builder()
+                                            .header("content-encoding", "gzip")
+                                            .body(Body::from("abc"))
+                                            .unwrap(),
+                                        "/slow" => {
+                                            tokio::time::sleep(Duration::from_secs(2)).await;
+                                            Response::new(Body::from("abc"))
+                                        }
+                                        "/short" => Response::new(Body::from("ab")),
+                                        "/long" => Response::new(Body::from("abcd")),
+                                        "/hash0" => Response::new(Body::from("aaa")),
+                                        "/hash1" => Response::new(Body::from("bbb")),
+                                        "/hash2" => Response::new(Body::from("ccc")),
+                                        _ => Response::new(Body::from("abc")),
+                                    };
+                                    Ok::<_, std::convert::Infallible>(response)
+                                }
+                            },
+                        ))
+                    }
+                }));
+            let addr = server.local_addr();
+            let task = tokio::spawn(async move {
+                let _ = server.await;
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            Self { hits, task, addr }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
+        }
+
+        fn hit_count(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for LoopbackFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn image_run_job_test_app(limits: Limits) -> (Arc<BotState>, Policy, (u64, u64)) {
+        let path = std::env::temp_dir().join(format!(
+            "image_run_job_{}.db",
+            jmodguard::control::random_request_id().unwrap()
+        ));
+        let process = jmodguard::config::BotProcessConfig {
+            image_spam: limits.clone(),
+            ..Default::default()
+        };
+        let app = BotState::new(process, crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        crate::db::enroll_guild(&app.db, 1, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rule = crate::defaults::default_rules().remove(1);
+        rule.enabled = true;
+        rule.dry_run = true;
+        rule.params["mode"] = "exact_image_test".into();
+        crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        (app, policy, token)
+    }
+
+    fn admit_channel_with_token(
+        d: &Detector,
+        id: u64,
+        channel: u64,
+        at: Instant,
+        token: (u64, u64),
+        policy: &Policy,
+    ) -> Option<Job> {
+        let mut post = post(id, channel, at, &[1, 2]);
+        post.revision = d.revision();
+        match d.admit(1, 2, post, token, policy, at, false) {
+            AdmitOutcome::Matched(job) => Some(job),
+            _ => None,
+        }
+    }
+
+    fn admit_three_channel_job(
+        d: &Detector,
+        token: (u64, u64),
+        policy: &Policy,
+        now: Instant,
+    ) -> Job {
+        assert!(admit_channel_with_token(d, 10, 100, now, token, policy).is_none());
+        assert!(admit_channel_with_token(d, 11, 101, now, token, policy).is_none());
+        admit_channel_with_token(d, 12, 102, now, token, policy)
+            .expect("third channel starts hash job")
+    }
+
+    fn rewrite_job_downloads(job: &mut Job, uri: &str, size: u64) {
+        for post in &mut job.posts {
+            post.hashes = None;
+            for file in &mut post.files {
+                file.size = size;
+                file.set_request_uri_str_for_test(uri);
+            }
+        }
+    }
+
+    fn rewrite_job_downloads_shared_pair(job: &mut Job, fixture: &LoopbackFixture) {
+        for post in &mut job.posts {
+            post.hashes = None;
+            for (index, file) in post.files.iter_mut().enumerate() {
+                file.size = 3;
+                let path = if index % 2 == 0 { "/hash0" } else { "/hash1" };
+                file.set_request_uri_str_for_test(&fixture.url(path));
+            }
+        }
+    }
+
+    async fn run_job_capture_automod(
+        app: &Arc<BotState>,
+        job: Job,
+        policy: Policy,
+        channel: u64,
+    ) -> BTreeMap<String, String> {
+        let capture = Arc::new(std::sync::Mutex::new(None));
+        crate::logging::with_automod_vars_capture(Arc::clone(&capture), async {
+            let permit = app.image_spam.try_acquire_job_slot();
+            let ctx = delete_context(Arc::new(
+                serenity::http::HttpBuilder::new("token")
+                    .ratelimiter_disabled(true)
+                    .build(),
+            ))
+            .await;
+            run_job(app, &ctx, job, policy, channel, permit).await;
+        })
+        .await;
+        capture
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("run_job must emit automod vars")
+    }
+
+    fn assert_incomplete_automod(vars: &BTreeMap<String, String>, evidence: &str) {
+        let notice = automod_notice(vars);
+        assert!(notice.contains("Exact image check incomplete"), "{notice}");
+        assert!(
+            vars["content"].contains(evidence),
+            "content={} expected={evidence}",
+            vars["content"]
+        );
+        assert!(
+            !notice.contains("Verified identical image bytes"),
+            "{notice}"
+        );
+        assert!(!notice.contains("log only"), "{notice}");
+        assert!(!notice.contains("http://"), "{notice}");
+        assert!(!notice.contains("cdn.discordapp.com"), "{notice}");
+    }
+
+    async fn run_incomplete_gate_case(limits: Limits, uri: &str, file_size: u64, evidence: &str) {
+        let (app, policy, token) = image_run_job_test_app(limits).await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads(&mut job, uri, file_size);
+        let vars = run_job_capture_automod(&app, job, policy, 102).await;
+        assert_incomplete_automod(&vars, evidence);
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_process_budget_gate() {
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            requests_per_minute: 5,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 100,
+            ..Limits::default()
+        })
+        .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut job.posts {
+            post.hashes = None;
+        }
+        let vars = run_job_capture_automod(&app, job, policy, 102).await;
+        assert_incomplete_automod(&vars, "Stopped at the process request budget");
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_guild_budget_gate() {
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            requests_per_minute: 100,
+            requests_per_guild_minute: 5,
+            requests_per_author_minute: 100,
+            ..Limits::default()
+        })
+        .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut job.posts {
+            post.hashes = None;
+        }
+        let vars = run_job_capture_automod(&app, job, policy, 102).await;
+        assert_incomplete_automod(&vars, "Stopped at the guild request budget");
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_author_budget_gate() {
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            requests_per_minute: 100,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 5,
+            ..Limits::default()
+        })
+        .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        for post in &mut job.posts {
+            post.hashes = None;
+        }
+        let vars = run_job_capture_automod(&app, job, policy, 102).await;
+        assert_incomplete_automod(&vars, "Stopped at the author request budget");
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_http_429_gate() {
+        let fixture = LoopbackFixture::start();
+        run_incomplete_gate_case(
+            Limits::default(),
+            &fixture.url("/too_many"),
+            3,
+            "Stopped at HTTP status 429.",
+        )
+        .await;
+        assert_eq!(fixture.hit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_http_302_gate_does_not_follow_location() {
+        let fixture = LoopbackFixture::start();
+        let before = fixture.hit_count();
+        run_incomplete_gate_case(
+            Limits::default(),
+            &fixture.url("/redirect"),
+            3,
+            "Stopped at HTTP status 302.",
+        )
+        .await;
+        assert_eq!(fixture.hit_count(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_content_encoding_gate() {
+        let fixture = LoopbackFixture::start();
+        run_incomplete_gate_case(
+            Limits::default(),
+            &fixture.url("/encoding"),
+            3,
+            "Stopped because the response was content-encoded.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_short_body_gate() {
+        let fixture = LoopbackFixture::start();
+        run_incomplete_gate_case(
+            Limits::default(),
+            &fixture.url("/short"),
+            3,
+            "Stopped because the body length did not match the declared size.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_long_body_gate() {
+        let fixture = LoopbackFixture::start();
+        run_incomplete_gate_case(
+            Limits::default(),
+            &fixture.url("/long"),
+            3,
+            "Stopped because the body length did not match the declared size.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_timeout_gate() {
+        let fixture = LoopbackFixture::start();
+        run_incomplete_gate_case(
+            Limits {
+                timeout_secs: 1,
+                ..Limits::default()
+            },
+            &fixture.url("/slow"),
+            3,
+            "Stopped at the 1s download deadline",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_transport_gate() {
+        run_incomplete_gate_case(
+            Limits::default(),
+            "http://127.0.0.1:1/unreachable",
+            3,
+            "Stopped because the download failed before a response.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_job_notice_comparison_budget_gate() {
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            comparison_steps: 1,
+            ..Limits::default()
+        })
+        .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        for post in &mut job.posts {
+            post.hashes = Some(vec![[1; 32], [2; 32]]);
+        }
+        let vars = run_job_capture_automod(&app, job, policy, 102).await;
+        assert_incomplete_automod(&vars, "Stopped at the comparison step budget");
+    }
+
+    #[test]
+    fn non_match_complete_stores_some_then_failed_job_preserves_hashes() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        assert!(admit(&d, 10, 100, now).is_none());
+        assert!(matches!(
+            d.admit(
+                1,
+                2,
+                post(11, 101, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            ),
+            AdmitOutcome::Admitted
+        ));
+        let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let job = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .into_iter()
+                .map(|mut post| {
+                    post.hashes = Some(vec![[1; 32], [2; 32]]);
+                    post
+                })
+                .collect(),
+        };
+        assert_eq!(
+            d.complete(job, &policy(), false, transport_gate(), now),
+            CompleteOutcome::Dropped
+        );
+        let stored = d.state.lock().guilds[&1].authors[&2].posts[0]
+            .hashes
+            .clone()
+            .expect("first job stores hashes");
+        let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let failed = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .into_iter()
+                .map(|mut post| {
+                    post.hashes = None;
+                    post
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            d.complete(failed, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Dropped | CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2].posts[0].hashes,
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn verified_window_blocks_late_none_or_different_some_hash_writebacks() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        complete_report(&d, job(&d, now), &policy(), false, now).unwrap();
+        let stored = d.state.lock().guilds[&1].authors[&2].posts[0]
+            .hashes
+            .clone()
+            .unwrap();
+        let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let none_job = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .into_iter()
+                .map(|mut post| {
+                    post.hashes = None;
+                    post
+                })
+                .collect(),
+        };
+        assert_eq!(
+            d.complete(none_job, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Dropped
+        );
+        let different = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: d.state.lock().guilds[&1].authors[&2]
+                .posts
+                .clone()
+                .into_iter()
+                .map(|mut post| {
+                    post.hashes = Some(vec![[9; 32]]);
+                    post
+                })
+                .collect(),
+        };
+        assert_eq!(
+            d.complete(different, &policy(), false, transport_gate(), now),
+            CompleteOutcome::Dropped
+        );
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2].posts[0].hashes,
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn stored_some_survives_unverified_none_and_second_unverified_is_suppressed() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        assert!(admit(&d, 10, 100, now).is_none());
+        assert!(matches!(
+            d.admit(
+                1,
+                2,
+                post(11, 101, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            ),
+            AdmitOutcome::Admitted
+        ));
+        let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let store = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .into_iter()
+                .map(|mut post| {
+                    post.hashes = Some(vec![[4; 32], [5; 32]]);
+                    post
+                })
+                .collect(),
+        };
+        assert_eq!(
+            d.complete(store, &policy(), false, transport_gate(), now),
+            CompleteOutcome::Dropped
+        );
+        assert!(
+            d.state.lock().guilds[&1].authors[&2].posts[0]
+                .hashes
+                .is_some()
+        );
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            d.complete(pending, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        assert!(
+            d.state.lock().guilds[&1].authors[&2].posts[0]
+                .hashes
+                .is_some()
+        );
+        let mut again = admit(&d, 13, 103, now).expect("still in incomplete window");
+        for post in &mut again.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            d.complete(again, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Suppressed(_)
+        ));
+    }
+
+    #[test]
+    fn incomplete_parked_author_restores_and_suppresses_second_failure() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+        }
+        clear_stored_hashes(&d);
+        assert!(matches!(
+            d.complete(pending, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        let until = d.state.lock().guilds[&1].authors[&2].reported_until;
+        d.invalidate_author(1, 2);
+        assert!(d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert_eq!(
+            d.state.lock().guilds[&1].watermarks[&2].reported_until,
+            until
+        );
+        let mut p = post(20, 120, now, &[1, 2]);
+        p.revision = d.revision();
+        assert!(matches!(
+            d.admit(1, 2, p, (0, 0), &policy(), now, false),
+            AdmitOutcome::Admitted | AdmitOutcome::Matched(_)
+        ));
+        assert!(admit(&d, 21, 121, now).is_none());
+        let mut second = admit(&d, 22, 122, now).expect("job after restore");
+        for post in &mut second.posts {
+            post.hashes = None;
+        }
+        clear_stored_hashes(&d);
+        assert_eq!(
+            d.complete(second, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Suppressed(transport_gate())
+        );
+    }
+
+    #[test]
+    fn partial_job_writes_only_posts_with_some_hashes() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        job(&d, now);
+        clear_stored_hashes(&d);
+        let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
+        let job = Job {
+            guild: 1,
+            author: 2,
+            token: (0, 0),
+            posts: posts
+                .into_iter()
+                .enumerate()
+                .map(|(index, mut post)| {
+                    if index == 0 {
+                        post.hashes = Some(vec![[7; 32], [8; 32]]);
+                    } else {
+                        post.hashes = None;
+                    }
+                    post
+                })
+                .collect(),
+        };
+        let _ = d.complete(job, &policy(), true, transport_gate(), now);
+        let bucket = &d.state.lock().guilds[&1].authors[&2].posts;
+        assert!(bucket[0].hashes.is_some());
+        assert!(bucket[1].hashes.is_none());
+        assert!(bucket[2].hashes.is_none());
+    }
+
+    #[test]
+    fn verified_parked_watermark_clears_blocked_flag_and_blocks_admit_until_retryable() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let window = complete_verified_window(&d, now);
+        d.invalidate_author(1, 2);
+        assert!(!d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        let mut p = post(20, 120, now, &[1, 2]);
+        p.revision = d.revision();
+        assert!(matches!(
+            d.admit(1, 2, p, (0, 0), &policy(), now, false),
+            AdmitOutcome::Admitted
+        ));
+        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(admit(&d, 21, 121, now).is_none());
+        finish_verified_report_window(
+            &d,
+            1,
+            2,
+            window,
+            crate::spam_actions::ReportDisposition::Retryable,
+            now + Duration::from_secs(1),
+        );
+        assert!(admit(&d, 22, 122, now).is_none());
+    }
+
+    #[test]
+    fn reserve_success_then_failed_complete_keeps_budget_charged() {
+        let now = Instant::now();
+        let d = Detector::new(Limits {
+            requests_per_author_minute: 20,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut job = job(&d, now);
+        for post in &mut job.posts {
+            post.hashes = None;
+        }
+        clear_stored_hashes(&d);
+        assert!(matches!(
+            d.reserve(&job, &policy(), now),
+            ReserveOutcome::Ok
+        ));
+        let charged = d.author_budget_requests(1, 2);
+        assert!(charged > 0);
+        let mut pending = job;
+        for post in &mut pending.posts {
+            post.hashes = None;
+        }
+        assert!(matches!(
+            d.complete(pending, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        assert_eq!(d.author_budget_requests(1, 2), charged);
+    }
+
+    #[test]
+    fn reserve_skips_posts_that_already_have_hashes() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut job = job(&d, now);
+        for (index, post) in job.posts.iter_mut().enumerate() {
+            if index == 0 {
+                post.hashes = Some(vec![[1; 32], [2; 32]]);
+            } else {
+                post.hashes = None;
+            }
+        }
+        let before = d.process_budget_requests();
+        assert!(matches!(
+            d.reserve(&job, &policy(), now),
+            ReserveOutcome::Ok
+        ));
+        let files_without_hashes = job
+            .posts
+            .iter()
+            .filter(|p| p.hashes.is_none())
+            .map(|p| p.files.len())
+            .sum::<usize>();
+        assert_eq!(
+            d.process_budget_requests(),
+            before + files_without_hashes as u64
+        );
+    }
+
+    #[test]
+    fn prune_past_keep_drops_watermark_and_guild() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+        }
+        clear_stored_hashes(&d);
+        assert!(matches!(
+            d.complete(pending, &policy(), true, transport_gate(), now),
+            CompleteOutcome::Report(Report::Unverified(_))
+        ));
+        d.invalidate_author(1, 2);
+        assert!(d.state.lock().guilds[&1].watermarks.contains_key(&2));
+        d.prune_at(now + KEEP + Duration::from_secs(1));
+        assert!(!d.state.lock().guilds.contains_key(&1));
+        assert!(admit(&d, 30, 130, now + KEEP + Duration::from_secs(2)).is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_window_followup_can_still_verify_with_sha256_notice() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut pending = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads(&mut pending, &fixture.url("/too_many"), 3);
+        run_job_capture_automod(&app, pending, policy.clone(), 102).await;
+        let mut followup = admit_channel_with_token(&app.image_spam, 13, 103, now, token, &policy)
+            .expect("follow-up job");
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads_shared_pair(&mut followup, &fixture);
+        let permit = app.image_spam.try_acquire_job_slot();
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        run_job(&app, &ctx, followup, policy.clone(), 103, permit).await;
+        for post in &app.image_spam.state.lock().guilds[&1].authors[&2].posts {
+            assert!(post.hashes.is_some(), "downloads must store hashes");
+        }
+        let bucket_posts = app.image_spam.state.lock().guilds[&1].authors[&2]
+            .posts
+            .clone();
+        let post_refs: Vec<_> = bucket_posts
+            .iter()
+            .filter(|p| live(p, &policy, now))
+            .collect();
+        let image_match = common_images(&post_refs, &policy, 100_000)
+            .expect("compare")
+            .expect("proving match after follow-up download");
+        let vars = report_vars(Report::Verified(image_match), 2, 103, &policy);
+        assert!(vars["content"].contains("sha256"));
     }
 }

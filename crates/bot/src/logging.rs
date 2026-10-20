@@ -28,6 +28,22 @@ const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
+#[cfg(test)]
+type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUTOMOD_VARS_CAPTURE: AutomodVarsCaptureSlot;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_automod_vars_capture<F, T>(capture: AutomodVarsCaptureSlot, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    AUTOMOD_VARS_CAPTURE.scope(capture, f).await
+}
+
 /// Display-only correlation state. No entry may explain two reports, and an
 /// unresolved observation must not donate a delayed entry to a later action.
 #[derive(Default)]
@@ -858,6 +874,14 @@ async fn emit_to_observed_with_audit(
         vars.entry("time".into())
             .or_insert_with(|| chrono::Utc::now().to_rfc3339());
         vars.insert("guild".into(), guild_id.get().to_string());
+        #[cfg(test)]
+        if event == "automod"
+            && AUTOMOD_VARS_CAPTURE
+                .try_with(|cap| *cap.lock().unwrap() = Some(vars.clone()))
+                .is_ok()
+        {
+            return Ok(Delivery::Sent);
+        }
         let template = cfg
             .templates
             .get(event)

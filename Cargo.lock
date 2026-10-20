@@ -1202,6 +1202,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dashmap 6.2.1",
+ "hyper 0.14.32",
  "jmodguard",
  "libsql",
  "parking_lot",
