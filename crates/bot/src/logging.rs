@@ -29,7 +29,7 @@ const MEMBER_AUDIT_LIMIT: usize = 4096;
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
-type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>;
+type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -877,7 +877,7 @@ async fn emit_to_observed_with_audit(
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
-                .try_with(|cap| *cap.lock().unwrap() = Some(vars.clone()))
+                .try_with(|cap| cap.lock().unwrap().push(vars.clone()))
                 .is_ok()
         {
             return Ok(Delivery::Sent);

@@ -876,8 +876,6 @@ impl Detector {
             .flat_map(|p| &p.files);
         let (requests, bytes) = files.fold((0, 0), |(n, b), f| (n + 1, b + f.size));
         let mut s = self.state.lock();
-        let process_requests = s.budget.requests;
-        let process_bytes = s.budget.bytes;
         if !s.budget.fits(
             now,
             requests,
@@ -885,17 +883,17 @@ impl Detector {
             self.limits.requests_per_minute,
             self.limits.bytes_per_minute,
         ) {
+            // `fits` already rolled an expired window. Report that usage, not the previous one.
             return ReserveOutcome::Miss(AnalysisGate::ProcessBudget {
-                requests: process_requests,
+                requests: s.budget.requests,
                 request_limit: self.limits.requests_per_minute,
-                bytes: process_bytes,
+                bytes: s.budget.bytes,
                 byte_limit: self.limits.bytes_per_minute,
             });
         }
         let Some(g) = s.guilds.get_mut(&job.guild) else {
             return ReserveOutcome::Stale;
         };
-        let guild_requests = g.budget.requests;
         if !g.budget.fits(
             now,
             requests,
@@ -904,7 +902,7 @@ impl Detector {
             u64::MAX,
         ) {
             return ReserveOutcome::Miss(AnalysisGate::GuildBudget {
-                requests: guild_requests,
+                requests: g.budget.requests,
                 request_limit: self.limits.requests_per_guild_minute,
             });
         }
@@ -920,7 +918,6 @@ impl Detector {
         {
             return ReserveOutcome::Stale;
         }
-        let author_requests = b.budget.requests;
         if !b.budget.fits(
             now,
             requests,
@@ -929,7 +926,7 @@ impl Detector {
             u64::MAX,
         ) {
             return ReserveOutcome::Miss(AnalysisGate::AuthorBudget {
-                requests: author_requests,
+                requests: b.budget.requests,
                 request_limit: self.limits.requests_per_author_minute,
             });
         }
@@ -1716,18 +1713,33 @@ async fn run_job(
     // Reconcile configuration before report/enforce. Hashing above is already bounded;
     // delete/ban below rely on per-operation Discord timeouts in spam_actions.
     if app.poll_config_version().await.is_err() {
+        if failed {
+            warn_incomplete_analysis(&job_gate, guild, author);
+        }
         return;
     }
     let Ok(current) = app.configs.get(&app.db, guild).await else {
+        if failed {
+            warn_incomplete_analysis(&job_gate, guild, author);
+        }
         return;
     };
     if (current.version, current.durable_version) != token {
+        if failed {
+            warn_incomplete_analysis(&job_gate, guild, author);
+        }
         return;
     }
     let Some(rule) = current.rules.get("attachment_flood") else {
+        if failed {
+            warn_incomplete_analysis(&job_gate, guild, author);
+        }
         return;
     };
     let Some(current_policy) = policy_for_config(&current, rule) else {
+        if failed {
+            warn_incomplete_analysis(&job_gate, guild, author);
+        }
         return;
     };
     let excerpts: Vec<_> = job
@@ -1743,9 +1755,14 @@ async fn run_job(
         })
         .collect();
     let completed_at = Instant::now();
-    let outcome = detector.complete(job, &policy, failed, job_gate, completed_at);
+    let outcome = detector.complete(job, &policy, failed, job_gate.clone(), completed_at);
     let report = match outcome {
-        CompleteOutcome::Dropped => return,
+        CompleteOutcome::Dropped => {
+            if failed {
+                warn_incomplete_analysis(&job_gate, guild, author);
+            }
+            return;
+        }
         CompleteOutcome::Suppressed(gate) => {
             warn_incomplete_analysis(&gate, guild, author);
             return;
@@ -2825,6 +2842,23 @@ mod tests {
             "{notice}"
         );
         assert!(!notice.contains("http"), "{notice}");
+        let failed_download = Detector::new(Limits {
+            comparison_steps: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            failed_download.complete(
+                job(&failed_download, now),
+                &policy(),
+                true,
+                transport_gate(),
+                now
+            ),
+            CompleteOutcome::Report(Report::Unverified(AnalysisGate::ComparisonSteps {
+                steps: 1
+            }))
+        ));
     }
 
     #[test]
@@ -4106,6 +4140,68 @@ mod tests {
     }
 
     #[test]
+    fn reserve_miss_after_window_reset_reports_current_counters() {
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(60);
+        let d = Detector::new(Limits {
+            requests_per_minute: 100,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut author_job = job(&d, now);
+        for post in &mut author_job.posts {
+            post.hashes = None;
+        }
+        {
+            let mut state = d.state.lock();
+            state.budget.requests = 80;
+            state.budget.bytes = 10;
+            state.budget.start = expired;
+            let guild = state.guilds.get_mut(&1).unwrap();
+            guild.budget.requests = 70;
+            guild.budget.start = expired;
+            let author = guild.authors.get_mut(&2).unwrap();
+            author.budget.requests = 40;
+            author.budget.start = expired;
+        }
+        assert!(matches!(
+            d.reserve(&author_job, &policy(), now),
+            ReserveOutcome::Miss(AnalysisGate::AuthorBudget {
+                requests: 0,
+                request_limit: 1
+            })
+        ));
+
+        let process = Detector::new(Limits {
+            requests_per_minute: 1,
+            requests_per_guild_minute: 100,
+            requests_per_author_minute: 100,
+            ..Limits::default()
+        })
+        .unwrap();
+        let mut process_job = job(&process, now);
+        for post in &mut process_job.posts {
+            post.hashes = None;
+        }
+        {
+            let mut state = process.state.lock();
+            state.budget.requests = 90;
+            state.budget.bytes = 12;
+            state.budget.start = expired;
+        }
+        assert!(matches!(
+            process.reserve(&process_job, &policy(), now),
+            ReserveOutcome::Miss(AnalysisGate::ProcessBudget {
+                requests: 0,
+                bytes: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn incomplete_analysis_warn_includes_gate_without_urls() {
         struct CapturedLog(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CapturedLog {
@@ -4337,7 +4433,7 @@ mod tests {
         policy: Policy,
         channel: u64,
     ) -> BTreeMap<String, String> {
-        let capture = Arc::new(std::sync::Mutex::new(None));
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
         crate::logging::with_automod_vars_capture(Arc::clone(&capture), async {
             let permit = app.image_spam.try_acquire_job_slot();
             let ctx = delete_context(Arc::new(
@@ -4349,11 +4445,14 @@ mod tests {
             run_job(app, &ctx, job, policy, channel, permit).await;
         })
         .await;
-        capture
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("run_job must emit automod vars")
+        let notices = capture.lock().unwrap().clone();
+        assert_eq!(
+            notices.len(),
+            1,
+            "run_job must emit one automod notice, got {}",
+            notices.len()
+        );
+        notices.into_iter().next().unwrap()
     }
 
     fn assert_incomplete_automod(vars: &BTreeMap<String, String>, evidence: &str) {
@@ -4543,6 +4642,91 @@ mod tests {
         }
         let vars = run_job_capture_automod(&app, job, policy, 102).await;
         assert_incomplete_automod(&vars, "Stopped at the comparison step budget");
+    }
+
+    #[test]
+    fn suppressed_repeat_logs_without_a_second_automod_notice() {
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Clone for CapturedLog {
+            fn clone(&self) -> Self {
+                Self(Arc::clone(&self.0))
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturedLog(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (app, policy, token) = image_run_job_test_app(Limits {
+                    requests_per_minute: 100,
+                    requests_per_guild_minute: 100,
+                    requests_per_author_minute: 5,
+                    ..Limits::default()
+                })
+                .await;
+                let now = Instant::now();
+                let mut first = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                for post in &mut first.posts {
+                    post.hashes = None;
+                }
+                let ctx = delete_context(Arc::new(
+                    serenity::http::HttpBuilder::new("token")
+                        .ratelimiter_disabled(true)
+                        .build(),
+                ))
+                .await;
+                crate::logging::with_automod_vars_capture(Arc::clone(&capture), async {
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    run_job(&app, &ctx, first, policy.clone(), 102, permit).await;
+                    let mut second = admit_channel_with_token(
+                        &app.image_spam,
+                        13,
+                        103,
+                        Instant::now(),
+                        token,
+                        &policy,
+                    )
+                    .expect("incomplete window still starts a job");
+                    for post in &mut second.posts {
+                        post.hashes = None;
+                    }
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    run_job(&app, &ctx, second, policy, 103, permit).await;
+                })
+                .await;
+            });
+        });
+        let notices = capture.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1, "a suppressed repeat must not emit again");
+        assert_incomplete_automod(&notices[0], "Stopped at the author request budget");
+        let output = String::from_utf8(buffer.lock().clone()).unwrap();
+        assert_eq!(
+            output.matches("author_budget").count(),
+            2,
+            "the first notice and the suppressed repeat each log the gate: {output}"
+        );
+        assert!(!output.contains("cdn.discordapp.com"), "{output}");
+        assert!(!output.contains("http://"), "{output}");
+        assert!(!output.contains("sha256"), "{output}");
     }
 
     #[test]

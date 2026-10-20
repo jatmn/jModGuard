@@ -526,20 +526,24 @@ mod tests {
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is a single request");
         source.uri = format!("http://{address}/redirect").parse().unwrap();
-        assert!(client.hash(&source, Duration::from_secs(1)).await.is_err());
+        assert_eq!(
+            client.hash(&source, Duration::from_secs(1)).await,
+            Err(DownloadError::HttpStatus(302))
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             3,
             "redirect must not issue a second request"
         );
         source.uri = format!("http://{address}/encoding").parse().unwrap();
-        assert!(client.hash(&source, Duration::from_secs(1)).await.is_err());
+        assert_eq!(
+            client.hash(&source, Duration::from_secs(1)).await,
+            Err(DownloadError::ContentEncoding)
+        );
         source.uri = format!("http://{address}/slow").parse().unwrap();
-        assert!(
-            client
-                .hash(&source, Duration::from_millis(30))
-                .await
-                .is_err()
+        assert_eq!(
+            client.hash(&source, Duration::from_millis(30)).await,
+            Err(DownloadError::Timeout)
         );
         source.uri = format!("http://{address}/ok").parse().unwrap();
         let dest = std::env::temp_dir().join(format!(
