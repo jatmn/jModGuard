@@ -4706,35 +4706,36 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let _tracing = tracing::subscriber::set_global_default(subscriber);
-        runtime.block_on(async {
-            let fixture = LoopbackFixture::start();
-            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
-            let now = Instant::now();
-            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
-            clear_stored_hashes(&app.image_spam);
-            rewrite_job_downloads(&mut job, &fixture.body_read_url(), 3);
-            let vars = run_job_capture_automod(&app, job, policy, 102).await;
-            assert_incomplete_automod(&vars, evidence);
-            let notice = automod_notice(&vars);
-            assert!(notice.contains(evidence), "{notice}");
-            assert!(!notice.contains("before a response"), "{notice}");
-            assert!(
-                vars["content"].contains(evidence),
-                "content={} expected={evidence}",
-                vars["content"]
-            );
-            let output = String::from_utf8(buffer.lock().clone()).unwrap();
-            let warning = output
-                .lines()
-                .find(|line| line.contains("body_read"))
-                .unwrap_or_else(|| panic!("missing body_read warning in log output: {output}"));
-            assert!(warning.contains(evidence), "{warning}");
-            assert!(!warning.contains("before a response"), "{warning}");
-            assert!(!warning.contains("http://"), "{warning}");
-            assert!(!warning.contains("127.0.0.1"), "{warning}");
-            assert!(!warning.contains("sha256"), "{warning}");
-            assert_eq!(fixture.body_read_hit_count(), 1);
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let fixture = LoopbackFixture::start();
+                let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+                let now = Instant::now();
+                let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                rewrite_job_downloads(&mut job, &fixture.body_read_url(), 3);
+                let vars = run_job_capture_automod(&app, job, policy, 102).await;
+                assert_incomplete_automod(&vars, evidence);
+                let notice = automod_notice(&vars);
+                assert!(notice.contains(evidence), "{notice}");
+                assert!(!notice.contains("before a response"), "{notice}");
+                assert!(
+                    vars["content"].contains(evidence),
+                    "content={} expected={evidence}",
+                    vars["content"]
+                );
+                let output = String::from_utf8(buffer.lock().clone()).unwrap();
+                let warning = output
+                    .lines()
+                    .find(|line| line.contains("body_read"))
+                    .unwrap_or_else(|| panic!("missing body_read warning in log output: {output}"));
+                assert!(warning.contains(evidence), "{warning}");
+                assert!(!warning.contains("before a response"), "{warning}");
+                assert!(!warning.contains("http://"), "{warning}");
+                assert!(!warning.contains("127.0.0.1"), "{warning}");
+                assert!(!warning.contains("sha256"), "{warning}");
+                assert_eq!(fixture.body_read_hit_count(), 1);
+            });
         });
     }
 
