@@ -298,6 +298,7 @@ enum AnalysisGate {
         elapsed_ms: u64,
     },
     Transport,
+    BodyRead,
     ComparisonSteps {
         steps: usize,
     },
@@ -338,6 +339,7 @@ impl AnalysisGate {
                 elapsed_ms,
             } => format!("Stopped at the {timeout_secs}s download deadline after {elapsed_ms}ms."),
             Self::Transport => "Stopped because the download failed before a response.".to_string(),
+            Self::BodyRead => "Stopped because the response body could not be read.".to_string(),
             Self::ComparisonSteps { steps } => {
                 format!("Stopped at the comparison step budget ({steps} steps).")
             }
@@ -354,6 +356,7 @@ impl AnalysisGate {
             Self::SizeMismatch => "size_mismatch",
             Self::Timeout { .. } => "timeout",
             Self::Transport => "transport",
+            Self::BodyRead => "body_read",
             Self::ComparisonSteps { .. } => "comparison_steps",
         }
     }
@@ -1557,7 +1560,8 @@ fn analysis_gate_from_download(
     started: Instant,
 ) -> AnalysisGate {
     match error {
-        DownloadError::Transport | DownloadError::BodyRead => AnalysisGate::Transport,
+        DownloadError::Transport => AnalysisGate::Transport,
+        DownloadError::BodyRead => AnalysisGate::BodyRead,
         DownloadError::HttpStatus(status) => AnalysisGate::HttpStatus { status },
         DownloadError::ContentEncoding => AnalysisGate::ContentEncoding,
         DownloadError::SizeMismatch => AnalysisGate::SizeMismatch,
@@ -1641,7 +1645,10 @@ fn warn_incomplete_analysis(gate: &AnalysisGate, guild: u64, author: u64) {
             elapsed_ms,
             sentence
         ),
-        AnalysisGate::ContentEncoding | AnalysisGate::SizeMismatch | AnalysisGate::Transport => {
+        AnalysisGate::ContentEncoding
+        | AnalysisGate::SizeMismatch
+        | AnalysisGate::Transport
+        | AnalysisGate::BodyRead => {
             tracing::warn!(
                 gate = gate_name,
                 scope,
@@ -4274,6 +4281,9 @@ mod tests {
         hits: Arc<std::sync::atomic::AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
         addr: std::net::SocketAddr,
+        body_read_hits: Arc<std::sync::atomic::AtomicUsize>,
+        body_read_task: tokio::task::JoinHandle<()>,
+        body_read_addr: std::net::SocketAddr,
     }
 
     impl LoopbackFixture {
@@ -4283,6 +4293,28 @@ mod tests {
                 service::{make_service_fn, service_fn},
             };
             use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+            let body_read_hits = Arc::new(AtomicUsize::new(0));
+            let body_read_seen = Arc::clone(&body_read_hits);
+            let body_read_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let body_read_addr = body_read_listener.local_addr().unwrap();
+            body_read_listener.set_nonblocking(true).unwrap();
+            let body_read_task = tokio::spawn(async move {
+                let listener = TcpListener::from_std(body_read_listener).unwrap();
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    body_read_seen.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let response =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
+                    let _ = stream.write_all(response).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
             let hits = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&hits);
             let server =
@@ -4329,21 +4361,38 @@ mod tests {
                 let _ = server.await;
             });
             std::thread::sleep(Duration::from_millis(20));
-            Self { hits, task, addr }
+            Self {
+                hits,
+                task,
+                addr,
+                body_read_hits,
+                body_read_task,
+                body_read_addr,
+            }
         }
 
         fn url(&self, path: &str) -> String {
             format!("http://{}{}", self.addr, path)
         }
 
+        fn body_read_url(&self) -> String {
+            format!("http://{}/", self.body_read_addr)
+        }
+
         fn hit_count(&self) -> usize {
             self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn body_read_hit_count(&self) -> usize {
+            self.body_read_hits
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
     impl Drop for LoopbackFixture {
         fn drop(&mut self) {
             self.task.abort();
+            self.body_read_task.abort();
         }
     }
 
@@ -4626,6 +4675,67 @@ mod tests {
             "Stopped because the download failed before a response.",
         )
         .await;
+    }
+
+    #[test]
+    fn run_job_notice_body_read_gate() {
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Clone for CapturedLog {
+            fn clone(&self) -> Self {
+                Self(Arc::clone(&self.0))
+            }
+        }
+        let evidence = "Stopped because the response body could not be read.";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturedLog(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _tracing = tracing::subscriber::set_global_default(subscriber);
+        runtime.block_on(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.body_read_url(), 3);
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_incomplete_automod(&vars, evidence);
+            let notice = automod_notice(&vars);
+            assert!(notice.contains(evidence), "{notice}");
+            assert!(!notice.contains("before a response"), "{notice}");
+            assert!(
+                vars["content"].contains(evidence),
+                "content={} expected={evidence}",
+                vars["content"]
+            );
+            let output = String::from_utf8(buffer.lock().clone()).unwrap();
+            let warning = output
+                .lines()
+                .find(|line| line.contains("body_read"))
+                .unwrap_or_else(|| panic!("missing body_read warning in log output: {output}"));
+            assert!(warning.contains(evidence), "{warning}");
+            assert!(!warning.contains("before a response"), "{warning}");
+            assert!(!warning.contains("http://"), "{warning}");
+            assert!(!warning.contains("127.0.0.1"), "{warning}");
+            assert!(!warning.contains("sha256"), "{warning}");
+            assert_eq!(fixture.body_read_hit_count(), 1);
+        });
     }
 
     #[tokio::test]
