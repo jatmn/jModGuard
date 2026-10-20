@@ -2800,12 +2800,27 @@ mod tests {
             assert_eq!(bucket.reported_until, reported_until);
             assert!(now < reported_until);
         }
-        let mut suppressed = post(30, 130, now, &[1, 2]);
-        suppressed.revision = d.revision();
-        assert!(!matches!(
-            d.admit(1, 2, suppressed, (1, 0), &p, now, false),
-            AdmitOutcome::Matched(_)
+        // Two posts cannot match. The third channel would, unless the verified
+        // window still suppresses jobs after the token change.
+        let mut second = post(21, 121, now, &[1, 2]);
+        second.revision = d.revision();
+        assert!(matches!(
+            d.admit(1, 2, second, (1, 0), &p, now, false),
+            AdmitOutcome::Admitted
         ));
+        let mut third = post(22, 122, now, &[1, 2]);
+        third.revision = d.revision();
+        assert!(
+            matches!(
+                d.admit(1, 2, third, (1, 0), &p, now, false),
+                AdmitOutcome::Admitted
+            ),
+            "a verified window still suppresses a new job after the token change"
+        );
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2].reported_until,
+            reported_until
+        );
         finish_verified_report_window(
             &d,
             1,

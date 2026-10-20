@@ -951,13 +951,15 @@ async fn emit_to_observed_with_audit(
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        if !commit() {
-            return Ok(Delivery::Dropped);
-        }
         vars.insert("event".into(), event.to_owned());
         vars.entry("time".into())
             .or_insert_with(|| chrono::Utc::now().to_rfc3339());
         vars.insert("guild".into(), guild_id.get().to_string());
+        // Last step before the test capture records a send. Production checks again
+        // immediately before the Discord call.
+        if !commit() {
+            return Ok(Delivery::Dropped);
+        }
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
