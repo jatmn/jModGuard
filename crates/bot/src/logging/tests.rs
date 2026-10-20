@@ -1625,6 +1625,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         templates::user_vars(123, "username", "Display"),
         Some(observation),
         Admission::Immediate,
+        || true,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);

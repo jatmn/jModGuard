@@ -78,7 +78,11 @@ the attachment address. If a download, request budget, or comparison work budget
 match is proven, the automod title is **Exact image check incomplete**, the action
 is **no action; check did not finish**, and the Evidence field names the stopping
 gate (never a URL, hash, or image bytes). A later check in the same incomplete
-window can still become a verified hit. A repeat incomplete notice is not sent
+window can still become a verified hit. An incomplete notice that has not been
+sent is not sent once that verified match owns the window. A new configuration
+token clears the incomplete-notice reservation; park and restore on the same token
+still keeps it; a verified window is not cleared by the token change. A repeat
+incomplete notice is not sent
 after one was delivered. If delivery does not succeed, a later incomplete check
 in that window can try the notice again. A failed job does not clear hashes
 already stored for those posts. Hashing still uses one CDN request per attachment

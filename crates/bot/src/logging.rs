@@ -44,6 +44,46 @@ where
     AUTOMOD_VARS_CAPTURE.scope(capture, f).await
 }
 
+#[cfg(test)]
+pub(crate) struct AutomodEmitPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AutomodEmitPause {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+type AutomodEmitPauseSlot = Arc<AutomodEmitPause>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUTOMOD_EMIT_PAUSE: AutomodEmitPauseSlot;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_automod_emit_pause<F, T>(pause: AutomodEmitPauseSlot, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    AUTOMOD_EMIT_PAUSE.scope(pause, f).await
+}
+
 /// Display-only correlation state. No entry may explain two reports, and an
 /// unresolved observation must not donate a delayed entry to a later action.
 #[derive(Default)]
@@ -770,7 +810,29 @@ pub(crate) async fn emit_to(
     event: &str,
     vars: BTreeMap<String, String>,
 ) -> Delivery {
-    emit_to_observed(app, sink, guild_id, event, vars, None, Admission::Immediate).await
+    emit_to_if(app, sink, guild_id, event, vars, || true).await
+}
+
+pub(crate) async fn emit_to_if(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    vars: BTreeMap<String, String>,
+    commit: impl FnMut() -> bool,
+) -> Delivery {
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        None,
+        Admission::Immediate,
+        commit,
+    )
+    .await
+    .0
 }
 
 async fn emit_to_observed(
@@ -782,11 +844,21 @@ async fn emit_to_observed(
     observation: Option<MemberAuditObservation>,
     admission: Admission,
 ) -> Delivery {
-    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation, admission)
-        .await
-        .0
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        observation,
+        admission,
+        || true,
+    )
+    .await
+    .0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_to_observed_with_audit(
     app: &Arc<BotState>,
     sink: &impl LogDelivery,
@@ -795,6 +867,7 @@ async fn emit_to_observed_with_audit(
     mut vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
     admission: Admission,
+    commit: impl FnMut() -> bool,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -833,6 +906,7 @@ async fn emit_to_observed_with_audit(
     };
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+        let mut commit = commit;
         let cfg = app.configs.get(&app.db, guild_id.get()).await?;
         let Some(channel_id) = channel_for(&cfg, event) else {
             return Ok(Delivery::Unconfigured);
@@ -870,6 +944,16 @@ async fn emit_to_observed_with_audit(
                 return Ok(Delivery::Unconfigured);
             }
         }
+        #[cfg(test)]
+        if event == "automod"
+            && let Ok(pause) = AUTOMOD_EMIT_PAUSE.try_with(Arc::clone)
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+        if !commit() {
+            return Ok(Delivery::Dropped);
+        }
         vars.insert("event".into(), event.to_owned());
         vars.entry("time".into())
             .or_insert_with(|| chrono::Utc::now().to_rfc3339());
@@ -905,6 +989,9 @@ async fn emit_to_observed_with_audit(
         let recovery = app
             .remembered_discord_targets
             .capture_recovery_epoch(rest_target);
+        if !commit() {
+            return Ok(Delivery::Dropped);
+        }
         match crate::discord::race_discord_call(
             &app.activation,
             sink.send(channel_id, log_message(&rendered)),
@@ -1999,6 +2086,7 @@ pub(crate) async fn emit_member_event(
         vars,
         observation,
         Admission::Immediate,
+        || true,
     )
     .await
     .1
@@ -2025,6 +2113,7 @@ pub(crate) async fn emit_verified_member_departure(
         vars,
         None,
         Admission::Immediate,
+        || true,
     )
     .await;
 }

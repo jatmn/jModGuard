@@ -971,10 +971,7 @@ async fn capture_attachments(
                 continue;
             }
             Err(error) => {
-                tracing::warn!(
-                    guild_id = enrollment.guild_id,
-                    "attachment download failed: {error:#}"
-                );
+                tracing::warn!(guild_id = enrollment.guild_id, "{error:#}");
                 continue;
             }
         }
