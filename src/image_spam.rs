@@ -229,6 +229,23 @@ impl Attachment {
 }
 
 pub type Hash = [u8; 32];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DownloadError {
+    #[error("transport failure")]
+    Transport,
+    #[error("http status {0}")]
+    HttpStatus(u16),
+    #[error("content-encoded response")]
+    ContentEncoding,
+    #[error("download timed out")]
+    Timeout,
+    #[error("body size mismatch")]
+    SizeMismatch,
+    #[error("body read failure")]
+    BodyRead,
+}
+
 pub struct Hasher {
     client: Client<crate::remote_https::HttpsConnector<hyper::client::HttpConnector>>,
 }
@@ -244,31 +261,38 @@ impl Default for Hasher {
     }
 }
 impl Hasher {
-    async fn get_body(&self, attachment: &Attachment) -> Result<Body> {
+    async fn get_body(&self, attachment: &Attachment) -> Result<Body, DownloadError> {
         let response = self
             .client
             .get(attachment.uri.clone())
             .await
-            .map_err(|_| anyhow::anyhow!("image download failed"))?;
-        ensure!(
-            response.status() == hyper::StatusCode::OK,
-            "image download did not return 200"
-        );
-        ensure!(
-            !response
-                .headers()
-                .contains_key(hyper::header::CONTENT_ENCODING),
-            "encoded image response is unsupported"
-        );
+            .map_err(|_| DownloadError::Transport)?;
+        if response.status() != hyper::StatusCode::OK {
+            return Err(DownloadError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .headers()
+            .contains_key(hyper::header::CONTENT_ENCODING)
+        {
+            return Err(DownloadError::ContentEncoding);
+        }
         Ok(response.into_body())
     }
 
-    pub async fn hash(&self, attachment: &Attachment, timeout: Duration) -> Result<Hash> {
-        tokio::time::timeout(timeout, async {
+    pub async fn hash(
+        &self,
+        attachment: &Attachment,
+        timeout: Duration,
+    ) -> Result<Hash, DownloadError> {
+        match tokio::time::timeout(timeout, async {
             hash_body(self.get_body(attachment).await?, attachment.size).await
         })
         .await
-        .map_err(|_| anyhow::anyhow!("image download timed out"))?
+        {
+            Ok(Ok(hash)) => Ok(hash),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(DownloadError::Timeout),
+        }
     }
 
     /// Stream the attachment to a new local file using the same CDN contract as `hash`.
@@ -295,7 +319,7 @@ impl Hasher {
                 Ok(hash) => Ok(hash),
                 Err(error) => {
                     let _ = std::fs::remove_file(&dest);
-                    Err(error)
+                    Err(download_anyhow(error))
                 }
             }
         })
@@ -313,36 +337,50 @@ impl Hasher {
         }
     }
 }
-async fn hash_body(body: Body, expected: u64) -> Result<Hash> {
+
+fn download_anyhow(error: DownloadError) -> anyhow::Error {
+    match error {
+        DownloadError::Transport => anyhow::anyhow!("image download failed"),
+        DownloadError::HttpStatus(_) => anyhow::anyhow!("image download did not return 200"),
+        DownloadError::ContentEncoding => anyhow::anyhow!("encoded image response is unsupported"),
+        DownloadError::Timeout => anyhow::anyhow!("image download timed out"),
+        DownloadError::SizeMismatch => {
+            anyhow::anyhow!("image body length differs from declared size")
+        }
+        DownloadError::BodyRead => anyhow::anyhow!("image body failed"),
+    }
+}
+
+async fn hash_body(body: Body, expected: u64) -> Result<Hash, DownloadError> {
     stream_body(body, expected, None).await
 }
 async fn stream_body(
     mut body: Body,
     expected: u64,
     mut dest: Option<&mut std::fs::File>,
-) -> Result<Hash> {
+) -> Result<Hash, DownloadError> {
     use std::io::Write;
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
     let mut bytes = 0u64;
     while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|_| anyhow::anyhow!("image body failed"))?;
+        let chunk = chunk.map_err(|_| DownloadError::BodyRead)?;
         bytes = bytes
             .checked_add(chunk.len() as u64)
-            .ok_or_else(|| anyhow::anyhow!("image body too large"))?;
-        ensure!(bytes <= expected, "image body exceeds declared size");
+            .ok_or(DownloadError::SizeMismatch)?;
+        if bytes > expected {
+            return Err(DownloadError::SizeMismatch);
+        }
         if let Some(file) = dest.as_mut() {
             file.write_all(&chunk)
-                .map_err(|_| anyhow::anyhow!("image capture write failed"))?;
+                .map_err(|_| DownloadError::Transport)?;
         }
         hash.update(&chunk);
     }
-    ensure!(
-        bytes == expected,
-        "image body length differs from declared size"
-    );
+    if bytes != expected {
+        return Err(DownloadError::SizeMismatch);
+    }
     if let Some(file) = dest.as_mut() {
-        file.sync_all()
-            .map_err(|_| anyhow::anyhow!("image capture sync failed"))?;
+        file.sync_all().map_err(|_| DownloadError::Transport)?;
     }
     Ok(hash.finish().as_ref().try_into().expect("SHA256 length"))
 }
@@ -393,8 +431,14 @@ mod tests {
             h.as_slice(),
             ring::digest::digest(&ring::digest::SHA256, b"abc").as_ref()
         );
-        assert!(hash_body(Body::from("ab"), 3).await.is_err());
-        assert!(hash_body(Body::from("abcd"), 3).await.is_err());
+        assert_eq!(
+            hash_body(Body::from("ab"), 3).await,
+            Err(DownloadError::SizeMismatch)
+        );
+        assert_eq!(
+            hash_body(Body::from("abcd"), 3).await,
+            Err(DownloadError::SizeMismatch)
+        );
         assert_ne!(h, hash_body(Body::from("abd"), 3).await.unwrap());
     }
     #[tokio::test]
@@ -418,6 +462,9 @@ mod tests {
                             hits.fetch_add(1, Ordering::SeqCst);
                             async move {
                                 let response = match request.uri().path() {
+                                    "/too_many" => {
+                                        Response::builder().status(429).body(Body::empty()).unwrap()
+                                    }
                                     "/redirect" => Response::builder()
                                         .status(302)
                                         .header("location", "/ok")
@@ -456,11 +503,22 @@ mod tests {
             client.hash(&source, Duration::from_secs(1)).await.unwrap(),
             hash_body(Body::from("abc"), 3).await.unwrap()
         );
+        source.uri = format!("http://{address}/too_many").parse().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            client.hash(&source, Duration::from_secs(1)).await,
+            Err(DownloadError::HttpStatus(429))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "429 must not backoff"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is a single request");
         source.uri = format!("http://{address}/redirect").parse().unwrap();
         assert!(client.hash(&source, Duration::from_secs(1)).await.is_err());
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            2,
+            3,
             "redirect must not issue a second request"
         );
         source.uri = format!("http://{address}/encoding").parse().unwrap();

@@ -74,11 +74,16 @@ object capture.
 A verified image match, in either mode, uses a reason that describes the
 identical-image match. The automod Evidence field lists the matched channel and
 message ids and the proving SHA-256 hashes. It does not include image bytes or
-the attachment address. If a download, request budget, or comparison work budget
-stops analysis before a match is proven, the notice says analysis did not finish
-and is not a spam hit. It does not use the dry-run success action. Hashes already
-stored for those posts still count, and an in-flight result that proves the match
-is reported as that match.
+the attachment address. If a download, request budget, or comparison work budget stops analysis before a
+match is proven, the automod title is **Exact image check incomplete**, the action
+is **no action; check did not finish**, and the Evidence field names the stopping
+gate (never a URL, hash, or image bytes). A later check in the same incomplete
+window can still become a verified hit; a repeat incomplete notice is not sent.
+A failed job does not clear hashes already stored for those posts. Hashing still
+uses one CDN request per attachment with no redirect follow and no retry. Hashes
+already stored still count toward a match, and an in-flight result that proves the
+match is reported as that match. There is still no background message queue;
+verified evidence remains hash-only.
 
 Exact-image matches retain only hashes and case text metadata. They never capture,
 cache, or re-share attachment bytes through the evidence backend. Attachment hashing
