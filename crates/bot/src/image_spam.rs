@@ -1042,7 +1042,8 @@ impl Detector {
         }
     }
 
-    /// Whether the live author bucket still holds this incomplete-notice reservation.
+    /// Whether this incomplete-notice reservation is still the author's.
+    /// A parked author keeps it on the watermark.
     fn incomplete_notice_current(
         &self,
         guild: u64,
@@ -1050,16 +1051,25 @@ impl Detector {
         reservation: ReportWindow,
     ) -> bool {
         let state = self.state.lock();
-        let Some(bucket) = state
-            .guilds
-            .get(&guild)
-            .and_then(|guild_state| guild_state.authors.get(&author))
-        else {
+        let Some(guild_state) = state.guilds.get(&guild) else {
             return false;
         };
-        bucket.token == reservation.token
-            && bucket.blocked_notice
-            && bucket.reported_until == reservation.until
+        let same = |token: (u64, u64), blocked: bool, until: Instant| {
+            token == reservation.token && blocked && until == reservation.until
+        };
+        if let Some(bucket) = guild_state.authors.get(&author) {
+            return same(bucket.token, bucket.blocked_notice, bucket.reported_until);
+        }
+        guild_state
+            .watermarks
+            .get(&author)
+            .is_some_and(|watermark| {
+                same(
+                    watermark.token,
+                    watermark.blocked_notice,
+                    watermark.reported_until,
+                )
+            })
     }
 
     /// Give back an incomplete-notice reservation when delivery did not succeed.
@@ -1223,6 +1233,11 @@ fn replace_existing(
             .sum::<usize>();
     g.bytes += old.cost;
     state.bytes += old.cost;
+    // The edited post is a different observation. Drop only the incomplete reservation.
+    if b.blocked_notice {
+        b.blocked_notice = false;
+        b.reported_until = now;
+    }
     b.token = token;
     b.last_seen = now;
     Some(ReplaceOutcome::Updated(candidate_job(
@@ -1887,7 +1902,7 @@ async fn run_job(
             let vars = report_vars(Report::Unverified(gate), author, channel, &policy);
             // Reserve the window before delivery so overlapping jobs do not each
             // send. Give it back when this notice is not actually sent.
-            let delivery = crate::logging::emit_to_if(
+            let delivery = crate::logging::emit_to_if_after_rate_limit(
                 app,
                 ctx.http.as_ref(),
                 GuildId::new(guild),
@@ -6113,5 +6128,123 @@ mod tests {
         assert!(!notice.contains("Exact image check incomplete"), "{notice}");
         assert!(!notice.contains("http://"), "{notice}");
         assert!(!notice.contains("cdn.discordapp.com"), "{notice}");
+    }
+
+    #[derive(Default)]
+    struct NoticeSink {
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    #[serenity::async_trait]
+    impl crate::logging::LogDelivery for NoticeSink {
+        async fn send(
+            &self,
+            _channel: serenity::model::id::ChannelId,
+            _message: serenity::builder::CreateMessage,
+        ) -> anyhow::Result<()> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_clears_only_an_incomplete_notice_reservation() {
+        let (app, _policy, token) = image_run_job_test_app(Limits::default()).await;
+        app.activation.mark_lock_held(true);
+        let now = Instant::now();
+        seed_incomplete_notice(&app.image_spam, 2, token, now);
+        let reservation = {
+            let bucket = &app.image_spam.state.lock().guilds[&1].authors[&2];
+            assert!(bucket.blocked_notice);
+            ReportWindow {
+                token: bucket.token,
+                until: bucket.reported_until,
+            }
+        };
+        assert!(app.image_spam.incomplete_notice_current(1, 2, reservation));
+        let mut edited = post(40, 400, now, &[9]);
+        edited.revision = app.image_spam.revision();
+        edited.edited_ms = 1;
+        assert!(matches!(
+            app.image_spam
+                .admit(1, 2, edited, token, &policy(), now, true),
+            AdmitOutcome::Admitted | AdmitOutcome::Matched(_)
+        ));
+        {
+            let bucket = &app.image_spam.state.lock().guilds[&1].authors[&2];
+            assert!(!bucket.blocked_notice);
+            assert!(bucket.reported_until <= now);
+        }
+        assert!(!app.image_spam.incomplete_notice_current(1, 2, reservation));
+        let sink = NoticeSink::default();
+        assert_eq!(
+            crate::logging::emit_to_if_after_rate_limit(
+                &app,
+                &sink,
+                GuildId::new(1),
+                "automod",
+                BTreeMap::new(),
+                || app.image_spam.incomplete_notice_current(1, 2, reservation),
+            )
+            .await,
+            crate::logging::Delivery::Dropped
+        );
+        assert_eq!(sink.sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let verified = Detector::new(Limits::default()).unwrap();
+        let window = complete_verified_window(&verified, now);
+        let until = verified.state.lock().guilds[&1].authors[&2].reported_until;
+        assert!(!verified.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert_eq!(until, window.until);
+        let mut replacement = post(10, 100, now, &[9]);
+        replacement.revision = verified.revision();
+        replacement.edited_ms = 1;
+        assert!(matches!(
+            verified.admit(1, 2, replacement, (0, 0), &policy(), now, true),
+            AdmitOutcome::Admitted
+        ));
+        let bucket = &verified.state.lock().guilds[&1].authors[&2];
+        assert!(!bucket.blocked_notice);
+        assert_eq!(bucket.reported_until, until);
+    }
+
+    #[tokio::test]
+    async fn parked_author_keeps_incomplete_notice_and_still_sends() {
+        let (app, _policy, token) = image_run_job_test_app(Limits::default()).await;
+        app.activation.mark_lock_held(true);
+        let now = Instant::now();
+        seed_incomplete_notice(&app.image_spam, 2, token, now);
+        let reservation = {
+            let bucket = &app.image_spam.state.lock().guilds[&1].authors[&2];
+            ReportWindow {
+                token: bucket.token,
+                until: bucket.reported_until,
+            }
+        };
+        app.image_spam.invalidate_author(1, 2);
+        {
+            let state = app.image_spam.state.lock();
+            assert!(!state.guilds[&1].authors.contains_key(&2));
+            let watermark = &state.guilds[&1].watermarks[&2];
+            assert!(watermark.blocked_notice);
+            assert_eq!(watermark.token, reservation.token);
+            assert_eq!(watermark.reported_until, reservation.until);
+        }
+        assert!(app.image_spam.incomplete_notice_current(1, 2, reservation));
+        let sink = NoticeSink::default();
+        assert_eq!(
+            crate::logging::emit_to_if_after_rate_limit(
+                &app,
+                &sink,
+                GuildId::new(1),
+                "automod",
+                BTreeMap::new(),
+                || app.image_spam.incomplete_notice_current(1, 2, reservation),
+            )
+            .await,
+            crate::logging::Delivery::Sent
+        );
+        assert_eq!(sink.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.image_spam.state.lock().guilds[&1].watermarks[&2].blocked_notice);
     }
 }

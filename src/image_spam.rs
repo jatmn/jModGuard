@@ -523,7 +523,7 @@ mod tests {
             Err(DownloadError::HttpStatus(429))
         );
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_millis(100),
             "429 must not backoff"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is a single request");

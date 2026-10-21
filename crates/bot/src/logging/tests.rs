@@ -1626,6 +1626,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         Some(observation),
         Admission::Immediate,
         || true,
+        false,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);
@@ -2749,6 +2750,214 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
         calls.load(Ordering::SeqCst),
         parts.len(),
         "every text fallback part must reach Discord"
+    );
+    server.abort();
+}
+
+struct ScriptedHttpReply {
+    status: u16,
+    headers: &'static str,
+    body: &'static str,
+}
+
+async fn scripted_discord_proxy(
+    replies: Vec<ScriptedHttpReply>,
+) -> (
+    serenity::http::Http,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let replies = Arc::new(Mutex::new(replies));
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut header_end = None;
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = Some(pos + 4);
+                    break;
+                }
+            }
+            let Some(header_end) = header_end else {
+                break;
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if !name.eq_ignore_ascii_case("content-length") {
+                        return None;
+                    }
+                    value.trim().parse::<usize>().ok()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let reply = {
+                let mut pending = replies.lock().unwrap();
+                if pending.is_empty() {
+                    ScriptedHttpReply {
+                        status: 500,
+                        headers: "",
+                        body: "unexpected",
+                    }
+                } else {
+                    pending.remove(0)
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n{headers}\r\n{body}",
+                status = reply.status,
+                len = reply.body.len(),
+                headers = reply.headers,
+                body = reply.body,
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .build();
+    (http, calls, server)
+}
+
+#[tokio::test]
+async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::with_timeout(5);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 200,
+            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset-after: 0.45\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 1\r\nx-ratelimit-reset-after: 0.45\r\n",
+            body: "{}",
+        },
+    ])
+    .await;
+    assert!(
+        crate::discord::send_discord_log_after_rate_limit(
+            &http,
+            ChannelId::new(456),
+            CreateMessage::new().content("seed"),
+            &|| true,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let superseded = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&superseded);
+    let commit_flag = Arc::clone(&superseded);
+    let started = Instant::now();
+    let hook: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
+    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            move || !commit_flag.load(Ordering::SeqCst),
+        )
+        .await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(delivery, Delivery::Dropped);
+    assert!(
+        superseded.load(Ordering::SeqCst),
+        "the reservation must change during the rate-limit wait"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a stale notice must not be written after the wait"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "preemptive wait was too short: {elapsed:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::with_timeout(5);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "retry-after: 0.45\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    let superseded = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&superseded);
+    let commit_flag = Arc::clone(&superseded);
+    let started = Instant::now();
+    let hook: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
+    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            move || !commit_flag.load(Ordering::SeqCst),
+        )
+        .await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(delivery, Delivery::Dropped);
+    assert!(superseded.load(Ordering::SeqCst));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the 429 request already left; the retry must not"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "429 wait was too short: {elapsed:?}"
     );
     server.abort();
 }

@@ -36,6 +36,144 @@ where
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static ON_RATE_LIMIT_WAIT: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_rate_limit_wait_hook<F, T>(
+    hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+    future: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    ON_RATE_LIMIT_WAIT.scope(hook, future).await
+}
+
+fn note_rate_limit_wait_for_test() {
+    #[cfg(test)]
+    {
+        let _ = ON_RATE_LIMIT_WAIT.try_with(|hook| hook());
+    }
+}
+
+fn log_delivery_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .use_rustls_tls()
+            .build()
+            .expect("log delivery client")
+    })
+}
+
+/// Send one log message after the shared route rate-limit wait.
+///
+/// `still_current` runs again after every wait and before the HTTP request.
+/// `Ok(false)` means the notice was dropped before that request was written.
+pub(crate) async fn send_discord_log_after_rate_limit(
+    http: &serenity::http::Http,
+    channel: ChannelId,
+    message: serenity::builder::CreateMessage,
+    still_current: &(dyn Fn() -> bool + Sync),
+) -> Result<bool> {
+    let Some(ratelimiter) = http.ratelimiter.as_ref() else {
+        if !still_current() {
+            return Ok(false);
+        }
+        channel.send_message(http, message).await?;
+        return Ok(true);
+    };
+
+    let payload =
+        serde_json::to_vec(&message).map_err(|_| anyhow!("discord log delivery failed"))?;
+    let mut path = serenity::http::Route::ChannelMessages {
+        channel_id: channel,
+    }
+    .path()
+    .into_owned();
+    if let Some(proxy) = http.proxy.as_deref() {
+        path = path.replace("https://discord.com", proxy.trim_end_matches('/'));
+    }
+    let request = serenity::http::Request::new(
+        serenity::http::Route::ChannelMessages {
+            channel_id: channel,
+        },
+        serenity::http::LightMethod::Post,
+    );
+    let bucket_key = request.route_ref().ratelimiting_bucket();
+    let on_wait = |_: serenity::http::RatelimitInfo| note_rate_limit_wait_for_test();
+    let token = reqwest::header::HeaderValue::from_str(http.token())
+        .map_err(|_| anyhow!("discord log delivery failed"))?;
+
+    loop {
+        if !still_current() {
+            return Ok(false);
+        }
+        let routes = ratelimiter.routes();
+        let bucket = {
+            let mut routes = routes.write().await;
+            std::sync::Arc::clone(routes.entry(bucket_key).or_default())
+        };
+        bucket.lock().await.pre_hook(&request, &on_wait).await;
+        // The pre-hook sleep is the rate-limit wait. Recheck before any bytes leave.
+        if !still_current() {
+            return Ok(false);
+        }
+        let response = log_delivery_client()
+            .post(&path)
+            .header(reqwest::header::USER_AGENT, serenity::constants::USER_AGENT)
+            .header(reqwest::header::AUTHORIZATION, &token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload.clone())
+            .send()
+            .await
+            .map_err(|_| anyhow!("discord log delivery failed"))?;
+        if response.headers().get("x-ratelimit-global").is_some() {
+            let Some(retry_after) = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .and_then(|retry_after| std::time::Duration::try_from_secs_f64(retry_after).ok())
+            else {
+                return Err(anyhow!(
+                    "discord log delivery failed ({})",
+                    response.status().as_u16()
+                ));
+            };
+            note_rate_limit_wait_for_test();
+            tokio::time::sleep(retry_after).await;
+            if !still_current() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let retry = bucket
+            .lock()
+            .await
+            .post_hook(&response, &request, &on_wait, false)
+            .await
+            .map_err(|_| anyhow!("discord log delivery failed"))?;
+        if retry {
+            if !still_current() {
+                return Ok(false);
+            }
+            continue;
+        }
+        if response.status().is_success() {
+            return Ok(true);
+        }
+        return Err(anyhow!(
+            "discord log delivery failed ({})",
+            response.status().as_u16()
+        ));
+    }
+}
+
 /// A non-4xx error so [`crate::cases::classify_discord`] reports [`crate::db::guild_data::CaseOutcome::Uncertain`].
 pub(crate) fn cutoff_discord_error() -> serenity::Error {
     serenity::Error::Io(std::io::Error::new(

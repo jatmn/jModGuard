@@ -13,6 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 parking_lot = "0.12"
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "collector", "cache", "model", "builder", "http", "utils", "chrono", "rustls_backend"] }
@@ -22,7 +23,6 @@ tracing = "0.1"
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 jmodguard = { path = "../..", features = ["test-support"] }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 rand = "0.10"

@@ -79,7 +79,11 @@ match is proven, the automod title is **Exact image check incomplete**, the acti
 is **no action; check did not finish**, and the Evidence field names the stopping
 gate (never a URL, hash, or image bytes). A later check in the same incomplete
 window can still become a verified hit. An incomplete notice that has not been
-sent is not sent once that verified match owns the window. A new configuration
+sent is not sent once that verified match owns the window. That check runs again
+after a Discord rate-limit wait and before the log request is written. A request
+already sent is not recalled. Replacing a post's attachments clears an incomplete
+reservation and leaves a verified window in place. A parked author keeps the
+reservation, so the notice is still sent. A new configuration
 token clears the incomplete-notice reservation; park and restore on the same token
 still keeps it; a verified window is not cleared by the token change. A repeat
 incomplete notice is not sent
