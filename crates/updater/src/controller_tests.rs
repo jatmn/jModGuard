@@ -82,6 +82,27 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     }
 }
 
+fn complete_exit_code(raw: &str) -> Option<i32> {
+    if !raw.ends_with('\n') {
+        return None;
+    }
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.parse().expect("exit-code record is not an integer"))
+}
+
+fn exit_code_bytes(code: impl std::fmt::Display) -> String {
+    format!("{code}\n")
+}
+
+fn publish_exit_code_sync(path: &std::path::Path, code: impl std::fmt::Display) {
+    let pending = path.with_extension("tmp");
+    std::fs::write(&pending, exit_code_bytes(&code)).unwrap();
+    std::fs::rename(&pending, path).unwrap();
+}
+
 async fn executable(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
     let code = format!(
@@ -91,6 +112,16 @@ use std::sync::atomic::{{AtomicBool, Ordering}};
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {{ STOP.store(true, Ordering::SeqCst); }}
 unsafe extern "C" {{ fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }}
+fn complete_exit_code(raw: &str) -> Option<i32> {{
+    if !raw.ends_with('\n') {{
+        return None;
+    }}
+    let text = raw.trim();
+    if text.is_empty() {{
+        return None;
+    }}
+    Some(text.parse().expect("exit-code record is not an integer"))
+}}
 fn main() {{
     unsafe {{ signal(15, stop); }}
     let root = std::path::Path::new({root:?});
@@ -113,8 +144,26 @@ fn main() {{
             }}
             Some(listener)
         }} else {{ None }};
-        if let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            std::process::exit(code.trim().parse().unwrap());
+        if let Ok(mut raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
+            if let Some(code) = complete_exit_code(&raw) {{
+                std::process::exit(code);
+            }} else {{
+                let incomplete_start = std::time::Instant::now();
+                while !STOP.load(Ordering::SeqCst)
+                    && incomplete_start.elapsed() < std::time::Duration::from_millis(200)
+                {{
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    match std::fs::read_to_string(root.join("exit-code-{name}")) {{
+                        Ok(updated) => {{
+                            raw = updated;
+                            if let Some(code) = complete_exit_code(&raw) {{
+                                std::process::exit(code);
+                            }}
+                        }}
+                        Err(_) => break,
+                    }}
+                }}
+            }}
         }}
         if root.join("fail-{name}").exists() {{
             std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "stale marker").unwrap();
@@ -126,8 +175,10 @@ fn main() {{
         event("ready");
     }}
     while !STOP.load(Ordering::SeqCst) {{
-        if !maintenance && let Ok(code) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            std::process::exit(code.trim().parse().unwrap());
+        if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
+            if let Some(code) = complete_exit_code(&raw) {{
+                std::process::exit(code);
+            }}
         }}
         std::thread::sleep(std::time::Duration::from_millis(5));
     }}
@@ -158,13 +209,14 @@ fn main() {{
     path
 }
 
-/// Publish an exit code by renaming a complete sibling onto the path the
-/// fixture child polls. Creating the watched name first lets that child parse
-/// an empty file.
+/// Publish an exit code by renaming a complete `{code}\n` record onto the path
+/// the fixture child polls.
 async fn publish_exit_code(path: impl AsRef<std::path::Path>, code: impl std::fmt::Display) {
     let path = path.as_ref();
     let pending = path.with_extension("tmp");
-    tokio::fs::write(&pending, code.to_string()).await.unwrap();
+    tokio::fs::write(&pending, exit_code_bytes(&code))
+        .await
+        .unwrap();
     tokio::fs::rename(&pending, path).await.unwrap();
 }
 
@@ -4483,6 +4535,143 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+#[test]
+fn exit_code_publish_is_absent_or_complete() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    assert_eq!(complete_exit_code(""), None);
+    assert_eq!(complete_exit_code("7"), None);
+    assert_eq!(complete_exit_code("78"), None);
+    assert_eq!(complete_exit_code("\n"), None);
+    assert_eq!(complete_exit_code(" \n"), None);
+    assert_eq!(complete_exit_code("7\n"), Some(7));
+    assert_eq!(complete_exit_code("78\n"), Some(78));
+    assert_eq!(complete_exit_code(" 78\n"), Some(78));
+    assert_eq!(complete_exit_code("78\r\n"), Some(78));
+    assert!(catch_unwind(AssertUnwindSafe(|| complete_exit_code("nope\n"))).is_err());
+
+    let root = std::env::temp_dir().join(format!("exit-publish-{:032x}", rand::random::<u128>()));
+    std::fs::create_dir_all(&root).unwrap();
+    let exit = root.join("exit-code-stress");
+    let empty = Arc::new(AtomicUsize::new(0));
+    let seven = Arc::new(AtomicUsize::new(0));
+    let bare = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2000 {
+        let _ = std::fs::remove_file(&exit);
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(5));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let exit = exit.clone();
+                let barrier = Arc::clone(&barrier);
+                let published = Arc::clone(&published);
+                let empty = Arc::clone(&empty);
+                let seven = Arc::clone(&seven);
+                let bare = Arc::clone(&bare);
+                thread::spawn(move || {
+                    barrier.wait();
+                    while !published.load(Ordering::Acquire) {
+                        if let Ok(bytes) = std::fs::read(&exit) {
+                            if bytes.as_slice() == b"78\n" {
+                                continue;
+                            }
+                            if bytes.is_empty() {
+                                empty.fetch_add(1, Ordering::Relaxed);
+                            } else if bytes.as_slice() == b"7" {
+                                seven.fetch_add(1, Ordering::Relaxed);
+                            } else if bytes.as_slice() == b"78" {
+                                bare.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                panic!("unexpected read: {:?}", bytes);
+                            }
+                        }
+                    }
+                    let bytes = std::fs::read(&exit).unwrap();
+                    assert_eq!(bytes, b"78\n");
+                })
+            })
+            .collect();
+        barrier.wait();
+        publish_exit_code_sync(&exit, 78);
+        published.store(true, Ordering::Release);
+        for handle in threads {
+            handle.join().unwrap();
+        }
+    }
+    assert_eq!(empty.load(Ordering::Relaxed), 0);
+    assert_eq!(seven.load(Ordering::Relaxed), 0);
+    assert_eq!(bare.load(Ordering::Relaxed), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn exit_code_child_retries_empty_and_partial_records() {
+    let root = std::env::temp_dir().join(format!("exit-record-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let name = "exit-record";
+    let binary = executable(&root, name).await;
+    let exit = root.join(format!("exit-code-{name}"));
+    let ready = root.join("ready");
+    let events = root.join("events");
+
+    async fn spawn_child(binary: &Path, ready: &Path) -> tokio::process::Child {
+        use std::process::Stdio;
+        Command::new(binary)
+            .env("JMODGUARD_READY_FILE", ready)
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    async fn stderr_has_parse_error(child: &mut tokio::process::Child) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).contains("ParseIntError")
+    }
+
+    tokio::fs::write(&exit, "").await.unwrap();
+    let mut child = spawn_child(&binary, &ready).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+    assert!(!stderr_has_parse_error(&mut child).await);
+
+    tokio::fs::write(&exit, "7").await.unwrap();
+    let mut child = spawn_child(&binary, &ready).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    publish_exit_code_sync(&exit, 78);
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(78));
+    assert!(!stderr_has_parse_error(&mut child).await);
+
+    for _ in 0..40 {
+        tokio::fs::write(&exit, "").await.unwrap();
+        let mut child = spawn_child(&binary, &ready).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        publish_exit_code_sync(&exit, 78);
+        let status = child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(78));
+        assert!(!stderr_has_parse_error(&mut child).await);
+        let _ = tokio::fs::remove_file(&exit).await;
+        let _ = tokio::fs::remove_file(&ready).await;
+        let _ = tokio::fs::remove_file(&events).await;
+    }
+
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn readiness_recovery_holds_token_exit_between_status_checks() {
     use std::future::Future as _;
@@ -4524,7 +4713,7 @@ async fn readiness_recovery_holds_token_exit_between_status_checks() {
                 .await
                 .is_pending()
         );
-        std::fs::write(root.join(format!("exit-code-{name}")), "78").unwrap();
+        publish_exit_code_sync(&root.join(format!("exit-code-{name}")), 78);
         std::fs::remove_file(&hold).unwrap();
         let deadline = Instant::now() + POLL;
         while !child_is_zombie(pid) {
