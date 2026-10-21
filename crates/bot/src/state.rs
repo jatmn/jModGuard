@@ -771,6 +771,8 @@ pub struct BotState {
     pub(crate) member_sync_rate_limit_until_ms: AtomicI64,
     pub(crate) member_sync_rate_limit_epoch: AtomicU64,
     pub(crate) member_sync_rate_limit_persisted_epoch: AtomicU64,
+    member_sync_rate_limit_persist_notify: tokio::sync::Notify,
+    pub(crate) member_sync_rate_limit_persist_running: AtomicBool,
     pub(crate) member_sync_bot_id: AtomicI64,
     pub(crate) rate_limit_wait_logged_at: parking_lot::Mutex<HashMap<String, Instant>>,
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
@@ -783,6 +785,8 @@ pub struct BotState {
     pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
     #[cfg(test)]
     gateway_ban_path_phases: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    member_sync_rate_limit_persist_exit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BotState {
@@ -872,6 +876,8 @@ impl BotState {
             member_sync_rate_limit_until_ms: AtomicI64::new(0),
             member_sync_rate_limit_epoch: AtomicU64::new(0),
             member_sync_rate_limit_persisted_epoch: AtomicU64::new(0),
+            member_sync_rate_limit_persist_notify: tokio::sync::Notify::new(),
+            member_sync_rate_limit_persist_running: AtomicBool::new(false),
             member_sync_bot_id: AtomicI64::new(0),
             rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
@@ -882,7 +888,17 @@ impl BotState {
             remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
             #[cfg(test)]
             gateway_ban_path_phases: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            member_sync_rate_limit_persist_exit_hook: Mutex::new(None),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_member_sync_rate_limit_persist_exit_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.member_sync_rate_limit_persist_exit_hook.lock() = hook;
     }
 
     pub(crate) fn arm_member_sync_rate_limit(&self, deadline: i64) {
@@ -896,6 +912,16 @@ impl BotState {
     }
 
     pub(crate) async fn persist_pending_member_sync_rate_limit(&self) {
+        self.persist_pending_member_sync_rate_limit_inner(true)
+            .await;
+    }
+
+    pub(crate) async fn persist_pending_member_sync_rate_limit_quiet(&self) {
+        self.persist_pending_member_sync_rate_limit_inner(false)
+            .await;
+    }
+
+    async fn persist_pending_member_sync_rate_limit_inner(&self, warn_on_failure: bool) {
         let bot_id = self.member_sync_bot_id.load(Ordering::Relaxed);
         if bot_id <= 0 {
             return;
@@ -918,8 +944,119 @@ impl BotState {
                     .fetch_max(epoch, Ordering::Release);
             }
             Err(error) => {
-                tracing::warn!("failed to persist Discord retry deadline: {error:#}");
+                if warn_on_failure {
+                    tracing::warn!("failed to persist Discord retry deadline: {error:#}");
+                }
             }
+        }
+    }
+
+    fn member_sync_rate_limit_should_keep_persisting(&self) -> bool {
+        let epoch = self.member_sync_rate_limit_epoch.load(Ordering::Acquire);
+        if epoch
+            == self
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if self.member_sync_bot_id.load(Ordering::Relaxed) <= 0 {
+            return false;
+        }
+        let stored = self.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        stored > now_ms
+    }
+
+    fn member_sync_rate_limit_persist_exit(&self) -> bool {
+        if self.member_sync_rate_limit_should_keep_persisting() {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.member_sync_rate_limit_persist_exit_hook.lock().clone() {
+            hook();
+        }
+        self.member_sync_rate_limit_persist_running
+            .swap(false, Ordering::AcqRel);
+        if self.member_sync_rate_limit_should_keep_persisting()
+            && !self
+                .member_sync_rate_limit_persist_running
+                .swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+        true
+    }
+
+    async fn member_sync_rate_limit_persist_loop(self: Arc<Self>) {
+        let mut backoff = Duration::from_millis(25);
+        const MAX_BACKOFF: Duration = Duration::from_millis(300);
+        let mut warned_epoch = 0_u64;
+        loop {
+            let epoch = self.member_sync_rate_limit_epoch.load(Ordering::Acquire);
+            if epoch
+                == self
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+            {
+                if self.member_sync_rate_limit_persist_exit() {
+                    return;
+                }
+                continue;
+            }
+            if self.member_sync_bot_id.load(Ordering::Relaxed) <= 0 {
+                if self.member_sync_rate_limit_persist_exit() {
+                    return;
+                }
+                continue;
+            }
+            let warn = epoch != warned_epoch;
+            if warn {
+                warned_epoch = epoch;
+                self.persist_pending_member_sync_rate_limit().await;
+            } else {
+                self.persist_pending_member_sync_rate_limit_quiet().await;
+            }
+            if epoch
+                == self
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+            {
+                backoff = Duration::from_millis(25);
+                if self.member_sync_rate_limit_persist_exit() {
+                    return;
+                }
+                continue;
+            }
+            let stored = self.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if stored <= now_ms {
+                // A failed write with deadline <= now leaves epoch > persisted_epoch
+                // until the next observe or publish_member_sync_bot_id.
+                if self.member_sync_rate_limit_persist_exit() {
+                    return;
+                }
+                continue;
+            }
+            backoff = backoff.min(MAX_BACKOFF);
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = self.member_sync_rate_limit_persist_notify.notified() => {}
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
+    pub(crate) fn ensure_member_sync_rate_limit_persist_task(self: &Arc<Self>) {
+        self.member_sync_rate_limit_persist_notify.notify_one();
+        if !self
+            .member_sync_rate_limit_persist_running
+            .swap(true, Ordering::AcqRel)
+        {
+            let app = Arc::clone(self);
+            tokio::spawn(async move {
+                app.member_sync_rate_limit_persist_loop().await;
+            });
         }
     }
 

@@ -5,32 +5,20 @@ use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) -> Pin<Box<dyn Future<Output = ()> + Send>>
-    + Send
-    + Sync;
+pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) + Send + Sync;
 
 #[cfg(test)]
-pub(crate) fn ignore_global_rate_limit(
-    _: crate::handlers::RateLimitWait,
-) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async {})
-}
+pub(crate) fn ignore_global_rate_limit(_: crate::handlers::RateLimitWait) {}
 
 #[cfg(test)]
 pub(crate) fn member_sync_global_rate_limit_hook(
     app: std::sync::Arc<crate::state::BotState>,
-) -> impl Fn(crate::handlers::RateLimitWait) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync
-{
+) -> impl Fn(crate::handlers::RateLimitWait) + Send + Sync {
     move |wait| {
-        let app = std::sync::Arc::clone(&app);
-        Box::pin(async move {
-            crate::handlers::apply_rate_limit_wait(&app, wait).await;
-        })
+        crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
     }
 }
 
@@ -176,8 +164,7 @@ pub(crate) async fn send_discord_log_after_rate_limit(
                 method: serenity::http::LightMethod::Post,
                 path: message_route.path().to_string(),
                 global: true,
-            })
-            .await;
+            });
             note_rate_limit_wait_for_test();
             tokio::time::sleep(retry_after).await;
             if !still_current() {

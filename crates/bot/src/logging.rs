@@ -15,9 +15,7 @@ use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
@@ -1055,10 +1053,7 @@ async fn emit_to_observed_with_audit(
         let on_global_rate_limit = {
             let app = Arc::clone(app);
             move |wait: crate::handlers::RateLimitWait| {
-                let app = Arc::clone(&app);
-                Box::pin(async move {
-                    crate::handlers::apply_rate_limit_wait(&app, wait).await;
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
         let call = crate::discord::race_discord_call(&app.activation, async {
