@@ -1040,9 +1040,7 @@ impl BotState {
             .is_ok()
         {
             let app = Arc::clone(self);
-            let span = tracing::Span::current();
             tokio::spawn(async move {
-                let _guard = span.enter();
                 app.member_sync_rate_limit_persist_loop().await;
             });
         }
