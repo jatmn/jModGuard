@@ -148,6 +148,7 @@ fn main() {{
             if let Some(code) = complete_exit_code(&raw) {{
                 std::process::exit(code);
             }} else {{
+                event("exit-partial");
                 let incomplete_start = std::time::Instant::now();
                 while !STOP.load(Ordering::SeqCst)
                     && incomplete_start.elapsed() < std::time::Duration::from_millis(200)
@@ -159,6 +160,7 @@ fn main() {{
                             if let Some(code) = complete_exit_code(&raw) {{
                                 std::process::exit(code);
                             }}
+                            event("exit-partial");
                         }}
                         Err(_) => break,
                     }}
@@ -4562,18 +4564,25 @@ fn exit_code_publish_is_absent_or_complete() {
     for _ in 0..2000 {
         let _ = std::fs::remove_file(&exit);
         let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers_sampled = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(5));
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let exit = exit.clone();
                 let barrier = Arc::clone(&barrier);
                 let published = Arc::clone(&published);
+                let readers_sampled = Arc::clone(&readers_sampled);
                 let empty = Arc::clone(&empty);
                 let seven = Arc::clone(&seven);
                 let bare = Arc::clone(&bare);
                 thread::spawn(move || {
                     barrier.wait();
+                    let mut sampled = false;
                     while !published.load(Ordering::Acquire) {
+                        if !sampled {
+                            sampled = true;
+                            readers_sampled.fetch_add(1, Ordering::Release);
+                        }
                         if let Ok(bytes) = std::fs::read(&exit) {
                             if bytes.as_slice() == b"78\n" {
                                 continue;
@@ -4595,6 +4604,9 @@ fn exit_code_publish_is_absent_or_complete() {
             })
             .collect();
         barrier.wait();
+        while readers_sampled.load(Ordering::Acquire) < 4 {
+            std::hint::spin_loop();
+        }
         publish_exit_code_sync(&exit, 78);
         published.store(true, Ordering::Release);
         for handle in threads {
@@ -4644,9 +4656,23 @@ async fn exit_code_child_retries_empty_and_partial_records() {
     let _ = child.wait().await;
     assert!(!stderr_has_parse_error(&mut child).await);
 
+    let _ = tokio::fs::remove_file(&events).await;
     tokio::fs::write(&exit, "7").await.unwrap();
+    let hold = root.join("hold-exit-record-ready");
+    tokio::fs::write(&hold, "hold").await.unwrap();
     let mut child = spawn_child(&binary, &ready).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(&events).await
+                && text.lines().any(|line| line == "exit-record.exit-partial")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("fixture never observed the partial exit record");
     assert!(child.try_wait().unwrap().is_none());
     publish_exit_code_sync(&exit, 78);
     let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
@@ -4655,6 +4681,7 @@ async fn exit_code_child_retries_empty_and_partial_records() {
         .unwrap();
     assert_eq!(status.code(), Some(78));
     assert!(!stderr_has_parse_error(&mut child).await);
+    let _ = tokio::fs::remove_file(&hold).await;
 
     for _ in 0..40 {
         tokio::fs::write(&exit, "").await.unwrap();
