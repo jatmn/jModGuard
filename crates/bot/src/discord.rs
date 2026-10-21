@@ -5,8 +5,34 @@ use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
+#[cfg(test)]
+pub(crate) fn ignore_global_rate_limit(
+    _: crate::handlers::RateLimitWait,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async {})
+}
+
+#[cfg(test)]
+pub(crate) fn member_sync_global_rate_limit_hook(
+    app: std::sync::Arc<crate::state::BotState>,
+) -> impl Fn(crate::handlers::RateLimitWait) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync
+{
+    move |wait| {
+        let app = std::sync::Arc::clone(&app);
+        Box::pin(async move {
+            crate::handlers::apply_rate_limit_wait(&app, wait).await;
+        })
+    }
+}
 
 /// Bounds every reconciliation REST attempt so one half-open Discord request
 /// cannot stall durable work for every guild indefinitely.
@@ -79,6 +105,7 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     channel: ChannelId,
     message: serenity::builder::CreateMessage,
     still_current: &(dyn Fn() -> bool + Sync),
+    on_global_rate_limit: &OnGlobalRateLimitCallback,
 ) -> Result<bool> {
     let Some(ratelimiter) = http.ratelimiter.as_ref() else {
         if !still_current() {
@@ -98,12 +125,10 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     if let Some(proxy) = http.proxy.as_deref() {
         path = path.replace("https://discord.com", proxy.trim_end_matches('/'));
     }
-    let request = serenity::http::Request::new(
-        serenity::http::Route::ChannelMessages {
-            channel_id: channel,
-        },
-        serenity::http::LightMethod::Post,
-    );
+    let message_route = serenity::http::Route::ChannelMessages {
+        channel_id: channel,
+    };
+    let request = serenity::http::Request::new(message_route, serenity::http::LightMethod::Post);
     let bucket_key = request.route_ref().ratelimiting_bucket();
     let on_wait = |_: serenity::http::RatelimitInfo| note_rate_limit_wait_for_test();
     let token = reqwest::header::HeaderValue::from_str(http.token())
@@ -145,6 +170,14 @@ pub(crate) async fn send_discord_log_after_rate_limit(
                     response.status().as_u16()
                 ));
             };
+            on_global_rate_limit(crate::handlers::RateLimitWait {
+                timeout: retry_after,
+                limit: 50,
+                method: serenity::http::LightMethod::Post,
+                path: message_route.path().to_string(),
+                global: true,
+            })
+            .await;
             note_rate_limit_wait_for_test();
             tokio::time::sleep(retry_after).await;
             if !still_current() {

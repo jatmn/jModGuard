@@ -36,15 +36,20 @@ impl Handler {
     // covers both a real provider throttle and a pre-emptive empty bucket. This
     // function awaits the pacing write before it returns. A late commit cannot
     // shorten `request_after_ms` because the SQL keeps the max.
+    #[allow(dead_code)]
     pub(crate) async fn record_rate_limit_wait(&self, wait: RateLimitWait) {
-        let _logged = note_rate_limit_wait(&self.app, &wait, Instant::now());
-        if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
-            return;
-        }
-        let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
-        self.app.arm_member_sync_rate_limit(deadline);
-        self.app.persist_pending_member_sync_rate_limit().await;
+        apply_rate_limit_wait(&self.app, wait).await;
     }
+}
+
+pub(crate) async fn apply_rate_limit_wait(app: &Arc<BotState>, wait: RateLimitWait) {
+    let _logged = note_rate_limit_wait(app, &wait, Instant::now());
+    if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
+        return;
+    }
+    let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
+    app.arm_member_sync_rate_limit(deadline);
+    app.persist_pending_member_sync_rate_limit().await;
 }
 
 #[derive(Clone)]
