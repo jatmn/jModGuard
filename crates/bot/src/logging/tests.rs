@@ -3678,9 +3678,10 @@ async fn global_429_past_the_log_deadline_still_persists_pacing() {
     db::upsert_log_channel(&f.app.db, 789, "automod", 456)
         .await
         .unwrap();
+    let (lock_thread, release) = hold_sqlite_writer_lock(&f.path);
     let (http, calls, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
         status: 429,
-        headers: "x-ratelimit-global: true\r\nretry-after: 5\r\n",
+        headers: "x-ratelimit-global: true\r\nretry-after: 60\r\n",
         body: "{}",
     }])
     .await;
@@ -3703,6 +3704,16 @@ async fn global_429_past_the_log_deadline_still_persists_pacing() {
         .member_sync_rate_limit_until_ms
         .load(Ordering::Relaxed);
     assert!(stored > 0);
+    assert!(
+        f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            > f.app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire),
+        "pacing must stay dirty while the writer lock is held"
+    );
+    tokio::time::resume();
+    release.store(true, Ordering::SeqCst);
+    lock_thread.join().expect("writer lock thread");
     wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
     assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
     server.abort();

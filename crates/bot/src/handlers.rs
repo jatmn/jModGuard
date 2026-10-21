@@ -3551,6 +3551,21 @@ mod rate_limit_tests {
             .count()
     }
 
+    async fn wait_epoch_persisted(app: &BotState, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+                == app
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("member sync pacing epoch did not persist within {timeout:?}");
+    }
+
     async fn pacing_deadline(app: &BotState, bot_id: i64) -> Option<i64> {
         app.db
             .with_conn(move |conn| {
@@ -4079,6 +4094,73 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             app.member_sync_rate_limit_persisted_epoch
                 .load(Ordering::Relaxed)
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn member_sync_rate_limit_persist_exit_reclaims_epoch_armed_during_handoff() {
+        use super::observe_member_sync_rate_limit_wait;
+        use std::sync::atomic::AtomicBool;
+
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(2),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .await;
+        wait_epoch_persisted(&app, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let at_exit = Arc::new(AtomicBool::new(false));
+        let release_exit = Arc::new(AtomicBool::new(false));
+        app.set_member_sync_rate_limit_persist_exit_hook(Some(Arc::new({
+            let at_exit = Arc::clone(&at_exit);
+            let release_exit = Arc::clone(&release_exit);
+            move || {
+                at_exit.store(true, Ordering::SeqCst);
+                while !release_exit.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })));
+
+        app.ensure_member_sync_rate_limit_persist_task();
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !at_exit.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() > wait_until {
+                panic!("persist task did not reach exit handoff");
+            }
+            tokio::task::yield_now().await;
+        }
+
+        observe_member_sync_rate_limit_wait(
+            &app,
+            wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ),
+        );
+        assert!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+                > app
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire),
+            "new pacing epoch must stay dirty while the exiting task is still marked running"
+        );
+
+        release_exit.store(true, Ordering::SeqCst);
+        wait_epoch_persisted(&app, Duration::from_secs(5)).await;
+        assert_eq!(
+            pacing_deadline(&app, 42).await,
+            Some(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed))
+        );
+        app.set_member_sync_rate_limit_persist_exit_hook(None);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

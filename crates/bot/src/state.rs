@@ -785,6 +785,8 @@ pub struct BotState {
     pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
     #[cfg(test)]
     gateway_ban_path_phases: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    member_sync_rate_limit_persist_exit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl BotState {
@@ -886,7 +888,17 @@ impl BotState {
             remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
             #[cfg(test)]
             gateway_ban_path_phases: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            member_sync_rate_limit_persist_exit_hook: Mutex::new(None),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_member_sync_rate_limit_persist_exit_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.member_sync_rate_limit_persist_exit_hook.lock() = hook;
     }
 
     pub(crate) fn arm_member_sync_rate_limit(&self, deadline: i64) {
@@ -960,13 +972,16 @@ impl BotState {
         if self.member_sync_rate_limit_should_keep_persisting() {
             return false;
         }
+        #[cfg(test)]
+        if let Some(hook) = self.member_sync_rate_limit_persist_exit_hook.lock().clone() {
+            hook();
+        }
         self.member_sync_rate_limit_persist_running
-            .store(false, Ordering::Release);
+            .swap(false, Ordering::AcqRel);
         if self.member_sync_rate_limit_should_keep_persisting()
-            && self
+            && !self
                 .member_sync_rate_limit_persist_running
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
+                .swap(true, Ordering::AcqRel)
         {
             return false;
         }
@@ -1034,10 +1049,9 @@ impl BotState {
 
     pub(crate) fn ensure_member_sync_rate_limit_persist_task(self: &Arc<Self>) {
         self.member_sync_rate_limit_persist_notify.notify_one();
-        if self
+        if !self
             .member_sync_rate_limit_persist_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+            .swap(true, Ordering::AcqRel)
         {
             let app = Arc::clone(self);
             tokio::spawn(async move {
