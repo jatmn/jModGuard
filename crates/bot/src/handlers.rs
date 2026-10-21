@@ -34,21 +34,27 @@ impl Handler {
 
     // Serenity spawns this hook and does not await it before sleeping. The sleep
     // covers both a real provider throttle and a pre-emptive empty bucket. This
-    // function awaits the pacing write before it returns. A late commit cannot
-    // shorten `request_after_ms` because the SQL keeps the max.
+    // function awaits one pacing write attempt before it returns; the log sender
+    // only schedules the coalesced persist task. A late commit cannot shorten
+    // `request_after_ms` because the SQL keeps the max.
     #[allow(dead_code)]
     pub(crate) async fn record_rate_limit_wait(&self, wait: RateLimitWait) {
         apply_rate_limit_wait(&self.app, wait).await;
     }
 }
 
-pub(crate) async fn apply_rate_limit_wait(app: &Arc<BotState>, wait: RateLimitWait) {
+pub(crate) fn observe_member_sync_rate_limit_wait(app: &Arc<BotState>, wait: RateLimitWait) {
     let _logged = note_rate_limit_wait(app, &wait, Instant::now());
     if !member_sync_rate_limit_route(wait.global, &redact_rate_limit_path(&wait.path)) {
         return;
     }
     let deadline = member_sync_deadline_ms(chrono::Utc::now().timestamp_millis(), wait.timeout);
     app.arm_member_sync_rate_limit(deadline);
+    app.ensure_member_sync_rate_limit_persist_task();
+}
+
+pub(crate) async fn apply_rate_limit_wait(app: &Arc<BotState>, wait: RateLimitWait) {
+    observe_member_sync_rate_limit_wait(app, wait);
     app.persist_pending_member_sync_rate_limit().await;
 }
 
@@ -4065,6 +4071,67 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             Some(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed))
         );
         assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > kept);
+        assert_eq!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
+            app.member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Relaxed)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handler_failed_pacing_write_retries_without_another_wait() {
+        let (directory, app, handler) = test_state().await;
+        app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        let log = CapturedLog::default();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(30),
+                LightMethod::Get,
+                "/guilds/1/members",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        let kept = pacing_deadline(&app, 42).await.unwrap();
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        handler
+            .record_rate_limit_wait(wait(
+                Duration::from_secs(90),
+                LightMethod::Get,
+                "/guilds/1/bans",
+                false,
+            ))
+            .with_subscriber(log.dispatch())
+            .await;
+        assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > kept);
+        assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
+        let text = log.text();
+        assert!(text.contains("failed to persist Discord retry deadline"));
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536)
+            })
+            .await
+            .unwrap();
+        let target = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
+        let poll = tokio::time::timeout(Duration::from_secs(5), async {
+            while pacing_deadline(&app, 42).await != Some(target) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(poll.is_ok());
         assert_eq!(
             app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
             app.member_sync_rate_limit_persisted_epoch

@@ -160,7 +160,7 @@ The current shared limit does not establish per-guild fairness.
 A valid warm configuration cache permits delivery during database failure. An expired,
 missing or invalidated configuration still needs SQL; it fails within the deadline.
 Delivery failures and drops increment a process counter and produce sparse warnings
-without raw content. A timeout can mean Discord received the report; no retry follows.
+without raw content. A timeout can mean Discord received the report; no retry follows. The member-sync pacing commit for a global 429 is scheduled outside `log.discord_timeout_secs` and outside activation cutoff.
 Mentions and automatic link previews are disabled. Template expansion stops at the
 Discord-sized UTF-16 output budget instead of allocating an arbitrary expanded message.
 Discord-channel copies have Discord's own lifecycle, separate from jModGuard storage.

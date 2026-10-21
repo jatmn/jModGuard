@@ -2908,6 +2908,10 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
         elapsed >= Duration::from_secs(25),
         "preemptive wait was too short: {elapsed:?}"
     );
+    assert_eq!(
+        f.app.member_sync_rate_limit_until_ms.load(Ordering::SeqCst),
+        0
+    );
     server.abort();
 }
 
@@ -2961,6 +2965,10 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
     assert!(
         elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
         "429 wait duration unexpected: {elapsed:?}"
+    );
+    assert_eq!(
+        f.app.member_sync_rate_limit_until_ms.load(Ordering::SeqCst),
+        0
     );
     server.abort();
 }
@@ -3193,6 +3201,58 @@ async fn conditional_transient_5xx_and_429_are_not_remembered() {
     server.abort();
 }
 
+async fn wait_member_sync_rate_limit_persisted(app: &BotState, timeout: Duration) {
+    use std::sync::atomic::Ordering;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            == app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("member-sync pacing epoch did not persist within {timeout:?}");
+}
+
+fn hold_sqlite_writer_lock(
+    path: &std::path::Path,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let release = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let db_path = path.to_path_buf();
+    let release_flag = Arc::clone(&release);
+    let ready_flag = Arc::clone(&ready);
+    let handle = std::thread::spawn(move || {
+        let db = Db::open(&db_path, 2).expect("open pacing lock database");
+        db.with_conn_sync(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            ready_flag.store(true, Ordering::SeqCst);
+            while !release_flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })
+        .expect("hold pacing writer lock");
+    });
+    let wait_until = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.load(Ordering::SeqCst) {
+        if std::time::Instant::now() > wait_until {
+            panic!("writer lock thread did not acquire BEGIN IMMEDIATE");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (handle, release)
+}
+
 async fn member_sync_pacing_deadline(app: &BotState, bot_id: i64) -> Option<i64> {
     app.db
         .with_conn(move |conn| {
@@ -3264,6 +3324,7 @@ async fn global_429_notifies_member_sync_and_retries_when_current() {
         .member_sync_rate_limit_until_ms
         .load(Ordering::Relaxed);
     assert!(stored >= before && stored <= after + 1);
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
     assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
     let text = log.text();
     assert_eq!(rate_limit_wait_log_lines(&text), 1);
@@ -3322,6 +3383,7 @@ async fn global_429_notifies_member_sync_and_drops_the_retry_when_stale() {
         .member_sync_rate_limit_until_ms
         .load(Ordering::Relaxed);
     assert!(stored >= before && stored <= after + 1);
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
     assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
     server.abort();
 }
@@ -3469,6 +3531,7 @@ async fn global_429_virtual_wait_blocks_an_earlier_member_sync_claim() {
         .member_sync_rate_limit_until_ms
         .load(Ordering::Relaxed);
     assert!(deadline >= before + 30_000 && deadline <= after + 30_000);
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
     assert!(
         crate::db::claim_member_sync_request(
             &f.app.db,
@@ -3538,5 +3601,370 @@ async fn global_429_without_published_bot_id_still_retries() {
             > 0
     );
     assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
+    for _ in 0..50 {
+        if !f
+            .app
+            .member_sync_rate_limit_persist_running
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !f.app
+            .member_sync_rate_limit_persist_running
+            .load(Ordering::SeqCst)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_slow_pacing_write_does_not_spend_the_log_deadline() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::with_timeout(1);
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (lock_thread, release) = hold_sqlite_writer_lock(&f.path);
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    let started = tokio::time::Instant::now();
+    let delivery = emit_to_if_after_rate_limit(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "automod",
+        BTreeMap::new(),
+        || true,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "log delivery waited on the pacing write: {elapsed:?}"
+    );
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored > 0);
+    release.store(true, Ordering::SeqCst);
+    lock_thread.join().expect("writer lock thread");
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_past_the_log_deadline_still_persists_pacing() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::with_timeout(1);
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
+        status: 429,
+        headers: "x-ratelimit-global: true\r\nretry-after: 5\r\n",
+        body: "{}",
+    }])
+    .await;
+    tokio::time::pause();
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored > 0);
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_cutoff_during_retry_sleep_still_persists_pacing() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (lock_thread, release) = hold_sqlite_writer_lock(&f.path);
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    let app = Arc::clone(&f.app);
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || app.activation.cut_off());
+    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await
+    })
+    .await;
+    assert_ne!(delivery, Delivery::Sent);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored > 0);
+    assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
+    release.store(true, Ordering::SeqCst);
+    lock_thread.join().expect("writer lock thread");
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_stale_notice_and_failed_pacing_write_still_commits_after_retry() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::with_timeout(60);
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    f.app.publish_member_sync_bot_id(42).await;
+    crate::handlers::apply_rate_limit_wait(
+        &f.app,
+        crate::handlers::RateLimitWait {
+            timeout: Duration::from_secs(5),
+            limit: 50,
+            method: serenity::http::LightMethod::Get,
+            path: "/guilds/1/members".to_string(),
+            global: false,
+        },
+    )
+    .await;
+    let kept = member_sync_pacing_deadline(&f.app, 42).await.unwrap();
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
+        status: 429,
+        headers: "x-ratelimit-global: true\r\nretry-after: 30\r\n",
+        body: "{}",
+    }])
+    .await;
+    let superseded = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&superseded);
+    let commit_flag = Arc::clone(&superseded);
+    tokio::time::pause();
+    let hook: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
+    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            move || !commit_flag.load(Ordering::SeqCst),
+        )
+        .await
+    })
+    .await;
+    assert_eq!(delivery, Delivery::Dropped);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored > kept);
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(kept));
+    for _ in 0..50 {
+        if f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            > f.app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            > f.app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+    );
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    f.app
+        .db
+        .with_conn(|conn| conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536))
+        .await
+        .unwrap();
+    wait_member_sync_rate_limit_persisted(&f.app, Duration::from_secs(5)).await;
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    assert!(
+        crate::db::claim_member_sync_request(
+            &f.app.db,
+            42,
+            "fixture".into(),
+            stored - 1,
+            15_000,
+            90_000,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        crate::db::claim_member_sync_request(
+            &f.app.db,
+            42,
+            "fixture".into(),
+            stored,
+            15_000,
+            90_000,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_failed_pacing_write_stops_after_the_deadline() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    f.app.publish_member_sync_bot_id(42).await;
+    let kept = member_sync_pacing_deadline(&f.app, 42).await;
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER reject_pacing_insert
+BEFORE INSERT ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;
+CREATE TRIGGER reject_pacing_extend
+BEFORE UPDATE ON member_sync_pacing
+BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
+        status: 429,
+        headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+        body: "{}",
+    }])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    for _ in 0..50 {
+        if f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            > f.app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+            > f.app
+                .member_sync_rate_limit_persisted_epoch
+                .load(Ordering::Acquire)
+    );
+    for _ in 0..50 {
+        if !f
+            .app
+            .member_sync_rate_limit_persist_running
+            .load(Ordering::SeqCst)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !f.app
+            .member_sync_rate_limit_persist_running
+            .load(Ordering::SeqCst)
+    );
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, kept);
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "DROP TRIGGER reject_pacing_insert; DROP TRIGGER reject_pacing_extend;",
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
     server.abort();
 }
