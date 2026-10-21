@@ -4083,7 +4083,6 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
     async fn handler_failed_pacing_write_retries_without_another_wait() {
         let (directory, app, handler) = test_state().await;
         app.member_sync_bot_id.store(42, Ordering::Relaxed);
-        let log = CapturedLog::default();
         handler
             .record_rate_limit_wait(wait(
                 Duration::from_secs(30),
@@ -4091,7 +4090,6 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
                 "/guilds/1/members",
                 false,
             ))
-            .with_subscriber(log.dispatch())
             .await;
         let kept = pacing_deadline(&app, 42).await.unwrap();
         app.db
@@ -4112,12 +4110,15 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
                 "/guilds/1/bans",
                 false,
             ))
-            .with_subscriber(log.dispatch())
             .await;
         assert!(app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed) > kept);
         assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
-        let text = log.text();
-        assert!(text.contains("failed to persist Discord retry deadline"));
+        assert!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+                > app
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+        );
         app.db
             .with_conn(|conn| {
                 conn.execute_batch_bounded("DROP TRIGGER reject_pacing_extend;", 65_536)
