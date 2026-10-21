@@ -88,7 +88,10 @@ token clears the incomplete-notice reservation; park and restore on the same tok
 still keeps it; a verified window is not cleared by the token change. A repeat
 incomplete notice is not sent
 after one was delivered. If delivery does not succeed, a later incomplete check
-in that window can try the notice again. A failed job does not clear hashes
+in that window can try the notice again. A permanent log-channel rejection
+(Discord 50001, 50013, or 10003) still uses the existing 30-minute suppression,
+so that later try does not call Discord again; a transient failure, including 429
+and 5xx, does. A failed job does not clear hashes
 already stored for those posts. Hashing still uses one CDN request per attachment
 that does not already have a stored hash, with no redirect follow and no retry.
 An overlapping job copies hashes stored since it was admitted before it charges

@@ -167,10 +167,10 @@ pub(crate) async fn send_discord_log_after_rate_limit(
         if response.status().is_success() {
             return Ok(true);
         }
-        return Err(anyhow!(
-            "discord log delivery failed ({})",
-            response.status().as_u16()
+        let error = serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+            serenity::http::ErrorResponse::from_response(response, reqwest::Method::POST).await,
         ));
+        return Err(error.into());
     }
 }
 

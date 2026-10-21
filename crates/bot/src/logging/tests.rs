@@ -2961,3 +2961,231 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn conditional_permanent_403_50013_suppresses_the_second_http_request() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 403,
+            headers: "",
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Blocked
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn conditional_permanent_404_unknown_channel_suppresses_the_second_http_request() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 404,
+            headers: "",
+            body: r#"{"code":10003,"message":"Unknown Channel"}"#,
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Blocked
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn conditional_403_without_destination_code_is_not_remembered() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 403,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+        ScriptedHttpReply {
+            status: 403,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            emit_to_if_after_rate_limit(
+                &f.app,
+                &http,
+                GuildId::new(789),
+                "automod",
+                BTreeMap::new(),
+                || true,
+            )
+            .await,
+            Delivery::Failed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn conditional_transient_5xx_and_429_are_not_remembered() {
+    use std::sync::atomic::Ordering;
+    let target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: 789,
+        channel: 456,
+    };
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 503,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+        ScriptedHttpReply {
+            status: 503,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert!(
+        !f.app
+            .remembered_discord_targets
+            .blocked(target, std::time::Instant::now())
+    );
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Failed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+        ScriptedHttpReply {
+            status: 429,
+            headers: "",
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            emit_to_if_after_rate_limit(
+                &f.app,
+                &http,
+                GuildId::new(789),
+                "automod",
+                BTreeMap::new(),
+                || true,
+            )
+            .await,
+            Delivery::Failed
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !f.app
+            .remembered_discord_targets
+            .blocked(target, std::time::Instant::now())
+    );
+    server.abort();
+}
