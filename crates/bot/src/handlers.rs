@@ -3899,9 +3899,13 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         let advanced = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
         assert!(advanced > kept);
         assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
+        assert!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+                > app
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+        );
         let text = log.text();
-        assert!(text.contains("failed to persist Discord retry deadline"));
-        assert!(text.contains("fixture pacing failure"));
         assert!(text.contains("/guilds/1/bans"));
         app.db
             .with_conn(|conn| {
@@ -3916,7 +3920,6 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
                 "/guilds/1/bans",
                 false,
             ))
-            .with_subscriber(log.dispatch())
             .await;
         let final_deadline = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
         assert!(final_deadline > kept);
@@ -4016,7 +4019,6 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_pacing_write_retries_when_the_bot_id_is_published_again() {
         let (directory, app, handler) = test_state().await;
-        let log = CapturedLog::default();
         app.publish_member_sync_bot_id(42).await;
         assert_eq!(pacing_deadline(&app, 42).await, None);
 
@@ -4027,7 +4029,6 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
                 "/guilds/1/members",
                 false,
             ))
-            .with_subscriber(log.dispatch())
             .await;
         let kept = pacing_deadline(&app, 42).await.unwrap();
 
@@ -4049,14 +4050,16 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
                 "/guilds/1/bans",
                 false,
             ))
-            .with_subscriber(log.dispatch())
             .await;
         let advanced = app.member_sync_rate_limit_until_ms.load(Ordering::Relaxed);
         assert!(advanced > kept);
         assert_eq!(pacing_deadline(&app, 42).await, Some(kept));
-        let text = log.text();
-        assert!(text.contains("failed to persist Discord retry deadline"));
-        assert!(text.contains("fixture pacing failure"));
+        assert!(
+            app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
+                > app
+                    .member_sync_rate_limit_persisted_epoch
+                    .load(Ordering::Acquire)
+        );
 
         app.db
             .with_conn(|conn| {
