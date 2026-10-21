@@ -15,7 +15,9 @@ use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
@@ -776,6 +778,7 @@ pub(crate) trait LogDelivery: Sync {
         channel: ChannelId,
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
+        _on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
     ) -> anyhow::Result<bool> {
         if !still_current() {
             return Ok(false);
@@ -803,9 +806,16 @@ impl LogDelivery for serenity::http::Http {
         channel: ChannelId,
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
+        on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
     ) -> anyhow::Result<bool> {
-        crate::discord::send_discord_log_after_rate_limit(self, channel, message, still_current)
-            .await
+        crate::discord::send_discord_log_after_rate_limit(
+            self,
+            channel,
+            message,
+            still_current,
+            on_global_rate_limit,
+        )
+        .await
     }
 }
 
@@ -1042,10 +1052,24 @@ async fn emit_to_observed_with_audit(
         if !commit() {
             return Ok(Delivery::Dropped);
         }
+        let on_global_rate_limit = {
+            let app = Arc::clone(app);
+            move |wait: crate::handlers::RateLimitWait| {
+                let app = Arc::clone(&app);
+                Box::pin(async move {
+                    crate::handlers::apply_rate_limit_wait(&app, wait).await;
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            }
+        };
         let call = crate::discord::race_discord_call(&app.activation, async {
             if after_rate_limit {
-                sink.send_after_rate_limit(channel_id, log_message(&rendered), &commit)
-                    .await
+                sink.send_after_rate_limit(
+                    channel_id,
+                    log_message(&rendered),
+                    &commit,
+                    &on_global_rate_limit,
+                )
+                .await
             } else {
                 sink.send(channel_id, log_message(&rendered)).await?;
                 Ok(true)

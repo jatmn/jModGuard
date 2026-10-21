@@ -2852,22 +2852,24 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
     let (http, calls, server) = scripted_discord_proxy(vec![
         ScriptedHttpReply {
             status: 200,
-            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset-after: 0.45\r\n",
+            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset-after: 30\r\n",
             body: "{}",
         },
         ScriptedHttpReply {
             status: 200,
-            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 1\r\nx-ratelimit-reset-after: 0.45\r\n",
+            headers: "x-ratelimit-limit: 1\r\nx-ratelimit-remaining: 1\r\nx-ratelimit-reset-after: 30\r\n",
             body: "{}",
         },
     ])
     .await;
+    let ignore_rl = crate::discord::ignore_global_rate_limit;
     assert!(
         crate::discord::send_discord_log_after_rate_limit(
             &http,
             ChannelId::new(456),
             CreateMessage::new().content("seed"),
             &|| true,
+            &ignore_rl,
         )
         .await
         .unwrap()
@@ -2876,23 +2878,23 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
     let superseded = Arc::new(AtomicBool::new(false));
     let hook_flag = Arc::clone(&superseded);
     let commit_flag = Arc::clone(&superseded);
-    let started = Instant::now();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
     let hook: Arc<dyn Fn() + Send + Sync> =
         Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
-    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
-        emit_to_if_after_rate_limit(
-            &f.app,
+    let sent = crate::discord::with_rate_limit_wait_hook(hook, async {
+        crate::discord::send_discord_log_after_rate_limit(
             &http,
-            GuildId::new(789),
-            "automod",
-            BTreeMap::new(),
-            move || !commit_flag.load(Ordering::SeqCst),
+            ChannelId::new(456),
+            CreateMessage::new().content("stale"),
+            &move || !commit_flag.load(Ordering::SeqCst),
+            &ignore_rl,
         )
         .await
     })
     .await;
     let elapsed = started.elapsed();
-    assert_eq!(delivery, Delivery::Dropped);
+    assert!(matches!(sent, Ok(false)));
     assert!(
         superseded.load(Ordering::SeqCst),
         "the reservation must change during the rate-limit wait"
@@ -2903,7 +2905,7 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
         "a stale notice must not be written after the wait"
     );
     assert!(
-        elapsed >= Duration::from_millis(300),
+        elapsed >= Duration::from_secs(25),
         "preemptive wait was too short: {elapsed:?}"
     );
     server.abort();
@@ -2919,7 +2921,7 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
     let (http, calls, server) = scripted_discord_proxy(vec![
         ScriptedHttpReply {
             status: 429,
-            headers: "retry-after: 0.45\r\n",
+            headers: "retry-after: 2\r\n",
             body: "{}",
         },
         ScriptedHttpReply {
@@ -2932,23 +2934,24 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
     let superseded = Arc::new(AtomicBool::new(false));
     let hook_flag = Arc::clone(&superseded);
     let commit_flag = Arc::clone(&superseded);
-    let started = Instant::now();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
     let hook: Arc<dyn Fn() + Send + Sync> =
         Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
-    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
-        emit_to_if_after_rate_limit(
-            &f.app,
+    let ignore_rl = crate::discord::ignore_global_rate_limit;
+    let sent = crate::discord::with_rate_limit_wait_hook(hook, async {
+        crate::discord::send_discord_log_after_rate_limit(
             &http,
-            GuildId::new(789),
-            "automod",
-            BTreeMap::new(),
-            move || !commit_flag.load(Ordering::SeqCst),
+            ChannelId::new(456),
+            CreateMessage::new().content("stale"),
+            &move || !commit_flag.load(Ordering::SeqCst),
+            &ignore_rl,
         )
         .await
     })
     .await;
     let elapsed = started.elapsed();
-    assert_eq!(delivery, Delivery::Dropped);
+    assert!(matches!(sent, Ok(false)));
     assert!(superseded.load(Ordering::SeqCst));
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -2956,8 +2959,8 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
         "the 429 request already left; the retry must not"
     );
     assert!(
-        elapsed >= Duration::from_millis(400),
-        "429 wait was too short: {elapsed:?}"
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+        "429 wait duration unexpected: {elapsed:?}"
     );
     server.abort();
 }
@@ -3187,5 +3190,353 @@ async fn conditional_transient_5xx_and_429_are_not_remembered() {
             .remembered_discord_targets
             .blocked(target, std::time::Instant::now())
     );
+    server.abort();
+}
+
+async fn member_sync_pacing_deadline(app: &BotState, bot_id: i64) -> Option<i64> {
+    app.db
+        .with_conn(move |conn| {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM member_sync_pacing WHERE bot_id=?1",
+                [bot_id],
+                |row| Ok(row.get(0)?),
+            )?;
+            if present == 0 {
+                return Ok(None);
+            }
+            conn.query_row(
+                "SELECT request_after_ms FROM member_sync_pacing WHERE bot_id=?1",
+                [bot_id],
+                |row| Ok(row.get(0)?),
+            )
+            .map(Some)
+        })
+        .await
+        .unwrap()
+}
+
+fn rate_limit_wait_log_lines(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.contains("rate-limit wait"))
+        .count()
+}
+
+#[tokio::test]
+async fn global_429_notifies_member_sync_and_retries_when_current() {
+    use crate::logging::persistence_log_tests::CapturedLog;
+    use std::sync::atomic::Ordering;
+    use tracing::instrument::WithSubscriber;
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    let log = CapturedLog::default();
+    let before = chrono::Utc::now().timestamp_millis();
+    let delivery = emit_to_if_after_rate_limit(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "automod",
+        BTreeMap::new(),
+        || true,
+    )
+    .with_subscriber(log.dispatch())
+    .await;
+    let after = chrono::Utc::now().timestamp_millis();
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored >= before && stored <= after + 1);
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    let text = log.text();
+    assert_eq!(rate_limit_wait_log_lines(&text), 1);
+    assert!(text.contains("Post"));
+    assert!(text.contains("/channels/456/messages"));
+    assert!(text.contains("global=true"));
+    assert!(!text.contains("127.0.0.1"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_notifies_member_sync_and_drops_the_retry_when_stale() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    let superseded = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&superseded);
+    let commit_flag = Arc::clone(&superseded);
+    let hook: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || hook_flag.store(true, Ordering::SeqCst));
+    let before = chrono::Utc::now().timestamp_millis();
+    let delivery = crate::discord::with_rate_limit_wait_hook(hook, async {
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            move || !commit_flag.load(Ordering::SeqCst),
+        )
+        .await
+    })
+    .await;
+    let after = chrono::Utc::now().timestamp_millis();
+    assert_eq!(delivery, Delivery::Dropped);
+    assert!(superseded.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let stored = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(stored >= before && stored <= after + 1);
+    assert_eq!(member_sync_pacing_deadline(&f.app, 42).await, Some(stored));
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_malformed_retry_after_does_not_notify() {
+    use crate::logging::persistence_log_tests::CapturedLog;
+    use std::sync::atomic::Ordering;
+    use tracing::instrument::WithSubscriber;
+
+    async fn run_case(headers: &'static str) {
+        let f = Fixture::new();
+        f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+        db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+            .await
+            .unwrap();
+        let (http, calls, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
+            status: 429,
+            headers,
+            body: "{}",
+        }])
+        .await;
+        let log = CapturedLog::default();
+        let delivery = emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .with_subscriber(log.dispatch())
+        .await;
+        assert_eq!(delivery, Delivery::Failed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.app
+                .member_sync_rate_limit_until_ms
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
+        assert_eq!(rate_limit_wait_log_lines(&log.text()), 0);
+        server.abort();
+    }
+
+    run_case("x-ratelimit-global: true\r\n").await;
+    run_case("x-ratelimit-global: true\r\nretry-after: nope\r\n").await;
+}
+
+#[tokio::test]
+async fn route_429_does_not_arm_member_sync() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "retry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.app
+            .member_sync_rate_limit_until_ms
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_virtual_wait_blocks_an_earlier_member_sync_claim() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    f.app.member_sync_bot_id.store(42, Ordering::Relaxed);
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 10\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 30\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    tokio::time::pause();
+    let member_sync_hook = crate::discord::member_sync_global_rate_limit_hook(Arc::clone(&f.app));
+    let before = chrono::Utc::now().timestamp_millis();
+    let started = tokio::time::Instant::now();
+    assert!(
+        crate::discord::send_discord_log_after_rate_limit(
+            &http,
+            ChannelId::new(456),
+            CreateMessage::new().content("notice"),
+            &|| true,
+            &member_sync_hook,
+        )
+        .await
+        .unwrap()
+    );
+    let elapsed = started.elapsed();
+    let after = chrono::Utc::now().timestamp_millis();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(
+        elapsed >= Duration::from_secs(40) && elapsed < Duration::from_secs(41),
+        "virtual wait unexpected: {elapsed:?}"
+    );
+    let deadline = f
+        .app
+        .member_sync_rate_limit_until_ms
+        .load(Ordering::Relaxed);
+    assert!(deadline >= before + 30_000 && deadline <= after + 30_000);
+    assert!(
+        crate::db::claim_member_sync_request(
+            &f.app.db,
+            42,
+            "fixture".into(),
+            deadline - 1,
+            15_000,
+            90_000,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        crate::db::claim_member_sync_request(
+            &f.app.db,
+            42,
+            "fixture".into(),
+            deadline,
+            15_000,
+            90_000,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn global_429_without_published_bot_id_still_retries() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod", 456)
+        .await
+        .unwrap();
+    let (http, calls, server) = scripted_discord_proxy(vec![
+        ScriptedHttpReply {
+            status: 429,
+            headers: "x-ratelimit-global: true\r\nretry-after: 0\r\n",
+            body: "{}",
+        },
+        ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to_if_after_rate_limit(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "automod",
+            BTreeMap::new(),
+            || true,
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        f.app
+            .member_sync_rate_limit_until_ms
+            .load(Ordering::Relaxed)
+            > 0
+    );
+    assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
     server.abort();
 }
