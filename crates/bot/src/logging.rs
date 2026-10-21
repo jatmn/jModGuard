@@ -44,6 +44,46 @@ where
     AUTOMOD_VARS_CAPTURE.scope(capture, f).await
 }
 
+#[cfg(test)]
+pub(crate) struct AutomodEmitPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AutomodEmitPause {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+type AutomodEmitPauseSlot = Arc<AutomodEmitPause>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUTOMOD_EMIT_PAUSE: AutomodEmitPauseSlot;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_automod_emit_pause<F, T>(pause: AutomodEmitPauseSlot, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    AUTOMOD_EMIT_PAUSE.scope(pause, f).await
+}
+
 /// Display-only correlation state. No entry may explain two reports, and an
 /// unresolved observation must not donate a delayed entry to a later action.
 #[derive(Default)]
@@ -730,6 +770,19 @@ pub fn shutdown_notice_content(uptime_seconds: u64) -> String {
 #[serenity::async_trait]
 pub(crate) trait LogDelivery: Sync {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()>;
+    /// `Ok(false)` drops the notice before the HTTP request is written.
+    async fn send_after_rate_limit(
+        &self,
+        channel: ChannelId,
+        message: CreateMessage,
+        still_current: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<bool> {
+        if !still_current() {
+            return Ok(false);
+        }
+        self.send(channel, message).await?;
+        Ok(true)
+    }
     async fn member_audit(&self, _guild: GuildId, _action: Action) -> anyhow::Result<AuditLogs> {
         anyhow::bail!("audit context unavailable")
     }
@@ -744,6 +797,15 @@ impl LogDelivery for serenity::http::Http {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
         channel.send_message(self, message).await?;
         Ok(())
+    }
+    async fn send_after_rate_limit(
+        &self,
+        channel: ChannelId,
+        message: CreateMessage,
+        still_current: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<bool> {
+        crate::discord::send_discord_log_after_rate_limit(self, channel, message, still_current)
+            .await
     }
 }
 
@@ -770,7 +832,54 @@ pub(crate) async fn emit_to(
     event: &str,
     vars: BTreeMap<String, String>,
 ) -> Delivery {
-    emit_to_observed(app, sink, guild_id, event, vars, None, Admission::Immediate).await
+    emit_to_if(app, sink, guild_id, event, vars, || true).await
+}
+
+pub(crate) async fn emit_to_if(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    vars: BTreeMap<String, String>,
+    commit: impl Fn() -> bool + Sync,
+) -> Delivery {
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        None,
+        Admission::Immediate,
+        commit,
+        false,
+    )
+    .await
+    .0
+}
+
+/// Incomplete-notice delivery. The predicate is checked again after a rate-limit wait.
+pub(crate) async fn emit_to_if_after_rate_limit(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    vars: BTreeMap<String, String>,
+    commit: impl Fn() -> bool + Sync,
+) -> Delivery {
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        None,
+        Admission::Immediate,
+        commit,
+        true,
+    )
+    .await
+    .0
 }
 
 async fn emit_to_observed(
@@ -782,11 +891,22 @@ async fn emit_to_observed(
     observation: Option<MemberAuditObservation>,
     admission: Admission,
 ) -> Delivery {
-    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation, admission)
-        .await
-        .0
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        observation,
+        admission,
+        || true,
+        false,
+    )
+    .await
+    .0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_to_observed_with_audit(
     app: &Arc<BotState>,
     sink: &impl LogDelivery,
@@ -795,6 +915,8 @@ async fn emit_to_observed_with_audit(
     mut vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
     admission: Admission,
+    commit: impl Fn() -> bool + Sync,
+    after_rate_limit: bool,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -870,10 +992,22 @@ async fn emit_to_observed_with_audit(
                 return Ok(Delivery::Unconfigured);
             }
         }
+        #[cfg(test)]
+        if event == "automod"
+            && let Ok(pause) = AUTOMOD_EMIT_PAUSE.try_with(Arc::clone)
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
         vars.insert("event".into(), event.to_owned());
         vars.entry("time".into())
             .or_insert_with(|| chrono::Utc::now().to_rfc3339());
         vars.insert("guild".into(), guild_id.get().to_string());
+        // Last step before the test capture records a send. Production checks again
+        // immediately before the Discord call.
+        if !commit() {
+            return Ok(Delivery::Dropped);
+        }
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
@@ -905,14 +1039,22 @@ async fn emit_to_observed_with_audit(
         let recovery = app
             .remembered_discord_targets
             .capture_recovery_epoch(rest_target);
-        match crate::discord::race_discord_call(
-            &app.activation,
-            sink.send(channel_id, log_message(&rendered)),
-        )
-        .await
-        {
+        if !commit() {
+            return Ok(Delivery::Dropped);
+        }
+        let call = crate::discord::race_discord_call(&app.activation, async {
+            if after_rate_limit {
+                sink.send_after_rate_limit(channel_id, log_message(&rendered), &commit)
+                    .await
+            } else {
+                sink.send(channel_id, log_message(&rendered)).await?;
+                Ok(true)
+            }
+        });
+        match call.await {
             crate::discord::DiscordCall::Cancelled => return Ok(Delivery::Dropped),
-            crate::discord::DiscordCall::Finished(Ok(())) => {
+            crate::discord::DiscordCall::Finished(Ok(false)) => return Ok(Delivery::Dropped),
+            crate::discord::DiscordCall::Finished(Ok(true)) => {
                 app.remembered_discord_targets.forget(rest_target);
             }
             crate::discord::DiscordCall::Finished(Err(error)) => {
@@ -1999,6 +2141,8 @@ pub(crate) async fn emit_member_event(
         vars,
         observation,
         Admission::Immediate,
+        || true,
+        false,
     )
     .await
     .1
@@ -2025,6 +2169,8 @@ pub(crate) async fn emit_verified_member_departure(
         vars,
         None,
         Admission::Immediate,
+        || true,
+        false,
     )
     .await;
 }

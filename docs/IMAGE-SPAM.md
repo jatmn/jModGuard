@@ -78,9 +78,20 @@ the attachment address. If a download, request budget, or comparison work budget
 match is proven, the automod title is **Exact image check incomplete**, the action
 is **no action; check did not finish**, and the Evidence field names the stopping
 gate (never a URL, hash, or image bytes). A later check in the same incomplete
-window can still become a verified hit. A repeat incomplete notice is not sent
+window can still become a verified hit. An incomplete notice that has not been
+sent is not sent once that verified match owns the window. That check runs again
+after a Discord rate-limit wait and before the log request is written. A request
+already sent is not recalled. Replacing a post's attachments clears an incomplete
+reservation and leaves a verified window in place. A parked author keeps the
+reservation, so the notice is still sent. A new configuration
+token clears the incomplete-notice reservation; park and restore on the same token
+still keeps it; a verified window is not cleared by the token change. A repeat
+incomplete notice is not sent
 after one was delivered. If delivery does not succeed, a later incomplete check
-in that window can try the notice again. A failed job does not clear hashes
+in that window can try the notice again. A permanent log-channel rejection
+(Discord 50001, 50013, or 10003) still uses the existing 30-minute suppression,
+so that later try does not call Discord again; a transient failure, including 429
+and 5xx, does. A failed job does not clear hashes
 already stored for those posts. Hashing still uses one CDN request per attachment
 that does not already have a stored hash, with no redirect follow and no retry.
 An overlapping job copies hashes stored since it was admitted before it charges

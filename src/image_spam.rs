@@ -255,6 +255,8 @@ pub enum DownloadError {
     SizeMismatch,
     #[error("body read failure")]
     BodyRead,
+    #[error("capture failure")]
+    Capture,
 }
 
 pub struct Hasher {
@@ -359,6 +361,7 @@ fn download_anyhow(error: DownloadError) -> anyhow::Error {
             anyhow::anyhow!("image body length differs from declared size")
         }
         DownloadError::BodyRead => anyhow::anyhow!("image body failed"),
+        DownloadError::Capture => anyhow::anyhow!("image capture failed"),
     }
 }
 
@@ -382,8 +385,7 @@ async fn stream_body(
             return Err(DownloadError::SizeMismatch);
         }
         if let Some(file) = dest.as_mut() {
-            file.write_all(&chunk)
-                .map_err(|_| DownloadError::Transport)?;
+            file.write_all(&chunk).map_err(|_| DownloadError::Capture)?;
         }
         hash.update(&chunk);
     }
@@ -391,7 +393,7 @@ async fn stream_body(
         return Err(DownloadError::SizeMismatch);
     }
     if let Some(file) = dest.as_mut() {
-        file.sync_all().map_err(|_| DownloadError::Transport)?;
+        file.sync_all().map_err(|_| DownloadError::Capture)?;
     }
     Ok(hash.finish().as_ref().try_into().expect("SHA256 length"))
 }
@@ -521,7 +523,7 @@ mod tests {
             Err(DownloadError::HttpStatus(429))
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_millis(100),
             "429 must not backoff"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is a single request");
@@ -582,6 +584,42 @@ mod tests {
         );
         let _ = std::fs::remove_file(&dest);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn capture_write_is_not_a_download_transport_error() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard-capture-write-{:032x}.part",
+            rand::random::<u128>()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let mut file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let error = stream_body(Body::from("abc"), 3, Some(&mut file))
+            .await
+            .unwrap_err();
+        assert_eq!(error, DownloadError::Capture);
+        let message = format!("{:#}", download_anyhow(error));
+        assert_eq!(message, "image capture failed");
+        assert!(!message.contains("image download failed"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn capture_sync_is_not_a_download_transport_error() {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let error = stream_body(Body::from("abc"), 3, Some(&mut file))
+            .await
+            .unwrap_err();
+        assert_eq!(error, DownloadError::Capture);
+    }
+
+    #[test]
+    fn download_transport_anyhow_is_unchanged() {
+        let message = format!("{:#}", download_anyhow(DownloadError::Transport));
+        assert_eq!(message, "image download failed");
     }
 
     #[test]
