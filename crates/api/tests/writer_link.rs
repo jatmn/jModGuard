@@ -1,10 +1,16 @@
 //! The production API open is read-only. A settings save reaches a separate writer.
 use jmodguard::config::{ApiProcessConfig, BotProcessConfig, ControlSecret};
-use jmodguard::db::{self, Db};
+use jmodguard::db::{self, Db, SqlExecutor};
 use jmodguard::tenant::TenantRuntime;
 use jmodguard_api::web::state::ApiState;
+use jmodguard_api::web::updates::{
+    RELEASE_LOOKUP_TIMEOUT, record_release_checks, run_release_check_loop,
+};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 fn temp_db(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -15,6 +21,110 @@ fn temp_db(label: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+struct InstallSnapshot {
+    desired: Option<db::ComponentRelease>,
+    desired_launcher: Option<db::ComponentRelease>,
+    installed: Option<db::ComponentRelease>,
+    state: String,
+    auto_last_digest: Option<String>,
+    auto_last_window: Option<String>,
+}
+
+async fn install_snapshot(db: &Db, component: &str) -> InstallSnapshot {
+    let row = db::component_update(db, component).await.unwrap();
+    let component_id = component.to_owned();
+    let (auto_last_digest, auto_last_window) = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT auto_last_digest, auto_last_window FROM component_updates WHERE component=?1",
+                [component_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    InstallSnapshot {
+        desired: row.desired,
+        desired_launcher: row.desired_launcher,
+        installed: row.installed,
+        state: row.state,
+        auto_last_digest,
+        auto_last_window,
+    }
+}
+
+async fn assert_install_unchanged(db: &Db, component: &str, before: &InstallSnapshot) {
+    let after = install_snapshot(db, component).await;
+    assert_eq!(after.desired, before.desired, "{component} desired");
+    assert_eq!(
+        after.desired_launcher, before.desired_launcher,
+        "{component} desired_launcher"
+    );
+    assert_eq!(after.installed, before.installed, "{component} installed");
+    assert_eq!(after.state, before.state, "{component} state");
+    assert_ne!(after.state, "queued", "{component}");
+    assert_eq!(
+        after.auto_last_digest, before.auto_last_digest,
+        "{component} auto_last_digest"
+    );
+    assert_eq!(
+        after.auto_last_window, before.auto_last_window,
+        "{component} auto_last_window"
+    );
+}
+
+fn discover_release(
+    component: &str,
+    channel: &str,
+    digest_nibble: char,
+) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<db::ComponentRelease>> + Send>> {
+    let release = test_release(component, channel, digest_nibble);
+    Box::pin(async move { Ok(release) })
+}
+
+fn test_release(component: &str, channel: &str, digest_nibble: char) -> db::ComponentRelease {
+    let digest = format!("sha256:{}", digest_nibble.to_string().repeat(64));
+    db::ComponentRelease {
+        upgrade: None,
+        component: component.into(),
+        channel: channel.into(),
+        release_id: "test".into(),
+        source_sha: "a".repeat(40),
+        published_at: "2026-10-01T00:00:00Z".into(),
+        image: format!("ghcr.io/jatmn/jmodguard-{component}"),
+        digest,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        result_schema: db::CORE_SCHEMA_VERSION,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: None,
+        base_abi: if component == "webui" {
+            "static-webui-v1".into()
+        } else {
+            "debian-bookworm-amd64".into()
+        },
+    }
+}
+
+fn pending_shutdown() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(std::future::pending())
+}
+
+fn watch_shutdown(
+    rx: &tokio::sync::watch::Receiver<bool>,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    let mut rx = rx.clone();
+    Box::pin(async move {
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
 }
 
 fn cleanup(path: &Path) {
@@ -359,16 +469,341 @@ async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
         !jmodguard_api::web::updates::release_check_is_stale(stored.checked_at, now),
         "an install immediately after Check must not be stale"
     );
-    let before = probe.immediate();
-    jmodguard_api::web::updates::poll_releases(&app, async |_component, _channel| {
-        Ok::<_, anyhow::Error>("sha256:dddd".to_owned())
-    })
-    .await;
+    let before_probe = probe.immediate();
+    let before_bot = install_snapshot(&bot.db, "bot").await;
+    let before_api = install_snapshot(&bot.db, "api").await;
+    let before_webui = install_snapshot(&bot.db, "webui").await;
+    assert!(
+        record_release_checks(
+            &app,
+            |component, channel| discover_release(component, channel, 'd'),
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    );
     assert_eq!(
         probe.immediate(),
-        before,
-        "the hourly API timer writes nothing"
+        before_probe,
+        "the hourly API timer must not open a local write transaction"
     );
+    let expected_digest = format!("sha256:{}", "d".repeat(64));
+    for component in ["bot", "api", "webui"] {
+        let stored = db::component_update(&bot.db, component).await.unwrap();
+        assert_eq!(stored.candidate.unwrap().digest, expected_digest);
+        assert!(stored.checked_at.is_some());
+        assert!(stored.check_error.is_none());
+    }
+    assert_install_unchanged(&bot.db, "bot", &before_bot).await;
+    assert_install_unchanged(&bot.db, "api", &before_api).await;
+    assert_install_unchanged(&bot.db, "webui", &before_webui).await;
+
+    let policy = app
+        .commit(db::ControlOp::SetUpdatePolicy {
+            component: "api".into(),
+            channel: "stable".into(),
+            cadence: "daily".into(),
+            unattended_allowed: true,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(policy, db::ControlReply::Saved { .. }));
+    let before_api = install_snapshot(&bot.db, "api").await;
+    assert!(
+        record_release_checks(
+            &app,
+            |component, channel| discover_release(component, channel, 'e'),
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    );
+    let api_row = db::component_update(&bot.db, "api").await.unwrap();
+    assert!(api_row.desired.is_none());
+    assert_ne!(api_row.state, "queued");
+    assert_install_unchanged(&bot.db, "api", &before_api).await;
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_records_the_channel_digest_and_does_not_install() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-digest").await;
+    let probe = Arc::new(db::StartupProbe::default());
+    let _guard = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let before_probe = probe.immediate();
+    let snapshots = [
+        ("bot", install_snapshot(&bot.db, "bot").await),
+        ("api", install_snapshot(&bot.db, "api").await),
+        ("webui", install_snapshot(&bot.db, "webui").await),
+    ];
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: db::component_update(&app.db, "bot").await.unwrap().channel,
+        candidate: None,
+        error: Some("seed".into()),
+        now: chrono::Utc::now().timestamp(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        record_release_checks(
+            &app,
+            |component, channel| discover_release(component, channel, 'f'),
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    );
+    assert_eq!(probe.immediate(), before_probe);
+    let expected_digest = format!("sha256:{}", "f".repeat(64));
+    for component in ["bot", "api", "webui"] {
+        let stored = db::component_update(&bot.db, component).await.unwrap();
+        assert_eq!(stored.candidate.unwrap().digest, expected_digest);
+        assert!(stored.checked_at.is_some());
+        assert!(stored.check_error.is_none());
+    }
+    for (component, before) in snapshots {
+        assert_install_unchanged(&bot.db, component, &before).await;
+    }
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_records_a_lookup_error_and_does_not_install() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-err").await;
+    let seed = test_release("bot", "latest", '1');
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "latest".into(),
+        candidate: Some(seed.clone()),
+        error: None,
+        now: 1,
+    })
+    .await
+    .unwrap();
+    let before = [
+        ("bot", install_snapshot(&bot.db, "bot").await),
+        ("api", install_snapshot(&bot.db, "api").await),
+        ("webui", install_snapshot(&bot.db, "webui").await),
+    ];
+    let calls = AtomicUsize::new(0);
+    assert!(
+        record_release_checks(
+            &app,
+            |_component, _channel| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { anyhow::bail!("registry lookup failed") })
+            },
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for component in ["bot", "api", "webui"] {
+        let stored = db::component_update(&bot.db, component).await.unwrap();
+        assert!(
+            stored
+                .check_error
+                .as_deref()
+                .is_some_and(|err| err.contains("registry lookup failed"))
+        );
+        assert!(stored.checked_at.is_some());
+    }
+    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+    assert_eq!(bot_row.candidate.unwrap().digest, seed.digest);
+    for (component, snap) in before {
+        assert_install_unchanged(&bot.db, component, &snap).await;
+    }
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_records_a_lookup_timeout_and_does_not_install() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-timeout").await;
+    let before = [
+        ("bot", install_snapshot(&bot.db, "bot").await),
+        ("api", install_snapshot(&bot.db, "api").await),
+        ("webui", install_snapshot(&bot.db, "webui").await),
+    ];
+    let started = std::time::Instant::now();
+    assert!(
+        record_release_checks(
+            &app,
+            |_component, _channel| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(test_release("bot", "latest", '2'))
+                })
+            },
+            Duration::from_millis(50),
+            pending_shutdown(),
+        )
+        .await
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    for component in ["bot", "api", "webui"] {
+        let stored = db::component_update(&bot.db, component).await.unwrap();
+        assert!(
+            stored
+                .check_error
+                .as_deref()
+                .is_some_and(|err| err.contains("timed out"))
+        );
+    }
+    for (component, snap) in before {
+        assert_install_unchanged(&bot.db, component, &snap).await;
+    }
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_records_http_429_and_does_not_retry() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-429").await;
+    let seed = test_release("bot", "latest", '3');
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "latest".into(),
+        candidate: Some(seed.clone()),
+        error: None,
+        now: 1,
+    })
+    .await
+    .unwrap();
+    let before = install_snapshot(&bot.db, "bot").await;
+    let calls = AtomicUsize::new(0);
+    assert!(
+        record_release_checks(
+            &app,
+            |_component, _channel| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { anyhow::bail!("registry returned HTTP 429") })
+            },
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+    assert!(
+        bot_row
+            .check_error
+            .as_deref()
+            .is_some_and(|err| err.contains("429"))
+    );
+    assert_eq!(bot_row.candidate.unwrap().digest, seed.digest);
+    assert_install_unchanged(&bot.db, "bot", &before).await;
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_skips_overlapping_ticks() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-overlap").await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let app_task = Arc::clone(&app);
+    let gate_worker = Arc::clone(&gate);
+    let in_flight_worker = Arc::clone(&in_flight);
+    let calls_worker = Arc::clone(&calls);
+    let worker = tokio::spawn(async move {
+        run_release_check_loop(
+            app_task,
+            Duration::from_millis(10),
+            RELEASE_LOOKUP_TIMEOUT,
+            move |_component, _channel| {
+                let gate = Arc::clone(&gate_worker);
+                let in_flight = Arc::clone(&in_flight_worker);
+                let calls = Arc::clone(&calls_worker);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(active <= 1, "overlapping release checks");
+                    gate.notified().await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(test_release("bot", "latest", '4'))
+                })
+            },
+            || watch_shutdown(&stop_rx),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = stop_tx.send(true);
+    worker.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_stops_on_shutdown_without_installing() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-shutdown").await;
+    let api_gate = Arc::new(tokio::sync::Notify::new());
+    let webui_called = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let started = std::time::Instant::now();
+    let app_task = Arc::clone(&app);
+    let api_gate_worker = Arc::clone(&api_gate);
+    let webui_called_worker = Arc::clone(&webui_called);
+    let worker = tokio::spawn(async move {
+        run_release_check_loop(
+            app_task,
+            Duration::from_secs(3600),
+            RELEASE_LOOKUP_TIMEOUT,
+            move |component, channel| {
+                let (component, channel) = (component.to_owned(), channel.to_owned());
+                let api_gate = Arc::clone(&api_gate_worker);
+                let webui_called = Arc::clone(&webui_called_worker);
+                Box::pin(async move {
+                    if component == "bot" {
+                        return Ok(test_release(&component, &channel, '5'));
+                    }
+                    if component == "api" {
+                        api_gate.notified().await;
+                        Ok(test_release(&component, &channel, '6'))
+                    } else {
+                        webui_called.fetch_add(1, Ordering::SeqCst);
+                        Ok(test_release(&component, &channel, '7'))
+                    }
+                })
+            },
+            || watch_shutdown(&stop_rx),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = stop_tx.send(true);
+    worker.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+    assert_eq!(
+        bot_row.candidate.unwrap().digest,
+        format!("sha256:{}", "5".repeat(64))
+    );
+    let api_row = db::component_update(&bot.db, "api").await.unwrap();
+    assert!(api_row.candidate.is_none() || api_row.check_error.is_some());
+    assert_eq!(webui_called.load(Ordering::SeqCst), 0);
+    for component in ["bot", "api", "webui"] {
+        let row = db::component_update(&bot.db, component).await.unwrap();
+        assert_ne!(row.state, "queued");
+    }
     drop(app);
     drop(bot);
     cleanup(&path);

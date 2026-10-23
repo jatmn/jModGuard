@@ -11,8 +11,10 @@ use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::timeout;
 use tower_sessions::Session;
 
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -534,6 +536,177 @@ async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow:
         }
     }
     Ok(())
+}
+
+pub const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+pub const RELEASE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn control_link_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
+}
+
+async fn record_release_check(
+    app: &Arc<ApiState>,
+    component: &str,
+    channel: &str,
+    candidate: Option<ComponentRelease>,
+    error: Option<String>,
+    now: i64,
+) -> anyhow::Result<()> {
+    via_bot!(
+        app,
+        db::record_update_check(
+            &app.db,
+            component,
+            channel,
+            candidate.clone(),
+            error.clone(),
+            now
+        ),
+        db::ControlOp::RecordUpdateCheck {
+            component: component.to_owned(),
+            channel: channel.to_owned(),
+            candidate,
+            error,
+            now,
+        }
+    )?;
+    Ok(())
+}
+
+/// Record configured-channel digest lookups through the bot writer. Discovery is
+/// injected so tests do not call the registry.
+pub async fn record_release_checks<F>(
+    app: &Arc<ApiState>,
+    mut discover: F,
+    lookup_timeout: Duration,
+    mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> bool
+where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+{
+    for component in ["bot", "api", "webui"] {
+        let state = match db::component_update(&app.db, component).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(component, "release read failed: {error:#}");
+                continue;
+            }
+        };
+        let channel = state.channel.clone();
+        let outcome = tokio::select! {
+            _ = &mut shutdown => return false,
+            outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+        };
+        let now = chrono::Utc::now().timestamp();
+        match outcome {
+            Err(_) => {
+                if let Err(error) = record_release_check(
+                    app,
+                    component,
+                    &channel,
+                    None,
+                    Some("release lookup timed out".into()),
+                    now,
+                )
+                .await
+                {
+                    if control_link_unavailable(&error) {
+                        tracing::warn!(component, "control link unavailable during release check");
+                    } else {
+                        tracing::warn!(component, "failed to record release check: {error:#}");
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                let message = format!("{error:#}");
+                if let Err(error) =
+                    record_release_check(app, component, &channel, None, Some(message), now).await
+                {
+                    if control_link_unavailable(&error) {
+                        tracing::warn!(component, "control link unavailable during release check");
+                    } else {
+                        tracing::warn!(component, "failed to record release check: {error:#}");
+                    }
+                }
+            }
+            Ok(Ok(release)) => {
+                let record = if let Err(error) = release.validate() {
+                    Err(format!("{error:#}"))
+                } else if release.component != component || release.channel != channel {
+                    Err("candidate component or channel mismatch".into())
+                } else {
+                    Ok(release)
+                };
+                match record {
+                    Ok(release) => {
+                        if let Err(error) =
+                            record_release_check(app, component, &channel, Some(release), None, now)
+                                .await
+                        {
+                            if control_link_unavailable(&error) {
+                                tracing::warn!(
+                                    component,
+                                    "control link unavailable during release check"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    component,
+                                    "failed to record release check: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        if let Err(error) =
+                            record_release_check(app, component, &channel, None, Some(message), now)
+                                .await
+                        {
+                            if control_link_unavailable(&error) {
+                                tracing::warn!(
+                                    component,
+                                    "control link unavailable during release check"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    component,
+                                    "failed to record release check: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Background release checks for the configured channel. Each tick completes
+/// before the next interval fires.
+pub async fn run_release_check_loop<F, S>(
+    app: Arc<ApiState>,
+    interval: Duration,
+    lookup_timeout: Duration,
+    mut discover: F,
+    shutdown: S,
+) where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+    S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
+{
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown() => break,
+            _ = tick.tick() => {}
+        }
+        if !record_release_checks(&app, &mut discover, lookup_timeout, shutdown()).await {
+            break;
+        }
+    }
 }
 
 /// Read-only release poll. A changed candidate is logged and not recorded.
