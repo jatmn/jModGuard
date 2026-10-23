@@ -710,10 +710,7 @@ async fn background_check_records_http_429_and_does_not_retry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn background_check_skips_record_when_update_lease_held() {
     let (bot, app, path, _enrollment) = linked_writer("bg-lease").await;
-    let channel = db::component_update(&app.db, "bot")
-        .await
-        .unwrap()
-        .channel;
+    let channel = db::component_update(&app.db, "bot").await.unwrap().channel;
     let owner = test_release("bot", &channel, 'o');
     let now = chrono::Utc::now().timestamp();
     app.commit(db::ControlOp::RecordUpdateCheck {
@@ -747,53 +744,9 @@ async fn background_check_skips_record_when_update_lease_held() {
         api_row.candidate.unwrap().digest,
         format!("sha256:{}", "z".repeat(64))
     );
-    db::release_update_lease(&bot.db, "bot", &held).await.unwrap();
-    drop(app);
-    drop(bot);
-    cleanup(&path);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn background_check_skips_record_when_update_lease_held() {
-    let (bot, app, path, _enrollment) = linked_writer("bg-lease").await;
-    let channel = db::component_update(&app.db, "bot")
+    db::release_update_lease(&bot.db, "bot", &held)
         .await
-        .unwrap()
-        .channel;
-    let owner = test_release("bot", &channel, 'o');
-    let now = chrono::Utc::now().timestamp();
-    app.commit(db::ControlOp::RecordUpdateCheck {
-        component: "bot".into(),
-        channel: channel.clone(),
-        candidate: Some(owner.clone()),
-        error: None,
-        now,
-    })
-    .await
-    .unwrap();
-    let held = "h".repeat(32);
-    assert!(
-        db::claim_update_lease(&bot.db, "bot", &held, now, 240)
-            .await
-            .unwrap()
-    );
-    assert!(
-        record_release_checks(
-            &app,
-            |component, channel| discover_release(component, channel, 'z'),
-            RELEASE_LOOKUP_TIMEOUT,
-            pending_shutdown(),
-        )
-        .await
-    );
-    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
-    assert_eq!(bot_row.candidate.unwrap().digest, owner.digest);
-    let api_row = db::component_update(&bot.db, "api").await.unwrap();
-    assert_eq!(
-        api_row.candidate.unwrap().digest,
-        format!("sha256:{}", "z".repeat(64))
-    );
-    db::release_update_lease(&bot.db, "bot", &held).await.unwrap();
+        .unwrap();
     drop(app);
     drop(bot);
     cleanup(&path);

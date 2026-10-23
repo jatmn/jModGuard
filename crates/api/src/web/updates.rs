@@ -606,8 +606,7 @@ where
         let channel = state.channel.clone();
         let lease = format!("{:032x}", rand::random::<u128>());
         let claim_now = chrono::Utc::now().timestamp();
-        let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await
-        {
+        let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(component, "release check skipped: {error:#}");

@@ -1030,7 +1030,7 @@ mod presentation_tests {
             .unwrap();
         assert!(api.contains("observation stale (2h)"), "{api}");
         assert!(!api.ends_with('✅'), "{api}");
-        assert!(!api.contains('⬆️'), "{api}");
+        assert!(!api.contains("⬆️"), "{api}");
     }
 
     #[test]
