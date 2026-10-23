@@ -597,6 +597,7 @@ where
         };
         let channel = state.channel.clone();
         let outcome = tokio::select! {
+            biased;
             _ = &mut shutdown => return false,
             outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
         };
@@ -684,8 +685,39 @@ where
     true
 }
 
-/// Background release checks for the configured channel. Each tick completes
-/// before the next interval fires.
+/// Promoted channels may install on a cadence. `latest` cannot, and cadence
+/// `off` never does. This is the same pair `set_update_policy` allows.
+pub fn scheduled_auto_install_allowed(channel: &str, cadence: &str) -> bool {
+    matches!(channel, "stable" | "nightly") && matches!(cadence, "daily" | "weekly" | "monthly")
+}
+
+/// The install half of [`poll_all`]. Flags still default off. Rows that are
+/// not a stable or nightly cadence are left untouched.
+pub async fn poll_scheduled_installs(app: &Arc<ApiState>) {
+    if !(enabled("JMODGUARD_UNATTENDED_UPDATES") && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")) {
+        return;
+    }
+    for component in ["bot", "api", "webui"] {
+        let state = match db::component_update(&app.db, component).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(component, "automatic update skipped: {error:#}");
+                continue;
+            }
+        };
+        if !scheduled_auto_install_allowed(&state.channel, &state.cadence) {
+            continue;
+        }
+        if let Err(error) = automatic_install(app, component).await {
+            tracing::warn!(component, "automatic update skipped: {error:#}");
+        }
+    }
+}
+
+/// Background release checks for the configured channel. Each tick records the
+/// digest, then runs [`poll_scheduled_installs`] for stable and nightly
+/// cadences. `latest` and cadence `off` stay record-only. A tick finishes
+/// before the next one starts.
 pub async fn run_release_check_loop<F, S>(
     app: Arc<ApiState>,
     interval: Duration,
@@ -700,11 +732,22 @@ pub async fn run_release_check_loop<F, S>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             _ = shutdown() => break,
             _ = tick.tick() => {}
         }
-        if !record_release_checks(&app, &mut discover, lookup_timeout, shutdown()).await {
+        let finished = tokio::select! {
+            biased;
+            _ = shutdown() => break,
+            finished = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()) => finished,
+        };
+        if !finished {
             break;
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown() => break,
+            _ = poll_scheduled_installs(&app) => {}
         }
     }
 }
@@ -743,21 +786,16 @@ pub async fn poll_releases(
     }
 }
 
-/// API process timer is independent of browser sessions and auto-apply policy.
+/// Log-only registry poll plus the scheduled install. The hourly task does not
+/// call this: it records through [`record_release_checks`], then
+/// [`poll_scheduled_installs`], so a second unrecorded lookup does not run.
 pub async fn poll_all(app: &Arc<ApiState>) {
     poll_releases(app, async |component, channel| {
         let registry = Registry::ghcr()?;
         Ok(registry.discover(component, channel).await?.digest)
     })
     .await;
-    for component in ["bot", "api", "webui"] {
-        if enabled("JMODGUARD_UNATTENDED_UPDATES")
-            && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")
-            && let Err(error) = automatic_install(app, component).await
-        {
-            tracing::warn!(component, "automatic update skipped: {error:#}");
-        }
-    }
+    poll_scheduled_installs(app).await;
 }
 
 async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Result<()> {
@@ -1152,6 +1190,20 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_auto_install_allows_only_promoted_cadences() {
+        for cadence in ["daily", "weekly", "monthly"] {
+            assert!(scheduled_auto_install_allowed("stable", cadence));
+            assert!(scheduled_auto_install_allowed("nightly", cadence));
+        }
+        for channel in ["latest", "stable", "nightly"] {
+            assert!(!scheduled_auto_install_allowed(channel, "off"));
+        }
+        for cadence in ["daily", "weekly", "monthly"] {
+            assert!(!scheduled_auto_install_allowed("latest", cadence));
+        }
+    }
 
     #[tokio::test]
     async fn live_webui_worker_renews_lease_through_slow_work() {

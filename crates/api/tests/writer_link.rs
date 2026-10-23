@@ -809,6 +809,146 @@ async fn background_check_stops_on_shutdown_without_installing() {
     cleanup(&path);
 }
 
+struct ApplyFlags;
+
+impl ApplyFlags {
+    fn enable() -> Self {
+        unsafe {
+            std::env::set_var("JMODGUARD_UNATTENDED_UPDATES", "1");
+            std::env::set_var("JMODGUARD_UPDATE_APPLY_ENABLED", "1");
+        }
+        Self
+    }
+}
+
+impl Drop for ApplyFlags {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("JMODGUARD_UNATTENDED_UPDATES");
+            std::env::remove_var("JMODGUARD_UPDATE_APPLY_ENABLED");
+        }
+    }
+}
+
+fn running_observation(now: i64) -> db::ComponentObservation {
+    db::ComponentObservation {
+        source_sha: "b".repeat(40),
+        executable_sha256: "c".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "d".repeat(40),
+        started_at: now,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+        guild_schema: Some(1),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+    }
+}
+
+fn promoted_release(component: &str, channel: &str, nibble: char) -> db::ComponentRelease {
+    let mut release = test_release(component, channel, nibble);
+    release.upgrade = Some(db::UpgradeCompatibility {
+        control_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        min_core: 15,
+        min_guild: 1,
+        guild_schema: 1,
+    });
+    release.launcher = Some(db::LauncherCompatibility {
+        revision: db::LAUNCHER_REVISION,
+        min_revision: db::REQUIRED_LAUNCHER_REVISION,
+    });
+    release
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_still_schedules_promoted_cadences() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-cadence").await;
+    let now = chrono::Utc::now().timestamp();
+    for component in ["bot", "api"] {
+        app.commit(db::ControlOp::RecordBakedComponentRunning {
+            component: component.into(),
+            observation: running_observation(now),
+            now,
+        })
+        .await
+        .unwrap();
+    }
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "bot".into(),
+        channel: "nightly".into(),
+        cadence: "weekly".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "api".into(),
+        channel: "stable".into(),
+        cadence: "daily".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    let _flags = ApplyFlags::enable();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let app_task = Arc::clone(&app);
+    let worker = tokio::spawn(async move {
+        run_release_check_loop(
+            app_task,
+            Duration::from_secs(3600),
+            RELEASE_LOOKUP_TIMEOUT,
+            |component, channel| {
+                let nibble = match component {
+                    "bot" => 'b',
+                    "api" => 'a',
+                    _ => 'c',
+                };
+                let release = promoted_release(component, channel, nibble);
+                Box::pin(async move { Ok(release) })
+            },
+            || watch_shutdown(&stop_rx),
+        )
+        .await;
+    });
+    let started = std::time::Instant::now();
+    loop {
+        let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+        let api_row = db::component_update(&bot.db, "api").await.unwrap();
+        if bot_row.desired.is_some() && api_row.desired.is_some() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "promoted cadence was not queued: bot={bot_row:?} api={api_row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = stop_tx.send(true);
+    worker.await.unwrap();
+    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+    let api_row = db::component_update(&bot.db, "api").await.unwrap();
+    let webui_row = db::component_update(&bot.db, "webui").await.unwrap();
+    assert_eq!(bot_row.state, "queued");
+    assert_eq!(api_row.state, "queued");
+    assert_eq!(
+        bot_row.desired.unwrap().digest,
+        format!("sha256:{}", "b".to_string().repeat(64))
+    );
+    assert_eq!(
+        api_row.desired.unwrap().digest,
+        format!("sha256:{}", "a".to_string().repeat(64))
+    );
+    assert!(webui_row.desired.is_none());
+    assert_ne!(webui_row.state, "queued");
+    assert!(webui_row.candidate.is_some());
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn check_without_a_control_target_is_control_link_unavailable() {
     let path = temp_db("check-down");
