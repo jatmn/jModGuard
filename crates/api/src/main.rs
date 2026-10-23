@@ -108,7 +108,9 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     web::updates::run_release_check_loop(
                         update_app,
-                        web::updates::RELEASE_CHECK_INTERVAL,
+                        web::updates::ReleaseCheckTick::interval(
+                            web::updates::RELEASE_CHECK_INTERVAL,
+                        ),
                         web::updates::RELEASE_LOOKUP_TIMEOUT,
                         |component, channel| {
                             let (component, channel) = (component.to_owned(), channel.to_owned());

@@ -4,8 +4,8 @@ use jmodguard::db::{self, Db, SqlExecutor};
 use jmodguard::tenant::TenantRuntime;
 use jmodguard_api::web::state::ApiState;
 use jmodguard_api::web::updates::{
-    RELEASE_LOOKUP_TIMEOUT, ScheduledInstallPolicy, poll_scheduled_installs, record_release_checks,
-    run_release_check_loop,
+    RELEASE_LOOKUP_TIMEOUT, ReleaseCheckTick, ScheduledInstallPolicy, poll_scheduled_installs,
+    record_release_checks, run_release_check_loop,
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -864,20 +864,25 @@ async fn background_check_skips_scheduled_install_when_update_lease_held() {
 async fn background_check_skips_overlapping_ticks() {
     let (bot, app, path, _enrollment) = linked_writer("bg-overlap").await;
     let gate = Arc::new(tokio::sync::Notify::new());
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let (lookup_started_tx, mut lookup_started_rx) = tokio::sync::mpsc::channel(4);
+    let (lookup_started_tx, mut lookup_started_rx) = tokio::sync::mpsc::channel(8);
+    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(false);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let gate_worker = Arc::clone(&gate);
     let in_flight_worker = Arc::clone(&in_flight);
     let calls_worker = Arc::clone(&calls);
+    let tick = ReleaseCheckTick::coalescing(Arc::clone(&tick_notify), parked_tx);
+    tick.fire();
     let worker = tokio::spawn(async move {
         run_release_check_loop(
             app_task,
-            Duration::from_millis(10),
+            tick,
             RELEASE_LOOKUP_TIMEOUT,
-            move |_component, _channel| {
+            move |component, channel| {
+                let (component, channel) = (component.to_owned(), channel.to_owned());
                 let gate = Arc::clone(&gate_worker);
                 let in_flight = Arc::clone(&in_flight_worker);
                 let calls = Arc::clone(&calls_worker);
@@ -890,9 +895,11 @@ async fn background_check_skips_overlapping_ticks() {
                         .send(ordinal)
                         .await
                         .expect("test must receive lookup start signals");
-                    gate.notified().await;
+                    if ordinal == 1 {
+                        gate.notified().await;
+                    }
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok(test_release("bot", "latest", '4'))
+                    Ok(test_release(&component, &channel, '4'))
                 })
             },
             || watch_shutdown(&stop_rx),
@@ -907,16 +914,43 @@ async fn background_check_skips_overlapping_ticks() {
             .expect("first lookup did not start in time"),
         Some(1)
     );
+    tick_notify.notify_one();
+    tick_notify.notify_one();
+    tick_notify.notify_one();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     gate.notify_one();
-    assert_eq!(
-        tokio::time::timeout(wait, lookup_started_rx.recv())
-            .await
-            .expect("second lookup did not start in time"),
-        Some(2)
+    for expected in [2, 3] {
+        assert_eq!(
+            tokio::time::timeout(wait, lookup_started_rx.recv())
+                .await
+                .expect("lookup did not finish the first tick in time"),
+            Some(expected)
+        );
+    }
+    tick_notify.notify_one();
+    for expected in [4, 5, 6] {
+        assert_eq!(
+            tokio::time::timeout(wait, lookup_started_rx.recv())
+                .await
+                .expect("second tick did not run in time"),
+            Some(expected)
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    let parked = tokio::time::timeout(wait, async {
+        while !*parked_rx.borrow() {
+            if parked_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        parked.is_ok(),
+        "release check loop did not park on the tick wait"
     );
     let _ = stop_tx.send(true);
     worker.await.unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
     drop(app);
     drop(bot);
     cleanup(&path);
@@ -927,25 +961,31 @@ async fn background_check_stops_on_shutdown_without_installing() {
     let (bot, app, path, _enrollment) = linked_writer("bg-shutdown").await;
     let api_gate = Arc::new(tokio::sync::Notify::new());
     let webui_called = Arc::new(AtomicUsize::new(0));
+    let (api_entered_tx, mut api_entered_rx) = tokio::sync::mpsc::channel(1);
+    let tick_notify = Arc::new(tokio::sync::Notify::new());
+    let (parked_tx, _parked_rx) = tokio::sync::watch::channel(false);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let started = std::time::Instant::now();
     let app_task = Arc::clone(&app);
     let api_gate_worker = Arc::clone(&api_gate);
     let webui_called_worker = Arc::clone(&webui_called);
+    let tick = ReleaseCheckTick::coalescing(Arc::clone(&tick_notify), parked_tx);
+    tick.fire();
     let worker = tokio::spawn(async move {
         run_release_check_loop(
             app_task,
-            Duration::from_secs(3600),
+            tick,
             RELEASE_LOOKUP_TIMEOUT,
             move |component, channel| {
                 let (component, channel) = (component.to_owned(), channel.to_owned());
                 let api_gate = Arc::clone(&api_gate_worker);
                 let webui_called = Arc::clone(&webui_called_worker);
+                let api_entered_tx = api_entered_tx.clone();
                 Box::pin(async move {
                     if component == "bot" {
                         return Ok(test_release(&component, &channel, '5'));
                     }
                     if component == "api" {
+                        let _ = api_entered_tx.try_send(());
                         api_gate.notified().await;
                         Ok(test_release(&component, &channel, '6'))
                     } else {
@@ -959,21 +999,42 @@ async fn background_check_stops_on_shutdown_without_installing() {
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let wait = Duration::from_secs(5);
+    tokio::time::timeout(wait, api_entered_rx.recv())
+        .await
+        .expect("api discover did not start in time")
+        .expect("api discover exited before signaling");
     let _ = stop_tx.send(true);
-    worker.await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    api_gate.notify_one();
+    tokio::time::timeout(wait, worker)
+        .await
+        .expect("release check loop did not stop in time")
+        .unwrap();
     let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
     assert_eq!(
         bot_row.candidate.unwrap().digest,
         format!("sha256:{}", "5".repeat(64))
     );
     let api_row = db::component_update(&bot.db, "api").await.unwrap();
-    assert!(api_row.candidate.is_none() || api_row.check_error.is_some());
+    assert!(api_row.check_error.is_none());
     assert_eq!(webui_called.load(Ordering::SeqCst), 0);
     for component in ["bot", "api", "webui"] {
         let row = db::component_update(&bot.db, component).await.unwrap();
         assert_ne!(row.state, "queued");
+    }
+    let now = chrono::Utc::now().timestamp();
+    for component in ["bot", "api", "webui"] {
+        let owner = format!("{:032x}", rand::random::<u128>());
+        let claim = app
+            .commit(db::ControlOp::ClaimUpdateLease {
+                component: component.into(),
+                owner,
+                now,
+                ttl: 240,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
     }
     drop(app);
     drop(bot);
@@ -1045,9 +1106,13 @@ async fn background_check_still_schedules_promoted_cadences() {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let worker = tokio::spawn(async move {
+        let tick_notify = Arc::new(tokio::sync::Notify::new());
+        let (parked_tx, _parked_rx) = tokio::sync::watch::channel(false);
+        let tick = ReleaseCheckTick::coalescing(tick_notify.clone(), parked_tx);
+        tick.fire();
         run_release_check_loop(
             app_task,
-            Duration::from_secs(3600),
+            tick,
             RELEASE_LOOKUP_TIMEOUT,
             |component, channel| {
                 let nibble = match component {
@@ -1096,6 +1161,162 @@ async fn background_check_still_schedules_promoted_cadences() {
     assert!(webui_row.candidate.is_some());
     drop(app);
     drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_install_respects_active_lease_without_skip_set() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-active-lease").await;
+    let now = chrono::Utc::now().timestamp();
+    app.commit(db::ControlOp::RecordBakedComponentRunning {
+        component: "bot".into(),
+        observation: running_observation(now),
+        now,
+    })
+    .await
+    .unwrap();
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "bot".into(),
+        channel: "stable".into(),
+        cadence: "daily".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    let seed = promoted_release("bot", "stable", '0');
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "stable".into(),
+        candidate: Some(seed),
+        error: None,
+        now,
+    })
+    .await
+    .unwrap();
+    let held = "ef".repeat(16);
+    app.commit(db::ControlOp::ClaimUpdateLease {
+        component: "bot".into(),
+        owner: held.clone(),
+        now,
+        ttl: 240,
+    })
+    .await
+    .unwrap();
+    let before = install_snapshot(&bot.db, "bot").await;
+    poll_scheduled_installs(
+        &app,
+        &std::collections::HashSet::new(),
+        ScheduledInstallPolicy::enabled(true, true),
+    )
+    .await;
+    assert_install_unchanged(&bot.db, "bot", &before).await;
+    app.commit(db::ControlOp::ReleaseUpdateLease {
+        component: "bot".into(),
+        owner: held,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+fn writer_db(bot: &Arc<std::sync::Mutex<Option<Arc<jmodguard_bot::state::BotState>>>>) -> Db {
+    bot.lock().unwrap().as_ref().expect("bot writer").db.clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_skips_install_after_failed_renew() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-renew-fail").await;
+    let bot_slot = Arc::new(std::sync::Mutex::new(Some(bot)));
+    let db = writer_db(&bot_slot);
+    let now = chrono::Utc::now().timestamp();
+    app.commit(db::ControlOp::RecordBakedComponentRunning {
+        component: "bot".into(),
+        observation: running_observation(now),
+        now,
+    })
+    .await
+    .unwrap();
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "bot".into(),
+        channel: "stable".into(),
+        cadence: "daily".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    let seed = promoted_release("bot", "stable", '4');
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "stable".into(),
+        candidate: Some(seed),
+        error: None,
+        now,
+    })
+    .await
+    .unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let gate_release = Arc::clone(&gate);
+    let (bot_entered_tx, mut bot_entered_rx) = tokio::sync::mpsc::channel(1);
+    let app_task = Arc::clone(&app);
+    let worker = tokio::spawn(async move {
+        record_release_checks(
+            &app_task,
+            move |component, channel| {
+                let (component, channel) = (component.to_owned(), channel.to_owned());
+                let gate = Arc::clone(&gate);
+                let bot_entered_tx = bot_entered_tx.clone();
+                Box::pin(async move {
+                    if component == "bot" {
+                        let _ = bot_entered_tx.try_send(());
+                        gate.notified().await;
+                        Ok(promoted_release(&component, &channel, '5'))
+                    } else {
+                        Ok(promoted_release(&component, &channel, '6'))
+                    }
+                })
+            },
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), bot_entered_rx.recv())
+        .await
+        .expect("bot check did not start in time");
+    let owner: String = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT lease_owner FROM component_updates WHERE component='bot'",
+                (),
+                |row| row.get::<String>(0).map_err(anyhow::Error::from),
+            )
+        })
+        .await
+        .unwrap();
+    app.commit(db::ControlOp::ReleaseUpdateLease {
+        component: "bot".into(),
+        owner,
+    })
+    .await
+    .unwrap();
+    gate_release.notify_one();
+    let batch = tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("release checks did not finish in time")
+        .unwrap();
+    assert!(batch.lease_held.contains("bot"));
+    let before = install_snapshot(&db, "bot").await;
+    poll_scheduled_installs(
+        &app,
+        &batch.lease_held,
+        ScheduledInstallPolicy::enabled(true, true),
+    )
+    .await;
+    assert_install_unchanged(&db, "bot", &before).await;
+    drop(app);
+    drop(bot_slot);
     cleanup(&path);
 }
 

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tower_sessions::Session;
 
@@ -37,7 +38,7 @@ fn check_failure(err: &anyhow::Error) -> (StatusCode, Json<Value>) {
 }
 
 pub fn release_check_is_stale(checked_at: Option<i64>, now: i64) -> bool {
-    checked_at.is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+    db::release_check_is_stale(checked_at, now)
 }
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -636,7 +637,7 @@ where
             let now = chrono::Utc::now().timestamp();
             match outcome {
                 Err(_) => {
-                    if let Err(error) = record_release_check(
+                    record_release_check(
                         app,
                         component,
                         &channel,
@@ -645,18 +646,13 @@ where
                         now,
                     )
                     .await
-                    {
-                        warn_record_release_check(component, &error);
-                    }
+                    .inspect_err(|error| warn_record_release_check(component, error))?;
                 }
                 Ok(Err(error)) => {
                     let message = format!("{error:#}");
-                    if let Err(error) =
-                        record_release_check(app, component, &channel, None, Some(message), now)
-                            .await
-                    {
-                        warn_record_release_check(component, &error);
-                    }
+                    record_release_check(app, component, &channel, None, Some(message), now)
+                        .await
+                        .inspect_err(|error| warn_record_release_check(component, error))?;
                 }
                 Ok(Ok(release)) => {
                     let record = if let Err(error) = release.validate() {
@@ -668,7 +664,7 @@ where
                     };
                     match record {
                         Ok(release) => {
-                            if let Err(error) = record_release_check(
+                            record_release_check(
                                 app,
                                 component,
                                 &channel,
@@ -677,12 +673,10 @@ where
                                 now,
                             )
                             .await
-                            {
-                                warn_record_release_check(component, &error);
-                            }
+                            .inspect_err(|error| warn_record_release_check(component, error))?;
                         }
                         Err(message) => {
-                            if let Err(error) = record_release_check(
+                            record_release_check(
                                 app,
                                 component,
                                 &channel,
@@ -691,9 +685,7 @@ where
                                 now,
                             )
                             .await
-                            {
-                                warn_record_release_check(component, &error);
-                            }
+                            .inspect_err(|error| warn_record_release_check(component, error))?;
                         }
                     }
                 }
@@ -710,6 +702,7 @@ where
             }
             Err(error) => {
                 tracing::warn!(component, "background release check failed: {error:#}");
+                lease_held.insert(component);
             }
         }
     }
@@ -784,13 +777,79 @@ pub async fn poll_scheduled_installs(
     }
 }
 
+/// Coalesced or interval-based tick source for [`run_release_check_loop`].
+pub struct ReleaseCheckTick {
+    inner: ReleaseCheckTickInner,
+}
+
+enum ReleaseCheckTickInner {
+    Interval(tokio::time::Interval),
+    Coalescing {
+        notify: Arc<Notify>,
+        parked: Option<tokio::sync::watch::Sender<bool>>,
+    },
+}
+
+impl ReleaseCheckTick {
+    pub fn interval(duration: Duration) -> Self {
+        let mut tick = tokio::time::interval(duration);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            inner: ReleaseCheckTickInner::Interval(tick),
+        }
+    }
+
+    pub fn coalescing(notify: Arc<Notify>, parked: tokio::sync::watch::Sender<bool>) -> Self {
+        Self {
+            inner: ReleaseCheckTickInner::Coalescing {
+                notify,
+                parked: Some(parked),
+            },
+        }
+    }
+
+    pub fn fire(&self) {
+        if let ReleaseCheckTickInner::Coalescing { notify, .. } = &self.inner {
+            notify.notify_one();
+        }
+    }
+
+    async fn wait_for_tick(&mut self, shutdown: Pin<Box<dyn Future<Output = ()> + Send>>) -> bool {
+        match &mut self.inner {
+            ReleaseCheckTickInner::Interval(tick) => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown => false,
+                    _ = tick.tick() => true,
+                }
+            }
+            ReleaseCheckTickInner::Coalescing { notify, .. } => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown => false,
+                    _ = notify.notified() => true,
+                }
+            }
+        }
+    }
+
+    fn signal_parked(&self) {
+        if let ReleaseCheckTickInner::Coalescing {
+            parked: Some(tx), ..
+        } = &self.inner
+        {
+            let _ = tx.send_replace(true);
+        }
+    }
+}
+
 /// Background release checks for the configured channel. Each tick records the
 /// digest, then runs [`poll_scheduled_installs`] for stable and nightly
 /// cadences. `latest` and cadence `off` stay record-only. A tick finishes
 /// before the next one starts.
 pub async fn run_release_check_loop<F, S>(
     app: Arc<ApiState>,
-    interval: Duration,
+    mut tick: ReleaseCheckTick,
     lookup_timeout: Duration,
     mut discover: F,
     shutdown: S,
@@ -799,27 +858,16 @@ pub async fn run_release_check_loop<F, S>(
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
     S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
 {
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            biased;
-            _ = shutdown() => break,
-            _ = tick.tick() => {}
+        if !tick.wait_for_tick(shutdown()).await {
+            break;
         }
-        let batch = tokio::select! {
-            biased;
-            _ = shutdown() => break,
-            batch = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()) => batch,
-        };
+        let batch = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()).await;
         if !batch.finished {
             break;
         }
-        tokio::select! {
-            biased;
-            _ = shutdown() => break,
-            _ = poll_scheduled_installs(&app, &batch.lease_held, policy) => {}
-        }
+        poll_scheduled_installs(&app, &batch.lease_held, policy).await;
+        tick.signal_parked();
     }
 }
 

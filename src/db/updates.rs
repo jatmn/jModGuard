@@ -288,6 +288,10 @@ pub async fn record_update_check(
     }).await
 }
 
+pub fn release_check_is_stale(checked_at: Option<i64>, now: i64) -> bool {
+    checked_at.is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+}
+
 pub(super) fn checked_install_candidate(
     raw: Option<String>,
     channel: &str,
@@ -301,7 +305,7 @@ pub(super) fn checked_install_candidate(
         "last release check failed; check again"
     );
     anyhow::ensure!(
-        checked_at.is_some_and(|at| at <= now && now.saturating_sub(at) < 7200),
+        !release_check_is_stale(checked_at, now),
         "candidate check is stale; check again"
     );
     let candidate: ComponentRelease = serde_json::from_str(&raw.context("no checked candidate")?)?;
@@ -750,18 +754,22 @@ pub async fn request_due_automatic_install(
     db.with_conn(move |conn| {
         struct AutoState {
             channel:String,cadence:String,candidate:Option<String>,installed:Option<String>,previous:Option<String>,desired:Option<String>,checked_at:Option<i64>,
-            check_error:Option<String>,last_digest:Option<String>,last_window:Option<String>,
+            check_error:Option<String>,last_digest:Option<String>,last_window:Option<String>,lease_until:i64,
         }
         let tx=conn.transaction_immediate()?;
         if update_control::ensure_no_service_upgrade(&tx).is_err() { tx.commit()?; return Ok(None); }
         let state:AutoState = tx.query_row(
-            "SELECT channel,cadence,candidate,installed,previous,desired,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
+            "SELECT channel,cadence,candidate,installed,previous,desired,checked_at,check_error,auto_last_digest,auto_last_window,lease_until FROM component_updates WHERE component=?1",
             params![component.clone()],|row| Ok(AutoState {
                 channel:row.get(0)?,cadence:row.get(1)?,candidate:row.get(2)?,installed:row.get(3)?,previous:row.get(4)?,desired:row.get(5)?,checked_at:row.get(6)?,
-                check_error:row.get(7)?,last_digest:row.get(8)?,last_window:row.get(9)?,
+                check_error:row.get(7)?,last_digest:row.get(8)?,last_window:row.get(9)?,lease_until:row.get(10)?,
             }))?;
         let Some(window)=automatic_window(&state.cadence,now) else { tx.commit()?; return Ok(None); };
-        if state.check_error.is_some() || state.checked_at.is_none_or(|at| at>now || now.saturating_sub(at)>=7200) || state.last_window.as_deref()==Some(window.as_str()) {
+        if component != "webui" && state.lease_until > now {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if state.check_error.is_some() || release_check_is_stale(state.checked_at, now) || state.last_window.as_deref()==Some(window.as_str()) {
             tx.commit()?; return Ok(None);
         }
         let Some(candidate)=state.candidate else { tx.commit()?; return Ok(None); };
@@ -1731,6 +1739,56 @@ mod tests {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
             }
+        }
+    }
+
+    #[test]
+    fn release_check_is_stale_matches_install_gate() {
+        let now = 10_000;
+        assert!(release_check_is_stale(None, now));
+        assert!(release_check_is_stale(Some(now + 1), now));
+        assert!(!release_check_is_stale(Some(now - 7_199), now));
+        assert!(release_check_is_stale(Some(now - 7_200), now));
+    }
+
+    #[tokio::test]
+    async fn automatic_install_skips_while_update_lease_is_held() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_updates_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-23T01:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut release = candidate('a');
+        release.component = "bot".into();
+        release.channel = "stable".into();
+        release.image = "ghcr.io/jatmn/jmodguard-bot".into();
+        set_update_policy(&db, "bot", "stable", "daily", true)
+            .await
+            .unwrap();
+        record_update_check(&db, "bot", "stable", Some(release.clone()), None, now)
+            .await
+            .unwrap();
+        let owner = "a".repeat(32);
+        assert!(
+            claim_update_lease(&db, "bot", &owner, now, 240)
+                .await
+                .unwrap()
+        );
+        assert!(
+            request_due_automatic_install(&db, "bot", &release.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let state = component_update(&db, "bot").await.unwrap();
+        assert_ne!(state.state, "queued");
+        release_update_lease(&db, "bot", &owner).await.unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 

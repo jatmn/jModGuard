@@ -59,7 +59,7 @@ fn release_status_reason(
     component: &str,
     now: i64,
 ) -> Option<String> {
-    if component == "webui" && item.installed.is_none() {
+    if component == "webui" && item.installed.is_none() && item.desired.is_none() {
         return Some("webui not managed by updater".into());
     }
     if item.check_error.is_some() {
@@ -74,11 +74,15 @@ fn release_status_reason(
     {
         return Some("not checked".into());
     }
-    if let Some(checked) = item.checked_at
-        && now.saturating_sub(checked) > 7200
-    {
-        let hours = now.saturating_sub(checked) / 3600;
-        return Some(format!("check stale ({hours}h)"));
+    if crate::db::release_check_is_stale(item.checked_at, now) {
+        let hours = item
+            .checked_at
+            .filter(|&checked| checked <= now)
+            .map(|checked| now.saturating_sub(checked) / 3600);
+        return Some(match hours {
+            Some(hours) => format!("check stale ({hours}h)"),
+            None => "check stale".into(),
+        });
     }
     None
 }
@@ -876,6 +880,23 @@ mod presentation_tests {
         assert!(api.contains("check stale (2h)"), "{api}");
         assert!(!api.contains('❓'), "{api}");
 
+        let mut fresh_boundary = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(now - 7_199),
+            None,
+            Some(sample_observed(source)),
+            Some(now - 3_600),
+            "latest",
+        );
+        fresh_boundary.installed = fresh_boundary.candidate.clone();
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh_boundary], now);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.ends_with("⬆️") || api.ends_with('✅'), "{api}");
+        assert!(!api.contains("check stale"), "{api}");
+
         let row = sample_api_update_row(
             Some(sample_candidate("latest", source, &"b".repeat(64))),
             Some(now - 3 * 3600),
@@ -907,8 +928,26 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(api.ends_with('✅'), "{api}");
-        assert!(!api.contains("check stale"), "{api}");
+        assert!(api.contains("check stale (2h)"), "{api}");
+        assert!(!api.ends_with('✅'), "{api}");
+
+        let mut future_checked = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(boundary_now + 60),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        future_checked.installed = future_checked.candidate.clone();
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[future_checked], boundary_now);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("check stale"), "{api}");
+        assert!(!api.contains("check stale (0h)"), "{api}");
+        assert!(!api.ends_with('✅'), "{api}");
     }
 
     #[test]
@@ -987,6 +1026,35 @@ mod presentation_tests {
             assert!(!webui.contains("first seen"), "{webui}");
             assert!(!webui.contains("unknown"), "{webui}");
         }
+
+        let mut queued = ComponentUpdate {
+            component: "webui".into(),
+            channel: "latest".into(),
+            cadence: "off".into(),
+            candidate: Some(candidate.clone()),
+            checked_at: Some(1_100),
+            check_error: None,
+            desired: Some(candidate.clone()),
+            desired_launcher: None,
+            installed: None,
+            installed_launcher: None,
+            launcher_sha256: None,
+            launcher_installed_at: None,
+            previous: None,
+            observed: Some(sample_observed(source)),
+            observed_at: Some(1_000),
+            installed_at: None,
+            state: "queued".into(),
+            last_error: None,
+        };
+        queued.candidate.as_mut().unwrap().source_sha = "c".repeat(40);
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[queued], 1_200);
+        let webui = out
+            .lines()
+            .find(|line| line.starts_with("**webui:**"))
+            .unwrap();
+        assert!(webui.ends_with("⬆️"), "{webui}");
+        assert!(!webui.contains("webui not managed by updater"), "{webui}");
 
         let mut api = sample_api_update_row(
             Some(sample_candidate("latest", source, &"b".repeat(64))),
