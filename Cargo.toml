@@ -30,7 +30,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 hyper = { version = "0.14", default-features = false, features = ["client", "http1", "tcp", "runtime"] }
-libsql = { version = "0.9.30", default-features = false, features = ["core", "remote"] }
+libsql = { version = "0.10.0", default-features = false, features = ["core", "remote"] }
 rand = "0.10"
 regex = "1"
 # Reuse the crypto implementation already required by rustls for streaming SHA-256.
