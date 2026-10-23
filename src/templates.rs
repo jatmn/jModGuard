@@ -901,6 +901,7 @@ mod presentation_tests {
             "latest",
         );
         fresh.installed = fresh.candidate.clone();
+        fresh.observed_at = Some(boundary_now - 3_600);
         let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh], boundary_now);
         let api = out
             .lines()
