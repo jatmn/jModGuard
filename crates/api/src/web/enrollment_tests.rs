@@ -1006,28 +1006,101 @@ async fn guild_list_cooldown_survives_a_new_api_process() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     f.app.guild_cache.clear();
+    *f.discord.retry_after.lock().unwrap() = "120".into();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
     let (status, _) = f.request("POST", "/api/guilds/10/cases/case-1", "{}").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    assert!(db::guild_enrollment(&f.app.db, 10).await.unwrap().is_some());
+
+    let deadlines = super::discord_retry::load_deadlines(&f.app.db).unwrap();
+    let g42 = deadlines
+        .get("g:42")
+        .expect("expected g:42 deadline after first 429");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    assert!(
+        *g42 > now_ms + 60_000,
+        "g:42 deadline {g42} is not more than 60s ahead of now {now_ms}"
+    );
 
     let endpoint = f.app.oauth.guilds_endpoint.clone().unwrap();
     let cfg = (*f.app.cfg).clone();
     let db = db::Db::open(&f.path, 2).unwrap();
-    let mut restarted = ApiState::new(cfg, db).unwrap();
+    let mut restarted = ApiState::new(cfg.clone(), db).unwrap();
     std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut restarted).unwrap().oauth)
         .unwrap()
-        .guilds_endpoint = Some(endpoint);
+        .guilds_endpoint = Some(endpoint.clone());
     let err = restarted
         .oauth
         .my_guilds(42, "fixture-token")
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        oauth::GuildListError::RateLimited { fresh: false, .. }
-    ));
+    assert!(
+        matches!(err, oauth::GuildListError::RateLimited { fresh: false, .. }),
+        "restart saw {err:?} calls={}",
+        f.discord.calls.load(Ordering::SeqCst)
+    );
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    let err = restarted
+        .oauth
+        .my_guilds(99, "fixture-token")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, oauth::GuildListError::RateLimited { fresh: true, .. }),
+        "other user saw {err:?} calls={}",
+        f.discord.calls.load(Ordering::SeqCst)
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+
+    let other_path = std::env::temp_dir().join(format!(
+        "jmodguard_api_enrollment_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let other_db = db::Db::open(&other_path, 2).unwrap();
+    let mut other_state = ApiState::new(cfg.clone(), other_db).unwrap();
+    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut other_state).unwrap().oauth)
+        .unwrap()
+        .guilds_endpoint = Some(endpoint.clone());
+    let err = other_state
+        .oauth
+        .my_guilds(42, "fixture-token")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, oauth::GuildListError::RateLimited { fresh: true, .. }),
+        "other file saw {err:?} calls={}",
+        f.discord.calls.load(Ordering::SeqCst)
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+    crate::tenant::remove_sidecars(&other_path);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", other_path.display()));
+    }
+
+    let expired_ms = chrono::Utc::now().timestamp_millis() - 600_000;
+    let expired_json = format!(r#"{{"g:42":{expired_ms}}}"#);
+    let expired_db = db::Db::open(&f.path, 2).unwrap();
+    super::discord_retry::store_deadlines(&expired_db, expired_json)
+        .await
+        .unwrap();
+    let mut expired_state = ApiState::new(cfg, expired_db).unwrap();
+    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut expired_state).unwrap().oauth)
+        .unwrap()
+        .guilds_endpoint = Some(endpoint);
+    let err = expired_state
+        .oauth
+        .my_guilds(42, "fixture-token")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, oauth::GuildListError::RateLimited { fresh: true, .. }),
+        "expired row saw {err:?} calls={}",
+        f.discord.calls.load(Ordering::SeqCst)
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
