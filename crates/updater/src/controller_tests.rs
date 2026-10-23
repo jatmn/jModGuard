@@ -5112,18 +5112,20 @@ struct Reservation {
 }
 
 /// `bind(0)` draws from the ephemeral range. A fixture that closes a port and
-/// binds that same address later races every other `bind(0)`. These ranges sit
-/// below that range, so the kernel will not assign them.
+/// binds that same address later races every other `bind(0)`. Candidates in
+/// that range, or below the unprivileged bind floor, are skipped.
 ///
-/// Each process starts at a random offset and walks forward once. A port is
-/// claimed in a shared reservation before the bind. The claim outlives the
-/// socket, so another live process skips a port this process already handed
-/// out and then closed. A dead owner's claim is dropped. A bind that loses to
-/// some other socket releases the claim and tries the next port.
+/// Each process starts at a random offset and walks every slot in the span
+/// once. A port is claimed in one shared reservation directory before the
+/// bind. The claim outlives the socket, so another live process skips a port
+/// this process already handed out and then closed. A pid that is gone is
+/// dropped. A pid whose `/proc` entry cannot be read is kept. A bind that
+/// loses to some other socket releases the claim and tries the next port.
 ///
 /// Registry updates are a synced snapshot renamed into place. The lock is a
 /// different file, so a writer killed before the rename cannot erase another
-/// live owner's claim or replace the lock inode.
+/// live owner's claim or replace the lock inode. The directory is not taken
+/// from the process temp dir, and a symlink at that path is refused.
 async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
     bind_scanned(20_000, 10_000, &OUTSIDE_EPHEMERAL_SCAN).await
 }
@@ -5148,9 +5150,59 @@ fn scan_origin(scan: &'static PortScan) -> u32 {
         .get_or_init(|| rand::random::<u32>() ^ std::process::id())
 }
 
+/// `origin % span + step` stays inside `span` values. Adding before the modulo
+/// repeats slots once `origin` wraps through `u32::MAX`.
+fn scan_slot(origin: u32, step: u32, span: u32) -> u32 {
+    (origin % span + step) % span
+}
+
+#[derive(Clone, Copy)]
+struct PortPolicy {
+    ephemeral_low: u16,
+    ephemeral_high: u16,
+    unprivileged_start: u16,
+    root: bool,
+}
+
+fn port_policy() -> PortPolicy {
+    static POLICY: std::sync::OnceLock<PortPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .unwrap_or_else(|_| panic!("cannot read the ephemeral port range"));
+        let mut parts = text.split_whitespace();
+        let ephemeral_low = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .unwrap_or_else(|| panic!("cannot parse the ephemeral port range"));
+        let ephemeral_high = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .unwrap_or_else(|| panic!("cannot parse the ephemeral port range"));
+        let unprivileged_start =
+            std::fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+                .ok()
+                .and_then(|text| text.split_whitespace().next()?.parse().ok())
+                .unwrap_or(1024);
+        PortPolicy {
+            ephemeral_low,
+            ephemeral_high,
+            unprivileged_start,
+            root: unsafe { libc::geteuid() } == 0,
+        }
+    })
+}
+
+fn port_is_selectable(port: u16, policy: PortPolicy) -> bool {
+    let outside_ephemeral = port < policy.ephemeral_low || port > policy.ephemeral_high;
+    let bindable = policy.root || port >= policy.unprivileged_start;
+    outside_ephemeral && bindable
+}
+
 async fn bind_scanned(first: u16, span: u16, scan: &'static PortScan) -> tokio::net::TcpListener {
+    let policy = port_policy();
     let origin = scan_origin(scan);
     let span = u32::from(span);
+    let mut selectable = 0u32;
     for _ in 0..span {
         let step = scan
             .cursor
@@ -5158,32 +5210,111 @@ async fn bind_scanned(first: u16, span: u16, scan: &'static PortScan) -> tokio::
         if step >= span {
             break;
         }
-        let port = first + ((origin.wrapping_add(step)) % span) as u16;
+        let port = first + scan_slot(origin, step, span) as u16;
+        if !port_is_selectable(port, policy) {
+            continue;
+        }
+        selectable += 1;
         if !claim_port(port) {
             continue;
         }
         match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => return listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                release_port(port);
+                panic!(
+                    "loopback port {port} is not bindable by this user (ip_unprivileged_port_start={})",
+                    policy.unprivileged_start
+                );
+            }
             Err(_) => release_port(port),
         }
+    }
+    if selectable == 0 {
+        panic!(
+            "no bindable port outside the ephemeral range in {first}..{}; ephemeral {}-{}, unprivileged start {}",
+            u32::from(first) + span,
+            policy.ephemeral_low,
+            policy.ephemeral_high,
+            policy.unprivileged_start
+        );
     }
     panic!("no free loopback port outside the ephemeral range");
 }
 
+fn shared_reservation_dir() -> &'static std::path::Path {
+    std::path::Path::new("/tmp/jmodguard-updater-port-reservations.d")
+}
+
 fn reservation_dir() -> std::path::PathBuf {
-    let dir = match std::env::var("JMODGUARD_PORT_RESERVATION_DIR") {
+    match std::env::var("JMODGUARD_PORT_RESERVATION_DIR") {
         Ok(value) if !value.is_empty() => std::path::PathBuf::from(value),
-        _ => std::env::temp_dir().join("jmodguard-updater-port-reservations.d"),
-    };
-    std::fs::create_dir_all(&dir)
-        .unwrap_or_else(|_| panic!("cannot create the port reservation directory"));
-    dir
+        _ => shared_reservation_dir().to_path_buf(),
+    }
+}
+
+fn prepare_reservation_dir(dir: &std::path::Path, share: bool) {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            panic!("port reservation directory must not be a symlink");
+        }
+        Ok(meta) if !meta.is_dir() => {
+            panic!("port reservation path is not a directory");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(create_error) = std::fs::create_dir(dir)
+                && create_error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                panic!("cannot create the port reservation directory: {create_error}");
+            }
+            let meta = std::fs::symlink_metadata(dir)
+                .unwrap_or_else(|_| panic!("cannot inspect the port reservation directory"));
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                panic!("port reservation directory must be a real directory");
+            }
+        }
+        Err(error) => panic!("cannot inspect the port reservation directory: {error}"),
+    }
+    if share {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(dir).unwrap().permissions().mode();
+        if (mode & 0o1777) != 0o1777 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777))
+                .unwrap_or_else(|_| panic!("cannot share the port reservation directory"));
+        }
+    }
+}
+
+fn share_reservation_file(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
+        .unwrap_or_else(|_| panic!("cannot share the port reservation file"));
 }
 
 fn lock_reservations(file: &std::fs::File) {
+    lock_reservations_until(file, Instant::now() + Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("timed out waiting for the port reservation lock"));
+}
+
+fn lock_reservations_until(file: &std::fs::File, deadline: Instant) -> Result<(), ()> {
     use std::os::fd::AsRawFd;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    assert_eq!(rc, 0, "port reservation lock failed");
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let blocked = error.raw_os_error() == Some(libc::EAGAIN)
+            || error.raw_os_error() == Some(libc::EWOULDBLOCK);
+        if !blocked {
+            panic!("port reservation lock failed: {error}");
+        }
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn unlock_reservations(file: &std::fs::File) {
@@ -5191,10 +5322,36 @@ fn unlock_reservations(file: &std::fs::File) {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
-fn process_start(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.rsplit_once(')')?.1.trim_start();
-    rest.split_whitespace().nth(19)?.parse().ok()
+#[derive(Debug)]
+enum ProcLookup {
+    Gone,
+    Unreadable,
+}
+
+fn process_start(pid: u32) -> Result<u64, ProcLookup> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ProcLookup::Gone);
+        }
+        Err(_) => return Err(ProcLookup::Unreadable),
+    };
+    let Some(rest) = stat.rsplit_once(')') else {
+        return Err(ProcLookup::Unreadable);
+    };
+    rest.1
+        .split_whitespace()
+        .nth(19)
+        .and_then(|field| field.parse().ok())
+        .ok_or(ProcLookup::Unreadable)
+}
+
+fn owner_still_reserved(observed: Result<u64, ProcLookup>, recorded: u64) -> bool {
+    match observed {
+        Ok(start) => start == recorded,
+        Err(ProcLookup::Gone) => false,
+        Err(ProcLookup::Unreadable) => true,
+    }
 }
 
 fn our_start() -> u64 {
@@ -5214,7 +5371,9 @@ fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
             let port = parts.next()?.parse().ok()?;
             let pid = parts.next()?.parse().ok()?;
             let start = parts.next()?.parse().ok()?;
-            process_start(pid).filter(|alive| *alive == start)?;
+            if !owner_still_reserved(process_start(pid), start) {
+                return None;
+            }
             Some(Reservation { port, pid, start })
         })
         .collect()
@@ -5264,15 +5423,19 @@ fn with_reservations_in<T>(dir: &std::path::Path, body: impl FnOnce(&std::path::
     // flock is per process on Linux, so threads in this process also need a mutex.
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::fs::create_dir_all(dir)
-        .unwrap_or_else(|_| panic!("cannot create the port reservation directory"));
+    let share = dir == shared_reservation_dir();
+    prepare_reservation_dir(dir, share);
+    let lock_path = dir.join("lock");
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join("lock"))
+        .open(&lock_path)
         .unwrap_or_else(|_| panic!("cannot open the port reservation lock"));
+    if share {
+        share_reservation_file(&lock_path);
+    }
     lock_reservations(&lock);
     let result = body(dir);
     unlock_reservations(&lock);
@@ -5280,11 +5443,11 @@ fn with_reservations_in<T>(dir: &std::path::Path, body: impl FnOnce(&std::path::
 }
 
 fn with_reservations<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
-    with_reservations_in(&reservation_dir(), body)
+    with_reservations_in(shared_reservation_dir(), body)
 }
 
 fn claim_port(port: u16) -> bool {
-    claim_port_in(&reservation_dir(), port)
+    claim_port_in(shared_reservation_dir(), port)
 }
 
 fn claim_port_in(dir: &std::path::Path, port: u16) -> bool {
@@ -5717,16 +5880,168 @@ fn assert_unique_ports(ports: &[u16]) {
 }
 
 fn assert_outside_ephemeral(ports: &[u16]) {
-    let text = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
-    let mut parts = text.split_whitespace();
-    let low: u16 = parts.next().unwrap().parse().unwrap();
-    let high: u16 = parts.next().unwrap().parse().unwrap();
+    let policy = port_policy();
     for port in ports {
         assert!(
-            *port < low || *port > high,
+            *port < policy.ephemeral_low || *port > policy.ephemeral_high,
             "port {port} is inside the ephemeral range"
         );
     }
+}
+
+#[test]
+fn scan_near_u32_max_visits_every_slot() {
+    let span = 10_000u32;
+    let origin = u32::MAX - 17;
+    let mut seen = vec![false; span as usize];
+    for step in 0..span {
+        seen[scan_slot(origin, step, span) as usize] = true;
+    }
+    assert!(seen.iter().all(|slot| *slot));
+}
+
+#[test]
+fn selectable_ports_skip_the_ephemeral_range_and_privileged_ports() {
+    let policy = PortPolicy {
+        ephemeral_low: 32_768,
+        ephemeral_high: 60_999,
+        unprivileged_start: 1024,
+        root: false,
+    };
+    assert!(port_is_selectable(20_000, policy));
+    assert!(port_is_selectable(31_000, policy));
+    assert!(!port_is_selectable(40_000, policy));
+    assert!(!port_is_selectable(80, policy));
+    let root = PortPolicy {
+        root: true,
+        ..policy
+    };
+    assert!(port_is_selectable(80, root));
+    assert!(!port_is_selectable(40_000, root));
+    let shifted = PortPolicy {
+        ephemeral_low: 10_000,
+        ephemeral_high: 25_000,
+        ..policy
+    };
+    assert!(!port_is_selectable(20_000, shifted));
+    assert!(port_is_selectable(31_000, shifted));
+}
+
+#[test]
+fn port_claims_share_one_directory_outside_the_temp_dir() {
+    assert_eq!(
+        shared_reservation_dir(),
+        std::path::Path::new("/tmp/jmodguard-updater-port-reservations.d")
+    );
+}
+
+#[test]
+fn shared_reservation_directory_is_sticky_and_world_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("port-mode-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(dir.clone());
+    prepare_reservation_dir(&dir, true);
+    let mode = std::fs::symlink_metadata(&dir)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o1777, 0o1777);
+    let lock = dir.join("lock");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    share_reservation_file(&lock);
+    let lock_mode = std::fs::symlink_metadata(&lock)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(lock_mode & 0o777, 0o666);
+}
+
+#[test]
+fn reservation_directory_rejects_a_symlink() {
+    let root = std::env::temp_dir().join(format!("port-link-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(root.clone());
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("claims"), "keep").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let linked = link.clone();
+    let panicked = std::panic::catch_unwind(|| prepare_reservation_dir(&linked, true));
+    assert!(
+        panicked.is_err(),
+        "symlink reservation directory was accepted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("claims")).unwrap(),
+        "keep"
+    );
+}
+
+#[test]
+fn reservation_lock_times_out_while_another_process_holds_it() {
+    use std::os::fd::AsRawFd;
+    let dir = std::env::temp_dir().join(format!("port-lock-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(dir.clone());
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock_path = dir.join("lock");
+    std::fs::File::create(&lock_path).unwrap();
+    let holder = KillChildren(vec![
+        std::process::Command::new("flock")
+            .arg("-x")
+            .arg(&lock_path)
+            .arg("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    ]);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let blocked = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            break;
+        }
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        assert!(Instant::now() < blocked, "holder never took the lock");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = lock_reservations_until(&file, Instant::now() + Duration::from_millis(200));
+    assert!(result.is_err(), "lock wait should time out");
+    drop(holder);
+}
+
+#[test]
+fn a_dead_owner_is_dropped_and_an_unreadable_owner_is_kept() {
+    assert!(owner_still_reserved(Ok(4), 4));
+    assert!(!owner_still_reserved(Ok(5), 4));
+    assert!(!owner_still_reserved(Err(ProcLookup::Gone), 1));
+    assert!(owner_still_reserved(Err(ProcLookup::Unreadable), 1));
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let start = process_start(pid).expect("live owner");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(matches!(process_start(pid), Err(ProcLookup::Gone)));
+
+    let dir = std::env::temp_dir().join(format!("port-dead-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(dir.clone());
+    prepare_reservation_dir(&dir, false);
+    std::fs::write(dir.join("claims"), format!("25010 {pid} {start}\n")).unwrap();
+    assert!(load_reservations(&dir).is_empty());
 }
 
 #[tokio::test]
