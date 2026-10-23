@@ -5091,48 +5091,440 @@ fn child_liveness_observes_exit_without_reaping() {
     ));
 }
 
-/// `bind(0)` draws from the ephemeral range. Reclaiming one of those ports
-/// races every other test that also binds an ephemeral port.
+struct PortScan {
+    origin: std::sync::OnceLock<u32>,
+    cursor: std::sync::atomic::AtomicU32,
+}
+
+static OUTSIDE_EPHEMERAL_SCAN: PortScan = PortScan {
+    origin: std::sync::OnceLock::new(),
+    cursor: std::sync::atomic::AtomicU32::new(0),
+};
+static RECLAIMABLE_SCAN: PortScan = PortScan {
+    origin: std::sync::OnceLock::new(),
+    cursor: std::sync::atomic::AtomicU32::new(0),
+};
+
+struct Reservation {
+    port: u16,
+    pid: u32,
+    start: u64,
+}
+
+/// `bind(0)` draws from the ephemeral range. A fixture that closes a port and
+/// binds that same address later races every other `bind(0)`. These ranges sit
+/// below that range, so the kernel will not assign them.
 ///
-/// Ports are handed out once per process, climbing through 20_000..30_000.
-/// A port another process already holds is skipped and is not offered again,
-/// so a fixture that drops its listener cannot collide with the next caller.
+/// Each process starts at a random offset and walks forward once. A port is
+/// claimed in a shared reservation before the bind. The claim outlives the
+/// socket, so another live process skips a port this process already handed
+/// out and then closed. A dead owner's claim is dropped. A bind that loses to
+/// some other socket releases the claim and tries the next port.
 async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20_000);
-    const FIRST: u16 = 20_000;
-    const LAST: u16 = 30_000;
-    for _ in 0..(LAST - FIRST) {
-        let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !(FIRST..LAST).contains(&port) {
+    bind_scanned(20_000, 10_000, &OUTSIDE_EPHEMERAL_SCAN).await
+}
+
+/// Same allocator as [`bind_outside_ephemeral_range`], in a disjoint range.
+/// Rebinding a port just closed in the other range must not take this one
+/// while a test is between close and the later bind.
+async fn bind_reclaimable_health_port() -> tokio::net::TcpListener {
+    bind_scanned(31_000, 1_000, &RECLAIMABLE_SCAN).await
+}
+
+async fn bind_scanned(first: u16, span: u16, scan: &'static PortScan) -> tokio::net::TcpListener {
+    let origin = *scan
+        .origin
+        .get_or_init(|| rand::random::<u32>() ^ std::process::id());
+    let span = u32::from(span);
+    for _ in 0..span {
+        let step = scan
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if step >= span {
             break;
         }
-        if let Ok(listener) =
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
-        {
-            return listener;
+        let port = first + ((origin.wrapping_add(step)) % span) as u16;
+        if !claim_port(port) {
+            continue;
+        }
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return listener,
+            Err(_) => release_port(port),
         }
     }
     panic!("no free loopback port outside the ephemeral range");
 }
 
-/// A port this process will close and bind again. It stays out of
-/// `20_000..30_000` so the shared allocator cannot claim it during that gap,
-/// and out of the kernel ephemeral range so `bind(0)` cannot either.
-async fn bind_reclaimable_health_port() -> tokio::net::TcpListener {
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    const FIRST: u16 = 31_000;
-    const SPAN: u16 = 1_000;
-    let origin = (std::process::id() as u16) % SPAN;
-    for _ in 0..SPAN {
-        let port =
-            FIRST + (origin + NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) % SPAN;
-        if let Ok(listener) =
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
-        {
-            return listener;
+fn reservation_file() -> std::fs::File {
+    let path = std::env::temp_dir().join("jmodguard-updater-port-reservations");
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap_or_else(|_| panic!("cannot open the port reservation file"))
+}
+
+fn lock_reservations(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "port reservation lock failed");
+}
+
+fn unlock_reservations(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1.trim_start();
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn our_start() -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *START.get_or_init(|| process_start(std::process::id()).unwrap_or(0))
+}
+
+fn load_reservations(file: &mut std::fs::File) -> Vec<Reservation> {
+    use std::io::{Read, Seek};
+    file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let port = parts.next()?.parse().ok()?;
+            let pid = parts.next()?.parse().ok()?;
+            let start = parts.next()?.parse().ok()?;
+            process_start(pid).filter(|alive| *alive == start)?;
+            Some(Reservation { port, pid, start })
+        })
+        .collect()
+}
+
+fn store_reservations(file: &mut std::fs::File, rows: &[Reservation]) {
+    use std::io::{Seek, Write};
+    file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    file.set_len(0).unwrap();
+    let mut text = String::new();
+    for row in rows {
+        text.push_str(&format!("{} {} {}\n", row.port, row.pid, row.start));
+    }
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+fn with_reservations<T>(body: impl FnOnce(&mut std::fs::File) -> T) -> T {
+    // flock is per process on Linux, so threads in this process also need a mutex.
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = reservation_file();
+    lock_reservations(&file);
+    let result = body(&mut file);
+    unlock_reservations(&file);
+    result
+}
+
+fn claim_port(port: u16) -> bool {
+    with_reservations(|file| {
+        let mut rows = load_reservations(file);
+        let free = rows.iter().all(|row| row.port != port);
+        if free {
+            rows.push(Reservation {
+                port,
+                pid: std::process::id(),
+                start: our_start(),
+            });
+        }
+        store_reservations(file, &rows);
+        free
+    })
+}
+
+fn release_port(port: u16) {
+    with_reservations(|file| {
+        let pid = std::process::id();
+        let start = our_start();
+        let mut rows = load_reservations(file);
+        rows.retain(|row| !(row.port == port && row.pid == pid && row.start == start));
+        store_reservations(file, &rows);
+    });
+}
+
+/// Many threads, and two processes, must not be handed the same port.
+/// A second process also allocates after the first has closed its sockets:
+/// the fixed 20000 counter used to bind those same ports again.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_port_allocations_never_return_the_same_port() {
+    if let Ok(role) = std::env::var("JMODGUARD_PORT_ALLOC_CHILD") {
+        let dir = std::path::PathBuf::from(
+            std::env::var("JMODGUARD_PORT_ALLOC_DIR").expect("child directory"),
+        );
+        match role.as_str() {
+            "hold" => hold_allocated_ports(&dir).await,
+            "gap-owner" => gap_owner(&dir).await,
+            "gap-other" => gap_other(&dir).await,
+            other => panic!("unknown port allocation child role: {other}"),
+        }
+        return;
+    }
+
+    let listeners = threaded_listeners(24);
+    let mut outside = Vec::new();
+    let mut reclaimable = Vec::new();
+    for (index, listener) in listeners.iter().enumerate() {
+        let port = listener.local_addr().unwrap().port();
+        if index % 2 == 0 {
+            outside.push(port);
+        } else {
+            reclaimable.push(port);
         }
     }
-    panic!("no free reclaimable health port");
+    assert_unique_ports(&outside);
+    assert_unique_ports(&reclaimable);
+    assert_outside_ephemeral(&outside);
+    assert_outside_ephemeral(&reclaimable);
+    assert!(
+        outside.iter().all(|port| (20_000..30_000).contains(port)),
+        "outside-ephemeral allocator left its range"
+    );
+    assert!(
+        reclaimable
+            .iter()
+            .all(|port| (31_000..32_000).contains(port)),
+        "reclaimable allocator left its range"
+    );
+    drop(listeners);
+
+    let hold = std::env::temp_dir().join(format!("port-hold-{:032x}", rand::random::<u128>()));
+    let hold_a = hold.join("a");
+    let hold_b = hold.join("b");
+    std::fs::create_dir_all(&hold_a).unwrap();
+    std::fs::create_dir_all(&hold_b).unwrap();
+    let mut held_children = KillChildren(vec![
+        spawn_port_child("hold", &hold_a),
+        spawn_port_child("hold", &hold_b),
+    ]);
+    wait_for_file(&hold_a.join("ready"));
+    wait_for_file(&hold_b.join("ready"));
+    let mut held = read_ports(&hold_a.join("ports"));
+    held.extend(read_ports(&hold_b.join("ports")));
+    assert_unique_ports(&held);
+    assert_outside_ephemeral(&held);
+    std::fs::write(hold_a.join("release"), "ok").unwrap();
+    std::fs::write(hold_b.join("release"), "ok").unwrap();
+    assert!(
+        held_children.wait_all(),
+        "hold children failed while keeping their listeners"
+    );
+
+    let gap = std::env::temp_dir().join(format!("port-gap-{:032x}", rand::random::<u128>()));
+    std::fs::create_dir_all(&gap).unwrap();
+    let mut gap_children = KillChildren(vec![
+        spawn_port_child("gap-owner", &gap),
+        spawn_port_child("gap-other", &gap),
+    ]);
+    wait_for_file(&gap.join("owner-ready"));
+    wait_for_file(&gap.join("other-ready"));
+    let owner_ports = read_ports(&gap.join("owner-ports"));
+    let other_ports = read_ports(&gap.join("other-ports"));
+    let mut combined = owner_ports.clone();
+    combined.extend(&other_ports);
+    assert_unique_ports(&combined);
+    assert_outside_ephemeral(&combined);
+    std::fs::write(gap.join("rebind"), "ok").unwrap();
+    wait_for_file(&gap.join("rebound"));
+    std::fs::write(gap.join("release"), "ok").unwrap();
+    assert!(
+        gap_children.wait_all(),
+        "gap children failed while rebinding a closed port"
+    );
+    let _ = std::fs::remove_dir_all(&hold);
+    let _ = std::fs::remove_dir_all(&gap);
+}
+
+fn threaded_listeners(count: usize) -> Vec<std::net::TcpListener> {
+    // A runtime built on this async test's worker thread is rejected, and
+    // blocking that worker while it waits for itself deadlocks. Allocate on
+    // fresh threads and keep the sockets after those runtimes shut down.
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(count);
+        for _ in 0..count {
+            joins.push(scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let outside = bind_outside_ephemeral_range().await.into_std().unwrap();
+                    let reclaimable = bind_reclaimable_health_port().await.into_std().unwrap();
+                    (outside, reclaimable)
+                })
+            }));
+        }
+        let mut listeners = Vec::with_capacity(count * 2);
+        for join in joins {
+            let (outside, reclaimable) = join.join().unwrap();
+            listeners.push(outside);
+            listeners.push(reclaimable);
+        }
+        listeners
+    })
+}
+
+async fn hold_allocated_ports(dir: &std::path::Path) {
+    let listeners = threaded_listeners(16);
+    let ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect::<Vec<_>>();
+    write_port_list(&dir.join("ports"), &ports);
+    std::fs::write(dir.join("ready"), "ok").unwrap();
+    wait_for_file(&dir.join("release"));
+}
+
+async fn gap_owner(dir: &std::path::Path) {
+    let mut listeners = Vec::new();
+    for _ in 0..8 {
+        listeners.push(bind_outside_ephemeral_range().await);
+    }
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    drop(listeners);
+    write_port_list(&dir.join("owner-ports"), &ports);
+    std::fs::write(dir.join("owner-ready"), "ok").unwrap();
+    wait_for_file(&dir.join("rebind"));
+    let mut rebound = Vec::new();
+    for port in &ports {
+        rebound.push(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port))
+                .await
+                .expect("closed port was handed to another live process"),
+        );
+    }
+    std::fs::write(dir.join("rebound"), "ok").unwrap();
+    wait_for_file(&dir.join("release"));
+    drop(rebound);
+}
+
+async fn gap_other(dir: &std::path::Path) {
+    wait_for_file(&dir.join("owner-ready"));
+    let mut listeners = Vec::new();
+    for _ in 0..8 {
+        listeners.push(bind_outside_ephemeral_range().await);
+    }
+    write_ports(&dir.join("other-ports"), &listeners);
+    std::fs::write(dir.join("other-ready"), "ok").unwrap();
+    wait_for_file(&dir.join("release"));
+}
+
+fn spawn_port_child(role: &str, dir: &std::path::Path) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "controller_tests::concurrent_port_allocations_never_return_the_same_port",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env("JMODGUARD_PORT_ALLOC_CHILD", role)
+        .env("JMODGUARD_PORT_ALLOC_DIR", dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap()
+}
+
+struct KillChildren(Vec<std::process::Child>);
+
+impl KillChildren {
+    fn wait_all(&mut self) -> bool {
+        self.0.iter_mut().all(wait_child)
+    }
+}
+
+impl Drop for KillChildren {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn wait_child(child: &mut std::process::Child) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.success();
+        }
+        assert!(Instant::now() < deadline, "port allocation child timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("marker")
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn write_ports(path: &std::path::Path, listeners: &[tokio::net::TcpListener]) {
+    let ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect::<Vec<_>>();
+    write_port_list(path, &ports);
+}
+
+fn write_port_list(path: &std::path::Path, ports: &[u16]) {
+    let mut text = String::new();
+    for port in ports {
+        text.push_str(&port.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+fn read_ports(path: &std::path::Path) -> Vec<u16> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse().unwrap())
+        .collect()
+}
+
+fn assert_unique_ports(ports: &[u16]) {
+    let mut seen = HashSet::new();
+    for port in ports {
+        assert!(seen.insert(*port), "port {port} was allocated twice");
+    }
+    assert!(!ports.is_empty(), "allocation returned no ports");
+}
+
+fn assert_outside_ephemeral(ports: &[u16]) {
+    let text = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let mut parts = text.split_whitespace();
+    let low: u16 = parts.next().unwrap().parse().unwrap();
+    let high: u16 = parts.next().unwrap().parse().unwrap();
+    for port in ports {
+        assert!(
+            *port < low || *port > high,
+            "port {port} is inside the ephemeral range"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5213,7 +5605,10 @@ async fn held_launcher_health(
         Duration::ZERO,
         Instant::now(),
     );
-    let listener = bind_reclaimable_health_port().await;
+    // The server keeps this socket. An OS-assigned port stays ours while it does.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(jmodguard::health::serve_listener_as_with_reason(
         listener,
