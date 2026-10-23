@@ -4,7 +4,7 @@ use jmodguard::db::{self, Db, SqlExecutor};
 use jmodguard::tenant::TenantRuntime;
 use jmodguard_api::web::state::ApiState;
 use jmodguard_api::web::updates::{
-    RELEASE_LOOKUP_TIMEOUT, record_release_checks, run_release_check_loop,
+    RELEASE_LOOKUP_TIMEOUT, poll_scheduled_installs, record_release_checks, run_release_check_loop,
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -481,6 +481,7 @@ async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     assert_eq!(
         probe.immediate(),
@@ -517,6 +518,7 @@ async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     let api_row = db::component_update(&bot.db, "api").await.unwrap();
     assert!(api_row.desired.is_none());
@@ -555,6 +557,7 @@ async fn background_check_records_the_channel_digest_and_does_not_install() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     assert_eq!(probe.immediate(), before_probe);
     let expected_digest = format!("sha256:{}", "f".repeat(64));
@@ -602,6 +605,7 @@ async fn background_check_records_a_lookup_error_and_does_not_install() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     for component in ["bot", "api", "webui"] {
@@ -646,6 +650,7 @@ async fn background_check_records_a_lookup_timeout_and_does_not_install() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     assert!(started.elapsed() < Duration::from_secs(2));
     for component in ["bot", "api", "webui"] {
@@ -691,6 +696,7 @@ async fn background_check_records_http_429_and_does_not_retry() {
             pending_shutdown(),
         )
         .await
+        .finished
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
@@ -708,11 +714,158 @@ async fn background_check_records_http_429_and_does_not_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn background_check_skips_record_when_update_lease_held() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-lease").await;
+    let owner = test_release("bot", "latest", '3');
+    let now = chrono::Utc::now().timestamp();
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "latest".into(),
+        candidate: Some(owner.clone()),
+        error: None,
+        now,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        db::component_update(&bot.db, "bot")
+            .await
+            .unwrap()
+            .candidate
+            .unwrap()
+            .digest,
+        owner.digest
+    );
+    let held = "ab".repeat(16);
+    let claim = app
+        .commit(db::ControlOp::ClaimUpdateLease {
+            component: "bot".into(),
+            owner: held.clone(),
+            now,
+            ttl: 240,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
+    assert!(
+        record_release_checks(
+            &app,
+            |component, channel| discover_release(component, channel, 'd'),
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await
+        .finished
+    );
+    let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
+    assert_eq!(bot_row.candidate.unwrap().digest, owner.digest);
+    let api_row = db::component_update(&bot.db, "api").await.unwrap();
+    assert_eq!(
+        api_row.candidate.unwrap().digest,
+        format!("sha256:{}", "d".repeat(64))
+    );
+    app.commit(db::ControlOp::ReleaseUpdateLease {
+        component: "bot".into(),
+        owner: held,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_check_skips_scheduled_install_when_update_lease_held() {
+    let (bot, app, path, _enrollment) = linked_writer("bg-lease-install").await;
+    let now = chrono::Utc::now().timestamp();
+    for component in ["bot", "api"] {
+        app.commit(db::ControlOp::RecordBakedComponentRunning {
+            component: component.into(),
+            observation: running_observation(now),
+            now,
+        })
+        .await
+        .unwrap();
+    }
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "bot".into(),
+        channel: "nightly".into(),
+        cadence: "weekly".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    app.commit(db::ControlOp::SetUpdatePolicy {
+        component: "api".into(),
+        channel: "stable".into(),
+        cadence: "daily".into(),
+        unattended_allowed: true,
+    })
+    .await
+    .unwrap();
+    let bot_seed = promoted_release("bot", "nightly", '0');
+    app.commit(db::ControlOp::RecordUpdateCheck {
+        component: "bot".into(),
+        channel: "nightly".into(),
+        candidate: Some(bot_seed),
+        error: None,
+        now,
+    })
+    .await
+    .unwrap();
+    let held = "cd".repeat(16);
+    let claim = app
+        .commit(db::ControlOp::ClaimUpdateLease {
+            component: "bot".into(),
+            owner: held.clone(),
+            now,
+            ttl: 240,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
+    let before_bot = install_snapshot(&bot.db, "bot").await;
+    let _flags = ApplyFlags::enable();
+    let batch = record_release_checks(
+        &app,
+        |component, channel| {
+            let nibble = if component == "api" { 'a' } else { 'c' };
+            let release = promoted_release(component, channel, nibble);
+            Box::pin(async move { Ok(release) })
+        },
+        RELEASE_LOOKUP_TIMEOUT,
+        pending_shutdown(),
+    )
+    .await;
+    assert!(batch.finished);
+    assert!(batch.lease_held.contains("bot"));
+    poll_scheduled_installs(&app, &batch.lease_held).await;
+    assert_install_unchanged(&bot.db, "bot", &before_bot).await;
+    let api_row = db::component_update(&bot.db, "api").await.unwrap();
+    assert_eq!(api_row.state, "queued");
+    assert_eq!(
+        api_row.desired.unwrap().digest,
+        format!("sha256:{}", "a".repeat(64))
+    );
+    app.commit(db::ControlOp::ReleaseUpdateLease {
+        component: "bot".into(),
+        owner: held,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn background_check_skips_overlapping_ticks() {
     let (bot, app, path, _enrollment) = linked_writer("bg-overlap").await;
     let gate = Arc::new(tokio::sync::Notify::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
+    let (lookup_started_tx, mut lookup_started_rx) = tokio::sync::mpsc::channel(4);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let gate_worker = Arc::clone(&gate);
@@ -727,10 +880,15 @@ async fn background_check_skips_overlapping_ticks() {
                 let gate = Arc::clone(&gate_worker);
                 let in_flight = Arc::clone(&in_flight_worker);
                 let calls = Arc::clone(&calls_worker);
+                let lookup_started_tx = lookup_started_tx.clone();
                 Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
+                    let ordinal = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     assert!(active <= 1, "overlapping release checks");
+                    lookup_started_tx
+                        .send(ordinal)
+                        .await
+                        .expect("test must receive lookup start signals");
                     gate.notified().await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     Ok(test_release("bot", "latest", '4'))
@@ -740,10 +898,20 @@ async fn background_check_skips_overlapping_ticks() {
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        tokio::time::timeout(wait, lookup_started_rx.recv())
+            .await
+            .expect("first lookup did not start in time"),
+        Some(1)
+    );
     gate.notify_one();
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        tokio::time::timeout(wait, lookup_started_rx.recv())
+            .await
+            .expect("second lookup did not start in time"),
+        Some(2)
+    );
     let _ = stop_tx.send(true);
     worker.await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);

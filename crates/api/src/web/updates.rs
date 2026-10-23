@@ -10,6 +10,7 @@ use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -547,6 +548,21 @@ fn control_link_unavailable(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string() == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
 }
 
+fn warn_record_release_check(component: &str, error: &anyhow::Error) {
+    if control_link_unavailable(error) {
+        tracing::warn!(component, "control link unavailable during release check");
+    } else {
+        tracing::warn!(component, "failed to record release check: {error:#}");
+    }
+}
+
+/// Outcome of one [`record_release_checks`] pass.
+pub struct ReleaseCheckBatch {
+    pub finished: bool,
+    /// Components whose update lease was held; skip automatic install this tick.
+    pub lease_held: HashSet<&'static str>,
+}
+
 async fn record_release_check(
     app: &Arc<ApiState>,
     component: &str,
@@ -583,10 +599,11 @@ pub async fn record_release_checks<F>(
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-) -> bool
+) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
 {
+    let mut lease_held = HashSet::new();
     for component in ["bot", "api", "webui"] {
         let state = match db::component_update(&app.db, component).await {
             Ok(state) => state,
@@ -596,93 +613,110 @@ where
             }
         };
         let channel = state.channel.clone();
-        let outcome = tokio::select! {
-            biased;
-            _ = &mut shutdown => return false,
-            outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+        let lease = format!("{:032x}", rand::random::<u128>());
+        let claim_now = chrono::Utc::now().timestamp();
+        let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(component, "release check skipped: {error:#}");
+                continue;
+            }
         };
-        let now = chrono::Utc::now().timestamp();
-        match outcome {
-            Err(_) => {
-                if let Err(error) = record_release_check(
-                    app,
-                    component,
-                    &channel,
-                    None,
-                    Some("release lookup timed out".into()),
-                    now,
-                )
-                .await
-                {
-                    if control_link_unavailable(&error) {
-                        tracing::warn!(component, "control link unavailable during release check");
+        if !claimed {
+            tracing::debug!(component, "release check skipped: update lease held");
+            lease_held.insert(component);
+            continue;
+        }
+        let work = with_update_lease(Some(app), &app.db, component, &lease, 240, async {
+            let outcome = tokio::select! {
+                biased;
+                _ = &mut shutdown => anyhow::bail!("release check shutdown"),
+                outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+            };
+            let now = chrono::Utc::now().timestamp();
+            match outcome {
+                Err(_) => {
+                    if let Err(error) = record_release_check(
+                        app,
+                        component,
+                        &channel,
+                        None,
+                        Some("release lookup timed out".into()),
+                        now,
+                    )
+                    .await
+                    {
+                        warn_record_release_check(component, &error);
+                    }
+                }
+                Ok(Err(error)) => {
+                    let message = format!("{error:#}");
+                    if let Err(error) =
+                        record_release_check(app, component, &channel, None, Some(message), now)
+                            .await
+                    {
+                        warn_record_release_check(component, &error);
+                    }
+                }
+                Ok(Ok(release)) => {
+                    let record = if let Err(error) = release.validate() {
+                        Err(format!("{error:#}"))
+                    } else if release.component != component || release.channel != channel {
+                        Err("candidate component or channel mismatch".into())
                     } else {
-                        tracing::warn!(component, "failed to record release check: {error:#}");
+                        Ok(release)
+                    };
+                    match record {
+                        Ok(release) => {
+                            if let Err(error) = record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                Some(release),
+                                None,
+                                now,
+                            )
+                            .await
+                            {
+                                warn_record_release_check(component, &error);
+                            }
+                        }
+                        Err(message) => {
+                            if let Err(error) = record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                None,
+                                Some(message),
+                                now,
+                            )
+                            .await
+                            {
+                                warn_record_release_check(component, &error);
+                            }
+                        }
                     }
                 }
             }
-            Ok(Err(error)) => {
-                let message = format!("{error:#}");
-                if let Err(error) =
-                    record_release_check(app, component, &channel, None, Some(message), now).await
-                {
-                    if control_link_unavailable(&error) {
-                        tracing::warn!(component, "control link unavailable during release check");
-                    } else {
-                        tracing::warn!(component, "failed to record release check: {error:#}");
-                    }
-                }
-            }
-            Ok(Ok(release)) => {
-                let record = if let Err(error) = release.validate() {
-                    Err(format!("{error:#}"))
-                } else if release.component != component || release.channel != channel {
-                    Err("candidate component or channel mismatch".into())
-                } else {
-                    Ok(release)
+            Ok(())
+        });
+        match work.await {
+            Ok(()) => {}
+            Err(error) if error.to_string() == "release check shutdown" => {
+                return ReleaseCheckBatch {
+                    finished: false,
+                    lease_held,
                 };
-                match record {
-                    Ok(release) => {
-                        if let Err(error) =
-                            record_release_check(app, component, &channel, Some(release), None, now)
-                                .await
-                        {
-                            if control_link_unavailable(&error) {
-                                tracing::warn!(
-                                    component,
-                                    "control link unavailable during release check"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    component,
-                                    "failed to record release check: {error:#}"
-                                );
-                            }
-                        }
-                    }
-                    Err(message) => {
-                        if let Err(error) =
-                            record_release_check(app, component, &channel, None, Some(message), now)
-                                .await
-                        {
-                            if control_link_unavailable(&error) {
-                                tracing::warn!(
-                                    component,
-                                    "control link unavailable during release check"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    component,
-                                    "failed to record release check: {error:#}"
-                                );
-                            }
-                        }
-                    }
-                }
+            }
+            Err(error) => {
+                tracing::warn!(component, "background release check failed: {error:#}");
             }
         }
     }
-    true
+    ReleaseCheckBatch {
+        finished: true,
+        lease_held,
+    }
 }
 
 /// Promoted channels may install on a cadence. `latest` cannot, and cadence
@@ -693,11 +727,14 @@ pub fn scheduled_auto_install_allowed(channel: &str, cadence: &str) -> bool {
 
 /// The install half of [`poll_all`]. Flags still default off. Rows that are
 /// not a stable or nightly cadence are left untouched.
-pub async fn poll_scheduled_installs(app: &Arc<ApiState>) {
+pub async fn poll_scheduled_installs(app: &Arc<ApiState>, skip_lease_held: &HashSet<&'static str>) {
     if !(enabled("JMODGUARD_UNATTENDED_UPDATES") && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")) {
         return;
     }
     for component in ["bot", "api", "webui"] {
+        if skip_lease_held.contains(component) {
+            continue;
+        }
         let state = match db::component_update(&app.db, component).await {
             Ok(state) => state,
             Err(error) => {
@@ -736,18 +773,18 @@ pub async fn run_release_check_loop<F, S>(
             _ = shutdown() => break,
             _ = tick.tick() => {}
         }
-        let finished = tokio::select! {
+        let batch = tokio::select! {
             biased;
             _ = shutdown() => break,
-            finished = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()) => finished,
+            batch = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()) => batch,
         };
-        if !finished {
+        if !batch.finished {
             break;
         }
         tokio::select! {
             biased;
             _ = shutdown() => break,
-            _ = poll_scheduled_installs(&app) => {}
+            _ = poll_scheduled_installs(&app, &batch.lease_held) => {}
         }
     }
 }
@@ -795,7 +832,7 @@ pub async fn poll_all(app: &Arc<ApiState>) {
         Ok(registry.discover(component, channel).await?.digest)
     })
     .await;
-    poll_scheduled_installs(app).await;
+    poll_scheduled_installs(app, &HashSet::new()).await;
 }
 
 async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Result<()> {
