@@ -24,7 +24,7 @@ tracing = "0.1"
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
 jmodguard = { path = "../..", features = ["test-support"] }
-libsql = { version = "0.9.30", default-features = false, features = ["core"] }
+libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
