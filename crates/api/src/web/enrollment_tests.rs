@@ -1080,7 +1080,7 @@ async fn guild_list_cooldown_survives_a_new_api_process() {
         let _ = std::fs::remove_file(format!("{}{suffix}", other_path.display()));
     }
 
-    let expired_ms = chrono::Utc::now().timestamp_millis() - 1000;
+    let expired_ms = chrono::Utc::now().timestamp_millis() - 600_000;
     let expired_json = format!(r#"{{"g:42":{expired_ms}}}"#);
     let expired_db = db::Db::open(&f.path, 2).unwrap();
     super::discord_retry::store_deadlines(&expired_db, expired_json)
