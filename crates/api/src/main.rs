@@ -157,10 +157,10 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!("API listening on http://{web_bind}");
-    axum::serve(listener, web_app)
+    let serve_result = axum::serve(listener, web_app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("web server error")?;
+        .context("web server error");
     match tokio::time::timeout(web::updates::RELEASE_CHECK_SHUTDOWN_DRAIN, release_check).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
             );
         }
     }
+    serve_result?;
     jmodguard::log_shutdown_finished("api");
     tracing::info!("API process stopped");
     Ok(())

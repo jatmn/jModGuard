@@ -976,13 +976,10 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
         }
     };
     if component == "webui" {
-        let worker = Arc::clone(app);
         let lease = lease.expect("WebUI install owns its lease");
-        tokio::spawn(async move {
-            if let Err(error) = run_webui_install(&worker, release, &lease).await {
-                tracing::error!("automatic WebUI install failed: {error:#}");
-            }
-        });
+        if let Err(error) = run_webui_install(app, release, &lease).await {
+            tracing::error!("automatic WebUI install failed: {error:#}");
+        }
     }
     Ok(())
 }
