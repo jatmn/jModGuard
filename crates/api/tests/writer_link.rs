@@ -710,28 +710,41 @@ async fn background_check_records_http_429_and_does_not_retry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn background_check_skips_record_when_update_lease_held() {
     let (bot, app, path, _enrollment) = linked_writer("bg-lease").await;
-    let channel = db::component_update(&app.db, "bot").await.unwrap().channel;
-    let owner = test_release("bot", &channel, 'o');
+    let owner = test_release("bot", "latest", '3');
     let now = chrono::Utc::now().timestamp();
     app.commit(db::ControlOp::RecordUpdateCheck {
         component: "bot".into(),
-        channel: channel.clone(),
+        channel: "latest".into(),
         candidate: Some(owner.clone()),
         error: None,
         now,
     })
     .await
     .unwrap();
-    let held = "h".repeat(32);
-    assert!(
-        db::claim_update_lease(&bot.db, "bot", &held, now, 240)
+    assert_eq!(
+        db::component_update(&bot.db, "bot")
             .await
             .unwrap()
+            .candidate
+            .unwrap()
+            .digest,
+        owner.digest
     );
+    let held = "ab".repeat(16);
+    let claim = app
+        .commit(db::ControlOp::ClaimUpdateLease {
+            component: "bot".into(),
+            owner: held.clone(),
+            now,
+            ttl: 240,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
     assert!(
         record_release_checks(
             &app,
-            |component, channel| discover_release(component, channel, 'z'),
+            |component, channel| discover_release(component, channel, 'd'),
             RELEASE_LOOKUP_TIMEOUT,
             pending_shutdown(),
         )
@@ -742,11 +755,14 @@ async fn background_check_skips_record_when_update_lease_held() {
     let api_row = db::component_update(&bot.db, "api").await.unwrap();
     assert_eq!(
         api_row.candidate.unwrap().digest,
-        format!("sha256:{}", "z".repeat(64))
+        format!("sha256:{}", "d".repeat(64))
     );
-    db::release_update_lease(&bot.db, "bot", &held)
-        .await
-        .unwrap();
+    app.commit(db::ControlOp::ReleaseUpdateLease {
+        component: "bot".into(),
+        owner: held,
+    })
+    .await
+    .unwrap();
     drop(app);
     drop(bot);
     cleanup(&path);

@@ -1605,10 +1605,11 @@ mod tests {
             "{healthy}"
         );
         for component in ["bot", "api", "webui"] {
-            assert!(
-                healthy.contains(&format!("**{component}:** not checked")),
-                "{healthy}"
-            );
+            let expected = format!("**{component}:** not checked");
+            let line = healthy
+                .lines()
+                .find(|line| line.starts_with(&format!("**{component}:**")));
+            assert_eq!(line, Some(expected.as_str()), "{healthy}");
         }
         db.with_conn(|conn| {
             conn.execute_batch_bounded("DROP TABLE component_updates", 1024 * 1024)?;
