@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
                 // a background task on a process that then failed to listen.
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
-                tokio::spawn(async move {
+                let release_check = tokio::spawn(async move {
                     web::updates::run_release_check_loop(
                         update_app,
                         web::updates::ReleaseCheckTick::interval(
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
-                Ok::<_, anyhow::Error>(Some(web_app))
+                Ok::<_, anyhow::Error>(Some((web_app, release_check)))
             } => result,
             _ = shutdown_signal() => {
                 tracing::info!("shutdown during API startup");
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     })
     .await?;
 
-    let Some(web_app) = web_app else {
+    let Some((web_app, release_check)) = web_app else {
         tracing::info!("API process stopped");
         return Ok(());
     };
@@ -161,6 +161,18 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("web server error")?;
+    match tokio::time::timeout(web::updates::RELEASE_CHECK_SHUTDOWN_DRAIN, release_check).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("release check task stopped with error: {error}");
+        }
+        Err(_) => {
+            tracing::warn!(
+                "release check task did not finish within {:?}",
+                web::updates::RELEASE_CHECK_SHUTDOWN_DRAIN
+            );
+        }
+    }
     jmodguard::log_shutdown_finished("api");
     tracing::info!("API process stopped");
     Ok(())

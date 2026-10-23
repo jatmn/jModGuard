@@ -542,6 +542,8 @@ async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow:
 
 pub const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 pub const RELEASE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Drain the background release-check task after HTTP graceful shutdown.
+pub const RELEASE_CHECK_SHUTDOWN_DRAIN: Duration = Duration::from_secs(60);
 
 fn control_link_unavailable(error: &anyhow::Error) -> bool {
     error
@@ -786,7 +788,7 @@ enum ReleaseCheckTickInner {
     Interval(tokio::time::Interval),
     Coalescing {
         notify: Arc<Notify>,
-        parked: Option<tokio::sync::watch::Sender<bool>>,
+        parked: Option<tokio::sync::watch::Sender<u32>>,
     },
 }
 
@@ -799,7 +801,7 @@ impl ReleaseCheckTick {
         }
     }
 
-    pub fn coalescing(notify: Arc<Notify>, parked: tokio::sync::watch::Sender<bool>) -> Self {
+    pub fn coalescing(notify: Arc<Notify>, parked: tokio::sync::watch::Sender<u32>) -> Self {
         Self {
             inner: ReleaseCheckTickInner::Coalescing {
                 notify,
@@ -838,7 +840,10 @@ impl ReleaseCheckTick {
             parked: Some(tx), ..
         } = &self.inner
         {
-            let _ = tx.send_replace(true);
+            let _ = tx.send_if_modified(|generation| {
+                *generation += 1;
+                true
+            });
         }
     }
 }

@@ -868,7 +868,7 @@ async fn background_check_skips_overlapping_ticks() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let (lookup_started_tx, mut lookup_started_rx) = tokio::sync::mpsc::channel(8);
-    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(false);
+    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(0u32);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let gate_worker = Arc::clone(&gate);
@@ -927,7 +927,6 @@ async fn background_check_skips_overlapping_ticks() {
             Some(expected)
         );
     }
-    tick_notify.notify_one();
     for expected in [4, 5, 6] {
         assert_eq!(
             tokio::time::timeout(wait, lookup_started_rx.recv())
@@ -937,8 +936,9 @@ async fn background_check_skips_overlapping_ticks() {
         );
     }
     assert_eq!(calls.load(Ordering::SeqCst), 6);
+    const SECOND_TICK_PARKED: u32 = 2;
     let parked = tokio::time::timeout(wait, async {
-        while !*parked_rx.borrow() {
+        while *parked_rx.borrow() < SECOND_TICK_PARKED {
             if parked_rx.changed().await.is_err() {
                 break;
             }
@@ -946,8 +946,8 @@ async fn background_check_skips_overlapping_ticks() {
     })
     .await;
     assert!(
-        parked.is_ok(),
-        "release check loop did not park on the tick wait"
+        parked.is_ok() && *parked_rx.borrow() >= SECOND_TICK_PARKED,
+        "release check loop did not park after the second tick"
     );
     let _ = stop_tx.send(true);
     worker.await.unwrap();
@@ -963,7 +963,7 @@ async fn background_check_stops_on_shutdown_without_installing() {
     let webui_called = Arc::new(AtomicUsize::new(0));
     let (api_entered_tx, mut api_entered_rx) = tokio::sync::mpsc::channel(1);
     let tick_notify = Arc::new(tokio::sync::Notify::new());
-    let (parked_tx, _parked_rx) = tokio::sync::watch::channel(false);
+    let (parked_tx, _parked_rx) = tokio::sync::watch::channel(0u32);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let api_gate_worker = Arc::clone(&api_gate);
@@ -1107,7 +1107,7 @@ async fn background_check_still_schedules_promoted_cadences() {
     let app_task = Arc::clone(&app);
     let worker = tokio::spawn(async move {
         let tick_notify = Arc::new(tokio::sync::Notify::new());
-        let (parked_tx, _parked_rx) = tokio::sync::watch::channel(false);
+        let (parked_tx, _parked_rx) = tokio::sync::watch::channel(0u32);
         let tick = ReleaseCheckTick::coalescing(tick_notify.clone(), parked_tx);
         tick.fire();
         run_release_check_loop(
