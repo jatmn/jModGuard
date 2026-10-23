@@ -215,6 +215,19 @@ pub fn stats_response_with_update_availability(
             ));
             continue;
         }
+        if !observation_fresh {
+            let reason = if item.observed_at.is_none() {
+                "unknown".into()
+            } else {
+                let hours = item
+                    .observed_at
+                    .map(|at| now.saturating_sub(at) / 3600)
+                    .unwrap_or(0);
+                format!("observation stale ({hours}h)")
+            };
+            lines.push(release_status_line(component, None, None, reason));
+            continue;
+        }
         let running_source = item
             .observed
             .as_ref()
@@ -888,6 +901,7 @@ mod presentation_tests {
             "latest",
         );
         fresh.installed = fresh.candidate.clone();
+        fresh.observed_at = Some(boundary_now - 3_600);
         let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh], boundary_now);
         let api = out
             .lines()
@@ -993,6 +1007,31 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api_line.ends_with("⚠️"), "{api_line}");
+    }
+
+    #[test]
+    fn status_wont_claim_up_to_date_from_stale_observation_with_fresh_check() {
+        let running = "a".repeat(40);
+        let candidate_source = "b".repeat(40);
+        let candidate = sample_candidate("latest", &candidate_source, &"c".repeat(64));
+        let mut row = sample_api_update_row(
+            Some(candidate.clone()),
+            Some(8_900),
+            None,
+            Some(sample_observed(&running)),
+            Some(1_000),
+            "latest",
+        );
+        row.installed = Some(candidate);
+        row.observed.as_mut().unwrap().source_sha = candidate_source;
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 9_000);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("observation stale (2h)"), "{api}");
+        assert!(!api.ends_with('✅'), "{api}");
+        assert!(!api.contains("⬆️"), "{api}");
     }
 
     #[test]
