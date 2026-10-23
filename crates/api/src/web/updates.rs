@@ -725,10 +725,43 @@ pub fn scheduled_auto_install_allowed(channel: &str, cadence: &str) -> bool {
     matches!(channel, "stable" | "nightly") && matches!(cadence, "daily" | "weekly" | "monthly")
 }
 
+/// Unattended apply gates for [`poll_scheduled_installs`] and
+/// [`run_release_check_loop`]. Production passes [`ScheduledInstallPolicy::from_env`];
+/// integration tests inject explicit values instead of mutating process env.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledInstallPolicy {
+    pub unattended_updates: bool,
+    pub apply_enabled: bool,
+}
+
+impl ScheduledInstallPolicy {
+    pub fn from_env() -> Self {
+        Self {
+            unattended_updates: enabled("JMODGUARD_UNATTENDED_UPDATES"),
+            apply_enabled: enabled("JMODGUARD_UPDATE_APPLY_ENABLED"),
+        }
+    }
+
+    pub fn enabled(unattended_updates: bool, apply_enabled: bool) -> Self {
+        Self {
+            unattended_updates,
+            apply_enabled,
+        }
+    }
+
+    pub fn allows_scheduled_install(&self) -> bool {
+        self.unattended_updates && self.apply_enabled
+    }
+}
+
 /// The install half of [`poll_all`]. Flags still default off. Rows that are
 /// not a stable or nightly cadence are left untouched.
-pub async fn poll_scheduled_installs(app: &Arc<ApiState>, skip_lease_held: &HashSet<&'static str>) {
-    if !(enabled("JMODGUARD_UNATTENDED_UPDATES") && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")) {
+pub async fn poll_scheduled_installs(
+    app: &Arc<ApiState>,
+    skip_lease_held: &HashSet<&'static str>,
+    policy: ScheduledInstallPolicy,
+) {
+    if !policy.allows_scheduled_install() {
         return;
     }
     for component in ["bot", "api", "webui"] {
@@ -761,6 +794,7 @@ pub async fn run_release_check_loop<F, S>(
     lookup_timeout: Duration,
     mut discover: F,
     shutdown: S,
+    policy: ScheduledInstallPolicy,
 ) where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
     S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -784,7 +818,7 @@ pub async fn run_release_check_loop<F, S>(
         tokio::select! {
             biased;
             _ = shutdown() => break,
-            _ = poll_scheduled_installs(&app, &batch.lease_held) => {}
+            _ = poll_scheduled_installs(&app, &batch.lease_held, policy) => {}
         }
     }
 }
@@ -832,7 +866,7 @@ pub async fn poll_all(app: &Arc<ApiState>) {
         Ok(registry.discover(component, channel).await?.digest)
     })
     .await;
-    poll_scheduled_installs(app, &HashSet::new()).await;
+    poll_scheduled_installs(app, &HashSet::new(), ScheduledInstallPolicy::from_env()).await;
 }
 
 async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Result<()> {

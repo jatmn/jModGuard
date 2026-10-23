@@ -4,7 +4,8 @@ use jmodguard::db::{self, Db, SqlExecutor};
 use jmodguard::tenant::TenantRuntime;
 use jmodguard_api::web::state::ApiState;
 use jmodguard_api::web::updates::{
-    RELEASE_LOOKUP_TIMEOUT, poll_scheduled_installs, record_release_checks, run_release_check_loop,
+    RELEASE_LOOKUP_TIMEOUT, ScheduledInstallPolicy, poll_scheduled_installs, record_release_checks,
+    run_release_check_loop,
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -826,7 +827,7 @@ async fn background_check_skips_scheduled_install_when_update_lease_held() {
         .unwrap();
     assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
     let before_bot = install_snapshot(&bot.db, "bot").await;
-    let _flags = ApplyFlags::enable();
+    let apply = ScheduledInstallPolicy::enabled(true, true);
     let batch = record_release_checks(
         &app,
         |component, channel| {
@@ -840,7 +841,7 @@ async fn background_check_skips_scheduled_install_when_update_lease_held() {
     .await;
     assert!(batch.finished);
     assert!(batch.lease_held.contains("bot"));
-    poll_scheduled_installs(&app, &batch.lease_held).await;
+    poll_scheduled_installs(&app, &batch.lease_held, apply).await;
     assert_install_unchanged(&bot.db, "bot", &before_bot).await;
     let api_row = db::component_update(&bot.db, "api").await.unwrap();
     assert_eq!(api_row.state, "queued");
@@ -895,6 +896,7 @@ async fn background_check_skips_overlapping_ticks() {
                 })
             },
             || watch_shutdown(&stop_rx),
+            ScheduledInstallPolicy::enabled(false, false),
         )
         .await;
     });
@@ -953,6 +955,7 @@ async fn background_check_stops_on_shutdown_without_installing() {
                 })
             },
             || watch_shutdown(&stop_rx),
+            ScheduledInstallPolicy::enabled(false, false),
         )
         .await;
     });
@@ -975,27 +978,6 @@ async fn background_check_stops_on_shutdown_without_installing() {
     drop(app);
     drop(bot);
     cleanup(&path);
-}
-
-struct ApplyFlags;
-
-impl ApplyFlags {
-    fn enable() -> Self {
-        unsafe {
-            std::env::set_var("JMODGUARD_UNATTENDED_UPDATES", "1");
-            std::env::set_var("JMODGUARD_UPDATE_APPLY_ENABLED", "1");
-        }
-        Self
-    }
-}
-
-impl Drop for ApplyFlags {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("JMODGUARD_UNATTENDED_UPDATES");
-            std::env::remove_var("JMODGUARD_UPDATE_APPLY_ENABLED");
-        }
-    }
 }
 
 fn running_observation(now: i64) -> db::ComponentObservation {
@@ -1060,7 +1042,6 @@ async fn background_check_still_schedules_promoted_cadences() {
     })
     .await
     .unwrap();
-    let _flags = ApplyFlags::enable();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let app_task = Arc::clone(&app);
     let worker = tokio::spawn(async move {
@@ -1078,6 +1059,7 @@ async fn background_check_still_schedules_promoted_cadences() {
                 Box::pin(async move { Ok(release) })
             },
             || watch_shutdown(&stop_rx),
+            ScheduledInstallPolicy::enabled(true, true),
         )
         .await;
     });

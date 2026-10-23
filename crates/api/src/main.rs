@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
                             })
                         },
                         || Box::pin(shutdown_signal()),
+                        web::updates::ScheduledInstallPolicy::from_env(),
                     )
                     .await;
                 });
