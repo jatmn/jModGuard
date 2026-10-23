@@ -1606,7 +1606,7 @@ mod tests {
         );
         for component in ["bot", "api", "webui"] {
             assert!(
-                healthy.contains(&format!("**{component}:** ❓")),
+                healthy.contains(&format!("**{component}:** not checked")),
                 "{healthy}"
             );
         }

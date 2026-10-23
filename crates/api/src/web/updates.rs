@@ -547,6 +547,14 @@ fn control_link_unavailable(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string() == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
 }
 
+fn warn_record_release_check(component: &str, error: &anyhow::Error) {
+    if control_link_unavailable(error) {
+        tracing::warn!(component, "control link unavailable during release check");
+    } else {
+        tracing::warn!(component, "failed to record release check: {error:#}");
+    }
+}
+
 async fn record_release_check(
     app: &Arc<ApiState>,
     component: &str,
@@ -596,89 +604,98 @@ where
             }
         };
         let channel = state.channel.clone();
-        let outcome = tokio::select! {
-            biased;
-            _ = &mut shutdown => return false,
-            outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+        let lease = format!("{:032x}", rand::random::<u128>());
+        let claim_now = chrono::Utc::now().timestamp();
+        let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(component, "release check skipped: {error:#}");
+                continue;
+            }
         };
-        let now = chrono::Utc::now().timestamp();
-        match outcome {
-            Err(_) => {
-                if let Err(error) = record_release_check(
-                    app,
-                    component,
-                    &channel,
-                    None,
-                    Some("release lookup timed out".into()),
-                    now,
-                )
-                .await
-                {
-                    if control_link_unavailable(&error) {
-                        tracing::warn!(component, "control link unavailable during release check");
-                    } else {
-                        tracing::warn!(component, "failed to record release check: {error:#}");
+        if !claimed {
+            tracing::debug!(component, "release check skipped: update lease held");
+            continue;
+        }
+        let work = with_update_lease(Some(app), &app.db, component, &lease, 240, async {
+            let outcome = tokio::select! {
+                biased;
+                _ = &mut shutdown => anyhow::bail!("release check shutdown"),
+                outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+            };
+            let now = chrono::Utc::now().timestamp();
+            match outcome {
+                Err(_) => {
+                    if let Err(error) = record_release_check(
+                        app,
+                        component,
+                        &channel,
+                        None,
+                        Some("release lookup timed out".into()),
+                        now,
+                    )
+                    .await
+                    {
+                        warn_record_release_check(component, &error);
                     }
                 }
-            }
-            Ok(Err(error)) => {
-                let message = format!("{error:#}");
-                if let Err(error) =
-                    record_release_check(app, component, &channel, None, Some(message), now).await
-                {
-                    if control_link_unavailable(&error) {
-                        tracing::warn!(component, "control link unavailable during release check");
-                    } else {
-                        tracing::warn!(component, "failed to record release check: {error:#}");
+                Ok(Err(error)) => {
+                    let message = format!("{error:#}");
+                    if let Err(error) =
+                        record_release_check(app, component, &channel, None, Some(message), now)
+                            .await
+                    {
+                        warn_record_release_check(component, &error);
                     }
                 }
-            }
-            Ok(Ok(release)) => {
-                let record = if let Err(error) = release.validate() {
-                    Err(format!("{error:#}"))
-                } else if release.component != component || release.channel != channel {
-                    Err("candidate component or channel mismatch".into())
-                } else {
-                    Ok(release)
-                };
-                match record {
-                    Ok(release) => {
-                        if let Err(error) =
-                            record_release_check(app, component, &channel, Some(release), None, now)
-                                .await
-                        {
-                            if control_link_unavailable(&error) {
-                                tracing::warn!(
-                                    component,
-                                    "control link unavailable during release check"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    component,
-                                    "failed to record release check: {error:#}"
-                                );
+                Ok(Ok(release)) => {
+                    let record = if let Err(error) = release.validate() {
+                        Err(format!("{error:#}"))
+                    } else if release.component != component || release.channel != channel {
+                        Err("candidate component or channel mismatch".into())
+                    } else {
+                        Ok(release)
+                    };
+                    match record {
+                        Ok(release) => {
+                            if let Err(error) = record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                Some(release),
+                                None,
+                                now,
+                            )
+                            .await
+                            {
+                                warn_record_release_check(component, &error);
                             }
                         }
-                    }
-                    Err(message) => {
-                        if let Err(error) =
-                            record_release_check(app, component, &channel, None, Some(message), now)
-                                .await
-                        {
-                            if control_link_unavailable(&error) {
-                                tracing::warn!(
-                                    component,
-                                    "control link unavailable during release check"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    component,
-                                    "failed to record release check: {error:#}"
-                                );
+                        Err(message) => {
+                            if let Err(error) = record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                None,
+                                Some(message),
+                                now,
+                            )
+                            .await
+                            {
+                                warn_record_release_check(component, &error);
                             }
                         }
                     }
                 }
+            }
+            Ok(())
+        });
+        match work.await {
+            Ok(()) => {}
+            Err(error) if error.to_string() == "release check shutdown" => return false,
+            Err(error) => {
+                tracing::warn!(component, "background release check failed: {error:#}");
             }
         }
     }
