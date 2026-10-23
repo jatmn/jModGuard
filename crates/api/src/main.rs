@@ -3,6 +3,7 @@
 use anyhow::{Context as _, Result};
 use jmodguard_api::config::ApiProcessConfig;
 use jmodguard_api::{health, init_tracing, shutdown_signal, web};
+use jmodguard_updater::oci::Registry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,12 +106,21 @@ async fn main() -> Result<()> {
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
                 tokio::spawn(async move {
-                    let mut interval=tokio::time::interval(Duration::from_secs(3600));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        interval.tick().await;
-                        web::updates::poll_all(&update_app).await;
-                    }
+                    web::updates::run_release_check_loop(
+                        update_app,
+                        web::updates::RELEASE_CHECK_INTERVAL,
+                        web::updates::RELEASE_LOOKUP_TIMEOUT,
+                        |component, channel| {
+                            let (component, channel) = (component.to_owned(), channel.to_owned());
+                            Box::pin(async move {
+                                let registry = Registry::ghcr()?;
+                                registry.discover(&component, &channel).await
+                            })
+                        },
+                        || Box::pin(shutdown_signal()),
+                        web::updates::ScheduledInstallPolicy::from_env(),
+                    )
+                    .await;
                 });
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));

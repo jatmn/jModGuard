@@ -42,6 +42,61 @@ fn release_status_icon(availability: &str) -> &'static str {
     }
 }
 
+fn is_ascii_hex_sha40(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn running_short_sha(item: &crate::db::ComponentUpdate) -> Option<String> {
+    if item.state == "drift" {
+        return None;
+    }
+    let sha = item.observed.as_ref().map(|v| v.source_sha.as_str())?;
+    is_ascii_hex_sha40(sha).then(|| sha[..7].to_string())
+}
+
+fn release_status_reason(
+    item: &crate::db::ComponentUpdate,
+    component: &str,
+    now: i64,
+) -> Option<String> {
+    if component == "webui" && item.installed.is_none() {
+        return Some("webui not managed by updater".into());
+    }
+    if item.check_error.is_some() {
+        return Some("check failed".into());
+    }
+    if item.candidate.is_none()
+        || item
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.channel != item.channel)
+        || item.checked_at.is_none()
+    {
+        return Some("not checked".into());
+    }
+    if let Some(checked) = item.checked_at
+        && now.saturating_sub(checked) > 7200
+    {
+        let hours = now.saturating_sub(checked) / 3600;
+        return Some(format!("check stale ({hours}h)"));
+    }
+    None
+}
+
+fn release_status_line(
+    component: &str,
+    short_sha: Option<&str>,
+    age_clause: Option<String>,
+    tail: String,
+) -> String {
+    match (short_sha, age_clause) {
+        (Some(sha), Some(age)) => format!("**{component}:** `{sha}` · {age} · {tail}"),
+        (Some(sha), None) => format!("**{component}:** `{sha}` · {tail}"),
+        (None, Some(age)) => format!("**{component}:** {age} · {tail}"),
+        (None, None) => format!("**{component}:** {tail}"),
+    }
+}
+
 /// Absolute UTC timestamp for Discord display, without fractional-second noise.
 pub fn format_timestamp(time: chrono::DateTime<chrono::Utc>) -> String {
     time.format("%b %d, %Y • %H:%M:%S UTC").to_string()
@@ -77,7 +132,7 @@ pub fn stats_response(uptime_seconds: u64, cases: Option<i64>, warns: i64, bans:
 }
 
 /// Append cached release observations without making a network request from
-/// a Discord command. Unknown includes stale checks and legacy manual images.
+/// a Discord command. Release lines name missing, stale, or failed checks.
 ///
 /// ```
 /// let response: String = jmodguard::templates::stats_response_with_updates(
@@ -96,8 +151,7 @@ pub fn stats_response_with_updates(
 }
 
 /// Render release lookup availability alongside moderation stats. None means
-/// the lookup failed; successful reads retain [`stats_response_with_updates`]
-/// semantics, including unknown markers for missing or stale observations.
+/// the lookup failed; successful reads name why a check is missing or stale.
 pub fn stats_response_with_update_availability(
     uptime_seconds: u64,
     cases: Option<i64>,
@@ -118,24 +172,14 @@ pub fn stats_response_with_update_availability(
     let mut lines = Vec::new();
     for component in ["bot", "api", "webui"] {
         let Some(item) = updates.iter().find(|item| item.component == component) else {
-            lines.push(format!(
-                "**{component}:** {}",
-                release_status_icon("unknown")
-            ));
+            lines.push(format!("**{component}:** not checked"));
             continue;
         };
-        let fresh = item
+        let observation_fresh = item
             .observed_at
             .is_some_and(|at| now.saturating_sub(at) <= 7200)
             && item.state != "drift";
-        let sha = if fresh {
-            item.observed
-                .as_ref()
-                .map(|v| v.source_sha.as_str())
-                .unwrap_or("unknown")
-        } else {
-            "unknown"
-        };
+        let short_sha = running_short_sha(item);
         let (time, label) = match (
             item.installed_at,
             item.installed.as_ref(),
@@ -148,32 +192,53 @@ pub fn stats_response_with_update_availability(
             }
             _ => (item.observed.as_ref().map(|v| v.started_at), "first seen"),
         };
-        let age = time
-            .filter(|_| fresh)
-            .map(|time| {
-                format!(
-                    "{} ago",
-                    format_compact_duration(now.saturating_sub(time).max(0) as u64)
-                )
-            })
-            .unwrap_or_else(|| "unknown".into());
-        let availability = if !fresh
-            || item.check_error.is_some()
-            || item
-                .checked_at
-                .is_none_or(|checked| now.saturating_sub(checked) > 7200)
-            || item
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| candidate.channel != item.channel)
-        {
-            "unknown"
-        } else if let Some(candidate) = &item.candidate {
+        let age_clause = time.filter(|_| observation_fresh).map(|time| {
+            format!(
+                "{} {}",
+                label,
+                format_compact_duration(now.saturating_sub(time).max(0) as u64)
+            )
+        });
+        if let Some(reason) = release_status_reason(item, component, now) {
+            let webui_unmanaged = reason == "webui not managed by updater";
+            let sha_for_line = if webui_unmanaged {
+                None
+            } else {
+                short_sha.as_deref()
+            };
+            let age_for_line = if webui_unmanaged { None } else { age_clause };
+            lines.push(release_status_line(
+                component,
+                sha_for_line,
+                age_for_line,
+                reason,
+            ));
+            continue;
+        }
+        if !observation_fresh {
+            let reason = if item.observed_at.is_none() {
+                "unknown".into()
+            } else {
+                let hours = item
+                    .observed_at
+                    .map(|at| now.saturating_sub(at) / 3600)
+                    .unwrap_or(0);
+                format!("observation stale ({hours}h)")
+            };
+            lines.push(release_status_line(component, None, None, reason));
+            continue;
+        }
+        let running_source = item
+            .observed
+            .as_ref()
+            .map(|observed| observed.source_sha.as_str())
+            .filter(|sha| is_ascii_hex_sha40(sha));
+        let availability = if let Some(candidate) = &item.candidate {
             if item
                 .installed
                 .as_ref()
                 .is_some_and(|installed| installed.digest == candidate.digest)
-                && sha == candidate.source_sha
+                && running_source == Some(candidate.source_sha.as_str())
             {
                 "up to date"
             } else if component != "webui"
@@ -182,24 +247,28 @@ pub fn stats_response_with_update_availability(
                     .observed
                     .as_ref()
                     .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
-                && sha == candidate.source_sha
+                && running_source == Some(candidate.source_sha.as_str())
             {
                 "no source update (image digest unverified)"
-            } else if sha != "unknown" && sha != candidate.source_sha {
+            } else if running_source.is_some_and(|sha| sha != candidate.source_sha.as_str()) {
                 "update available"
             } else {
-                "unknown"
+                "not checked"
             }
         } else {
-            "unknown"
+            "not checked"
         };
-        let icon = release_status_icon(availability);
-        let sha = if sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            &sha[..7]
+        let tail = if availability == "not checked" {
+            "not checked".to_string()
         } else {
-            sha
+            release_status_icon(availability).to_string()
         };
-        lines.push(format!("**{component}:** `{sha}` · {label} {age} · {icon}"));
+        lines.push(release_status_line(
+            component,
+            short_sha.as_deref(),
+            age_clause,
+            tail,
+        ));
     }
     render(
         "{moderation}\n\n**Release status**\n{releases}",
@@ -589,9 +658,11 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(wrong_api.ends_with("❓"), "{wrong_api}");
-        assert!(wrong_channel.contains("**bot:** ❓"));
-        assert!(wrong_channel.contains("**webui:** ❓"));
+        assert!(wrong_api.contains("not checked"), "{wrong_api}");
+        assert!(!wrong_api.contains('❓'), "{wrong_api}");
+        assert!(!wrong_api.contains("⬆️"), "{wrong_api}");
+        assert!(wrong_channel.contains("**bot:** not checked"));
+        assert!(wrong_channel.contains("**webui:** not checked"));
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
@@ -620,12 +691,6 @@ mod presentation_tests {
             for (source, expected) in [
                 ("abcdef0123456789abcdef0123456789abcdef01", "abcdef0"),
                 ("ABCDEF0123456789ABCDEF0123456789ABCDEF01", "ABCDEF0"),
-                ("unknown", "unknown"),
-                ("abcdef012345", "abcdef012345"),
-                (
-                    "g123456789012345678901234567890123456789",
-                    "g123456789012345678901234567890123456789",
-                ),
             ] {
                 let mut display = row.clone();
                 display.component = component.into();
@@ -648,20 +713,369 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(stale_api.contains("unknown"), "{stale_api}");
-        assert!(stale_api.ends_with("❓"), "{stale_api}");
+        assert!(stale_api.contains("check stale (2h)"), "{stale_api}");
+        assert!(stale_api.contains("`aaaaaaa`"), "{stale_api}");
+        assert!(!stale_api.contains('❓'), "{stale_api}");
+        assert!(!stale_api.contains("unknown"), "{stale_api}");
     }
 
     #[test]
     fn missing_release_rows_use_the_unknown_icon() {
         let out = stats_response_with_updates(0, Some(0), 0, 0, &[], 1_000);
         for component in ["bot", "api", "webui"] {
-            assert!(
-                out.contains(&format!("**{component}:** ❓")),
+            assert_eq!(
+                out.lines()
+                    .find(|line| line.starts_with(&format!("**{component}:**")))
+                    .unwrap(),
+                &format!("**{component}:** not checked"),
                 "{component} missing from {out}"
             );
         }
         assert!(!out.contains("**bot:** unknown"));
+    }
+
+    fn sample_api_update_row(
+        candidate: Option<crate::db::ComponentRelease>,
+        checked_at: Option<i64>,
+        check_error: Option<String>,
+        observed: Option<crate::db::ComponentObservation>,
+        observed_at: Option<i64>,
+        channel: &str,
+    ) -> crate::db::ComponentUpdate {
+        use crate::db::ComponentUpdate;
+        ComponentUpdate {
+            component: "api".into(),
+            channel: channel.into(),
+            cadence: "off".into(),
+            candidate,
+            checked_at,
+            check_error,
+            desired: None,
+            desired_launcher: None,
+            installed: None,
+            installed_launcher: None,
+            launcher_sha256: None,
+            launcher_installed_at: None,
+            previous: None,
+            observed,
+            observed_at,
+            installed_at: None,
+            state: "running".into(),
+            last_error: None,
+        }
+    }
+
+    fn sample_observed(source_sha: &str) -> crate::db::ComponentObservation {
+        use crate::db::ComponentObservation;
+        ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
+            launcher_revision: 0,
+            source_sha: source_sha.into(),
+            executable_sha256: "c".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "d".repeat(40),
+            started_at: 900,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: false,
+            base_abi: "debian-bookworm-amd64".into(),
+        }
+    }
+
+    fn sample_candidate(
+        channel: &str,
+        source_sha: &str,
+        digest_hex: &str,
+    ) -> crate::db::ComponentRelease {
+        use crate::db::ComponentRelease;
+        ComponentRelease {
+            upgrade: None,
+            component: "api".into(),
+            channel: channel.into(),
+            release_id: "v1".into(),
+            source_sha: source_sha.into(),
+            published_at: "2026-09-23T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-api".into(),
+            digest: format!("sha256:{digest_hex}"),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            launcher: None,
+            base_abi: "debian-bookworm-amd64".into(),
+        }
+    }
+
+    #[test]
+    fn status_says_not_checked_when_there_is_no_candidate() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let observed = sample_observed(source);
+        let row = sample_api_update_row(None, None, None, Some(observed), Some(1_000), "latest");
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_100);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("`abcdef0`"), "{api}");
+        assert!(api.contains("not checked"), "{api}");
+        assert!(!api.contains('❓'), "{api}");
+
+        let candidate = sample_candidate("stable", source, &"b".repeat(64));
+        let row = sample_api_update_row(
+            Some(candidate),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        let mismatch = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let api = mismatch
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("not checked"), "{api}");
+        assert!(!api.contains("⬆️"), "{api}");
+        assert!(!api.contains("update available"), "{api}");
+
+        let missing = stats_response_with_updates(0, Some(0), 0, 0, &[], 1_000);
+        for component in ["bot", "api", "webui"] {
+            assert_eq!(
+                missing
+                    .lines()
+                    .find(|line| line.starts_with(&format!("**{component}:**")))
+                    .unwrap(),
+                &format!("**{component}:** not checked")
+            );
+        }
+    }
+
+    #[test]
+    fn status_says_check_stale_with_hour_age() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let candidate = sample_candidate("latest", source, &"b".repeat(64));
+        let row = sample_api_update_row(
+            Some(candidate),
+            Some(7_201),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        let now = 14_402;
+        let out = stats_response_with_updates(0, Some(0), 0, 0, std::slice::from_ref(&row), now);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("`abcdef0`"), "{api}");
+        assert!(api.contains("check stale (2h)"), "{api}");
+        assert!(!api.contains('❓'), "{api}");
+
+        let row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(now - 3 * 3600),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], now);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("check stale (3h)"), "{api}");
+
+        let boundary_now = 14_400;
+        let mut fresh = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(boundary_now - 7_200),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        fresh.installed = fresh.candidate.clone();
+        fresh.observed_at = Some(boundary_now - 3_600);
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh], boundary_now);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.ends_with('✅'), "{api}");
+        assert!(!api.contains("check stale"), "{api}");
+    }
+
+    #[test]
+    fn status_says_check_failed_when_check_error_is_set() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            Some("registry returned HTTP 429".into()),
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("`abcdef0`"), "{api}");
+        assert!(api.contains("check failed"), "{api}");
+        assert!(!api.contains('✅'), "{api}");
+        assert!(!api.contains("⬆️"), "{api}");
+        assert!(!api.contains('❓'), "{api}");
+    }
+
+    #[test]
+    fn status_says_webui_is_not_managed_when_no_release_is_installed() {
+        use crate::db::{ComponentRelease, ComponentUpdate};
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let candidate = ComponentRelease {
+            upgrade: None,
+            component: "webui".into(),
+            channel: "latest".into(),
+            release_id: "v1".into(),
+            source_sha: source.into(),
+            published_at: "2026-09-23T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-webui".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            launcher: None,
+            base_abi: "static-webui-v1".into(),
+        };
+        for candidate in [Some(candidate.clone()), None] {
+            let row = ComponentUpdate {
+                component: "webui".into(),
+                channel: "latest".into(),
+                cadence: "off".into(),
+                candidate: candidate.clone(),
+                checked_at: Some(1_100),
+                check_error: None,
+                desired: None,
+                desired_launcher: None,
+                installed: None,
+                installed_launcher: None,
+                launcher_sha256: None,
+                launcher_installed_at: None,
+                previous: None,
+                observed: Some(sample_observed(source)),
+                observed_at: Some(1_000),
+                installed_at: None,
+                state: "running".into(),
+                last_error: None,
+            };
+            let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+            let webui = out
+                .lines()
+                .find(|line| line.starts_with("**webui:**"))
+                .unwrap();
+            assert!(webui.contains("webui not managed by updater"), "{webui}");
+            assert!(!webui.contains('❓'), "{webui}");
+            assert!(!webui.contains("first seen"), "{webui}");
+            assert!(!webui.contains("unknown"), "{webui}");
+        }
+
+        let mut api = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some({
+                let mut observed = sample_observed(source);
+                observed.base_image_sha = source.into();
+                observed
+            }),
+            Some(1_000),
+            "latest",
+        );
+        api.component = "api".into();
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[api], 1_200);
+        let api_line = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api_line.ends_with("⚠️"), "{api_line}");
+    }
+
+    #[test]
+    fn status_wont_claim_up_to_date_from_stale_observation_with_fresh_check() {
+        let running = "a".repeat(40);
+        let candidate_source = "b".repeat(40);
+        let candidate = sample_candidate("latest", &candidate_source, &"c".repeat(64));
+        let mut row = sample_api_update_row(
+            Some(candidate.clone()),
+            Some(8_900),
+            None,
+            Some(sample_observed(&running)),
+            Some(1_000),
+            "latest",
+        );
+        row.installed = Some(candidate);
+        row.observed.as_mut().unwrap().source_sha = candidate_source;
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 9_000);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("observation stale (2h)"), "{api}");
+        assert!(!api.ends_with('✅'), "{api}");
+        assert!(!api.contains("⬆️"), "{api}");
+    }
+
+    #[test]
+    fn status_shows_the_running_short_sha_after_a_fresh_check() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let candidate = sample_candidate("latest", source, &"b".repeat(64));
+        let mut row = sample_api_update_row(
+            Some(candidate.clone()),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        row.installed = Some(candidate);
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("`abcdef0`"), "{api}");
+        assert!(api.ends_with('✅'), "{api}");
+        assert!(!api.contains("not checked"), "{api}");
+        assert!(!api.contains("check stale"), "{api}");
+        assert!(!api.contains("check failed"), "{api}");
+        assert!(!api.contains('❓'), "{api}");
+
+        let running = "abcdef0123456789abcdef0123456789abcdef00";
+        let row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some(sample_observed(running)),
+            Some(1_000),
+            "latest",
+        );
+        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api.contains("`abcdef0`"), "{api}");
+        assert!(!api.contains("`abcdef1`"), "{api}");
+        assert!(api.ends_with("⬆️"), "{api}");
     }
 
     #[test]
