@@ -5116,16 +5116,18 @@ struct Reservation {
 /// that range, or below the unprivileged bind floor, are skipped.
 ///
 /// Each process starts at a random offset and walks every slot in the span
-/// once. A port is claimed in one shared reservation directory before the
-/// bind. The claim outlives the socket, so another live process skips a port
-/// this process already handed out and then closed. A pid that is gone is
-/// dropped. A pid whose `/proc` entry cannot be read is kept. A bind that
-/// loses to some other socket releases the claim and tries the next port.
+/// once. A port is claimed in this user's private reservation directory
+/// before the bind. The claim outlives the socket, so another live process
+/// of the same user skips a port this process already handed out and then
+/// closed. A pid that is gone is dropped. A pid whose `/proc` entry cannot
+/// be read is kept. A bind that loses to some other socket releases the
+/// claim and tries the next port.
 ///
 /// Registry updates are a synced snapshot renamed into place. The lock is a
 /// different file, so a writer killed before the rename cannot erase another
-/// live owner's claim or replace the lock inode. The directory is not taken
-/// from the process temp dir, and a symlink at that path is refused.
+/// live owner's claim or replace the lock inode. The directory is mode 0700,
+/// owned by this user, and neither it nor the lock or claims entries may be
+/// a symlink.
 async fn bind_outside_ephemeral_range() -> tokio::net::TcpListener {
     bind_scanned(20_000, 10_000, &OUTSIDE_EPHEMERAL_SCAN).await
 }
@@ -5242,54 +5244,123 @@ async fn bind_scanned(first: u16, span: u16, scan: &'static PortScan) -> tokio::
     panic!("no free loopback port outside the ephemeral range");
 }
 
-fn shared_reservation_dir() -> &'static std::path::Path {
-    std::path::Path::new("/tmp/jmodguard-updater-port-reservations.d")
+fn our_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn reservation_dir_for_bind() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/tmp/jmodguard-updater-port-reservations-{}",
+        our_uid()
+    ))
 }
 
 fn reservation_dir() -> std::path::PathBuf {
     match std::env::var("JMODGUARD_PORT_RESERVATION_DIR") {
         Ok(value) if !value.is_empty() => std::path::PathBuf::from(value),
-        _ => shared_reservation_dir().to_path_buf(),
+        _ => reservation_dir_for_bind(),
     }
 }
 
-fn prepare_reservation_dir(dir: &std::path::Path, share: bool) {
+fn reservation_metadata_trust(meta: &std::fs::Metadata, uid: u32) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.file_type().is_symlink() {
+        return Err("port reservation path must not be a symlink");
+    }
+    if !meta.is_dir() {
+        return Err("port reservation path is not a directory");
+    }
+    if meta.uid() != uid {
+        return Err("port reservation directory is owned by another user");
+    }
+    Ok(())
+}
+
+fn prepare_reservation_dir_for(dir: &std::path::Path, uid: u32) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            panic!("port reservation directory must not be a symlink");
-        }
-        Ok(meta) if !meta.is_dir() => {
-            panic!("port reservation path is not a directory");
-        }
-        Ok(_) => {}
+        Ok(meta) => reservation_metadata_trust(&meta, uid).map_err(str::to_string)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Err(create_error) = std::fs::create_dir(dir)
-                && create_error.kind() != std::io::ErrorKind::AlreadyExists
-            {
-                panic!("cannot create the port reservation directory: {create_error}");
+            let mut bytes = dir.as_os_str().as_bytes().to_vec();
+            if bytes.contains(&0) {
+                return Err("port reservation path is not a usable directory name".into());
             }
-            let meta = std::fs::symlink_metadata(dir)
-                .unwrap_or_else(|_| panic!("cannot inspect the port reservation directory"));
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                panic!("port reservation directory must be a real directory");
+            bytes.push(0);
+            let rc = unsafe { libc::mkdir(bytes.as_ptr().cast(), 0o700) };
+            if rc != 0 {
+                let create_error = std::io::Error::last_os_error();
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!(
+                        "cannot create the port reservation directory: {create_error}"
+                    ));
+                }
             }
+            let meta = std::fs::symlink_metadata(dir).map_err(|error| {
+                format!("cannot inspect the port reservation directory: {error}")
+            })?;
+            reservation_metadata_trust(&meta, uid).map_err(str::to_string)?;
         }
-        Err(error) => panic!("cannot inspect the port reservation directory: {error}"),
-    }
-    if share {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::symlink_metadata(dir).unwrap().permissions().mode();
-        if (mode & 0o1777) != 0o1777 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777))
-                .unwrap_or_else(|_| panic!("cannot share the port reservation directory"));
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect the port reservation directory: {error}"
+            ));
         }
     }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                "port reservation path must not be a symlink".to_string()
+            } else {
+                format!("cannot open the port reservation directory: {error}")
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect the port reservation directory: {error}"))?;
+    if meta.uid() != uid || !meta.is_dir() {
+        return Err("port reservation directory is owned by another user".into());
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        let rc = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+        if rc != 0 {
+            return Err(format!(
+                "cannot set the port reservation directory mode: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn share_reservation_file(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
-        .unwrap_or_else(|_| panic!("cannot share the port reservation file"));
+fn prepare_reservation_dir(dir: &std::path::Path) {
+    prepare_reservation_dir_for(dir, our_uid()).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn open_reservation_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                "port reservation lock is a symlink".to_string()
+            } else {
+                format!("cannot open the port reservation lock: {error}")
+            }
+        })?;
+    if file.metadata().map_err(|error| error.to_string())?.uid() != our_uid() {
+        return Err("port reservation lock is owned by another user".into());
+    }
+    Ok(file)
 }
 
 fn lock_reservations(file: &std::fs::File) {
@@ -5359,12 +5430,33 @@ fn our_start() -> u64 {
     *START.get_or_init(|| process_start(std::process::id()).unwrap_or(0))
 }
 
-fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
-    let text = match std::fs::read_to_string(dir.join("claims")) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => panic!("cannot read the port reservation file: {error}"),
+fn read_reservation_claims(dir: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = dir.join("claims");
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err("port reservation claims entry is a symlink".into());
+        }
+        Err(error) => return Err(format!("cannot read the port reservation file: {error}")),
     };
+    if file.metadata().map_err(|error| error.to_string())?.uid() != our_uid() {
+        return Err("port reservation claims file is owned by another user".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("cannot read the port reservation file: {error}"))?;
+    Ok(text)
+}
+
+fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
+    let text = read_reservation_claims(dir).unwrap_or_else(|error| panic!("{error}"));
     text.lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
@@ -5389,6 +5481,7 @@ fn reservation_text(rows: &[Reservation]) -> String {
 
 fn store_reservations(dir: &std::path::Path, rows: &[Reservation]) {
     use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let snapshot = dir.join(format!(
         ".claims.{}.{}.tmp",
         std::process::id(),
@@ -5397,10 +5490,13 @@ fn store_reservations(dir: &std::path::Path, rows: &[Reservation]) {
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&snapshot)
-            .unwrap_or_else(|_| panic!("cannot create the port reservation snapshot"));
+            .unwrap_or_else(|error| panic!("cannot create the port reservation snapshot: {error}"));
+        if file.metadata().map(|meta| meta.uid()).ok() != Some(our_uid()) {
+            panic!("port reservation snapshot is owned by another user");
+        }
         file.write_all(reservation_text(rows).as_bytes()).unwrap();
         file.sync_all()
             .unwrap_or_else(|_| panic!("cannot sync the port reservation snapshot"));
@@ -5412,8 +5508,14 @@ fn store_reservations(dir: &std::path::Path, rows: &[Reservation]) {
     }
     std::fs::rename(&snapshot, dir.join("claims"))
         .unwrap_or_else(|_| panic!("cannot publish the port reservation snapshot"));
-    let directory = std::fs::File::open(dir)
-        .unwrap_or_else(|_| panic!("cannot open the port reservation directory"));
+    let directory = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(dir)
+            .unwrap_or_else(|error| panic!("cannot open the port reservation directory: {error}"))
+    };
     directory
         .sync_all()
         .unwrap_or_else(|_| panic!("cannot sync the port reservation directory"));
@@ -5423,19 +5525,8 @@ fn with_reservations_in<T>(dir: &std::path::Path, body: impl FnOnce(&std::path::
     // flock is per process on Linux, so threads in this process also need a mutex.
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let share = dir == shared_reservation_dir();
-    prepare_reservation_dir(dir, share);
-    let lock_path = dir.join("lock");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .unwrap_or_else(|_| panic!("cannot open the port reservation lock"));
-    if share {
-        share_reservation_file(&lock_path);
-    }
+    prepare_reservation_dir(dir);
+    let lock = open_reservation_lock(&dir.join("lock")).unwrap_or_else(|error| panic!("{error}"));
     lock_reservations(&lock);
     let result = body(dir);
     unlock_reservations(&lock);
@@ -5443,11 +5534,11 @@ fn with_reservations_in<T>(dir: &std::path::Path, body: impl FnOnce(&std::path::
 }
 
 fn with_reservations<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
-    with_reservations_in(shared_reservation_dir(), body)
+    with_reservations_in(&reservation_dir_for_bind(), body)
 }
 
 fn claim_port(port: u16) -> bool {
-    claim_port_in(shared_reservation_dir(), port)
+    claim_port_in(&reservation_dir_for_bind(), port)
 }
 
 fn claim_port_in(dir: &std::path::Path, port: u16) -> bool {
@@ -5927,25 +6018,86 @@ fn selectable_ports_skip_the_ephemeral_range_and_privileged_ports() {
     assert!(port_is_selectable(31_000, shifted));
 }
 
+fn unix_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
 #[test]
-fn port_claims_share_one_directory_outside_the_temp_dir() {
+fn port_claims_use_a_private_per_user_directory() {
     assert_eq!(
-        shared_reservation_dir(),
-        std::path::Path::new("/tmp/jmodguard-updater-port-reservations.d")
+        reservation_dir_for_bind(),
+        std::path::PathBuf::from(format!(
+            "/tmp/jmodguard-updater-port-reservations-{}",
+            our_uid()
+        ))
     );
 }
 
 #[test]
-fn shared_reservation_directory_is_sticky_and_world_writable() {
+fn reservation_lock_symlink_does_not_change_the_target_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("port-lock-link-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(dir.clone());
+    prepare_reservation_dir(&dir);
+    let sentinel = dir.join("sentinel");
+    let claims_target = dir.join("claims-target");
+    for path in [&sentinel, &claims_target] {
+        std::fs::File::create(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::os::unix::fs::symlink(&sentinel, dir.join("lock")).unwrap();
+    std::os::unix::fs::symlink(&claims_target, dir.join("claims")).unwrap();
+    let lock_error = open_reservation_lock(&dir.join("lock")).unwrap_err();
+    assert!(
+        lock_error.contains("symlink"),
+        "lock symlink was opened: {lock_error}"
+    );
+    let claims_error = read_reservation_claims(&dir).unwrap_err();
+    assert!(
+        claims_error.contains("symlink"),
+        "claims symlink was followed: {claims_error}"
+    );
+    assert_eq!(unix_mode(&sentinel), 0o600);
+    assert_eq!(unix_mode(&claims_target), 0o600);
+}
+
+#[test]
+fn reservation_directory_owned_by_another_user_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("port-foreign-{:032x}", rand::random::<u128>()));
+    let _cleanup = RemoveDir(dir.clone());
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sentinel = dir.join("lock");
+    std::fs::File::create(&sentinel).unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let error = prepare_reservation_dir_for(&dir, our_uid().wrapping_add(1)).unwrap_err();
+    assert!(
+        error.contains("another user"),
+        "foreign reservation directory was accepted: {error}"
+    );
+    assert_eq!(unix_mode(&dir), 0o755, "foreign directory mode changed");
+    assert_eq!(unix_mode(&sentinel), 0o600, "foreign file mode changed");
+}
+
+#[test]
+fn private_reservation_directory_tightens_only_its_own_mode() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("port-mode-{:032x}", rand::random::<u128>()));
     let _cleanup = RemoveDir(dir.clone());
-    prepare_reservation_dir(&dir, true);
-    let mode = std::fs::symlink_metadata(&dir)
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o1777, 0o1777);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sibling = dir.join("sibling");
+    std::fs::File::create(&sibling).unwrap();
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o640)).unwrap();
+    prepare_reservation_dir(&dir);
+    assert_eq!(unix_mode(&dir), 0o700);
+    assert_eq!(unix_mode(&sibling), 0o640);
     let lock = dir.join("lock");
     std::fs::OpenOptions::new()
         .write(true)
@@ -5954,12 +6106,8 @@ fn shared_reservation_directory_is_sticky_and_world_writable() {
         .open(&lock)
         .unwrap();
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
-    share_reservation_file(&lock);
-    let lock_mode = std::fs::symlink_metadata(&lock)
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(lock_mode & 0o777, 0o666);
+    open_reservation_lock(&lock).unwrap();
+    assert_eq!(unix_mode(&lock), 0o600);
 }
 
 #[test]
@@ -5971,11 +6119,10 @@ fn reservation_directory_rejects_a_symlink() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("claims"), "keep").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    let linked = link.clone();
-    let panicked = std::panic::catch_unwind(|| prepare_reservation_dir(&linked, true));
+    let error = prepare_reservation_dir_for(&link, our_uid()).unwrap_err();
     assert!(
-        panicked.is_err(),
-        "symlink reservation directory was accepted"
+        error.contains("symlink"),
+        "symlink reservation directory was accepted: {error}"
     );
     assert_eq!(
         std::fs::read_to_string(target.join("claims")).unwrap(),
@@ -6039,7 +6186,7 @@ fn a_dead_owner_is_dropped_and_an_unreadable_owner_is_kept() {
 
     let dir = std::env::temp_dir().join(format!("port-dead-{:032x}", rand::random::<u128>()));
     let _cleanup = RemoveDir(dir.clone());
-    prepare_reservation_dir(&dir, false);
+    prepare_reservation_dir(&dir);
     std::fs::write(dir.join("claims"), format!("25010 {pid} {start}\n")).unwrap();
     assert!(load_reservations(&dir).is_empty());
 }
@@ -6203,7 +6350,36 @@ async fn failed_auth_retry_boot_open_keeps_current_ready_reason() {
     })
     .unwrap();
     let mut restart = RestartPolicy::default();
-    let (addr, task) = held_launcher_health(&mut restart).await;
+    restart.exited(
+        true,
+        Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE),
+        Duration::ZERO,
+        Instant::now(),
+    );
+    // The retry drops this listener and binds the same address. A reserved
+    // port stays outside the ephemeral range across that gap.
+    let listener = bind_reclaimable_health_port().await;
+    let addr = listener.local_addr().unwrap();
+    assert_outside_ephemeral(&[addr.port()]);
+    assert!(
+        (31_000..32_000).contains(&addr.port()),
+        "retry fixture left the reserved range"
+    );
+    let port = addr.port().to_string();
+    let reserved = read_reservation_claims(&reservation_dir_for_bind()).unwrap();
+    assert!(
+        reserved
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(port.as_str())),
+        "retry fixture did not reserve its port"
+    );
+    let task = tokio::spawn(jmodguard::health::serve_listener_as_with_reason(
+        listener,
+        "launcher",
+        restart.not_ready_reason(),
+    ));
+    assert_launcher_health(addr, "discord token rejected").await;
+    restart.auth_retry_at = Some(Instant::now());
     let mut health = Some(task);
     assert!(
         restart
