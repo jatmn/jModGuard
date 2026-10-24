@@ -2834,6 +2834,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn prefix_check_logs_no_message_content() {
         use std::io::Write;
+        use tracing::subscriber::Subscriber;
+
         #[derive(Clone)]
         struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
         impl Write for Capture {
@@ -2845,6 +2847,46 @@ mod tests {
                 Ok(())
             }
         }
+
+        // tracing-core caches one Interest per callsite for the process. With
+        // zero or one dispatcher, the first thread to hit "prefix check" stores
+        // Interest::never from its own subscriber (NoSubscriber, or an INFO fmt
+        // subscriber). This test's DEBUG line is then dropped even though its
+        // capture subscriber is installed. A second dispatcher that always
+        // returns sometimes, and a DEBUG ceiling, forces per-event enabled()
+        // checks and keeps LevelFilter::current() from hiding this line.
+        struct ForceSometimes;
+        impl Subscriber for ForceSometimes {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+
+            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+                Some(tracing::level_filters::LevelFilter::DEBUG)
+            }
+
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {}
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
         let output = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2853,6 +2895,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        let _peer = tracing::Dispatch::new(ForceSometimes);
         let _guard = tracing::subscriber::set_default(subscriber);
         let (app, path) = temp_command_test_db();
         let cfg = Arc::new(CachedGuildConfig {
@@ -2876,6 +2919,7 @@ mod tests {
         msg.content = "SENTINEL_PRIVATE_MESSAGE".into();
         msg.guild_id = Some(GuildId::new(10));
         msg.author.id = UserId::new(2);
+        tracing::callsite::rebuild_interest_cache();
         let result = handle_prefix(
             &app,
             &serenity::http::Http::new("unused"),
