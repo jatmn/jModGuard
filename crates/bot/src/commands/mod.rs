@@ -452,6 +452,56 @@ pub struct BehaviorOutcome {
 // prefix dispatch
 // ---------------------------------------------------------------------------
 
+// Test builds leak two dispatchers before the prefix-check event can register.
+// tracing-core's single-dispatcher path (`Rebuilder::JustOne`) takes no
+// registry lock: a registration that already chose it can store
+// `Interest::never` after a later rebuild. `Once` finishes both dispatchers
+// before any thread reaches that event, and two of them keep later
+// registrations on the locked multi-dispatcher path. Non-test builds omit this.
+#[cfg(test)]
+fn install_prefix_check_interest() {
+    use std::sync::Once;
+    use tracing::subscriber::Subscriber;
+
+    struct ForceSometimes;
+    impl Subscriber for ForceSometimes {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::DEBUG)
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        std::mem::forget(tracing::Dispatch::new(ForceSometimes));
+        std::mem::forget(tracing::Dispatch::new(ForceSometimes));
+    });
+}
+
 pub async fn handle_prefix(
     app: &Arc<BotState>,
     http: &serenity::http::Http,
@@ -467,6 +517,8 @@ pub async fn handle_prefix(
         return Ok(false);
     };
     let prefix = &cfg.settings.prefix;
+    #[cfg(test)]
+    install_prefix_check_interest();
     tracing::debug!(
         content_len = msg.content.len(),
         starts = !prefix.is_empty() && msg.content.starts_with(prefix.as_str()),
@@ -2834,7 +2886,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn prefix_check_logs_no_message_content() {
         use std::io::Write;
-        use tracing::subscriber::Subscriber;
 
         #[derive(Clone)]
         struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -2848,45 +2899,6 @@ mod tests {
             }
         }
 
-        // tracing-core caches one Interest per callsite for the process. With
-        // zero or one dispatcher, the first thread to hit "prefix check" stores
-        // Interest::never from its own subscriber (NoSubscriber, or an INFO fmt
-        // subscriber). This test's DEBUG line is then dropped even though its
-        // capture subscriber is installed. A second dispatcher that always
-        // returns sometimes, and a DEBUG ceiling, forces per-event enabled()
-        // checks and keeps LevelFilter::current() from hiding this line.
-        struct ForceSometimes;
-        impl Subscriber for ForceSometimes {
-            fn register_callsite(
-                &self,
-                _: &'static tracing::Metadata<'static>,
-            ) -> tracing::subscriber::Interest {
-                tracing::subscriber::Interest::sometimes()
-            }
-
-            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-                Some(tracing::level_filters::LevelFilter::DEBUG)
-            }
-
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                false
-            }
-
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-            fn event(&self, _: &tracing::Event<'_>) {}
-
-            fn enter(&self, _: &tracing::span::Id) {}
-
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
         let output = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2895,7 +2907,6 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        let _peer = tracing::Dispatch::new(ForceSometimes);
         let _guard = tracing::subscriber::set_default(subscriber);
         let (app, path) = temp_command_test_db();
         let cfg = Arc::new(CachedGuildConfig {
@@ -2919,7 +2930,6 @@ mod tests {
         msg.content = "SENTINEL_PRIVATE_MESSAGE".into();
         msg.guild_id = Some(GuildId::new(10));
         msg.author.id = UserId::new(2);
-        tracing::callsite::rebuild_interest_cache();
         let result = handle_prefix(
             &app,
             &serenity::http::Http::new("unused"),
@@ -2937,6 +2947,124 @@ mod tests {
             "must exercise the diagnostic"
         );
         assert!(!logs.contains("SENTINEL_PRIVATE_MESSAGE"));
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn prefix_check_logs_survive_concurrent_registration() {
+        use std::io::Write;
+        use std::sync::Barrier;
+        use std::thread;
+
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 50;
+        let barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let (app, path) = temp_command_test_db();
+        let cfg = Arc::new(CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: std::time::Instant::now(),
+            settings: crate::types::GuildSettings {
+                prefix: "!".into(),
+                ..Default::default()
+            },
+            rules: Default::default(),
+            commands: Default::default(),
+            templates: Default::default(),
+            log_channels: Default::default(),
+            known_bad_hashes: Default::default(),
+            log_filters: Default::default(),
+            regexes: Vec::new(),
+            custom_patterns: Default::default(),
+        });
+        let mut workers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let barrier = Arc::clone(&barrier);
+            let app = Arc::clone(&app);
+            let cfg = Arc::clone(&cfg);
+            workers.push(thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                runtime.block_on(async move {
+                    for _ in 0..ROUNDS {
+                        let mut msg = serenity::model::channel::Message::default();
+                        msg.content = "parallel-prefix".into();
+                        msg.guild_id = Some(GuildId::new(10));
+                        msg.author.id = UserId::new(3);
+                        handle_prefix(
+                            &app,
+                            &serenity::http::Http::new("unused"),
+                            &serenity::cache::Cache::default(),
+                            Arc::clone(&cfg),
+                            &msg,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+            }));
+        }
+        barrier.wait();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let output = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            for round in 0..ROUNDS {
+                output.0.lock().unwrap().clear();
+                let mut msg = serenity::model::channel::Message::default();
+                msg.content = "SENTINEL_PRIVATE_MESSAGE".into();
+                msg.guild_id = Some(GuildId::new(10));
+                msg.author.id = UserId::new(2);
+                let result = handle_prefix(
+                    &app,
+                    &serenity::http::Http::new("unused"),
+                    &serenity::cache::Cache::default(),
+                    Arc::clone(&cfg),
+                    &msg,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(!result);
+                let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+                assert!(
+                    logs.contains("prefix check"),
+                    "round {round} missed the diagnostic"
+                );
+                assert!(
+                    !logs.contains("SENTINEL_PRIVATE_MESSAGE"),
+                    "round {round} logged message content"
+                );
+            }
+        });
+        for worker in workers {
+            worker.join().unwrap();
+        }
         drop(app);
         remove_command_test_db(&path);
     }
