@@ -143,9 +143,10 @@ exact content hash. An unfinished check matches size, filename, and content
 type, so a body-length mismatch still counts. This does not change the
 exact-image size check, does not use that rule's 3-channel exact-hash
 threshold, and does not look at account age. Repeats in one channel, posts
-outside the window, and other members do not count. The timeout is the only
+outside the window, and other members do not count. A repeated delivery of
+the same message does not time the member out again. The timeout is the only
 automatic action; the buttons reuse the existing timeout removal, ban, and
-case paths.
+case paths. A button posted before a restart does not apply to a later review.
 
 ## Resource controls
 

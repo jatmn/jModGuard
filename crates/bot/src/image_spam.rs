@@ -3663,6 +3663,45 @@ mod tests {
             1,
         );
         assert_eq!(app.attachment_burst.hits(), 1);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            1,
+        );
+        let event = serde_json::from_value(serde_json::json!({
+            "id": "101",
+            "channel_id": "11",
+            "guild_id": "1",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339(),
+            "attachments": [{
+                "id": "1001",
+                "filename": "spam.png",
+                "size": 42,
+                "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                "width": 8,
+                "height": 8,
+                "content_type": "image/png"
+            }]
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &event,
+            &crate::handlers::UpdateObservation {
+                author: Some(author),
+                received: now,
+                received_at: chrono::Utc::now(),
+            },
+            1,
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
         tokio::task::yield_now().await;
         drop(app);
         jmodguard::tenant::remove_sidecars(&path);
