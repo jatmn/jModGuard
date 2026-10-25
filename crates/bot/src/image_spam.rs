@@ -316,7 +316,7 @@ impl AnalysisGate {
                 bytes,
                 byte_limit,
             } => format!(
-                "Stopped at the process request budget ({requests}/{request_limit} requests, {bytes}/{byte_limit} bytes)."
+                "Stopped at the process budget ({requests}/{request_limit} requests, {bytes}/{byte_limit} bytes)."
             ),
             Self::GuildBudget {
                 requests,
@@ -4689,7 +4689,7 @@ mod tests {
         let vars = report_vars(Report::Unverified(gate), 2, 100, &policy());
         let notice = automod_notice(&vars);
         assert!(notice.contains("Exact image check incomplete"));
-        assert!(notice.contains("Stopped at the process request budget"));
+        assert!(notice.contains("Stopped at the process budget"));
         assert!(!notice.contains("Verified identical image bytes"));
         assert!(!notice.contains("log only"));
         assert!(!notice.contains("http"));
@@ -5246,7 +5246,7 @@ mod tests {
             post.hashes = None;
         }
         let vars = run_job_capture_automod(&app, job, policy, 102).await;
-        assert_incomplete_automod(&vars, "Stopped at the process request budget");
+        assert_incomplete_automod(&vars, "Stopped at the process budget");
     }
 
     #[tokio::test]
@@ -5713,7 +5713,7 @@ mod tests {
             assert_eq!(app.image_spam.process_budget_requests(), 6);
             assert_eq!(app.image_spam.guild_budget_requests(1), 6);
             assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
-            assert_incomplete_automod(&vars, "Stopped at the process request budget");
+            assert_incomplete_automod(&vars, "Stopped at the process budget");
         });
         assert!(logs.contains("process_budget"), "{logs}");
         assert!(!logs.contains("http://"), "{logs}");
@@ -5795,7 +5795,10 @@ mod tests {
             );
             assert_eq!(app.image_spam.process_budget_requests(), 6);
             assert_eq!(app.image_spam.process_budget_bytes(), 18);
-            assert_incomplete_automod(&vars, "Stopped at the process request budget");
+            assert_incomplete_automod(
+                &vars,
+                "Stopped at the process budget (6/120 requests, 18/18 bytes).",
+            );
             let notice = automod_notice(&vars);
             assert!(
                 !notice
@@ -5805,6 +5808,7 @@ mod tests {
         });
         assert!(logs.contains("process_budget"), "{logs}");
         assert!(!logs.contains("received_size=4"), "{logs}");
+        assert!(!logs.contains("process request budget"), "{logs}");
         assert!(!logs.contains("http://"), "{logs}");
     }
 
