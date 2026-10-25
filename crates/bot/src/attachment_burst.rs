@@ -27,7 +27,7 @@ use jmodguard::defaults::{
     ATTACHMENT_BURST_BANNED, ATTACHMENT_BURST_DECISION, ATTACHMENT_BURST_DENIED,
     ATTACHMENT_BURST_FAILED, ATTACHMENT_BURST_HANDLED, ATTACHMENT_BURST_REASON,
     ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_REVIEW_REASON, ATTACHMENT_BURST_TIMEOUT_ACTION,
-    ATTACHMENT_BURST_TIMEOUT_MISSED,
+    ATTACHMENT_BURST_TIMEOUT_MISSED, ATTACHMENT_BURST_TIMEOUT_UNCERTAIN,
 };
 
 const MAX_GUILDS: usize = 256;
@@ -111,6 +111,9 @@ struct MessageNote {
     author: u64,
     at: Instant,
     attachments: BTreeSet<u64>,
+    edited_ms: i64,
+    deleted: bool,
+    lifetime: Option<Arc<()>>,
 }
 
 struct State {
@@ -121,6 +124,7 @@ struct State {
     reviews: HashMap<u64, Review>,
     next_review: u64,
     next_generation: u64,
+    revision: u64,
 }
 
 pub(crate) struct Hit {
@@ -162,6 +166,7 @@ impl Tracker {
                 reviews: HashMap::new(),
                 next_review: 1,
                 next_generation: 1,
+                revision: 0,
             }),
             hits: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
@@ -203,12 +208,17 @@ impl Tracker {
     }
 
     /// Returns the generation stored with this file. A later restage replaces it.
+    #[cfg(test)]
     pub(crate) fn stage(&self, sighting: Sighting, file: FileMeta) -> u64 {
         if !self.usable() {
             self.state.lock().clear();
             return 0;
         }
         let mut state = self.state.lock();
+        Self::stage_locked(&mut state, sighting, file)
+    }
+
+    fn stage_locked(state: &mut State, sighting: Sighting, file: FileMeta) -> u64 {
         if state.staged.len() >= MAX_STAGED && !state.staged.contains_key(&file.attachment_id) {
             state.drop_oldest_staged();
         }
@@ -261,28 +271,146 @@ impl Tracker {
     }
 
     pub(crate) fn forget_message(&self, guild: u64, channel: u64, message: u64) {
-        let min_channels = self.settings.min_channels;
+        self.invalidate_message(guild, channel, message, true);
+    }
+
+    pub(crate) fn invalidate_message(&self, guild: u64, channel: u64, message: u64, deleted: bool) {
+        self.invalidate_message_at(guild, channel, message, deleted, None);
+    }
+
+    pub(crate) fn invalidate_message_at(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        deleted: bool,
+        edited_ms: Option<i64>,
+    ) {
+        let mut state = self.state.lock();
+        state.revision = state.revision.wrapping_add(1);
+        state.forget_message(guild, channel, message, self.settings.min_channels);
+        let key = (guild, channel, message);
+        if !state.messages.contains_key(&key) {
+            state.remember_message(
+                Sighting {
+                    guild,
+                    author: 0,
+                    channel,
+                    message,
+                    at: Instant::now(),
+                },
+                BTreeSet::new(),
+            );
+        }
+        if let Some(note) = state.messages.get_mut(&key) {
+            note.deleted |= deleted;
+            note.lifetime = None;
+            if let Some(edited_ms) = edited_ms {
+                note.edited_ms = note.edited_ms.max(edited_ms);
+            }
+        }
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.state.lock().revision
+    }
+
+    pub(crate) fn author_of(&self, guild: u64, channel: u64, message: u64) -> Option<u64> {
         self.state
             .lock()
-            .forget_message(guild, channel, message, min_channels);
+            .messages
+            .get(&(guild, channel, message))
+            .filter(|note| !note.deleted && note.author != 0)
+            .map(|note| note.author)
+    }
+
+    pub(crate) fn invalidate_author(&self, guild: u64, author: u64) {
+        self.invalidate_scope(guild, Some(author));
+    }
+
+    pub(crate) fn invalidate_guild(&self, guild: u64) {
+        self.invalidate_scope(guild, None);
+    }
+
+    fn invalidate_scope(&self, guild: u64, author: Option<u64>) {
+        let mut state = self.state.lock();
+        state.revision = state.revision.wrapping_add(1);
+        for ((seen_guild, _, _), note) in &mut state.messages {
+            if *seen_guild == guild && author.is_none_or(|a| a == note.author) {
+                note.lifetime = None;
+                note.deleted = true;
+            }
+        }
+        state.staged.retain(|_, staged| {
+            staged.sighting.guild != guild || author.is_some_and(|a| a != staged.sighting.author)
+        });
+        if let Some(author) = author {
+            if let Some(guild) = state.guilds.get_mut(&guild)
+                && guild.authors.remove(&author).is_some()
+            {
+                state.authors = state.authors.saturating_sub(1);
+            }
+        } else if let Some(guild) = state.guilds.remove(&guild) {
+            state.authors = state.authors.saturating_sub(guild.authors.len());
+        }
+    }
+
+    fn stage_sighting(
+        &self,
+        sighting: Sighting,
+        files: Vec<FileMeta>,
+        admission: (u64, i64),
+    ) -> Vec<(u64, u64)> {
+        let mut state = self.state.lock();
+        if !self.usable()
+            || state.revision != admission.0
+            || !self.prepare_locked(
+                &mut state,
+                sighting,
+                &files.iter().map(|f| f.attachment_id).collect::<Vec<_>>(),
+                admission.1,
+            )
+        {
+            return Vec::new();
+        }
+        files
+            .into_iter()
+            .map(|file| {
+                let id = file.attachment_id;
+                (id, Self::stage_locked(&mut state, sighting, file))
+            })
+            .collect()
     }
 
     /// False when this message already carries the same attachment ids.
     /// A replay keeps the original sighting time and does not clear a hit.
+    #[cfg(test)]
     pub(crate) fn prepare_sighting(&self, sighting: Sighting, attachment_ids: &[u64]) -> bool {
         if !self.usable() {
             self.state.lock().clear();
             return false;
         }
-        let wanted = attachment_ids.iter().copied().collect::<BTreeSet<_>>();
         let mut state = self.state.lock();
+        self.prepare_locked(&mut state, sighting, attachment_ids, 0)
+    }
+
+    fn prepare_locked(
+        &self,
+        state: &mut State,
+        sighting: Sighting,
+        attachment_ids: &[u64],
+        edited_ms: i64,
+    ) -> bool {
+        let wanted = attachment_ids.iter().copied().collect::<BTreeSet<_>>();
         let key = (sighting.guild, sighting.channel, sighting.message);
-        if state
-            .messages
-            .get(&key)
-            .is_some_and(|note| note.author == sighting.author && note.attachments == wanted)
-        {
-            return false;
+        if let Some(note) = state.messages.get_mut(&key) {
+            if note.deleted || edited_ms < note.edited_ms {
+                return false;
+            }
+            if note.author == sighting.author && note.attachments == wanted {
+                note.edited_ms = edited_ms;
+                return false;
+            }
         }
         let min_channels = self.settings.min_channels;
         state.forget_message(
@@ -292,6 +420,11 @@ impl Tracker {
             min_channels,
         );
         state.remember_message(sighting, wanted);
+        state
+            .messages
+            .get_mut(&key)
+            .expect("remembered message")
+            .edited_ms = edited_ms;
         true
     }
 
@@ -309,7 +442,11 @@ impl Tracker {
             Review {
                 guild: hit.guild,
                 user: hit.author,
-                body: body.chars().take(1800).collect(),
+                body: templates::render_bounded(
+                    "{body}",
+                    &BTreeMap::from([("body".to_string(), body)]),
+                    1800,
+                ),
                 at: Instant::now(),
                 enrollment,
             },
@@ -357,6 +494,13 @@ impl Tracker {
         let window = Duration::from_secs(self.settings.window_secs);
         let min_channels = self.settings.min_channels;
         state.prepare(sighting.guild, sighting.at, window);
+        let message_key = (sighting.guild, sighting.channel, sighting.message);
+        // The physical message owns pending evidence, even when its channel's
+        // representative is replaced by a later post of the same attachment.
+        if !state.messages.contains_key(&message_key) {
+            state.remember_message(sighting, BTreeSet::new());
+        }
+        let lifetime = state.messages.get(&message_key)?.lifetime.clone()?;
         let author_exists = state
             .guilds
             .get(&sighting.guild)
@@ -424,7 +568,7 @@ impl Tracker {
                 ChannelSight {
                     message: sighting.message,
                     at: sighting.at,
-                    lifetime: Arc::new(()),
+                    lifetime,
                 },
             );
             let newest = bucket
@@ -616,6 +760,9 @@ impl State {
                 author: sighting.author,
                 at: sighting.at,
                 attachments,
+                edited_ms: 0,
+                deleted: false,
+                lifetime: Some(Arc::new(())),
             },
         );
     }
@@ -626,7 +773,9 @@ impl State {
                 && staged.sighting.channel == channel
                 && staged.sighting.message == message)
         });
-        self.messages.remove(&(guild, channel, message));
+        if let Some(note) = self.messages.get_mut(&(guild, channel, message)) {
+            note.lifetime = None;
+        }
         let Some(guild_state) = self.guilds.get_mut(&guild) else {
             return;
         };
@@ -724,30 +873,32 @@ impl Handoff {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stage(
         app: &Arc<BotState>,
         ctx: &Context,
         sighting: Sighting,
         files: Vec<FileMeta>,
     ) -> Self {
-        let attachment_ids = files
-            .iter()
-            .map(|file| file.attachment_id)
-            .collect::<Vec<_>>();
-        if !app
+        Self::stage_at(
+            app,
+            ctx,
+            sighting,
+            files,
+            (app.attachment_burst.revision(), 0),
+        )
+    }
+
+    pub(crate) fn stage_at(
+        app: &Arc<BotState>,
+        ctx: &Context,
+        sighting: Sighting,
+        files: Vec<FileMeta>,
+        admission: (u64, i64),
+    ) -> Self {
+        let ids = app
             .attachment_burst
-            .prepare_sighting(sighting, &attachment_ids)
-        {
-            return Self::inert();
-        }
-        let mut ids = Vec::with_capacity(files.len());
-        for file in files {
-            let id = file.attachment_id;
-            let generation = app.attachment_burst.stage(sighting, file);
-            if generation != 0 {
-                ids.push((id, generation));
-            }
-        }
+            .stage_sighting(sighting, files, admission);
         let armed = !ids.is_empty();
         Self {
             app: Some(Arc::clone(app)),
@@ -815,6 +966,51 @@ impl PendingBurst {
             dispatch_hit(&self.app, &self.ctx, hit);
         }
     }
+
+    pub(crate) fn resolve_cached(
+        &self,
+        files: &[jmodguard::image_spam::Attachment],
+        hashes: &[jmodguard::image_spam::Hash],
+    ) {
+        let tracker = &self.app.attachment_burst;
+        let mut state = tracker.state.lock();
+        let stages: Vec<_> = files
+            .iter()
+            .filter_map(|file| {
+                let (_, generation) = self.ids.iter().find(|(id, _)| *id == file.id)?;
+                state.take_staged(file.id, *generation)
+            })
+            .collect();
+        // A cached set is distinct and sorted, not parallel to the file list.
+        // Consume every owned completed stage. Only a complete physical-message
+        // snapshot can contribute that set; partial ownership must not fallback.
+        let Some(first) = stages.first() else { return };
+        let sighting = first.sighting;
+        let complete = stages.len() == files.len()
+            && stages.iter().all(|stage| {
+                (
+                    stage.sighting.guild,
+                    stage.sighting.author,
+                    stage.sighting.channel,
+                    stage.sighting.message,
+                ) == (
+                    sighting.guild,
+                    sighting.author,
+                    sighting.channel,
+                    sighting.message,
+                )
+            });
+        let hits = if complete {
+            hashes
+                .iter()
+                .filter_map(|hash| tracker.record_locked(&mut state, sighting, Key::Hash(*hash)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(state);
+        dispatch(&self.app, &self.ctx, hits);
+    }
 }
 
 impl Drop for PendingBurst {
@@ -865,7 +1061,32 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
     if !membership_still(app, hit.guild, &enrollment).await {
         return;
     }
-    let timed_out = apply_timeout(app, ctx, &hit, &enrollment).await;
+    let outcome = apply_timeout(app, ctx, &hit, &enrollment).await;
+    let timed_out = matches!(outcome, Some(crate::db::guild_data::CaseOutcome::Succeeded));
+    if let Some(outcome) = outcome.as_ref() {
+        let (channel, message) = hit.messages.first().copied().unwrap_or((0, 0));
+        cases::record(
+            app,
+            enrollment.clone(),
+            crate::db::guild_data::CaseAction::Timeout,
+            outcome.clone(),
+            hit.author,
+            None,
+            Some(templates::render(
+                ATTACHMENT_BURST_REASON,
+                &BTreeMap::from([
+                    ("channels".to_string(), hit.channels.len().to_string()),
+                    (
+                        "window".to_string(),
+                        templates::format_duration(hit.window_secs),
+                    ),
+                ]),
+            )),
+            cases::text_excerpt(channel, message, hit.author, &evidence(&hit)),
+            cases::application_source(),
+        )
+        .await;
+    }
     if !timed_out && !hit.still_valid() {
         return;
     }
@@ -877,6 +1098,8 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
                 templates::format_duration(hit.timeout_secs),
             )]),
         )
+    } else if matches!(outcome, Some(crate::db::guild_data::CaseOutcome::Uncertain)) {
+        ATTACHMENT_BURST_TIMEOUT_UNCERTAIN.to_string()
     } else {
         ATTACHMENT_BURST_TIMEOUT_MISSED.to_string()
     };
@@ -926,21 +1149,6 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
         || timed_out || hit.still_valid(),
     )
     .await;
-    if timed_out {
-        let (channel, message) = hit.messages.first().copied().unwrap_or((0, 0));
-        cases::record(
-            app,
-            enrollment,
-            crate::db::guild_data::CaseAction::Timeout,
-            crate::db::guild_data::CaseOutcome::Succeeded,
-            hit.author,
-            None,
-            Some(reason),
-            cases::text_excerpt(channel, message, hit.author, &evidence(&hit)),
-            cases::application_source(),
-        )
-        .await;
-    }
 }
 
 fn evidence(hit: &Hit) -> String {
@@ -980,37 +1188,30 @@ async fn apply_timeout(
     ctx: &Context,
     hit: &Hit,
     enrollment: &Option<crate::db::GuildEnrollment>,
-) -> bool {
+) -> Option<crate::db::guild_data::CaseOutcome> {
     let Some(mut member) = member(ctx, GuildId::new(hit.guild), UserId::new(hit.author)).await
     else {
         tracing::warn!("attachment burst timeout skipped because the member was not available");
-        return false;
+        return None;
     };
     let Ok(until) = Timestamp::from_unix_timestamp(
         chrono::Utc::now()
             .timestamp()
             .saturating_add(i64::try_from(hit.timeout_secs).unwrap_or(i64::MAX)),
     ) else {
-        return false;
+        return None;
     };
     if !app.activation.may_record()
         || !membership_still(app, hit.guild, enrollment).await
         || !hit.still_valid()
     {
-        return false;
+        return None;
     }
-    match raced(
+    attempted_outcome(
         app,
         member.disable_communication_until_datetime(&ctx.http, until),
     )
     .await
-    {
-        Some(Ok(())) => true,
-        _ => {
-            tracing::warn!("attachment burst timeout was not applied");
-            false
-        }
-    }
 }
 
 async fn member(
@@ -1065,6 +1266,28 @@ async fn membership_still(
     admitted: &Option<crate::db::GuildEnrollment>,
 ) -> bool {
     cases::capture(app, guild).await == *admitted
+        && !crate::db::guild_stores::guild_is_write_fenced(&app.db, guild as i64)
+            .await
+            .unwrap_or(true)
+}
+
+async fn attempted_outcome<T>(
+    app: &BotState,
+    call: impl std::future::Future<Output = serenity::Result<T>>,
+) -> Option<crate::db::guild_data::CaseOutcome> {
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let result = raced(app, async {
+        started.store(true, Ordering::Relaxed);
+        call.await
+    })
+    .await;
+    if !started.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(match result {
+        Some(result) => cases::classify_discord(result.as_ref().err()),
+        None => crate::db::guild_data::CaseOutcome::Uncertain,
+    })
 }
 
 async fn raced<T>(
@@ -1142,7 +1365,7 @@ pub(crate) async fn handle_component(
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
         return;
     }
-    if !membership_still(app, review.guild, &review.enrollment).await {
+    if cases::capture(app, review.guild).await != review.enrollment {
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_FAILED).await;
         return;
     }
@@ -1167,18 +1390,28 @@ pub(crate) async fn handle_component(
         app.attachment_burst.restore_review(press.review_id, review);
         return;
     }
-    let mut vars = std::collections::BTreeMap::from([
-        ("body".to_string(), review.body),
-        ("decision".to_string(), label.to_string()),
-        ("actor".to_string(), format!("user {}", press.user_id)),
-    ]);
-    let content = templates::render(ATTACHMENT_BURST_DECISION, &vars);
-    vars.clear();
-    let _ = EditInteractionResponse::new()
-        .content(content)
-        .components(Vec::new())
+    let _ = decision_edit(review.body, label, press.user_id)
         .execute(&ctx.http, press.token.as_str())
         .await;
+}
+
+fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionResponse {
+    let vars = std::collections::BTreeMap::from([
+        ("body".to_string(), body),
+        ("decision".to_string(), label.to_string()),
+        ("actor".to_string(), format!("user {actor}")),
+    ]);
+    let content = templates::render_bounded(ATTACHMENT_BURST_DECISION, &vars, 2000);
+    EditInteractionResponse::new()
+        .content(content)
+        .allowed_mentions(
+            serenity::builder::CreateAllowedMentions::new()
+                .all_users(false)
+                .all_roles(false)
+                .everyone(false)
+                .replied_user(false),
+        )
+        .components(Vec::new())
 }
 
 enum ReviewDecision {
@@ -1204,11 +1437,7 @@ async fn release_member(
     if !app.activation.may_record() || !membership_still(app, review.guild, &enrollment).await {
         return ReviewDecision::Failed;
     }
-    let Some(result) = raced(app, member.enable_communication(&ctx.http)).await else {
-        return ReviewDecision::Failed;
-    };
-    let error = result.err();
-    let Some(outcome) = cases::discord_attempt_outcome(true, error.as_ref()) else {
+    let Some(outcome) = attempted_outcome(app, member.enable_communication(&ctx.http)).await else {
         return ReviewDecision::Failed;
     };
     cases::record(
@@ -1366,6 +1595,24 @@ async fn ban_then_record(
     }
     pending.finish(app, outcome.clone()).await;
     if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
+        if app.activation.may_record()
+            && let Err(error) = crate::db::record_enrolled_ban_if_absent(
+                &app.db,
+                enrollment,
+                review.user as i64,
+                None,
+                None,
+                Some(actor.get() as i64),
+                None,
+                ATTACHMENT_BURST_REVIEW_REASON,
+                None,
+                crate::db::BanRecord::Fresh,
+                Some(&operation_id),
+            )
+            .await
+        {
+            tracing::warn!("attachment burst ban mirror recording failed: {error:#}");
+        }
         ReviewDecision::Banned
     } else {
         ReviewDecision::Failed
@@ -2288,15 +2535,119 @@ mod tests {
 
     #[tokio::test]
     async fn review_ban_owns_one_gateway_echo() {
+        for early_echo in [false, true] {
+            let (app, path) = open_app();
+            let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            app.tenant.activate(enrollment.clone()).await.unwrap();
+            let gateway_app = Arc::clone(&app);
+            let gateway_enrollment = enrollment.clone();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let Some((method, path)) = read_request(&mut stream).await else {
+                        continue;
+                    };
+                    if method == "GET" && path.contains("/bans/") {
+                        write_response(
+                            &mut stream,
+                            "404 Not Found",
+                            r#"{"code":10026,"message":"Unknown Ban"}"#,
+                        )
+                        .await;
+                    } else if method == "PUT" && path.contains("/bans/") {
+                        if early_echo {
+                            let echo = gateway_app.consume_gateway_ban_echo(10, 99).resolve();
+                            assert!(echo.owned_by_bot && echo.suppress_case);
+                            assert!(echo.operation_id.is_some());
+                            crate::db::record_gateway_ban(
+                                &gateway_app.db,
+                                Some(gateway_enrollment.clone()),
+                                99,
+                                None,
+                                None,
+                                None,
+                                true,
+                                echo.operation_id.as_deref(),
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        write_response(&mut stream, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut stream, "200 OK", "{}").await;
+                    }
+                }
+            });
+
+            let ctx = fixture_context(http_at(address)).await;
+            let decision = ban_member(
+                &app,
+                &ctx,
+                &Review {
+                    guild: 10,
+                    user: 99,
+                    body: String::new(),
+                    at: Instant::now(),
+                    enrollment: Some(enrollment.clone()),
+                },
+                UserId::new(7),
+            )
+            .await;
+            assert!(matches!(decision, ReviewDecision::Banned));
+            if !early_echo {
+                let echo = app.consume_gateway_ban_echo(10, 99).resolve();
+                assert!(echo.suppress_case);
+                assert!(echo.owned_by_bot);
+                assert!(echo.operation_id.is_some());
+                assert!(!crate::handlers::record_unresolved_gateway_observation(
+                    echo.suppress_case
+                ));
+            }
+            let rows = crate::db::list_enrolled_bans(&app.reads, enrollment.clone(), 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].moderator_id, Some(7));
+            assert_eq!(
+                rows[0].reason.as_deref(),
+                Some(ATTACHMENT_BURST_REVIEW_REASON)
+            );
+            let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+            assert_eq!(
+                store
+                    .case_count(scope, crate::tenant::case_limits())
+                    .await
+                    .unwrap(),
+                1
+            );
+            server.abort();
+            let _ = server.await;
+            close_app(&path);
+        }
+    }
+    #[tokio::test]
+    async fn fenced_burst_mutations() {
+        use jmodguard::db::SqlExecutor as _;
+        use std::sync::atomic::AtomicUsize;
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
+        let changes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&changes);
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
+                let (mut stream, _) = listener.accept().await.unwrap();
                 let Some((method, path)) = read_request(&mut stream).await else {
                     continue;
                 };
@@ -2307,10 +2658,231 @@ mod tests {
                         r#"{"code":10026,"message":"Unknown Ban"}"#,
                     )
                     .await;
-                } else if method == "PUT" && path.contains("/bans/") {
-                    write_response(&mut stream, "204 No Content", "").await;
                 } else {
-                    write_response(&mut stream, "200 OK", "{}").await;
+                    if method == "PUT" || method == "PATCH" {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if method == "PUT" {
+                        write_response(&mut stream, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut stream,"200 OK",r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                    }
+                }
+            }
+        });
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let destination = crate::db::guild_stores::StoreId::new();
+        crate::db::guild_stores::register_store(
+            &app.db,
+            destination.clone(),
+            crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+        )
+        .await
+        .unwrap();
+        app.db.with_conn(move |conn| { conn.execute_bounded("INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at) VALUES(10,?1,'freeze',?2,?1,unixepoch())",libsql::params![format!("{:032x}",9u128),destination.as_str()],65536)?; Ok(()) }).await.unwrap();
+        assert!(
+            crate::db::guild_stores::guild_is_write_fenced(&app.db, 10)
+                .await
+                .unwrap()
+        );
+        let ctx = fixture_context(http_at(address)).await;
+        enforce(&app, &ctx, test_hit(&app, 99)).await;
+        let after_timeout = changes.load(Ordering::SeqCst);
+        let review = Review {
+            guild: 10,
+            user: 99,
+            body: String::new(),
+            at: Instant::now(),
+            enrollment: Some(enrollment),
+        };
+        let _ = release_member(&app, &ctx, &review, UserId::new(7)).await;
+        let after_release = changes.load(Ordering::SeqCst);
+        let _ = ban_member(&app, &ctx, &review, UserId::new(7)).await;
+        let after_ban = changes.load(Ordering::SeqCst);
+        server.abort();
+        close_app(&path);
+        assert_eq!(
+            (after_timeout, after_release, after_ban),
+            (0, 0, 0),
+            "fenced timeout, release, ban wrote Discord"
+        );
+    }
+
+    #[test]
+    fn repeated_channel_keeps_pending_hit() {
+        let tracker = tracker();
+        let now = Instant::now();
+        assert!(
+            tracker
+                .record(sight(4, 10, 100, now), hash_key(1))
+                .is_none()
+        );
+        let hit = tracker.record(sight(4, 11, 101, now), hash_key(1)).unwrap();
+        assert!(hit.still_valid());
+        assert!(
+            tracker
+                .record(sight(4, 10, 102, now), hash_key(1))
+                .is_none()
+        );
+        assert!(
+            hit.still_valid(),
+            "same-channel repeat destroyed pending proof"
+        );
+        tracker.forget_message(1, 10, 100);
+        assert!(
+            !hit.still_valid(),
+            "deleting the original still revokes its proof"
+        );
+    }
+
+    #[test]
+    fn admission_respects_deletes_edits_and_membership_invalidation() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let file = |id| FileMeta {
+            attachment_id: id,
+            size: 42,
+            filename: "a.png".into(),
+            content_type: "image/png".into(),
+        };
+        let first = sight(4, 10, 100, now);
+        let captured = tracker.revision();
+        tracker.forget_message(1, 10, 100);
+        assert!(
+            tracker
+                .stage_sighting(first, vec![file(1)], (captured, 10))
+                .is_empty()
+        );
+        assert!(
+            tracker
+                .stage_sighting(first, vec![file(1)], (tracker.revision(), 10))
+                .is_empty(),
+            "delete tombstone rejects fresh replay"
+        );
+        let current = sight(4, 11, 101, now);
+        let ids = tracker.stage_sighting(current, vec![file(2)], (tracker.revision(), 20));
+        assert_eq!(ids.len(), 1);
+        assert_eq!(tracker.author_of(1, 11, 101), Some(4));
+        // An unchanged edit advances ordering without refreshing evidence time.
+        assert!(
+            tracker
+                .stage_sighting(current, vec![file(2)], (tracker.revision(), 30))
+                .is_empty()
+        );
+        assert!(
+            tracker
+                .stage_sighting(current, vec![file(3)], (tracker.revision(), 25))
+                .is_empty()
+        );
+        assert_eq!(tracker.staged_generation(2), Some(ids[0].1));
+        tracker.invalidate_author(1, 4);
+        assert!(tracker.staged_generation(2).is_none());
+        assert!(
+            tracker
+                .stage_sighting(current, vec![file(2)], (tracker.revision(), 30))
+                .is_empty(),
+            "membership invalidation cannot be undone by replay"
+        );
+        assert!(
+            tracker
+                .stage_sighting(current, vec![file(3)], (tracker.revision(), 40))
+                .is_empty(),
+            "another pre-departure snapshot cannot revive the physical message"
+        );
+        let next = sight(4, 12, 102, now);
+        let revision = tracker.revision();
+        assert_eq!(
+            tracker
+                .stage_sighting(next, vec![file(4)], (revision, 40))
+                .len(),
+            1
+        );
+        tracker.invalidate_guild(1);
+        assert!(tracker.staged_generation(4).is_none());
+        assert!(
+            tracker
+                .stage_sighting(next, vec![file(5)], (revision, 50))
+                .is_empty()
+        );
+        let edited = sight(4, 13, 103, now);
+        assert_eq!(
+            tracker
+                .stage_sighting(edited, vec![file(6)], (tracker.revision(), 10))
+                .len(),
+            1
+        );
+        tracker.invalidate_message_at(1, 13, 103, false, Some(30));
+        assert!(
+            tracker
+                .stage_sighting(edited, vec![file(7)], (tracker.revision(), 20))
+                .is_empty(),
+            "failed config read still advances edit ordering"
+        );
+        assert_eq!(
+            tracker
+                .stage_sighting(edited, vec![file(8)], (tracker.revision(), 40))
+                .len(),
+            1,
+            "a genuine later replacement remains admissible"
+        );
+    }
+
+    #[test]
+    fn decision_edits_suppress_mentions_and_bound_utf16() {
+        let tracker = tracker();
+        let now = Instant::now();
+        tracker.record(sight(4, 10, 100, now), hash_key(1));
+        let hit = tracker.record(sight(4, 11, 101, now), hash_key(1)).unwrap();
+        tracker.open_review(&hit, None, format!("<@4> @everyone {}", "😀".repeat(1000)));
+        let review = tracker
+            .claim_review(hit.review_id, 1, tracker.process_nonce)
+            .unwrap();
+        assert!(review.body.encode_utf16().count() <= 1800);
+        for label in [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED] {
+            let value =
+                serde_json::to_value(decision_edit(review.body.clone(), label, UserId::new(7)))
+                    .unwrap();
+            assert!(value["content"].as_str().unwrap().encode_utf16().count() <= 2000);
+            assert!(value["content"].as_str().unwrap().contains(label));
+            assert_eq!(value["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(value["allowed_mentions"]["replied_user"], false);
+            assert_eq!(value["components"], serde_json::json!([]));
+        }
+    }
+    #[tokio::test]
+    async fn uncertain_timeout_records_case() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stalled = Arc::clone(&stall);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, _)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "PATCH" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if stalled.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        r#"{"code":0,"message":"unknown result"}"#,
+                    )
+                    .await;
+                } else {
+                    write_response(&mut stream,"200 OK",r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
                 }
             }
         });
@@ -2321,7 +2893,15 @@ mod tests {
             .unwrap();
         app.tenant.activate(enrollment.clone()).await.unwrap();
         let ctx = fixture_context(http_at(address)).await;
-        let decision = ban_member(
+        enforce(&app, &ctx, test_hit(&app, 99)).await;
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "positive control: mutation was attempted"
+        );
+        // A Release request that reached Discord but exceeded our outer deadline
+        // has an unknown outcome and still needs its selected case.
+        stall.store(true, Ordering::SeqCst);
+        let decision = release_member(
             &app,
             &ctx,
             &Review {
@@ -2334,22 +2914,27 @@ mod tests {
             UserId::new(7),
         )
         .await;
-        assert!(matches!(decision, ReviewDecision::Banned));
-        let echo = app.consume_gateway_ban_echo(10, 99).resolve();
-        assert!(echo.suppress_case);
-        assert!(echo.owned_by_bot);
-        assert!(echo.operation_id.is_some());
-        assert!(!crate::handlers::record_unresolved_gateway_observation(
-            echo.suppress_case
-        ));
+        assert!(matches!(decision, ReviewDecision::Failed));
+        assert!(calls.load(Ordering::SeqCst) >= 2);
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
-        assert_eq!(
-            store
-                .case_count(scope, crate::tenant::case_limits())
-                .await
-                .unwrap(),
-            1
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        let cases = store
+            .case_summaries(scope, ids, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(cases.len(), 2);
+        assert!(
+            cases
+                .values()
+                .all(|case| matches!(case.outcome, crate::db::guild_data::CaseOutcome::Uncertain))
         );
+        assert!(cases.values().any(|case| matches!(
+            case.action,
+            crate::db::guild_data::CaseAction::TimeoutRemoval
+        )));
         server.abort();
         close_app(&path);
     }

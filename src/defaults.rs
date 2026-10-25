@@ -475,6 +475,7 @@ pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by
 pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
 pub const ATTACHMENT_BURST_TIMEOUT_ACTION: &str = "timeout {duration}";
 pub const ATTACHMENT_BURST_TIMEOUT_MISSED: &str = "timeout not applied; awaiting review";
+pub const ATTACHMENT_BURST_TIMEOUT_UNCERTAIN: &str = "timeout outcome uncertain; awaiting review";
 pub const ATTACHMENT_BURST_DENIED: &str = "That review action is not available to you.";
 pub const ATTACHMENT_BURST_HANDLED: &str = "That review was already handled.";
 pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
