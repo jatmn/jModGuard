@@ -5,8 +5,8 @@
 //! and content type. Account age is not an input.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -80,6 +80,7 @@ struct Staged {
 struct ChannelSight {
     message: u64,
     at: Instant,
+    lifetime: Arc<()>,
 }
 
 struct KeyBucket {
@@ -103,6 +104,7 @@ struct Review {
     user: u64,
     body: String,
     at: Instant,
+    enrollment: Option<crate::db::GuildEnrollment>,
 }
 
 struct MessageNote {
@@ -130,6 +132,13 @@ pub(crate) struct Hit {
     key: Key,
     timeout_secs: u64,
     window_secs: u64,
+    proof: Vec<Weak<()>>,
+}
+
+impl Hit {
+    fn still_valid(&self) -> bool {
+        self.proof.iter().all(|sight| sight.strong_count() > 0)
+    }
 }
 
 pub struct Tracker {
@@ -184,6 +193,7 @@ impl Tracker {
         self.hits.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn staged_generation(&self, attachment_id: u64) -> Option<u64> {
         self.state
             .lock()
@@ -219,8 +229,7 @@ impl Tracker {
 
     #[cfg(test)]
     fn resolve_hash(&self, attachment_id: u64, hash: [u8; 32]) -> Option<Hit> {
-        let staged = self.state.lock().staged.remove(&attachment_id)?;
-        self.record(staged.sighting, Key::Hash(hash))
+        self.resolve_hash_at(attachment_id, self.staged_generation(attachment_id)?, hash)
     }
 
     pub(crate) fn resolve_hash_at(
@@ -229,8 +238,9 @@ impl Tracker {
         generation: u64,
         hash: [u8; 32],
     ) -> Option<Hit> {
-        let staged = self.take_staged(attachment_id, generation)?;
-        self.record(staged.sighting, Key::Hash(hash))
+        let mut state = self.state.lock();
+        let staged = state.take_staged(attachment_id, generation)?;
+        self.record_locked(&mut state, staged.sighting, Key::Hash(hash))
     }
 
     #[cfg(test)]
@@ -239,24 +249,15 @@ impl Tracker {
     }
 
     pub(crate) fn resolve_incomplete_at(&self, attachment_id: u64, generation: u64) -> Option<Hit> {
-        let staged = self.take_staged(attachment_id, generation)?;
+        let mut state = self.state.lock();
+        let staged = state.take_staged(attachment_id, generation)?;
         let sighting = staged.sighting;
-        self.record(sighting, fallback_key(staged))
+        self.record_locked(&mut state, sighting, fallback_key(staged))
     }
 
     #[cfg(test)]
     fn resolve_incomplete_at_any(&self, attachment_id: u64) -> Option<Hit> {
-        let staged = self.state.lock().staged.remove(&attachment_id)?;
-        let sighting = staged.sighting;
-        self.record(sighting, fallback_key(staged))
-    }
-
-    fn take_staged(&self, attachment_id: u64, generation: u64) -> Option<Staged> {
-        let mut state = self.state.lock();
-        match state.staged.get(&attachment_id) {
-            Some(staged) if staged.generation == generation => state.staged.remove(&attachment_id),
-            _ => None,
-        }
+        self.resolve_incomplete_at(attachment_id, self.staged_generation(attachment_id)?)
     }
 
     pub(crate) fn forget_message(&self, guild: u64, channel: u64, message: u64) {
@@ -298,11 +299,21 @@ impl Tracker {
         format!("jmgburst:{:016x}:{action}:{review_id}", self.process_nonce)
     }
 
-    pub(crate) fn set_review_body(&self, review_id: u64, body: String) {
+    fn open_review(&self, hit: &Hit, enrollment: Option<crate::db::GuildEnrollment>, body: String) {
         let mut state = self.state.lock();
-        if let Some(review) = state.reviews.get_mut(&review_id) {
-            review.body = body.chars().take(1800).collect();
+        if state.reviews.len() >= MAX_REVIEWS {
+            state.drop_oldest_review();
         }
+        state.reviews.insert(
+            hit.review_id,
+            Review {
+                guild: hit.guild,
+                user: hit.author,
+                body: body.chars().take(1800).collect(),
+                at: Instant::now(),
+                enrollment,
+            },
+        );
     }
 
     fn claim_review(&self, review_id: u64, guild: u64, nonce: u64) -> Option<Review> {
@@ -331,14 +342,20 @@ impl Tracker {
             && self.settings.window_secs > 0
     }
 
+    #[cfg(test)]
     fn record(&self, sighting: Sighting, key: Key) -> Option<Hit> {
+        self.record_locked(&mut self.state.lock(), sighting, key)
+    }
+
+    // Settlement and invalidation share this lock, so a removed stage cannot
+    // be reintroduced as a live sight after forget_message has completed.
+    fn record_locked(&self, state: &mut State, sighting: Sighting, key: Key) -> Option<Hit> {
         if !self.usable() {
-            self.state.lock().clear();
+            state.clear();
             return None;
         }
         let window = Duration::from_secs(self.settings.window_secs);
         let min_channels = self.settings.min_channels;
-        let mut state = self.state.lock();
         state.prepare(sighting.guild, sighting.at, window);
         let author_exists = state
             .guilds
@@ -407,6 +424,7 @@ impl Tracker {
                 ChannelSight {
                     message: sighting.message,
                     at: sighting.at,
+                    lifetime: Arc::new(()),
                 },
             );
             let newest = bucket
@@ -437,24 +455,16 @@ impl Tracker {
                 .iter()
                 .map(|channel| (*channel, bucket.channels[channel].message))
                 .collect();
-            Some((channels, messages))
+            let proof = bucket
+                .channels
+                .values()
+                .map(|sight| Arc::downgrade(&sight.lifetime))
+                .collect();
+            Some((channels, messages, proof))
         }?;
-        let (channels, messages) = noted;
+        let (channels, messages, proof) = noted;
         let review_id = state.next_review;
         state.next_review = state.next_review.wrapping_add(1).max(1);
-        if state.reviews.len() >= MAX_REVIEWS {
-            state.drop_oldest_review();
-        }
-        state.reviews.insert(
-            review_id,
-            Review {
-                guild: sighting.guild,
-                user: sighting.author,
-                body: String::new(),
-                at: sighting.at,
-            },
-        );
-        drop(state);
         self.hits.fetch_add(1, Ordering::Relaxed);
         Some(Hit {
             guild: sighting.guild,
@@ -465,11 +475,19 @@ impl Tracker {
             key,
             timeout_secs: self.settings.timeout_secs,
             window_secs: self.settings.window_secs,
+            proof,
         })
     }
 }
 
 impl State {
+    fn take_staged(&mut self, attachment_id: u64, generation: u64) -> Option<Staged> {
+        match self.staged.get(&attachment_id) {
+            Some(staged) if staged.generation == generation => self.staged.remove(&attachment_id),
+            _ => None,
+        }
+    }
+
     fn clear(&mut self) {
         self.guilds.clear();
         self.authors = 0;
@@ -739,8 +757,9 @@ impl Handoff {
         }
     }
 
-    pub(crate) fn hand_to_job(&mut self) {
+    pub(crate) fn hand_to_job(&mut self) -> Vec<(u64, u64)> {
         self.armed = false;
+        std::mem::take(&mut self.ids)
     }
 
     pub(crate) fn finish_incomplete(&mut self) {
@@ -782,6 +801,20 @@ impl PendingBurst {
             ids,
         }
     }
+
+    pub(crate) fn resolve_hash(&self, id: u64, hash: jmodguard::image_spam::Hash) {
+        let Some((_, generation)) = self.ids.iter().find(|(attachment, _)| *attachment == id)
+        else {
+            return;
+        };
+        if let Some(hit) = self
+            .app
+            .attachment_burst
+            .resolve_hash_at(id, *generation, hash)
+        {
+            dispatch_hit(&self.app, &self.ctx, hit);
+        }
+    }
 }
 
 impl Drop for PendingBurst {
@@ -797,42 +830,6 @@ impl Drop for PendingBurst {
             .collect();
         dispatch(&self.app, &self.ctx, hits);
     }
-}
-
-pub(crate) fn resolve_known_hashes(
-    app: &Arc<BotState>,
-    ctx: &Context,
-    files: &[jmodguard::image_spam::Attachment],
-    hashes: &[jmodguard::image_spam::Hash],
-) {
-    let mut hits = Vec::new();
-    let mut files = files.iter();
-    for hash in hashes {
-        let Some(file) = files.next() else {
-            break;
-        };
-        let Some(generation) = app.attachment_burst.staged_generation(file.id) else {
-            continue;
-        };
-        if let Some(hit) = app
-            .attachment_burst
-            .resolve_hash_at(file.id, generation, *hash)
-        {
-            hits.push(hit);
-        }
-    }
-    for file in files {
-        let Some(generation) = app.attachment_burst.staged_generation(file.id) else {
-            continue;
-        };
-        if let Some(hit) = app
-            .attachment_burst
-            .resolve_incomplete_at(file.id, generation)
-        {
-            hits.push(hit);
-        }
-    }
-    dispatch(app, ctx, hits);
 }
 
 pub(crate) fn dispatch_hit(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
@@ -861,14 +858,17 @@ fn dispatch(app: &Arc<BotState>, ctx: &Context, hits: Vec<Hit>) {
 }
 
 async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
-    if !app.activation.may_record() {
+    if !app.activation.may_record() || !hit.still_valid() {
         return;
     }
     let enrollment = cases::capture(app, hit.guild).await;
     if !membership_still(app, hit.guild, &enrollment).await {
         return;
     }
-    let timed_out = apply_timeout(app, ctx, &hit).await;
+    let timed_out = apply_timeout(app, ctx, &hit, &enrollment).await;
+    if !timed_out && !hit.still_valid() {
+        return;
+    }
     let action = if timed_out {
         templates::render(
             ATTACHMENT_BURST_TIMEOUT_ACTION,
@@ -907,7 +907,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
     ]);
     let rendered = logging::preview_automod(app, GuildId::new(hit.guild), &mut vars).await;
     app.attachment_burst
-        .set_review_body(hit.review_id, rendered.clone());
+        .open_review(&hit, enrollment.clone(), rendered.clone());
     let buttons = vec![CreateActionRow::Buttons(vec![
         CreateButton::new(app.attachment_burst.component_id("r", hit.review_id))
             .label("Release")
@@ -923,6 +923,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
         "automod",
         vars,
         buttons,
+        || timed_out || hit.still_valid(),
     )
     .await;
     if timed_out {
@@ -974,7 +975,12 @@ fn hex(hash: &[u8; 32]) -> String {
     out
 }
 
-async fn apply_timeout(app: &Arc<BotState>, ctx: &Context, hit: &Hit) -> bool {
+async fn apply_timeout(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    hit: &Hit,
+    enrollment: &Option<crate::db::GuildEnrollment>,
+) -> bool {
     let Some(mut member) = member(ctx, GuildId::new(hit.guild), UserId::new(hit.author)).await
     else {
         tracing::warn!("attachment burst timeout skipped because the member was not available");
@@ -987,7 +993,10 @@ async fn apply_timeout(app: &Arc<BotState>, ctx: &Context, hit: &Hit) -> bool {
     ) else {
         return false;
     };
-    if !app.activation.may_record() {
+    if !app.activation.may_record()
+        || !membership_still(app, hit.guild, enrollment).await
+        || !hit.still_valid()
+    {
         return false;
     }
     match raced(
@@ -1055,12 +1064,7 @@ async fn membership_still(
     guild: u64,
     admitted: &Option<crate::db::GuildEnrollment>,
 ) -> bool {
-    let Some(admitted) = admitted else {
-        return true;
-    };
-    cases::capture(app, guild)
-        .await
-        .is_some_and(|current| current.id == admitted.id)
+    cases::capture(app, guild).await == *admitted
 }
 
 async fn raced<T>(
@@ -1138,9 +1142,7 @@ pub(crate) async fn handle_component(
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
         return;
     }
-    let enrollment = cases::capture(app, press.guild_id.get()).await;
-    if !membership_still(app, press.guild_id.get(), &enrollment).await {
-        app.attachment_burst.restore_review(press.review_id, review);
+    if !membership_still(app, review.guild, &review.enrollment).await {
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_FAILED).await;
         return;
     }
@@ -1153,8 +1155,8 @@ pub(crate) async fn handle_component(
         return;
     }
     let decision = match press.action {
-        ButtonAction::Release => release_member(app, ctx, &review, press.user_id, enrollment).await,
-        ButtonAction::Ban => ban_member(app, ctx, &review, press.user_id, enrollment).await,
+        ButtonAction::Release => release_member(app, ctx, &review, press.user_id).await,
+        ButtonAction::Ban => ban_member(app, ctx, &review, press.user_id).await,
     };
     let (label, ok) = match decision {
         ReviewDecision::Released => (ATTACHMENT_BURST_RELEASED, true),
@@ -1190,8 +1192,8 @@ async fn release_member(
     ctx: &Context,
     review: &Review,
     actor: UserId,
-    enrollment: Option<crate::db::GuildEnrollment>,
 ) -> ReviewDecision {
+    let enrollment = review.enrollment.clone();
     if !membership_still(app, review.guild, &enrollment).await {
         return ReviewDecision::Failed;
     }
@@ -1233,8 +1235,8 @@ async fn ban_member(
     ctx: &Context,
     review: &Review,
     actor: UserId,
-    enrollment: Option<crate::db::GuildEnrollment>,
 ) -> ReviewDecision {
+    let enrollment = review.enrollment.clone();
     if !app.activation.may_record() || !membership_still(app, review.guild, &enrollment).await {
         return ReviewDecision::Failed;
     }
@@ -1626,6 +1628,53 @@ mod tests {
     }
 
     #[test]
+    fn resolving_and_forgetting_cannot_resurrect_a_sighting() {
+        for hashed in [true, false] {
+            for _ in 0..250 {
+                let tracker = tracker();
+                let now = Instant::now();
+                let meta = |id| FileMeta {
+                    attachment_id: id,
+                    size: 42,
+                    filename: "spam.png".into(),
+                    content_type: "image/png".into(),
+                };
+                let first = tracker.stage(sight(4, 10, 100, now), meta(1));
+                let resolve = |id, generation| {
+                    if hashed {
+                        tracker.resolve_hash_at(id, generation, [1; 32])
+                    } else {
+                        tracker.resolve_incomplete_at(id, generation)
+                    }
+                };
+                assert!(resolve(1, first).is_none());
+                let second = tracker.stage(sight(4, 11, 101, now), meta(2));
+                let start = std::sync::Barrier::new(2);
+                let hit = std::thread::scope(|scope| {
+                    let settling = scope.spawn(|| {
+                        start.wait();
+                        resolve(2, second)
+                    });
+                    start.wait();
+                    tracker.forget_message(1, 11, 101);
+                    settling.join().unwrap()
+                });
+                assert!(
+                    hit.is_none_or(|hit| !hit.still_valid()),
+                    "a completed invalidation revokes any concurrent hit"
+                );
+                assert!(
+                    tracker.state.lock().guilds[&1].authors[&4]
+                        .keys
+                        .values()
+                        .all(|bucket| !bucket.channels.contains_key(&11)),
+                    "settlement cannot restore a forgotten channel"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn forgetting_a_message_drops_its_channel() {
         let tracker = tracker();
         let now = Instant::now();
@@ -1668,6 +1717,7 @@ mod tests {
         let older = first
             .record(sight(4, 11, 101, now), hash_key(1))
             .expect("first review");
+        first.open_review(&older, None, String::new());
         let button = first.component_id("b", older.review_id);
         let (action, nonce, review_id) = parse_button(&button).expect("button");
         assert!(matches!(action, ButtonAction::Ban));
@@ -1680,6 +1730,7 @@ mod tests {
         let newer = restarted
             .record(sight(8, 11, 201, now), hash_key(2))
             .expect("restarted review");
+        restarted.open_review(&newer, None, String::new());
         assert_eq!(older.review_id, newer.review_id);
         assert!(restarted.claim_review(review_id, 1, nonce).is_none());
         let review = restarted
@@ -1732,6 +1783,7 @@ mod tests {
         let hit = tracker
             .record(sight(4, 11, 101, now), hash_key(1))
             .expect("hit");
+        tracker.open_review(&hit, None, String::new());
         assert!(
             tracker
                 .claim_review(hit.review_id, 99, tracker.process_nonce)
@@ -1900,6 +1952,21 @@ mod tests {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
+    fn test_hit(app: &BotState, author: u64) -> Hit {
+        let now = Instant::now();
+        let sight = |channel| Sighting {
+            guild: 10,
+            author,
+            channel,
+            message: channel * 100 + author,
+            at: now,
+        };
+        assert!(app.attachment_burst.record(sight(1), hash_key(1)).is_none());
+        app.attachment_burst
+            .record(sight(2), hash_key(1))
+            .expect("two channels")
+    }
+
     #[tokio::test]
     async fn enforcement_stays_bounded_and_drops_the_rest() {
         use std::sync::atomic::AtomicUsize;
@@ -1936,20 +2003,7 @@ mod tests {
         let (app, path) = open_app();
         let ctx = fixture_context(http_at(address)).await;
         for author in 1..=8 {
-            dispatch(
-                &app,
-                &ctx,
-                vec![Hit {
-                    guild: 10,
-                    author,
-                    review_id: author,
-                    channels: vec![1, 2],
-                    messages: vec![(1, 10)],
-                    key: Key::Hash([1; 32]),
-                    timeout_secs: 600,
-                    window_secs: 10,
-                }],
-            );
+            dispatch(&app, &ctx, vec![test_hit(&app, author)]);
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while accepted.load(Ordering::SeqCst) < MAX_IN_FLIGHT && Instant::now() < deadline {
@@ -2018,21 +2072,7 @@ mod tests {
         ctx.cache.update(&mut event);
         let app_task = Arc::clone(&app);
         let task = tokio::spawn(async move {
-            enforce(
-                &app_task,
-                &ctx,
-                Hit {
-                    guild: 10,
-                    author: 99,
-                    review_id: 1,
-                    channels: vec![1, 2],
-                    messages: vec![(1, 10)],
-                    key: Key::Hash([1; 32]),
-                    timeout_secs: 600,
-                    window_secs: 10,
-                },
-            )
-            .await;
+            enforce(&app_task, &ctx, test_hit(&app_task, 99)).await;
         });
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -2062,6 +2102,188 @@ mod tests {
         );
         server.abort();
         close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn retained_review_cannot_act_after_rejoin() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&mutations);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, path)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "GET" && path.contains("/bans/") {
+                    write_response(
+                        &mut stream,
+                        "404 Not Found",
+                        r#"{"code":10026,"message":"Unknown Ban"}"#,
+                    )
+                    .await;
+                } else {
+                    if method == "PUT" || method == "PATCH" {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    write_response(&mut stream, "200 OK", r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                }
+            }
+        });
+        let (app, path) = open_app();
+        let old = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(old.clone()).await.unwrap();
+        let ctx = fixture_context(http_at(address)).await;
+        let now = Instant::now();
+        let sighting = |channel, message| Sighting {
+            guild: 10,
+            author: 99,
+            channel,
+            message,
+            at: now,
+        };
+        assert!(
+            app.attachment_burst
+                .record(sighting(1, 100), hash_key(1))
+                .is_none()
+        );
+        let hit = app
+            .attachment_burst
+            .record(sighting(2, 101), hash_key(1))
+            .unwrap();
+        let review_id = hit.review_id;
+        enforce(&app, &ctx, hit).await;
+        mutations.store(0, Ordering::SeqCst);
+        crate::db::retire_guild_enrollment(&app.db, 10, 100)
+            .await
+            .unwrap();
+        app.tenant.schedule_erasure(old).await.unwrap();
+        app.tenant.drive_erasure().await.unwrap();
+        let new = crate::db::enroll_guild(&app.db, 10, 101)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(new.clone()).await.unwrap();
+        let review = app
+            .attachment_burst
+            .claim_review(review_id, 10, app.attachment_burst.process_nonce)
+            .unwrap();
+        let ban = ban_member(&app, &ctx, &review, UserId::new(7)).await;
+        let release = release_member(&app, &ctx, &review, UserId::new(7)).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(ban, ReviewDecision::Failed),
+            "old review must not ban in replacement enrollment"
+        );
+        assert!(
+            matches!(release, ReviewDecision::Failed),
+            "old review must not release in replacement enrollment"
+        );
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+        let (store, scope) = app.tenant.live(new).await.unwrap();
+        assert_eq!(
+            store
+                .case_count(scope, crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            0
+        );
+        close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn invalidated_hits_do_not_dispatch_timeouts_or_reviews() {
+        use std::sync::atomic::AtomicUsize;
+        for (delay_lookup, replace) in [(false, false), (true, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&mutations);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let started_task = Arc::clone(&started);
+            let resume_task = Arc::clone(&resume);
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let Some((method, _)) = read_request(&mut stream).await else {
+                        continue;
+                    };
+                    if method == "GET" && delay_lookup {
+                        started_task.notify_one();
+                        resume_task.notified().await;
+                    } else if method == "PATCH" || method == "POST" {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    write_response(&mut stream, "200 OK", r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                }
+            });
+            let (app, path) = open_app();
+            let ctx = fixture_context(http_at(address)).await;
+            let now = Instant::now();
+            let sighting = |channel, message| Sighting {
+                guild: 10,
+                author: 99,
+                channel,
+                message,
+                at: now,
+            };
+            assert!(
+                app.attachment_burst
+                    .record(sighting(1, 100), hash_key(1))
+                    .is_none()
+            );
+            let hit = app
+                .attachment_burst
+                .record(sighting(2, 101), hash_key(1))
+                .unwrap();
+            let review_id = hit.review_id;
+            if !delay_lookup {
+                app.attachment_burst.forget_message(10, 1, 100);
+            }
+            let task_app = Arc::clone(&app);
+            let task = tokio::spawn(async move { enforce(&task_app, &ctx, hit).await });
+            if delay_lookup {
+                tokio::time::timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .unwrap();
+                if replace {
+                    app.attachment_burst
+                        .prepare_sighting(sighting(1, 100), &[999]);
+                } else {
+                    app.attachment_burst.forget_message(10, 1, 100);
+                }
+                resume.notify_one();
+            }
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "invalidated evidence must not punish (delayed={delay_lookup}, replaced={replace})"
+            );
+            assert!(
+                app.attachment_burst
+                    .claim_review(review_id, 10, app.attachment_burst.process_nonce)
+                    .is_none(),
+                "invalidated evidence must not open a review"
+            );
+            close_app(&path);
+        }
     }
 
     #[tokio::test]
@@ -2107,9 +2329,9 @@ mod tests {
                 user: 99,
                 body: String::new(),
                 at: Instant::now(),
+                enrollment: Some(enrollment.clone()),
             },
             UserId::new(7),
-            Some(enrollment.clone()),
         )
         .await;
         assert!(matches!(decision, ReviewDecision::Banned));

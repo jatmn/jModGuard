@@ -271,6 +271,7 @@ struct Job {
     author: u64,
     token: (u64, u64),
     posts: Vec<Post>,
+    burst_ids: Vec<(u64, u64)>,
 }
 #[derive(Debug, Clone, PartialEq)]
 enum AnalysisGate {
@@ -1176,6 +1177,7 @@ fn candidate_job(
         return None;
     }
     Some(Job {
+        burst_ids: Vec::new(),
         guild,
         author,
         token,
@@ -1269,14 +1271,16 @@ fn spawn_image_job(
     app: &Arc<BotState>,
     ctx: &Context,
     detector: &Detector,
-    job: Job,
+    mut job: Job,
     policy: Policy,
     channel: u64,
+    burst: &mut crate::attachment_burst::Handoff,
 ) -> bool {
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
         detector.capacity_drop();
         return false;
     };
+    job.burst_ids = burst.hand_to_job();
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
@@ -1643,11 +1647,16 @@ pub fn observe(
         msg.channel_id.get(),
         msg.id.get(),
         false,
+    ) && !spawn_image_job(
+        app,
+        ctx,
+        detector,
+        job,
+        policy,
+        msg.channel_id.get(),
+        &mut burst,
     ) {
-        burst.hand_to_job();
-        if !spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get()) {
-            burst.finish_incomplete();
-        }
+        burst.finish_incomplete();
     }
 }
 
@@ -1792,11 +1801,18 @@ pub(crate) fn observe_update(
         update.received,
         true,
     );
-    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
-        burst.hand_to_job();
-        if !spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get()) {
-            burst.finish_incomplete();
-        }
+    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true)
+        && !spawn_image_job(
+            app,
+            ctx,
+            detector,
+            job,
+            policy,
+            event.channel_id.get(),
+            &mut burst,
+        )
+    {
+        burst.finish_incomplete();
     }
 }
 
@@ -1917,17 +1933,8 @@ async fn run_job(
     channel: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let burst_ids = job
-        .posts
-        .iter()
-        .flat_map(|post| post.files.iter())
-        .filter_map(|file| {
-            app.attachment_burst
-                .staged_generation(file.id)
-                .map(|generation| (file.id, generation))
-        })
-        .collect();
-    let _pending_burst = crate::attachment_burst::PendingBurst::new(app, ctx, burst_ids);
+    let pending_burst =
+        crate::attachment_burst::PendingBurst::new(app, ctx, std::mem::take(&mut job.burst_ids));
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
     let started = Instant::now();
@@ -1948,21 +1955,16 @@ async fn run_job(
         let outcome = tokio::time::timeout(job_timeout, async {
             for post in &mut job.posts {
                 if let Some(hashes) = post.hashes.clone() {
-                    crate::attachment_burst::resolve_known_hashes(app, ctx, &post.files, &hashes);
+                    for (file, hash) in post.files.iter().zip(&hashes) {
+                        pending_burst.resolve_hash(file.id, *hash);
+                    }
                     continue;
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
                     match detector.hasher.hash(file, job_timeout).await {
                         Ok(hash) => {
-                            if let Some(generation) =
-                                app.attachment_burst.staged_generation(file.id)
-                                && let Some(hit) = app
-                                    .attachment_burst
-                                    .resolve_hash_at(file.id, generation, hash)
-                            {
-                                crate::attachment_burst::dispatch_hit(app, ctx, hit);
-                            }
+                            pending_burst.resolve_hash(file.id, hash);
                             unique.insert(hash);
                         }
                         Err(error) => {
@@ -3368,6 +3370,7 @@ mod tests {
         let Report::Verified(image_match) = complete_report(
             &detector,
             Job {
+                burst_ids: Vec::new(),
                 guild: 1,
                 author: 2,
                 token: (0, 0),
@@ -3388,6 +3391,7 @@ mod tests {
         assert_eq!(
             detector.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -4627,6 +4631,7 @@ mod tests {
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let stored = posts[0].hashes.clone().expect("admission stored hashes");
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -4645,6 +4650,7 @@ mod tests {
         );
         assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
         let failed_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5167,6 +5173,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_image_job_cannot_consume_a_newer_burst_generation() {
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut old_job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        let post = &old_job.posts[0];
+        let file = &post.files[0];
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: post.channel,
+            message: post.id,
+            at: now,
+        };
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: file.id,
+            size: file.size,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut handoff =
+            crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        old_job.burst_ids = handoff.hand_to_job();
+        app.image_spam.invalidate(1, post.channel, post.id);
+        app.attachment_burst
+            .forget_message(1, post.channel, post.id);
+        let newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let new_generation = app.attachment_burst.staged_generation(file.id).unwrap();
+        let attachment_id = file.id;
+        let permit = app.image_spam.try_acquire_job_slot();
+        run_job(&app, &ctx, old_job, policy, 102, permit).await;
+        assert_eq!(
+            app.attachment_burst.staged_generation(attachment_id),
+            Some(new_generation),
+            "stale job must leave the replacement stage for its owner"
+        );
+        assert!(
+            app.attachment_burst
+                .resolve_hash_at(attachment_id, new_generation, [7; 32])
+                .is_none()
+        );
+        assert!(
+            app.attachment_burst
+                .staged_generation(attachment_id)
+                .is_none(),
+            "newer owner can settle its own hash"
+        );
+        drop(newer);
+    }
+
+    #[tokio::test]
+    async fn delayed_image_hash_cannot_consume_a_newer_burst_generation() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads(&mut job, &fixture.url("/hash0"), 3);
+        job.posts[0].files[0].set_request_uri_str_for_test(&fixture.url("/slow"));
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: job.posts[0].channel,
+            message: job.posts[0].id,
+            at: now,
+        };
+        let id = job.posts[0].files[0].id;
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: id,
+            size: 3,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut old = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        job.burst_ids = old.hand_to_job();
+        let task_app = Arc::clone(&app);
+        let task_ctx = ctx.clone();
+        let task = tokio::spawn(async move {
+            let permit = task_app.image_spam.try_acquire_job_slot();
+            run_job(&task_app, &task_ctx, job, policy, 102, permit).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.hit_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hash request started");
+        app.attachment_burst
+            .forget_message(1, sighting.channel, sighting.message);
+        let mut newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let generation = app.attachment_burst.staged_generation(id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.attachment_burst.staged_generation(id),
+            Some(generation),
+            "late hash must not resolve the replacement observation"
+        );
+        let owned = crate::attachment_burst::PendingBurst::new(&app, &ctx, newer.hand_to_job());
+        owned.resolve_hash(id, [7; 32]);
+        assert!(
+            app.attachment_burst.staged_generation(id).is_none(),
+            "replacement job retains ownership of its hash"
+        );
+    }
+
+    #[tokio::test]
     async fn run_job_notice_process_budget_gate() {
         let (app, policy, token) = image_run_job_test_app(Limits {
             requests_per_minute: 5,
@@ -5494,6 +5621,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5515,6 +5643,7 @@ mod tests {
             .expect("first job stores hashes");
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let failed = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5547,6 +5676,7 @@ mod tests {
             .unwrap();
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let none_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5563,6 +5693,7 @@ mod tests {
             CompleteOutcome::Dropped
         );
         let different = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5605,6 +5736,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5705,6 +5837,7 @@ mod tests {
         clear_stored_hashes(&d);
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5949,6 +6082,7 @@ mod tests {
             .collect();
         assert!(stored.iter().all(|hashes| hashes.is_some()));
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5977,6 +6111,7 @@ mod tests {
         assert_eq!(
             d.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -6017,6 +6152,7 @@ mod tests {
                 .hashes = None;
         }
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6329,6 +6465,7 @@ mod tests {
             })
             .collect();
         Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author,
             token,

@@ -924,6 +924,7 @@ pub(crate) async fn emit_with_components(
     event: &str,
     vars: BTreeMap<String, String>,
     components: Vec<CreateActionRow>,
+    commit: impl Fn() -> bool + Sync,
 ) -> Delivery {
     emit_to_observed_with_audit(
         app,
@@ -933,8 +934,8 @@ pub(crate) async fn emit_with_components(
         vars,
         None,
         Admission::Immediate,
-        || true,
-        false,
+        commit,
+        true,
         components,
     )
     .await
