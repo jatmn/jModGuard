@@ -1682,7 +1682,6 @@ pub(crate) fn observe_update(
 }
 
 fn analysis_gate_from_download(
-    detector: &Detector,
     error: DownloadError,
     timeout_secs: u64,
     started: Instant,
@@ -1695,7 +1694,9 @@ fn analysis_gate_from_download(
         DownloadError::SizeMismatch {
             declared, received, ..
         } => AnalysisGate::SizeMismatch { declared, received },
-        DownloadError::ByteAllowance { .. } => detector.process_budget_gate(started),
+        DownloadError::ByteAllowance { .. } => {
+            unreachable!("byte admission returns its captured process-budget gate");
+        }
         DownloadError::Capture => {
             unreachable!("in-memory exact-image hashing does not write a capture file");
         }
@@ -1828,12 +1829,6 @@ impl Detector {
         }
     }
 
-    fn process_budget_gate(&self, now: Instant) -> AnalysisGate {
-        let mut state = self.state.lock();
-        state.budget.reset(now);
-        Self::process_budget_gate_locked(&state.budget, &self.limits)
-    }
-
     /// Admit one extra GET in the current budget window. Request capacity is
     /// charged only when the byte budget can cover a non-empty body.
     fn admit_exact_retry(&self, account: DownloadAccount) -> RetryAdmit {
@@ -1947,17 +1942,18 @@ impl Detector {
 /// Declared bytes were charged when the job was reserved. Charge each chunk's
 /// excess in the current window under the process budget lock before hashing.
 /// Consumed capacity therefore survives stream failure, timeout and cancellation.
-fn admit_stream_bytes(
-    detector: &Detector,
+fn admit_stream_bytes<'a>(
+    detector: &'a Detector,
     account: DownloadAccount,
     mut prepaid: u64,
-) -> impl FnMut(u64) -> bool + '_ {
+    denied: &'a mut Option<AnalysisGate>,
+) -> impl FnMut(u64) -> bool + 'a {
     move |bytes| {
         let covered = bytes.min(prepaid);
-        if detector
-            .charge_downloaded_bytes(bytes - covered, account)
-            .is_err()
-        {
+        if let Err(gate) = detector.charge_downloaded_bytes(bytes - covered, account) {
+            // Keep the denial-time totals even if another job renews or charges
+            // the process window before this attempt's error is reported.
+            *denied = Some(gate);
             return false;
         }
         prepaid -= covered;
@@ -1976,13 +1972,14 @@ async fn hash_for_exact_check(
     timeout: Duration,
 ) -> Result<Hash, ExactCheckFailure> {
     let max_file_bytes = detector.limits.max_file_bytes;
+    let mut denied = None;
     match detector
         .hasher()
         .hash(
             file,
             timeout,
             max_file_bytes,
-            admit_stream_bytes(detector, account, file.size),
+            admit_stream_bytes(detector, account, file.size, &mut denied),
         )
         .await
     {
@@ -1990,7 +1987,9 @@ async fn hash_for_exact_check(
         Err(error) if error.is_retryable_size_mismatch() => {
             retry_exact_check(detector, account, file, timeout, error).await
         }
-        Err(error) => Err(ExactCheckFailure::Download(error)),
+        Err(error) => {
+            Err(denied.map_or(ExactCheckFailure::Download(error), ExactCheckFailure::Gate))
+        }
     }
 }
 
@@ -2007,17 +2006,18 @@ async fn retry_exact_check(
         RetryAdmit::Miss(gate) => return Err(ExactCheckFailure::Gate(gate)),
         RetryAdmit::Stale => return Err(ExactCheckFailure::Download(truncated)),
     }
+    let mut denied = None;
     detector
         .hasher()
         .hash(
             file,
             timeout,
             max_file_bytes,
-            admit_stream_bytes(detector, account, 0),
+            admit_stream_bytes(detector, account, 0, &mut denied),
         )
         .await
         .map(|(hash, _)| hash)
-        .map_err(ExactCheckFailure::Download)
+        .map_err(|error| denied.map_or(ExactCheckFailure::Download(error), ExactCheckFailure::Gate))
 }
 
 async fn run_job(
@@ -2060,8 +2060,7 @@ async fn run_job(
                     match hash_for_exact_check(detector, account, file, job_timeout).await {
                         Ok(hash) => unique.insert(hash),
                         Err(ExactCheckFailure::Download(error)) => {
-                            job_gate =
-                                analysis_gate_from_download(detector, error, timeout_secs, started);
+                            job_gate = analysis_gate_from_download(error, timeout_secs, started);
                             return Err(());
                         }
                         Err(ExactCheckFailure::Gate(gate)) => {
@@ -5745,9 +5744,14 @@ mod tests {
             };
             assert!(notice.contains(digest), "{notice}");
         }
+        let budget_gate = {
+            let mut state = app.image_spam.state.lock();
+            state.budget.reset(Instant::now());
+            Detector::process_budget_gate_locked(&state.budget, &app.image_spam.limits)
+        };
         let AnalysisGate::ProcessBudget {
             requests, bytes, ..
-        } = app.image_spam.process_budget_gate(Instant::now())
+        } = budget_gate
         else {
             unreachable!()
         };
@@ -5942,6 +5946,85 @@ mod tests {
         assert!(!logs.contains("received_size=4"), "{logs}");
         assert!(!logs.contains("process request budget"), "{logs}");
         assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    fn byte_denial_keeps_its_budget_window(retry: bool) {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let byte_limit = if retry { 20 } else { 18 };
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                bytes_per_minute: byte_limit,
+                ..Limits::default()
+            })
+            .await;
+            let detector = &app.image_spam;
+            let started = Instant::now();
+            let mut job = admit_three_channel_job(detector, token, &policy, started);
+            clear_stored_hashes(detector);
+            rewrite_job_downloads(
+                &mut job,
+                &fixture.url(if retry { "/retry0" } else { "/long0" }),
+                3,
+            );
+            assert!(matches!(
+                detector.reserve(&mut job, &policy, started),
+                ReserveOutcome::Ok
+            ));
+            let account = DownloadAccount {
+                guild: 1,
+                author: 2,
+                token,
+            };
+            let failure = hash_for_exact_check(
+                detector,
+                account,
+                &job.posts[0].files[0],
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the actual body must exhaust byte admission");
+            let requests = if retry { 7 } else { 6 };
+            assert_eq!(fixture.hit_count(), if retry { 2 } else { 1 });
+            assert_eq!(detector.process_budget_requests(), requests);
+            assert_eq!(detector.process_budget_bytes(), 18);
+
+            // Model another job renewing and charging the process window before
+            // run_job renders this download failure. No clock sleeps or HTTP mocks.
+            detector.state.lock().budget.start = Instant::now() - Duration::from_secs(60);
+            assert!(detector.charge_downloaded_bytes(1, account).is_ok());
+            assert_eq!(detector.process_budget_requests(), 0);
+            assert_eq!(detector.process_budget_bytes(), 1);
+            let gate = match failure {
+                ExactCheckFailure::Download(error) => {
+                    analysis_gate_from_download(error, 1, started)
+                }
+                ExactCheckFailure::Gate(gate) => gate,
+            };
+            warn_incomplete_analysis(&gate, 1, 2);
+            let vars = report_vars(Report::Unverified(gate), 2, 102, &policy);
+            assert_incomplete_automod(
+                &vars,
+                &format!(
+                    "Stopped at the process budget ({requests}/120 requests, 18/{byte_limit} bytes)."
+                ),
+            );
+        });
+        assert!(
+            logs.contains(if retry { "requests=7" } else { "requests=6" }),
+            "{logs}"
+        );
+        assert!(logs.contains("bytes=18"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn initial_byte_denial_keeps_its_budget_window() {
+        byte_denial_keeps_its_budget_window(false);
+    }
+
+    #[test]
+    fn retry_byte_denial_keeps_its_budget_window() {
+        byte_denial_keeps_its_budget_window(true);
     }
 
     #[tokio::test]
