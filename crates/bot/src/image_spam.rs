@@ -1,7 +1,9 @@
 //! Bounded exact-image observations. Punishment uses `spam_actions`, not automod.
 use crate::state::{BotState, CachedGuildConfig};
 use jmodguard::db::guild_data::TextEvidence;
-use jmodguard::image_spam::{Attachment, DownloadError, Hash, Hasher, Limits, Policy};
+use jmodguard::image_spam::{
+    Attachment, DownloadError, Hash, Hasher, Limits, Policy, SizeMismatchKind,
+};
 use parking_lot::Mutex;
 use serenity::{
     client::Context,
@@ -424,6 +426,21 @@ impl Detector {
     #[cfg(test)]
     pub(crate) fn process_budget_requests(&self) -> u64 {
         self.state.lock().budget.requests
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_budget_bytes(&self) -> u64 {
+        self.state.lock().budget.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guild_budget_requests(&self, guild: u64) -> u64 {
+        self.state
+            .lock()
+            .guilds
+            .get(&guild)
+            .map(|guild| guild.budget.requests)
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -1667,6 +1684,7 @@ pub(crate) fn observe_update(
 }
 
 fn analysis_gate_from_download(
+    detector: &Detector,
     error: DownloadError,
     timeout_secs: u64,
     started: Instant,
@@ -1679,6 +1697,7 @@ fn analysis_gate_from_download(
         DownloadError::SizeMismatch {
             declared, received, ..
         } => AnalysisGate::SizeMismatch { declared, received },
+        DownloadError::ByteAllowance { .. } => detector.process_budget_gate(started),
         DownloadError::Capture => {
             unreachable!("in-memory exact-image hashing does not write a capture file");
         }
@@ -1783,20 +1802,253 @@ fn warn_incomplete_analysis(gate: &AnalysisGate, guild: u64, author: u64) {
     }
 }
 
+enum RetryAdmit {
+    Ready(u64),
+    Miss(AnalysisGate),
+    Stale,
+}
+
+enum ExactCheckFailure {
+    Download(DownloadError),
+    Gate(AnalysisGate),
+}
+
+#[derive(Clone, Copy)]
+struct DownloadAccount {
+    guild: u64,
+    author: u64,
+    token: (u64, u64),
+}
+
+impl Detector {
+    fn process_budget_gate_locked(budget: &Budget, limits: &Limits) -> AnalysisGate {
+        AnalysisGate::ProcessBudget {
+            requests: budget.requests,
+            request_limit: limits.requests_per_minute,
+            bytes: budget.bytes,
+            byte_limit: limits.bytes_per_minute,
+        }
+    }
+
+    fn process_budget_gate(&self, now: Instant) -> AnalysisGate {
+        let mut state = self.state.lock();
+        state.budget.reset(now);
+        Self::process_budget_gate_locked(&state.budget, &self.limits)
+    }
+
+    /// Declared size is already charged. Spare process bytes may cover a longer body.
+    fn prepaid_body_allowance(&self, declared: u64, now: Instant) -> u64 {
+        let mut state = self.state.lock();
+        state.budget.reset(now);
+        let spare = self
+            .limits
+            .bytes_per_minute
+            .saturating_sub(state.budget.bytes);
+        declared
+            .saturating_add(spare)
+            .min(self.limits.max_file_bytes)
+    }
+
+    /// Admit one extra GET. Request capacity is charged only when the process
+    /// byte budget can also cover a non-empty body. Nothing is fetched on a miss.
+    fn admit_exact_retry(&self, account: DownloadAccount, now: Instant) -> RetryAdmit {
+        let mut state = self.state.lock();
+        if !state.budget.fits(
+            now,
+            1,
+            0,
+            self.limits.requests_per_minute,
+            self.limits.bytes_per_minute,
+        ) {
+            return RetryAdmit::Miss(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        let spare = self
+            .limits
+            .bytes_per_minute
+            .saturating_sub(state.budget.bytes);
+        let allowance = spare.min(self.limits.max_file_bytes);
+        let Some(guild) = state.guilds.get_mut(&account.guild) else {
+            return RetryAdmit::Stale;
+        };
+        if !guild
+            .budget
+            .fits(now, 1, 0, self.limits.requests_per_guild_minute, u64::MAX)
+        {
+            return RetryAdmit::Miss(AnalysisGate::GuildBudget {
+                requests: guild.budget.requests,
+                request_limit: self.limits.requests_per_guild_minute,
+            });
+        }
+        let Some(author) = guild.authors.get_mut(&account.author) else {
+            return RetryAdmit::Stale;
+        };
+        if author.token != account.token {
+            return RetryAdmit::Stale;
+        }
+        if !author
+            .budget
+            .fits(now, 1, 0, self.limits.requests_per_author_minute, u64::MAX)
+        {
+            return RetryAdmit::Miss(AnalysisGate::AuthorBudget {
+                requests: author.budget.requests,
+                request_limit: self.limits.requests_per_author_minute,
+            });
+        }
+        if allowance == 0 {
+            return RetryAdmit::Miss(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        author.budget.charge(1, 0);
+        guild.budget.charge(1, 0);
+        state.budget.charge(1, 0);
+        RetryAdmit::Ready(allowance)
+    }
+
+    fn charge_downloaded_bytes(
+        &self,
+        bytes: u64,
+        now: Instant,
+        account: DownloadAccount,
+    ) -> Result<(), AnalysisGate> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        if !state.budget.fits(
+            now,
+            0,
+            bytes,
+            self.limits.requests_per_minute,
+            self.limits.bytes_per_minute,
+        ) {
+            return Err(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        state.budget.charge(0, bytes);
+        if let Some(guild) = state.guilds.get_mut(&account.guild) {
+            if guild.budget.fits(
+                now,
+                0,
+                bytes,
+                self.limits.requests_per_guild_minute,
+                u64::MAX,
+            ) {
+                guild.budget.charge(0, bytes);
+            }
+            if let Some(author) = guild.authors.get_mut(&account.author)
+                && author.token == account.token
+                && author.budget.fits(
+                    now,
+                    0,
+                    bytes,
+                    self.limits.requests_per_author_minute,
+                    u64::MAX,
+                )
+            {
+                author.budget.charge(0, bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn charge_streamed_beyond(
+    detector: &Detector,
+    account: DownloadAccount,
+    now: Instant,
+    prepaid: u64,
+    streamed: u64,
+) -> Result<(), ExactCheckFailure> {
+    detector
+        .charge_downloaded_bytes(streamed.saturating_sub(prepaid), now, account)
+        .map_err(ExactCheckFailure::Gate)
+}
+
 /// Hash one exact-check attachment. A body that ends short of the declared size
-/// is fetched once more. Oversized bodies and every other download error are not retried.
-/// The hash is streamed; image bytes are not retained.
+/// is fetched once more when process, guild, and author request budgets and the
+/// process byte budget admit that GET. Oversized bodies and every other download
+/// error are not retried. The hash is streamed; image bytes are not retained.
 async fn hash_for_exact_check(
-    hasher: &Hasher,
+    detector: &Detector,
+    account: DownloadAccount,
     file: &Attachment,
     timeout: Duration,
-    max_file_bytes: u64,
-) -> Result<Hash, DownloadError> {
-    match hasher.hash(file, timeout, max_file_bytes).await {
-        Err(error) if error.is_retryable_size_mismatch() => {
-            hasher.hash(file, timeout, max_file_bytes).await
+    now: Instant,
+) -> Result<Hash, ExactCheckFailure> {
+    let max_file_bytes = detector.limits.max_file_bytes;
+    let allowance = detector.prepaid_body_allowance(file.size, now);
+    match detector
+        .hasher()
+        .hash(file, timeout, max_file_bytes, allowance)
+        .await
+    {
+        Ok((hash, received)) => {
+            charge_streamed_beyond(detector, account, now, file.size, received)?;
+            Ok(hash)
         }
-        other => other,
+        Err(error) if error.is_retryable_size_mismatch() => {
+            retry_exact_check(detector, account, file, timeout, now, error).await
+        }
+        Err(error @ DownloadError::ByteAllowance { accepted, .. }) => {
+            charge_streamed_beyond(detector, account, now, file.size, accepted)?;
+            Err(ExactCheckFailure::Download(error))
+        }
+        Err(error) => Err(ExactCheckFailure::Download(error)),
+    }
+}
+
+async fn retry_exact_check(
+    detector: &Detector,
+    account: DownloadAccount,
+    file: &Attachment,
+    timeout: Duration,
+    now: Instant,
+    truncated: DownloadError,
+) -> Result<Hash, ExactCheckFailure> {
+    let max_file_bytes = detector.limits.max_file_bytes;
+    let allowance = match detector.admit_exact_retry(account, now) {
+        RetryAdmit::Ready(allowance) => allowance,
+        RetryAdmit::Miss(gate) => return Err(ExactCheckFailure::Gate(gate)),
+        RetryAdmit::Stale => return Err(ExactCheckFailure::Download(truncated)),
+    };
+    match detector
+        .hasher()
+        .hash(file, timeout, max_file_bytes, allowance)
+        .await
+    {
+        Ok((hash, received)) => {
+            charge_streamed_beyond(detector, account, now, 0, received)?;
+            if received < file.size {
+                return Err(ExactCheckFailure::Download(DownloadError::SizeMismatch {
+                    declared: file.size,
+                    received,
+                    kind: SizeMismatchKind::Truncated,
+                }));
+            }
+            Ok(hash)
+        }
+        Err(
+            error @ DownloadError::SizeMismatch {
+                received,
+                kind: SizeMismatchKind::Truncated,
+                ..
+            },
+        ) => {
+            charge_streamed_beyond(detector, account, now, 0, received)?;
+            Err(ExactCheckFailure::Download(error))
+        }
+        Err(error @ DownloadError::ByteAllowance { accepted, .. }) => {
+            charge_streamed_beyond(detector, account, now, 0, accepted)?;
+            Err(ExactCheckFailure::Download(error))
+        }
+        Err(error) => Err(ExactCheckFailure::Download(error)),
     }
 }
 
@@ -1826,24 +2078,28 @@ async fn run_job(
     if !failed {
         // One whole job deadline, not a fresh unbounded deadline per attachment.
         let outcome = tokio::time::timeout(job_timeout, async {
+            let account = DownloadAccount {
+                guild: job.guild,
+                author: job.author,
+                token: job.token,
+            };
             for post in &mut job.posts {
                 if post.hashes.is_some() {
                     continue;
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
-                    match hash_for_exact_check(
-                        detector.hasher(),
-                        file,
-                        job_timeout,
-                        detector.limits.max_file_bytes,
-                    )
-                    .await
+                    match hash_for_exact_check(detector, account, file, job_timeout, started).await
                     {
                         Ok(hash) => unique.insert(hash),
-                        Err(error) => {
-                            job_gate = analysis_gate_from_download(error, timeout_secs, started);
-                            return Err(error);
+                        Err(ExactCheckFailure::Download(error)) => {
+                            job_gate =
+                                analysis_gate_from_download(detector, error, timeout_secs, started);
+                            return Err(());
+                        }
+                        Err(ExactCheckFailure::Gate(gate)) => {
+                            job_gate = gate;
+                            return Err(());
                         }
                     };
                 }
@@ -1854,7 +2110,7 @@ async fn run_job(
         .await;
         failed = match outcome {
             Ok(Ok(())) => false,
-            Ok(Err(_)) => true,
+            Ok(Err(())) => true,
             Err(_) => {
                 job_gate = AnalysisGate::Timeout {
                     timeout_secs,
@@ -5114,6 +5370,8 @@ mod tests {
                 "{}",
                 vars["content"]
             );
+            assert_eq!(app.image_spam.process_budget_requests(), 7);
+            assert_eq!(app.image_spam.process_budget_bytes(), 20);
         });
         assert!(logs.contains("declared_size=3"), "{logs}");
         assert!(logs.contains("received_size=2"), "{logs}");
@@ -5148,6 +5406,8 @@ mod tests {
                 notice.contains("3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"),
                 "{notice}"
             );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 18);
         });
         assert!(!logs.contains("declared_size"), "{logs}");
         assert!(!logs.contains("size_mismatch"), "{logs}");
@@ -5184,6 +5444,8 @@ mod tests {
                 "{notice}"
             );
             assert!(!notice.contains("http://"), "{notice}");
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 24);
         });
         assert!(logs.contains("declared_size=3"), "{logs}");
         assert!(logs.contains("received_size=4"), "{logs}");
@@ -5226,6 +5488,11 @@ mod tests {
                     .contains("961b6dd3ede3cb8ecbaacbd68de040cd78eb2ed5889130cceb4c49268ea4d506"),
                 "{notice}"
             );
+            assert_eq!(fixture.hit_count(), before + 8);
+            assert_eq!(app.image_spam.process_budget_requests(), 8);
+            assert_eq!(app.image_spam.process_budget_bytes(), 24);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 8);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 8);
         });
         assert!(!logs.contains("size_mismatch"), "{logs}");
     }
@@ -5254,6 +5521,126 @@ mod tests {
         assert!(logs.contains("declared_size=3"), "{logs}");
         assert!(logs.contains("received_size=4"), "{logs}");
         assert!(logs.contains("size_mismatch"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_when_request_budget_is_full() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 6,
+                requests_per_guild_minute: 6,
+                requests_per_author_minute: 6,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 1,
+                "a retry GET is not sent when the request budget is already full"
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the process request budget");
+        });
+        assert!(logs.contains("process_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_at_guild_request_budget() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 100,
+                requests_per_guild_minute: 6,
+                requests_per_author_minute: 100,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(fixture.hit_count(), before + 1);
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the guild request budget");
+        });
+        assert!(logs.contains("guild_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_at_author_request_budget() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 100,
+                requests_per_guild_minute: 100,
+                requests_per_author_minute: 6,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(fixture.hit_count(), before + 1);
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the author request budget");
+        });
+        assert!(logs.contains("author_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_longer_body_stops_when_byte_budget_covers_only_the_declared_size() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                bytes_per_minute: 18,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads_pair(&mut job, &fixture, 3, "/long0", "/long1");
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 1,
+                "a longer body is not hashed when the byte budget only covers the declared size"
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 18);
+            assert_incomplete_automod(&vars, "Stopped at the process request budget");
+            let notice = automod_notice(&vars);
+            assert!(
+                !notice
+                    .contains("61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"),
+                "{notice}"
+            );
+        });
+        assert!(logs.contains("process_budget"), "{logs}");
+        assert!(!logs.contains("received_size=4"), "{logs}");
         assert!(!logs.contains("http://"), "{logs}");
     }
 

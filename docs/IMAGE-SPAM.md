@@ -60,9 +60,12 @@ creates, expired IDs and late hash results cannot refresh the window.
 
 Hashing still streams original `cdn.discordapp.com/attachments/...` URLs with the
 same origin/path, no-redirect, no-credential contract. A completed body within the
-file cap is hashed even when it is longer than the size Discord declared. A body
-that ends short of that declared size is fetched once more. A body over the cap,
-and every other download failure, is not retried.
+file cap is hashed even when it is longer than the size Discord declared, and only
+when the process byte budget covers that received length. A body that ends short of
+that declared size is fetched once more only when the process, guild, and author
+request budgets and the process byte budget admit the extra request. A body over
+the cap, a body the byte budget cannot cover, and every other download failure, is
+not retried.
 
 ## Enforcement
 
@@ -98,8 +101,9 @@ so that later try does not call Discord again; a transient failure, including 42
 and 5xx, does. A failed job does not clear hashes
 already stored for those posts. Hashing uses one CDN request per attachment
 that does not already have a stored hash, plus one extra request only when that
-body ends short of the declared size. Redirects are not followed. Image bytes
-are not stored.
+body ends short of the declared size and the process, guild, and author request
+budgets and the process byte budget admit it. Redirects are not followed. Image
+bytes are not stored.
 An overlapping job copies hashes stored since it was admitted before it charges
 its download budget. When every live post already has a hash and comparison finds
 no match, a budget miss does not send an incomplete notice. Hashes already stored

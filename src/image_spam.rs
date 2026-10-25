@@ -265,6 +265,10 @@ pub enum DownloadError {
         received: u64,
         kind: SizeMismatchKind,
     },
+    /// The next chunk would pass the process byte allowance. `accepted` is the
+    /// length already hashed; that chunk is not hashed and is not retained.
+    #[error("byte allowance exceeded")]
+    ByteAllowance { declared: u64, accepted: u64 },
     #[error("body read failure")]
     BodyRead,
     #[error("capture failure")]
@@ -318,26 +322,29 @@ impl Hasher {
         Ok(response.into_body())
     }
 
-    /// One HTTP GET. A finished body within `max_file_bytes` is hashed even when
-    /// Discord declared a smaller size. A short body is a retryable mismatch.
-    /// Image bytes are not retained.
+    /// One HTTP GET. A finished body within `max_file_bytes` and `byte_allowance`
+    /// is hashed even when Discord declared a smaller size. A short body is a
+    /// retryable mismatch. A chunk past the allowance is not hashed. Image bytes
+    /// are not retained. The returned length is the number of bytes hashed.
     pub async fn hash(
         &self,
         attachment: &Attachment,
         timeout: Duration,
         max_file_bytes: u64,
-    ) -> Result<Hash, DownloadError> {
+        byte_allowance: u64,
+    ) -> Result<(Hash, u64), DownloadError> {
         match tokio::time::timeout(timeout, async {
             hash_exact_body(
                 self.get_body(attachment).await?,
                 attachment.size,
                 max_file_bytes,
+                byte_allowance,
             )
             .await
         })
         .await
         {
-            Ok(Ok(hash)) => Ok(hash),
+            Ok(Ok(hashed)) => Ok(hashed),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(DownloadError::Timeout),
         }
@@ -396,6 +403,9 @@ fn download_anyhow(error: DownloadError) -> anyhow::Error {
         DownloadError::SizeMismatch { .. } => {
             anyhow::anyhow!("image body length differs from declared size")
         }
+        DownloadError::ByteAllowance { .. } => {
+            anyhow::anyhow!("image body exceeded the byte allowance")
+        }
         DownloadError::BodyRead => anyhow::anyhow!("image body failed"),
         DownloadError::Capture => anyhow::anyhow!("image capture failed"),
     }
@@ -414,14 +424,15 @@ fn rejected_size(declared: u64, received: u64) -> DownloadError {
     }
 }
 
-/// Exact-image hash. A completed body within the cap is hashed even when it is
-/// longer than `declared`. A short body is retryable. Bytes past the cap are
-/// not hashed and are not retained.
+/// Exact-image hash. A completed body within the cap and `byte_allowance` is
+/// hashed even when it is longer than `declared`. A short body is retryable.
+/// Bytes past the cap or the allowance are not hashed and are not retained.
 async fn hash_exact_body(
     mut body: Body,
     declared: u64,
     max_file_bytes: u64,
-) -> Result<Hash, DownloadError> {
+    byte_allowance: u64,
+) -> Result<(Hash, u64), DownloadError> {
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
     let mut received = 0u64;
     while let Some(chunk) = body.data().await {
@@ -432,6 +443,12 @@ async fn hash_exact_body(
         };
         if next > max_file_bytes {
             return Err(rejected_size(declared, next));
+        }
+        if next > byte_allowance {
+            return Err(DownloadError::ByteAllowance {
+                declared,
+                accepted: received,
+            });
         }
         received = next;
         hash.update(&chunk);
@@ -450,7 +467,10 @@ async fn hash_exact_body(
             "exact image check hashed a completed body that was longer than the declared size"
         );
     }
-    Ok(hash.finish().as_ref().try_into().expect("SHA256 length"))
+    Ok((
+        hash.finish().as_ref().try_into().expect("SHA256 length"),
+        received,
+    ))
 }
 
 async fn stream_body(
@@ -542,12 +562,14 @@ mod tests {
     }
     #[tokio::test]
     async fn exact_check_hashes_match_and_completed_longer_body_within_cap() {
-        let matched = hash_exact_body(Body::from("abc"), 3, 8).await.unwrap();
+        let (matched, matched_len) = hash_exact_body(Body::from("abc"), 3, 8, 8).await.unwrap();
+        assert_eq!(matched_len, 3);
         assert_eq!(
             matched.as_slice(),
             ring::digest::digest(&ring::digest::SHA256, b"abc").as_ref()
         );
-        let longer = hash_exact_body(Body::from("abcd"), 3, 8).await.unwrap();
+        let (longer, longer_len) = hash_exact_body(Body::from("abcd"), 3, 8, 8).await.unwrap();
+        assert_eq!(longer_len, 4);
         assert_eq!(
             longer.as_slice(),
             ring::digest::digest(&ring::digest::SHA256, b"abcd").as_ref()
@@ -556,7 +578,9 @@ mod tests {
     }
     #[tokio::test]
     async fn exact_check_short_body_is_retryable_and_over_cap_is_not() {
-        let truncated = hash_exact_body(Body::from("ab"), 3, 8).await.unwrap_err();
+        let truncated = hash_exact_body(Body::from("ab"), 3, 8, 8)
+            .await
+            .unwrap_err();
         assert_eq!(
             truncated,
             DownloadError::SizeMismatch {
@@ -566,9 +590,22 @@ mod tests {
             }
         );
         assert!(truncated.is_retryable_size_mismatch());
-        let oversized = hash_exact_body(Body::from("abcd"), 3, 3).await.unwrap_err();
+        let oversized = hash_exact_body(Body::from("abcd"), 3, 3, 8)
+            .await
+            .unwrap_err();
         assert_eq!(oversized, rejected_size(3, 4));
         assert!(!oversized.is_retryable_size_mismatch());
+        let over_allowance = hash_exact_body(Body::from("abcd"), 3, 8, 3)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            over_allowance,
+            DownloadError::ByteAllowance {
+                declared: 3,
+                accepted: 0,
+            }
+        );
+        assert!(!over_allowance.is_retryable_size_mismatch());
     }
     #[tokio::test]
     async fn transport_streams_without_redirects_and_has_a_deadline() {
@@ -630,15 +667,16 @@ mod tests {
         source.uri = format!("http://{address}/ok").parse().unwrap();
         assert_eq!(
             client
-                .hash(&source, Duration::from_secs(1), 10)
+                .hash(&source, Duration::from_secs(1), 10, 10)
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             hash_body(Body::from("abc"), 3).await.unwrap()
         );
         source.uri = format!("http://{address}/too_many").parse().unwrap();
         let started = std::time::Instant::now();
         assert_eq!(
-            client.hash(&source, Duration::from_secs(1), 10).await,
+            client.hash(&source, Duration::from_secs(1), 10, 10).await,
             Err(DownloadError::HttpStatus(429))
         );
         assert!(
@@ -648,7 +686,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is a single request");
         source.uri = format!("http://{address}/redirect").parse().unwrap();
         assert_eq!(
-            client.hash(&source, Duration::from_secs(1), 10).await,
+            client.hash(&source, Duration::from_secs(1), 10, 10).await,
             Err(DownloadError::HttpStatus(302))
         );
         assert_eq!(
@@ -658,12 +696,14 @@ mod tests {
         );
         source.uri = format!("http://{address}/encoding").parse().unwrap();
         assert_eq!(
-            client.hash(&source, Duration::from_secs(1), 10).await,
+            client.hash(&source, Duration::from_secs(1), 10, 10).await,
             Err(DownloadError::ContentEncoding)
         );
         source.uri = format!("http://{address}/slow").parse().unwrap();
         assert_eq!(
-            client.hash(&source, Duration::from_millis(30), 10).await,
+            client
+                .hash(&source, Duration::from_millis(30), 10, 10)
+                .await,
             Err(DownloadError::Timeout)
         );
         source.uri = format!("http://{address}/ok").parse().unwrap();
