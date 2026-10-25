@@ -470,6 +470,18 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Appended to an attachment-burst review after a moderator uses a button.
+pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";
+pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
+pub const ATTACHMENT_BURST_TIMEOUT_ACTION: &str = "timeout {duration}";
+pub const ATTACHMENT_BURST_TIMEOUT_MISSED: &str = "timeout not applied; awaiting review";
+pub const ATTACHMENT_BURST_DENIED: &str = "That review action is not available to you.";
+pub const ATTACHMENT_BURST_HANDLED: &str = "That review was already handled.";
+pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
+pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
+pub const ATTACHMENT_BURST_BANNED: &str = "banned";
+pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
+
 /// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
 ///
 /// These stay out of [`default_templates`] so startup does not insert new

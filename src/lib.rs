@@ -23,6 +23,7 @@ pub use jmodguard_runtime::mark_child_ready;
 pub use jmodguard_runtime::process_ready;
 pub use jmodguard_runtime::set_process_ready;
 pub use jmodguard_runtime::set_shutdown_context;
+pub mod attachment_burst;
 pub mod ids;
 pub mod image_spam;
 pub mod normalize;

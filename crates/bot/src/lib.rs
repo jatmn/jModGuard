@@ -7,6 +7,7 @@ pub use jmodguard::{
 pub mod action_worker;
 pub mod activation;
 pub mod activity_log;
+pub mod attachment_burst;
 pub mod automod;
 pub mod cases;
 pub mod commands;

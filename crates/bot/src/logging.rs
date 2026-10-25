@@ -1,7 +1,7 @@
 //! Event routing: renders a template for an event type and posts it to the
 //! configured guild-scoped log channel. Routine delivery never archives an event.
 
-use serenity::builder::{CreateAllowedMentions, CreateAttachment, CreateMessage};
+use serenity::builder::{CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateMessage};
 use serenity::client::Context;
 use serenity::model::channel::MessageFlags;
 use serenity::model::event::MessageUpdateEvent;
@@ -861,6 +861,7 @@ pub(crate) async fn emit_to_if(
         Admission::Immediate,
         commit,
         false,
+        Vec::new(),
     )
     .await
     .0
@@ -885,6 +886,7 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         Admission::Immediate,
         commit,
         true,
+        Vec::new(),
     )
     .await
     .0
@@ -909,9 +911,55 @@ async fn emit_to_observed(
         admission,
         || true,
         false,
+        Vec::new(),
     )
     .await
     .0
+}
+
+pub(crate) async fn emit_with_components(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    vars: BTreeMap<String, String>,
+    components: Vec<CreateActionRow>,
+) -> Delivery {
+    emit_to_observed_with_audit(
+        app,
+        sink,
+        guild_id,
+        event,
+        vars,
+        None,
+        Admission::Immediate,
+        || true,
+        false,
+        components,
+    )
+    .await
+    .0
+}
+
+pub(crate) async fn preview_automod(
+    app: &Arc<BotState>,
+    guild_id: GuildId,
+    vars: &mut BTreeMap<String, String>,
+) -> String {
+    let template = match app.configs.get(&app.db, guild_id.get()).await {
+        Ok(cfg) => cfg
+            .templates
+            .get("automod")
+            .cloned()
+            .unwrap_or_else(|| default_template("automod").to_string()),
+        Err(_) => default_template("automod").to_string(),
+    };
+    vars.insert("event".into(), "automod".into());
+    vars.entry("time".into())
+        .or_insert_with(|| chrono::Utc::now().to_rfc3339());
+    vars.insert("guild".into(), guild_id.get().to_string());
+    let mut owned = vars.clone();
+    render_log_template("automod", &template, &mut owned)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,6 +973,7 @@ async fn emit_to_observed_with_audit(
     admission: Admission,
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
+    components: Vec<CreateActionRow>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1056,17 +1105,19 @@ async fn emit_to_observed_with_audit(
                 crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
+        let rows = components.clone();
         let call = crate::discord::race_discord_call(&app.activation, async {
             if after_rate_limit {
                 sink.send_after_rate_limit(
                     channel_id,
-                    log_message(&rendered),
+                    log_message_with(&rendered, &rows),
                     &commit,
                     &on_global_rate_limit,
                 )
                 .await
             } else {
-                sink.send(channel_id, log_message(&rendered)).await?;
+                sink.send(channel_id, log_message_with(&rendered, &rows))
+                    .await?;
                 Ok(true)
             }
         });
@@ -1198,7 +1249,11 @@ pub(crate) fn record_delivery_failure(app: &BotState) {
 }
 
 fn log_message(content: &str) -> CreateMessage {
-    CreateMessage::new()
+    log_message_with(content, &[])
+}
+
+fn log_message_with(content: &str, components: &[CreateActionRow]) -> CreateMessage {
+    let message = CreateMessage::new()
         .content(clip(content, 2000))
         .allowed_mentions(
             CreateAllowedMentions::new()
@@ -1207,7 +1262,12 @@ fn log_message(content: &str) -> CreateMessage {
                 .everyone(false)
                 .replied_user(false),
         )
-        .flags(MessageFlags::SUPPRESS_EMBEDS)
+        .flags(MessageFlags::SUPPRESS_EMBEDS);
+    if components.is_empty() {
+        message
+    } else {
+        message.components(components.to_vec())
+    }
 }
 
 /// Bound UTF-16 units too, so astral characters cannot exceed Discord's limit.
@@ -2162,6 +2222,7 @@ pub(crate) async fn emit_member_event(
         Admission::Immediate,
         || true,
         false,
+        Vec::new(),
     )
     .await
     .1
@@ -2190,6 +2251,7 @@ pub(crate) async fn emit_verified_member_departure(
         Admission::Immediate,
         || true,
         false,
+        Vec::new(),
     )
     .await;
 }

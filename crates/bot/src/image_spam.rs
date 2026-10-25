@@ -1272,16 +1272,17 @@ fn spawn_image_job(
     job: Job,
     policy: Policy,
     channel: u64,
-) {
+) -> bool {
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
         detector.capacity_drop();
-        return;
+        return false;
     };
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
         run_job(&app, &ctx, job, policy, channel, permit).await;
     });
+    true
 }
 
 fn live(p: &Post, policy: &Policy, now: Instant) -> bool {
@@ -1423,6 +1424,98 @@ fn is_image_attachment(
     }
 }
 
+const BURST_FILES: usize = 10;
+
+fn burst_files(
+    attachments: &[serenity::model::channel::Attachment],
+) -> Vec<crate::attachment_burst::FileMeta> {
+    let mut files = Vec::new();
+    for attachment in attachments {
+        if files.len() >= BURST_FILES {
+            break;
+        }
+        if attachment.size == 0 {
+            continue;
+        }
+        if !is_image_attachment(
+            attachment.width.is_some(),
+            attachment.height.is_some(),
+            attachment.content_type.as_deref(),
+            &attachment.filename,
+        ) {
+            continue;
+        }
+        if files
+            .iter()
+            .any(|file: &crate::attachment_burst::FileMeta| {
+                file.attachment_id == attachment.id.get()
+            })
+        {
+            continue;
+        }
+        files.push(crate::attachment_burst::FileMeta {
+            attachment_id: attachment.id.get(),
+            size: u64::from(attachment.size),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone().unwrap_or_default(),
+        });
+    }
+    files
+}
+
+fn burst_instant(
+    received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
+    occurred_ms: i64,
+    window_secs: u64,
+) -> Option<Instant> {
+    let age_ms = received_at.timestamp_millis() - occurred_ms;
+    if age_ms < 0 || age_ms as u64 > window_secs.saturating_mul(1000) {
+        return None;
+    }
+    received.checked_sub(Duration::from_millis(age_ms as u64))
+}
+
+fn burst_handoff(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    place: (u64, u64, u64, u64),
+    attachments: &[serenity::model::channel::Attachment],
+    occurred_ms: i64,
+    received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> crate::attachment_burst::Handoff {
+    let (guild, author, channel, message) = place;
+    if !app.attachment_burst.accepts() {
+        return crate::attachment_burst::Handoff::inert();
+    }
+    let Some(at) = burst_instant(
+        received,
+        received_at,
+        occurred_ms,
+        app.attachment_burst.window_secs(),
+    ) else {
+        return crate::attachment_burst::Handoff::inert();
+    };
+    let files = burst_files(attachments);
+    if files.is_empty() {
+        app.attachment_burst.forget_message(guild, channel, message);
+        return crate::attachment_burst::Handoff::inert();
+    }
+    crate::attachment_burst::Handoff::stage(
+        app,
+        ctx,
+        crate::attachment_burst::Sighting {
+            guild,
+            author,
+            channel,
+            message,
+            at,
+        },
+        files,
+    )
+}
+
 /// Called before the generic automod bot-author exemption. Unknown membership and
 /// webhooks are skipped; no privileged role/bot exemption is inferred.
 pub fn observe(
@@ -1438,6 +1531,24 @@ pub fn observe(
     if msg.author.id == ctx.cache.current_user().id || msg.webhook_id.is_some() {
         return;
     }
+    let mut burst = if msg.edited_timestamp.is_some() {
+        crate::attachment_burst::Handoff::inert()
+    } else {
+        burst_handoff(
+            app,
+            ctx,
+            (
+                guild.get(),
+                msg.author.id.get(),
+                msg.channel_id.get(),
+                msg.id.get(),
+            ),
+            &msg.attachments,
+            msg.timestamp.timestamp_millis(),
+            received,
+            received_at,
+        )
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         return;
     };
@@ -1533,7 +1644,10 @@ pub fn observe(
         msg.id.get(),
         false,
     ) {
-        spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
+        burst.hand_to_job();
+        if !spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get()) {
+            burst.finish_incomplete();
+        }
     }
 }
 
@@ -1555,6 +1669,26 @@ pub(crate) fn observe_update(
     let channel = event.channel_id.get();
     let message = event.id.get();
     let guild_id = guild.get();
+    let mut burst = if let Some(author) = update
+        .author
+        .filter(|author| *author != ctx.cache.current_user().id.get())
+    {
+        let occurred_ms = event
+            .edited_timestamp
+            .map(|stamp| stamp.timestamp_millis())
+            .unwrap_or_else(|| update.received_at.timestamp_millis());
+        burst_handoff(
+            app,
+            ctx,
+            (guild_id, author, channel, message),
+            attachments,
+            occurred_ms,
+            update.received,
+            update.received_at,
+        )
+    } else {
+        crate::attachment_burst::Handoff::inert()
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         app.image_spam.invalidate(guild_id, channel, message);
         return;
@@ -1659,7 +1793,10 @@ pub(crate) fn observe_update(
         true,
     );
     if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
-        spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get());
+        burst.hand_to_job();
+        if !spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get()) {
+            burst.finish_incomplete();
+        }
     }
 }
 
@@ -1780,6 +1917,17 @@ async fn run_job(
     channel: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let burst_ids = job
+        .posts
+        .iter()
+        .flat_map(|post| post.files.iter())
+        .filter_map(|file| {
+            app.attachment_burst
+                .staged_generation(file.id)
+                .map(|generation| (file.id, generation))
+        })
+        .collect();
+    let _pending_burst = crate::attachment_burst::PendingBurst::new(app, ctx, burst_ids);
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
     let started = Instant::now();
@@ -1799,13 +1947,24 @@ async fn run_job(
         // One whole job deadline, not a fresh unbounded deadline per attachment.
         let outcome = tokio::time::timeout(job_timeout, async {
             for post in &mut job.posts {
-                if post.hashes.is_some() {
+                if let Some(hashes) = post.hashes.clone() {
+                    crate::attachment_burst::resolve_known_hashes(app, ctx, &post.files, &hashes);
                     continue;
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
                     match detector.hasher.hash(file, job_timeout).await {
-                        Ok(hash) => unique.insert(hash),
+                        Ok(hash) => {
+                            if let Some(generation) =
+                                app.attachment_burst.staged_generation(file.id)
+                                && let Some(hit) = app
+                                    .attachment_burst
+                                    .resolve_hash_at(file.id, generation, hash)
+                            {
+                                crate::attachment_burst::dispatch_hit(app, ctx, hit);
+                            }
+                            unique.insert(hash);
+                        }
                         Err(error) => {
                             job_gate = analysis_gate_from_download(error, timeout_secs, started);
                             return Err(error);
@@ -3424,6 +3583,92 @@ mod tests {
         drop(runner);
         drop(socket);
         ctx
+    }
+
+    #[tokio::test]
+    async fn observe_records_the_same_image_across_two_channels() {
+        let path = std::env::temp_dir().join(format!(
+            "attachment_burst_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = crate::state::BotState::new(
+            jmodguard::config::BotProcessConfig::default(),
+            crate::db::Db::open(&path, 2).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
+        let cfg = crate::state::CachedGuildConfig {
+            version: 0,
+            durable_version: 0,
+            loaded_at: Instant::now(),
+            settings: crate::types::GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
+        let post = |channel: u64, message: u64, attachment: u64| {
+            let mut msg = serenity::model::channel::Message::default();
+            msg.id = serenity::model::id::MessageId::new(message);
+            msg.channel_id = serenity::model::id::ChannelId::new(channel);
+            msg.guild_id = Some(serenity::model::id::GuildId::new(1));
+            msg.author.id = serenity::model::id::UserId::new(author);
+            msg.timestamp = serenity::model::timestamp::Timestamp::now();
+            msg.attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": attachment.to_string(),
+                    "filename": "spam.png",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                    "width": 8,
+                    "height": 8,
+                    "content_type": "image/png"
+                }))
+                .unwrap(),
+            ];
+            msg
+        };
+        let now = Instant::now();
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            1,
+        );
+        assert_eq!(app.attachment_burst.hits(), 0);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(11, 101, 1001),
+            now,
+            chrono::Utc::now(),
+            1,
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
+        tokio::task::yield_now().await;
+        drop(app);
+        jmodguard::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     async fn image_dispatch_race(
