@@ -1834,10 +1834,11 @@ impl Detector {
         Self::process_budget_gate_locked(&state.budget, &self.limits)
     }
 
-    /// Admit one extra GET. Request capacity is charged only when the process
-    /// byte budget can also cover a non-empty body. Nothing is fetched on a miss.
-    fn admit_exact_retry(&self, account: DownloadAccount, now: Instant) -> RetryAdmit {
+    /// Admit one extra GET in the current budget window. Request capacity is
+    /// charged only when the byte budget can cover a non-empty body.
+    fn admit_exact_retry(&self, account: DownloadAccount) -> RetryAdmit {
         let mut state = self.state.lock();
+        let now = Instant::now();
         if !state.budget.fits(
             now,
             1,
@@ -1896,13 +1897,13 @@ impl Detector {
     fn charge_downloaded_bytes(
         &self,
         bytes: u64,
-        now: Instant,
         account: DownloadAccount,
     ) -> Result<(), AnalysisGate> {
         if bytes == 0 {
             return Ok(());
         }
         let mut state = self.state.lock();
+        let now = Instant::now();
         if !state.budget.fits(
             now,
             0,
@@ -1944,18 +1945,17 @@ impl Detector {
 }
 
 /// Declared bytes were charged when the job was reserved. Charge each chunk's
-/// excess under the process budget lock before hashing, never after the await.
+/// excess in the current window under the process budget lock before hashing.
 /// Consumed capacity therefore survives stream failure, timeout and cancellation.
 fn admit_stream_bytes(
     detector: &Detector,
     account: DownloadAccount,
-    now: Instant,
     mut prepaid: u64,
 ) -> impl FnMut(u64) -> bool + '_ {
     move |bytes| {
         let covered = bytes.min(prepaid);
         if detector
-            .charge_downloaded_bytes(bytes - covered, now, account)
+            .charge_downloaded_bytes(bytes - covered, account)
             .is_err()
         {
             return false;
@@ -1974,7 +1974,6 @@ async fn hash_for_exact_check(
     account: DownloadAccount,
     file: &Attachment,
     timeout: Duration,
-    now: Instant,
 ) -> Result<Hash, ExactCheckFailure> {
     let max_file_bytes = detector.limits.max_file_bytes;
     match detector
@@ -1983,13 +1982,13 @@ async fn hash_for_exact_check(
             file,
             timeout,
             max_file_bytes,
-            admit_stream_bytes(detector, account, now, file.size),
+            admit_stream_bytes(detector, account, file.size),
         )
         .await
     {
         Ok((hash, _)) => Ok(hash),
         Err(error) if error.is_retryable_size_mismatch() => {
-            retry_exact_check(detector, account, file, timeout, now, error).await
+            retry_exact_check(detector, account, file, timeout, error).await
         }
         Err(error) => Err(ExactCheckFailure::Download(error)),
     }
@@ -2000,11 +1999,10 @@ async fn retry_exact_check(
     account: DownloadAccount,
     file: &Attachment,
     timeout: Duration,
-    now: Instant,
     truncated: DownloadError,
 ) -> Result<Hash, ExactCheckFailure> {
     let max_file_bytes = detector.limits.max_file_bytes;
-    match detector.admit_exact_retry(account, now) {
+    match detector.admit_exact_retry(account) {
         RetryAdmit::Ready => {}
         RetryAdmit::Miss(gate) => return Err(ExactCheckFailure::Gate(gate)),
         RetryAdmit::Stale => return Err(ExactCheckFailure::Download(truncated)),
@@ -2015,7 +2013,7 @@ async fn retry_exact_check(
             file,
             timeout,
             max_file_bytes,
-            admit_stream_bytes(detector, account, now, 0),
+            admit_stream_bytes(detector, account, 0),
         )
         .await
         .map(|(hash, _)| hash)
@@ -2059,8 +2057,7 @@ async fn run_job(
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
-                    match hash_for_exact_check(detector, account, file, job_timeout, started).await
-                    {
+                    match hash_for_exact_check(detector, account, file, job_timeout).await {
                         Ok(hash) => unique.insert(hash),
                         Err(ExactCheckFailure::Download(error)) => {
                             job_gate =
@@ -4891,6 +4888,7 @@ mod tests {
 
     struct LoopbackFixture {
         hits: Arc<std::sync::atomic::AtomicUsize>,
+        first_response_gate: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         task: tokio::task::JoinHandle<()>,
         addr: std::net::SocketAddr,
         body_read_hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -4960,6 +4958,8 @@ mod tests {
             let retry1 = Arc::new(AtomicUsize::new(0));
             let concurrent = Arc::new(tokio::sync::Barrier::new(2));
             let concurrent_retries = Arc::new(AtomicUsize::new(0));
+            let first_response_gate = Arc::new(Mutex::new(None::<Arc<tokio::sync::Barrier>>));
+            let response_gate = Arc::clone(&first_response_gate);
             let server =
                 Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(move |_| {
                     let hits = Arc::clone(&seen);
@@ -4967,6 +4967,7 @@ mod tests {
                     let retry1 = Arc::clone(&retry1);
                     let concurrent = Arc::clone(&concurrent);
                     let concurrent_retries = Arc::clone(&concurrent_retries);
+                    let response_gate = Arc::clone(&response_gate);
                     async move {
                         Ok::<_, std::convert::Infallible>(service_fn(
                             move |request: hyper::Request<Body>| {
@@ -4976,7 +4977,13 @@ mod tests {
                                 let retry1 = Arc::clone(&retry1);
                                 let concurrent = Arc::clone(&concurrent);
                                 let concurrent_retries = Arc::clone(&concurrent_retries);
+                                let response_gate = Arc::clone(&response_gate);
                                 async move {
+                                    let gate = response_gate.lock().take();
+                                    if let Some(gate) = gate {
+                                        gate.wait().await;
+                                        gate.wait().await;
+                                    }
                                     let response = match path.as_str() {
                                         "/too_many" => Response::builder()
                                             .status(429)
@@ -5045,6 +5052,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             Self {
                 hits,
+                first_response_gate,
                 task,
                 addr,
                 body_read_hits,
@@ -5406,15 +5414,13 @@ mod tests {
                             &app.image_spam,
                             account,
                             file,
-                            Duration::from_secs(1),
-                            now
+                            Duration::from_secs(1)
                         ),
                         hash_for_exact_check(
                             &app.image_spam,
                             account,
                             file,
-                            Duration::from_secs(1),
-                            now
+                            Duration::from_secs(1)
                         ),
                     )
                 })
@@ -5473,7 +5479,7 @@ mod tests {
                 } else {
                     Duration::from_secs(1)
                 };
-                let download = hash_for_exact_check(&app.image_spam, account, file, timeout, now);
+                let download = hash_for_exact_check(&app.image_spam, account, file, timeout);
                 if ending == "cancel" {
                     // The whole-job deadline drops a live body future.
                     assert!(
@@ -5659,6 +5665,132 @@ mod tests {
             assert_eq!(app.image_spam.author_budget_requests(1, 2), 8);
         });
         assert!(!logs.contains("size_mismatch"), "{logs}");
+    }
+
+    async fn run_job_current_budget_window_case(scope: &str) {
+        let fixture = LoopbackFixture::start();
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        *fixture.first_response_gate.lock() = Some(Arc::clone(&gate));
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            requests_per_minute: if scope == "process" { 6 } else { 100 },
+            requests_per_guild_minute: if scope == "guild" { 6 } else { 100 },
+            requests_per_author_minute: if scope == "author" { 6 } else { 100 },
+            bytes_per_minute: if scope == "bytes" { 18 } else { 1000 },
+            ..Limits::default()
+        })
+        .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        match scope {
+            "bytes" | "extra-retention" => {
+                rewrite_job_downloads_pair(&mut job, &fixture, 3, "/long0", "/long1");
+            }
+            "retry-retention" => {
+                rewrite_job_downloads_pair(&mut job, &fixture, 3, "/retry0", "/retry1");
+            }
+            _ => rewrite_job_downloads(&mut job, &fixture.url("/short"), 3),
+        }
+        {
+            let mut state = app.image_spam.state.lock();
+            state.budget.start = now - Duration::from_secs(60);
+        }
+        let expire_after_reservation = async {
+            gate.wait().await;
+            {
+                let mut state = app.image_spam.state.lock();
+                assert_eq!((state.budget.requests, state.budget.bytes), (6, 18));
+                let reserved_at = state.budget.start;
+                assert!(reserved_at >= now);
+                // Model expiry during the real HTTP await. The captured job-start
+                // clock precedes expiry; the next actual admission follows it.
+                let start = reserved_at - Duration::from_secs(60) + Duration::from_nanos(1);
+                assert!(Instant::now() > reserved_at + Duration::from_nanos(1));
+                state.budget.start = start;
+                let guild = state.guilds.get_mut(&1).unwrap();
+                guild.budget.start = start;
+                guild.authors.get_mut(&2).unwrap().budget.start = start;
+            }
+            gate.wait().await;
+        };
+        let (vars, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                run_job_capture_automod(&app, job, policy, 102),
+                expire_after_reservation
+            )
+        })
+        .await
+        .expect("the first HTTP response must be released and the job must finish");
+        let (gets, expected_requests, expected_bytes) = match scope {
+            "bytes" | "extra-retention" => (6, 0, 6),
+            "retry-retention" => (8, 2, 6),
+            _ => (2, 1, 2),
+        };
+        assert_eq!(fixture.hit_count(), gets, "{scope}: actual HTTP requests");
+        if gets == 2 {
+            assert_incomplete_automod(
+                &vars,
+                "Stopped because the body length did not match the declared size",
+            );
+        } else {
+            let notice = automod_notice(&vars);
+            assert!(
+                notice.contains("Verified identical image bytes"),
+                "{notice}"
+            );
+            let digest = if scope == "retry-retention" {
+                "9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"
+            } else {
+                "61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"
+            };
+            assert!(notice.contains(digest), "{notice}");
+        }
+        let AnalysisGate::ProcessBudget {
+            requests, bytes, ..
+        } = app.image_spam.process_budget_gate(Instant::now())
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (requests, bytes),
+            (expected_requests, expected_bytes),
+            "{scope}: newly admitted charges must survive the next current-window read"
+        );
+        assert_eq!(app.image_spam.guild_budget_requests(1), expected_requests);
+        assert_eq!(
+            app.image_spam.author_budget_requests(1, 2),
+            expected_requests
+        );
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_process_retry() {
+        run_job_current_budget_window_case("process").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_guild_retry() {
+        run_job_current_budget_window_case("guild").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_author_retry() {
+        run_job_current_budget_window_case("author").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_extra_byte_admission() {
+        run_job_current_budget_window_case("bytes").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_retry_charge_retention() {
+        run_job_current_budget_window_case("retry-retention").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_extra_charge_retention() {
+        run_job_current_budget_window_case("extra-retention").await;
     }
 
     #[test]
