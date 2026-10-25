@@ -61,8 +61,11 @@ creates, expired IDs and late hash results cannot refresh the window.
 Hashing still streams original `cdn.discordapp.com/attachments/...` URLs with the
 same origin/path, no-redirect, no-credential contract. A completed body within the
 file cap is hashed even when it is longer than the size Discord declared, and only
-when the process byte budget covers that received length. A body that ends short of
-that declared size is fetched once more only when the process, guild, and author
+when the process byte budget covers that received length. Each chunk's additional
+bytes are charged atomically before hashing, including on retries, so concurrent
+streams cannot reuse spare capacity. Charges survive body errors, timeout and
+cancellation; the initial declared-size reservation is not refunded. A body that
+ends short of that declared size is fetched once more only when the process, guild, and author
 request budgets and the process byte budget admit the extra request. A body over
 the cap, a body the byte budget cannot cover, and every other download failure, is
 not retried.

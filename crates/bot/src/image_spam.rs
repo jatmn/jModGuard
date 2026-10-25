@@ -1,9 +1,7 @@
 //! Bounded exact-image observations. Punishment uses `spam_actions`, not automod.
 use crate::state::{BotState, CachedGuildConfig};
 use jmodguard::db::guild_data::TextEvidence;
-use jmodguard::image_spam::{
-    Attachment, DownloadError, Hash, Hasher, Limits, Policy, SizeMismatchKind,
-};
+use jmodguard::image_spam::{Attachment, DownloadError, Hash, Hasher, Limits, Policy};
 use parking_lot::Mutex;
 use serenity::{
     client::Context,
@@ -1803,7 +1801,7 @@ fn warn_incomplete_analysis(gate: &AnalysisGate, guild: u64, author: u64) {
 }
 
 enum RetryAdmit {
-    Ready(u64),
+    Ready,
     Miss(AnalysisGate),
     Stale,
 }
@@ -1836,19 +1834,6 @@ impl Detector {
         Self::process_budget_gate_locked(&state.budget, &self.limits)
     }
 
-    /// Declared size is already charged. Spare process bytes may cover a longer body.
-    fn prepaid_body_allowance(&self, declared: u64, now: Instant) -> u64 {
-        let mut state = self.state.lock();
-        state.budget.reset(now);
-        let spare = self
-            .limits
-            .bytes_per_minute
-            .saturating_sub(state.budget.bytes);
-        declared
-            .saturating_add(spare)
-            .min(self.limits.max_file_bytes)
-    }
-
     /// Admit one extra GET. Request capacity is charged only when the process
     /// byte budget can also cover a non-empty body. Nothing is fetched on a miss.
     fn admit_exact_retry(&self, account: DownloadAccount, now: Instant) -> RetryAdmit {
@@ -1869,7 +1854,6 @@ impl Detector {
             .limits
             .bytes_per_minute
             .saturating_sub(state.budget.bytes);
-        let allowance = spare.min(self.limits.max_file_bytes);
         let Some(guild) = state.guilds.get_mut(&account.guild) else {
             return RetryAdmit::Stale;
         };
@@ -1897,7 +1881,7 @@ impl Detector {
                 request_limit: self.limits.requests_per_author_minute,
             });
         }
-        if allowance == 0 {
+        if spare == 0 || self.limits.max_file_bytes == 0 {
             return RetryAdmit::Miss(Self::process_budget_gate_locked(
                 &state.budget,
                 &self.limits,
@@ -1906,7 +1890,7 @@ impl Detector {
         author.budget.charge(1, 0);
         guild.budget.charge(1, 0);
         state.budget.charge(1, 0);
-        RetryAdmit::Ready(allowance)
+        RetryAdmit::Ready
     }
 
     fn charge_downloaded_bytes(
@@ -1959,16 +1943,26 @@ impl Detector {
     }
 }
 
-fn charge_streamed_beyond(
+/// Declared bytes were charged when the job was reserved. Charge each chunk's
+/// excess under the process budget lock before hashing, never after the await.
+/// Consumed capacity therefore survives stream failure, timeout and cancellation.
+fn admit_stream_bytes(
     detector: &Detector,
     account: DownloadAccount,
     now: Instant,
-    prepaid: u64,
-    streamed: u64,
-) -> Result<(), ExactCheckFailure> {
-    detector
-        .charge_downloaded_bytes(streamed.saturating_sub(prepaid), now, account)
-        .map_err(ExactCheckFailure::Gate)
+    mut prepaid: u64,
+) -> impl FnMut(u64) -> bool + '_ {
+    move |bytes| {
+        let covered = bytes.min(prepaid);
+        if detector
+            .charge_downloaded_bytes(bytes - covered, now, account)
+            .is_err()
+        {
+            return false;
+        }
+        prepaid -= covered;
+        true
+    }
 }
 
 /// Hash one exact-check attachment. A body that ends short of the declared size
@@ -1983,22 +1977,19 @@ async fn hash_for_exact_check(
     now: Instant,
 ) -> Result<Hash, ExactCheckFailure> {
     let max_file_bytes = detector.limits.max_file_bytes;
-    let allowance = detector.prepaid_body_allowance(file.size, now);
     match detector
         .hasher()
-        .hash(file, timeout, max_file_bytes, allowance)
+        .hash(
+            file,
+            timeout,
+            max_file_bytes,
+            admit_stream_bytes(detector, account, now, file.size),
+        )
         .await
     {
-        Ok((hash, received)) => {
-            charge_streamed_beyond(detector, account, now, file.size, received)?;
-            Ok(hash)
-        }
+        Ok((hash, _)) => Ok(hash),
         Err(error) if error.is_retryable_size_mismatch() => {
             retry_exact_check(detector, account, file, timeout, now, error).await
-        }
-        Err(error @ DownloadError::ByteAllowance { accepted, .. }) => {
-            charge_streamed_beyond(detector, account, now, file.size, accepted)?;
-            Err(ExactCheckFailure::Download(error))
         }
         Err(error) => Err(ExactCheckFailure::Download(error)),
     }
@@ -2013,43 +2004,22 @@ async fn retry_exact_check(
     truncated: DownloadError,
 ) -> Result<Hash, ExactCheckFailure> {
     let max_file_bytes = detector.limits.max_file_bytes;
-    let allowance = match detector.admit_exact_retry(account, now) {
-        RetryAdmit::Ready(allowance) => allowance,
+    match detector.admit_exact_retry(account, now) {
+        RetryAdmit::Ready => {}
         RetryAdmit::Miss(gate) => return Err(ExactCheckFailure::Gate(gate)),
         RetryAdmit::Stale => return Err(ExactCheckFailure::Download(truncated)),
-    };
-    match detector
-        .hasher()
-        .hash(file, timeout, max_file_bytes, allowance)
-        .await
-    {
-        Ok((hash, received)) => {
-            charge_streamed_beyond(detector, account, now, 0, received)?;
-            if received < file.size {
-                return Err(ExactCheckFailure::Download(DownloadError::SizeMismatch {
-                    declared: file.size,
-                    received,
-                    kind: SizeMismatchKind::Truncated,
-                }));
-            }
-            Ok(hash)
-        }
-        Err(
-            error @ DownloadError::SizeMismatch {
-                received,
-                kind: SizeMismatchKind::Truncated,
-                ..
-            },
-        ) => {
-            charge_streamed_beyond(detector, account, now, 0, received)?;
-            Err(ExactCheckFailure::Download(error))
-        }
-        Err(error @ DownloadError::ByteAllowance { accepted, .. }) => {
-            charge_streamed_beyond(detector, account, now, 0, accepted)?;
-            Err(ExactCheckFailure::Download(error))
-        }
-        Err(error) => Err(ExactCheckFailure::Download(error)),
     }
+    detector
+        .hasher()
+        .hash(
+            file,
+            timeout,
+            max_file_bytes,
+            admit_stream_bytes(detector, account, now, 0),
+        )
+        .await
+        .map(|(hash, _)| hash)
+        .map_err(ExactCheckFailure::Download)
 }
 
 async fn run_job(
@@ -4943,6 +4913,7 @@ mod tests {
             let body_read_addr = body_read_listener.local_addr().unwrap();
             body_read_listener.set_nonblocking(true).unwrap();
             let body_read_task = tokio::spawn(async move {
+                let mut retry_hits = 0;
                 let listener = TcpListener::from_std(body_read_listener).unwrap();
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -4951,9 +4922,35 @@ mod tests {
                     body_read_seen.fetch_add(1, Ordering::SeqCst);
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf).await;
-                    let response =
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
-                    let _ = stream.write_all(response).await;
+                    let request = String::from_utf8_lossy(&buf);
+                    if request.contains("partial") || request.contains("pending") {
+                        if request.contains("retry") {
+                            retry_hits += 1;
+                            if retry_hits == 1 {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab",
+                                ).await;
+                                continue;
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nabcdefgh\r\n",
+                        ).await;
+                        // Deliver a valid chunk before failing or holding the body open.
+                        tokio::time::sleep(if request.contains("pending") {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::from_millis(50)
+                        })
+                        .await;
+                        if request.contains("cap") {
+                            let _ = stream.write_all(b"1\r\ni\r\n0\r\n\r\n").await;
+                        }
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab",
+                        ).await;
+                    }
                     let _ = stream.shutdown().await;
                 }
             });
@@ -4961,11 +4958,15 @@ mod tests {
             let seen = Arc::clone(&hits);
             let retry0 = Arc::new(AtomicUsize::new(0));
             let retry1 = Arc::new(AtomicUsize::new(0));
+            let concurrent = Arc::new(tokio::sync::Barrier::new(2));
+            let concurrent_retries = Arc::new(AtomicUsize::new(0));
             let server =
                 Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(move |_| {
                     let hits = Arc::clone(&seen);
                     let retry0 = Arc::clone(&retry0);
                     let retry1 = Arc::clone(&retry1);
+                    let concurrent = Arc::clone(&concurrent);
+                    let concurrent_retries = Arc::clone(&concurrent_retries);
                     async move {
                         Ok::<_, std::convert::Infallible>(service_fn(
                             move |request: hyper::Request<Body>| {
@@ -4973,6 +4974,8 @@ mod tests {
                                 let path = request.uri().path().to_string();
                                 let retry0 = Arc::clone(&retry0);
                                 let retry1 = Arc::clone(&retry1);
+                                let concurrent = Arc::clone(&concurrent);
+                                let concurrent_retries = Arc::clone(&concurrent_retries);
                                 async move {
                                     let response = match path.as_str() {
                                         "/too_many" => Response::builder()
@@ -4991,6 +4994,20 @@ mod tests {
                                         "/slow" => {
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                             Response::new(Body::from("abc"))
+                                        }
+                                        "/concurrent_long" => {
+                                            concurrent.wait().await;
+                                            Response::new(Body::from("abcdefgh"))
+                                        }
+                                        "/concurrent_retry" => {
+                                            if concurrent_retries.fetch_add(1, Ordering::SeqCst) < 2
+                                            {
+                                                concurrent.wait().await;
+                                                Response::new(Body::from("ab"))
+                                            } else {
+                                                concurrent.wait().await;
+                                                Response::new(Body::from("abcde"))
+                                            }
                                         }
                                         "/short" => Response::new(Body::from("ab")),
                                         "/long" => Response::new(Body::from("abcd")),
@@ -5343,6 +5360,153 @@ mod tests {
             runtime.block_on(future);
         });
         String::from_utf8(buffer.lock().expect("log buffer").clone()).unwrap()
+    }
+
+    #[test]
+    fn concurrent_exact_streams_cannot_hash_against_the_same_spare_bytes() {
+        for retry in [false, true] {
+            let logs = with_captured_logs(async {
+                let fixture = LoopbackFixture::start();
+                let (app, policy, token) = image_run_job_test_app(Limits {
+                    bytes_per_minute: 41,
+                    ..Limits::default()
+                })
+                .await;
+                let now = Instant::now();
+                let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                rewrite_job_downloads(
+                    &mut job,
+                    &fixture.url(if retry {
+                        "/concurrent_retry"
+                    } else {
+                        "/concurrent_long"
+                    }),
+                    3,
+                );
+                // Two overlapping real reservations leave five spare process bytes.
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                assert_eq!(app.image_spam.process_budget_bytes(), 36);
+                let account = DownloadAccount {
+                    guild: 1,
+                    author: 2,
+                    token,
+                };
+                let file = &job.posts[0].files[0];
+                let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(
+                        hash_for_exact_check(
+                            &app.image_spam,
+                            account,
+                            file,
+                            Duration::from_secs(1),
+                            now
+                        ),
+                        hash_for_exact_check(
+                            &app.image_spam,
+                            account,
+                            file,
+                            Duration::from_secs(1),
+                            now
+                        ),
+                    )
+                })
+                .await
+                .expect("both synchronized responses must finish");
+                assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+                assert_eq!(app.image_spam.process_budget_bytes(), 41);
+                assert_eq!(fixture.hit_count(), if retry { 4 } else { 2 });
+            });
+            assert_eq!(
+                logs.matches("hashed a completed body").count(),
+                1,
+                "only exclusively admitted bytes may reach hashing; retry={retry}: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_exact_streams_keep_bytes_charged_after_failure_or_drop() {
+        for retry in [false, true] {
+            for ending in ["body_read", "cap", "timeout", "cancel"] {
+                let fixture = LoopbackFixture::start();
+                let (app, policy, token) = image_run_job_test_app(Limits {
+                    bytes_per_minute: 30,
+                    max_file_bytes: 8,
+                    ..Limits::default()
+                })
+                .await;
+                let now = Instant::now();
+                let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                let path = match ending {
+                    "body_read" => "partial",
+                    "cap" => "partial-cap",
+                    _ => "pending",
+                };
+                let uri = format!(
+                    "http://{}/{}{}",
+                    fixture.body_read_addr,
+                    if retry { "retry-" } else { "" },
+                    path
+                );
+                rewrite_job_downloads(&mut job, &uri, 3);
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                let account = DownloadAccount {
+                    guild: 1,
+                    author: 2,
+                    token,
+                };
+                let file = &job.posts[0].files[0];
+                let timeout = if ending == "timeout" {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(1)
+                };
+                let download = hash_for_exact_check(&app.image_spam, account, file, timeout, now);
+                if ending == "cancel" {
+                    // The whole-job deadline drops a live body future.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), download)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    let expected = match ending {
+                        "timeout" => DownloadError::Timeout,
+                        "cap" => DownloadError::SizeMismatch {
+                            declared: 3,
+                            received: 9,
+                            kind: jmodguard::image_spam::SizeMismatchKind::Rejected,
+                        },
+                        _ => DownloadError::BodyRead,
+                    };
+                    assert!(
+                        matches!(download.await, Err(ExactCheckFailure::Download(error)) if error == expected)
+                    );
+                }
+                assert_eq!(fixture.body_read_hit_count(), if retry { 2 } else { 1 });
+                assert_eq!(
+                    app.image_spam.process_budget_requests(),
+                    if retry { 7 } else { 6 }
+                );
+                assert_eq!(
+                    app.image_spam.process_budget_bytes(),
+                    if retry { 26 } else { 23 },
+                    "the admitted eight-byte chunk must stay charged: retry={retry}, ending={ending}"
+                );
+            }
+        }
     }
 
     #[test]
