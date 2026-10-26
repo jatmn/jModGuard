@@ -146,6 +146,28 @@ cannot punish. Normal cross-process configuration polling delay still applies.
 Learning is explicit: confirm a digest, then add it in the WebUI. A dry-run match
 never adds a digest automatically.
 
+## Cross-channel attachment burst
+
+Process settings `[attachment_burst]` and `JMODGUARD_ATTACHMENT_BURST` watch
+one member posting the same attachment in several channels a few seconds
+apart. The default is 2 channels inside 10 seconds, then a 10 minute timeout
+and a mod-log post with Release and Ban buttons. A finished check matches the
+exact content hash. An unfinished check matches size, filename, and content
+type, so a body-length mismatch still counts. This does not change the
+exact-image size check, does not use that rule's 3-channel exact-hash
+threshold, and does not look at account age. Repeats in one channel, posts
+outside the window, and other members do not count. A repeated delivery of
+the same message does not time the member out again. The timeout is the only
+automatic action; the buttons reuse the existing timeout removal, ban, and
+case paths. A button posted before a restart does not apply to a later review.
+Before applying the automatic timeout, the bot reads the member's current timeout
+from Discord and preserves an equal or longer timeout already in place.
+Automatic timeout reads and writes are serialized per member within the existing
+four admitted burst actions, so overlapping bursts read the preceding action's
+settled timeout. Waiting observes the same deadline and shutdown cutoff as other
+Discord work. The REST read and write are not atomic against external moderators
+or a remote request whose outcome remains uncertain.
+
 ## Resource controls
 
 Image process budgets are unchanged (`[image_spam]` / `JMODGUARD_IMAGE_SPAM_LIMITS`).

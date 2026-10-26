@@ -40,6 +40,8 @@ struct Post {
     serial: u64,
     at: Instant,
     files: Vec<Attachment>,
+    /// Captured with this physical observation, never looked up from a later stage.
+    burst_ids: Vec<(u64, u64)>,
     /// Distinct computed hashes; no image bytes are retained.
     hashes: Option<Vec<Hash>>,
     valid: bool,
@@ -271,6 +273,7 @@ struct Job {
     author: u64,
     token: (u64, u64),
     posts: Vec<Post>,
+    burst_ids: Vec<(u64, u64)>,
 }
 #[derive(Debug, Clone, PartialEq)]
 enum AnalysisGate {
@@ -820,6 +823,7 @@ impl Detector {
             return AdmitOutcome::Rejected;
         }
         post.cost = 256
+            + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
             + post
                 .files
                 .iter()
@@ -1194,6 +1198,10 @@ fn candidate_job(
         return None;
     }
     Some(Job {
+        burst_ids: posts
+            .iter()
+            .flat_map(|post| post.burst_ids.iter().copied())
+            .collect(),
         guild,
         author,
         token,
@@ -1237,6 +1245,7 @@ fn replace_existing(
     state.bytes = state.bytes.saturating_sub(old.cost);
     old.serial = serial;
     old.files = post.files.clone();
+    old.burst_ids = post.burst_ids.clone();
     old.hashes = None;
     old.at = post.at;
     old.edited_ms = post.edited_ms;
@@ -1244,6 +1253,7 @@ fn replace_existing(
     old.valid = true;
     old.own_delete = Weak::new();
     old.cost = 256
+        + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
         + post
             .files
             .iter()
@@ -1290,16 +1300,19 @@ fn spawn_image_job(
     job: Job,
     policy: Policy,
     channel: u64,
-) {
+    burst: &mut crate::attachment_burst::Handoff,
+) -> bool {
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
         detector.capacity_drop();
-        return;
+        return false;
     };
+    burst.hand_to_job();
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
         run_job(&app, &ctx, job, policy, channel, permit).await;
     });
+    true
 }
 
 fn live(p: &Post, policy: &Policy, now: Instant) -> bool {
@@ -1441,6 +1454,98 @@ fn is_image_attachment(
     }
 }
 
+const BURST_FILES: usize = 10;
+
+fn burst_files(
+    attachments: &[serenity::model::channel::Attachment],
+) -> Vec<crate::attachment_burst::FileMeta> {
+    let mut files = Vec::new();
+    for attachment in attachments {
+        if files.len() >= BURST_FILES {
+            break;
+        }
+        if attachment.size == 0 {
+            continue;
+        }
+        if !is_image_attachment(
+            attachment.width.is_some(),
+            attachment.height.is_some(),
+            attachment.content_type.as_deref(),
+            &attachment.filename,
+        ) {
+            continue;
+        }
+        if files
+            .iter()
+            .any(|file: &crate::attachment_burst::FileMeta| {
+                file.attachment_id == attachment.id.get()
+            })
+        {
+            continue;
+        }
+        files.push(crate::attachment_burst::FileMeta {
+            attachment_id: attachment.id.get(),
+            size: u64::from(attachment.size),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone().unwrap_or_default(),
+        });
+    }
+    files
+}
+
+fn burst_instant(
+    received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
+    occurred_ms: i64,
+    window_secs: u64,
+) -> Option<Instant> {
+    let age_ms = received_at.timestamp_millis() - occurred_ms;
+    if age_ms < 0 || age_ms as u64 > window_secs.saturating_mul(1000) {
+        return None;
+    }
+    received.checked_sub(Duration::from_millis(age_ms as u64))
+}
+
+fn burst_handoff(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    place: (u64, u64, u64, u64),
+    attachments: &[serenity::model::channel::Attachment],
+    occurred_ms: i64,
+    received: Instant,
+    admission: (chrono::DateTime<chrono::Utc>, u64, Option<i64>),
+) -> crate::attachment_burst::Handoff {
+    let (guild, author, channel, message) = place;
+    if !app.attachment_burst.accepts() {
+        return crate::attachment_burst::Handoff::inert();
+    }
+    let at = burst_instant(
+        received,
+        admission.0,
+        occurred_ms,
+        app.attachment_burst.window_secs(),
+    );
+    let files = burst_files(attachments);
+    crate::attachment_burst::Handoff::stage_at(
+        app,
+        ctx,
+        crate::attachment_burst::Sighting {
+            guild,
+            author,
+            channel,
+            message,
+            at: at.unwrap_or(received),
+        },
+        files,
+        crate::attachment_burst::Admission {
+            revision: admission.1,
+            edited_ms: admission.2,
+            received,
+            eligible: at.is_some(),
+        },
+    )
+}
+
 /// Called before the generic automod bot-author exemption. Unknown membership and
 /// webhooks are skipped; no privileged role/bot exemption is inferred.
 pub fn observe(
@@ -1450,12 +1555,35 @@ pub fn observe(
     msg: &Message,
     received: Instant,
     received_at: chrono::DateTime<chrono::Utc>,
-    revision: u64,
+    revisions: (u64, u64),
 ) {
+    let (revision, burst_revision) = revisions;
     let Some(guild) = msg.guild_id else { return };
     if msg.author.id == ctx.cache.current_user().id || msg.webhook_id.is_some() {
         return;
     }
+    let mut burst = if msg.edited_timestamp.is_some() || burst_files(&msg.attachments).is_empty() {
+        crate::attachment_burst::Handoff::inert()
+    } else {
+        burst_handoff(
+            app,
+            ctx,
+            (
+                guild.get(),
+                msg.author.id.get(),
+                msg.channel_id.get(),
+                msg.id.get(),
+            ),
+            &msg.attachments,
+            msg.timestamp.timestamp_millis(),
+            received,
+            (
+                received_at,
+                burst_revision,
+                Some(msg.timestamp.timestamp_millis()),
+            ),
+        )
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         return;
     };
@@ -1530,6 +1658,7 @@ pub fn observe(
             channel: msg.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -1550,8 +1679,16 @@ pub fn observe(
         msg.channel_id.get(),
         msg.id.get(),
         false,
+    ) && !spawn_image_job(
+        app,
+        ctx,
+        detector,
+        job,
+        policy,
+        msg.channel_id.get(),
+        &mut burst,
     ) {
-        spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
+        burst.finish_incomplete();
     }
 }
 
@@ -1561,8 +1698,9 @@ pub(crate) fn observe_update(
     cfg: &CachedGuildConfig,
     event: &MessageUpdateEvent,
     update: &crate::handlers::UpdateObservation,
-    revision: u64,
+    revisions: (u64, u64),
 ) {
+    let (revision, burst_revision) = revisions;
     let Some(guild) = event.guild_id else { return };
     if matches!(event.webhook_id, Some(Some(_))) {
         return;
@@ -1573,6 +1711,38 @@ pub(crate) fn observe_update(
     let channel = event.channel_id.get();
     let message = event.id.get();
     let guild_id = guild.get();
+    let mut burst = if let Some(author) = update
+        .author
+        .or_else(|| app.attachment_burst.author_of(guild_id, channel, message))
+        .filter(|author| *author != ctx.cache.current_user().id.get())
+    {
+        let occurred_ms = event
+            .edited_timestamp
+            .map(|stamp| stamp.timestamp_millis())
+            .unwrap_or_else(|| update.received_at.timestamp_millis());
+        burst_handoff(
+            app,
+            ctx,
+            (guild_id, author, channel, message),
+            attachments,
+            occurred_ms,
+            update.received,
+            (
+                update.received_at,
+                burst_revision,
+                event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
+            ),
+        )
+    } else {
+        app.attachment_burst.invalidate_message_at(
+            guild_id,
+            channel,
+            message,
+            false,
+            event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
+        );
+        crate::attachment_burst::Handoff::inert()
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         app.image_spam.invalidate(guild_id, channel, message);
         return;
@@ -1663,6 +1833,7 @@ pub(crate) fn observe_update(
             channel: event.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -1676,8 +1847,18 @@ pub(crate) fn observe_update(
         update.received,
         true,
     );
-    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
-        spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get());
+    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true)
+        && !spawn_image_job(
+            app,
+            ctx,
+            detector,
+            job,
+            policy,
+            event.channel_id.get(),
+            &mut burst,
+        )
+    {
+        burst.finish_incomplete();
     }
 }
 
@@ -2028,6 +2209,8 @@ async fn run_job(
     channel: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let pending_burst =
+        crate::attachment_burst::PendingBurst::new(app, ctx, std::mem::take(&mut job.burst_ids));
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
     let started = Instant::now();
@@ -2052,13 +2235,17 @@ async fn run_job(
                 token: job.token,
             };
             for post in &mut job.posts {
-                if post.hashes.is_some() {
+                if let Some(hashes) = post.hashes.clone() {
+                    pending_burst.resolve_cached(&post.files, &hashes);
                     continue;
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
                     match hash_for_exact_check(detector, account, file, job_timeout).await {
-                        Ok(hash) => unique.insert(hash),
+                        Ok(hash) => {
+                            pending_burst.resolve_hash(file.id, hash);
+                            unique.insert(hash);
+                        }
                         Err(ExactCheckFailure::Download(error)) => {
                             job_gate = analysis_gate_from_download(error, timeout_secs, started);
                             return Err(());
@@ -2391,6 +2578,7 @@ mod tests {
             own_delete: Weak::new(),
             cost: 0,
             revision: 0,
+            burst_ids: Vec::new(),
             files: values
                 .iter()
                 .enumerate()
@@ -2460,6 +2648,7 @@ mod tests {
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         first.edited_ms = 1;
+        first.burst_ids = vec![(1, 10), (2, 11)];
         assert!(matches!(
             d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted
@@ -2479,6 +2668,7 @@ mod tests {
         changed.edited_ms = 9;
         changed.revision = d.revision();
         changed.hashes = None;
+        changed.burst_ids = vec![(50, 20), (51, 21)];
         changed.files = vec![
             Attachment::new(
                 10,
@@ -2503,6 +2693,7 @@ mod tests {
         ));
         let stored = &d.state.lock().guilds[&1].authors[&2].posts[0];
         assert_eq!(file_key(stored), vec![(50, 3), (51, 3)]);
+        assert_eq!(stored.burst_ids, vec![(50, 20), (51, 21)]);
         assert!(stored.hashes.is_none());
         assert_eq!(stored.at, now + Duration::from_secs(2));
     }
@@ -3466,6 +3657,7 @@ mod tests {
         let Report::Verified(image_match) = complete_report(
             &detector,
             Job {
+                burst_ids: Vec::new(),
                 guild: 1,
                 author: 2,
                 token: (0, 0),
@@ -3486,6 +3678,7 @@ mod tests {
         assert_eq!(
             detector.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -3681,6 +3874,181 @@ mod tests {
         drop(runner);
         drop(socket);
         ctx
+    }
+
+    #[tokio::test]
+    async fn observe_records_the_same_image_across_two_channels() {
+        let path = std::env::temp_dir().join(format!(
+            "attachment_burst_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = crate::state::BotState::new(
+            jmodguard::config::BotProcessConfig::default(),
+            crate::db::Db::open(&path, 2).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
+        let cfg = crate::state::CachedGuildConfig {
+            version: 0,
+            durable_version: 0,
+            loaded_at: Instant::now(),
+            settings: crate::types::GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
+        let post = |channel: u64, message: u64, attachment: u64| {
+            let mut msg = serenity::model::channel::Message::default();
+            msg.id = serenity::model::id::MessageId::new(message);
+            msg.channel_id = serenity::model::id::ChannelId::new(channel);
+            msg.guild_id = Some(serenity::model::id::GuildId::new(1));
+            msg.author.id = serenity::model::id::UserId::new(author);
+            msg.timestamp = serenity::model::timestamp::Timestamp::now();
+            msg.attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": attachment.to_string(),
+                    "filename": "spam.png",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                    "width": 8,
+                    "height": 8,
+                    "content_type": "image/png"
+                }))
+                .unwrap(),
+            ];
+            msg
+        };
+        let now = Instant::now();
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 0);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(11, 101, 1001),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        let event = serde_json::from_value(serde_json::json!({
+            "id": "101",
+            "channel_id": "11",
+            "guild_id": "1",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339(),
+            "attachments": [{
+                "id": "1001",
+                "filename": "spam.png",
+                "size": 42,
+                "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                "width": 8,
+                "height": 8,
+                "content_type": "image/png"
+            }]
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &event,
+            &crate::handlers::UpdateObservation {
+                author: Some(author),
+                received: now,
+                received_at: chrono::Utc::now(),
+            },
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
+        tokio::task::yield_now().await;
+        // This author-less edit has no exact-image or text candidate and no
+        // logging snippet; burst must use its own physical-message identity.
+        assert!(app.image_spam.author_of(1, 11, 101).is_none());
+        assert!(app.text_spam.author_of(1, 11, 101).is_none());
+        let removed = serde_json::from_value(serde_json::json!({
+            "id": "101", "channel_id": "11", "guild_id": "1",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339(), "attachments": []
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &removed,
+            &crate::handlers::UpdateObservation {
+                author: None,
+                received: now,
+                received_at: chrono::Utc::now(),
+            },
+            (1, app.attachment_burst.revision()),
+        );
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(12, 102, 1002),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            2,
+            "attachment removal clears the old hit latch"
+        );
+        let mut ordinary = post(13, 103, 1003);
+        ordinary.attachments.clear();
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &ordinary,
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert!(
+            app.attachment_burst.author_of(1, 13, 103).is_none(),
+            "ordinary creates do not acquire burst metadata"
+        );
+        drop(app);
+        jmodguard::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     async fn image_dispatch_race(
@@ -4600,6 +4968,7 @@ mod tests {
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let stored = posts[0].hashes.clone().expect("admission stored hashes");
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -4618,6 +4987,7 @@ mod tests {
         );
         assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
         let failed_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5036,6 +5406,7 @@ mod tests {
                                         "/hash0" => Response::new(Body::from("aaa")),
                                         "/hash1" => Response::new(Body::from("bbb")),
                                         "/hash2" => Response::new(Body::from("ccc")),
+                                        "/hash3" => Response::new(Body::from("ddd")),
                                         _ => Response::new(Body::from("abc")),
                                     };
                                     Ok::<_, std::convert::Infallible>(response)
@@ -5235,6 +5606,129 @@ mod tests {
         rewrite_job_downloads(&mut job, uri, file_size);
         let vars = run_job_capture_automod(&app, job, policy, 102).await;
         assert_incomplete_automod(&vars, evidence);
+    }
+
+    #[tokio::test]
+    async fn stale_image_job_cannot_consume_a_newer_burst_generation() {
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut old_job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        let post = &old_job.posts[0];
+        let file = &post.files[0];
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: post.channel,
+            message: post.id,
+            at: now,
+        };
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: file.id,
+            size: file.size,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut handoff =
+            crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        old_job.burst_ids = handoff.hand_to_job();
+        app.image_spam.invalidate(1, post.channel, post.id);
+        app.attachment_burst
+            .invalidate_message(1, post.channel, post.id, false);
+        app.attachment_burst.prepare_sighting(sighting, &[u64::MAX]);
+        let newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let new_generation = app.attachment_burst.staged_generation(file.id).unwrap();
+        let attachment_id = file.id;
+        let permit = app.image_spam.try_acquire_job_slot();
+        run_job(&app, &ctx, old_job, policy, 102, permit).await;
+        assert_eq!(
+            app.attachment_burst.staged_generation(attachment_id),
+            Some(new_generation),
+            "stale job must leave the replacement stage for its owner"
+        );
+        assert!(
+            app.attachment_burst
+                .resolve_hash_at(attachment_id, new_generation, [7; 32])
+                .is_none()
+        );
+        assert!(
+            app.attachment_burst
+                .staged_generation(attachment_id)
+                .is_none(),
+            "newer owner can settle its own hash"
+        );
+        drop(newer);
+    }
+
+    #[tokio::test]
+    async fn delayed_image_hash_cannot_consume_a_newer_burst_generation() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads(&mut job, &fixture.url("/hash0"), 3);
+        job.posts[0].files[0].set_request_uri_str_for_test(&fixture.url("/slow"));
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: job.posts[0].channel,
+            message: job.posts[0].id,
+            at: now,
+        };
+        let id = job.posts[0].files[0].id;
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: id,
+            size: 3,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut old = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        job.burst_ids = old.hand_to_job();
+        let task_app = Arc::clone(&app);
+        let task_ctx = ctx.clone();
+        let task = tokio::spawn(async move {
+            let permit = task_app.image_spam.try_acquire_job_slot();
+            run_job(&task_app, &task_ctx, job, policy, 102, permit).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.hit_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hash request started");
+        app.attachment_burst
+            .invalidate_message(1, sighting.channel, sighting.message, false);
+        app.attachment_burst.prepare_sighting(sighting, &[u64::MAX]);
+        let mut newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let generation = app.attachment_burst.staged_generation(id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.attachment_burst.staged_generation(id),
+            Some(generation),
+            "late hash must not resolve the replacement observation"
+        );
+        let owned = crate::attachment_burst::PendingBurst::new(&app, &ctx, newer.hand_to_job());
+        owned.resolve_hash(id, [7; 32]);
+        assert!(
+            app.attachment_burst.staged_generation(id).is_none(),
+            "replacement job retains ownership of its hash"
+        );
     }
 
     #[tokio::test]
@@ -6235,6 +6729,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6256,6 +6751,7 @@ mod tests {
             .expect("first job stores hashes");
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let failed = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6288,6 +6784,7 @@ mod tests {
             .unwrap();
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let none_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6304,6 +6801,7 @@ mod tests {
             CompleteOutcome::Dropped
         );
         let different = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6346,6 +6844,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6446,6 +6945,7 @@ mod tests {
         clear_stored_hashes(&d);
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6690,6 +7190,7 @@ mod tests {
             .collect();
         assert!(stored.iter().all(|hashes| hashes.is_some()));
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6718,6 +7219,7 @@ mod tests {
         assert_eq!(
             d.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -6758,6 +7260,7 @@ mod tests {
                 .hashes = None;
         }
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -7070,6 +7573,7 @@ mod tests {
             })
             .collect();
         Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author,
             token,
@@ -7271,5 +7775,316 @@ mod tests {
         );
         assert_eq!(sink.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(app.image_spam.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+    }
+    #[tokio::test]
+    async fn late_create_after_delete_is_not_admitted() {
+        let path = std::env::temp_dir().join(format!(
+            "attachment_burst_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = crate::state::BotState::new(
+            jmodguard::config::BotProcessConfig::default(),
+            crate::db::Db::open(&path, 2).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
+        let cfg = crate::state::CachedGuildConfig {
+            version: 0,
+            durable_version: 0,
+            loaded_at: Instant::now(),
+            settings: crate::types::GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
+        let post = |channel: u64, message: u64, attachment: u64| {
+            let mut msg = serenity::model::channel::Message::default();
+            msg.id = serenity::model::id::MessageId::new(message);
+            msg.channel_id = serenity::model::id::ChannelId::new(channel);
+            msg.guild_id = Some(serenity::model::id::GuildId::new(1));
+            msg.author.id = serenity::model::id::UserId::new(author);
+            msg.timestamp = serenity::model::timestamp::Timestamp::now();
+            msg.attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": attachment.to_string(),
+                    "filename": "spam.png",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                    "width": 8,
+                    "height": 8,
+                    "content_type": "image/png"
+                }))
+                .unwrap(),
+            ];
+            msg
+        };
+        let now = Instant::now();
+        let captured_revision = (app.image_spam.revision(), app.attachment_burst.revision());
+        // The create handler is waiting on its configuration read; delete arrives first.
+        app.image_spam.deleted(1, 10, 100);
+        app.attachment_burst.forget_message(1, 10, 100);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            captured_revision,
+        );
+        assert_eq!(app.attachment_burst.hits(), 0);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(11, 101, 1001),
+            now,
+            chrono::Utc::now(),
+            (app.image_spam.revision(), app.attachment_burst.revision()),
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "deleted create was reintroduced as proving burst message"
+        );
+        drop(app);
+        jmodguard::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_duplicate_completion_uses_real_jobs() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let now = Instant::now();
+        let mut jobs = Vec::new();
+        for n in 0..4u64 {
+            let message = 1000 + n;
+            let channel = 100 + n;
+            let mut item = post(message, channel, now, &[1, 1, 2]);
+            item.hashes = None;
+            item.revision = app.image_spam.revision();
+            let mut metadata = Vec::new();
+            for (i, file) in item.files.iter_mut().enumerate() {
+                let id = message * 10 + i as u64 + 1;
+                *file = Attachment::new(
+                    channel,
+                    id,
+                    3,
+                    &format!("https://cdn.discordapp.com/attachments/{channel}/{id}/image.png"),
+                    10,
+                )
+                .unwrap();
+                let path = match (n, i) {
+                    (1, _) => "/hash2",
+                    (3, _) => "/hash3",
+                    (2, 0 | 1) => "/hash0",
+                    (2, 2) => "/hash1",
+                    _ => "/ok",
+                };
+                file.set_request_uri_str_for_test(&fixture.url(path));
+                metadata.push(crate::attachment_burst::FileMeta {
+                    attachment_id: id,
+                    size: 3,
+                    filename: if (n == 1 || n == 2) && i == 2 {
+                        "shared.png".into()
+                    } else {
+                        format!("unique-{n}-{i}.png")
+                    },
+                    content_type: "image/png".into(),
+                });
+            }
+            let mut handoff = crate::attachment_burst::Handoff::stage(
+                &app,
+                &ctx,
+                crate::attachment_burst::Sighting {
+                    guild: 1,
+                    author: 2,
+                    channel,
+                    message,
+                    at: now,
+                },
+                metadata,
+            );
+            item.burst_ids = handoff.observations();
+            let outcome = app.image_spam.admit(1, 2, item, token, &policy, now, false);
+            match outcome {
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    jobs.push((channel, job, permit));
+                }
+                AdmitOutcome::Admitted => assert!(n < 2),
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(
+            jobs.len(),
+            2,
+            "two jobs hold the default two concurrency permits"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "no metadata hit before hashing"
+        );
+        // The latest admitted job runs first and caches all four real posts' hash sets.
+        let (channel, fast, permit) = jobs.pop().unwrap();
+        run_job(&app, &ctx, fast, policy.clone(), channel, permit).await;
+        assert_eq!(
+            fixture.hit_count(),
+            12,
+            "all files completed actual loopback hashing"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "fresh hashing found no shared bytes across target posts"
+        );
+        assert!(
+            app.image_spam.state.lock().guilds[&1].authors[&2]
+                .posts
+                .iter()
+                .all(|p| p.hashes.is_some())
+        );
+        let posts = app.image_spam.state.lock().guilds[&1].authors[&2]
+            .posts
+            .clone();
+        let a = posts
+            .iter()
+            .find(|p| p.id == 1002)
+            .unwrap()
+            .hashes
+            .as_ref()
+            .unwrap();
+        let b = posts
+            .iter()
+            .find(|p| p.id == 1001)
+            .unwrap()
+            .hashes
+            .as_ref()
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 1);
+        assert!(
+            a.iter().all(|hash| !b.contains(hash)),
+            "independent exact hashes are disjoint"
+        );
+        for (channel, job, permit) in jobs {
+            run_job(&app, &ctx, job, policy.clone(), channel, permit).await;
+        }
+        assert_eq!(
+            fixture.hit_count(),
+            12,
+            "cached jobs did not download again"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "fully hashed disjoint posts falsely matched via duplicate-file metadata fallback"
+        );
+    }
+    #[tokio::test]
+    async fn completed_job_counts_prior_fallback_observation() {
+        let fixture = LoopbackFixture::start();
+        let (app, _, _) = image_run_job_test_app(Limits::default()).await;
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let mut rule = cfg.rules["attachment_flood"].clone();
+        rule.params["min_channels"] = 2.into();
+        rule.params["min_attachments"] = 1.into();
+        crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, &cfg.rules["attachment_flood"]).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(fixture.url(""))
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let now = Instant::now();
+        for n in 0..2 {
+            let channel = 10 + n;
+            let message = 100 + n;
+            let id = 1000 + n;
+            let mut item = post(message, channel, now, &[3]);
+            item.hashes = None;
+            item.revision = app.image_spam.revision();
+            item.files = vec![
+                Attachment::new(
+                    channel,
+                    id,
+                    3,
+                    &format!("https://cdn.discordapp.com/attachments/{channel}/{id}/x.png"),
+                    10,
+                )
+                .unwrap(),
+            ];
+            item.files[0].set_request_uri_str_for_test(&fixture.url("/ok"));
+            let mut handoff = crate::attachment_burst::Handoff::stage(
+                &app,
+                &ctx,
+                crate::attachment_burst::Sighting {
+                    guild: 1,
+                    author: 2,
+                    channel,
+                    message,
+                    at: now,
+                },
+                vec![crate::attachment_burst::FileMeta {
+                    attachment_id: id,
+                    size: 3,
+                    filename: format!("{id}.png"),
+                    content_type: "image/png".into(),
+                }],
+            );
+            item.burst_ids = handoff.observations();
+            match app.image_spam.admit(1, 2, item, token, &policy, now, false) {
+                AdmitOutcome::Admitted => assert_eq!(n, 0),
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    run_job(&app, &ctx, job, policy.clone(), channel, permit).await;
+                }
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(
+            fixture.hit_count(),
+            2,
+            "both posts must finish real hashing"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            1,
+            "two identical completed images failed the default two-channel burst threshold"
+        );
     }
 }

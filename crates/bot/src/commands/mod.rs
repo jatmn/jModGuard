@@ -893,6 +893,10 @@ struct SlashCtx {
 }
 
 pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction: Interaction) {
+    if let Interaction::Component(interaction) = interaction {
+        crate::attachment_burst::handle_component(app, ctx, interaction).await;
+        return;
+    }
     let Interaction::Command(interaction) = interaction else {
         return;
     };

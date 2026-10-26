@@ -166,3 +166,16 @@ requests_per_guild_minute = 40
 requests_per_author_minute = 20
 bytes_per_minute = 67108864
 comparison_steps = 100000
+
+# Cross-channel attachment burst. Independent of the exact-image rule.
+# The same attachment in min_channels within window_secs applies a short
+# timeout and posts a mod review with Release and Ban buttons.
+# A finished check matches the content hash. An unfinished check matches
+# size, filename, and content type. Account age is not used.
+# Restart the bot after changing this section.
+# Optional JMODGUARD_ATTACHMENT_BURST JSON replaces the section.
+[attachment_burst]
+enabled = true
+min_channels = 2
+window_secs = 10
+timeout_secs = 600
