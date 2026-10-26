@@ -600,7 +600,7 @@ impl Tracker {
                 .get(&sighting.guild)
                 .is_some_and(|guild| guild.authors.len() >= MAX_AUTHORS_PER_GUILD);
             if guild_full || state.authors >= MAX_AUTHORS {
-                state.evict_author(sighting.guild, sighting.author);
+                state.evict_author(sighting.guild, sighting.author, min_channels);
             }
             if state.authors >= MAX_AUTHORS {
                 return None;
@@ -866,8 +866,8 @@ impl State {
             .retain(|_, review| now.saturating_duration_since(review.at) <= keep);
     }
 
-    fn evict_author(&mut self, guild: u64, keep: u64) {
-        let Some(guild_state) = self.guilds.get_mut(&guild) else {
+    fn evict_author(&mut self, guild: u64, keep: u64, min_channels: usize) {
+        let Some(guild_state) = self.guilds.get(&guild) else {
             return;
         };
         let oldest = guild_state
@@ -877,8 +877,22 @@ impl State {
             .min_by_key(|(_, author)| author.newest)
             .map(|(author, _)| *author);
         if let Some(author) = oldest {
-            guild_state.authors.remove(&author);
-            self.authors = self.authors.saturating_sub(1);
+            // Retire physical owners before losing their one-shot claims.
+            // Keep the ordering notes so unchanged snapshots remain replays.
+            let messages: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|((seen, _, _), note)| *seen == guild && note.author == author)
+                .map(|(key, _)| *key)
+                .collect();
+            for (guild, channel, message) in messages {
+                self.forget_message(guild, channel, message, min_channels);
+            }
+            if let Some(guild_state) = self.guilds.get_mut(&guild)
+                && guild_state.authors.remove(&author).is_some()
+            {
+                self.authors = self.authors.saturating_sub(1);
+            }
         }
     }
 
@@ -2389,6 +2403,52 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn author_eviction_cannot_repeat_a_physical_burst() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let mut stages = Vec::new();
+        for (channel, message, attachment) in [(10, 100, 1), (11, 101, 2)] {
+            let ids = tracker.stage_sighting(
+                sight(4, channel, message, now),
+                vec![burst_file(attachment)],
+                admission(tracker.revision(), 0),
+            );
+            stages.push(ids[0]);
+        }
+        assert!(
+            tracker
+                .resolve_incomplete_at(stages[0].0, stages[0].1)
+                .is_none()
+        );
+        let hit = tracker
+            .resolve_incomplete_at(stages[1].0, stages[1].1)
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+        let unrelated = tracker.stage(sight(8, 20, 500, later), burst_file(500));
+        assert!(tracker.resolve_incomplete_at(500, unrelated).is_none());
+        for author in 10..10 + MAX_AUTHORS_PER_GUILD as u64 - 1 {
+            tracker.record(sight(author, 30, 1000 + author, later), hash_key(7));
+        }
+        assert!(!tracker.state.lock().guilds[&1].authors.contains_key(&4));
+        for (attachment, generation) in stages {
+            assert!(
+                tracker
+                    .resolve_hash_at(attachment, generation, [1; 32])
+                    .is_none(),
+                "delayed hashes must not repeat an evicted physical burst"
+            );
+        }
+        assert_eq!(tracker.hits(), 1);
+        assert!(!hit.still_valid(), "eviction must retire its owned proof");
+        assert!(tracker.resolve_hash_at(500, unrelated, [9; 32]).is_none());
+        let next = tracker.stage(sight(8, 21, 501, later), burst_file(501));
+        assert!(
+            tracker.resolve_hash_at(501, next, [9; 32]).is_some(),
+            "eviction must preserve another author's pending observations"
+        );
     }
 
     #[test]
