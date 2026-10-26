@@ -8061,7 +8061,7 @@ mod tests {
                 vec![crate::attachment_burst::FileMeta {
                     attachment_id: id,
                     size: 3,
-                    filename: "x.png".into(),
+                    filename: format!("{id}.png"),
                     content_type: "image/png".into(),
                 }],
             );
