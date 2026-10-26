@@ -604,7 +604,7 @@ impl Tracker {
                 .get(&sighting.guild)
                 .is_some_and(|guild| guild.authors.len() >= MAX_AUTHORS_PER_GUILD);
             if guild_full || state.authors >= MAX_AUTHORS {
-                state.evict_author(sighting.guild, sighting.author, min_channels);
+                state.evict_author(guild_full.then_some(sighting.guild), min_channels);
             }
             if state.authors >= MAX_AUTHORS {
                 return None;
@@ -870,17 +870,22 @@ impl State {
             .retain(|_, review| now.saturating_duration_since(review.at) <= keep);
     }
 
-    fn evict_author(&mut self, guild: u64, keep: u64, min_channels: usize) {
-        let Some(guild_state) = self.guilds.get(&guild) else {
-            return;
-        };
-        let oldest = guild_state
-            .authors
+    fn evict_author(&mut self, within_guild: Option<u64>, min_channels: usize) {
+        // A per-guild cap evicts locally; a process-wide cap needs a victim
+        // across guilds, including when the incoming guild is not tracked yet.
+        let oldest = self
+            .guilds
             .iter()
-            .filter(|(author, _)| **author != keep)
-            .min_by_key(|(_, author)| author.newest)
-            .map(|(author, _)| *author);
-        if let Some(author) = oldest {
+            .filter(|(guild, _)| within_guild.is_none_or(|only| only == **guild))
+            .flat_map(|(guild, state)| {
+                state
+                    .authors
+                    .iter()
+                    .map(move |(author, state)| ((*guild, *author), state.newest))
+            })
+            .min_by_key(|(_, newest)| *newest)
+            .map(|(key, _)| key);
+        if let Some((guild, author)) = oldest {
             // Retire physical owners before losing their one-shot claims.
             // Keep the ordering notes so unchanged snapshots remain replays.
             let messages: Vec<_> = self
@@ -1559,7 +1564,7 @@ async fn attempted_outcome<T>(
         call.await
     })
     .await;
-    if !started.load(Ordering::Relaxed) {
+    if !started.load(Ordering::Relaxed) || !app.activation.may_record() {
         return None;
     }
     Some(match result {
@@ -2758,6 +2763,56 @@ mod tests {
                     .all(|guild| guild.authors.len() < MAX_AUTHORS_PER_GUILD)
             );
         }
+    }
+
+    #[test]
+    fn global_author_eviction_admits_new_guild_and_retires_old_proof() {
+        let tracker = tracker();
+        let now = Instant::now();
+        tracker.record(sight(0, 10, 1, now), hash_key(1));
+        let old_hit = tracker.record(sight(0, 11, 2, now), hash_key(1)).unwrap();
+        let later = now + Duration::from_secs(1);
+        for author in 1..MAX_AUTHORS {
+            tracker.record(
+                Sighting {
+                    guild: (author / (MAX_AUTHORS_PER_GUILD / 2) + 1) as u64,
+                    ..sight(author as u64, 10, author as u64 + 2, later)
+                },
+                hash_key(1),
+            );
+        }
+        assert_eq!(tracker.state.lock().authors, MAX_AUTHORS);
+        for (channel, message) in [(10, 600), (11, 601)] {
+            tracker.record(
+                Sighting {
+                    guild: 999,
+                    ..sight(999, channel, message, later)
+                },
+                hash_key(1),
+            );
+        }
+        assert_eq!(
+            tracker.hits(),
+            2,
+            "a new guild must still detect bursts at capacity"
+        );
+        assert_eq!(tracker.state.lock().authors, MAX_AUTHORS);
+        assert!(
+            !old_hit.still_valid(),
+            "global eviction must retire owned proof"
+        );
+        for (channel, message) in [(10, 1), (11, 2)] {
+            assert!(
+                tracker
+                    .record(sight(0, channel, message, now), hash_key(1))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            tracker.hits(),
+            2,
+            "evicted physical messages must remain replays"
+        );
     }
 
     #[test]
@@ -3970,6 +4025,94 @@ mod tests {
             assert_eq!(value["components"], serde_json::json!([]));
         }
     }
+    #[tokio::test]
+    async fn timeout_paths_do_not_record_after_writer_cutoff() {
+        let mut counts = Vec::new();
+        for release in [false, true] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let patch_started = Arc::new(tokio::sync::Notify::new());
+            let observed = Arc::clone(&patch_started);
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let Some((method, _)) = read_request(&mut stream).await else {
+                        continue;
+                    };
+                    if method == "PATCH" {
+                        observed.notify_one();
+                        std::future::pending::<()>().await;
+                    } else {
+                        write_response(&mut stream, "200 OK", r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                    }
+                }
+            });
+            let (app, path) = open_app();
+            // A real lease keeps selected-case storage writable after activation
+            // cutoff, just as during shutdown before the durable lease is released.
+            assert_eq!(
+                crate::activation::poll_writer_lock(&app.db, &app.activation)
+                    .await
+                    .unwrap(),
+                crate::activation::WriterLockPoll::Ready
+            );
+            let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            app.tenant.activate(enrollment.clone()).await.unwrap();
+            let ctx = fixture_context(http_at(address)).await;
+            let operation = async {
+                if release {
+                    let decision = release_member(
+                        &app,
+                        &ctx,
+                        &Review {
+                            guild: 10,
+                            user: 99,
+                            body: String::new(),
+                            at: Instant::now(),
+                            enrollment: Some(enrollment.clone()),
+                        },
+                        UserId::new(7),
+                    )
+                    .await;
+                    assert!(matches!(decision, ReviewDecision::Failed));
+                } else {
+                    enforce(&app, &ctx, test_hit(&app, 99)).await;
+                }
+            };
+            let cutoff = async {
+                tokio::time::timeout(Duration::from_secs(5), patch_started.notified())
+                    .await
+                    .unwrap();
+                assert!(app.activation.may_record());
+                app.activation.begin_shutdown();
+                app.activation.cut_off();
+                assert!(!app.activation.may_record());
+            };
+            tokio::join!(operation, cutoff);
+            let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+            counts.push(
+                store
+                    .case_ids(scope, None, 10, crate::tenant::case_limits())
+                    .await
+                    .unwrap()
+                    .len(),
+            );
+            server.abort();
+            let _ = server.await;
+            close_app(&path);
+        }
+        assert_eq!(
+            counts,
+            vec![0, 0],
+            "automatic timeout and Release must stop recording at cutoff"
+        );
+    }
+
     #[tokio::test]
     async fn uncertain_timeout_records_case() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
