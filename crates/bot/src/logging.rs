@@ -960,6 +960,7 @@ pub(crate) async fn preview_automod(
         .or_insert_with(|| chrono::Utc::now().to_rfc3339());
     vars.insert("guild".into(), guild_id.get().to_string());
     let mut owned = vars.clone();
+    templates::format_log_timestamps(&mut owned);
     render_log_template("automod", &template, &mut owned)
 }
 

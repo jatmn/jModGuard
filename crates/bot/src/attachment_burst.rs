@@ -1265,8 +1265,11 @@ fn dispatch(app: &Arc<BotState>, ctx: &Context, hits: Vec<Hit>) {
         };
         let app = Arc::clone(app);
         let ctx = ctx.clone();
+        // Keep settings and shutdown behind admitted work, including before its first poll.
+        let rule_hold = app.activation.hold_rule();
         handle.spawn(async move {
             let _permit = permit;
+            let _rule_hold = rule_hold;
             enforce(&app, &ctx, hit).await;
         });
     }
@@ -4067,6 +4070,148 @@ mod tests {
         assert_eq!(
             retained, 1,
             "a read error permanently consumed the visible review without an action"
+        );
+    }
+    #[tokio::test]
+    async fn decision_edits_preserve_log_date_formatting() {
+        let (app, path) = open_app();
+        let raw = "2026-10-26T02:03:04.123456+00:00";
+        let expected = "Oct 26, 2026 • 02:03:04 UTC";
+        let mut vars = BTreeMap::from([
+            ("time".to_string(), raw.to_string()),
+            ("rule".to_string(), "Attachment burst".to_string()),
+            ("mention".to_string(), "user 99".to_string()),
+            ("user_id".to_string(), "99".to_string()),
+            ("channel".to_string(), "channel 1".to_string()),
+            ("action".to_string(), "timeout 10m".to_string()),
+            ("reason".to_string(), "fixture".to_string()),
+            ("content".to_string(), "fixture".to_string()),
+        ]);
+        let preview = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
+        let bodies: Vec<_> = [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED]
+            .into_iter()
+            .map(|label| {
+                let rendered =
+                    serde_json::to_value(decision_edit(preview.clone(), label, UserId::new(7)))
+                        .unwrap();
+                rendered["content"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            vars["time"], raw,
+            "display formatting must preserve raw inputs"
+        );
+        drop(app);
+        close_app(&path);
+        for body in bodies {
+            assert!(
+                body.contains(expected),
+                "decision must keep documented whole-second UTC display; got {body}"
+            );
+            assert!(!body.contains(raw));
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_timeout_participates_in_shutdown_drain() {
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::clone(&started);
+        let resume = Arc::clone(&release);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, _)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "PATCH" {
+                    seen.notify_one();
+                    resume.notified().await;
+                }
+                write_response(&mut stream, "200 OK", r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        let ingress_hold = app.activation.hold_rule();
+        dispatch(&app, &ctx, vec![test_hit(&app, 99)]);
+        let before_poll = (
+            app.activation.in_flight(),
+            app.activation.moderation_depth(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("real timeout PATCH reached fixture");
+        drop(ingress_hold);
+        let counters = (
+            app.activation.in_flight(),
+            app.activation.moderation_depth(),
+        );
+        let activation = Arc::clone(&app.activation);
+        activation.begin_shutdown();
+        let drain = tokio::spawn(async move {
+            crate::activation::drain_for_shutdown_notices(&activation, async {}).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waited_for_timeout = !drain.is_finished();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.attachment_burst.slots.available_permits() != MAX_IN_FLIGHT {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("enforcement settled");
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        let summaries = store
+            .case_summaries(scope, ids, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+        let after_settlement = (
+            app.activation.in_flight(),
+            app.activation.moderation_depth(),
+        );
+        drop(app);
+        close_app(&path);
+        assert_eq!(before_poll, (2, 2), "work must be held before spawning");
+        assert_eq!(
+            after_settlement,
+            (0, 0),
+            "settled work must release its hold"
+        );
+        assert_eq!(
+            counters,
+            (1, 1),
+            "detached work must retain shutdown and settings ordering"
+        );
+        assert_eq!(summaries.len(), 1);
+        assert!(
+            summaries
+                .values()
+                .all(|case| case.outcome == crate::db::guild_data::CaseOutcome::Succeeded)
+        );
+        assert!(
+            waited_for_timeout,
+            "shutdown skipped drain while an admitted automatic timeout PATCH was outstanding"
         );
     }
 }
