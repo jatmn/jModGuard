@@ -118,6 +118,9 @@ struct Review {
 
 struct MessageNote {
     author: u64,
+    // Historical ownership survives channel replacement and hash promotion.
+    // Production admits <=10 files, each contributing <=1 fallback +1 hash.
+    keys: Vec<Key>,
     at: Instant,
     attachments: BTreeSet<u64>,
     edited_ms: i64,
@@ -362,6 +365,7 @@ impl Tracker {
             note.invalidated_revision = invalidated_revision;
             note.deleted |= deleted;
             note.lifetime = None;
+            note.keys.clear();
             if let Some(edited_ms) = edited_ms {
                 note.edited_ms = note.edited_ms.max(edited_ms);
             }
@@ -396,6 +400,7 @@ impl Tracker {
         for ((seen_guild, _, _), note) in &mut state.messages {
             if *seen_guild == guild && author.is_none_or(|a| a == note.author) {
                 note.lifetime = None;
+                note.keys.clear();
                 note.deleted = true;
             }
         }
@@ -593,7 +598,15 @@ impl Tracker {
             }
             state.remember_message(sighting, BTreeSet::new(), min_channels);
         }
-        let lifetime = state.messages.get(&message_key)?.lifetime.clone()?;
+        state.messages.get(&message_key)?.lifetime.as_ref()?;
+        state.evict_key(sighting, &key, min_channels);
+        // Eviction can retire another attachment of this same physical message.
+        // Acquire its proof only after retirement has finished.
+        let note = state.messages.get_mut(&message_key)?;
+        let lifetime = note.lifetime.clone()?;
+        if !note.keys.contains(&key) {
+            note.keys.push(key.clone());
+        }
         let author_exists = state
             .guilds
             .get(&sighting.guild)
@@ -638,11 +651,6 @@ impl Tracker {
             let guild_state = state.guilds.get_mut(&sighting.guild)?;
             let author_state = guild_state.authors.get_mut(&sighting.author)?;
             author_state.newest = author_state.newest.max(sighting.at);
-            if !author_state.keys.contains_key(&key)
-                && author_state.keys.len() >= MAX_KEYS_PER_AUTHOR
-            {
-                author_state.drop_oldest_key_except(&key);
-            }
             let bucket = author_state
                 .keys
                 .entry(key.clone())
@@ -870,6 +878,43 @@ impl State {
             .retain(|_, review| now.saturating_duration_since(review.at) <= keep);
     }
 
+    fn evict_key(&mut self, sighting: Sighting, incoming: &Key, min_channels: usize) {
+        let Some(author) = self
+            .guilds
+            .get_mut(&sighting.guild)
+            .and_then(|guild| guild.authors.get_mut(&sighting.author))
+        else {
+            return;
+        };
+        if author.keys.contains_key(incoming) || author.keys.len() < MAX_KEYS_PER_AUTHOR {
+            return;
+        }
+        let Some(oldest) = author
+            .keys
+            .iter()
+            .min_by_key(|(_, bucket)| bucket.newest)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        author.keys.remove(&oldest);
+        // The current channel representatives omit older physical owners that
+        // may still have pending hashes or enforcement proof for this key.
+        let messages: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|((guild, _, _), note)| {
+                *guild == sighting.guild
+                    && note.author == sighting.author
+                    && note.keys.contains(&oldest)
+            })
+            .map(|((_, channel, message), _)| (*channel, *message))
+            .collect();
+        for (channel, message) in messages {
+            self.forget_message(sighting.guild, channel, message, min_channels);
+        }
+    }
+
     fn evict_author(&mut self, within_guild: Option<u64>, min_channels: usize) {
         // A per-guild cap evicts locally; a process-wide cap needs a victim
         // across guilds, including when the incoming guild is not tracked yet.
@@ -975,6 +1020,7 @@ impl State {
             key,
             MessageNote {
                 author: sighting.author,
+                keys: Vec::new(),
                 at: sighting.at,
                 attachments,
                 edited_ms: 0,
@@ -991,6 +1037,7 @@ impl State {
             return;
         };
         note.lifetime = None;
+        note.keys.clear();
         let author = note.author;
         for id in &note.attachments {
             if self.staged.get(id).is_some_and(|stage| {
@@ -1027,20 +1074,6 @@ impl State {
         }
         if guild_state.authors.is_empty() {
             self.guilds.remove(&guild);
-        }
-    }
-}
-
-impl AuthorState {
-    fn drop_oldest_key_except(&mut self, keep: &Key) {
-        let oldest = self
-            .keys
-            .iter()
-            .filter(|(key, _)| *key != keep)
-            .min_by_key(|(_, bucket)| bucket.newest)
-            .map(|(key, _)| key.clone());
-        if let Some(key) = oldest {
-            self.keys.remove(&key);
         }
     }
 }
@@ -2472,6 +2505,133 @@ mod tests {
         assert!(
             tracker.resolve_hash_at(501, next, [9; 32]).is_some(),
             "eviction must preserve another author's pending observations"
+        );
+    }
+
+    #[test]
+    fn key_eviction_cannot_repeat_a_physical_burst() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let mut stages = Vec::new();
+        let mut hit = None;
+        // Include a superseded same-channel observation, not just the two
+        // representatives left in the evicted bucket.
+        for (channel, message, attachment) in [(10, 100, 1), (11, 101, 2), (10, 102, 3)] {
+            let ids = tracker.stage_sighting(
+                sight(4, channel, message, now),
+                vec![burst_file(attachment)],
+                admission(tracker.revision(), 0),
+            );
+            stages.push(ids[0]);
+            if let Some(found) = tracker.resolve_incomplete_at(ids[0].0, ids[0].1) {
+                assert!(hit.replace(found).is_none());
+            }
+        }
+        let hit = hit.unwrap();
+        let later = now + Duration::from_secs(1);
+        let unrelated = tracker.stage(
+            sight(4, 20, 500, later + Duration::from_secs(1)),
+            FileMeta {
+                filename: "unrelated.png".into(),
+                ..burst_file(500)
+            },
+        );
+        assert!(tracker.resolve_incomplete_at(500, unrelated).is_none());
+        for key in 0..MAX_KEYS_PER_AUTHOR - 1 {
+            tracker.record(sight(4, 30, 1000 + key as u64, later), hash_key(key as u8));
+        }
+        assert_eq!(
+            tracker.state.lock().guilds[&1].authors[&4].keys.len(),
+            MAX_KEYS_PER_AUTHOR
+        );
+        for (attachment, generation) in stages {
+            assert!(
+                tracker
+                    .resolve_hash_at(attachment, generation, [99; 32])
+                    .is_none(),
+                "key eviction must not produce a second hit from the same physical messages"
+            );
+        }
+        assert_eq!(tracker.hits(), 1);
+        assert!(
+            !hit.still_valid(),
+            "eviction must retire the old owned proof"
+        );
+        assert!(tracker.resolve_hash_at(500, unrelated, [100; 32]).is_none());
+        let next = tracker.stage(
+            sight(4, 21, 501, later + Duration::from_secs(2)),
+            burst_file(501),
+        );
+        assert!(
+            tracker.resolve_hash_at(501, next, [100; 32]).is_some(),
+            "key eviction must preserve unrelated observations of the same author"
+        );
+        assert!(tracker.state.lock().guilds[&1].authors[&4].keys.len() <= MAX_KEYS_PER_AUTHOR);
+    }
+
+    #[test]
+    fn key_eviction_retires_superseded_hash_owners() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let mut delayed = Vec::new();
+        for (channel, message, id) in [(10, 100, 1), (11, 101, 3)] {
+            let stages = tracker.stage_sighting(
+                sight(4, channel, message, now),
+                vec![burst_file(id), burst_file(id + 1)],
+                admission(tracker.revision(), 0),
+            );
+            tracker.resolve_hash_at(stages[0].0, stages[0].1, [99; 32]);
+            delayed.push(stages[1]);
+        }
+        assert_eq!(tracker.hits(), 1);
+        let later = now + Duration::from_secs(1);
+        for (channel, message, id) in [(10, 102, 5), (11, 103, 6)] {
+            let generation = tracker.stage(sight(4, channel, message, later), burst_file(id));
+            assert!(tracker.resolve_hash_at(id, generation, [99; 32]).is_none());
+        }
+        for key in 0..MAX_KEYS_PER_AUTHOR {
+            tracker.record(
+                sight(4, 30, 1000 + key as u64, later + Duration::from_secs(1)),
+                hash_key(key as u8),
+            );
+        }
+        for (id, generation) in delayed {
+            assert!(
+                tracker.resolve_hash_at(id, generation, [99; 32]).is_none(),
+                "superseded hash owners must not replay through another attachment"
+            );
+        }
+        assert_eq!(tracker.hits(), 1);
+    }
+
+    #[test]
+    fn key_eviction_cannot_resurrect_its_incoming_physical_owner() {
+        let tracker = tracker();
+        let now = Instant::now();
+        // Distinct keys from one physical message all share its lifetime.
+        for key in 0..MAX_KEYS_PER_AUTHOR {
+            tracker.record(sight(4, 10, 100, now), hash_key(key as u8));
+        }
+        tracker.record(sight(4, 10, 100, now), hash_key(99));
+        assert!(
+            tracker
+                .record(sight(4, 11, 101, now), hash_key(99))
+                .is_none(),
+            "retiring the incoming message must not resurrect its proof under a new key"
+        );
+        let state = tracker.state.lock();
+        assert_eq!(state.authors, 1);
+        assert_eq!(state.guilds[&1].authors[&4].keys.len(), 1);
+        assert!(state.messages[&(1, 10, 100)].lifetime.is_none());
+        drop(state);
+        for key in 0..MAX_KEYS_PER_AUTHOR - 1 {
+            tracker.record(sight(4, 30, 1000 + key as u64, now), hash_key(key as u8));
+        }
+        tracker.record(sight(4, 10, 100, now), hash_key(200));
+        assert_eq!(
+            tracker.state.lock().guilds[&1].authors[&4].keys.len(),
+            MAX_KEYS_PER_AUTHOR,
+            "a retired incoming message must not evict live observations"
         );
     }
 
