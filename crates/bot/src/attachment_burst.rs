@@ -3262,8 +3262,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
+        // Test-only loopback connection with a synthetic token, never a production gateway.
         let url = Arc::new(tokio::sync::Mutex::new(format!(
-            "ws://{}",
+            "ws://{}", // nosemgrep: javascript.lang.security.detect-insecure-websocket
             listener.local_addr().unwrap()
         )));
         let accept = tokio::spawn(async move {
