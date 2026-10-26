@@ -59,7 +59,16 @@ Edits replace the physical message's candidate. Deletes invalidate it. Duplicate
 creates, expired IDs and late hash results cannot refresh the window.
 
 Hashing still streams original `cdn.discordapp.com/attachments/...` URLs with the
-same origin/path, no-redirect, no-credential, no-retry contract as before.
+same origin/path, no-redirect, no-credential contract. A completed body within the
+file cap is hashed even when it is longer than the size Discord declared, and only
+when the process byte budget covers that received length. Each chunk's additional
+bytes are charged atomically before hashing, including on retries, so concurrent
+streams cannot reuse spare capacity. Charges survive body errors, timeout and
+cancellation; the initial declared-size reservation is not refunded. A body that
+ends short of that declared size is fetched once more only when the process, guild, and author
+request budgets and the process byte budget admit the extra request. A body over
+the cap, a body the byte budget cannot cover, and every other download failure, is
+not retried.
 
 ## Enforcement
 
@@ -77,7 +86,8 @@ message ids and the proving SHA-256 hashes. It does not include image bytes or
 the attachment address. If a download, request budget, or comparison work budget stops analysis before a
 match is proven, the automod title is **Exact image check incomplete**, the action
 is **no action; check did not finish**, and the Evidence field names the stopping
-gate (never a URL, hash, or image bytes). A later check in the same incomplete
+gate. A size mismatch also names the declared size and the received length. The
+field never includes a URL, a hash, or image bytes. A later check in the same incomplete
 window can still become a verified hit. An incomplete notice that has not been
 sent is not sent once that verified match owns the window. That check runs again
 after a Discord rate-limit wait and before the log request is written. A request
@@ -92,8 +102,11 @@ in that window can try the notice again. A permanent log-channel rejection
 (Discord 50001, 50013, or 10003) still uses the existing 30-minute suppression,
 so that later try does not call Discord again; a transient failure, including 429
 and 5xx, does. A failed job does not clear hashes
-already stored for those posts. Hashing still uses one CDN request per attachment
-that does not already have a stored hash, with no redirect follow and no retry.
+already stored for those posts. Hashing uses one CDN request per attachment
+that does not already have a stored hash, plus one extra request only when that
+body ends short of the declared size and the process, guild, and author request
+budgets and the process byte budget admit it. Redirects are not followed. Image
+bytes are not stored.
 An overlapping job copies hashes stored since it was admitted before it charges
 its download budget. When every live post already has a hash and comparison finds
 no match, a budget miss does not send an incomplete notice. Hashes already stored
