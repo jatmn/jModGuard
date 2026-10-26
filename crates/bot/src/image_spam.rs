@@ -40,6 +40,8 @@ struct Post {
     serial: u64,
     at: Instant,
     files: Vec<Attachment>,
+    /// Captured with this physical observation, never looked up from a later stage.
+    burst_ids: Vec<(u64, u64)>,
     /// Distinct computed hashes; no image bytes are retained.
     hashes: Option<Vec<Hash>>,
     valid: bool,
@@ -803,6 +805,7 @@ impl Detector {
             return AdmitOutcome::Rejected;
         }
         post.cost = 256
+            + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
             + post
                 .files
                 .iter()
@@ -1177,7 +1180,10 @@ fn candidate_job(
         return None;
     }
     Some(Job {
-        burst_ids: Vec::new(),
+        burst_ids: posts
+            .iter()
+            .flat_map(|post| post.burst_ids.iter().copied())
+            .collect(),
         guild,
         author,
         token,
@@ -1221,6 +1227,7 @@ fn replace_existing(
     state.bytes = state.bytes.saturating_sub(old.cost);
     old.serial = serial;
     old.files = post.files.clone();
+    old.burst_ids = post.burst_ids.clone();
     old.hashes = None;
     old.at = post.at;
     old.edited_ms = post.edited_ms;
@@ -1228,6 +1235,7 @@ fn replace_existing(
     old.valid = true;
     old.own_delete = Weak::new();
     old.cost = 256
+        + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
         + post
             .files
             .iter()
@@ -1271,7 +1279,7 @@ fn spawn_image_job(
     app: &Arc<BotState>,
     ctx: &Context,
     detector: &Detector,
-    mut job: Job,
+    job: Job,
     policy: Policy,
     channel: u64,
     burst: &mut crate::attachment_burst::Handoff,
@@ -1280,7 +1288,7 @@ fn spawn_image_job(
         detector.capacity_drop();
         return false;
     };
-    job.burst_ids = burst.hand_to_job();
+    burst.hand_to_job();
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
@@ -1487,20 +1495,18 @@ fn burst_handoff(
     attachments: &[serenity::model::channel::Attachment],
     occurred_ms: i64,
     received: Instant,
-    admission: (chrono::DateTime<chrono::Utc>, u64),
+    admission: (chrono::DateTime<chrono::Utc>, u64, Option<i64>),
 ) -> crate::attachment_burst::Handoff {
     let (guild, author, channel, message) = place;
     if !app.attachment_burst.accepts() {
         return crate::attachment_burst::Handoff::inert();
     }
-    let Some(at) = burst_instant(
+    let at = burst_instant(
         received,
         admission.0,
         occurred_ms,
         app.attachment_burst.window_secs(),
-    ) else {
-        return crate::attachment_burst::Handoff::inert();
-    };
+    );
     let files = burst_files(attachments);
     crate::attachment_burst::Handoff::stage_at(
         app,
@@ -1510,10 +1516,15 @@ fn burst_handoff(
             author,
             channel,
             message,
-            at,
+            at: at.unwrap_or(received),
         },
         files,
-        (admission.1, occurred_ms),
+        crate::attachment_burst::Admission {
+            revision: admission.1,
+            edited_ms: admission.2,
+            received,
+            eligible: at.is_some(),
+        },
     )
 }
 
@@ -1548,7 +1559,11 @@ pub fn observe(
             &msg.attachments,
             msg.timestamp.timestamp_millis(),
             received,
-            (received_at, burst_revision),
+            (
+                received_at,
+                burst_revision,
+                Some(msg.timestamp.timestamp_millis()),
+            ),
         )
     };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
@@ -1625,6 +1640,7 @@ pub fn observe(
             channel: msg.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -1693,7 +1709,11 @@ pub(crate) fn observe_update(
             attachments,
             occurred_ms,
             update.received,
-            (update.received_at, burst_revision),
+            (
+                update.received_at,
+                burst_revision,
+                event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
+            ),
         )
     } else {
         app.attachment_burst.invalidate_message_at(
@@ -1795,6 +1815,7 @@ pub(crate) fn observe_update(
             channel: event.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -2300,6 +2321,7 @@ mod tests {
             own_delete: Weak::new(),
             cost: 0,
             revision: 0,
+            burst_ids: Vec::new(),
             files: values
                 .iter()
                 .enumerate()
@@ -2369,6 +2391,7 @@ mod tests {
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         first.edited_ms = 1;
+        first.burst_ids = vec![(1, 10), (2, 11)];
         assert!(matches!(
             d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted
@@ -2388,6 +2411,7 @@ mod tests {
         changed.edited_ms = 9;
         changed.revision = d.revision();
         changed.hashes = None;
+        changed.burst_ids = vec![(50, 20), (51, 21)];
         changed.files = vec![
             Attachment::new(
                 10,
@@ -2412,6 +2436,7 @@ mod tests {
         ));
         let stored = &d.state.lock().guilds[&1].authors[&2].posts[0];
         assert_eq!(file_key(stored), vec![(50, 3), (51, 3)]);
+        assert_eq!(stored.burst_ids, vec![(50, 20), (51, 21)]);
         assert!(stored.hashes.is_none());
         assert_eq!(stored.at, now + Duration::from_secs(2));
     }
@@ -5044,6 +5069,7 @@ mod tests {
                                         "/hash0" => Response::new(Body::from("aaa")),
                                         "/hash1" => Response::new(Body::from("bbb")),
                                         "/hash2" => Response::new(Body::from("ccc")),
+                                        "/hash3" => Response::new(Body::from("ddd")),
                                         _ => Response::new(Body::from("abc")),
                                     };
                                     Ok::<_, std::convert::Infallible>(response)
@@ -6849,6 +6875,7 @@ mod tests {
                 .unwrap();
                 let path = match (n, i) {
                     (1, _) => "/hash2",
+                    (3, _) => "/hash3",
                     (2, 0 | 1) => "/hash0",
                     (2, 2) => "/hash1",
                     _ => "/ok",
@@ -6877,10 +6904,11 @@ mod tests {
                 },
                 metadata,
             );
+            item.burst_ids = handoff.observations();
             let outcome = app.image_spam.admit(1, 2, item, token, &policy, now, false);
             match outcome {
-                AdmitOutcome::Matched(mut job) => {
-                    job.burst_ids = handoff.hand_to_job();
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
                     let permit = app.image_spam.try_acquire_job_slot();
                     jobs.push((channel, job, permit));
                 }
@@ -6952,6 +6980,86 @@ mod tests {
             app.attachment_burst.hits(),
             0,
             "fully hashed disjoint posts falsely matched via duplicate-file metadata fallback"
+        );
+    }
+    #[tokio::test]
+    async fn completed_job_counts_prior_fallback_observation() {
+        let fixture = LoopbackFixture::start();
+        let (app, _, _) = image_run_job_test_app(Limits::default()).await;
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let mut rule = cfg.rules["attachment_flood"].clone();
+        rule.params["min_channels"] = 2.into();
+        rule.params["min_attachments"] = 1.into();
+        crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, &cfg.rules["attachment_flood"]).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(fixture.url(""))
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let now = Instant::now();
+        for n in 0..2 {
+            let channel = 10 + n;
+            let message = 100 + n;
+            let id = 1000 + n;
+            let mut item = post(message, channel, now, &[3]);
+            item.hashes = None;
+            item.revision = app.image_spam.revision();
+            item.files = vec![
+                Attachment::new(
+                    channel,
+                    id,
+                    3,
+                    &format!("https://cdn.discordapp.com/attachments/{channel}/{id}/x.png"),
+                    10,
+                )
+                .unwrap(),
+            ];
+            item.files[0].set_request_uri_str_for_test(&fixture.url("/ok"));
+            let mut handoff = crate::attachment_burst::Handoff::stage(
+                &app,
+                &ctx,
+                crate::attachment_burst::Sighting {
+                    guild: 1,
+                    author: 2,
+                    channel,
+                    message,
+                    at: now,
+                },
+                vec![crate::attachment_burst::FileMeta {
+                    attachment_id: id,
+                    size: 3,
+                    filename: "x.png".into(),
+                    content_type: "image/png".into(),
+                }],
+            );
+            item.burst_ids = handoff.observations();
+            match app.image_spam.admit(1, 2, item, token, &policy, now, false) {
+                AdmitOutcome::Admitted => assert_eq!(n, 0),
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    run_job(&app, &ctx, job, policy.clone(), channel, permit).await;
+                }
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(
+            fixture.hit_count(),
+            2,
+            "both posts must finish real hashing"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            1,
+            "two identical completed images failed the default two-channel burst threshold"
         );
     }
 }

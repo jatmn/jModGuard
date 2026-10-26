@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serenity::builder::{
     Builder, CreateActionRow, CreateButton, CreateInteractionResponse,
-    CreateInteractionResponseMessage, EditInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::client::Context;
 use serenity::model::application::{ButtonStyle, ComponentInteraction};
@@ -62,6 +62,13 @@ pub(crate) struct Sighting {
     pub at: Instant,
 }
 
+pub(crate) struct Admission {
+    pub revision: u64,
+    pub edited_ms: Option<i64>,
+    pub received: Instant,
+    pub eligible: bool,
+}
+
 pub(crate) struct FileMeta {
     pub attachment_id: u64,
     pub size: u64,
@@ -75,12 +82,14 @@ struct Staged {
     size: u64,
     filename: String,
     content_type: String,
+    fallback: bool,
 }
 
 struct ChannelSight {
     message: u64,
     at: Instant,
     lifetime: Arc<()>,
+    claimed_at: Option<Instant>,
 }
 
 struct KeyBucket {
@@ -112,6 +121,7 @@ struct MessageNote {
     at: Instant,
     attachments: BTreeSet<u64>,
     edited_ms: i64,
+    received: Instant,
     deleted: bool,
     lifetime: Option<Arc<()>>,
 }
@@ -125,6 +135,7 @@ struct State {
     next_review: u64,
     next_generation: u64,
     revision: u64,
+    retired_through: u64,
 }
 
 pub(crate) struct Hit {
@@ -167,6 +178,7 @@ impl Tracker {
                 next_review: 1,
                 next_generation: 1,
                 revision: 0,
+                retired_through: 0,
             }),
             hits: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
@@ -204,6 +216,7 @@ impl Tracker {
             .lock()
             .staged
             .get(&attachment_id)
+            .filter(|stage| !stage.fallback)
             .map(|staged| staged.generation)
     }
 
@@ -224,6 +237,16 @@ impl Tracker {
         }
         let generation = state.next_generation;
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
+        let message = (sighting.guild, sighting.channel, sighting.message);
+        if !state.messages.contains_key(&message) {
+            state.remember_message(sighting, BTreeSet::new());
+        }
+        state
+            .messages
+            .get_mut(&message)
+            .expect("message")
+            .attachments
+            .insert(file.attachment_id);
         state.staged.insert(
             file.attachment_id,
             Staged {
@@ -232,6 +255,7 @@ impl Tracker {
                 size: file.size,
                 filename: bound_chars(&file.filename, NAME_CHARS),
                 content_type: media_type(&file.content_type),
+                fallback: false,
             },
         );
         generation
@@ -250,7 +274,8 @@ impl Tracker {
     ) -> Option<Hit> {
         let mut state = self.state.lock();
         let staged = state.take_staged(attachment_id, generation)?;
-        self.record_locked(&mut state, staged.sighting, Key::Hash(hash))
+        let was_acted = state.retract_fallback(&staged);
+        self.record_locked(&mut state, staged.sighting, Key::Hash(hash), was_acted)
     }
 
     #[cfg(test)]
@@ -260,9 +285,16 @@ impl Tracker {
 
     pub(crate) fn resolve_incomplete_at(&self, attachment_id: u64, generation: u64) -> Option<Hit> {
         let mut state = self.state.lock();
-        let staged = state.take_staged(attachment_id, generation)?;
+        let staged = state.staged.get_mut(&attachment_id)?;
+        if staged.generation != generation || staged.fallback {
+            return None;
+        }
+        // Retain the exact observation for a later job that hashes this post.
+        // The existing stage cap and message invalidation still own its lifetime.
+        staged.fallback = true;
         let sighting = staged.sighting;
-        self.record_locked(&mut state, sighting, fallback_key(staged))
+        let key = fallback_key(staged);
+        self.record_locked(&mut state, sighting, key, false)
     }
 
     #[cfg(test)]
@@ -287,6 +319,16 @@ impl Tracker {
         edited_ms: Option<i64>,
     ) {
         let mut state = self.state.lock();
+        if !deleted
+            && edited_ms.is_some_and(|edited| {
+                state
+                    .messages
+                    .get(&(guild, channel, message))
+                    .is_some_and(|note| edited < note.edited_ms)
+            })
+        {
+            return;
+        }
         state.revision = state.revision.wrapping_add(1);
         state.forget_message(guild, channel, message, self.settings.min_channels);
         let key = (guild, channel, message);
@@ -359,17 +401,28 @@ impl Tracker {
         &self,
         sighting: Sighting,
         files: Vec<FileMeta>,
-        admission: (u64, i64),
+        admission: Admission,
     ) -> Vec<(u64, u64)> {
         let mut state = self.state.lock();
+        // Rejected observations may revoke a known superseded snapshot, but
+        // must not allocate new evidence or ordering notes for unknown messages.
+        if (state.revision != admission.revision || !admission.eligible)
+            && !state
+                .messages
+                .contains_key(&(sighting.guild, sighting.channel, sighting.message))
+        {
+            return Vec::new();
+        }
         if !self.usable()
-            || state.revision != admission.0
             || !self.prepare_locked(
                 &mut state,
                 sighting,
                 &files.iter().map(|f| f.attachment_id).collect::<Vec<_>>(),
-                admission.1,
+                admission.edited_ms,
+                admission.received,
             )
+            || state.revision != admission.revision
+            || !admission.eligible
         {
             return Vec::new();
         }
@@ -391,7 +444,7 @@ impl Tracker {
             return false;
         }
         let mut state = self.state.lock();
-        self.prepare_locked(&mut state, sighting, attachment_ids, 0)
+        self.prepare_locked(&mut state, sighting, attachment_ids, None, Instant::now())
     }
 
     fn prepare_locked(
@@ -399,16 +452,26 @@ impl Tracker {
         state: &mut State,
         sighting: Sighting,
         attachment_ids: &[u64],
-        edited_ms: i64,
+        edited_ms: Option<i64>,
+        received: Instant,
     ) -> bool {
         let wanted = attachment_ids.iter().copied().collect::<BTreeSet<_>>();
         let key = (sighting.guild, sighting.channel, sighting.message);
+        if !state.messages.contains_key(&key) && sighting.message <= state.retired_through {
+            return false;
+        }
+        let mut watermark = edited_ms.unwrap_or(0);
         if let Some(note) = state.messages.get_mut(&key) {
-            if note.deleted || edited_ms < note.edited_ms {
+            if note.deleted
+                || edited_ms.is_some_and(|edited| edited < note.edited_ms)
+                || (edited_ms.is_none() && received < note.received)
+            {
                 return false;
             }
+            watermark = watermark.max(note.edited_ms);
             if note.author == sighting.author && note.attachments == wanted {
-                note.edited_ms = edited_ms;
+                note.edited_ms = watermark;
+                note.received = note.received.max(received);
                 return false;
             }
         }
@@ -420,11 +483,9 @@ impl Tracker {
             min_channels,
         );
         state.remember_message(sighting, wanted);
-        state
-            .messages
-            .get_mut(&key)
-            .expect("remembered message")
-            .edited_ms = edited_ms;
+        let note = state.messages.get_mut(&key).expect("remembered message");
+        note.edited_ms = watermark;
+        note.received = received;
         true
     }
 
@@ -481,12 +542,18 @@ impl Tracker {
 
     #[cfg(test)]
     fn record(&self, sighting: Sighting, key: Key) -> Option<Hit> {
-        self.record_locked(&mut self.state.lock(), sighting, key)
+        self.record_locked(&mut self.state.lock(), sighting, key, false)
     }
 
     // Settlement and invalidation share this lock, so a removed stage cannot
     // be reintroduced as a live sight after forget_message has completed.
-    fn record_locked(&self, state: &mut State, sighting: Sighting, key: Key) -> Option<Hit> {
+    fn record_locked(
+        &self,
+        state: &mut State,
+        sighting: Sighting,
+        key: Key,
+        was_acted: bool,
+    ) -> Option<Hit> {
         if !self.usable() {
             state.clear();
             return None;
@@ -498,6 +565,9 @@ impl Tracker {
         // The physical message owns pending evidence, even when its channel's
         // representative is replaced by a later post of the same attachment.
         if !state.messages.contains_key(&message_key) {
+            if sighting.message <= state.retired_through {
+                return None;
+            }
             state.remember_message(sighting, BTreeSet::new());
         }
         let lifetime = state.messages.get(&message_key)?.lifetime.clone()?;
@@ -563,14 +633,32 @@ impl Tracker {
             {
                 return None;
             }
-            bucket.channels.insert(
-                sighting.channel,
-                ChannelSight {
-                    message: sighting.message,
-                    at: sighting.at,
-                    lifetime,
-                },
-            );
+            let inherited = bucket
+                .channels
+                .get(&sighting.channel)
+                .and_then(|current| current.claimed_at);
+            let claimed_at = if was_acted {
+                Some(inherited.map_or(sighting.at, |at| at.max(sighting.at)))
+            } else {
+                inherited
+            };
+            if bucket
+                .channels
+                .get(&sighting.channel)
+                .is_none_or(|current| current.at <= sighting.at)
+            {
+                bucket.channels.insert(
+                    sighting.channel,
+                    ChannelSight {
+                        message: sighting.message,
+                        at: sighting.at,
+                        lifetime,
+                        claimed_at,
+                    },
+                );
+            } else if was_acted && let Some(current) = bucket.channels.get_mut(&sighting.channel) {
+                current.claimed_at = claimed_at;
+            }
             let newest = bucket
                 .channels
                 .values()
@@ -580,6 +668,14 @@ impl Tracker {
             bucket
                 .channels
                 .retain(|_, sight| newest.saturating_duration_since(sight.at) <= window);
+            for sight in bucket.channels.values_mut() {
+                if sight
+                    .claimed_at
+                    .is_some_and(|at| newest.saturating_duration_since(at) > window)
+                {
+                    sight.claimed_at = None;
+                }
+            }
             bucket.newest = bucket
                 .channels
                 .values()
@@ -590,7 +686,13 @@ impl Tracker {
                 bucket.acted = false;
                 return None;
             }
-            if bucket.acted {
+            if bucket.acted
+                || bucket
+                    .channels
+                    .values()
+                    .any(|sight| sight.claimed_at.is_some())
+            {
+                bucket.acted = true;
                 return None;
             }
             bucket.acted = true;
@@ -625,6 +727,50 @@ impl Tracker {
 }
 
 impl State {
+    // Remove only this physical observation's obsolete metadata contribution.
+    // Another file in the same message may still own the same fallback key.
+    fn retract_fallback(&mut self, staged: &Staged) -> bool {
+        if !staged.fallback {
+            return false;
+        }
+        let sight = staged.sighting;
+        let key = fallback_key(staged);
+        let another = self
+            .messages
+            .get(&(sight.guild, sight.channel, sight.message))
+            .is_some_and(|note| {
+                note.attachments.iter().any(|id| {
+                    self.staged
+                        .get(id)
+                        .is_some_and(|other| other.fallback && fallback_key(other) == key)
+                })
+            });
+        let Some(author) = self
+            .guilds
+            .get_mut(&sight.guild)
+            .and_then(|guild| guild.authors.get_mut(&sight.author))
+        else {
+            return false;
+        };
+        let Some(bucket) = author.keys.get_mut(&key) else {
+            return false;
+        };
+        let acted = bucket.acted;
+        if !another
+            && bucket
+                .channels
+                .get(&sight.channel)
+                .is_some_and(|current| current.message == sight.message)
+        {
+            bucket.channels.remove(&sight.channel);
+        }
+        // Preserve the old claim while its other observations are promoted.
+        if bucket.channels.is_empty() {
+            author.keys.remove(&key);
+        }
+        acted
+    }
+
     fn take_staged(&mut self, attachment_id: u64, generation: u64) -> Option<Staged> {
         match self.staged.get(&attachment_id) {
             Some(staged) if staged.generation == generation => self.staged.remove(&attachment_id),
@@ -716,7 +862,14 @@ impl State {
             && let Some(removed) = self.guilds.remove(&guild)
         {
             self.authors = self.authors.saturating_sub(removed.authors.len());
-            self.messages.retain(|(seen, _, _), _| *seen != guild);
+            self.messages.retain(|(seen, _, message), _| {
+                if *seen == guild {
+                    self.retired_through = self.retired_through.max(*message);
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
@@ -751,6 +904,7 @@ impl State {
                 .min_by_key(|(_, note)| note.at)
                 .map(|(key, _)| *key);
             if let Some(oldest) = oldest {
+                self.retired_through = self.retired_through.max(oldest.2);
                 self.messages.remove(&oldest);
             }
         }
@@ -761,6 +915,7 @@ impl State {
                 at: sighting.at,
                 attachments,
                 edited_ms: 0,
+                received: sighting.at,
                 deleted: false,
                 lifetime: Some(Arc::new(())),
             },
@@ -847,11 +1002,11 @@ fn media_type(value: &str) -> String {
     bound_chars(head, TYPE_CHARS).to_ascii_lowercase()
 }
 
-fn fallback_key(staged: Staged) -> Key {
+fn fallback_key(staged: &Staged) -> Key {
     Key::Fallback {
         size: staged.size,
-        filename: staged.filename,
-        content_type: staged.content_type,
+        filename: staged.filename.clone(),
+        content_type: staged.content_type.clone(),
     }
 }
 
@@ -885,7 +1040,12 @@ impl Handoff {
             ctx,
             sighting,
             files,
-            (app.attachment_burst.revision(), 0),
+            Admission {
+                revision: app.attachment_burst.revision(),
+                edited_ms: None,
+                received: Instant::now(),
+                eligible: true,
+            },
         )
     }
 
@@ -894,7 +1054,7 @@ impl Handoff {
         ctx: &Context,
         sighting: Sighting,
         files: Vec<FileMeta>,
-        admission: (u64, i64),
+        admission: Admission,
     ) -> Self {
         let ids = app
             .attachment_burst
@@ -911,6 +1071,10 @@ impl Handoff {
     pub(crate) fn hand_to_job(&mut self) -> Vec<(u64, u64)> {
         self.armed = false;
         std::mem::take(&mut self.ids)
+    }
+
+    pub(crate) fn observations(&self) -> Vec<(u64, u64)> {
+        self.ids.clone()
     }
 
     pub(crate) fn finish_incomplete(&mut self) {
@@ -1000,10 +1164,16 @@ impl PendingBurst {
                     sighting.message,
                 )
             });
+        let mut was_acted = false;
+        for stage in &stages {
+            was_acted |= state.retract_fallback(stage);
+        }
         let hits = if complete {
             hashes
                 .iter()
-                .filter_map(|hash| tracker.record_locked(&mut state, sighting, Key::Hash(*hash)))
+                .filter_map(|hash| {
+                    tracker.record_locked(&mut state, sighting, Key::Hash(*hash), was_acted)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1057,7 +1227,13 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
     if !app.activation.may_record() || !hit.still_valid() {
         return;
     }
-    let enrollment = cases::capture(app, hit.guild).await;
+    let enrollment = match crate::db::guild_enrollment(&app.db, hit.guild as i64).await {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            tracing::warn!("attachment burst enrollment read failed: {error:#}");
+            return;
+        }
+    };
     if !membership_still(app, hit.guild, &enrollment).await {
         return;
     }
@@ -1133,10 +1309,10 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, hit: Hit) {
         .open_review(&hit, enrollment.clone(), rendered.clone());
     let buttons = vec![CreateActionRow::Buttons(vec![
         CreateButton::new(app.attachment_burst.component_id("r", hit.review_id))
-            .label("Release")
+            .label(templates::render("Release", &BTreeMap::new()))
             .style(ButtonStyle::Success),
         CreateButton::new(app.attachment_burst.component_id("b", hit.review_id))
-            .label("Ban")
+            .label(templates::render("Ban", &BTreeMap::new()))
             .style(ButtonStyle::Danger),
     ])];
     logging::emit_with_components(
@@ -1265,7 +1441,9 @@ async fn membership_still(
     guild: u64,
     admitted: &Option<crate::db::GuildEnrollment>,
 ) -> bool {
-    cases::capture(app, guild).await == *admitted
+    crate::db::guild_enrollment(&app.db, guild as i64)
+        .await
+        .is_ok_and(|current| current == *admitted)
         && !crate::db::guild_stores::guild_is_write_fenced(&app.db, guild as i64)
             .await
             .unwrap_or(true)
@@ -1365,10 +1543,6 @@ pub(crate) async fn handle_component(
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
         return;
     }
-    if cases::capture(app, review.guild).await != review.enrollment {
-        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_FAILED).await;
-        return;
-    }
     let acked = CreateInteractionResponse::Acknowledge
         .execute(&ctx.http, (press.id, press.token.as_str()))
         .await
@@ -1376,6 +1550,21 @@ pub(crate) async fn handle_component(
     if !acked {
         app.attachment_burst.restore_review(press.review_id, review);
         return;
+    }
+    // A read failure says nothing about the original enrollment. Keep the
+    // claim retryable, but never rebind it to a replacement membership.
+    match crate::db::guild_enrollment(&app.db, review.guild as i64).await {
+        Ok(current) if current == review.enrollment => {}
+        Ok(_) => {
+            let _ = review_read_failed(ctx, &press).await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!("attachment burst review enrollment read failed: {error:#}");
+            app.attachment_burst.restore_review(press.review_id, review);
+            let _ = review_read_failed(ctx, &press).await;
+            return;
+        }
     }
     let decision = match press.action {
         ButtonAction::Release => release_member(app, ctx, &review, press.user_id).await,
@@ -1581,6 +1770,11 @@ async fn ban_then_record(
     )
     .await
     else {
+        if let Some(attempt) = attempted {
+            attempt
+                .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
+                .await;
+        }
         pending
             .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
             .await;
@@ -1622,7 +1816,7 @@ async fn ban_then_record(
 async fn ephemeral(ctx: &Context, press: &ButtonPress, text: &str) -> serenity::Result<()> {
     CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
-            .content(text)
+            .content(templates::render(text, &BTreeMap::new()))
             .ephemeral(true),
     )
     .execute(&ctx.http, (press.id, press.token.as_str()))
@@ -1630,9 +1824,336 @@ async fn ephemeral(ctx: &Context, press: &ButtonPress, text: &str) -> serenity::
     .map(|_| ())
 }
 
+async fn review_read_failed(ctx: &Context, press: &ButtonPress) -> serenity::Result<()> {
+    CreateInteractionResponseFollowup::new()
+        .content(templates::render(ATTACHMENT_BURST_FAILED, &BTreeMap::new()))
+        .ephemeral(true)
+        .execute(&ctx.http, (None, press.token.as_str()))
+        .await
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enrollment_read_error_cannot_authorize_a_timeout() {
+        use jmodguard::db::SqlExecutor as _;
+        let (app, path) = open_app();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&mutations);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, route)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "PATCH" {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                let user = route.rsplit('/').next().unwrap_or("99");
+                let member = serde_json::json!({"user":{"id":user,"username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0});
+                write_response(&mut stream, "200 OK", &member.to_string()).await;
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        assert!(
+            membership_still(&app, 10, &None).await,
+            "verified absence remains supported"
+        );
+        enforce(&app, &ctx, test_hit(&app, 99)).await;
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            1,
+            "positive control must reach the real timeout route"
+        );
+        crate::db::enroll_guild(&app.db, 10, 100).await.unwrap();
+        app.db.with_conn(|conn| {
+            conn.execute_bounded("UPDATE guild_enrollments SET joined_at_ns='unreadable fixture value' WHERE guild_id=10", [] as [libsql::Value;0], 65536)?;
+            Ok(())
+        }).await.unwrap();
+        assert!(crate::db::guild_enrollment(&app.db, 10).await.is_err());
+        assert!(
+            !crate::db::guild_stores::guild_is_write_fenced(&app.db, 10)
+                .await
+                .unwrap()
+        );
+        let accepted = membership_still(&app, 10, &None).await;
+        enforce(&app, &ctx, test_hit(&app, 100)).await;
+        let after_error = mutations.load(Ordering::SeqCst);
+        server.abort();
+        let _ = server.await;
+        drop(app);
+        close_app(&path);
+        assert_eq!(
+            after_error, 1,
+            "failed enrollment read must not authorize another timeout"
+        );
+        assert!(
+            !accepted,
+            "mutation rechecks must distinguish lookup failure from verified absence"
+        );
+    }
+
+    fn burst_file(id: u64) -> FileMeta {
+        FileMeta {
+            attachment_id: id,
+            size: 42,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn rejected_updates_revoke_only_superseded_proof() {
+        for rejection in ["revision", "age", "refresh"] {
+            for replacement in [false, true] {
+                let tracker = tracker();
+                let now = Instant::now();
+                let first = sight(4, 10, 100, now);
+                let a = tracker.stage_sighting(
+                    first,
+                    vec![burst_file(1)],
+                    admission(tracker.revision(), 10),
+                );
+                let b = tracker.stage_sighting(
+                    sight(4, 11, 101, now),
+                    vec![burst_file(2)],
+                    admission(tracker.revision(), 10),
+                );
+                assert!(tracker.resolve_hash_at(a[0].0, a[0].1, [1; 32]).is_none());
+                let hit = tracker.resolve_hash_at(b[0].0, b[0].1, [1; 32]).unwrap();
+                let mut edit = admission(tracker.revision(), 20);
+                match rejection {
+                    "revision" => tracker.forget_message(2, 90, 999),
+                    "age" => edit.eligible = false,
+                    _ => {
+                        assert!(
+                            tracker
+                                .stage_sighting(
+                                    first,
+                                    vec![burst_file(1)],
+                                    Admission {
+                                        revision: tracker.revision(),
+                                        edited_ms: None,
+                                        received: now + Duration::from_secs(2),
+                                        eligible: true,
+                                    }
+                                )
+                                .is_empty()
+                        );
+                    }
+                }
+                let files = if replacement {
+                    vec![burst_file(3)]
+                } else {
+                    vec![]
+                };
+                tracker.stage_sighting(first, files, edit);
+                assert!(!hit.still_valid(), "{rejection}, replacement={replacement}");
+                // An older real edit cannot overwrite the replacement or its watermark.
+                assert!(
+                    tracker
+                        .stage_sighting(
+                            first,
+                            vec![burst_file(4)],
+                            admission(tracker.revision(), 15)
+                        )
+                        .is_empty()
+                );
+                assert_eq!(tracker.state.lock().messages[&(1, 10, 100)].edited_ms, 20);
+            }
+        }
+    }
+
+    #[test]
+    fn late_timestamp_free_refresh_cannot_erase_a_newer_snapshot() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let sighting = sight(4, 10, 100, now);
+        let mut newer = admission(tracker.revision(), 20);
+        newer.received = now + Duration::from_secs(1);
+        let ids = tracker.stage_sighting(sighting, vec![burst_file(2)], newer);
+        assert_eq!(ids.len(), 1);
+        assert!(
+            tracker
+                .stage_sighting(
+                    sighting,
+                    vec![burst_file(1)],
+                    Admission {
+                        revision: tracker.revision(),
+                        edited_ms: None,
+                        received: now,
+                        eligible: true,
+                    }
+                )
+                .is_empty()
+        );
+        assert_eq!(tracker.staged_generation(2), Some(ids[0].1));
+    }
+
+    #[test]
+    fn capacity_eviction_keeps_deleted_snapshots_rejected() {
+        for guild_cap in [false, true] {
+            let tracker = tracker();
+            let now = Instant::now();
+            let first = sight(4, 10, 100, now);
+            tracker.prepare_sighting(first, &[1]);
+            tracker.record(first, hash_key(1));
+            tracker.record(sight(4, 11, 101, now), hash_key(2));
+            tracker.forget_message(1, 10, 100);
+            if guild_cap {
+                for n in 0..MAX_GUILDS {
+                    let mut other = sight(4, 20, 1000 + n as u64, now + Duration::from_secs(1));
+                    other.guild = 2 + n as u64;
+                    tracker.record(other, hash_key(3));
+                }
+            } else {
+                for n in 0..MAX_MESSAGES {
+                    tracker.prepare_sighting(
+                        sight(4, 20, 1000 + n as u64, now + Duration::from_secs(1)),
+                        &[1000 + n as u64],
+                    );
+                }
+            }
+            assert!(!tracker.state.lock().messages.contains_key(&(1, 10, 100)));
+            assert!(
+                tracker
+                    .stage_sighting(
+                        first,
+                        vec![burst_file(1)],
+                        admission(tracker.revision(), 10)
+                    )
+                    .is_empty()
+            );
+            assert_eq!(
+                tracker
+                    .stage_sighting(
+                        sight(4, 20, 10000, now + Duration::from_secs(2)),
+                        vec![burst_file(10000)],
+                        admission(tracker.revision(), 30)
+                    )
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_completion_preserves_newest_channel_evidence() {
+        for key in [
+            hash_key(1),
+            Key::Fallback {
+                size: 42,
+                filename: "spam.png".into(),
+                content_type: "image/png".into(),
+            },
+        ] {
+            let tracker = tracker();
+            let now = Instant::now();
+            assert!(
+                tracker
+                    .record(sight(4, 10, 101, now + Duration::from_secs(3)), key.clone())
+                    .is_none()
+            );
+            assert!(
+                tracker
+                    .record(sight(4, 10, 100, now), key.clone())
+                    .is_none()
+            );
+            assert!(
+                tracker
+                    .record(sight(4, 11, 102, now + Duration::from_secs(12)), key)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_observations_leave_metadata_and_keep_one_shot_claims() {
+        for matched_fallback in [false, true] {
+            let tracker = tracker();
+            let now = Instant::now();
+            let first = tracker.stage(sight(4, 10, 100, now), burst_file(1));
+            assert!(tracker.resolve_incomplete_at(1, first).is_none());
+            let second = tracker.stage(sight(4, 11, 101, now), burst_file(2));
+            if matched_fallback {
+                assert!(tracker.resolve_incomplete_at(2, second).is_some());
+            }
+            assert!(tracker.resolve_hash_at(1, first, [1; 32]).is_none());
+            assert_eq!(
+                tracker.resolve_hash_at(2, second, [1; 32]).is_some(),
+                !matched_fallback
+            );
+            assert_eq!(tracker.hits(), 1);
+            let third = tracker.stage(sight(4, 12, 102, now), burst_file(3));
+            assert!(tracker.resolve_hash_at(3, third, [1; 32]).is_none());
+            assert_eq!(tracker.hits(), 1);
+        }
+        let tracker = tracker();
+        let now = Instant::now();
+        let a = tracker.stage(sight(4, 10, 100, now), burst_file(1));
+        tracker.resolve_incomplete_at(1, a);
+        tracker.resolve_hash_at(1, a, [1; 32]);
+        let b = tracker.stage(sight(4, 11, 101, now), burst_file(2));
+        assert!(
+            tracker.resolve_incomplete_at(2, b).is_none(),
+            "completed A must no longer match unfinished metadata"
+        );
+        assert!(
+            tracker.resolve_hash_at(2, b, [2; 32]).is_none(),
+            "completed unequal bytes must not match"
+        );
+        assert_eq!(tracker.hits(), 0);
+    }
+
+    #[test]
+    fn promoting_one_file_preserves_other_unfinished_file_in_same_message() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let a = tracker.stage(sight(4, 10, 100, now), burst_file(1));
+        let b = tracker.stage(sight(4, 10, 100, now), burst_file(2));
+        tracker.resolve_incomplete_at(1, a);
+        tracker.resolve_incomplete_at(2, b);
+        tracker.resolve_hash_at(1, a, [1; 32]);
+        let c = tracker.stage(sight(4, 11, 101, now), burst_file(3));
+        assert!(
+            tracker.resolve_incomplete_at(3, c).is_some(),
+            "file 2 still owns the metadata evidence"
+        );
+    }
+
+    #[test]
+    fn promoted_claim_survives_channel_refresh_only_inside_its_window() {
+        for later in [4, 12] {
+            let tracker = tracker();
+            let now = Instant::now();
+            let a = tracker.stage(sight(4, 10, 100, now), burst_file(1));
+            let b = tracker.stage(sight(4, 11, 101, now), burst_file(2));
+            tracker.resolve_incomplete_at(1, a);
+            assert!(tracker.resolve_incomplete_at(2, b).is_some());
+            tracker.resolve_hash_at(1, a, [1; 32]);
+            // B remains unfinished; a newer post replaces A's hash representative.
+            let a_new = tracker.stage(
+                sight(4, 10, 102, now + Duration::from_secs(3)),
+                burst_file(3),
+            );
+            assert!(tracker.resolve_hash_at(3, a_new, [1; 32]).is_none());
+            let c = tracker.stage(
+                sight(4, 12, 103, now + Duration::from_secs(later)),
+                burst_file(4),
+            );
+            assert_eq!(
+                tracker.resolve_hash_at(4, c, [1; 32]).is_some(),
+                later == 12
+            );
+        }
+    }
 
     fn settings() -> Settings {
         Settings::default()
@@ -1640,6 +2161,15 @@ mod tests {
 
     fn tracker() -> Tracker {
         Tracker::new(settings())
+    }
+
+    fn admission(revision: u64, edited_ms: i64) -> Admission {
+        Admission {
+            revision,
+            edited_ms: Some(edited_ms),
+            received: Instant::now(),
+            eligible: true,
+        }
     }
 
     fn sight(author: u64, channel: u64, message: u64, at: Instant) -> Sighting {
@@ -2755,28 +3285,28 @@ mod tests {
         tracker.forget_message(1, 10, 100);
         assert!(
             tracker
-                .stage_sighting(first, vec![file(1)], (captured, 10))
+                .stage_sighting(first, vec![file(1)], admission(captured, 10))
                 .is_empty()
         );
         assert!(
             tracker
-                .stage_sighting(first, vec![file(1)], (tracker.revision(), 10))
+                .stage_sighting(first, vec![file(1)], admission(tracker.revision(), 10))
                 .is_empty(),
             "delete tombstone rejects fresh replay"
         );
         let current = sight(4, 11, 101, now);
-        let ids = tracker.stage_sighting(current, vec![file(2)], (tracker.revision(), 20));
+        let ids = tracker.stage_sighting(current, vec![file(2)], admission(tracker.revision(), 20));
         assert_eq!(ids.len(), 1);
         assert_eq!(tracker.author_of(1, 11, 101), Some(4));
         // An unchanged edit advances ordering without refreshing evidence time.
         assert!(
             tracker
-                .stage_sighting(current, vec![file(2)], (tracker.revision(), 30))
+                .stage_sighting(current, vec![file(2)], admission(tracker.revision(), 30))
                 .is_empty()
         );
         assert!(
             tracker
-                .stage_sighting(current, vec![file(3)], (tracker.revision(), 25))
+                .stage_sighting(current, vec![file(3)], admission(tracker.revision(), 25))
                 .is_empty()
         );
         assert_eq!(tracker.staged_generation(2), Some(ids[0].1));
@@ -2784,13 +3314,13 @@ mod tests {
         assert!(tracker.staged_generation(2).is_none());
         assert!(
             tracker
-                .stage_sighting(current, vec![file(2)], (tracker.revision(), 30))
+                .stage_sighting(current, vec![file(2)], admission(tracker.revision(), 30))
                 .is_empty(),
             "membership invalidation cannot be undone by replay"
         );
         assert!(
             tracker
-                .stage_sighting(current, vec![file(3)], (tracker.revision(), 40))
+                .stage_sighting(current, vec![file(3)], admission(tracker.revision(), 40))
                 .is_empty(),
             "another pre-departure snapshot cannot revive the physical message"
         );
@@ -2798,7 +3328,7 @@ mod tests {
         let revision = tracker.revision();
         assert_eq!(
             tracker
-                .stage_sighting(next, vec![file(4)], (revision, 40))
+                .stage_sighting(next, vec![file(4)], admission(revision, 40))
                 .len(),
             1
         );
@@ -2806,26 +3336,26 @@ mod tests {
         assert!(tracker.staged_generation(4).is_none());
         assert!(
             tracker
-                .stage_sighting(next, vec![file(5)], (revision, 50))
+                .stage_sighting(next, vec![file(5)], admission(revision, 50))
                 .is_empty()
         );
         let edited = sight(4, 13, 103, now);
         assert_eq!(
             tracker
-                .stage_sighting(edited, vec![file(6)], (tracker.revision(), 10))
+                .stage_sighting(edited, vec![file(6)], admission(tracker.revision(), 10))
                 .len(),
             1
         );
         tracker.invalidate_message_at(1, 13, 103, false, Some(30));
         assert!(
             tracker
-                .stage_sighting(edited, vec![file(7)], (tracker.revision(), 20))
+                .stage_sighting(edited, vec![file(7)], admission(tracker.revision(), 20))
                 .is_empty(),
             "failed config read still advances edit ordering"
         );
         assert_eq!(
             tracker
-                .stage_sighting(edited, vec![file(8)], (tracker.revision(), 40))
+                .stage_sighting(edited, vec![file(8)], admission(tracker.revision(), 40))
                 .len(),
             1,
             "a genuine later replacement remains admissible"
@@ -2937,5 +3467,279 @@ mod tests {
         )));
         server.abort();
         close_app(&path);
+    }
+    #[tokio::test]
+    async fn review_ban_deadline_settles_case_and_audit_identity() {
+        use std::sync::atomic::AtomicUsize;
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let puts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&puts);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, path)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "GET" && path.contains("/bans/") {
+                    write_response(
+                        &mut stream,
+                        "404 Not Found",
+                        r#"{"code":10026,"message":"Unknown Ban"}"#,
+                    )
+                    .await;
+                } else if method == "PUT" {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(90)).await;
+                } else {
+                    write_response(&mut stream, "200 OK", "{}").await;
+                }
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        let review = Review {
+            guild: 10,
+            user: 99,
+            body: String::new(),
+            at: Instant::now(),
+            enrollment: Some(enrollment.clone()),
+        };
+        assert!(matches!(
+            ban_member(&app, &ctx, &review, UserId::new(7)).await,
+            ReviewDecision::Failed
+        ));
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "actual ban PUT must reach fixture"
+        );
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        let summaries = store
+            .case_summaries(scope, ids, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        let outcome = summaries.values().next().unwrap().outcome.clone();
+        let audit = app.remember_discord_audit(crate::db::guild_data::CaseAction::Ban, 10, 99, 777);
+        assert!(
+            audit.is_some(),
+            "uncertain dispatched ban must retain its application identity"
+        );
+        drop(app);
+        close_app(&path);
+        assert!(
+            matches!(outcome, crate::db::guild_data::CaseOutcome::Uncertain),
+            "ban reached Discord but deadline left {outcome:?}"
+        );
+    }
+
+    fn review_interaction(
+        app: &BotState,
+        ctx: &Context,
+        enrollment: crate::db::GuildEnrollment,
+    ) -> ComponentInteraction {
+        use serenity::model::id::{ChannelId, RoleId};
+        let mut role = serenity::model::guild::Role::default();
+        role.id = RoleId::new(20);
+        role.permissions = serenity::model::permissions::Permissions::BAN_MEMBERS;
+        let mut guild = serenity::model::guild::Guild::default();
+        guild.id = GuildId::new(10);
+        guild.roles.insert(role.id, role);
+        let mut event: serenity::model::event::GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(&guild).unwrap()).unwrap();
+        ctx.cache.update(&mut event);
+        assert_eq!(
+            crate::commands::cached_moderator_status(app, &ctx.cache, GuildId::new(10), 7, &[20]),
+            ModeratorStatus::Moderator
+        );
+        let hit = test_hit(app, 99);
+        let id = app.attachment_burst.component_id("r", hit.review_id);
+        app.attachment_burst
+            .open_review(&hit, Some(enrollment), String::new());
+        let mut user = serenity::model::user::User::default();
+        user.id = UserId::new(7);
+        user.name = "moderator".into();
+        let mut member = serenity::model::guild::Member::default();
+        member.guild_id = GuildId::new(10);
+        member.user = user.clone();
+        member.roles = vec![RoleId::new(20)];
+        let mut message = serenity::model::channel::Message::default();
+        message.id = serenity::model::id::MessageId::new(500);
+        message.channel_id = ChannelId::new(10);
+        serde_json::from_value(serde_json::json!({"id":"1","application_id":"1","type":3,"data":{"custom_id":id,"component_type":2},"guild_id":"10","channel_id":"10","member":member,"user":user,"token":"fixture","version":1,"message":message,"locale":"en-US","app_permissions":"8","entitlements":[],"authorizing_integration_owners":{},"context":0,"attachment_size_limit":10000000})).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn review_ack_precedes_database_wait() {
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let clock = Arc::clone(&started);
+        let latency = Arc::new(AtomicU64::new(u64::MAX));
+        let observed = Arc::clone(&latency);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((_, path)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if path.contains("/interactions/") {
+                    let ms = clock.lock().unwrap().elapsed().as_millis() as u64;
+                    observed.store(ms, Ordering::SeqCst);
+                    if ms > 3000 {
+                        write_response(
+                            &mut stream,
+                            "404 Not Found",
+                            r#"{"code":10062,"message":"Unknown interaction"}"#,
+                        )
+                        .await;
+                    } else {
+                        write_response(&mut stream, "204 No Content", "").await;
+                    }
+                } else {
+                    write_response(&mut stream,"200 OK",r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                }
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        let interaction = review_interaction(&app, &ctx, enrollment);
+        let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut blockers = Vec::new();
+        for _ in 0..2 {
+            let app = Arc::clone(&app);
+            let ready = Arc::clone(&ready);
+            blockers.push(tokio::spawn(async move {
+                app.db
+                    .with_conn(move |_| {
+                        ready.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_secs(4));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+        while ready.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        *started.lock().unwrap() = Instant::now();
+        handle_component(&app, &ctx, interaction).await;
+        for blocker in blockers {
+            blocker.await.unwrap();
+        }
+        let actual = latency.load(Ordering::SeqCst);
+        server.abort();
+        let _ = server.await;
+        drop(app);
+        close_app(&path);
+        assert!(
+            actual < 3000,
+            "initial component acknowledgement took {actual} ms, exceeding Discord deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_read_error_preserves_original_claim() {
+        use jmodguard::db::SqlExecutor as _;
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&mutations);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, route)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                if method == "PATCH" && route.contains("/members/") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                if route.contains("/members/") {
+                    write_response(&mut stream, "200 OK", r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#).await;
+                } else {
+                    write_response(&mut stream, "204 No Content", "").await;
+                }
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        let interaction = review_interaction(&app, &ctx, enrollment.clone());
+        app.db
+            .with_conn(|conn| {
+                conn.execute_bounded(
+                    "UPDATE guild_enrollments SET joined_at_ns='unreadable fixture value' WHERE guild_id=10",
+                    [] as [libsql::Value; 0],
+                    65536,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(crate::db::guild_enrollment(&app.db, 10).await.is_err());
+        let mut retry = interaction.clone();
+        retry.id = InteractionId::new(2);
+        handle_component(&app, &ctx, interaction).await;
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+        app.db
+            .with_conn(|conn| {
+                conn.execute_bounded(
+                    "UPDATE guild_enrollments SET joined_at_ns=100 WHERE guild_id=10",
+                    [] as [libsql::Value; 0],
+                    65536,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(cases::capture(&app, 10).await, Some(enrollment));
+        let retained = app.attachment_burst.state.lock().reviews.len();
+        assert_eq!(
+            retained, 1,
+            "the failed read must restore the original claim"
+        );
+        handle_component(&app, &ctx, retry).await;
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            1,
+            "the healthy retry must actually release the member"
+        );
+        assert!(app.attachment_burst.state.lock().reviews.is_empty());
+        server.abort();
+        let _ = server.await;
+        drop(app);
+        close_app(&path);
+        assert_eq!(
+            retained, 1,
+            "a read error permanently consumed the visible review without an action"
+        );
     }
 }
