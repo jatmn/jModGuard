@@ -122,6 +122,7 @@ struct MessageNote {
     attachments: BTreeSet<u64>,
     edited_ms: i64,
     received: Instant,
+    invalidated_revision: u64,
     deleted: bool,
     lifetime: Option<Arc<()>>,
 }
@@ -135,6 +136,7 @@ struct State {
     next_review: u64,
     next_generation: u64,
     revision: u64,
+    scope_revision: u64,
     retired_through: u64,
 }
 
@@ -178,6 +180,7 @@ impl Tracker {
                 next_review: 1,
                 next_generation: 1,
                 revision: 0,
+                scope_revision: 0,
                 retired_through: 0,
             }),
             hits: AtomicU64::new(0),
@@ -193,7 +196,7 @@ impl Tracker {
         }
         let window =
             Duration::from_secs(self.settings.window_secs.saturating_add(PRUNE_SLACK_SECS));
-        state.drop_expired(Instant::now(), window);
+        state.drop_expired(Instant::now(), window, self.settings.min_channels);
         state.drop_old_reviews(Instant::now(), Duration::from_secs(86_400));
     }
 
@@ -228,10 +231,15 @@ impl Tracker {
             return 0;
         }
         let mut state = self.state.lock();
-        Self::stage_locked(&mut state, sighting, file)
+        Self::stage_locked(&mut state, sighting, file, self.settings.min_channels)
     }
 
-    fn stage_locked(state: &mut State, sighting: Sighting, file: FileMeta) -> u64 {
+    fn stage_locked(
+        state: &mut State,
+        sighting: Sighting,
+        file: FileMeta,
+        min_channels: usize,
+    ) -> u64 {
         if state.staged.len() >= MAX_STAGED && !state.staged.contains_key(&file.attachment_id) {
             state.drop_oldest_staged();
         }
@@ -239,7 +247,7 @@ impl Tracker {
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let message = (sighting.guild, sighting.channel, sighting.message);
         if !state.messages.contains_key(&message) {
-            state.remember_message(sighting, BTreeSet::new());
+            state.remember_message(sighting, BTreeSet::new(), min_channels);
         }
         state
             .messages
@@ -330,6 +338,7 @@ impl Tracker {
             return;
         }
         state.revision = state.revision.wrapping_add(1);
+        let invalidated_revision = state.revision;
         state.forget_message(guild, channel, message, self.settings.min_channels);
         let key = (guild, channel, message);
         if !state.messages.contains_key(&key) {
@@ -342,9 +351,11 @@ impl Tracker {
                     at: Instant::now(),
                 },
                 BTreeSet::new(),
+                self.settings.min_channels,
             );
         }
         if let Some(note) = state.messages.get_mut(&key) {
+            note.invalidated_revision = invalidated_revision;
             note.deleted |= deleted;
             note.lifetime = None;
             if let Some(edited_ms) = edited_ms {
@@ -377,6 +388,7 @@ impl Tracker {
     fn invalidate_scope(&self, guild: u64, author: Option<u64>) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
+        state.scope_revision = state.revision;
         for ((seen_guild, _, _), note) in &mut state.messages {
             if *seen_guild == guild && author.is_none_or(|a| a == note.author) {
                 note.lifetime = None;
@@ -404,13 +416,14 @@ impl Tracker {
         admission: Admission,
     ) -> Vec<(u64, u64)> {
         let mut state = self.state.lock();
+        let note = state
+            .messages
+            .get(&(sighting.guild, sighting.channel, sighting.message));
+        let stale = admission.revision < state.scope_revision
+            || note.is_some_and(|note| admission.revision < note.invalidated_revision);
         // Rejected observations may revoke a known superseded snapshot, but
         // must not allocate new evidence or ordering notes for unknown messages.
-        if (state.revision != admission.revision || !admission.eligible)
-            && !state
-                .messages
-                .contains_key(&(sighting.guild, sighting.channel, sighting.message))
-        {
+        if (stale || !admission.eligible) && note.is_none() {
             return Vec::new();
         }
         if !self.usable()
@@ -421,7 +434,7 @@ impl Tracker {
                 admission.edited_ms,
                 admission.received,
             )
-            || state.revision != admission.revision
+            || stale
             || !admission.eligible
         {
             return Vec::new();
@@ -430,7 +443,10 @@ impl Tracker {
             .into_iter()
             .map(|file| {
                 let id = file.attachment_id;
-                (id, Self::stage_locked(&mut state, sighting, file))
+                (
+                    id,
+                    Self::stage_locked(&mut state, sighting, file, self.settings.min_channels),
+                )
             })
             .collect()
     }
@@ -461,6 +477,7 @@ impl Tracker {
             return false;
         }
         let mut watermark = edited_ms.unwrap_or(0);
+        let mut invalidated_revision = 0;
         if let Some(note) = state.messages.get_mut(&key) {
             if note.deleted
                 || edited_ms.is_some_and(|edited| edited < note.edited_ms)
@@ -469,6 +486,7 @@ impl Tracker {
                 return false;
             }
             watermark = watermark.max(note.edited_ms);
+            invalidated_revision = note.invalidated_revision;
             if note.author == sighting.author && note.attachments == wanted {
                 note.edited_ms = watermark;
                 note.received = note.received.max(received);
@@ -482,10 +500,11 @@ impl Tracker {
             sighting.message,
             min_channels,
         );
-        state.remember_message(sighting, wanted);
+        state.remember_message(sighting, wanted, min_channels);
         let note = state.messages.get_mut(&key).expect("remembered message");
         note.edited_ms = watermark;
         note.received = received;
+        note.invalidated_revision = invalidated_revision;
         true
     }
 
@@ -560,7 +579,7 @@ impl Tracker {
         }
         let window = Duration::from_secs(self.settings.window_secs);
         let min_channels = self.settings.min_channels;
-        state.prepare(sighting.guild, sighting.at, window);
+        state.prepare(sighting.guild, min_channels);
         let message_key = (sighting.guild, sighting.channel, sighting.message);
         // The physical message owns pending evidence, even when its channel's
         // representative is replaced by a later post of the same attachment.
@@ -568,7 +587,7 @@ impl Tracker {
             if sighting.message <= state.retired_through {
                 return None;
             }
-            state.remember_message(sighting, BTreeSet::new());
+            state.remember_message(sighting, BTreeSet::new(), min_channels);
         }
         let lifetime = state.messages.get(&message_key)?.lifetime.clone()?;
         let author_exists = state
@@ -786,15 +805,14 @@ impl State {
         self.reviews.clear();
     }
 
-    fn prepare(&mut self, guild: u64, now: Instant, window: Duration) {
-        let slack = window.saturating_add(Duration::from_secs(PRUNE_SLACK_SECS));
-        self.drop_expired(now, slack);
+    fn prepare(&mut self, guild: u64, min_channels: usize) {
+        // Global expiry belongs to the existing periodic prune, not message work.
         if !self.guilds.contains_key(&guild) && self.guilds.len() >= MAX_GUILDS {
-            self.remove_oldest_guild_except(guild);
+            self.remove_oldest_guild_except(guild, min_channels);
         }
     }
 
-    fn drop_expired(&mut self, now: Instant, slack: Duration) {
+    fn drop_expired(&mut self, now: Instant, slack: Duration, min_channels: usize) {
         let guilds: Vec<u64> = self.guilds.keys().copied().collect();
         for guild in guilds {
             let Some(guild_state) = self.guilds.get_mut(&guild) else {
@@ -826,8 +844,21 @@ impl State {
         for id in stale {
             self.staged.remove(&id);
         }
-        self.messages
-            .retain(|_, note| now.saturating_duration_since(note.at) <= slack);
+        let stale: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|(_, note)| now.saturating_duration_since(note.at) > slack)
+            .map(|(key, _)| *key)
+            .collect();
+        for (guild, channel, message) in stale {
+            // A suspended callback can outlive this bounded ordering note.
+            // Keep its invalidation floor without retaining another registry.
+            if let Some(note) = self.messages.get(&(guild, channel, message)) {
+                self.scope_revision = self.scope_revision.max(note.invalidated_revision);
+            }
+            self.forget_message(guild, channel, message, min_channels);
+            self.messages.remove(&(guild, channel, message));
+        }
     }
 
     fn drop_old_reviews(&mut self, now: Instant, keep: Duration) {
@@ -851,7 +882,7 @@ impl State {
         }
     }
 
-    fn remove_oldest_guild_except(&mut self, keep: u64) {
+    fn remove_oldest_guild_except(&mut self, keep: u64, min_channels: usize) {
         let oldest = self
             .guilds
             .iter()
@@ -862,14 +893,17 @@ impl State {
             && let Some(removed) = self.guilds.remove(&guild)
         {
             self.authors = self.authors.saturating_sub(removed.authors.len());
-            self.messages.retain(|(seen, _, message), _| {
-                if *seen == guild {
-                    self.retired_through = self.retired_through.max(*message);
-                    false
-                } else {
-                    true
-                }
-            });
+            let messages: Vec<_> = self
+                .messages
+                .keys()
+                .filter(|(seen, _, _)| *seen == guild)
+                .copied()
+                .collect();
+            for (guild, channel, message) in messages {
+                self.retired_through = self.retired_through.max(message);
+                self.forget_message(guild, channel, message, min_channels);
+                self.messages.remove(&(guild, channel, message));
+            }
         }
     }
 
@@ -895,7 +929,12 @@ impl State {
         }
     }
 
-    fn remember_message(&mut self, sighting: Sighting, attachments: BTreeSet<u64>) {
+    fn remember_message(
+        &mut self,
+        sighting: Sighting,
+        attachments: BTreeSet<u64>,
+        min_channels: usize,
+    ) {
         let key = (sighting.guild, sighting.channel, sighting.message);
         if self.messages.len() >= MAX_MESSAGES && !self.messages.contains_key(&key) {
             let oldest = self
@@ -905,6 +944,7 @@ impl State {
                 .map(|(key, _)| *key);
             if let Some(oldest) = oldest {
                 self.retired_through = self.retired_through.max(oldest.2);
+                self.forget_message(oldest.0, oldest.1, oldest.2, min_channels);
                 self.messages.remove(&oldest);
             }
         }
@@ -916,6 +956,7 @@ impl State {
                 attachments,
                 edited_ms: 0,
                 received: sighting.at,
+                invalidated_revision: 0,
                 deleted: false,
                 lifetime: Some(Arc::new(())),
             },
@@ -923,26 +964,34 @@ impl State {
     }
 
     fn forget_message(&mut self, guild: u64, channel: u64, message: u64, min_channels: usize) {
-        self.staged.retain(|_, staged| {
-            !(staged.sighting.guild == guild
-                && staged.sighting.channel == channel
-                && staged.sighting.message == message)
-        });
-        if let Some(note) = self.messages.get_mut(&(guild, channel, message)) {
-            note.lifetime = None;
+        let Some(note) = self.messages.get_mut(&(guild, channel, message)) else {
+            return;
+        };
+        note.lifetime = None;
+        let author = note.author;
+        for id in &note.attachments {
+            if self.staged.get(id).is_some_and(|stage| {
+                (
+                    stage.sighting.guild,
+                    stage.sighting.channel,
+                    stage.sighting.message,
+                ) == (guild, channel, message)
+            }) {
+                self.staged.remove(id);
+            }
         }
         let Some(guild_state) = self.guilds.get_mut(&guild) else {
             return;
         };
-        let authors: Vec<u64> = guild_state.authors.keys().copied().collect();
-        for author in authors {
-            let Some(author_state) = guild_state.authors.get_mut(&author) else {
-                continue;
-            };
+        if let Some(author_state) = guild_state.authors.get_mut(&author) {
             author_state.keys.retain(|_, bucket| {
-                bucket.channels.retain(|seen_channel, sight| {
-                    !(*seen_channel == channel && sight.message == message)
-                });
+                if bucket
+                    .channels
+                    .get(&channel)
+                    .is_some_and(|sight| sight.message == message)
+                {
+                    bucket.channels.remove(&channel);
+                }
                 if bucket.channels.len() < min_channels {
                     bucket.acted = false;
                 }
@@ -1365,7 +1414,8 @@ async fn apply_timeout(
     hit: &Hit,
     enrollment: &Option<crate::db::GuildEnrollment>,
 ) -> Option<crate::db::guild_data::CaseOutcome> {
-    let Some(mut member) = member(ctx, GuildId::new(hit.guild), UserId::new(hit.author)).await
+    let Some(mut member) =
+        fresh_member(ctx, GuildId::new(hit.guild), UserId::new(hit.author)).await
     else {
         tracing::warn!("attachment burst timeout skipped because the member was not available");
         return None;
@@ -1377,6 +1427,12 @@ async fn apply_timeout(
     ) else {
         return None;
     };
+    if member
+        .communication_disabled_until
+        .is_some_and(|current| current >= until)
+    {
+        return None;
+    }
     if !app.activation.may_record()
         || !membership_still(app, hit.guild, enrollment).await
         || !hit.still_valid()
@@ -1402,6 +1458,14 @@ async fn member(
     {
         return Some(found);
     }
+    fresh_member(ctx, guild, user).await
+}
+
+async fn fresh_member(
+    ctx: &Context,
+    guild: GuildId,
+    user: UserId,
+) -> Option<serenity::model::guild::Member> {
     match tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild.member(&ctx.http, user),
@@ -1838,6 +1902,153 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn automatic_timeout_preserves_a_longer_current_sanction() {
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mutations = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&mutations);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some((method, route)) = read_request(&mut stream).await else {
+                    continue;
+                };
+                let user = route.rsplit('/').next().unwrap();
+                if method == "PATCH" {
+                    seen.lock().push(user.to_string());
+                }
+                let until = match user {
+                    "99" => Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+                    "100" => Some((chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339()),
+                    _ => None,
+                };
+                let member = serde_json::json!({"user":{"id":user,"username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0,"communication_disabled_until":until});
+                write_response(&mut stream, "200 OK", &member.to_string()).await;
+            }
+        });
+        let ctx = fixture_context(http_at(address)).await;
+        // A stale Gateway cache must not conceal the longer current REST timeout.
+        let mut guild = serenity::model::guild::Guild::default();
+        guild.id = GuildId::new(10);
+        let mut cached = serenity::model::guild::Member::default();
+        cached.guild_id = guild.id;
+        cached.user.id = UserId::new(99);
+        guild.members.insert(cached.user.id, cached);
+        let mut event: serenity::model::event::GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(&guild).unwrap()).unwrap();
+        ctx.cache.update(&mut event);
+        for author in [99, 100, 101] {
+            enforce(&app, &ctx, test_hit(&app, author)).await;
+        }
+        let review_body = app
+            .attachment_burst
+            .state
+            .lock()
+            .reviews
+            .values()
+            .find(|review| review.user == 99)
+            .unwrap()
+            .body
+            .clone();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let cases = store
+            .case_count(scope, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        let dispatched = mutations.lock().clone();
+        server.abort();
+        let _ = server.await;
+        drop(app);
+        close_app(&path);
+        assert_eq!(
+            dispatched,
+            vec!["100", "101"],
+            "retain a longer timeout; still apply to a shorter or absent timeout"
+        );
+        assert_eq!(
+            cases, 2,
+            "a skipped automatic timeout must not create an attempted case"
+        );
+        assert!(
+            review_body.contains(ATTACHMENT_BURST_TIMEOUT_MISSED),
+            "review must not claim a new timeout was applied"
+        );
+    }
+
+    #[test]
+    fn unrelated_message_invalidation_preserves_pending_admission() {
+        for known in [false, true] {
+            let tracker = tracker();
+            let now = Instant::now();
+            let original = sight(4, 10, 100, now);
+            if known {
+                tracker.stage_sighting(
+                    original,
+                    vec![burst_file(1)],
+                    admission(tracker.revision(), 10),
+                );
+            }
+            let receipt = tracker.revision();
+            tracker.forget_message(2, 90, 999);
+            let ids = tracker.stage_sighting(original, vec![burst_file(2)], admission(receipt, 20));
+            assert_eq!(
+                ids.len(),
+                1,
+                "unrelated deletion lost known={known} observation"
+            );
+            assert!(tracker.resolve_hash_at(2, ids[0].1, [1; 32]).is_none());
+            let next = tracker.stage_sighting(
+                sight(4, 11, 101, now),
+                vec![burst_file(3)],
+                admission(tracker.revision(), 20),
+            );
+            assert!(tracker.resolve_hash_at(3, next[0].1, [1; 32]).is_some());
+        }
+        let tracker = tracker();
+        let now = Instant::now();
+        let first = sight(4, 10, 100, now);
+        tracker.stage_sighting(
+            first,
+            vec![burst_file(1)],
+            admission(tracker.revision(), 10),
+        );
+        let old = tracker.revision();
+        tracker.invalidate_message_at(1, 10, 100, false, Some(20));
+        assert!(
+            tracker
+                .stage_sighting(first, vec![burst_file(2)], admission(old, 30))
+                .is_empty(),
+            "the affected message still rejects its old receipt"
+        );
+        // Its invalidation watermark must survive replacement of the ordering note.
+        assert!(
+            tracker
+                .stage_sighting(first, vec![burst_file(3)], admission(old, 40))
+                .is_empty()
+        );
+        let old = tracker.revision();
+        tracker.invalidate_guild(1);
+        assert!(
+            tracker
+                .stage_sighting(
+                    sight(4, 20, 200, now),
+                    vec![burst_file(4)],
+                    admission(old, 50)
+                )
+                .is_empty(),
+            "scope retirement still rejects unknown in-flight observations"
+        );
+    }
+
+    #[tokio::test]
     async fn enrollment_read_error_cannot_authorize_a_timeout() {
         use jmodguard::db::SqlExecutor as _;
         let (app, path) = open_app();
@@ -2042,6 +2253,109 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn losing_an_ordering_note_retires_only_its_owned_evidence() {
+        for removal in ["message-cap", "guild-cap", "expiry"] {
+            let tracker = tracker();
+            let now = Instant::now();
+            let first = sight(4, 10, 100, now);
+            let generation = tracker.stage(first, burst_file(1));
+            tracker.resolve_incomplete_at(1, generation);
+            let second = tracker.stage(sight(4, 11, 101, now), burst_file(2));
+            let hit = tracker.resolve_incomplete_at(2, second).unwrap();
+            tracker.stage(first, burst_file(3));
+            let mut other = sight(8, 30, 500, now + Duration::from_secs(2));
+            other.guild = 2;
+            // Reused attachment handles must be checked against their physical owner.
+            let other_generation = tracker.stage(other, burst_file(3));
+            tracker.resolve_incomplete_at(3, other_generation);
+            match removal {
+                "message-cap" => {
+                    for n in 0..MAX_MESSAGES {
+                        tracker.prepare_sighting(
+                            sight(9, 20, 1000 + n as u64, now + Duration::from_secs(1)),
+                            &[1000 + n as u64],
+                        );
+                    }
+                }
+                "guild-cap" => {
+                    for n in 0..MAX_GUILDS {
+                        let mut added = sight(9, 20, 1000 + n as u64, now + Duration::from_secs(1));
+                        added.guild = 3 + n as u64;
+                        tracker.record(added, hash_key(7));
+                    }
+                }
+                _ => tracker.state.lock().drop_expired(
+                    now + Duration::from_secs(5),
+                    Duration::from_secs(3),
+                    settings().min_channels,
+                ),
+            }
+            assert!(
+                !tracker.state.lock().messages.contains_key(&(1, 10, 100)),
+                "{removal}"
+            );
+            tracker.forget_message(1, 10, 100);
+            assert!(!hit.still_valid(), "{removal} must leave no unowned proof");
+            assert!(tracker.resolve_hash_at(1, generation, [1; 32]).is_none());
+            assert!(
+                tracker
+                    .resolve_hash_at(3, other_generation, [9; 32])
+                    .is_none()
+            );
+            let mut next = other;
+            next.channel = 31;
+            next.message = 20_000;
+            next.at = now + Duration::from_secs(3);
+            let next_generation = tracker.stage(next, burst_file(20_000));
+            assert!(
+                tracker
+                    .resolve_hash_at(20_000, next_generation, [9; 32])
+                    .is_some(),
+                "{removal} must preserve unrelated staged ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_ordering_notes_keep_old_admissions_fenced() {
+        let tracker = tracker();
+        let now = Instant::now();
+        let original = sight(4, 10, 100, now);
+        let old_receipt = tracker.revision();
+        tracker.invalidate_message_at(1, 10, 100, false, Some(20));
+        let fresh_receipt = tracker.revision();
+        tracker.state.lock().drop_expired(
+            now + Duration::from_secs(1000),
+            Duration::from_secs(1),
+            settings().min_channels,
+        );
+        assert!(!tracker.state.lock().messages.contains_key(&(1, 10, 100)));
+        assert!(
+            tracker
+                .stage_sighting(original, vec![burst_file(1)], admission(old_receipt, 30))
+                .is_empty()
+        );
+        assert_eq!(
+            tracker
+                .stage_sighting(original, vec![burst_file(2)], admission(fresh_receipt, 40))
+                .len(),
+            1,
+            "a fresh edit of the old message ID remains admissible"
+        );
+        assert_eq!(
+            tracker
+                .stage_sighting(
+                    sight(8, 20, 50, now),
+                    vec![burst_file(3)],
+                    admission(fresh_receipt, 40)
+                )
+                .len(),
+            1,
+            "expiry must not impose a global message-ID floor"
+        );
     }
 
     #[test]
@@ -2351,10 +2665,11 @@ mod tests {
         assert!(keys <= MAX_KEYS_PER_AUTHOR);
         let old = now;
         let _ = tracker.record(sight(8, 10, 1, old), hash_key(3));
-        tracker
-            .state
-            .lock()
-            .drop_expired(old + Duration::from_secs(10_000), Duration::from_secs(1));
+        tracker.state.lock().drop_expired(
+            old + Duration::from_secs(10_000),
+            Duration::from_secs(1),
+            settings().min_channels,
+        );
         assert_eq!(tracker.state.lock().authors, 0);
 
         for id in 0..2_000 {
@@ -2807,7 +3122,19 @@ mod tests {
         let release_task = Arc::clone(&release);
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_request(&mut stream).await;
+            let (method, _) = read_request(&mut stream).await.unwrap();
+            assert_eq!(method, "GET");
+            write_response(
+                &mut stream,
+                "200 OK",
+                r#"{"user":{"id":"99","username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0}"#,
+            ).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (method, _) = read_request(&mut stream).await.unwrap();
+            assert_eq!(
+                method, "PATCH",
+                "pause after the real mutation was dispatched"
+            );
             started_task.notify_one();
             while !release_task.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;

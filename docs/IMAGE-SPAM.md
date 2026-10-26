@@ -160,6 +160,8 @@ outside the window, and other members do not count. A repeated delivery of
 the same message does not time the member out again. The timeout is the only
 automatic action; the buttons reuse the existing timeout removal, ban, and
 case paths. A button posted before a restart does not apply to a later review.
+Before applying the automatic timeout, the bot reads the member's current timeout
+from Discord and preserves an equal or longer timeout already in place.
 
 ## Resource controls
 
