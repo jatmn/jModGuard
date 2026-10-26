@@ -158,12 +158,15 @@ impl Hit {
     }
 }
 
+type TimeoutLocks = HashMap<(u64, u64), Weak<tokio::sync::Mutex<()>>>;
+
 pub struct Tracker {
     settings: Settings,
     process_nonce: u64,
     state: Mutex<State>,
     hits: AtomicU64,
     slots: Arc<tokio::sync::Semaphore>,
+    timeout_locks: Mutex<TimeoutLocks>,
 }
 
 impl Tracker {
@@ -185,6 +188,7 @@ impl Tracker {
             }),
             hits: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+            timeout_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1431,6 +1435,21 @@ async fn apply_timeout(
     hit: &Hit,
     enrollment: &Option<crate::db::GuildEnrollment>,
 ) -> Option<crate::db::guild_data::CaseOutcome> {
+    // Only the four admitted actions retain these locks. Reclaim dead entries
+    // before adding one, and keep each member's read and write in the same turn.
+    let lock = {
+        let mut locks = app.attachment_burst.timeout_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let entry = locks.entry((hit.guild, hit.author)).or_default();
+        if let Some(lock) = entry.upgrade() {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            *entry = Arc::downgrade(&lock);
+            lock
+        }
+    };
+    let _guard = raced(app, async { Ok(lock.lock().await) }).await?.ok()?;
     let Some(mut member) =
         fresh_member(ctx, GuildId::new(hit.guild), UserId::new(hit.author)).await
     else {
@@ -2706,6 +2725,42 @@ mod tests {
     }
 
     #[test]
+    fn author_limit_applies_across_guilds() {
+        let tracker = tracker();
+        let now = Instant::now();
+        // Stay below every per-guild cap while crossing the process-wide cap.
+        let per_guild = MAX_AUTHORS_PER_GUILD / 2;
+        for author in 0..MAX_AUTHORS * 2 {
+            tracker.record(
+                Sighting {
+                    guild: (author / per_guild + 1) as u64,
+                    ..sight(author as u64, 10, author as u64 + 1, now)
+                },
+                hash_key(1),
+            );
+            let state = tracker.state.lock();
+            let actual: usize = state.guilds.values().map(|guild| guild.authors.len()).sum();
+            assert_eq!(
+                state.authors, actual,
+                "author accounting must match retained state"
+            );
+            assert!(
+                actual <= MAX_AUTHORS,
+                "global author cap exceeded across guilds"
+            );
+            if author + 1 == MAX_AUTHORS {
+                assert_eq!(actual, MAX_AUTHORS, "fixture must reach the global cap");
+            }
+            assert!(
+                state
+                    .guilds
+                    .values()
+                    .all(|guild| guild.authors.len() < MAX_AUTHORS_PER_GUILD)
+            );
+        }
+    }
+
+    #[test]
     fn state_prunes_and_stays_bounded() {
         let tracker = tracker();
         let now = Instant::now();
@@ -3170,6 +3225,147 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         server.abort();
         close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn automatic_timeouts_serialize_each_member_before_reading() {
+        use hyper::{
+            Body, Response, Server,
+            service::{make_service_fn, service_fn},
+        };
+        use std::convert::Infallible;
+
+        let (app, path) = open_app();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let deadlines = Arc::new(Mutex::new(HashMap::<u64, serde_json::Value>::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let other_done = Arc::new(tokio::sync::Notify::new());
+        let service = make_service_fn({
+            let requests = Arc::clone(&requests);
+            let deadlines = Arc::clone(&deadlines);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let other_done = Arc::clone(&other_done);
+            move |_| {
+                let requests = Arc::clone(&requests);
+                let deadlines = Arc::clone(&deadlines);
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let other_done = Arc::clone(&other_done);
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |request: hyper::Request<Body>| {
+                        let requests = Arc::clone(&requests);
+                        let deadlines = Arc::clone(&deadlines);
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        let other_done = Arc::clone(&other_done);
+                        async move {
+                            let user: u64 = request
+                                .uri()
+                                .path()
+                                .rsplit('/')
+                                .next()
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            let patch = request.method() == hyper::Method::PATCH;
+                            let first_patch = {
+                                let mut requests = requests.lock();
+                                let first =
+                                    patch && user == 99 && !requests.contains(&(true, user));
+                                requests.push((patch, user));
+                                first
+                            };
+                            if patch {
+                                let body =
+                                    hyper::body::to_bytes(request.into_body()).await.unwrap();
+                                let body: serde_json::Value =
+                                    serde_json::from_slice(&body).unwrap();
+                                if first_patch {
+                                    started.notify_one();
+                                    release.notified().await;
+                                }
+                                deadlines
+                                    .lock()
+                                    .insert(user, body["communication_disabled_until"].clone());
+                                if user == 100 {
+                                    other_done.notify_one();
+                                }
+                            }
+                            let until = deadlines.lock().get(&user).cloned();
+                            let body = serde_json::json!({"user":{"id":user.to_string(),"username":"member","discriminator":"0","avatar":null},"roles":[],"joined_at":"2020-01-01T00:00:00+00:00","deaf":false,"mute":false,"flags":0,"communication_disabled_until":until});
+                            Ok::<_, Infallible>(Response::new(Body::from(body.to_string())))
+                        }
+                    }))
+                }
+            }
+        });
+        let server = Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(service);
+        let ctx = fixture_context(http_at(server.local_addr())).await;
+        let server = tokio::spawn(server);
+        dispatch(&app, &ctx, vec![test_hit(&app, 99)]);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let now = Instant::now();
+        let sight = |channel| Sighting {
+            guild: 10,
+            author: 99,
+            channel,
+            message: channel * 100 + 99,
+            at: now,
+        };
+        assert!(app.attachment_burst.record(sight(3), hash_key(2)).is_none());
+        let second = app.attachment_burst.record(sight(4), hash_key(2)).unwrap();
+        dispatch(&app, &ctx, vec![second, test_hit(&app, 100)]);
+        tokio::time::timeout(Duration::from_secs(5), other_done.notified())
+            .await
+            .unwrap();
+        // The other member reaches Discord while the first PATCH is still blocked.
+        // Allow the same-member task to reach its read if it is not serialized.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before_release = requests.lock().clone();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.attachment_burst.slots.available_permits() != MAX_IN_FLIGHT {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = requests.lock().clone();
+        let reviews = app.attachment_burst.state.lock().reviews.len();
+        server.abort();
+        let _ = server.await;
+        drop(app);
+        close_app(&path);
+        assert_eq!(
+            before_release
+                .iter()
+                .filter(|request| **request == (false, 99))
+                .count(),
+            1,
+            "second burst must wait for the first timeout before reading this member"
+        );
+        assert!(
+            before_release.contains(&(true, 100)),
+            "another member must remain independent"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|request| **request == (false, 99))
+                .count(),
+            2,
+            "the waiting burst must re-read the current timeout"
+        );
+        assert_eq!(reviews, 3, "serialization must retain each admitted review");
     }
 
     #[tokio::test]

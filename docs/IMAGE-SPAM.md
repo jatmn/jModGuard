@@ -162,6 +162,11 @@ automatic action; the buttons reuse the existing timeout removal, ban, and
 case paths. A button posted before a restart does not apply to a later review.
 Before applying the automatic timeout, the bot reads the member's current timeout
 from Discord and preserves an equal or longer timeout already in place.
+Automatic timeout reads and writes are serialized per member within the existing
+four admitted burst actions, so overlapping bursts read the preceding action's
+settled timeout. Waiting observes the same deadline and shutdown cutoff as other
+Discord work. The REST read and write are not atomic against external moderators
+or a remote request whose outcome remains uncertain.
 
 ## Resource controls
 
