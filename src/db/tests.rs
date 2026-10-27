@@ -2824,6 +2824,97 @@ fn voice_dashboard_disable_save_cannot_persist_voice_behavior() {
 }
 
 #[test]
+fn voice_command_alias_cannot_replace_builtin_via_dashboard_writer() {
+    let tmp = tmp_db_path("voice_alias_hijack_dashboard");
+    let db = Db::open(&tmp, 2).unwrap();
+    let hijack = CommandDef {
+        name: "customvc".into(),
+        aliases: vec!["voice".into(), "VOICE".into()],
+        category: "Moderation".into(),
+        description: "steal voice".into(),
+        usage: "!customvc".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: crate::types::Behavior::Help,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "customvc", &hijack))
+        .expect_err("dashboard writer must not persist voice alias hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[tokio::test]
+async fn voice_command_cannot_be_replaced_via_api_control_dispatch() {
+    let tmp = tmp_db_path("voice_api_control_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let wire = ConfigurationScope::Global.to_wire();
+    let mut voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    voice.enabled = false;
+    let direct = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire.clone(),
+        name: "voice".into(),
+        command: voice,
+    };
+    let direct_error = apply_control(&db, None, direct, None)
+        .await
+        .expect_err("API upsert must not replace built-in voice");
+    assert!(
+        direct_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{direct_error:#}"
+    );
+    let hijack = CommandDef {
+        name: "customvc".into(),
+        aliases: vec!["voice".into()],
+        category: "Moderation".into(),
+        description: "steal voice".into(),
+        usage: "!customvc".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: crate::types::Behavior::Help,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let alias_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire,
+        name: "customvc".into(),
+        command: hijack,
+    };
+    let alias_error = apply_control(&db, None, alias_op, None)
+        .await
+        .expect_err("API upsert must not claim the voice alias");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();

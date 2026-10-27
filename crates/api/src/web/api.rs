@@ -608,7 +608,7 @@ pub async fn get_command(
     })))
 }
 
-fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
+fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef) -> ApiResult<()> {
     let valid_name = !cmd.name.is_empty()
         && cmd.name.len() <= 32
         && cmd
@@ -624,6 +624,11 @@ fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
     if !(1..=100).contains(&description_len) {
         return Err(ApiError(anyhow::anyhow!(
             "command description must be 1-100 characters"
+        )));
+    }
+    if crate::defaults::rejects_binary_overlay_command_persist(storage_name, cmd) {
+        return Err(ApiError(anyhow::anyhow!(
+            "command `{storage_name}` is merged from the running binary and cannot be written to the database"
         )));
     }
     Ok(())
@@ -642,7 +647,7 @@ pub async fn put_command(
     let name = name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&data)?;
+    validate_command_descriptor(&name, &data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -679,7 +684,7 @@ pub async fn create_command(
     let name = body.data.name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&data)?;
+    validate_command_descriptor(&name, &data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(

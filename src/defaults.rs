@@ -399,6 +399,10 @@ pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandD
     is_binary_overlay_command_name(storage_name)
         || is_binary_overlay_command_name(&cmd.name)
         || is_binary_overlay_behavior(&cmd.behavior)
+        || cmd
+            .aliases
+            .iter()
+            .any(|alias| is_binary_overlay_command_name(alias))
 }
 
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
@@ -740,5 +744,25 @@ mod rolling_upgrade_tests {
             ..voice
         };
         assert!(command_def_is_binary_overlay(&renamed));
+    }
+
+    #[test]
+    fn voice_alias_cannot_replace_builtin_command() {
+        let hijack = CommandDef {
+            name: "customvc".into(),
+            aliases: vec!["voice".into()],
+            category: "Moderation".into(),
+            description: "steal voice".into(),
+            usage: "!customvc".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist("customvc", &hijack));
     }
 }
