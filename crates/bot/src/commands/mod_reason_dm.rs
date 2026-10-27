@@ -104,12 +104,19 @@ pub(crate) fn moderation_failure_error(
     anyhow::Error::msg(text)
 }
 
+pub(crate) fn dm_outcome_may_have_delivered(dm_outcome: Option<ModReasonDmOutcome>) -> bool {
+    matches!(
+        dm_outcome,
+        Some(ModReasonDmOutcome::Sent) | Some(ModReasonDmOutcome::Uncertain)
+    )
+}
+
 pub(crate) async fn send_mod_reason_dm_moderation_failed_followup(
     env: &CmdEnv<'_>,
     target: UserId,
     dm_outcome: Option<ModReasonDmOutcome>,
 ) {
-    if dm_outcome != Some(ModReasonDmOutcome::Sent) {
+    if !dm_outcome_may_have_delivered(dm_outcome) {
         return;
     }
     bounded_mod_reason_dm_future(send_mod_reason_dm_moderation_failed_followup_inner(
@@ -181,7 +188,30 @@ pub(crate) async fn send_mod_reason_dm(
     action: &str,
     reason: &str,
 ) -> ModReasonDmOutcome {
-    bounded_mod_reason_dm_future(send_mod_reason_dm_inner(env, target, action, reason)).await
+    bounded_mod_reason_dm_future(send_mod_reason_dm_inner(
+        env,
+        target,
+        action,
+        reason,
+        jmodguard::defaults::MOD_REASON_DM_TEMPLATE,
+    ))
+    .await
+}
+
+pub(crate) async fn send_mod_reason_dm_already_removed(
+    env: &CmdEnv<'_>,
+    target: UserId,
+    action: &str,
+    reason: &str,
+) -> ModReasonDmOutcome {
+    bounded_mod_reason_dm_future(send_mod_reason_dm_inner(
+        env,
+        target,
+        action,
+        reason,
+        jmodguard::defaults::MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE,
+    ))
+    .await
 }
 
 async fn send_mod_reason_dm_inner(
@@ -189,6 +219,7 @@ async fn send_mod_reason_dm_inner(
     target: UserId,
     action: &str,
     reason: &str,
+    template: &str,
 ) -> ModReasonDmOutcome {
     let guild = env
         .ctx
@@ -197,7 +228,13 @@ async fn send_mod_reason_dm_inner(
         .map(|g| g.name.clone())
         .unwrap_or_else(|| env.guild_id.to_string());
     let actor = format!("{} (<@{}>)", env.actor_member.display_name(), env.actor);
-    let text = render_mod_reason_dm_body_for_reason(&guild, action, reason, &actor);
+    let text = if template == jmodguard::defaults::MOD_REASON_DM_TEMPLATE {
+        render_mod_reason_dm_body_for_reason(&guild, action, reason, &actor)
+    } else {
+        let clean = jmodguard::ban_reason::without_tag(reason);
+        let vars = mod_reason_dm_vars(&guild, action, clean, &actor);
+        jmodguard::templates::render_bounded(template, &vars, 2000)
+    };
 
     let channel = match crate::discord::race_discord_call(
         &env.app.activation,
@@ -371,29 +408,24 @@ mod tests {
 
     #[test]
     fn dm_clause_renders_sent_not_sent_and_uncertain() {
-        for outcome in [
-            ModReasonDmOutcome::Sent,
-            ModReasonDmOutcome::NotSent,
-            ModReasonDmOutcome::Uncertain,
-        ] {
-            let clause = render_mod_reason_dm_clause(outcome);
+        let sent = render_mod_reason_dm_clause(ModReasonDmOutcome::Sent);
+        let not_sent = render_mod_reason_dm_clause(ModReasonDmOutcome::NotSent);
+        let uncertain = render_mod_reason_dm_clause(ModReasonDmOutcome::Uncertain);
+        for clause in [&sent, &not_sent, &uncertain] {
             assert!(
                 clause.starts_with(" | "),
                 "confirmation must join with the shipped separator: {clause:?}"
             );
         }
-        assert!(
-            render_mod_reason_dm_clause(ModReasonDmOutcome::Sent)
-                .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT,)
-        );
-        assert!(
-            render_mod_reason_dm_clause(ModReasonDmOutcome::NotSent)
-                .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT,)
-        );
-        assert!(
-            render_mod_reason_dm_clause(ModReasonDmOutcome::Uncertain)
-                .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN,)
-        );
+        assert!(sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
+        assert!(!sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT));
+        assert!(!sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN));
+        assert!(not_sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT));
+        assert!(!not_sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
+        assert!(!not_sent.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN));
+        assert!(uncertain.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN));
+        assert!(!uncertain.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
+        assert!(!uncertain.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT));
         assert!(render_mod_reason_dm_clause(ModReasonDmOutcome::Cancelled).is_empty());
     }
 

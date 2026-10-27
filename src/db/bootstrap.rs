@@ -958,6 +958,26 @@ pub(crate) fn legacy_kick_ban_usage_payload(
 
 const KICK_BAN_DM_USAGE_MARKER: &str = "kick_ban_dm_usage_v1";
 
+fn kick_ban_dm_usage_needs_upgrade(conn: &impl SqlExecutor) -> Result<bool> {
+    for cmd in crate::defaults::default_commands() {
+        let (name, legacy_usage) = match cmd.name.as_str() {
+            "kick" => ("kick", "!kick <user> [reason]"),
+            "ban" => ("ban", "!ban <user> [reason]"),
+            _ => continue,
+        };
+        let legacy = legacy_kick_ban_usage_payload(&cmd, legacy_usage)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE name = ?1 AND data = ?2",
+            params![name, legacy],
+            |row| Ok(row.get(0)?),
+        )?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn kick_ban_dm_usage_upgrade_sql() -> Result<String> {
     let mut sql = String::new();
     for cmd in crate::defaults::default_commands() {
@@ -990,6 +1010,13 @@ fn kick_ban_dm_usage_upgrade_sql() -> Result<String> {
 /// sees a satisfied seed so guild-scoped rows are not skipped after the marker
 /// is first written.
 pub(super) fn upgrade_legacy_kick_ban_usage_conn(conn: &mut Connection) -> Result<()> {
+    let marker_missing = meta_string_conn(conn, KICK_BAN_DM_USAGE_MARKER)?.is_none();
+    if !kick_ban_dm_usage_needs_upgrade(conn)? {
+        if marker_missing {
+            write_meta_string_conn(conn, KICK_BAN_DM_USAGE_MARKER, "1")?;
+        }
+        return Ok(());
+    }
     let body = kick_ban_dm_usage_upgrade_sql()?;
     let tx = conn.transaction_immediate()?;
     let before = total_changes(&tx)?;

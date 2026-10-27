@@ -819,8 +819,9 @@ async fn set_slash_commands(
         let description = slash_description(&cmd.description);
         let mut builder = CreateCommand::new(name).description(description);
         for opt in behaviors::slash_spec(&cmd.behavior) {
-            let mut o = CreateCommandOption::new(opt.kind, opt.name, opt.description)
-                .required(opt.required);
+            let description = templates::render(opt.description, &BTreeMap::new());
+            let mut o =
+                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
             if opt.kind == CommandOptionType::Integer {
                 o = o.min_int_value(0);
             }
@@ -1324,6 +1325,14 @@ async fn run_command(env: CmdEnv<'_>) -> Result<BehaviorOutcome> {
 }
 
 fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
+    const DISCORD_MESSAGE_LIMIT: usize = 2000;
+    let clause = outcome
+        .vars
+        .get("mod_reason_dm_clause")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let clause_units = clause.chars().count();
+    let body_limit = DISCORD_MESSAGE_LIMIT.saturating_sub(clause_units);
     if !cmd.response.is_empty() {
         let mut vars = outcome.vars.clone();
         vars.insert(
@@ -1352,16 +1361,18 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
             }
             _ => &cmd.response,
         };
-        let rendered = templates::render(response, &vars);
+        if response.contains("{mod_reason_dm_clause}") {
+            return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
+        }
+        let rendered = templates::render_bounded(response, &vars, body_limit);
         if matches!(cmd.behavior, Behavior::Kick { .. } | Behavior::Ban { .. })
-            && !response.contains("{mod_reason_dm_clause}")
-            && let Some(clause) = vars.get("mod_reason_dm_clause")
+            && !clause.is_empty()
         {
             return format!("{rendered}{clause}");
         }
         rendered
     } else if let Some(r) = &outcome.response {
-        r.clone()
+        templates::render_bounded(r, &outcome.vars, body_limit)
     } else {
         "done".to_string()
     }
@@ -2146,6 +2157,37 @@ mod tests {
 
         with_dm.vars.remove("mod_reason_dm_clause");
         assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");
+    }
+
+    #[test]
+    fn near_limit_kick_confirmation_stays_deliverable_with_dm_clause() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let mut custom = kick.clone();
+        custom.response = "x".repeat(2000);
+        let outcome = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam".into()),
+                (
+                    "mod_reason_dm_clause".into(),
+                    mod_reason_dm::render_mod_reason_dm_clause(
+                        mod_reason_dm::ModReasonDmOutcome::Sent,
+                    ),
+                ),
+            ]),
+            suppress_response: false,
+        };
+        let rendered = render_outcome(&custom, &outcome);
+        assert!(
+            rendered.chars().count() <= 2000,
+            "DM status made a valid custom confirmation undeliverable: {} characters",
+            rendered.chars().count()
+        );
+        assert!(rendered.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
     }
 
     #[test]

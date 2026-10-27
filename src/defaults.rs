@@ -486,6 +486,13 @@ pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
 /// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
 pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
 
+/// DM when Discord already shows the user removed but a moderator requested `--dm`.
+pub const MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE: &str =
+    "You are already removed from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// Slash option label for the optional kick/ban `dm` flag.
+pub const SLASH_MOD_REASON_DM_OPTION_TEMPLATE: &str = "DM the reason before applying the action";
+
 /// Follow-up when the preliminary reason DM was sent but kick/ban failed.
 pub const MOD_REASON_DM_MODERATION_FAILED_TEMPLATE: &str =
     "Update: your removal from **{guild}** did not complete; you may still be in the server.";

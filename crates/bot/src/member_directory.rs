@@ -670,6 +670,24 @@ impl Drop for BanObservation<'_> {
     }
 }
 
+/// Serializes overlapping moderator-initiated bans for one guild member.
+pub(crate) struct CommandBanInProgress<'a> {
+    _observation: BanObservation<'a>,
+}
+
+pub(crate) fn begin_command_ban_in_progress(
+    app: &BotState,
+    guild_id: u64,
+    user_id: u64,
+) -> Result<CommandBanInProgress<'_>> {
+    if app.begin_ban_observation(guild_id, user_id) {
+        anyhow::bail!("another ban for this user is already in progress");
+    }
+    Ok(CommandBanInProgress {
+        _observation: BanObservation::new(app, guild_id, user_id),
+    })
+}
+
 pub async fn observe_unban(
     app: &BotState,
     guild_id: u64,

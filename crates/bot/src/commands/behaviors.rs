@@ -47,6 +47,21 @@ async fn mod_reason_dm_if_requested(
     Some(mod_reason_dm::send_mod_reason_dm(env, target, action, reason).await)
 }
 
+async fn mod_reason_dm_if_requested_already_removed(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+    action: &str,
+    reason: &str,
+) -> Option<mod_reason_dm::ModReasonDmOutcome> {
+    if !env.dm {
+        return None;
+    }
+    if !env.app.activation.may_record() {
+        return Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
+    }
+    Some(mod_reason_dm::send_mod_reason_dm_already_removed(env, target, action, reason).await)
+}
+
 fn apply_mod_reason_dm_clause(
     vars: &mut std::collections::BTreeMap<String, String>,
     dm: Option<mod_reason_dm::ModReasonDmOutcome>,
@@ -82,6 +97,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|g| g.members.get(&target).cloned());
             refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
+            let _ban_in_progress = crate::member_directory::begin_command_ban_in_progress(
+                env.app,
+                env.guild_id.get(),
+                target.get(),
+            )?;
             #[allow(unused_assignments)]
             let mut dm_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
@@ -107,13 +127,19 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await;
                     let dm_reason = _finished_reason.as_deref().unwrap_or(reason.as_str());
-                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
+                    dm_outcome = mod_reason_dm_if_requested_already_removed(
+                        env, target, "banned", dm_reason,
+                    )
+                    .await;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
                 } => {
                     let dm_reason = discord_reason.as_deref().unwrap_or(reason.as_str());
-                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
+                    dm_outcome = mod_reason_dm_if_requested_already_removed(
+                        env, target, "banned", dm_reason,
+                    )
+                    .await;
                     if continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -174,6 +200,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
                     dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
+                    if dm_outcome == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+                        if let Some(attempt) = attempted {
+                            attempt
+                                .finish(env.app, crate::db::guild_data::CaseOutcome::Failed)
+                                .await;
+                        }
+                        pending_ban
+                            .finish(env.app, crate::db::guild_data::CaseOutcome::Failed)
+                            .await;
+                        return Err(anyhow!("writer lease is not held"));
+                    }
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -374,6 +411,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
             let dm_outcome = mod_reason_dm_if_requested(env, target, "kicked", &reason).await;
+            if dm_outcome == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+                return Err(anyhow!("writer lease is not held"));
+            }
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
                 member.kick_with_reason(&env.ctx.http, &reason),
@@ -1516,7 +1556,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Ban { .. } => vec![
             opt("user", User, true, "User to ban"),
             opt("reason", Str, false, "Ban reason"),
-            opt("dm", Boolean, false, "DM the reason"),
+            opt(
+                "dm",
+                Boolean,
+                false,
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+            ),
         ],
         Behavior::Unban { .. } => vec![
             opt("user", User, true, "User to unban"),
@@ -1525,7 +1570,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Kick { .. } => vec![
             opt("user", User, true, "User to kick"),
             opt("reason", Str, false, "Kick reason"),
-            opt("dm", Boolean, false, "DM the reason"),
+            opt(
+                "dm",
+                Boolean,
+                false,
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+            ),
         ],
         Behavior::Timeout { .. } => vec![
             opt("user", User, true, "User to timeout"),
@@ -1587,6 +1637,8 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[tokio::test]
@@ -1937,6 +1989,17 @@ mod tests {
             .expect("ban dm option");
         assert_eq!(ban_dm.kind, CommandOptionType::Boolean);
         assert!(!ban_dm.required);
+        assert_eq!(
+            kick_dm.description,
+            jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE
+        );
+        assert_eq!(
+            jmodguard::templates::render(kick_dm.description, &BTreeMap::new()),
+            jmodguard::templates::render(
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+                &BTreeMap::new(),
+            )
+        );
     }
 
     #[test]
