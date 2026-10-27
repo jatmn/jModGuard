@@ -7100,10 +7100,17 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
                 .collect::<Result<Vec<_>>>()?;
             assert!(
                 plan.iter().any(|line| {
-                    line.contains("SEARCH guild_member_case_index")
-                        && line.contains("guild_member_cases_user")
+                    line.contains("guild_member_cases_user")
+                        && line.contains("guild_id=?")
+                        && line.contains("user_id=?")
                 }),
                 "case index lookup must be scoped to the member: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| {
+                    line.contains("SCAN i") || line.contains("SCAN guild_member_case_index")
+                }),
+                "case lookup must not scan the member case index: {plan:?}"
             );
             assert!(
                 !plan.iter().any(|line| line.contains("TEMP B-TREE")),
