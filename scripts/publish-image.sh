@@ -460,7 +460,7 @@ JS
 }
 
 registry_promote_tag() {
-  run_docker buildx imagetools create "$@" || return 1
+  docker buildx imagetools create "$@" || return 1
 }
 
 promote_image_tag() {
@@ -651,7 +651,8 @@ verify_published_image() {
       (cd "$scratch" && sha256sum -c share/jmodguard/files.sha256 >/dev/null) || publish_fail 'effective service binaries do not match image inventory'
     fi
   fi
-  verify_image_runtime_configuration "$component" "$ref" "$layout"
+  verify_image_runtime_configuration "$component" "$ref" "$layout" \
+    || publish_fail 'published image failed runtime configuration verification'
   run_docker rm "$cid" >/dev/null
   rm -rf "$scratch"
 }
@@ -748,11 +749,12 @@ sign_published_digest() {
       --tlog-upload=false \
       -a "io.jmodguard.not-after=${not_after}" \
       "${image}@${digest}"
-  )
+  ) || publish_fail 'cosign sign failed'
   run_cosign verify \
     --key "$SIGNING_PUBLIC_KEY" \
     --insecure-ignore-tlog=true \
-    "${image}@${digest}"
+    "${image}@${digest}" \
+    || publish_fail 'cosign verify failed'
 }
 
 scratch_dir() {
@@ -871,7 +873,8 @@ publish_component_build() {
   published_digest="$(digest_from_build_metadata "$metadata_file")" \
     || publish_fail 'build metadata did not report an image digest'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
-  verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
+  verify_published_image "$component" "$image" "$published_digest" "$context" "$layout" \
+    || publish_fail 'published image failed content verification'
   write_publish_state "$component" "$(COMPONENT="$component" IMAGE="$image" SHA="$sha" LABEL="$label" MODE="$mode" CHANNEL="$channel" DIGEST="$published_digest" STAGING_REF="$staging_ref" node --input-type=commonjs - <<'JS'
 process.stdout.write(JSON.stringify({
   component: process.env.COMPONENT,
@@ -927,7 +930,8 @@ publish_component_sign() {
   ensure_signing_secrets_captured
   persist_signing_secrets_to_files "$scratch"
   signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
-  sign_published_digest "$component" "$image" "$published_digest"
+  sign_published_digest "$component" "$image" "$published_digest" \
+    || publish_fail 'published image failed signing'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
   promote_with_rollback() {
     local tag="$1"
@@ -953,9 +957,17 @@ publish_component_sign() {
   rm -rf "$scratch"
 }
 
+publish_component_phase() {
+  local phase_fn="$1" component="$2" rc=0
+  "$phase_fn" "$component"
+  rc=$?
+  return "$rc"
+}
+
 publish_component() {
   local component="$1"
   local phase="${JMODGUARD_PUBLISH_PHASE:-all}"
+  local phase_rc=0
   if [[ "$phase" == all ]]; then
     if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" || -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]]; then
       capture_signing_secrets
@@ -963,12 +975,24 @@ publish_component() {
     fi
   fi
   case "$phase" in
-    build) publish_component_build "$component" || return $? ;;
-    sign) publish_component_sign "$component" || return $? ;;
+    build)
+      publish_component_phase publish_component_build "$component"
+      phase_rc=$?
+      return "$phase_rc"
+      ;;
+    sign)
+      publish_component_phase publish_component_sign "$component"
+      phase_rc=$?
+      return "$phase_rc"
+      ;;
     all)
-      publish_component_build "$component" || return $?
+      publish_component_phase publish_component_build "$component"
+      phase_rc=$?
+      [[ "$phase_rc" -eq 0 ]] || return "$phase_rc"
       if [[ -f "$(publish_state_file "$component")" ]]; then
-        publish_component_sign "$component" || return $?
+        publish_component_phase publish_component_sign "$component"
+        phase_rc=$?
+        return "$phase_rc"
       fi
       ;;
     *)

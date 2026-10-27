@@ -300,7 +300,10 @@ BUILD_LINE=""
 GITHUB_TOKEN_SEEN=""
 FAIL_BUILD=0
 FAIL_VERIFY=0
+FAIL_RUNTIME=0
 FAIL_SIGN=0
+PROMOTE_CREATE_ATTEMPTS=0
+MOCK_PROMOTE_FAIL_ON=""
 PUBLISH_SHA="$HEAD_SHA"
 SOURCE_LAYOUT=current
 TRACE_FILE=""
@@ -312,12 +315,18 @@ mock_publish_helpers() {
   REDACTOR_INPUT=""
   BUILD_LINE=""
   GITHUB_TOKEN_SEEN=""
+  PROMOTE_CREATE_ATTEMPTS=0
   TRACE_FILE="$(mktemp "${PUBLISH_TEST_TRACE_DIR}/publish-trace-XXXXXX")"
 
   verify_published_image() {
     printf 'verify %s %s@%s %s\n' "$1" "$2" "$3" "${5:-current}" >>"$TRACE_FILE"
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
-    verify_image_runtime_configuration "$1" "${2}@${3}" "${5:-current}"
+    verify_image_runtime_configuration "$1" "${2}@${3}" "${5:-current}" \
+      || return 1
+  }
+  verify_image_runtime_configuration() {
+    printf 'verify runtime %s\n' "$1" >>"$TRACE_FILE"
+    [[ "$FAIL_RUNTIME" == 0 ]] || return 1
   }
   # The browser bundle itself is tested by package-webui-test.mjs. Here prove
   # publication installs/builds in the selected source worktree before packaging.
@@ -417,7 +426,13 @@ mock_publish_helpers() {
     [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
   }
   registry_promote_tag() {
-    run_docker buildx imagetools create "$@" || return 1
+    printf 'docker buildx imagetools create %s\n' "$*" >>"$TRACE_FILE"
+    if [[ -n "$MOCK_PROMOTE_FAIL_ON" && "$MOCK_PROMOTE_FAIL_ON" == "$((PROMOTE_CREATE_ATTEMPTS + 1))" ]]; then
+      PROMOTE_CREATE_ATTEMPTS=$((PROMOTE_CREATE_ATTEMPTS + 1))
+      return 1
+    fi
+    PROMOTE_CREATE_ATTEMPTS=$((PROMOTE_CREATE_ATTEMPTS + 1))
+    return 0
   }
   sign_published_digest() {
     printf 'sign %s %s %s\n' "$1" "$2" "$3" >>"$TRACE_FILE"
@@ -1228,6 +1243,134 @@ printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'failed signing must not promote tags'
 FAIL_SIGN=0
 unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+
+# Split build/sign phases must fail closed without state or promotion.
+reload_publisher
+mock_publish_helpers
+FAIL_RUNTIME=1
+FAIL_VERIFY=0
+PROMOTE_CREATE_ATTEMPTS=0
+MOCK_PROMOTE_FAIL_ON=""
+phase_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-phase-state-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$phase_state_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+JMODGUARD_PUBLISH_PHASE=build
+export JMODGUARD_PUBLISH_PHASE
+with_main
+GHCR_USERNAME=publisher
+GHCR_TOKEN=test-secret
+GITHUB_TOKEN=""
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
+changed_since_publication() { return 0; }
+if ( publish_component api ) >/dev/null 2>&1; then
+  fail 'build phase must fail when runtime verification fails'
+fi
+[[ -f "$phase_state_dir/api.json" ]] && fail 'build phase must not write publish state after runtime verification failure'
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+  && fail 'build phase must not promote tags when verification fails'
+rm -rf "$phase_state_dir"
+unset JMODGUARD_PUBLISH_PHASE FAIL_RUNTIME
+
+reload_publisher
+mock_publish_helpers
+FAIL_RUNTIME=0
+FAIL_VERIFY=0
+FAIL_SIGN=0
+PROMOTE_CREATE_ATTEMPTS=0
+phase_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-phase-state-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$phase_state_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+JMODGUARD_PUBLISH_PHASE=build
+export JMODGUARD_PUBLISH_PHASE
+with_main
+GHCR_USERNAME=publisher
+GHCR_TOKEN=test-secret
+GITHUB_TOKEN=""
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
+changed_since_publication() { return 0; }
+( publish_component api ) >/dev/null 2>&1 || fail 'build phase must succeed before sign regression'
+[[ -f "$phase_state_dir/api.json" ]] || fail 'build phase must persist publish state for signing'
+: >"$TRACE_FILE"
+JMODGUARD_PUBLISH_PHASE=sign
+export JMODGUARD_PUBLISH_PHASE
+FAIL_SIGN=1
+if ( publish_component api ) >/dev/null 2>&1; then
+  fail 'sign phase must fail when cosign sign fails'
+fi
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+  && fail 'sign phase must not promote tags when signing fails'
+rm -rf "$phase_state_dir"
+unset JMODGUARD_PUBLISH_PHASE FAIL_SIGN
+
+reload_publisher
+PROD_PROMOTE_CREATE=0
+ROLLBACK_PROMOTE_IMAGE=ghcr.io/jatmn/jmodguard-api
+ROLLBACK_PROMOTE_DIGEST="sha256:$(printf 'c%.0s' {1..64})"
+ROLLBACK_PROMOTE_PREV="sha256:$(printf 'b%.0s' {1..64})"
+declare -A ROLLBACK_PROMOTE_TAG_DIGEST=()
+docker() {
+  local prev="" arg ref digest
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    for arg in "$@"; do
+      if [[ "$prev" == --tag ]]; then
+        ref="$arg"
+      fi
+      if [[ "$arg" == *@sha256:* ]]; then
+        digest="${arg#*@}"
+      fi
+      prev="$arg"
+    done
+    [[ -n "$ref" && -n "$digest" ]] && ROLLBACK_PROMOTE_TAG_DIGEST["$ref"]="$digest"
+    PROD_PROMOTE_CREATE=$((PROD_PROMOTE_CREATE + 1))
+    [[ "$PROD_PROMOTE_CREATE" -lt 2 ]] || return 1
+    return 0
+  fi
+  return 0
+}
+run_docker() {
+  local prev="" arg ref digest
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    for arg in "$@"; do
+      if [[ "$prev" == --tag ]]; then
+        ref="$arg"
+      fi
+      if [[ "$arg" == *@sha256:* ]]; then
+        digest="${arg#*@}"
+      fi
+      prev="$arg"
+    done
+    [[ -n "$ref" && -n "$digest" ]] && ROLLBACK_PROMOTE_TAG_DIGEST["$ref"]="$digest"
+    return 0
+  fi
+  if [[ "$1 $2" == 'buildx imagetools' && "$3" == inspect && "$*" == *'{{json .Manifest}}'* ]]; then
+    ref="$4"
+    digest="${ROLLBACK_PROMOTE_TAG_DIGEST[$ref]:-$ROLLBACK_PROMOTE_DIGEST}"
+    printf '{"digest":"%s","size":10}\n' "$digest"
+    return 0
+  fi
+  if [[ "$1 $2" == 'buildx imagetools' && "$*" == *'{{json .Image}}'* ]]; then
+    printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
+    return 0
+  fi
+  return 0
+}
+ROLLBACK_PROMOTE_TAG_DIGEST["${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PROMOTE_PREV"
+PROMOTION_ROLLBACK=()
+promote_image_tag "$ROLLBACK_PROMOTE_IMAGE" "${HEAD_SHA}" "$ROLLBACK_PROMOTE_DIGEST" \
+  || fail 'first promotion must succeed before create failure'
+ROLLBACK_PROMOTE_TAG_DIGEST["${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PROMOTE_DIGEST"
+[[ "${#PROMOTION_ROLLBACK[@]}" -eq 1 ]] || fail 'first promotion must record rollback state'
+if promote_image_tag "$ROLLBACK_PROMOTE_IMAGE" latest "$ROLLBACK_PROMOTE_DIGEST"; then
+  fail 'production registry_promote_tag must fail when imagetools create fails'
+fi
+rollback_promoted_tags
+[[ "${ROLLBACK_PROMOTE_TAG_DIGEST[${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PROMOTE_PREV" ]] \
+  || fail 'rollback must restore the first promoted tag after production create failure'
+unset -f docker
 
 reload_publisher
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
