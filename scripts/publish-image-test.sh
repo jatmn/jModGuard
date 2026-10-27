@@ -223,18 +223,18 @@ done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=17 min-launcher-revision=7; do
+for field in launcher-revision=18 min-launcher-revision=18; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 17;$/pub const LAUNCHER_REVISION: u32 = 18;/' \
-    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 8;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 18;$/pub const LAUNCHER_REVISION: u32 = 19;/' \
+    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 18;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 19;/' \
     src/db/update_control.rs > "$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
-for field in launcher-revision=18 min-launcher-revision=8; do
+for field in launcher-revision=19 min-launcher-revision=19; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 rm -rf "$launcher_source"
@@ -324,6 +324,9 @@ mock_publish_helpers() {
   npm() {
     printf 'npm %s\n' "$*" >>"$TRACE_FILE"
     if [[ "$1" == run && "$2" == build ]]; then
+      signing_secrets_in_environ && fail 'signing secrets must not remain in the process environment during WebUI build'
+      [[ -z "$_JMG_SIGNING_KEY_FILE" || ! -f "$_JMG_SIGNING_KEY_FILE" ]] \
+        || fail 'signing key file must not exist during WebUI build'
       local context="${4%/tools/webui}"
       mkdir -p "$context/dist"
       cp -R "$root/dist/frontend" "$context/dist/frontend"
@@ -370,6 +373,8 @@ mock_publish_helpers() {
     if [[ "$1" == buildx ]]; then
       if [[ "$2" == build ]]; then
         assert_signing_secrets_not_in_environ
+        [[ -z "$_JMG_SIGNING_KEY_FILE" || ! -f "$_JMG_SIGNING_KEY_FILE" ]] \
+          || fail 'signing key file must not exist during image build'
         local arg prev=""
         local wrote_metadata=0
         for arg in "$@"; do

@@ -3226,7 +3226,7 @@ mod tests {
             .current_dir(&root)
             .args([
                 "-c",
-                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source scripts/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test .",
+                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source scripts/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test . \"\" current \"$(publish_staging_ref ghcr.io/jatmn/jmodguard-api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\"",
             ])
             .output()
             .await

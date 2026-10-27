@@ -47,8 +47,8 @@ impl SigningFixture {
         }
         if let Some(public) = self.previous_public_pem.as_ref() {
             let root = std::env::var("JMODGUARD_REPO_ROOT").unwrap_or_else(|_| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
+                std::env::temp_dir()
+                    .join(format!("jmodguard-signing-{:032x}", rand::random::<u128>()))
                     .to_string_lossy()
                     .into_owned()
             });

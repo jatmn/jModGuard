@@ -162,11 +162,20 @@ jobs:
           node-version: '24'
           package-manager-cache: false
       - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
-      - name: Publish changed component
-        # Signing secrets are validated before any image build and are not exported to
-        # npm/docker subprocesses; configure both secrets before running this workflow.
+      - name: Stage signing secrets
         env:
-          COMPONENT: ${{ matrix.component }}
           JMODGUARD_UPDATE_SIGNING_KEY: ${{ secrets.JMODGUARD_UPDATE_SIGNING_KEY }}
           JMODGUARD_UPDATE_SIGNING_PASSWORD: ${{ secrets.JMODGUARD_UPDATE_SIGNING_PASSWORD }}
+        run: |
+          umask 077
+          staging="${RUNNER_TEMP}/jmodguard-signing-secrets"
+          mkdir -p "$staging"
+          printf '%s' "$JMODGUARD_UPDATE_SIGNING_KEY" >"$staging/key"
+          printf '%s' "$JMODGUARD_UPDATE_SIGNING_PASSWORD" >"$staging/password"
+          echo "JMODGUARD_SIGNING_SECRETS_DIR=$staging" >>"$GITHUB_ENV"
+      - name: Publish changed component
+        # Signing secrets are staged outside this step; the publisher loads them only
+        # in memory until the cosign step writes short-lived key files.
+        env:
+          COMPONENT: ${{ matrix.component }}
         run: bash scripts/publish-image.sh "$COMPONENT"

@@ -90,10 +90,10 @@ mod tests {
     #[test]
     fn admitted_launchers_hold_auth_exits_and_standalone_is_not_refused() {
         assert_eq!(refusal_revision(Some("3".into()), true), Some(3));
-        for revision in 0..7 {
+        for revision in 0..crate::db::REQUIRED_LAUNCHER_REVISION {
             assert!(refusal_message_for(Some(revision)).is_some());
         }
-        for revision in 7..=crate::db::LAUNCHER_REVISION {
+        for revision in crate::db::REQUIRED_LAUNCHER_REVISION..=crate::db::LAUNCHER_REVISION {
             assert!(refusal_message_for(Some(revision)).is_none());
             assert!(launcher_holds_auth_exit(Some(revision)));
         }

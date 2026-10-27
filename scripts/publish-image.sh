@@ -23,7 +23,17 @@ _JMG_SIGNING_PASSWORD=""
 _JMG_SIGNING_KEY_FILE=""
 _JMG_SIGNING_PASSWORD_FILE=""
 
+load_signing_secrets_from_staging() {
+  local dir="${JMODGUARD_SIGNING_SECRETS_DIR:-}"
+  [[ -n "$dir" ]] || return 0
+  [[ -f "$dir/key" && -f "$dir/password" ]] \
+    || publish_fail 'signing secrets staging directory is incomplete'
+  _JMG_SIGNING_KEY="$(<"$dir/key")"
+  _JMG_SIGNING_PASSWORD="$(<"$dir/password")"
+}
+
 capture_signing_secrets() {
+  load_signing_secrets_from_staging
   if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]]; then
     _JMG_SIGNING_KEY="$JMODGUARD_UPDATE_SIGNING_KEY"
     _JMG_SIGNING_KEY_FILE=""
@@ -648,15 +658,17 @@ require_signing_secrets() {
 }
 
 validate_signing_key_pair() {
-  local scratch extracted_pub pass
-  [[ -f "$_JMG_SIGNING_KEY_FILE" && -f "$_JMG_SIGNING_PASSWORD_FILE" ]] \
-    || publish_fail 'signing secret files are missing'
+  local scratch extracted_pub pass key_file
+  [[ -n "$_JMG_SIGNING_KEY" && -n "$_JMG_SIGNING_PASSWORD" ]] \
+    || publish_fail 'signing secrets are missing'
   scratch="$(mktemp -d "${TMPDIR:-.tmp}/signing-validate-XXXXXX")"
+  key_file="$scratch/signing.key"
   extracted_pub="$scratch/extracted.pub"
-  pass="$(<"$_JMG_SIGNING_PASSWORD_FILE")"
+  printf '%s' "$_JMG_SIGNING_KEY" >"$key_file"
+  pass="$_JMG_SIGNING_PASSWORD"
   (
     export COSIGN_PASSWORD="$pass"
-    cosign public-key --key "$_JMG_SIGNING_KEY_FILE" --outfile "$extracted_pub"
+    cosign public-key --key "$key_file" --outfile "$extracted_pub"
   ) || publish_fail 'signing private key is malformed'
   diff -q "$extracted_pub" "$SIGNING_PUBLIC_KEY" >/dev/null \
     || publish_fail 'signing private key does not match deploy/update-signing.pub'
@@ -767,10 +779,8 @@ publish_component() {
     rm -rf "$JMODGUARD_PUBLISH_CLEANUP_SCRATCH"
   }
   trap cleanup_publish EXIT
-  persist_signing_secrets_to_files "$scratch"
-  signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
   validate_signing_key_pair
-  redact_tokens "$token" "$source_token" "$(<"$_JMG_SIGNING_KEY_FILE")" "$(<"$_JMG_SIGNING_PASSWORD_FILE")"
+  redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
@@ -800,6 +810,8 @@ publish_component() {
     || publish_fail 'build metadata did not report an image digest'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
   verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
+  persist_signing_secrets_to_files "$scratch"
+  signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
   sign_published_digest "$component" "$image" "$published_digest"
   assert_digest_matches_ref "$staging_ref" "$published_digest"
   promote_with_rollback() {

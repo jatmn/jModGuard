@@ -118,9 +118,6 @@ fn previous_key_paths() -> Vec<PathBuf> {
     if let Ok(root) = std::env::var("JMODGUARD_REPO_ROOT") {
         paths.push(PathBuf::from(root).join("deploy/update-signing-previous.pub"));
     }
-    paths.push(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/update-signing-previous.pub"),
-    );
     paths
 }
 

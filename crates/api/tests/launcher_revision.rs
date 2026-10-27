@@ -1,5 +1,6 @@
 //! A child started by a revision-2 launcher answers health and stays up.
-//! Revision 7 and a standalone start pass the gate.
+//! The current launcher revision and a standalone start pass the gate.
+use jmodguard::db::{LAUNCHER_REVISION, REQUIRED_LAUNCHER_REVISION};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -117,7 +118,9 @@ fn revision_two_api_child_answers_health_and_does_not_exit() {
     );
     wait_log(
         &running,
-        "this release requires launcher revision 7; the running launcher is revision 2",
+        &format!(
+            "this release requires launcher revision {REQUIRED_LAUNCHER_REVISION}; the running launcher is revision 2"
+        ),
     );
     let log = wait_log(&running, "health listener");
     let addr = health_addr(&log);
@@ -131,14 +134,15 @@ fn revision_two_api_child_answers_health_and_does_not_exit() {
 }
 
 #[test]
-fn revision_seven_api_child_passes_the_launcher_gate() {
-    let dir = root("rev7");
+fn current_launcher_revision_api_child_passes_the_launcher_gate() {
+    let dir = root("current");
+    let revision = LAUNCHER_REVISION.to_string();
     let mut running = spawn(
         &[
             ("JMODGUARD_WEB_BIND", "127.0.0.1:0"),
             ("JMODGUARD_READY_FILE", dir.join("ready").to_str().unwrap()),
             ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "7"),
+            ("JMODGUARD_LAUNCHER_REVISION", revision.as_str()),
         ],
         &["JMODGUARD_OAUTH_CLIENT_ID", "JMODGUARD_OAUTH_CLIENT_SECRET"],
     );
@@ -151,7 +155,7 @@ fn revision_seven_api_child_passes_the_launcher_gate() {
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "revision 7 API did not continue past the launcher gate\n{log}"
+            "current launcher API did not continue past the launcher gate\n{log}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
