@@ -166,7 +166,7 @@ async fn fixture_context_for_dm_order_test(
         .await
         .unwrap();
     let url = Arc::new(tokio::sync::Mutex::new(format!(
-        "ws://{}",
+        "ws://{}", // nosemgrep: javascript.lang.security.detect-insecure-websocket
         listener.local_addr().unwrap()
     )));
     let accept = tokio::spawn(async move {
