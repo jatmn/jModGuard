@@ -112,8 +112,18 @@ pub(crate) async fn send_mod_reason_dm_moderation_failed_followup(
     if dm_outcome != Some(ModReasonDmOutcome::Sent) {
         return;
     }
+    bounded_mod_reason_dm_future(send_mod_reason_dm_moderation_failed_followup_inner(
+        env, target,
+    ))
+    .await;
+}
+
+async fn send_mod_reason_dm_moderation_failed_followup_inner(
+    env: &CmdEnv<'_>,
+    target: UserId,
+) -> ModReasonDmOutcome {
     if !env.app.activation.may_record() {
-        return;
+        return ModReasonDmOutcome::Cancelled;
     }
     let guild = env
         .ctx
@@ -136,13 +146,21 @@ pub(crate) async fn send_mod_reason_dm_moderation_failed_followup(
     )
     .await
     {
-        crate::discord::DiscordCall::Cancelled => return,
-        crate::discord::DiscordCall::Finished(Err(_)) => return,
+        crate::discord::DiscordCall::Cancelled => return ModReasonDmOutcome::Cancelled,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            return classify_mod_reason_dm_delivery_error(&error);
+        }
         crate::discord::DiscordCall::Finished(Ok(channel)) => channel,
     };
-    let _ =
-        crate::discord::race_discord_call(&env.app.activation, channel.say(&env.ctx.http, &text))
-            .await;
+    match crate::discord::race_discord_call(&env.app.activation, channel.say(&env.ctx.http, &text))
+        .await
+    {
+        crate::discord::DiscordCall::Cancelled => ModReasonDmOutcome::Cancelled,
+        crate::discord::DiscordCall::Finished(Ok(_)) => ModReasonDmOutcome::Sent,
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            classify_mod_reason_dm_delivery_error(&error)
+        }
+    }
 }
 
 pub(crate) fn render_mod_reason_dm_clause(outcome: ModReasonDmOutcome) -> String {

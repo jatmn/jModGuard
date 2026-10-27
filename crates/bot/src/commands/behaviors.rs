@@ -390,7 +390,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
-                outcome,
+                outcome.clone(),
                 target.get(),
                 Some(env.actor.get()),
                 Some(reason.clone()),
@@ -399,10 +399,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await;
             lease_held(env)?;
             if let Err(error) = discord {
-                mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
-                    env, target, dm_outcome,
-                )
-                .await;
+                if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                    mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
+                        env, target, dm_outcome,
+                    )
+                    .await;
+                }
                 return Err(mod_reason_dm::moderation_failure_error(error, dm_outcome));
             }
             log_mod(

@@ -947,13 +947,62 @@ fn legacy_setname_payload(shipped: &crate::types::CommandDef) -> Result<String> 
     Ok(serde_json::to_string(&legacy)?)
 }
 
-fn legacy_kick_ban_usage_payload(
+pub(crate) fn legacy_kick_ban_usage_payload(
     shipped: &crate::types::CommandDef,
     usage: &str,
 ) -> Result<String> {
     let mut legacy = shipped.clone();
     legacy.usage = usage.into();
     Ok(serde_json::to_string(&legacy)?)
+}
+
+const KICK_BAN_DM_USAGE_MARKER: &str = "kick_ban_dm_usage_v1";
+
+fn kick_ban_dm_usage_upgrade_sql() -> Result<String> {
+    let mut sql = String::new();
+    for cmd in crate::defaults::default_commands() {
+        if cmd.name == "kick" {
+            sql.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'kick' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!kick <user> [reason]"
+                )?)
+            ));
+        }
+        if cmd.name == "ban" {
+            sql.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'ban' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!ban <user> [reason]"
+                )?)
+            ));
+        }
+    }
+    Ok(sql)
+}
+
+/// Rewrites legacy kick/ban usage strings on every guild row, including when
+/// global seeding is already satisfied. Idempotent: runs whenever migrate-open
+/// sees a satisfied seed so guild-scoped rows are not skipped after the marker
+/// is first written.
+pub(super) fn upgrade_legacy_kick_ban_usage_conn(conn: &mut Connection) -> Result<()> {
+    let body = kick_ban_dm_usage_upgrade_sql()?;
+    let tx = conn.transaction_immediate()?;
+    let before = total_changes(&tx)?;
+    tx.execute_batch_bounded(&body, seed_batch_growth(&body))?;
+    let changed = total_changes(&tx)? > before;
+    if changed {
+        bump_config_version_conn(&tx)?;
+    }
+    if changed || meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER)?.is_none() {
+        write_meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER, "1")?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// True when a migrate-open has nothing left to write. The check is one short
@@ -1064,6 +1113,7 @@ pub(super) fn seed_globals_conn(
     terminal: &GuildSettings,
 ) -> Result<()> {
     if globals_seed_satisfied(conn)? {
+        upgrade_legacy_kick_ban_usage_conn(conn)?;
         return Ok(());
     }
     let tx = conn.transaction_immediate()?;
@@ -1102,6 +1152,7 @@ pub(super) fn seed_globals_conn(
         write_meta_string_conn(&tx, key, "1")?;
     }
     tx.commit()?;
+    upgrade_legacy_kick_ban_usage_conn(conn)?;
     Ok(())
 }
 
@@ -1242,16 +1293,22 @@ fn seed_globals_sql(
         }
         if cmd.name == "kick" {
             commands.push_str(&format!(
-                "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'kick' AND data = {};\n",
+                "UPDATE commands SET data = {} WHERE name = 'kick' AND data = {};\n",
                 sql_text(&serde_json::to_string(&cmd)?),
-                sql_text(&legacy_kick_ban_usage_payload(&cmd, "!kick <user> [reason]")?)
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!kick <user> [reason]"
+                )?)
             ));
         }
         if cmd.name == "ban" {
             commands.push_str(&format!(
-                "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'ban' AND data = {};\n",
+                "UPDATE commands SET data = {} WHERE name = 'ban' AND data = {};\n",
                 sql_text(&serde_json::to_string(&cmd)?),
-                sql_text(&legacy_kick_ban_usage_payload(&cmd, "!ban <user> [reason]")?)
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!ban <user> [reason]"
+                )?)
             ));
         }
         commands.push_str(&format!(
