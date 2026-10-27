@@ -18,11 +18,19 @@ fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
 use crate::types::Behavior;
 use crate::{db, logging};
 
+fn skips_case_enrollment(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Voice)
+}
+
 /// Runs a command behavior. Returns an optional extra response plus vars
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
-    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
+    let enrollment = if skips_case_enrollment(&env.cmd.behavior) {
+        None
+    } else {
+        crate::cases::capture(env.app, env.guild_id.get()).await
+    };
 
     match &env.cmd.behavior {
         Behavior::Ban {
@@ -1553,6 +1561,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_skips_case_enrollment_capture() {
+        assert!(skips_case_enrollment(&Behavior::Voice));
+        assert!(!skips_case_enrollment(&Behavior::Help));
+    }
 
     #[tokio::test]
     async fn stats_counts_cases_and_reports_unavailable_stores() {

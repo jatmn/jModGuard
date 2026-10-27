@@ -385,6 +385,15 @@ pub fn is_binary_overlay_command_name(name: &str) -> bool {
         .any(|overlay| overlay.eq_ignore_ascii_case(name))
 }
 
+/// Behaviors merged from the running binary and never written to shared `commands` rows.
+pub fn is_binary_overlay_behavior(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Voice)
+}
+
+pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
+    is_binary_overlay_command_name(&cmd.name) || is_binary_overlay_behavior(&cmd.behavior)
+}
+
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
 pub fn default_global_seed_commands() -> Vec<CommandDef> {
     default_commands()
@@ -711,5 +720,18 @@ mod rolling_upgrade_tests {
                 .any(|cmd| cmd.name == "voice"),
             "voice must not be written to shared global command rows"
         );
+    }
+
+    #[test]
+    fn voice_behavior_is_binary_overlay_even_when_renamed() {
+        let voice = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        let renamed = CommandDef {
+            name: "vc".into(),
+            ..voice
+        };
+        assert!(command_def_is_binary_overlay(&renamed));
     }
 }

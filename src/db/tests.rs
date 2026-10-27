@@ -2735,6 +2735,41 @@ fn voice_command_cannot_be_persisted_to_the_database() {
             .contains("cannot be written to the database"),
         "{error:#}"
     );
+    let renamed = CommandDef {
+        name: "vc_lookup".into(),
+        ..voice.clone()
+    };
+    let renamed_error = tokio_test_block_on(upsert_command(&db, 0, "vc_lookup", &renamed))
+        .expect_err("voice behavior must not be stored under another name");
+    assert!(
+        renamed_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{renamed_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn voice_dashboard_disable_save_cannot_persist_voice_behavior() {
+    let tmp = tmp_db_path("voice_enrolled_persist_rejected");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    voice.enabled = false;
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "voice", &voice))
+        .expect_err("dashboard save of overlay voice must not persist");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
     cleanup_db(&tmp);
 }
 
