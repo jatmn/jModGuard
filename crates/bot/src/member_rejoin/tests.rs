@@ -42,15 +42,13 @@ fn no_cases_and_not_ever_banned_skips_note() {
         }],
         next_cursor: None,
     };
-    assert_eq!(rejoin_note_from_history(Ok(page), false), None);
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    assert_eq!(build_rejoin_note(cases, false, truncated), None);
 }
 
 #[test]
 fn history_error_skips_note_without_not_ready() {
-    assert_eq!(
-        rejoin_note_from_history(Err(anyhow::anyhow!("read failed")), true),
-        None
-    );
+    assert_eq!(build_rejoin_note(vec![], false, false), None);
 }
 
 #[test]
@@ -59,7 +57,8 @@ fn ever_banned_without_index_uses_not_ready_wording() {
         entries: vec![],
         next_cursor: None,
     };
-    let note = rejoin_note_from_history(Ok(page), true).unwrap();
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let note = build_rejoin_note(cases, true, truncated).unwrap();
     assert_eq!(note, RejoinNote::IndexNotReady);
     let vars = member_rejoin_vars(&user(42), &note);
     assert!(vars["notice"].contains("not ready"));
@@ -98,7 +97,8 @@ fn three_cases_newest_first_with_tag_stripped() {
             .collect(),
         next_cursor: None,
     };
-    let note = rejoin_note_from_history(Ok(page), false).unwrap();
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let note = build_rejoin_note(cases, false, truncated).unwrap();
     let RejoinNote::Cases { lines, truncated } = note else {
         panic!("expected cases");
     };
@@ -113,27 +113,113 @@ fn three_cases_newest_first_with_tag_stripped() {
 }
 
 #[test]
-fn truncation_notice_when_more_cases_exist() {
-    let page = MemberHistoryPage {
-        entries: vec![MemberHistoryEntry {
+fn truncation_notice_when_more_than_eight_cases_exist() {
+    let entries = (0..9)
+        .map(|index| MemberHistoryEntry {
             kind: "ban".into(),
-            occurred_at_ms: Some(1),
+            occurred_at_ms: Some(10_000 - index as i64),
             observed_at_ms: None,
             stay_id: None,
             observation_id: None,
-            case_id: Some("only".into()),
+            case_id: Some(format!("case-{index}")),
             joined_at_ms: None,
             departed_at_ms: None,
             moderator_id: None,
             reason: None,
             outcome: Some("succeeded".into()),
             source_kind: None,
-        }],
-        next_cursor: Some("0:ban:older".into()),
+        })
+        .collect();
+    let page = MemberHistoryPage {
+        entries,
+        next_cursor: None,
     };
-    let note = rejoin_note_from_history(Ok(page), false).unwrap();
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    assert!(truncated);
+    assert_eq!(cases.len(), PRIOR_CASE_LIMIT as usize);
+    let note = build_rejoin_note(cases, false, truncated).unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
     assert!(vars["notice"].contains("omitted"));
+}
+
+fn stay_row(at: i64, stay_id: &str) -> MemberHistoryEntry {
+    MemberHistoryEntry {
+        kind: "join".into(),
+        occurred_at_ms: Some(at),
+        observed_at_ms: None,
+        stay_id: Some(stay_id.into()),
+        observation_id: None,
+        case_id: None,
+        joined_at_ms: Some(at),
+        departed_at_ms: None,
+        moderator_id: None,
+        reason: None,
+        outcome: None,
+        source_kind: None,
+    }
+}
+
+fn case_row(at: i64, case_id: &str) -> MemberHistoryEntry {
+    MemberHistoryEntry {
+        kind: "ban".into(),
+        occurred_at_ms: Some(at),
+        observed_at_ms: None,
+        stay_id: None,
+        observation_id: None,
+        case_id: Some(case_id.into()),
+        joined_at_ms: None,
+        departed_at_ms: None,
+        moderator_id: None,
+        reason: None,
+        outcome: Some("succeeded".into()),
+        source_kind: None,
+    }
+}
+
+#[test]
+fn paginate_past_stay_rows_on_first_page() {
+    let page1 = MemberHistoryPage {
+        entries: vec![
+            stay_row(9_000, "stay-a"),
+            stay_row(8_000, "stay-b"),
+            stay_row(7_000, "stay-c"),
+            stay_row(6_000, "stay-d"),
+            stay_row(5_000, "stay-e"),
+            stay_row(4_000, "stay-f"),
+            stay_row(3_000, "stay-g"),
+            case_row(2_000, "case-one"),
+        ],
+        next_cursor: Some("2000:ban:case-one".into()),
+    };
+    let page2 = MemberHistoryPage {
+        entries: vec![case_row(1_000, "case-two"), case_row(500, "case-three")],
+        next_cursor: None,
+    };
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page1, page2]);
+    assert_eq!(cases.len(), 3);
+    assert!(!truncated);
+    let note = build_rejoin_note(cases, false, truncated).unwrap();
+    let vars = member_rejoin_vars(&user(42), &note);
+    assert!(vars["notice"].is_empty());
+}
+
+#[test]
+fn timeline_cursor_after_stays_does_not_imply_case_truncation() {
+    let page1 = MemberHistoryPage {
+        entries: vec![
+            stay_row(3_000, "stay-a"),
+            stay_row(2_000, "stay-b"),
+            case_row(1_000, "only-case"),
+        ],
+        next_cursor: Some("1000:ban:only-case".into()),
+    };
+    let page2 = MemberHistoryPage {
+        entries: vec![stay_row(500, "stay-c")],
+        next_cursor: None,
+    };
+    let (cases, truncated) = collect_prior_cases_from_pages(&[page1, page2]);
+    assert_eq!(cases.len(), 1);
+    assert!(!truncated);
 }
 
 #[test]
@@ -155,14 +241,11 @@ fn template_with_eight_long_reasons_stays_within_discord_limit() {
             source_kind: None,
         })
         .collect();
-    let note = rejoin_note_from_history(
-        Ok(MemberHistoryPage {
-            entries,
-            next_cursor: None,
-        }),
-        false,
-    )
-    .unwrap();
+    let (cases, truncated) = collect_prior_cases_from_pages(&[MemberHistoryPage {
+        entries,
+        next_cursor: None,
+    }]);
+    let note = build_rejoin_note(cases, false, truncated).unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
     let template = crate::defaults::activity_log_templates()
         .into_iter()
@@ -264,20 +347,12 @@ async fn ninth_case_is_truncated_not_a_second_post() {
         )
         .await;
     }
-    let history = store
-        .member_history(scope, SUBJECT as i64, None, PRIOR_CASE_LIMIT)
+    let (cases, truncated) = collect_prior_cases(&store, scope, SUBJECT as i64)
         .await
         .unwrap();
-    assert!(history.next_cursor.is_some());
-    assert_eq!(
-        history
-            .entries
-            .iter()
-            .filter(|entry| entry.case_id.is_some())
-            .count(),
-        8
-    );
-    let note = rejoin_note_from_history(Ok(history), false).unwrap();
+    assert!(truncated);
+    assert_eq!(cases.len(), PRIOR_CASE_LIMIT as usize);
+    let note = build_rejoin_note(cases, false, truncated).unwrap();
     let vars = member_rejoin_vars(&user(SUBJECT), &note);
     let sink = Sink::default();
     db::upsert_log_channel(&f.app.db, GUILD, "member_join", 100)

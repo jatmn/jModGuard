@@ -1,6 +1,8 @@
 //! Optional prior-case note when a member joins and the guild store already has cases.
 
-use crate::db::guild_data::{MemberHistoryEntry, MemberHistoryPage};
+use crate::db::guild_data::{
+    GuildDataScope, GuildDataStore, MemberHistoryEntry, MemberHistoryPage,
+};
 use crate::logging;
 use crate::state::BotState;
 use crate::templates;
@@ -10,6 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) const PRIOR_CASE_LIMIT: u32 = 8;
+const HISTORY_PAGE: u32 = 50;
 const REASON_UNITS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,25 +21,67 @@ pub(crate) enum RejoinNote {
     IndexNotReady,
 }
 
-pub(crate) fn rejoin_note_from_history(
-    history: Result<MemberHistoryPage, anyhow::Error>,
+pub(crate) fn build_rejoin_note(
+    cases: Vec<MemberHistoryEntry>,
     ever_banned: bool,
+    truncated: bool,
 ) -> Option<RejoinNote> {
-    let page = match history {
-        Ok(page) => page,
-        Err(_) => return None,
-    };
-    let cases: Vec<MemberHistoryEntry> = page
-        .entries
-        .into_iter()
-        .filter(|entry| entry.case_id.is_some())
-        .collect();
     if cases.is_empty() {
         return ever_banned.then_some(RejoinNote::IndexNotReady);
     }
-    let truncated = page.next_cursor.is_some();
     let lines = cases.iter().map(format_case_line).collect();
     Some(RejoinNote::Cases { lines, truncated })
+}
+
+/// Walks mixed member-history pages until eight case rows are collected or the
+/// timeline ends. `truncated` is true only when a ninth case row exists.
+pub(crate) fn collect_prior_cases_from_pages(
+    pages: &[MemberHistoryPage],
+) -> (Vec<MemberHistoryEntry>, bool) {
+    let limit = PRIOR_CASE_LIMIT as usize;
+    let mut cases = Vec::new();
+    for page in pages {
+        for entry in &page.entries {
+            if entry.case_id.is_none() {
+                continue;
+            }
+            if cases.len() < limit {
+                cases.push(entry.clone());
+            } else {
+                return (cases, true);
+            }
+        }
+    }
+    (cases, false)
+}
+
+pub(crate) async fn collect_prior_cases(
+    store: &GuildDataStore,
+    scope: GuildDataScope,
+    user_id: i64,
+) -> Result<(Vec<MemberHistoryEntry>, bool), anyhow::Error> {
+    let limit = PRIOR_CASE_LIMIT as usize;
+    let mut cases = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .member_history(scope.clone(), user_id, after, HISTORY_PAGE)
+            .await?;
+        for entry in page.entries {
+            if entry.case_id.is_none() {
+                continue;
+            }
+            if cases.len() < limit {
+                cases.push(entry);
+            } else {
+                return Ok((cases, true));
+            }
+        }
+        if page.next_cursor.is_none() {
+            return Ok((cases, false));
+        }
+        after = page.next_cursor;
+    }
 }
 
 pub(crate) fn member_rejoin_vars(user: &User, note: &RejoinNote) -> BTreeMap<String, String> {
@@ -131,17 +176,19 @@ pub(crate) async fn maybe_emit_member_rejoin(
             false
         }
     };
-    let history = store
-        .member_history(scope, user_id, None, PRIOR_CASE_LIMIT)
-        .await;
-    if let Err(error) = &history {
-        tracing::warn!(
-            guild_id = guild_id.get(),
-            user_id,
-            "member rejoin case history unavailable: {error:#}"
-        );
-    }
-    let Some(note) = rejoin_note_from_history(history, ever_banned) else {
+    let collected = collect_prior_cases(&store, scope, user_id).await;
+    let note = match collected {
+        Ok((cases, truncated)) => build_rejoin_note(cases, ever_banned, truncated),
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id,
+                "member rejoin case history unavailable: {error:#}"
+            );
+            None
+        }
+    };
+    let Some(note) = note else {
         return;
     };
     let vars = member_rejoin_vars(user, &note);
