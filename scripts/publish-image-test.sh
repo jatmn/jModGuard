@@ -904,6 +904,7 @@ fi
 
 # Actual Git diffs, with a complete matching registry publication, distinguish
 # component inputs from source copied only to satisfy Cargo workspace layout.
+published_signature_still_valid() { return 0; }
 while IFS='|' read -r path affected; do
   mkdir -p "$(dirname "$path")"
   echo changed >>"$path"

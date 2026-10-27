@@ -122,8 +122,8 @@ jobs:
     with:
       source_sha: ${{ needs.prepare-publication.outputs.release_sha }}
 
-  publish:
-    name: Publish / ${{ matrix.component }}
+  publish-build:
+    name: Publish build / ${{ matrix.component }}
     needs: [ci, release, prepare-publication, release-ci]
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
@@ -142,7 +142,7 @@ jobs:
       contents: read
       packages: write
     concurrency:
-      group: publish-${{ matrix.component }}
+      group: publish-build-${{ matrix.component }}
       cancel-in-progress: false
     env:
       GITHUB_TOKEN: ${{ github.token }}
@@ -161,13 +161,65 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
       - name: Build and verify component image
         env:
           COMPONENT: ${{ matrix.component }}
           JMODGUARD_PUBLISH_PHASE: build
           JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
         run: bash scripts/publish-image.sh "$COMPONENT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: publish-state-${{ matrix.component }}
+          path: ${{ runner.temp }}/jmodguard-publish-state
+          if-no-files-found: ignore
+          retention-days: 1
+
+  publish-sign:
+    name: Publish sign / ${{ matrix.component }}
+    needs: [ci, release, prepare-publication, release-ci, publish-build]
+    if: >-
+      always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
+      needs.publish-build.result == 'success' &&
+      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request' &&
+      (needs.release-ci.result == 'success' ||
+       (needs.release-ci.result == 'skipped' &&
+        (needs.prepare-publication.outputs.release_sha == '' ||
+         needs.prepare-publication.outputs.release_sha == github.sha)))
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [bot, api, webui]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: publish-sign-${{ matrix.component }}
+      cancel-in-progress: false
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GHCR_TOKEN: ${{ github.token }}
+      GHCR_USERNAME: ${{ github.repository_owner }}
+      JMODGUARD_PUBLICATION_PLAN: ${{ needs.prepare-publication.outputs.plan }}
+      JMODGUARD_PUBLISH_SOURCE: ${{ inputs.source }}
+      JMODGUARD_RELEASE_TAG: ${{ needs.prepare-publication.outputs.release_tag }}
+      JMODGUARD_RELEASE_SHA: ${{ needs.prepare-publication.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@fa0a81b6868b9c0b188dd8e825494aabb200ee93 # v4.1.8
+        with:
+          name: publish-state-${{ matrix.component }}
+          path: ${{ runner.temp }}/jmodguard-publish-state
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
       - name: Sign and promote component image
         env:
           COMPONENT: ${{ matrix.component }}
