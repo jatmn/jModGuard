@@ -288,25 +288,28 @@ pub(crate) fn mention_permission_in(
     }
 }
 
-/// Whether `member` may see `channel_id`, including overwrites and thread parents.
+/// Whether `user_id` with `role_ids` may see `channel_id`, including overwrites
+/// and thread parents. Prefer the gateway author id over `Member::user.id` when
+/// the member payload omitted `user` (prefix commands).
 pub(crate) fn member_can_view_channel(
     guild: &serenity::model::guild::Guild,
-    member: &serenity::model::guild::Member,
+    user_id: UserId,
+    role_ids: &[RoleId],
     channel_id: ChannelId,
 ) -> bool {
     let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
         return false;
     };
     if !guild.roles.contains_key(&RoleId::new(guild.id.get()))
-        || member.roles.iter().any(|id| !guild.roles.contains_key(id))
+        || role_ids.iter().any(|id| !guild.roles.contains_key(id))
     {
         return false;
     }
-    let Some(partial) = partial_member(guild.id, &member.roles) else {
+    let Some(partial) = partial_member(guild.id, role_ids) else {
         return false;
     };
     guild
-        .partial_member_permissions_in(channel, member.user.id, &partial)
+        .partial_member_permissions_in(channel, user_id, &partial)
         .contains(Permissions::VIEW_CHANNEL)
 }
 
@@ -383,6 +386,18 @@ pub fn guild_permissions(
     Permissions::from_bits_truncate(bits)
 }
 
+/// Gateway `Member` payloads must use the message/interaction author id for
+/// permission checks. `PartialMember::user` is often null and `Member::from`
+/// then fills a default user id that must not win over the cached member row.
+fn actor_member_for_command(
+    actor: UserId,
+    member: serenity::model::guild::Member,
+) -> serenity::model::guild::Member {
+    let mut member = member;
+    member.user.id = actor;
+    member
+}
+
 /// Resolves (guild roles, caller member) for command enforcement, preferring
 /// the cache and falling back to an HTTP guild fetch. Never holds a cache
 /// reference across `.await`.
@@ -393,14 +408,19 @@ async fn guild_snapshot(
     actor: UserId,
 ) -> Option<(StdHashMap<RoleId, Role>, serenity::model::guild::Member)> {
     if let Some(guild) = ctx.cache.guild(guild_id) {
-        let member = member_from_msg.or_else(|| guild.members.get(&actor).cloned());
+        let member = guild
+            .members
+            .get(&actor)
+            .cloned()
+            .or(member_from_msg)
+            .map(|member| actor_member_for_command(actor, member));
         return member.map(|m| (guild.roles.clone(), m));
     }
     tracing::warn!("guild {guild_id} not in cache; falling back to HTTP fetch");
     match ctx.http.get_guild(guild_id).await {
         Ok(guild) => {
             // REST guild payload carries roles but no member map.
-            let member = member_from_msg;
+            let member = member_from_msg.map(|member| actor_member_for_command(actor, member));
             member.map(|m| (guild.roles.clone(), m))
         }
         Err(e) => {
@@ -2470,9 +2490,132 @@ mod tests {
         actor.user.id = UserId::new(ACTOR);
         actor.guild_id = guild.id;
         assert!(
-            !super::member_can_view_channel(&guild, &actor, ChannelId::new(VOICE)),
+            !super::member_can_view_channel(
+                &guild,
+                UserId::new(ACTOR),
+                &actor.roles,
+                ChannelId::new(VOICE),
+            ),
             "member-specific deny must hide the channel"
         );
+    }
+
+    #[test]
+    fn prefix_voice_partial_member_with_member_deny_returns_channel_unavailable() {
+        use super::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::event::GuildCreateEvent;
+        use serenity::model::guild::{Guild, Member, PartialMember, Role};
+        use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+        use serenity::model::voice::VoiceState;
+        use std::sync::Arc;
+
+        const GUILD: u64 = 10;
+        const AUTHOR: u64 = 7;
+        const TARGET: u64 = 42;
+        const VOICE: u64 = 100;
+        const ROLE: u64 = 50;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.guild_id = GuildId::new(GUILD);
+            role.permissions = perms;
+            role
+        }
+
+        fn gateway_partial() -> PartialMember {
+            serde_json::from_value(serde_json::json!({
+                "deaf": false,
+                "joined_at": null,
+                "mute": false,
+                "nick": null,
+                "roles": [ROLE.to_string()],
+                "pending": false,
+                "premium_since": null,
+                "guild_id": GUILD.to_string(),
+                "user": null,
+                "permissions": null,
+                "unusual_dm_activity_until": null,
+                "avatar": null,
+                "banner": null,
+                "avatar_decoration_data": null,
+            }))
+            .unwrap()
+        }
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        guild
+            .roles
+            .insert(RoleId::new(ROLE), role(ROLE, Permissions::VIEW_CHANNEL));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.name = "Secret".into();
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(UserId::new(AUTHOR)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+
+        let mut cached = Member::default();
+        cached.user.id = UserId::new(AUTHOR);
+        cached.guild_id = guild.id;
+        cached.roles = vec![RoleId::new(ROLE)];
+        guild.members.insert(cached.user.id, cached);
+
+        let voice_state = serde_json::from_value::<VoiceState>(serde_json::json!({
+            "channel_id": VOICE.to_string(),
+            "deaf": false,
+            "guild_id": GUILD.to_string(),
+            "mute": false,
+            "self_deaf": false,
+            "self_mute": false,
+            "self_stream": null,
+            "self_video": false,
+            "session_id": "fixture",
+            "suppress": false,
+            "user_id": TARGET.to_string(),
+        }))
+        .unwrap();
+        guild.voice_states.insert(UserId::new(TARGET), voice_state);
+
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let partial = gateway_partial();
+        assert!(partial.user.is_none());
+        let from_gateway = Member::from(partial);
+        assert_ne!(from_gateway.user.id, UserId::new(AUTHOR));
+
+        let actor = UserId::new(AUTHOR);
+        let actor_member = cache
+            .guild(GuildId::new(GUILD))
+            .and_then(|g| g.members.get(&actor).cloned())
+            .or(Some(from_gateway))
+            .map(|member| super::actor_member_for_command(actor, member))
+            .expect("prefix dispatch must resolve a member");
+        assert_eq!(actor_member.user.id, actor);
+
+        let snapshot = snapshot_cached_voice(
+            &cache,
+            GuildId::new(GUILD),
+            actor,
+            &actor_member.roles,
+            UserId::new(TARGET),
+        );
+        assert_eq!(snapshot, VoiceLookupSnapshot::ChannelUnavailable);
     }
 
     fn everyone_attempt(can_mention: bool, unknown: bool) -> Option<crate::automod::PendingAction> {

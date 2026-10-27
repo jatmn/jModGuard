@@ -599,7 +599,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let snapshot = super::voice_lookup::snapshot_cached_voice(
                 &env.ctx.cache,
                 env.guild_id,
-                &env.actor_member,
+                env.actor,
+                &env.actor_member.roles,
                 target,
             );
             vars.insert("target".into(), target_user.name.clone());

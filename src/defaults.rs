@@ -379,6 +379,12 @@ pub fn default_commands() -> Vec<CommandDef> {
 /// unknown `Behavior` kinds).
 pub const BINARY_OVERLAY_COMMAND_NAMES: &[&str] = &["voice"];
 
+pub fn is_binary_overlay_command_name(name: &str) -> bool {
+    BINARY_OVERLAY_COMMAND_NAMES
+        .iter()
+        .any(|overlay| overlay.eq_ignore_ascii_case(name))
+}
+
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
 pub fn default_global_seed_commands() -> Vec<CommandDef> {
     default_commands()

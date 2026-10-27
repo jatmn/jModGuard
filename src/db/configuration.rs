@@ -319,6 +319,11 @@ pub async fn get_command_row(db: &Db, guild_id: i64, name: &str) -> Result<Optio
 }
 
 pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef) -> Result<()> {
+    if crate::defaults::is_binary_overlay_command_name(name) {
+        anyhow::bail!(
+            "command `{name}` is merged from the running binary and cannot be written to the database"
+        );
+    }
     upsert_row(
         db,
         "commands",
@@ -1613,6 +1618,11 @@ pub async fn upsert_enrolled_command(
     name: &str,
     command: &CommandDef,
 ) -> Result<()> {
+    if crate::defaults::is_binary_overlay_command_name(name) {
+        anyhow::bail!(
+            "command `{name}` is merged from the running binary and cannot be written to the database"
+        );
+    }
     upsert_row(
         db,
         "commands",

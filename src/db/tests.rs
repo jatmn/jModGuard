@@ -2720,6 +2720,25 @@ fn voice_command_loads_from_binary_overlay_without_global_row() {
 }
 
 #[test]
+fn voice_command_cannot_be_persisted_to_the_database() {
+    let tmp = tmp_db_path("voice_persist_rejected");
+    let db = Db::open(&tmp, 2).unwrap();
+    let voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    let error = tokio_test_block_on(upsert_command(&db, 0, "voice", &voice))
+        .expect_err("binary overlay commands must not be stored");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();

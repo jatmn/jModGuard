@@ -1,6 +1,6 @@
 //! Cached voice-channel lookup for the `!voice` command.
 
-use serenity::model::guild::{Guild, Member};
+use serenity::model::guild::Guild;
 use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::model::voice::VoiceState;
 
@@ -36,7 +36,8 @@ pub enum VoiceLookupSnapshot {
 pub fn snapshot_cached_voice(
     cache: &serenity::cache::Cache,
     guild_id: GuildId,
-    actor: &Member,
+    actor_id: UserId,
+    actor_roles: &[serenity::model::id::RoleId],
     target: UserId,
 ) -> VoiceLookupSnapshot {
     let Some(guild) = cache.guild(guild_id) else {
@@ -44,7 +45,7 @@ pub fn snapshot_cached_voice(
     };
     match guild.voice_states.get(&target) {
         None => VoiceLookupSnapshot::NotInChannel,
-        Some(state) => snapshot_voice_state(cache, guild_id, &guild, actor, state),
+        Some(state) => snapshot_voice_state(cache, guild_id, &guild, actor_id, actor_roles, state),
     }
 }
 
@@ -52,7 +53,8 @@ fn snapshot_voice_state(
     cache: &serenity::cache::Cache,
     guild_id: GuildId,
     guild: &Guild,
-    actor: &Member,
+    actor_id: UserId,
+    actor_roles: &[serenity::model::id::RoleId],
     state: &VoiceState,
 ) -> VoiceLookupSnapshot {
     let Some(channel_id) = state.channel_id else {
@@ -61,7 +63,7 @@ fn snapshot_voice_state(
     if !channel_belongs_to_guild(cache, guild_id, guild, channel_id) {
         return VoiceLookupSnapshot::ChannelUnavailable;
     }
-    if !actor_can_view_channel(guild, actor, channel_id) {
+    if !actor_can_view_channel(guild, actor_id, actor_roles, channel_id) {
         return VoiceLookupSnapshot::ChannelUnavailable;
     }
     let channel_name = guild
@@ -95,8 +97,13 @@ fn channel_belongs_to_guild(
     false
 }
 
-fn actor_can_view_channel(guild: &Guild, actor: &Member, channel_id: ChannelId) -> bool {
-    member_can_view_channel(guild, actor, channel_id)
+fn actor_can_view_channel(
+    guild: &Guild,
+    actor_id: UserId,
+    actor_roles: &[serenity::model::id::RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    member_can_view_channel(guild, actor_id, actor_roles, channel_id)
 }
 
 fn clip_channel_name(name: &str) -> String {
@@ -161,6 +168,17 @@ mod tests {
         member
     }
 
+    fn snapshot_for_mod(cache: &serenity::cache::Cache, target: UserId) -> VoiceLookupSnapshot {
+        let actor = mod_actor();
+        snapshot_cached_voice(
+            cache,
+            GuildId::new(GUILD),
+            actor.user.id,
+            &actor.roles,
+            target,
+        )
+    }
+
     fn cache_with_guild(
         voice_states: HashMap<UserId, VoiceState>,
         channels: Vec<GuildChannel>,
@@ -198,12 +216,7 @@ mod tests {
             voice_state(TARGET, Some(VOICE_CHANNEL)),
         );
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
-        let snapshot = snapshot_cached_voice(
-            &cache,
-            GuildId::new(GUILD),
-            &mod_actor(),
-            UserId::new(TARGET),
-        );
+        let snapshot = snapshot_for_mod(&cache, UserId::new(TARGET));
         assert_eq!(
             snapshot,
             VoiceLookupSnapshot::InChannel {
@@ -219,12 +232,7 @@ mod tests {
         states.insert(UserId::new(TARGET), voice_state(TARGET, None));
         let cache = cache_with_guild(states, vec![]);
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::NotInChannel
         );
     }
@@ -235,12 +243,7 @@ mod tests {
         states.insert(UserId::new(99), voice_state(99, Some(VOICE_CHANNEL)));
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::NotInChannel
         );
     }
@@ -249,12 +252,7 @@ mod tests {
     fn empty_guild_cache_is_not_cached() {
         let cache = Arc::new(serenity::cache::Cache::new());
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::GuildNotCached
         );
     }
@@ -263,12 +261,7 @@ mod tests {
     fn empty_voice_states_after_guild_ready_is_not_in_channel() {
         let cache = cache_with_guild(HashMap::new(), vec![]);
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::NotInChannel
         );
     }
@@ -283,12 +276,7 @@ mod tests {
         );
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
         assert!(matches!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::InChannel { .. }
         ));
         let leave = serde_json::json!({
@@ -307,12 +295,7 @@ mod tests {
         let mut event: VoiceStateUpdateEvent = serde_json::from_value(leave).unwrap();
         cache.update(&mut event);
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::NotInChannel
         );
     }
@@ -338,12 +321,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(foreign_guild).unwrap()).unwrap();
         cache.update(&mut event);
         assert_eq!(
-            snapshot_cached_voice(
-                &cache,
-                GuildId::new(GUILD),
-                &mod_actor(),
-                UserId::new(TARGET)
-            ),
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
             VoiceLookupSnapshot::ChannelUnavailable
         );
     }
@@ -368,12 +346,7 @@ mod tests {
             voice_state(TARGET, Some(VOICE_CHANNEL)),
         );
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
-        let snapshot = snapshot_cached_voice(
-            &cache,
-            GuildId::new(GUILD),
-            &mod_actor(),
-            UserId::new(TARGET),
-        );
+        let snapshot = snapshot_for_mod(&cache, UserId::new(TARGET));
         drop(cache);
         assert_eq!(
             assert_owned(snapshot),
@@ -393,12 +366,7 @@ mod tests {
             voice_state(TARGET, Some(VOICE_CHANNEL)),
         );
         let cache = cache_with_guild(states, vec![voice_channel(&long)]);
-        let snapshot = snapshot_cached_voice(
-            &cache,
-            GuildId::new(GUILD),
-            &mod_actor(),
-            UserId::new(TARGET),
-        );
+        let snapshot = snapshot_for_mod(&cache, UserId::new(TARGET));
         let VoiceLookupSnapshot::InChannel { channel_name, .. } = snapshot else {
             panic!("expected in-channel snapshot");
         };
@@ -421,16 +389,55 @@ mod tests {
         }];
         let cache = cache_with_guild(states, vec![channel]);
         let guild = cache.guild(GuildId::new(GUILD)).expect("guild");
-        let mut actor = Member::default();
-        actor.user.id = UserId::new(1);
-        actor.guild_id = GuildId::new(GUILD);
+        const ACTOR: u64 = 1;
+        let roles = vec![RoleId::new(50)];
         assert!(
-            !super::member_can_view_channel(&guild, &actor, ChannelId::new(VOICE_CHANNEL)),
+            !super::member_can_view_channel(
+                &guild,
+                UserId::new(ACTOR),
+                &roles,
+                ChannelId::new(VOICE_CHANNEL),
+            ),
             "actor without view must not read hidden channel metadata"
         );
         assert_eq!(
-            snapshot_cached_voice(&cache, GuildId::new(GUILD), &actor, UserId::new(TARGET)),
+            snapshot_cached_voice(
+                &cache,
+                GuildId::new(GUILD),
+                UserId::new(ACTOR),
+                &roles,
+                UserId::new(TARGET),
+            ),
             VoiceLookupSnapshot::ChannelUnavailable
+        );
+    }
+
+    #[test]
+    fn gateway_partial_member_default_user_id_does_not_bypass_view_denies() {
+        let mut states = HashMap::new();
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
+        let mut channel = voice_channel("Secret");
+        channel.permission_overwrites = vec![serenity::model::channel::PermissionOverwrite {
+            kind: serenity::model::channel::PermissionOverwriteType::Member(UserId::new(7)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        let cache = cache_with_guild(states, vec![channel]);
+        let author = UserId::new(7);
+        let roles = vec![RoleId::new(50)];
+        assert_eq!(
+            snapshot_cached_voice(
+                &cache,
+                GuildId::new(GUILD),
+                author,
+                &roles,
+                UserId::new(TARGET),
+            ),
+            VoiceLookupSnapshot::ChannelUnavailable,
+            "author id must drive member-specific view denies"
         );
     }
 
