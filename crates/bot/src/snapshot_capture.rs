@@ -302,11 +302,12 @@ impl SnapshotIngress {
                         false,
                     );
                     if !queued {
-                        let report = logging::message_delete_report(
+                        let report = logging::observed_delete_report(
                             app,
                             guild,
                             event.channel_id,
                             event.message_id,
+                            None,
                         );
                         submit_report(app, &context, report);
                     }
@@ -324,11 +325,7 @@ impl SnapshotIngress {
                         true,
                     );
                     if !queued {
-                        let mut transcript = logging::BulkTranscript::new(ids.len());
-                        for id in ids {
-                            transcript.push_unknown(id);
-                        }
-                        submit_bulk_report(app, &context, guild, event.channel_id, transcript);
+                        submit_peeled_bulk_deletes(app, &context, guild, event.channel_id, ids);
                     }
                 }
             }
@@ -1105,8 +1102,13 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         bulk: false,
                     } => {
                         if let Some(id) = ids.first() {
-                            let mut report =
-                                logging::message_delete_report(&app, guild, channel, *id);
+                            let mut report = logging::observed_delete_report(
+                                &app,
+                                guild,
+                                channel,
+                                *id,
+                                None,
+                            );
                             report
                                 .vars
                                 .insert("coverage".into(), "snapshot storage unavailable".into());
@@ -1119,11 +1121,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         ids,
                         bulk: true,
                     } => {
-                        let mut transcript = logging::BulkTranscript::new(ids.len());
-                        for id in ids {
-                            transcript.push_unknown(id);
-                        }
-                        submit_bulk_report(&app, &work.context, guild, channel, transcript);
+                        submit_peeled_bulk_deletes(&app, &work.context, guild, channel, ids);
                     }
                     _ => {}
                 }
@@ -1483,7 +1481,16 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         Ok(rows) => {
                             for (id, row) in chunk.iter().zip(rows) {
                                 if *bulk {
-                                    if row
+                                    let report = logging::observed_delete_report(
+                                        &app,
+                                        *guild,
+                                        *channel,
+                                        *id,
+                                        row.as_ref(),
+                                    );
+                                    if report.event == "automod_delete" {
+                                        submit_report(&app, &work.context, report);
+                                    } else if row
                                         .as_ref()
                                         .and_then(|row| row.fields.author_id)
                                         .is_some_and(|author| ignored_authors.contains(&author))
@@ -1514,8 +1521,13 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if *bulk {
                     submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
                 } else if let Some(id) = ids.first() {
-                    let mut report = logging::message_delete_report(&app, *guild, *channel, *id);
-                    logging::apply_retained_delete(&mut report, single.as_ref());
+                    let mut report = logging::observed_delete_report(
+                        &app,
+                        *guild,
+                        *channel,
+                        *id,
+                        single.as_ref(),
+                    );
                     if single_unknown {
                         report
                             .vars
@@ -1599,6 +1611,32 @@ fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePerm
             None
         }
     }
+}
+
+fn submit_peeled_bulk_deletes(
+    app: &Arc<BotState>,
+    context: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: Vec<MessageId>,
+) {
+    let mut plain = Vec::new();
+    for id in ids {
+        let report = logging::observed_delete_report(app, guild, channel, id, None);
+        if report.event == "automod_delete" {
+            submit_report(app, context, report);
+        } else {
+            plain.push(id);
+        }
+    }
+    if plain.is_empty() {
+        return;
+    }
+    let mut transcript = logging::BulkTranscript::new(plain.len());
+    for id in plain {
+        transcript.push_unknown(id);
+    }
+    submit_bulk_report(app, context, guild, channel, transcript);
 }
 
 fn submit_bulk_report(

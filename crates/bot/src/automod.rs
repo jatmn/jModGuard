@@ -423,6 +423,8 @@ async fn automod_try_delete_message(
     guild_id: u64,
     channel: u64,
     message: u64,
+    rule_id: &str,
+    rule_name: &str,
 ) {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -431,21 +433,34 @@ async fn automod_try_delete_message(
     {
         return;
     }
+    app.automod_delete_marks
+        .insert(guild_id, channel, message, rule_id, rule_name);
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    if let crate::discord::DiscordCall::Finished(Err(error)) = crate::discord::race_discord_call(
+    match crate::discord::race_discord_call(
         &app.activation,
         http.delete_message(channel.into(), message.into(), None),
     )
     .await
     {
-        app.remembered_discord_targets.remember_rest_rejection(
-            recovery,
-            &error,
-            target,
-            Instant::now(),
-        );
+        crate::discord::DiscordCall::Finished(Ok(_)) => {
+            app.automod_delete_marks.confirm(guild_id, channel, message);
+        }
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            app.automod_delete_marks
+                .remove_unconfirmed(guild_id, channel, message);
+            app.remembered_discord_targets.remember_rest_rejection(
+                recovery,
+                &error,
+                target,
+                Instant::now(),
+            );
+        }
+        crate::discord::DiscordCall::Cancelled => {
+            app.automod_delete_marks
+                .remove_unconfirmed(guild_id, channel, message);
+        }
     }
 }
 
@@ -648,7 +663,16 @@ pub(crate) async fn execute_pending_with(
             if !app.activation.may_record() {
                 return;
             }
-            automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
+            automod_try_delete_message(
+                app,
+                http,
+                guild_id.get(),
+                ch,
+                id,
+                pending.rule_id.as_str(),
+                pending.rule_name.as_str(),
+            )
+            .await;
         }
         // This return precedes the ban handoff and operation identity creation.
         if log_automod {
@@ -674,7 +698,16 @@ pub(crate) async fn execute_pending_with(
                 if !app.activation.may_record() {
                     return;
                 }
-                automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
+                automod_try_delete_message(
+                    app,
+                    http,
+                    guild_id.get(),
+                    ch,
+                    id,
+                    pending.rule_id.as_str(),
+                    pending.rule_name.as_str(),
+                )
+                .await;
             }
         }
         "warn" => {
@@ -3394,6 +3427,308 @@ mod tests {
             (1, 1),
             "the echo must not add or replace the active ban"
         );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn dry_run_delete_does_not_insert_automod_delete_mark() {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let path = std::env::temp_dir().join(format!(
+            "dry_run_delete_mark_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let mut rule = dry_run_word_ban();
+        rule.actions[0].action = "delete".into();
+        crate::db::upsert_rule(&app.db, 10, "custom:0123456789abcdef", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&[]))
+            .expect("dry-run delete rule matches");
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        let stub = DiscordStub::start();
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        let _ = stub.finish();
+        assert!(
+            !app
+                .automod_delete_marks
+                .inner
+                .lock()
+                .contains(10, 70, 42)
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn automod_delete_mark_exists_before_delete_rest_finishes() {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path = std::env::temp_dir().join(format!(
+            "delete_mark_order_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        rule.actions[0].action = "delete".into();
+        crate::db::upsert_rule(&app.db, 10, "custom:0123456789abcdef", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&[]))
+            .expect("delete rule matches");
+        let delete_seen = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let app_for_check = Arc::clone(&app);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server_delete_seen = Arc::clone(&delete_seen);
+        let server_release = Arc::clone(&release);
+        let server_app = Arc::clone(&app_for_check);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut tmp) {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let header = String::from_utf8_lossy(&buf);
+                        let method = header.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("");
+                        if method == "DELETE" && header.contains("/messages/") {
+                            server_delete_seen.store(true, Ordering::Relaxed);
+                            assert!(
+                                server_app
+                                    .automod_delete_marks
+                                    .inner
+                                    .lock()
+                                    .contains(10, 70, 42)
+                            );
+                            while !server_release.load(Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        let worker_app = Arc::clone(&app);
+        let task = tokio::spawn(async move {
+            execute_pending_with(
+                &worker_app,
+                &http,
+                &cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(42),
+                Some(70),
+                &pending,
+            )
+            .await;
+        });
+        while !delete_seen.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        release.store(true, Ordering::Relaxed);
+        task.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn failed_automod_delete_clears_mark_and_later_delete_is_plain() {
+        use crate::logging::observed_delete_report;
+        use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
+        use serenity::model::user::User;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path = std::env::temp_dir().join(format!(
+            "delete_mark_403_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        rule.actions[0].action = "delete".into();
+        crate::db::upsert_rule(&app.db, 10, "custom:0123456789abcdef", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let pending = AutomodEngine::new()
+            .evaluate(&cfg, &word_message(&[]))
+            .expect("delete rule matches");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut tmp) {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let response = b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"message\": \"forbidden\"}";
+                        let _ = stream.write_all(response);
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = serenity::cache::Cache::new();
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        execute_pending_with(
+            &app,
+            &http,
+            &cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        assert!(
+            !app
+                .automod_delete_marks
+                .inner
+                .lock()
+                .contains(10, 70, 42)
+        );
+        let report = observed_delete_report(
+            &app,
+            GuildId::new(10),
+            ChannelId::new(70),
+            MessageId::new(42),
+            None,
+        );
+        assert_eq!(report.event, "message_delete");
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);

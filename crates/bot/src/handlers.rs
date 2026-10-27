@@ -1375,8 +1375,13 @@ impl EventHandler for Handler {
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         if !hooked {
-            let report =
-                logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
+            let report = logging::observed_delete_report(
+                &self.app,
+                guild_id,
+                channel_id,
+                deleted_message_id,
+                None,
+            );
             logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
         }
     }
@@ -1414,11 +1419,24 @@ impl EventHandler for Handler {
         }
         if !hooked {
             let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
-            let mut transcript = logging::BulkTranscript::new(ids.len());
+            let mut plain = Vec::new();
             for id in ids {
-                transcript.push_unknown(id);
+                let report =
+                    logging::observed_delete_report(&self.app, guild_id, channel_id, id, None);
+                if report.event == "automod_delete" {
+                    logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
+                } else {
+                    plain.push(id);
+                }
             }
-            logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript).await;
+            if !plain.is_empty() {
+                let mut transcript = logging::BulkTranscript::new(plain.len());
+                for id in plain {
+                    transcript.push_unknown(id);
+                }
+                logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)
+                    .await;
+            }
         }
     }
 

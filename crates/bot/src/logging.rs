@@ -635,6 +635,13 @@ fn channel_for(
     cfg: &crate::state::CachedGuildConfig,
     event: &str,
 ) -> Option<serenity::model::id::ChannelId> {
+    if event == "automod_delete" {
+        return cfg
+            .log_channels
+            .get("automod_delete")
+            .or_else(|| cfg.log_channels.get("message_delete"))
+            .copied();
+    }
     cfg.log_channels.get(event).copied()
 }
 
@@ -1395,7 +1402,7 @@ fn bound_default_message_vars(event: &str, vars: &mut BTreeMap<String, String>) 
             bound_default_value(vars, "after", 600);
             bound_default_value(vars, "attachments", 240);
         }
-        "message_delete" => {
+        "message_delete" | "automod_delete" => {
             bound_default_value(vars, "content", 900);
             bound_default_value(vars, "attachments", 400);
         }
@@ -2148,6 +2155,54 @@ pub(crate) fn message_delete_report(
     }
 }
 
+fn automod_delete_report(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    rule_id: &str,
+    rule_name: &str,
+) -> MessageReport {
+    let mut vars = message_vars(guild_id, channel, id);
+    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
+        vars.extend(templates::user_vars(
+            snippet.author,
+            &snippet.author.to_string(),
+            &snippet.author.to_string(),
+        ));
+    }
+    vars.insert("rule_id".into(), rule_id.to_owned());
+    vars.insert("rule".into(), rule_name.to_owned());
+    MessageReport {
+        guild_id,
+        event: "automod_delete",
+        vars,
+    }
+}
+
+/// Gateway delete logging: plain `message_delete` unless an automod mark exists.
+pub(crate) fn observed_delete_report(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+) -> MessageReport {
+    let mut report = if let Some((rule_id, rule_name)) = app.automod_delete_marks.take(
+        guild_id.get(),
+        channel.get(),
+        id.get(),
+    ) {
+        automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name)
+    } else {
+        message_delete_report(app, guild_id, channel, id)
+    };
+    if let Some(row) = retained {
+        apply_retained_delete(&mut report, Some(row));
+    }
+    report
+}
+
 /// Emits a mod-action event with actor context (used by command behaviors).
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_mod_action(
@@ -2290,6 +2345,9 @@ fn default_template(event: &str) -> &'static str {
         .map(|(_, t)| t)
         .unwrap_or("**{event}**\n{content}")
 }
+
+#[cfg(test)]
+mod automod_delete_log;
 
 #[cfg(test)]
 mod tests;

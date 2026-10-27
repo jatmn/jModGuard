@@ -50,6 +50,7 @@ Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{ro
 - **message_delete** — message ID and last observed author, text and attachment metadata when available
 - **message_bulk_delete** — unique count, retained/known-missing/storage-unknown/filtered counts, omitted transcript entries, and a transient bounded transcript attachment; a definite attachment-permission failure uses plain-message chunks with an exact omitted count
 - **automod** — shield: rule, action, reason, evidence, channel
+- **automod_delete** — automod rule that removed a message (distinct from a plain human delete). Uses the `automod_delete` log channel when set, otherwise the `message_delete` channel. After a bot restart, a gateway delete that arrives before the mark was recorded still logs as **message_delete**
 - **mod_action** — judge: action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
 - **plan_executed** — custom command runs
@@ -87,6 +88,7 @@ be shared as global defaults.
 ```
 member_join   →  📥 {user} joined! Say hi in #welcome ({mention})
 automod       →  ⛔ {rule} fired on {mention} → {action} | {reason} | {content}
+automod_delete→  ⛔ {rule} deleted `{message_id}` in {channel}; text: {content}; attachments: {attachments}
 message_delete→  🗑 Message `{message_id}` deleted in {channel}; text: {content}; attachments: {attachments}.
 ```
 

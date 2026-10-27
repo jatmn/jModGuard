@@ -530,6 +530,10 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
             "thread_delete",
             "**:thread: Thread deleted**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Time:** `{time}`",
         ),
+        (
+            "automod_delete",
+            "**:wastebasket: Automod deleted message in {channel}**\n\n**Rule:** {rule} (`{rule_id}`)\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}\n**Attachments:** {attachments}",
+        ),
     ]
 }
 
