@@ -32,8 +32,15 @@ load_signing_secrets_from_staging() {
   _JMG_SIGNING_PASSWORD="$(<"$dir/password")"
 }
 
+assert_signing_secrets_not_staged_on_disk() {
+  local dir="${JMODGUARD_SIGNING_SECRETS_DIR:-}"
+  [[ -z "$dir" ]] && return 0
+  if [[ -f "$dir/key" || -f "$dir/password" ]]; then
+    publish_fail 'signing secrets must not be staged on disk before image build completes'
+  fi
+}
+
 capture_signing_secrets() {
-  load_signing_secrets_from_staging
   if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]]; then
     _JMG_SIGNING_KEY="$JMODGUARD_UPDATE_SIGNING_KEY"
     _JMG_SIGNING_KEY_FILE=""
@@ -45,6 +52,13 @@ capture_signing_secrets() {
     _JMG_SIGNING_PASSWORD_FILE=""
   fi
   unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+}
+
+ensure_signing_secrets_captured() {
+  if [[ -n "$_JMG_SIGNING_KEY" && -n "$_JMG_SIGNING_PASSWORD" ]]; then
+    return 0
+  fi
+  load_signing_secrets_from_staging
 }
 
 signing_secrets_in_environ() {
@@ -408,24 +422,32 @@ process.stdout.write(digest);
 JS
 }
 
-assert_digest_matches_ref() {
+digest_matches_ref() {
   local ref="$1" expected_digest="$2"
   local resolved
   IFS=$'\t' read -r resolved _ <<<"$(inspect_digest "$ref")"
-  [[ "$resolved" == "$expected_digest" ]] \
-    || publish_fail "registry reference ${ref} points at ${resolved}, expected ${expected_digest}"
+  [[ "$resolved" == "$expected_digest" ]]
+}
+
+assert_digest_matches_ref() {
+  local ref="$1" expected_digest="$2" resolved
+  if digest_matches_ref "$ref" "$expected_digest"; then
+    return 0
+  fi
+  IFS=$'\t' read -r resolved _ <<<"$(inspect_digest "$ref")"
+  publish_fail "registry reference ${ref} points at ${resolved}, expected ${expected_digest}"
 }
 
 verify_image_runtime_configuration() {
   local component="$1" ref="$2" layout="${3:-current}"
   local raw expected
   raw="$(run_docker buildx imagetools inspect "$ref" --format '{{json .Image}}')"
-  if [[ "$component" == "webui" ]]; then
-    expected='["/docker-entrypoint.sh"]'
-  elif [[ "$layout" == "legacy" ]]; then
+  if [[ "$layout" == "legacy" ]]; then
+    expected='[]'
+  elif [[ "$component" == "webui" ]]; then
     expected='[]'
   else
-    expected='["/usr/local/bin/jmodguard-bootstrap"]'
+    expected='["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]'
   fi
   IMAGE_JSON="$raw" EXPECTED_ENTRYPOINT="$expected" LAYOUT="$layout" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.IMAGE_JSON || "{}");
@@ -446,7 +468,7 @@ promote_image_tag() {
     PROMOTION_ROLLBACK+=("${image}:${tag}|")
   fi
   run_docker buildx imagetools create --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null
-  assert_digest_matches_ref "${image}:${tag}" "$digest"
+  digest_matches_ref "${image}:${tag}" "$digest" || return 1
 }
 
 rollback_promoted_tags() {
@@ -719,7 +741,7 @@ sign_published_digest() {
       --yes \
       --key "$_JMG_SIGNING_KEY_FILE" \
       --tlog-upload=false \
-      --annotation "io.jmodguard.not-after=${not_after}" \
+      -a "io.jmodguard.not-after=${not_after}" \
       "${image}@${digest}"
   )
   run_cosign verify \
@@ -793,6 +815,7 @@ publish_component() {
     return 0
   fi
   channel="$(channel_for "$mode" "$label" || true)"
+  assert_signing_secrets_not_staged_on_disk
   if [[ "$component" == "webui" ]]; then
     if [[ -f "$context/tools/webui/package-lock.json" ]]; then
       npm ci --ignore-scripts --prefix "$context/tools/webui"
@@ -810,6 +833,7 @@ publish_component() {
     || publish_fail 'build metadata did not report an image digest'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
   verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
+  ensure_signing_secrets_captured
   persist_signing_secrets_to_files "$scratch"
   signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
   sign_published_digest "$component" "$image" "$published_digest"

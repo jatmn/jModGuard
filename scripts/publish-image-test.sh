@@ -316,9 +316,8 @@ mock_publish_helpers() {
   verify_published_image() {
     printf 'verify %s %s@%s %s\n' "$1" "$2" "$3" "${5:-current}" >>"$TRACE_FILE"
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
+    verify_image_runtime_configuration "$1" "${2}@${3}" "${5:-current}"
   }
-  verify_image_runtime_configuration() { :; }
-
   # The browser bundle itself is tested by package-webui-test.mjs. Here prove
   # publication installs/builds in the selected source worktree before packaging.
   npm() {
@@ -388,7 +387,7 @@ mock_publish_helpers() {
       fi
       if [[ "$2" == imagetools ]]; then
         if [[ "$*" == *'{{json .Image}}'* ]]; then
-          printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
+          printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
           return 0
         fi
         printf '{"digest":"%s","size":10}\n' "$MOCK_BUILD_DIGEST"
@@ -1055,7 +1054,7 @@ run_docker() {
   fi
   if [[ "$1 $2" == 'buildx imagetools' ]]; then
     if [[ "$*" == *'{{json .Image}}'* ]]; then
-      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
       return 0
     fi
     printf '{"digest":"sha256:%064d","size":10}\n' 0
@@ -1150,7 +1149,7 @@ run_docker() {
   fi
   if [[ "$1 $2" == 'buildx imagetools' ]]; then
     if [[ "$*" == *'{{json .Image}}'* ]]; then
-      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
       return 0
     fi
     printf '{"digest":"sha256:%064d","size":10}\n' 0
@@ -1300,9 +1299,128 @@ rm -rf "$PROD_SIGN_SCRATCH"
 grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" \
   && fail 'production signing must not pass the private key through the environment'
 grep -Fq 'io.jmodguard.not-after=' "$COSIGN_TRACE" || fail 'production signing must attach the expiry annotation'
+grep -Fq -- '--annotation' "$COSIGN_TRACE" && fail 'cosign sign must use -a/--annotations, not --annotation'
+grep -Fq ' -a io.jmodguard.not-after=' "$COSIGN_TRACE" \
+  || grep -Fq -- '-a io.jmodguard.not-after=' "$COSIGN_TRACE" \
+  || fail 'cosign sign must pass -a for the expiry annotation'
 grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
 grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'
 _JMG_SIGNING_KEY=""
 _JMG_SIGNING_PASSWORD=""
+
+reload_publisher
+runtime_image_json() {
+  local component="$1" layout="${2:-current}"
+  if [[ "$layout" == legacy ]]; then
+    printf '%s' '{"config":{"Labels":{"org.opencontainers.image.revision":"abc"},"Entrypoint":[]}}'
+  elif [[ "$component" == webui ]]; then
+    printf '%s' '{"config":{"Labels":{"org.opencontainers.image.revision":"abc"},"Entrypoint":[]}}'
+  else
+    printf '%s' '{"config":{"Labels":{"org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
+  fi
+}
+run_docker() {
+  if [[ "$1 $2" == 'buildx imagetools' && "$*" == *'{{json .Image}}'* ]]; then
+    printf '%s' "$(runtime_image_json "$RUNTIME_TEST_COMPONENT" "$RUNTIME_TEST_LAYOUT")"
+    return 0
+  fi
+  return 0
+}
+for RUNTIME_TEST_COMPONENT in bot api; do
+  RUNTIME_TEST_LAYOUT=current
+  verify_image_runtime_configuration "$RUNTIME_TEST_COMPONENT" 'ghcr.io/jatmn/jmodguard-bot@sha256:deadbeef' current \
+    || fail "${RUNTIME_TEST_COMPONENT} current layout entrypoint must match Dockerfile"
+done
+RUNTIME_TEST_COMPONENT=webui
+RUNTIME_TEST_LAYOUT=current
+verify_image_runtime_configuration webui 'ghcr.io/jatmn/jmodguard-webui@sha256:deadbeef' current \
+  || fail 'webui scratch image must have no entrypoint'
+RUNTIME_TEST_COMPONENT=bot
+RUNTIME_TEST_LAYOUT=legacy
+verify_image_runtime_configuration bot 'ghcr.io/jatmn/jmodguard-bot@sha256:deadbeef' legacy \
+  || fail 'legacy service images must have no entrypoint'
+RUNTIME_TEST_LAYOUT=current
+run_docker() {
+  if [[ "$1 $2" == 'buildx imagetools' && "$*" == *'{{json .Image}}'* ]]; then
+    printf '%s' '{"config":{"Labels":{"org.opencontainers.image.revision":"abc"},"Entrypoint":["/wrong"]}}'
+    return 0
+  fi
+  return 0
+}
+if verify_image_runtime_configuration bot 'ghcr.io/jatmn/jmodguard-bot@sha256:deadbeef' current 2>/dev/null; then
+  fail 'mismatched entrypoint must fail runtime configuration'
+fi
+
+reload_publisher
+EARLY_SIGNING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/early-signing-XXXXXX")"
+umask 077
+printf '%s' "$SIGNING_KEY_VALUE" >"$EARLY_SIGNING_DIR/key"
+printf '%s' "$SIGNING_PASSWORD_VALUE" >"$EARLY_SIGNING_DIR/password"
+export JMODGUARD_SIGNING_SECRETS_DIR="$EARLY_SIGNING_DIR"
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+if exercise_publish 1 >/dev/null 2>&1; then
+  fail 'pre-staged signing secrets on disk must fail before image build'
+fi
+printf '%s\n' "${PUBLISH_LAST_ERROR:-}" | grep -q 'staged on disk' \
+  || fail 'pre-staged signing secrets must fail with a staged-on-disk error'
+rm -rf "$EARLY_SIGNING_DIR"
+unset JMODGUARD_SIGNING_SECRETS_DIR
+
+reload_publisher
+ROLLBACK_IMAGE=ghcr.io/jatmn/jmodguard-bot
+ROLLBACK_DIGEST="sha256:$(printf 'b%.0s' {1..64})"
+ROLLBACK_PREV="sha256:$(printf 'a%.0s' {1..64})"
+declare -A ROLLBACK_TAG_DIGEST=()
+ROLLBACK_PROMOTES=0
+ROLLBACK_ROLLBACKS=0
+run_docker() {
+  local prev="" arg ref digest
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    for arg in "$@"; do
+      if [[ "$prev" == --tag ]]; then
+        ref="$arg"
+      fi
+      if [[ "$arg" == *@sha256:* ]]; then
+        digest="${arg#*@}"
+      fi
+      prev="$arg"
+    done
+    ROLLBACK_TAG_DIGEST["$ref"]="$digest"
+    if [[ "$ref" == "${ROLLBACK_IMAGE}:latest" ]]; then
+      ROLLBACK_PROMOTES=$((ROLLBACK_PROMOTES + 1))
+      ROLLBACK_TAG_DIGEST["$ref"]="$ROLLBACK_PREV"
+      return 0
+    fi
+    ROLLBACK_PROMOTES=$((ROLLBACK_PROMOTES + 1))
+    return 0
+  fi
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then
+    if [[ "$3" == inspect && "$*" == *'{{json .Manifest}}'* ]]; then
+      ref="$4"
+      digest="${ROLLBACK_TAG_DIGEST[$ref]:-$ROLLBACK_DIGEST}"
+      printf '{"digest":"%s","size":10}\n' "$digest"
+      return 0
+    fi
+    if [[ "$*" == *'{{json .Image}}'* ]]; then
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
+      return 0
+    fi
+  fi
+  return 0
+}
+ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PREV"
+PROMOTION_ROLLBACK=()
+promote_image_tag "$ROLLBACK_IMAGE" "${HEAD_SHA}" "$ROLLBACK_DIGEST" \
+  || fail 'first promotion must succeed'
+ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_DIGEST"
+[[ "${#PROMOTION_ROLLBACK[@]}" -eq 1 ]] || fail 'first promotion must record rollback state'
+if promote_image_tag "$ROLLBACK_IMAGE" latest "$ROLLBACK_DIGEST"; then
+  fail 'second promotion must fail when digest verification mismatches'
+fi
+rollback_promoted_tags
+[[ "${ROLLBACK_TAG_DIGEST[${ROLLBACK_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PREV" ]] \
+  || fail 'rollback must restore the first promoted tag to its previous digest'
+[[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
 
 echo 'publish-image-test: ok'
