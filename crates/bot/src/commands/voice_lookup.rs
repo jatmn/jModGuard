@@ -8,7 +8,7 @@ use serenity::model::voice::VoiceState;
 pub const IN_CHANNEL_TEMPLATE: &str = "**{target}** is in **{channel}** (`{channel_id}`)";
 /// Rendered when the member has no cached voice state or left a channel.
 pub const NOT_IN_CHANNEL_TEMPLATE: &str = "**{target}** is not in a voice channel.";
-/// Rendered when the guild or voice-state cache is empty (for example right after a restart).
+/// Rendered when the guild is not present in the gateway cache.
 pub const NOT_CACHED_TEMPLATE: &str = "**{target}** voice state is not cached.";
 
 const CHANNEL_NAME_CLIP: usize = 100;
@@ -33,9 +33,6 @@ pub fn snapshot_cached_voice(
     let Some(guild) = cache.guild(guild_id) else {
         return VoiceLookupSnapshot::NotCached;
     };
-    if guild.voice_states.is_empty() {
-        return VoiceLookupSnapshot::NotCached;
-    }
     match guild.voice_states.get(&target) {
         None => VoiceLookupSnapshot::NotInChannel,
         Some(state) => snapshot_voice_state(cache, guild_id, &guild, state),
@@ -204,11 +201,45 @@ mod tests {
     }
 
     #[test]
-    fn empty_voice_states_is_not_cached_after_restart() {
+    fn empty_voice_states_after_guild_ready_is_not_in_channel() {
         let cache = cache_with_guild(HashMap::new(), vec![]);
         assert_eq!(
             snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET)),
-            VoiceLookupSnapshot::NotCached
+            VoiceLookupSnapshot::NotInChannel
+        );
+    }
+
+    #[test]
+    fn voice_state_update_leave_clears_cached_member() {
+        use serenity::model::event::VoiceStateUpdateEvent;
+        let mut states = HashMap::new();
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
+        let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
+        assert!(matches!(
+            snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET)),
+            VoiceLookupSnapshot::InChannel { .. }
+        ));
+        let leave = serde_json::json!({
+            "channel_id": null,
+            "deaf": false,
+            "guild_id": GUILD.to_string(),
+            "mute": false,
+            "self_deaf": false,
+            "self_mute": false,
+            "self_stream": null,
+            "self_video": false,
+            "session_id": "fixture",
+            "suppress": false,
+            "user_id": TARGET.to_string(),
+        });
+        let mut event: VoiceStateUpdateEvent = serde_json::from_value(leave).unwrap();
+        cache.update(&mut event);
+        assert_eq!(
+            snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET)),
+            VoiceLookupSnapshot::NotInChannel
         );
     }
 

@@ -2012,30 +2012,29 @@ mod tests {
             ("target_id".into(), "42".into()),
         ]);
         let not_cached = BehaviorOutcome {
-            response: Some(
-                templates::render(
-                    super::voice_lookup::NOT_CACHED_TEMPLATE,
-                    &vars,
-                ),
-            ),
+            response: Some(templates::render(
+                super::voice_lookup::NOT_CACHED_TEMPLATE,
+                &vars,
+            )),
             vars: vars.clone(),
             suppress_response: false,
         };
         let not_cached_text = render_outcome(&command, &not_cached);
         assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
-        assert!(!not_cached_text.contains("{channel_id}"), "{not_cached_text}");
+        assert!(
+            !not_cached_text.contains("{channel_id}"),
+            "{not_cached_text}"
+        );
         assert_eq!(
             prefix_response_text(&command, &not_cached).as_deref(),
             Some(not_cached_text.as_str())
         );
 
         let not_in_channel = BehaviorOutcome {
-            response: Some(
-                templates::render(
-                    super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
-                    &vars,
-                ),
-            ),
+            response: Some(templates::render(
+                super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                &vars,
+            )),
             vars: vars.clone(),
             suppress_response: false,
         };
