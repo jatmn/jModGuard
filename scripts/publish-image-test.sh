@@ -324,6 +324,9 @@ mock_publish_helpers() {
   npm() {
     printf 'npm %s\n' "$*" >>"$TRACE_FILE"
     if [[ "$1" == run && "$2" == build ]]; then
+      signing_secrets_in_environ && fail 'signing secrets must not remain in the process environment during WebUI build'
+      [[ -z "$_JMG_SIGNING_KEY_FILE" || ! -f "$_JMG_SIGNING_KEY_FILE" ]] \
+        || fail 'signing key file must not exist during WebUI build'
       local context="${4%/tools/webui}"
       mkdir -p "$context/dist"
       cp -R "$root/dist/frontend" "$context/dist/frontend"
@@ -370,6 +373,8 @@ mock_publish_helpers() {
     if [[ "$1" == buildx ]]; then
       if [[ "$2" == build ]]; then
         assert_signing_secrets_not_in_environ
+        [[ -z "$_JMG_SIGNING_KEY_FILE" || ! -f "$_JMG_SIGNING_KEY_FILE" ]] \
+          || fail 'signing key file must not exist during image build'
         local arg prev=""
         local wrote_metadata=0
         for arg in "$@"; do
