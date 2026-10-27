@@ -38,9 +38,10 @@ assert.doesNotMatch(publishBuild, /JMODGUARD_UPDATE_SIGNING_KEY/);
 assert.doesNotMatch(publishBuild, /JMODGUARD_UPDATE_SIGNING_PASSWORD/);
 assert.match(publishBuild, /upload-artifact@/);
 assert.match(publishBuild, /publish-state-\$\{\{ matrix\.component \}\}/);
-assert.match(publishBuild, /should_sign/);
+assert.doesNotMatch(publishBuild, /outputs:\s*\n\s+should_sign:/);
+assert.match(publishBuild, /cosign-installer@/);
 assert.match(publishSign, /needs: \[.*publish-build.*\]/);
-assert.match(publishSign, /needs\.publish-build\.outputs\.should_sign == 'true'/);
+assert.doesNotMatch(publishSign, /should_sign/);
 assert.match(publishSign, /download-artifact@/);
 assert.match(publishSign, /JMODGUARD_UPDATE_SIGNING_KEY/);
 assert.match(publishSign, /JMODGUARD_PUBLISH_PHASE: sign/);
@@ -252,11 +253,11 @@ try {
       for (const result of ["failure", "cancelled", "skipped", "success"]) {
         context.needs["release-ci"].result = result;
         assert.equal(condition(publishBuild, context), result === "success");
-        context.needs["publish-build"] = { result: result, outputs: { should_sign: "true" } };
+        context.needs["publish-build"] = { result: result, outputs: {} };
         assert.equal(
           condition(publishSign, context),
           result === "success",
-          "signing must follow a successful build handoff",
+          "signing must follow a successful build matrix",
         );
       }
     }
@@ -266,10 +267,10 @@ try {
     assert.equal(condition(jobs.get("release-ci"), context), false);
     context.needs["release-ci"].result = "skipped";
     assert.ok(condition(publishBuild, context), "same-source and manual routes keep original checks");
-    context.needs["publish-build"] = { result: "success", outputs: { should_sign: "false" } };
-    assert.equal(condition(publishSign, context), false, "skipped build must not run signing");
-    context.needs["publish-build"].outputs.should_sign = "true";
-    assert.ok(condition(publishSign, context), "verified build handoff must allow signing");
+    context.needs["publish-build"] = { result: "failure", outputs: {} };
+    assert.equal(condition(publishSign, context), false, "failed build must not run signing");
+    context.needs["publish-build"].result = "success";
+    assert.ok(condition(publishSign, context), "successful build must allow per-component signing");
   }
 
   // Saved main and release plans both skip release creation before restoration,
