@@ -947,6 +947,15 @@ fn legacy_setname_payload(shipped: &crate::types::CommandDef) -> Result<String> 
     Ok(serde_json::to_string(&legacy)?)
 }
 
+fn legacy_kick_ban_usage_payload(
+    shipped: &crate::types::CommandDef,
+    usage: &str,
+) -> Result<String> {
+    let mut legacy = shipped.clone();
+    legacy.usage = usage.into();
+    Ok(serde_json::to_string(&legacy)?)
+}
+
 /// True when a migrate-open has nothing left to write. The check is one short
 /// primary read. The previous seed held BEGIN IMMEDIATE across every default
 /// row, and each statement was its own Hrana round trip.
@@ -1229,6 +1238,20 @@ fn seed_globals_sql(
                 "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'setname' AND data = {};\n",
                 sql_text(&serde_json::to_string(&cmd)?),
                 sql_text(&legacy_setname_payload(&cmd)?)
+            ));
+        }
+        if cmd.name == "kick" {
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'kick' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(&cmd, "!kick <user> [reason]")?)
+            ));
+        }
+        if cmd.name == "ban" {
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'ban' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(&cmd, "!ban <user> [reason]")?)
             ));
         }
         commands.push_str(&format!(

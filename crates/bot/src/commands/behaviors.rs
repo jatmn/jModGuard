@@ -16,7 +16,10 @@ fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
     }
 }
 
-fn refuse_bot_target(env: &CmdEnv<'_>, target: serenity::model::id::UserId) -> Result<()> {
+pub(crate) fn refuse_bot_target(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+) -> Result<()> {
     if target == env.ctx.cache.current_user().id {
         let message = jmodguard::templates::render_bounded(
             jmodguard::defaults::CANNOT_MODERATE_BOT_TEMPLATE,
@@ -103,7 +106,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         _finished_reason.as_deref(),
                     )
                     .await;
-                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
+                    let dm_reason = _finished_reason.as_deref().unwrap_or(reason.as_str());
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
@@ -131,7 +135,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         )
                         .await;
                     }
-                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
+                    let dm_reason = discord_reason.as_deref().unwrap_or(reason.as_str());
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
                     if !env.app.activation.may_record() {
@@ -235,10 +240,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                             }
                         }
                         crate::db::guild_data::CaseOutcome::Failed => {
-                            return Err(discord
+                            mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
+                                env, target, dm_outcome,
+                            )
+                            .await;
+                            let message = discord
                                 .err()
-                                .map(|error| anyhow!("{error}"))
-                                .unwrap_or_else(|| anyhow!("ban failed")));
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "ban failed".to_string());
+                            return Err(mod_reason_dm::moderation_failure_error(
+                                message, dm_outcome,
+                            ));
                         }
                         _ => {
                             return Err(anyhow!("ban outcome is uncertain; verify it in Discord"));
@@ -383,7 +395,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             lease_held(env)?;
-            discord?;
+            if let Err(error) = discord {
+                mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
+                    env, target, dm_outcome,
+                )
+                .await;
+                return Err(mod_reason_dm::moderation_failure_error(error, dm_outcome));
+            }
             log_mod(
                 env,
                 enrollment.clone(),

@@ -11,9 +11,9 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 
 | Command | Category | Permission | Description |
 |---|---|---|---|
-| `!ban <user> [reason] [--dm]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
+| `!ban <user> [--dm] [reason]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
-| `!kick <user> [reason] [--dm]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
+| `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
 | `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |

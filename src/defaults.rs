@@ -484,8 +484,11 @@ pub const ATTACHMENT_BURST_BANNED: &str = "banned";
 pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
 
 /// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
-pub const MOD_REASON_DM_TEMPLATE: &str =
-    "You were {action} from **{guild}**.\nReason: {reason}\n— {actor}";
+pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// Follow-up when the preliminary reason DM was sent but kick/ban failed.
+pub const MOD_REASON_DM_MODERATION_FAILED_TEMPLATE: &str =
+    "Update: your removal from **{guild}** did not complete; you may still be in the server.";
 
 /// Shipped kick/ban confirmation clause when a reason DM was requested.
 pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";

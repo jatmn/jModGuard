@@ -42,9 +42,14 @@ pub(crate) fn command_supports_reason_dm(behavior: &Behavior) -> bool {
 }
 
 pub(crate) fn classify_mod_reason_dm_delivery_error(error: &serenity::Error) -> ModReasonDmOutcome {
-    match crate::cases::classify_discord(Some(error)) {
-        crate::db::guild_data::CaseOutcome::Failed => ModReasonDmOutcome::NotSent,
-        _ => ModReasonDmOutcome::Uncertain,
+    if matches!(
+        error,
+        serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response))
+            if (400..500).contains(&response.status_code.as_u16()) && response.status_code.as_u16() != 408
+    ) {
+        ModReasonDmOutcome::NotSent
+    } else {
+        ModReasonDmOutcome::Uncertain
     }
 }
 
@@ -86,6 +91,58 @@ pub(crate) fn render_mod_reason_dm_body_for_reason(
     let clean = jmodguard::ban_reason::without_tag(reason);
     let vars = mod_reason_dm_vars(guild, action, clean, actor);
     render_mod_reason_dm_body(&vars)
+}
+
+pub(crate) fn moderation_failure_error(
+    message: impl std::fmt::Display,
+    dm: Option<ModReasonDmOutcome>,
+) -> anyhow::Error {
+    let mut text = message.to_string();
+    if let Some(outcome) = dm {
+        text.push_str(&render_mod_reason_dm_clause(outcome));
+    }
+    anyhow::Error::msg(text)
+}
+
+pub(crate) async fn send_mod_reason_dm_moderation_failed_followup(
+    env: &CmdEnv<'_>,
+    target: UserId,
+    dm_outcome: Option<ModReasonDmOutcome>,
+) {
+    if dm_outcome != Some(ModReasonDmOutcome::Sent) {
+        return;
+    }
+    if !env.app.activation.may_record() {
+        return;
+    }
+    let guild = env
+        .ctx
+        .cache
+        .guild(env.guild_id)
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| env.guild_id.to_string());
+    let mut vars = BTreeMap::new();
+    vars.insert("guild".into(), guild);
+    let text = jmodguard::templates::render_bounded(
+        jmodguard::defaults::MOD_REASON_DM_MODERATION_FAILED_TEMPLATE,
+        &vars,
+        2000,
+    );
+    let channel = match crate::discord::race_discord_call(
+        &env.app.activation,
+        env.ctx
+            .http
+            .create_private_channel(&serde_json::json!({"recipient_id": target.to_string()})),
+    )
+    .await
+    {
+        crate::discord::DiscordCall::Cancelled => return,
+        crate::discord::DiscordCall::Finished(Err(_)) => return,
+        crate::discord::DiscordCall::Finished(Ok(channel)) => channel,
+    };
+    let _ =
+        crate::discord::race_discord_call(&env.app.activation, channel.say(&env.ctx.http, &text))
+            .await;
 }
 
 pub(crate) fn render_mod_reason_dm_clause(outcome: ModReasonDmOutcome) -> String {
@@ -224,6 +281,12 @@ async fn fixture_context_for_dm_order_test(
 }
 
 #[cfg(test)]
+const FIXTURE_PRIVATE_CHANNEL_JSON: &str =
+    r#"{"id":"555","type":1,"recipients":[{"id":"91","username":"target","discriminator":0}]}"#;
+#[cfg(test)]
+const FIXTURE_DM_MESSAGE_JSON: &str = r#"{"id":"1","channel_id":"555","author":{"id":"7","username":"bot","discriminator":0},"content":"hi","timestamp":"2020-01-01T00:00:00+00:00","tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"flags":0}"#;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::Args;
@@ -277,9 +340,15 @@ mod tests {
     fn production_dm_render_strips_ban_attempt_tag() {
         let tag = jmodguard::ban_reason::BanAttemptTag::new();
         let reason = jmodguard::ban_reason::discord_reason("secret", Some(&tag));
-        let body = render_mod_reason_dm_body_for_reason("Guild", "ban", &reason, "Mod");
+        let body = render_mod_reason_dm_body_for_reason("Guild", "banned", &reason, "Mod");
         assert!(!body.contains("[jmg:"));
         assert!(body.contains("secret"));
+        assert!(
+            body.contains("requested your removal"),
+            "pre-moderation DM must not claim completion: {body}"
+        );
+        assert!(!body.contains("were banned"));
+        assert!(!body.contains("You are being banned"));
     }
 
     #[test]
@@ -463,9 +532,9 @@ mod tests {
                 };
                 seq.lock().unwrap().push(label);
                 let (status, body) = if label == "dm_open" {
-                    (200, r#"{"id":"555"}"#)
+                    (200, FIXTURE_PRIVATE_CHANNEL_JSON)
                 } else if label == "dm_say" {
-                    (200, r#"{"id":"1"}"#)
+                    (200, FIXTURE_DM_MESSAGE_JSON)
                 } else if label == "kick" {
                     (204, "")
                 } else {
@@ -551,12 +620,183 @@ mod tests {
 
         let order = sequence.lock().unwrap().clone();
         let dm_open = order.iter().position(|step| *step == "dm_open");
+        let dm_say = order.iter().position(|step| *step == "dm_say");
         let kick_step = order.iter().position(|step| *step == "kick");
         assert!(
-            dm_open.is_some() && kick_step.is_some() && dm_open < kick_step,
-            "reason DM must open before kick removal, got {order:?}"
+            dm_open.is_some()
+                && dm_say.is_some()
+                && kick_step.is_some()
+                && dm_open < dm_say
+                && dm_say < kick_step,
+            "reason DM must post before kick removal, got {order:?}"
         );
 
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn kick_reason_dm_then_kick_403_sends_followup_and_error_includes_dm_clause() {
+        use serenity::model::event::GuildCreateEvent;
+        use serenity::model::guild::{Guild, Member};
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const GUILD: u64 = 10;
+        const TARGET: u64 = 91;
+        const MOD: u64 = 7;
+
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bodies);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_line = request.split(|&b| b == b'\n').next().unwrap_or(&[]);
+                let line = String::from_utf8_lossy(request_line);
+                let label = if line.contains("users/@me/channels") {
+                    "dm_open"
+                } else if line.contains("/messages") {
+                    "dm_say"
+                } else if line.contains("/members/") {
+                    "kick"
+                } else {
+                    "other"
+                };
+                if label == "dm_say" {
+                    let body_start = request
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
+                        .unwrap_or(request.len());
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request[body_start..]).to_string());
+                }
+                let (status, body) = if label == "dm_open" {
+                    (200, FIXTURE_PRIVATE_CHANNEL_JSON)
+                } else if label == "dm_say" {
+                    (200, FIXTURE_DM_MESSAGE_JSON)
+                } else if label == "kick" {
+                    (403, r#"{"code":50013,"message":"fixture forbidden"}"#)
+                } else {
+                    (404, r#"{"code":0,"message":"fixture"}"#)
+                };
+                let response = if body.is_empty() {
+                    format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("fixture")
+                .proxy(format!("http://{address}"))
+                .application_id(serenity::model::id::ApplicationId::new(1))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.name = "Test Guild".into();
+        for (user_id, name) in [(MOD, "mod"), (TARGET, "target")] {
+            let mut user = serenity::model::user::User::default();
+            user.id = UserId::new(user_id);
+            user.name = name.into();
+            let mut member = Member::default();
+            member.user = user;
+            member.guild_id = guild.id;
+            guild.members.insert(member.user.id, member);
+        }
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let path = std::env::temp_dir().join(format!(
+            "kick_dm_followup_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = Arc::new(
+            crate::state::BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap())
+                .unwrap(),
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, GUILD as i64, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+
+        let ctx = fixture_context_for_dm_order_test(Arc::clone(&http), Arc::clone(&cache)).await;
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let actor = cache
+            .guild(GuildId::new(GUILD))
+            .and_then(|g| g.members.get(&UserId::new(MOD)).cloned())
+            .expect("mod member");
+        let env = crate::commands::CmdEnv::new(
+            &app,
+            &ctx,
+            &kick,
+            GuildId::new(GUILD),
+            ChannelId::new(1),
+            UserId::new(MOD),
+            actor,
+            crate::commands::Args::new(&TARGET.to_string()),
+            true,
+            None,
+        );
+        let error = match crate::commands::behaviors::run(&env).await {
+            Ok(_) => panic!("kick must fail when Discord returns 403"),
+            Err(error) => error,
+        };
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT),
+            "operator error must include DM status: {error_text}"
+        );
+
+        let messages = bodies.lock().unwrap().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|body| body.contains("requested your removal")),
+            "pre-moderation DM must not claim completion: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|body| body.contains("did not complete")),
+            "follow-up DM must correct a failed kick: {messages:?}"
+        );
+
+        server.abort();
         drop(app);
         crate::tenant::remove_sidecars(&path);
         let _ = std::fs::remove_file(path);
