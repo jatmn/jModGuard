@@ -10,6 +10,18 @@ fail() {
   exit 1
 }
 
+command -v cosign >/dev/null || fail 'cosign is required for publish-image-test.sh'
+TEST_SIGNING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-image-signing-XXXXXX")"
+TEST_SIGNING_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '\n/=')"
+cleanup_test_signing() {
+  rm -rf "$TEST_SIGNING_DIR"
+}
+trap cleanup_test_signing EXIT
+COSIGN_PASSWORD="$TEST_SIGNING_PASSWORD" cosign generate-key-pair \
+  --output-key-prefix "$TEST_SIGNING_DIR/update-signing"
+SIGNING_KEY_VALUE="$(<"$TEST_SIGNING_DIR/update-signing.key")"
+SIGNING_PASSWORD_VALUE="$TEST_SIGNING_PASSWORD"
+
 # shellcheck disable=SC1091
 JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
 
@@ -254,8 +266,6 @@ FAIL_BUILD=0
 FAIL_VERIFY=0
 FAIL_SIGN=0
 PUBLISH_SHA="$HEAD_SHA"
-SIGNING_KEY_VALUE=fixture-signing-key
-SIGNING_PASSWORD_VALUE=fixture-signing-password
 SOURCE_LAYOUT=current
 TRACE_FILE=""
 PUBLISH_TEST_TRACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-traces-XXXXXX")"
