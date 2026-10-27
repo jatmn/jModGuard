@@ -491,7 +491,7 @@ impl Registry {
         let wanted: HashSet<&str> = requested.iter().copied().collect();
         ensure!(wanted.len() == requested.len(), "duplicate file request");
         let mut found = HashMap::new();
-        let mut hidden = HashSet::new();
+        let mut mask = LayerMask::default();
         for layer in manifest.layers.iter().rev() {
             let bytes = self.blob(repo, layer, MAX_LAYER).await?;
             merge_layer_into_found(
@@ -499,7 +499,7 @@ impl Registry {
                 &layer.media_type,
                 &wanted,
                 &mut found,
-                &mut hidden,
+                &mut mask,
             )?;
             if found.len() == requested.len() {
                 break;
@@ -520,9 +520,9 @@ fn resolve_requested_files_from_layers(
     let wanted: HashSet<&str> = requested.iter().copied().collect();
     ensure!(wanted.len() == requested.len(), "duplicate file request");
     let mut found = HashMap::new();
-    let mut hidden = HashSet::new();
+    let mut mask = LayerMask::default();
     for (bytes, media) in layers {
-        merge_layer_into_found(bytes, media, &wanted, &mut found, &mut hidden)?;
+        merge_layer_into_found(bytes, media, &wanted, &mut found, &mut mask)?;
         if found.len() == requested.len() {
             break;
         }
@@ -534,12 +534,54 @@ fn resolve_requested_files_from_layers(
     Ok(found)
 }
 
+#[derive(Default)]
+struct LayerMask {
+    hidden: HashSet<String>,
+    hidden_prefixes: HashSet<String>,
+    opaque_dirs: HashSet<String>,
+}
+
+impl LayerMask {
+    fn mask_deleted_path(&mut self, deleted: &str) {
+        self.hidden.insert(deleted.to_owned());
+        if !deleted.is_empty() {
+            self.hidden_prefixes.insert(format!("{deleted}/"));
+        }
+    }
+
+    fn mask_opaque_dir(&mut self, dir: &str) {
+        let prefix = if dir.ends_with('/') {
+            dir.to_owned()
+        } else {
+            format!("{dir}/")
+        };
+        self.opaque_dirs.insert(prefix);
+    }
+
+    fn is_masked(&self, name: &str) -> bool {
+        self.hidden.contains(name)
+            || self
+                .hidden_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || self
+                .opaque_dirs
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
+    fn drop_descendants(&self, found: &mut HashMap<String, Vec<u8>>, deleted: &str) {
+        let prefix = format!("{deleted}/");
+        found.retain(|path, _| path != deleted && !path.starts_with(&prefix));
+    }
+}
+
 fn merge_layer_into_found(
     bytes: &[u8],
     media: &str,
     wanted: &HashSet<&str>,
     found: &mut HashMap<String, Vec<u8>>,
-    hidden: &mut HashSet<String>,
+    mask: &mut LayerMask,
 ) -> Result<()> {
     let reader: Box<dyn Read + '_> = match media {
         "application/vnd.oci.image.layer.v1.tar+gzip"
@@ -569,18 +611,23 @@ fn merge_layer_into_found(
         let size = entry.size();
         total = total.checked_add(size).context("layer size overflow")?;
         ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
+        if let Some(dir) = opaque_whiteout_dir(normalized) {
+            mask.mask_opaque_dir(&dir);
+            continue;
+        }
         if let Some(deleted) = whiteout_target(normalized) {
-            hidden.insert(deleted.clone());
+            mask.mask_deleted_path(&deleted);
             if !found.contains_key(&deleted) {
                 found.remove(&deleted);
             }
+            mask.drop_descendants(found, &deleted);
             continue;
         }
         let name = normalized.to_owned();
         if !wanted.contains(name.as_str()) {
             continue;
         }
-        if hidden.contains(&name) {
+        if mask.is_masked(&name) {
             continue;
         }
         if found.contains_key(&name) {
@@ -601,6 +648,19 @@ fn merge_layer_into_found(
         found.insert(name, data);
     }
     Ok(())
+}
+
+fn opaque_whiteout_dir(normalized: &str) -> Option<String> {
+    let path = std::path::Path::new(normalized);
+    if path.file_name().and_then(|name| name.to_str()) != Some(".wh..opq") {
+        return None;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .and_then(|parent| parent.to_str())
+        .unwrap_or(".");
+    Some(parent.to_owned())
 }
 
 fn whiteout_target(normalized: &str) -> Option<String> {
@@ -849,6 +909,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+    }
+
+    #[test]
+    fn directory_whiteout_hides_requested_descendants() {
+        let newer = layer(&[(
+            "usr/local/.wh.bin",
+            b"",
+            tar::EntryType::Regular,
+        )]);
+        let older = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"stale",
+            tar::EntryType::Regular,
+        )]);
+        let err = resolve_requested_files_from_layers(
+            &[
+                (
+                    newer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    older.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing a required file"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn opaque_whiteout_hides_lower_layer_descendants() {
+        let newer = layer(&[(
+            "usr/local/bin/.wh..opq",
+            b"",
+            tar::EntryType::Regular,
+        )]);
+        let older = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"stale",
+            tar::EntryType::Regular,
+        )]);
+        let err = resolve_requested_files_from_layers(
+            &[
+                (
+                    newer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    older.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing a required file"),
+            "{err:#}"
+        );
     }
 
     #[test]
