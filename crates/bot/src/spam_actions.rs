@@ -548,11 +548,7 @@ async fn punish_proven_match(
                     .remove_unconfirmed(found.guild, *channel, *message);
                 delete_outcome(&error)
             }
-            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
-                app.automod_delete_marks
-                    .remove_unconfirmed(found.guild, *channel, *message);
-                CaseOutcome::Uncertain
-            }
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
         app.spam_gate.finish_delete(
             found.guild,

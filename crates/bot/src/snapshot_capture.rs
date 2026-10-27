@@ -2161,6 +2161,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
+        // Test-only loopback WebSocket URL for a local accept() fixture, not production traffic.
         let url = Arc::new(tokio::sync::Mutex::new(format!(
             "ws://{}",
             listener.local_addr().unwrap()
