@@ -64,7 +64,6 @@ fn cached_member_renders_profile_warns_and_cases() {
         Some(member),
         Some(
             serde_json::from_value(serde_json::json!({
-                "guild_id": "10",
                 "channel_id": "700",
                 "user_id": "91",
                 "session_id": "sess",
@@ -179,8 +178,26 @@ fn case_row(at: i64, case_id: &str) -> MemberHistoryEntry {
     }
 }
 
+fn absorb_case_page(
+    cases: &mut Vec<MemberHistoryEntry>,
+    page: &MemberHistoryPage,
+    limit: usize,
+) -> bool {
+    for entry in &page.entries {
+        if entry.case_id.is_none() {
+            continue;
+        }
+        if cases.len() < limit {
+            cases.push(entry.clone());
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_case_entries_from_pages(pages: &[MemberHistoryPage]) -> Vec<MemberHistoryEntry> {
-    let limit = CASE_LINE_LIMIT;
+    let limit = CASE_LINE_LIMIT as usize;
     let mut entries = Vec::new();
     for page in pages {
         if absorb_case_page(&mut entries, page, limit) {

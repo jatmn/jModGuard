@@ -1,6 +1,6 @@
 //! `!userinfo` / `/userinfo` — cached member snapshot plus warns and case history.
 
-use crate::db::guild_data::{MemberHistoryEntry, MemberHistoryPage};
+use crate::db::guild_data::{GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::voice::VoiceState;
@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 
 use super::{Args, BehaviorOutcome, CmdEnv};
 
-pub(crate) const CASE_LINE_LIMIT: usize = 8;
-const HISTORY_PAGE: u32 = 50;
+pub(crate) const CASE_LINE_LIMIT: u32 = 8;
 
 pub(crate) const MISSING: &str = "missing";
 pub(crate) const VOICE_NOT_IN: &str = "not in a voice channel";
@@ -128,7 +127,7 @@ fn voice_from_guild(
     let Some(channel_id) = state.channel_id else {
         return VoiceSnapshot::NotInChannel;
     };
-    if state.guild_id != Some(guild_id) {
+    if state.guild_id.is_some_and(|gid| gid != guild_id) {
         return VoiceSnapshot::NotCached;
     }
     let name = channels
@@ -161,25 +160,6 @@ pub(crate) fn apply_missing_user_identity(snapshot: &mut MemberSnapshot) {
     if snapshot.global_name.is_none() {
         snapshot.global_name = Some(MISSING.to_string());
     }
-}
-
-/// Adds case rows from one mixed history page. Returns true when a ninth case exists.
-pub(crate) fn absorb_case_page(
-    cases: &mut Vec<MemberHistoryEntry>,
-    page: &MemberHistoryPage,
-    limit: usize,
-) -> bool {
-    for entry in &page.entries {
-        if entry.case_id.is_none() {
-            continue;
-        }
-        if cases.len() < limit {
-            cases.push(entry.clone());
-        } else {
-            return true;
-        }
-    }
-    false
 }
 
 pub(crate) fn case_lines_from_entries(entries: &[MemberHistoryEntry]) -> Vec<String> {
@@ -514,29 +494,27 @@ async fn load_case_lines(
     let Ok((store, scope)) = live else {
         return CasesField::Unavailable;
     };
-    let limit = CASE_LINE_LIMIT;
-    let mut entries = Vec::new();
-    let mut after = None;
-    loop {
-        let page = store
-            .member_history(scope.clone(), target.get() as i64, after, HISTORY_PAGE)
-            .await;
-        let Ok(page) = page else {
-            return CasesField::Unavailable;
-        };
-        if absorb_case_page(&mut entries, &page, limit) {
-            break;
+    load_case_lines_from_store(&store, scope, target).await
+}
+
+async fn load_case_lines_from_store(
+    store: &GuildDataStore,
+    scope: GuildDataScope,
+    target: UserId,
+) -> CasesField {
+    let loaded = store
+        .member_case_entries(scope, target.get() as i64, CASE_LINE_LIMIT)
+        .await;
+    match loaded {
+        Ok((entries, _truncated)) => {
+            let lines = case_lines_from_entries(&entries);
+            if lines.is_empty() {
+                CasesField::None
+            } else {
+                CasesField::Lines(lines)
+            }
         }
-        if page.next_cursor.is_none() {
-            break;
-        }
-        after = page.next_cursor;
-    }
-    let lines = case_lines_from_entries(&entries);
-    if lines.is_empty() {
-        CasesField::None
-    } else {
-        CasesField::Lines(lines)
+        Err(_) => CasesField::Unavailable,
     }
 }
 
