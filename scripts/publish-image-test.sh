@@ -1377,6 +1377,88 @@ printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FO
 rm -rf "$trusted_sign_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
+# A retried publish-sign job must sign the existing staging digest without rebuilding.
+reload_publisher
+mock_publish_helpers
+FAIL_SIGN=0
+sign_retry_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-sign-retry-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$sign_retry_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+GITHUB_RUN_ID=424242
+export GITHUB_RUN_ID
+JMODGUARD_PUBLISH_PHASE=build
+export JMODGUARD_PUBLISH_PHASE
+with_main
+GHCR_USERNAME=publisher
+GHCR_TOKEN=test-secret
+GITHUB_TOKEN=""
+GITHUB_RUN_ATTEMPT=1
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON GITHUB_RUN_ATTEMPT
+unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+changed_since_publication() { return 0; }
+( publish_component api ) >/dev/null 2>&1 || fail 'build phase must stage the image before sign retry'
+: >"$TRACE_FILE"
+JMODGUARD_PUBLISH_PHASE=sign
+export JMODGUARD_PUBLISH_PHASE
+GITHUB_RUN_ATTEMPT=2
+export GITHUB_RUN_ATTEMPT
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+( publish_component api ) >/dev/null 2>&1 || fail 'sign retry must succeed using the staged registry digest'
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
+  && fail 'sign retry must not rebuild the image'
+printf '%s\n' "${CALLS[@]}" | grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
+  || fail 'sign retry must sign the staged registry digest'
+rm -rf "$sign_retry_dir"
+unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
+
+# Historical WebUI sources without an independent package must skip signing cleanly.
+reload_publisher
+mock_publish_helpers
+legacy_webui_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-webui-legacy-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$legacy_webui_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+run_git() {
+  printf 'git %s\n' "$*" >>"$TRACE_FILE"
+  case "$1" in
+    rev-parse) printf '%s\n' "$HEAD_SHA" ;;
+    status) printf '' ;;
+    worktree)
+      if [[ "$2" == add ]]; then
+        mkdir -p "$4"
+      elif [[ "$2" == remove ]]; then
+        rm -rf "$4"
+      fi
+      ;;
+    *) fail "unexpected git $*" ;;
+  esac
+}
+JMODGUARD_PUBLISH_PHASE=build
+export JMODGUARD_PUBLISH_PHASE
+with_main
+GHCR_USERNAME=publisher
+GHCR_TOKEN=test-secret
+GITHUB_TOKEN=""
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
+output="$(publish_component webui 2>&1)" || fail 'legacy WebUI build must skip cleanly'
+[[ "$output" == *'predates the independent WebUI package'* ]] \
+  || fail "unexpected legacy WebUI build message: $output"
+[[ -f "$legacy_webui_dir/handoff.json" ]] || fail 'legacy WebUI skip must write handoff metadata'
+HANDOFF_JSON="$(cat "$legacy_webui_dir/handoff.json")"
+HANDOFF_JSON="$HANDOFF_JSON" node --input-type=commonjs -e \
+  'process.exit(JSON.parse(process.env.HANDOFF_JSON).sign === false ? 0 : 2)' \
+  || fail 'legacy WebUI skip must mark sign:false in handoff'
+JMODGUARD_PUBLISH_PHASE=sign
+export JMODGUARD_PUBLISH_PHASE
+output="$(publish_component webui 2>&1)" || fail 'legacy WebUI sign phase must skip cleanly'
+[[ "$output" == *'skipping promotion'* ]] || fail "expected sign skip for legacy WebUI, got: $output"
+rm -rf "$legacy_webui_dir"
+unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
+
 reload_publisher
 PROD_PROMOTE_CREATE=0
 ROLLBACK_PROMOTE_IMAGE=ghcr.io/jatmn/jmodguard-api

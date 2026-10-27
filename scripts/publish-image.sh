@@ -86,8 +86,7 @@ load_signing_secrets_from_files() {
 publish_staging_ref() {
   local image="$1" sha="$2"
   local run_id="${GITHUB_RUN_ID:-0}"
-  local attempt="${GITHUB_RUN_ATTEMPT:-1}"
-  printf '%s:_publish-%s-%s-%s' "$image" "${sha:0:12}" "$run_id" "$attempt"
+  printf '%s:_publish-%s-%s' "$image" "${sha:0:12}" "$run_id"
 }
 read_publication_plan() {
   if [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" ]]; then
@@ -888,6 +887,7 @@ publish_component_build() {
   if [[ "$component" == "webui" && "$layout" == "legacy" ]]; then
     echo 'webui: selected source predates the independent WebUI package; no image to publish'
     clear_publish_state "$component"
+    write_publish_handoff "$component" false
     trap - EXIT
     cleanup_publish
     return 0
