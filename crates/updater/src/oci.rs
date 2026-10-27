@@ -213,7 +213,7 @@ impl Registry {
                 value.get("payloadType").is_some() && value.get("payload").is_some()
             })
         {
-            candidates.push(body.to_vec());
+            return Ok(vec![body.to_vec()]);
         }
         let manifest: Manifest =
             serde_json::from_slice(body).map_err(|_| signature::ImageSignatureRejection {
