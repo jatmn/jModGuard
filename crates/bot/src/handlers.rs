@@ -744,9 +744,25 @@ impl EventHandler for Handler {
             None,
         )
         .await;
-        if membership_refresh {
-            crate::member_rejoin::maybe_emit_member_rejoin(&app, &ctx, guild_id, &new_member.user)
-                .await;
+        let joined_at_ms = new_member
+            .joined_at
+            .map(|joined| joined.timestamp_millis())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        if app.rejoin_note_deliveries.should_attempt(
+            guild_id.get(),
+            uid,
+            joined_at_ms,
+            membership_refresh,
+        ) && crate::member_rejoin::maybe_emit_member_rejoin(
+            &app,
+            &ctx,
+            guild_id,
+            &new_member.user,
+        )
+        .await
+        {
+            app.rejoin_note_deliveries
+                .mark_delivered(guild_id.get(), uid, joined_at_ms);
         }
     }
 

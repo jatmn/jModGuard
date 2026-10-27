@@ -50,12 +50,23 @@ fn case_row(at: i64, case_id: &str, reason: Option<&str>) -> MemberHistoryEntry 
 
 #[test]
 fn no_cases_and_complete_index_skips_note() {
-    assert_eq!(build_rejoin_note(prior(vec![], false, true), false), None);
+    assert_eq!(
+        build_rejoin_note(prior(vec![], false, true), Some(false)),
+        None
+    );
+}
+
+#[test]
+fn incomplete_index_without_ban_history_skips_note() {
+    assert_eq!(
+        build_rejoin_note(prior(vec![], false, false), Some(false)),
+        None
+    );
 }
 
 #[test]
 fn incomplete_index_without_cases_uses_not_ready_wording() {
-    let note = build_rejoin_note(prior(vec![], false, false), true).unwrap();
+    let note = build_rejoin_note(prior(vec![], false, false), Some(true)).unwrap();
     assert_eq!(note, RejoinNote::IndexNotReady);
     let vars = member_rejoin_vars(&user(42), &note);
     assert!(vars["notice"].contains("not ready"));
@@ -64,7 +75,7 @@ fn incomplete_index_without_cases_uses_not_ready_wording() {
 
 #[test]
 fn complete_index_with_ban_history_only_uses_neutral_notice() {
-    let note = build_rejoin_note(prior(vec![], false, true), true).unwrap();
+    let note = build_rejoin_note(prior(vec![], false, true), Some(true)).unwrap();
     assert_eq!(note, RejoinNote::BanHistoryOnly);
     let vars = member_rejoin_vars(&user(42), &note);
     assert!(vars["notice"].contains("no case details"));
@@ -78,7 +89,7 @@ fn three_cases_newest_first_with_tag_stripped() {
         case_row(2_000, "case-2", None),
         case_row(1_000, "case-1", Some("rule break")),
     ];
-    let note = build_rejoin_note(prior(entries.to_vec(), false, true), false).unwrap();
+    let note = build_rejoin_note(prior(entries.to_vec(), false, true), Some(false)).unwrap();
     let RejoinNote::Cases {
         lines,
         truncated,
@@ -100,7 +111,7 @@ fn truncation_notice_when_more_than_eight_cases_exist() {
     let entries = (0..9)
         .map(|index| case_row(10_000 - index as i64, &format!("case-{index}"), None))
         .collect();
-    let note = build_rejoin_note(prior(entries, true, true), false).unwrap();
+    let note = build_rejoin_note(prior(entries, true, true), Some(false)).unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
     assert!(vars["notice"].contains("omitted"));
 }
@@ -109,7 +120,7 @@ fn truncation_notice_when_more_than_eight_cases_exist() {
 fn incomplete_index_with_partial_cases_adds_backfill_notice() {
     let note = build_rejoin_note(
         prior(vec![case_row(1_000, "case-one", None)], false, false),
-        false,
+        Some(false),
     )
     .unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
@@ -125,7 +136,7 @@ fn case_reason_newlines_and_markdown_are_sanitized() {
             false,
             true,
         ),
-        false,
+        Some(false),
     )
     .unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
@@ -274,7 +285,7 @@ async fn ninth_case_is_truncated_not_a_second_post() {
     let cases = collect_prior_cases(&store, scope, SUBJECT as i64)
         .await
         .unwrap();
-    let note = build_rejoin_note(cases, false).unwrap();
+    let note = build_rejoin_note(cases, Some(false)).unwrap();
     let vars = member_rejoin_vars(&user(SUBJECT), &note);
     let sink = Sink::default();
     db::upsert_log_channel(&f.app.db, GUILD, "member_join", 100)
@@ -360,15 +371,19 @@ async fn ignored_user_skips_member_rejoin_note() {
 }
 
 #[test]
-fn guild_member_addition_emits_rejoin_only_after_membership_refresh() {
+fn guild_member_addition_retries_rejoin_without_double_posting() {
     let source = include_str!("../handlers.rs");
     let start = source
         .find("async fn guild_member_addition")
         .expect("guild_member_addition");
     let body = &source[start..start + 3_200];
     assert!(
-        body.contains("if membership_refresh"),
-        "join handler must gate the prior-case note on a fresh membership observation"
+        body.contains("rejoin_note_deliveries.should_attempt"),
+        "join handler must admit rejoin notes via delivery state, not only membership_refresh"
+    );
+    assert!(
+        body.contains("mark_delivered"),
+        "join handler must record successful rejoin delivery"
     );
     assert_eq!(
         body.matches("maybe_emit_member_rejoin").count(),
@@ -482,25 +497,9 @@ async fn removed_last_case_after_backfill_uses_ban_history_notice() {
             .is_empty()
     );
     let user = user(SUBJECT);
-    assert!(
-        enrich_member_rejoin_vars(
-            &f.app,
-            GuildId::new(GUILD as u64),
-            &user,
-            &mut BTreeMap::new()
-        )
-        .await
-    );
-    let vars = member_rejoin_vars(
-        &user,
-        &build_rejoin_note(
-            collect_prior_cases(&store, scope, SUBJECT as i64)
-                .await
-                .unwrap(),
-            true,
-        )
-        .unwrap(),
-    );
+    let mut vars = BTreeMap::new();
+    assert!(enrich_member_rejoin_vars(&f.app, GuildId::new(GUILD as u64), &user, &mut vars).await);
     assert!(vars["notice"].contains("no case details"));
     assert!(!vars["notice"].contains("not ready"));
+    assert!(vars["cases"].is_empty());
 }

@@ -31,15 +31,21 @@ pub(crate) struct PriorCases {
     pub index_complete: bool,
 }
 
-pub(crate) fn build_rejoin_note(cases: PriorCases, ever_banned: bool) -> Option<RejoinNote> {
+pub(crate) fn build_rejoin_note(
+    cases: PriorCases,
+    ever_banned: Option<bool>,
+) -> Option<RejoinNote> {
     if cases.entries.is_empty() {
         if !cases.index_complete {
-            return Some(RejoinNote::IndexNotReady);
+            return ever_banned
+                .is_some_and(|ever_banned| ever_banned)
+                .then_some(RejoinNote::IndexNotReady);
         }
-        if ever_banned {
-            return Some(RejoinNote::BanHistoryOnly);
-        }
-        return None;
+        return match ever_banned {
+            Some(true) => Some(RejoinNote::BanHistoryOnly),
+            Some(false) => None,
+            None => Some(RejoinNote::BanHistoryOnly),
+        };
     }
     let lines = cases.entries.iter().map(format_case_line).collect();
     Some(RejoinNote::Cases {
@@ -57,7 +63,7 @@ pub(crate) async fn collect_prior_cases(
     let index_complete = store.member_case_index_complete(scope.clone()).await?;
     let (entries, truncated) = if index_complete {
         store
-            .member_case_entries(scope, user_id, PRIOR_CASE_LIMIT)
+            .member_case_entries(scope.clone(), user_id, PRIOR_CASE_LIMIT)
             .await?
     } else {
         store
@@ -102,15 +108,15 @@ pub(crate) async fn enrich_member_rejoin_vars(
     };
     let user_id = user.id.get() as i64;
     let ever_banned = match store.get_member(scope.clone(), user_id).await {
-        Ok(Some(profile)) => profile.ever_banned,
-        Ok(None) => false,
+        Ok(Some(profile)) => Some(profile.ever_banned),
+        Ok(None) => Some(false),
         Err(error) => {
             tracing::warn!(
                 guild_id = guild_id.get(),
                 user_id,
                 "member rejoin profile unavailable: {error:#}"
             );
-            false
+            None
         }
     };
     let collected = collect_prior_cases(&store, scope, user_id).await;
@@ -139,7 +145,7 @@ pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
             vars.insert("cases".into(), String::new());
             vars.insert(
                 "notice".into(),
-                "Ban history is recorded; indexed case lines are not ready yet.".into(),
+                "Recorded ban history exists; indexed case lines are not ready yet.".into(),
             );
         }
         RejoinNote::BanHistoryOnly => {
@@ -238,7 +244,7 @@ pub(crate) async fn maybe_emit_member_rejoin(
     ctx: &serenity::client::Context,
     guild_id: GuildId,
     user: &User,
-) {
+) -> bool {
     logging::emit_member_event(
         app,
         ctx,
@@ -248,7 +254,8 @@ pub(crate) async fn maybe_emit_member_rejoin(
         BTreeMap::new(),
         None,
     )
-    .await;
+    .await
+    .is_some()
 }
 
 #[cfg(test)]

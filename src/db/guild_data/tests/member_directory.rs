@@ -7049,7 +7049,7 @@ async fn member_case_entries_skips_deleted_rows_before_limit() {
         .await
         .unwrap();
     let mut ids = Vec::new();
-    for index in 0..3 {
+    for index in 0..12 {
         let id = CaseId::new();
         ids.push(id.clone());
         store
@@ -7065,7 +7065,7 @@ async fn member_case_entries_skips_deleted_rows_before_limit() {
                     outcome: CaseOutcome::Succeeded,
                     subject_id: SUBJECT,
                     actor_id: Some(42),
-                    occurred_at_ms: 3_000 - index,
+                    occurred_at_ms: 20_000 - index,
                     reason: Some(format!("live-{index}")),
                     evidence: CaseEvidence::Unavailable,
                 },
@@ -7074,17 +7074,20 @@ async fn member_case_entries_skips_deleted_rows_before_limit() {
             .await
             .unwrap();
     }
-    store
-        .remove_case(scope.clone(), ids[0].clone())
-        .await
-        .unwrap();
+    for removed in &ids[0..4] {
+        store
+            .remove_case(scope.clone(), removed.clone())
+            .await
+            .unwrap();
+    }
     let (entries, truncated) = store
         .member_case_entries(scope.clone(), SUBJECT, 8)
         .await
         .unwrap();
     assert!(!truncated);
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].reason.as_deref(), Some("live-1"));
+    assert_eq!(entries.len(), 8);
+    assert_eq!(entries[0].reason.as_deref(), Some("live-4"));
+    assert_eq!(entries[7].reason.as_deref(), Some("live-11"));
 }
 
 #[tokio::test]
@@ -7149,6 +7152,74 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
             assert!(
                 !plan.iter().any(|line| line.contains("TEMP B-TREE")),
                 "case lookup must not sort the full history: {plan:?}"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn member_subject_case_entries_lookup_is_index_bounded_during_backfill() {
+    const SUBJECT: i64 = 77;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for index in 0..25 {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::new(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::Application {
+                        operation_id: CaseId::new(),
+                    },
+                    action: CaseAction::Kick,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: SUBJECT,
+                    actor_id: Some(42),
+                    occurred_at_ms: 3_000_000 - index,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                CaseLimits::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let (entries, truncated) = store
+        .member_subject_case_entries(scope.clone(), SUBJECT, 8)
+        .await
+        .unwrap();
+    assert!(truncated);
+    assert_eq!(entries.len(), 8);
+    store
+        .db
+        .with_conn(move |conn| {
+            let sql = GuildDataStore::member_subject_cases_lookup_sql();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let plan = stmt
+                .query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        SUBJECT,
+                        9_i64
+                    ],
+                    |row| Ok(row.get::<String>(3)?),
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("guild_member_cases_user")),
+                "incomplete-index fallback must stay member-scoped: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "incomplete-index fallback must not sort full guild history: {plan:?}"
             );
             Ok(())
         })

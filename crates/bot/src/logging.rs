@@ -237,6 +237,37 @@ pub struct MemberJoinContext {
     inner: Mutex<HashMap<(u64, u64), (serenity::model::Timestamp, Instant)>>,
 }
 
+/// Suppresses duplicate member-rejoin notes for the same join token while still
+/// allowing redelivery after a failed first attempt.
+#[derive(Default)]
+pub struct RejoinNoteDeliveries {
+    inner: Mutex<HashMap<(u64, u64, i64), Instant>>,
+}
+
+impl RejoinNoteDeliveries {
+    pub fn should_attempt(
+        &self,
+        guild: u64,
+        user: u64,
+        joined_at_ms: i64,
+        membership_refresh: bool,
+    ) -> bool {
+        if membership_refresh {
+            return true;
+        }
+        self.inner
+            .lock()
+            .get(&(guild, user, joined_at_ms))
+            .is_none_or(|delivered| delivered.elapsed() >= MEMBER_JOINS_KEEP)
+    }
+
+    pub fn mark_delivered(&self, guild: u64, user: u64, joined_at_ms: i64) {
+        let mut entries = self.inner.lock();
+        entries.retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
+        entries.insert((guild, user, joined_at_ms), Instant::now());
+    }
+}
+
 impl MemberJoinContext {
     pub fn remember(&self, guild: u64, user: u64, joined: Option<serenity::model::Timestamp>) {
         let Some(joined) = joined else { return };

@@ -2889,12 +2889,15 @@ impl GuildDataStore {
         "SELECT EXISTS(SELECT 1 FROM (SELECT i.case_id FROM guild_member_case_index i INDEXED BY guild_member_cases_user WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) recent JOIN guild_cases c ON c.guild_id=?1 AND c.enrollment_id=?2 AND c.case_id=recent.case_id AND c.deleted=0 WHERE length(c.payload)>65536)"
     }
 
-    fn member_subject_cases_lookup_sql() -> &'static str {
-        "SELECT json_extract(c.payload,'$.action'),CAST(json_extract(c.payload,'$.occurred_at_ms') AS INTEGER),c.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM guild_cases c WHERE c.guild_id=?1 AND c.enrollment_id=?2 AND c.deleted=0 AND length(c.payload)<=65536 AND json_valid(c.payload) AND CAST(json_extract(c.payload,'$.subject_id') AS INTEGER)=?3 ORDER BY CAST(json_extract(c.payload,'$.occurred_at_ms') AS INTEGER) DESC,c.case_id DESC LIMIT ?4"
+    /// Bounded member-case lookup while `case_backfill_done` is false. Uses the
+    /// partial `guild_member_case_index` window (same plan as `member_case_entries`)
+    /// instead of scanning `guild_cases` by subject JSON.
+    pub(crate) fn member_subject_cases_lookup_sql() -> &'static str {
+        Self::member_case_entries_lookup_sql()
     }
 
     fn member_subject_cases_oversized_sql() -> &'static str {
-        "SELECT EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=?1 AND c.enrollment_id=?2 AND c.deleted=0 AND json_valid(c.payload) AND CAST(json_extract(c.payload,'$.subject_id') AS INTEGER)=?3 AND length(c.payload)>65536 ORDER BY CAST(json_extract(c.payload,'$.occurred_at_ms') AS INTEGER) DESC,c.case_id DESC LIMIT ?4)"
+        Self::member_case_entries_oversized_sql()
     }
 
     /// Recent moderation cases for one member, newest first. Fetches at most
@@ -2953,7 +2956,7 @@ impl GuildDataStore {
             .await
     }
 
-    /// Reads retained cases directly from `guild_cases` while the index backfill is incomplete.
+    /// Reads indexed cases for one member while backfill is still running.
     pub async fn member_subject_case_entries(
         &self,
         scope: GuildDataScope,
@@ -2982,7 +2985,8 @@ impl GuildDataStore {
                     |r| Ok(r.get(0)?),
                 )?;
                 anyhow::ensure!(!oversize, MemberSyncError::Invalid);
-                let mut stmt = tx.prepare(GuildDataStore::member_subject_cases_lookup_sql())?;
+                let sql = GuildDataStore::member_subject_cases_lookup_sql();
+                let mut stmt = tx.prepare(sql)?;
                 let rows = stmt.query_map(
                     params![
                         scope.guild_id(),
@@ -2990,22 +2994,7 @@ impl GuildDataStore {
                         user_id,
                         fetch as i64
                     ],
-                    |r| {
-                        Ok(MemberHistoryEntry {
-                            kind: r.get(0)?,
-                            occurred_at_ms: r.get(1)?,
-                            observed_at_ms: None,
-                            stay_id: None,
-                            observation_id: None,
-                            case_id: Some(r.get::<String>(2)?),
-                            joined_at_ms: None,
-                            departed_at_ms: None,
-                            moderator_id: r.get(3)?,
-                            reason: r.get(4)?,
-                            outcome: r.get(5)?,
-                            source_kind: r.get(6)?,
-                        })
-                    },
+                    Self::member_case_row,
                 )?;
                 let mut entries = Vec::new();
                 for row in rows {
