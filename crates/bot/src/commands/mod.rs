@@ -611,7 +611,11 @@ pub async fn handle_prefix(
     }
 
     let mut args = Args::new(raw_args);
-    let dm = args.strip_dm_flag();
+    let dm = if mod_reason_dm::command_supports_reason_dm(&cmd.behavior) {
+        args.strip_dm_flag()
+    } else {
+        false
+    };
     let env = CmdEnv {
         app,
         ctx,
@@ -1080,7 +1084,11 @@ pub(crate) fn options_to_args_with_dm(
     cmd: &CommandDef,
     options: &[(String, String)],
 ) -> (Vec<String>, bool) {
-    let dm = mod_reason_dm::slash_dm_flag(options);
+    let dm = if mod_reason_dm::command_supports_reason_dm(&cmd.behavior) {
+        mod_reason_dm::slash_dm_flag(options)
+    } else {
+        false
+    };
     let mut out = Vec::new();
     for spec in behaviors::slash_spec(&cmd.behavior) {
         if mod_reason_dm::slash_option_excluded_from_args(spec.name) {

@@ -3,8 +3,13 @@
 use anyhow::{Result, anyhow};
 use serenity::model::id::UserId;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::time::Duration;
 
 use super::CmdEnv;
+use crate::types::Behavior;
+
+pub(crate) const MOD_REASON_DM_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModReasonDmOutcome {
@@ -34,6 +39,20 @@ pub(crate) fn slash_dm_flag(options: &[(String, String)]) -> bool {
 
 pub(crate) fn slash_option_excluded_from_args(name: &str) -> bool {
     name == "dm"
+}
+
+pub(crate) fn command_supports_reason_dm(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Kick { .. } | Behavior::Ban { .. })
+}
+
+pub(crate) async fn bounded_mod_reason_dm_future<F>(future: F) -> ModReasonDmOutcome
+where
+    F: Future<Output = ModReasonDmOutcome>,
+{
+    match tokio::time::timeout(MOD_REASON_DM_TIMEOUT, future).await {
+        Ok(outcome) => outcome,
+        Err(_) => ModReasonDmOutcome::NotSent,
+    }
 }
 
 pub(crate) fn mod_reason_dm_vars(
@@ -73,6 +92,15 @@ pub(crate) fn dm_outcome_allows_moderation(outcome: ModReasonDmOutcome) -> Resul
 }
 
 pub(crate) async fn send_mod_reason_dm(
+    env: &CmdEnv<'_>,
+    target: UserId,
+    action: &str,
+    reason: &str,
+) -> ModReasonDmOutcome {
+    bounded_mod_reason_dm_future(send_mod_reason_dm_inner(env, target, action, reason)).await
+}
+
+async fn send_mod_reason_dm_inner(
     env: &CmdEnv<'_>,
     target: UserId,
     action: &str,
@@ -200,5 +228,50 @@ mod tests {
                 .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT,)
         );
         assert!(render_mod_reason_dm_clause(ModReasonDmOutcome::Cancelled).is_empty());
+    }
+
+    #[test]
+    fn reason_dm_flag_applies_only_to_kick_and_ban() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "kick")
+            .unwrap();
+        let warn = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "warn")
+            .unwrap();
+        assert!(command_supports_reason_dm(&kick.behavior));
+        assert!(!command_supports_reason_dm(&warn.behavior));
+
+        let mut warn_args = Args::new("42 --dm rule broken");
+        let dm = if command_supports_reason_dm(&warn.behavior) {
+            warn_args.strip_dm_flag()
+        } else {
+            false
+        };
+        assert!(!dm);
+        assert_eq!(warn_args.next_arg().as_deref(), Some("42"));
+        assert_eq!(warn_args.rest(), "--dm rule broken");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_dm_future_times_out_as_not_sent() {
+        let outcome = bounded_mod_reason_dm_future(async {
+            tokio::time::sleep(MOD_REASON_DM_TIMEOUT + Duration::from_millis(250)).await;
+            ModReasonDmOutcome::Sent
+        })
+        .await;
+        assert_eq!(outcome, ModReasonDmOutcome::NotSent);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fast_dm_future_keeps_outcome() {
+        let outcome = bounded_mod_reason_dm_future(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ModReasonDmOutcome::Sent
+        })
+        .await;
+        assert_eq!(outcome, ModReasonDmOutcome::Sent);
+        tokio::time::advance(MOD_REASON_DM_TIMEOUT).await;
     }
 }
