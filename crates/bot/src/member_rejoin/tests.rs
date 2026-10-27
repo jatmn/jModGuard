@@ -464,6 +464,29 @@ async fn delivered_rejoin_note_is_deduped_after_membership_refresh() {
 }
 
 #[test]
+fn case_text_inline_more_substrings_do_not_satisfy_overflow_marker() {
+    let lines = vec![
+        "- `ban` · succeeded · `2026-01-01T00:00:00Z` — reason mentions +3 more inline".into(),
+    ];
+    let note = RejoinNote::Cases {
+        lines,
+        truncated: false,
+        index_incomplete: false,
+    };
+    let vars = member_rejoin_vars(&user(42), &note);
+    let last_line = vars["cases"].lines().next_back().expect("cases text");
+    assert!(
+        !last_line
+            .strip_prefix('+')
+            .and_then(|rest| rest.strip_suffix(" more"))
+            .and_then(|count| count.parse::<usize>().ok())
+            .is_some_and(|count| count > 0),
+        "inline +N more text must not count as the overflow marker: {}",
+        vars["cases"]
+    );
+}
+
+#[test]
 fn case_text_budget_appends_more_suffix() {
     let lines = vec!["- `ban` · succeeded · `2026-01-01T00:00:00Z` — x".repeat(400); 6];
     let note = RejoinNote::Cases {

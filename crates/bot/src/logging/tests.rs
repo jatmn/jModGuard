@@ -3981,3 +3981,42 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         .unwrap();
     server.abort();
 }
+
+#[test]
+fn rejoin_note_canceled_in_flight_allows_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, 7)
+        .expect("first delivery attempt must reserve the join token");
+    drop(guard);
+    assert!(
+        deliveries.begin_attempt(9, 8, 7),
+        "canceled handler must release the in-flight join token"
+    );
+}
+
+#[test]
+fn rejoin_note_successful_delivery_blocks_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, 7)
+        .expect("delivery attempt must start");
+    guard.complete(true);
+    assert!(
+        !deliveries.begin_attempt(9, 8, 7),
+        "delivered join token must be deduped"
+    );
+}
+
+#[test]
+fn rejoin_note_failed_delivery_allows_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, 7)
+        .expect("delivery attempt must start");
+    guard.complete(false);
+    assert!(
+        deliveries.begin_attempt(9, 8, 7),
+        "failed delivery must not mark the join token as delivered"
+    );
+}
