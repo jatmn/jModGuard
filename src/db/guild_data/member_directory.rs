@@ -1182,6 +1182,13 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,bot_id)?;
             let (after,done):(Option<String>,bool)=tx.query_row("SELECT case_backfill_after,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if done {tx.finish_read()?;return Ok(true)}
+            let legacy_cases: i64=tx.query_row("SELECT COUNT(*) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
+            if legacy_cases==0 {
+                tx.ensure_mutation_receipt()?;
+                tx.member_execute("UPDATE guild_member_seed SET case_backfill_after=NULL,case_backfill_done=1 WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
+                tx.commit()?;
+                return Ok(true);
+            }
             let mut stmt=tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
             let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_deref().unwrap_or(""),limit as i64],|r|Ok(r.get::<String>(0)?))?;
             let mut last=None;let mut count=0;for row in rows{last=Some(row?);count+=1;}drop(stmt);
@@ -2835,9 +2842,9 @@ impl GuildDataStore {
         "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4"
     }
 
-    /// Primary read used before returning indexed case rows during upgrade backfill.
-    pub(crate) fn member_case_entries_backfill_gate_sql() -> &'static str {
-        "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2"
+    /// True when this member still has selected cases that are not in the subject index.
+    pub(crate) fn member_case_entries_index_gap_sql() -> &'static str {
+        "SELECT EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=?1 AND c.enrollment_id=?2 AND c.deleted=0 AND json_valid(c.payload) AND CAST(json_extract(c.payload,'$.subject_id') AS INTEGER)=?3 AND NOT EXISTS(SELECT 1 FROM guild_member_case_index i WHERE i.guild_id=c.guild_id AND i.enrollment_id=c.enrollment_id AND i.case_id=c.case_id))"
     }
 
     /// Recent moderation cases for one member, newest first. Fetches at most
@@ -2894,15 +2901,12 @@ impl GuildDataStore {
                 if truncated {
                     entries.pop();
                 }
-                let backfill_done: bool = tx
-                    .query_row(
-                        GuildDataStore::member_case_entries_backfill_gate_sql(),
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok(r.get(0)?),
-                    )
-                    .optional()?
-                    .unwrap_or(false);
-                if !backfill_done {
+                let index_gap: bool = tx.query_row(
+                    GuildDataStore::member_case_entries_index_gap_sql(),
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+                    |r| Ok(r.get(0)?),
+                )?;
+                if index_gap {
                     tx.finish_read()?;
                     return Err(MemberSyncError::Stale.into());
                 }

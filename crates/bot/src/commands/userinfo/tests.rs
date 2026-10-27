@@ -458,11 +458,7 @@ fn default_template_renders_without_embedded_paths() {
 async fn ready_userinfo_case_index(app: &BotState, enrollment: &crate::db::GuildEnrollment) {
     let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
     store
-        .initialize_member_directory(scope.clone(), 100, 1_000)
-        .await
-        .unwrap();
-    store
-        .backfill_member_case_index(scope, 100, 8)
+        .initialize_member_directory(scope, 100, 1_000)
         .await
         .unwrap();
 }
@@ -541,10 +537,6 @@ async fn retained_case_visible_after_join_depart_noise() {
     let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
     store
         .initialize_member_directory(scope.clone(), 100, 1_000)
-        .await
-        .unwrap();
-    store
-        .backfill_member_case_index(scope.clone(), 100, 8)
         .await
         .unwrap();
     crate::cases::record(

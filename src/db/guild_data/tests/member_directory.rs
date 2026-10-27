@@ -7212,9 +7212,26 @@ async fn member_case_entries_reports_stale_for_nonempty_partial_index_during_bac
             .unwrap();
     }
     let enrollment_id = scope.enrollment.id.clone();
+    let enrollment_for_lookup = enrollment_id.clone();
+    let older_case_id = store
+        .db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT case_id FROM guild_member_case_index WHERE guild_id=10 AND enrollment_id=?1 AND user_id=?2 ORDER BY occurred_at_ms ASC LIMIT 1",
+                params![enrollment_for_lookup.as_str(), SUBJECT],
+                |row| Ok(row.get::<String>(0)?),
+            )
+        })
+        .await
+        .unwrap();
     store
         .db
         .with_conn(move |conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_member_case_index WHERE guild_id=10 AND enrollment_id=?1 AND user_id=?2 AND case_id=?3",
+                params![enrollment_id.as_str(), SUBJECT, older_case_id.as_str()],
+                65_536,
+            )?;
             conn.execute_bounded(
                 "UPDATE guild_member_seed SET case_backfill_done=0, case_backfill_after='' WHERE guild_id=10 AND enrollment_id=?1",
                 params![enrollment_id.as_str()],
@@ -7224,26 +7241,6 @@ async fn member_case_entries_reports_stale_for_nonempty_partial_index_during_bac
         })
         .await
         .unwrap();
-    store
-        .backfill_member_case_index(scope.clone(), 42, 1)
-        .await
-        .unwrap();
-    let enrollment_for_count = scope.enrollment.id.clone();
-    let indexed: i64 = store
-        .db
-        .with_conn(move |conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM guild_member_case_index WHERE guild_id=10 AND enrollment_id=?1 AND user_id=?2",
-                params![enrollment_for_count.as_str(), SUBJECT],
-                |row| Ok(row.get(0)?),
-            )
-        })
-        .await
-        .unwrap();
-    assert!(
-        indexed >= 1,
-        "backfill should leave at least one indexed case before completion"
-    );
     let err = store
         .member_case_entries(scope.clone(), SUBJECT, 8)
         .await
@@ -7301,26 +7298,24 @@ async fn member_case_entries_after_backfill_includes_newly_recorded_cases() {
 }
 
 #[tokio::test]
-async fn member_case_entries_backfill_gate_reads_seed_not_guild_cases() {
+async fn member_case_entries_index_gap_is_scoped_to_member() {
+    const SUBJECT: i64 = 66;
     let (_fixture, _store, scope) = ready().await;
     _store
         .db
         .with_conn(move |conn| {
-            let sql = GuildDataStore::member_case_entries_backfill_gate_sql();
+            let sql = GuildDataStore::member_case_entries_index_gap_sql();
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
             let plan = stmt
                 .query_map(
-                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), SUBJECT],
                     |row| Ok(row.get::<String>(3)?),
                 )?
                 .collect::<Result<Vec<_>>>()?;
             assert!(
-                plan.iter().any(|line| line.contains("guild_member_seed")),
-                "backfill gate must read the seed row only: {plan:?}"
-            );
-            assert!(
-                !plan.iter().any(|line| line.contains("guild_cases")),
-                "backfill gate must not scan retained case payloads: {plan:?}"
+                plan.iter()
+                    .any(|line| { line.contains("guild_cases") && line.contains("SEARCH") }),
+                "index gap check must seek cases by scope, not scan history: {plan:?}"
             );
             Ok(())
         })
