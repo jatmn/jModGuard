@@ -242,18 +242,32 @@ fn bound_rejoin_case_lines(lines: &[String], notice_reserve: usize) -> String {
         used += separator + line_units;
         out.push(line.clone());
     }
-    let omitted = lines.len().saturating_sub(out.len());
+    let mut omitted = lines.len().saturating_sub(out.len());
     if omitted == 0 {
         return out.join("\n");
     }
-    let more = format!("+{omitted} more");
-    let more_units = more.encode_utf16().count();
-    let separator = if out.is_empty() { 0 } else { 1 };
-    if used + separator + more_units <= budget {
-        if out.is_empty() {
-            return more;
+    while omitted > 0 {
+        let more = format!("+{omitted} more");
+        let more_units = more.encode_utf16().count();
+        let separator = if out.is_empty() { 0 } else { 1 };
+        if used + separator + more_units <= budget {
+            if out.is_empty() {
+                return more;
+            }
+            return format!("{}\n{more}", out.join("\n"));
         }
-        return format!("{}\n{more}", out.join("\n"));
+        if out.is_empty() {
+            break;
+        }
+        out.pop();
+        omitted += 1;
+        used = 0;
+        for (index, line) in out.iter().enumerate() {
+            used += line.encode_utf16().count();
+            if index > 0 {
+                used += 1;
+            }
+        }
     }
     out.join("\n")
 }
