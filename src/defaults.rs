@@ -658,25 +658,6 @@ pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {
 
 /// A sample custom command plan, used to demonstrate the step editor.
 #[allow(dead_code)]
-#[cfg(test)]
-mod rolling_upgrade_tests {
-    use super::*;
-
-    #[test]
-    fn voice_command_is_binary_overlay_not_global_seed() {
-        assert!(
-            default_commands().iter().any(|cmd| cmd.name == "voice"),
-            "voice must ship in the binary default list"
-        );
-        assert!(
-            !default_global_seed_commands()
-                .iter()
-                .any(|cmd| cmd.name == "voice"),
-            "voice must not be written to shared global command rows"
-        );
-    }
-}
-
 pub fn sample_plan_command() -> CommandDef {
     CommandDef {
         name: "welcome".into(),
@@ -705,5 +686,24 @@ pub fn sample_plan_command() -> CommandDef {
         },
         response: String::new(),
         log_event: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod rolling_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn voice_command_is_binary_overlay_not_global_seed() {
+        assert!(
+            default_commands().iter().any(|cmd| cmd.name == "voice"),
+            "voice must ship in the binary default list"
+        );
+        assert!(
+            !default_global_seed_commands()
+                .iter()
+                .any(|cmd| cmd.name == "voice"),
+            "voice must not be written to shared global command rows"
+        );
     }
 }
