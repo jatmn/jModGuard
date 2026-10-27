@@ -323,6 +323,7 @@ pub enum Behavior {
     },
     Warns,
     WarnClear,
+    UserInfo,
     Banlist,
     Purge {
         default_count: u32,

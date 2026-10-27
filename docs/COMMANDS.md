@@ -18,6 +18,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
 | `!warnclear <user>` | Moderation | mod | Clear a user's warnings |
+| `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you) |
 | `!purge [count]` | Moderation | mod | Delete recent messages (max 100; `!clear`, `!p`) |
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
 | `!slowmode <seconds>` | Moderation | mod | Set slowmode on this channel |
@@ -33,7 +34,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
-`/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,
+`/warn`, `/warns`, `/warnclear`, `/userinfo`, `/purge`, `/say`, `/slowmode`, `/unban`,
 `/setname`, `/prefix`, `/template`, `/rule`, `/testregex`, `/help`, `/about`,
 `/stats`).
 

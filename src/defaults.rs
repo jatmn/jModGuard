@@ -208,6 +208,17 @@ pub fn default_commands() -> Vec<CommandDef> {
         vec![],
     ));
     out.push(cmd(
+        "userinfo",
+        "Moderation",
+        "Show a member's cached profile, warnings, and recent cases.",
+        "!userinfo [user]",
+        "mod",
+        Behavior::UserInfo,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
         "purge",
         "Moderation",
         "Delete the last N messages in this channel.",
@@ -469,6 +480,9 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
     ]
 }
+
+/// `!userinfo` / `/userinfo` reply body (rendered and clipped to 2000 UTF-16 units).
+pub const USER_INFO_TEMPLATE: &str = "**User info**\n**ID:** `{user_id}`\n**Username:** {username}\n**Global name:** {global_name}\n**Nick:** {nick}\n**Account:** {account_created} ({account_age})\n**Joined:** {joined_at}\n**Roles:** {roles}\n**Voice:** {voice}\n**Warnings:** {warns}\n**Cases:**\n{cases}{clipped}";
 
 /// Appended to an attachment-burst review after a moderator uses a button.
 pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";

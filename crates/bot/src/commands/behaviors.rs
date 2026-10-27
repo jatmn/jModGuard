@@ -555,6 +555,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
         Behavior::WarnClear => {
             let mut args = env.args.clone();
             let target =
@@ -1450,6 +1451,7 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("reason", Str, true, "Warning reason"),
         ],
         Behavior::Warns | Behavior::WarnClear => vec![opt("user", User, true, "User")],
+        Behavior::UserInfo => vec![opt("user", User, false, "User to inspect")],
         Behavior::Purge { .. } => {
             vec![opt("count", Integer, false, "Number of messages (max 100)")]
         }
