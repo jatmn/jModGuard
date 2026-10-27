@@ -163,8 +163,8 @@ jobs:
           package-manager-cache: false
       - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
       - name: Publish changed component
-        # Publication fails after the immutable SHA tag is pushed when either signing
-        # secret is unset; configure both before running this workflow.
+        # Signing secrets are validated before any image build and are not exported to
+        # npm/docker subprocesses; configure both secrets before running this workflow.
         env:
           COMPONENT: ${{ matrix.component }}
           JMODGUARD_UPDATE_SIGNING_KEY: ${{ secrets.JMODGUARD_UPDATE_SIGNING_KEY }}

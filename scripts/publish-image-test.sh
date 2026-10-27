@@ -10,7 +10,23 @@ fail() {
   exit 1
 }
 
-command -v cosign >/dev/null || fail 'cosign is required for publish-image-test.sh'
+ensure_cosign() {
+  if command -v cosign >/dev/null; then
+    return 0
+  fi
+  local cache="${TMPDIR:-/tmp}/jmodguard-cosign"
+  mkdir -p "$cache"
+  if [[ ! -x "$cache/cosign" ]]; then
+    local version='v2.4.1'
+    local url="https://github.com/sigstore/cosign/releases/download/${version}/cosign-linux-amd64"
+    curl -fsSL "$url" -o "$cache/cosign" || fail "could not download cosign ${version}"
+    chmod 700 "$cache/cosign"
+  fi
+  PATH="$cache:$PATH"
+  export PATH
+  command -v cosign >/dev/null || fail 'cosign is required for publish-image-test.sh'
+}
+ensure_cosign
 TEST_SIGNING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-image-signing-XXXXXX")"
 TEST_SIGNING_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '\n/=')"
 cleanup_test_signing() {
@@ -160,7 +176,7 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${nightly_args[@]}" \
 contains_arg "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}" "${nightly_args[@]}" \
   || fail 'nightly must tag the SHA'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly-20260915-${HEAD_SHA:0:12}" "${nightly_args[@]}" \
-  || fail 'nightly must tag the unique label'
+  && fail 'nightly must not push the unique label before verification and signing'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly" "${nightly_args[@]}" \
   && fail 'Nightly pointer must move only after verification'
 
@@ -168,7 +184,7 @@ readarray -d '' -t stable_args < <(build_args bot "$HEAD_SHA" v1.2.3 . stable)
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${stable_args[@]}" \
   && fail 'stable must not move latest before verification'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
-  || fail 'stable must tag the release'
+  && fail 'stable must not push the version tag before verification and signing'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
   && fail 'Stable pointer must move only after verification'
 
@@ -279,7 +295,7 @@ mock_publish_helpers() {
   TRACE_FILE="$(mktemp "${PUBLISH_TEST_TRACE_DIR}/publish-trace-XXXXXX")"
 
   verify_published_image() {
-    printf 'verify %s %s %s\n' "$1" "$2" "${4:-current}" >>"$TRACE_FILE"
+    printf 'verify %s %s@%s %s\n' "$1" "$2" "$3" "${5:-current}" >>"$TRACE_FILE"
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
   }
 
@@ -332,6 +348,10 @@ mock_publish_helpers() {
       return 0
     fi
     if [[ "$1" == buildx ]]; then
+      if [[ "$2" == build ]]; then
+        [[ -z "${JMODGUARD_UPDATE_SIGNING_KEY:-}" && -z "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]] \
+          || fail 'signing secrets must not be exported during image build'
+      fi
       if [[ "$2" == imagetools ]]; then
         if [[ "$*" == *'{{json .Image}}'* ]]; then
           printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"}}}'
@@ -399,7 +419,7 @@ exercise_publish() {
   GITHUB_TOKEN="$source_token"
   [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY+set}" ]] || JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
   [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD+set}" ]] || JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
-  export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+  export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
   if [[ "$mode" == manual ]]; then
     ref="${9:-refs/tags/v1}"
     sha="$BASE_SHA"
@@ -436,13 +456,24 @@ exercise_publish() {
     assert_eq "$3" "$HEAD_SHA"
     printf '%s\t\n' "$BASE_SHA"
   }
+  printf '%s\n' "$TRACE_FILE" >"$PUBLISH_TEST_TRACE_DIR/latest-trace-path"
+  local publish_rc=0
   if [[ "$FAIL_BUILD" == 1 || "$FAIL_VERIFY" == 1 ]]; then
-    if ( publish_component "$component" ) >/dev/null 2>&1; then
-      fail 'failed build must not succeed'
-    fi
+    ( publish_component "$component" ) >/dev/null 2>&1 || publish_rc=$?
+    [[ "$publish_rc" -ne 0 ]] || fail 'failed build must not succeed'
   else
-    publish_component "$component"
+    ( publish_component "$component" ) >/dev/null 2>&1 || publish_rc=$?
+    if [[ "$publish_rc" -ne 0 ]]; then
+      TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
+      load_trace
+      rm -rf "$scratch"
+      TMPDIR="$saved_tmp"
+      export TMPDIR
+      SOURCE_LAYOUT=current
+      return "$publish_rc"
+    fi
   fi
+  TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
   load_trace
   [[ -z "$(ls -A "$scratch" 2>/dev/null || true)" ]] || fail "scratch leftover: $(ls -A "$scratch")"
   rm -rf "$scratch"
@@ -540,13 +571,14 @@ for component in bot api webui; do
   exercise_publish 0 0 release '' "$release_plan" "$component"
   [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:${BASE_SHA}"* ]] \
     || fail "$component release must build the selected release SHA"
-  [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
-    || fail "$component release must retain its version tag"
+  [[ "$BUILD_LINE" != *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
+    || fail "$component release must not push the version tag before signing"
   verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^verify $component " | cut -d: -f1)"
   sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^sign $component " | cut -d: -f1)"
+  version_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3" | cut -d: -f1)"
   stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:stable" | cut -d: -f1)"
-  [[ -n "$verify_line" && -n "$sign_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$stable_line" ]] \
-    || fail "$component release must sign before promoting Stable"
+  [[ -n "$verify_line" && -n "$sign_line" && -n "$version_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$version_line" && "$sign_line" -lt "$stable_line" ]] \
+    || fail "$component release must sign before promoting version and Stable tags"
 
   # Reject mismatched source, workflow identity and version before registry login.
   for bad_plan in \
@@ -648,8 +680,8 @@ for component in bot api; do
     || fail "historical ${component} must receive the legacy final-image check"
   [[ "$BUILD_LINE" != *'io.jmodguard.launcher-protocol'* ]] \
     || fail "historical ${component} must not claim updater compatibility"
-  printf '%s\n' "$BUILD_LINE" | grep -q 'io.jmodguard.published-at=' \
-    || fail "historical ${component} must label a publication timestamp for signing"
+  printf '%s\n' "$BUILD_LINE" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+    || fail "historical ${component} must label a valid publication timestamp for signing"
   printf '%s\n' "${CALLS[@]}" | grep -q "^sign ${component} " \
     || fail "historical ${component} must sign before promoting latest"
   printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
@@ -677,7 +709,7 @@ run_docker() {
     *) fail "unexpected historical verifier command: $*" ;;
   esac
 }
-verify_published_image bot historical-image . legacy
+verify_published_image bot historical-image "sha256:$(printf 'b%.0s' {1..64})" . legacy
 
 partial_source="$(mktemp -d "${TMPDIR:-/tmp}/partial-source-XXXXXX")"
 mkdir -p "$partial_source/scripts"
@@ -712,23 +744,23 @@ run_docker() { printf '%s' "{\"digest\":\"sha256:${digest}\",\"size\":9}"; }
 got="$(inspect_digest "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}")"
 assert_eq "$got" "$(printf 'sha256:%s\t%s' "$digest" 9)"
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/publish-image-git-XXXXXX")"
-cleanup_git() { rm -rf "$scratch"; }
+git_fixture_scratch="$(mktemp -d "${TMPDIR:-/tmp}/publish-image-git-XXXXXX")"
+cleanup_git() { rm -rf "$git_fixture_scratch"; }
 trap cleanup_git EXIT
-git init -b main "$scratch" >/dev/null
-git -C "$scratch" config user.name Fixture
-git -C "$scratch" config user.email fixture@example.invalid
-mkdir -p "$scratch/src"
-echo old >"$scratch/src/lib.rs"
-printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-bot\n' >"$scratch/Dockerfile.bot"
-git -C "$scratch" add .
-git -C "$scratch" commit -m base >/dev/null
-base="$(git -C "$scratch" rev-parse HEAD)"
-git -C "$scratch" tag -a 'release/v1+meta' -m release
-git -C "$scratch" remote add origin "$scratch"
-fixture_git_root="$scratch"
+git init -b main "$git_fixture_scratch" >/dev/null
+git -C "$git_fixture_scratch" config user.name Fixture
+git -C "$git_fixture_scratch" config user.email fixture@example.invalid
+mkdir -p "$git_fixture_scratch/src"
+echo old >"$git_fixture_scratch/src/lib.rs"
+printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-bot\n' >"$git_fixture_scratch/Dockerfile.bot"
+git -C "$git_fixture_scratch" add .
+git -C "$git_fixture_scratch" commit -m base >/dev/null
+base="$(git -C "$git_fixture_scratch" rev-parse HEAD)"
+git -C "$git_fixture_scratch" tag -a 'release/v1+meta' -m release
+git -C "$git_fixture_scratch" remote add origin "$git_fixture_scratch"
+fixture_git_root="$git_fixture_scratch"
 
-pushd "$scratch" >/dev/null
+pushd "$git_fixture_scratch" >/dev/null
 reload_publisher
 mkdir -p frontend
 echo changed >frontend/style.css
@@ -913,6 +945,8 @@ HEAD_SHA="$base"
 GHCR_USERNAME=fixture
 GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 export GITHUB_SHA GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
 registry_inspect() {
   local ref="$1"
@@ -984,6 +1018,8 @@ HEAD_SHA="$base"
 GHCR_USERNAME=fixture
 GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 export GITHUB_SHA GITHUB_RUN_ATTEMPT GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
 registry_inspect() {
   local ref="$1"
@@ -1033,38 +1069,37 @@ reload_publisher
 FAIL_SIGN=0
 JMODGUARD_UPDATE_SIGNING_KEY=""
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
-export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
-if ( exercise_publish 1 ) >/dev/null 2>&1; then
+if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing key must fail publication'
 fi
-load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
+  && fail 'missing signing key must not build images'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'missing signing key must not promote tags'
 
 reload_publisher
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD=""
-export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
-if ( exercise_publish 1 ) >/dev/null 2>&1; then
+if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing password must fail publication'
 fi
-load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
+  && fail 'missing signing password must not build images'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'missing signing password must not promote tags'
 
 FAIL_SIGN=1
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
-export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
-if ( exercise_publish 1 ) >/dev/null 2>&1; then
+if exercise_publish 1 >/dev/null 2>&1; then
   fail 'failed signing must fail publication'
 fi
-load_trace
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'failed signing must not promote tags'
 FAIL_SIGN=0
 unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
 
+reload_publisher
 assert_eq "$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')" \
   $'::add-mask::a%25b\n::add-mask::c%0Ad\n::add-mask::secret-key\n::add-mask::secret-pass'
 trace="$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')"
@@ -1082,8 +1117,8 @@ assert_eq "$got" "2026-10-27T17:00:00Z"
 
 reload_publisher
 readarray -d '' -t legacy_sign_args < <(build_args bot "$HEAD_SHA" "" . stable legacy)
-printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.published-at=' \
-  || fail 'legacy builds must carry a publication timestamp for signing'
+printf '%s\n' "${legacy_sign_args[@]}" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+  || fail 'legacy builds must carry a valid publication timestamp for signing'
 printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol=1' \
   && fail 'legacy builds must not claim updater compatibility'
 
@@ -1110,12 +1145,19 @@ run_docker() {
   fi
   return 0
 }
+PROD_SIGN_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+PROD_SIGN_IMAGE=ghcr.io/jatmn/jmodguard-bot
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
-export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
-sign_published_digest bot ghcr.io/jatmn/jmodguard-bot "sha256:$(printf 'a%.0s' {1..64})"
-grep -q 'cosign sign' "$COSIGN_TRACE" || fail 'production signing must invoke cosign sign'
-grep -q 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
-unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+capture_signing_secrets
+sign_published_digest bot "$PROD_SIGN_IMAGE" "$PROD_SIGN_DIGEST"
+grep -Fq 'cosign sign --yes' "$COSIGN_TRACE" || fail 'production signing must pass --yes to cosign sign'
+grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production signing must target the verified digest reference'
+grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" || fail 'production signing must use the env signing key reference'
+grep -Fq 'io.jmodguard.not-after=' "$COSIGN_TRACE" || fail 'production signing must attach the expiry annotation'
+grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
+grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'
+_JMG_SIGNING_KEY=""
+_JMG_SIGNING_PASSWORD=""
 
 echo 'publish-image-test: ok'

@@ -96,6 +96,8 @@ jobs:
           NEED_RUST: ${{ matrix.rust }}
           NEED_NEXTEST: ${{ startsWith(matrix.lane, 'rust-') }}
         run: bash scripts/ci-setup.sh "$NEED_RUST"
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+        if: contains(matrix.groups, 'publish-tests')
       - name: Cache Rust dependencies
         if: matrix.rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
