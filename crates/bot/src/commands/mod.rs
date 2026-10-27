@@ -398,9 +398,23 @@ fn actor_member_for_command(
     member
 }
 
+/// Discord supplies the caller's current roles on each message/interaction; the
+/// guild member cache can lag behind role removals. Prefer invocation data when
+/// present and use the cache only as a fallback.
+fn resolve_actor_member_for_enforcement(
+    actor: UserId,
+    member_from_invocation: Option<serenity::model::guild::Member>,
+    cached_member: Option<serenity::model::guild::Member>,
+) -> Option<serenity::model::guild::Member> {
+    member_from_invocation
+        .or(cached_member)
+        .map(|member| actor_member_for_command(actor, member))
+}
+
 /// Resolves (guild roles, caller member) for command enforcement, preferring
-/// the cache and falling back to an HTTP guild fetch. Never holds a cache
-/// reference across `.await`.
+/// invocation-supplied member data when present and falling back to the guild
+/// member cache, then an HTTP guild fetch. Never holds a cache reference across
+/// `.await`.
 async fn guild_snapshot(
     ctx: &Context,
     guild_id: GuildId,
@@ -408,19 +422,18 @@ async fn guild_snapshot(
     actor: UserId,
 ) -> Option<(StdHashMap<RoleId, Role>, serenity::model::guild::Member)> {
     if let Some(guild) = ctx.cache.guild(guild_id) {
-        let member = guild
-            .members
-            .get(&actor)
-            .cloned()
-            .or(member_from_msg)
-            .map(|member| actor_member_for_command(actor, member));
+        let member = resolve_actor_member_for_enforcement(
+            actor,
+            member_from_msg,
+            guild.members.get(&actor).cloned(),
+        );
         return member.map(|m| (guild.roles.clone(), m));
     }
     tracing::warn!("guild {guild_id} not in cache; falling back to HTTP fetch");
     match ctx.http.get_guild(guild_id).await {
         Ok(guild) => {
             // REST guild payload carries roles but no member map.
-            let member = member_from_msg.map(|member| actor_member_for_command(actor, member));
+            let member = resolve_actor_member_for_enforcement(actor, member_from_msg, None);
             member.map(|m| (guild.roles.clone(), m))
         }
         Err(e) => {
@@ -2498,6 +2511,137 @@ mod tests {
             ),
             "member-specific deny must hide the channel"
         );
+    }
+
+    fn test_guild_member(user_id: u64, role_ids: &[u64]) -> serenity::model::guild::Member {
+        use serenity::model::guild::Member;
+        use serenity::model::id::UserId;
+        let mut member = Member::default();
+        member.user.id = UserId::new(user_id);
+        member.roles = role_ids.iter().map(|id| RoleId::new(*id)).collect();
+        member
+    }
+
+    #[test]
+    fn enforcement_member_prefers_invocation_roles_over_stale_cache() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let resolved =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("invocation or cache member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Everyone,
+            "stale cached moderator roles must not override invocation payload"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn enforcement_member_falls_back_to_cache_without_invocation_payload() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let resolved = super::resolve_actor_member_for_enforcement(actor, None, Some(cached))
+            .expect("cached member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Mod,
+            "cache remains the fallback when invocation member data is absent"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn check_enforcement_uses_invocation_roles_when_cache_still_moderator() {
+        use crate::state::CachedGuildConfig;
+        use crate::types::{CommandDef, GuildSettings};
+        use serenity::model::guild::Role;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let member =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("member");
+
+        let (app, path) = temp_command_test_db();
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: std::collections::BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let ban_behavior = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban")
+            .behavior;
+        let cmd = CommandDef {
+            name: "ban".into(),
+            aliases: vec![],
+            category: "Moderation".into(),
+            description: String::new(),
+            usage: String::new(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: ban_behavior,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        let denied =
+            super::check_enforcement(&app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))
+                .expect_err("demoted caller must not pass mod-gated enforcement");
+        assert!(
+            denied.contains("permission"),
+            "expected permission denial, got {denied}"
+        );
+        drop(app);
+        remove_command_test_db(&path);
     }
 
     #[test]

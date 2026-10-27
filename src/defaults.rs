@@ -4,6 +4,8 @@
 
 use crate::types::{ActionDef, Behavior, CommandDef, PlanStep, RULE_IDS, RuleDef};
 use serde_json::json;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 pub fn default_rules() -> Vec<RuleDef> {
     let mut out = Vec::with_capacity(RULE_IDS.len());
@@ -394,15 +396,104 @@ pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
     is_binary_overlay_command_name(&cmd.name) || is_binary_overlay_behavior(&cmd.behavior)
 }
 
+fn builtin_command_labels_lower() -> &'static HashSet<String> {
+    static LABELS: OnceLock<HashSet<String>> = OnceLock::new();
+    LABELS.get_or_init(|| {
+        let mut labels = HashSet::new();
+        for cmd in default_commands() {
+            labels.insert(cmd.name.to_ascii_lowercase());
+            for alias in &cmd.aliases {
+                labels.insert(alias.to_ascii_lowercase());
+            }
+        }
+        labels
+    })
+}
+
+/// Every shipped command name and alias (derived from [`default_commands`]).
+pub fn builtin_command_labels() -> Vec<String> {
+    let mut labels: Vec<String> = builtin_command_labels_lower().iter().cloned().collect();
+    labels.sort();
+    labels
+}
+
+/// Canonical primary command name when `label` matches a shipped name or alias.
+pub fn builtin_command_for_label(label: &str) -> Option<String> {
+    for cmd in default_commands() {
+        if cmd.name.eq_ignore_ascii_case(label) {
+            return Some(cmd.name.clone());
+        }
+        for alias in &cmd.aliases {
+            if alias.eq_ignore_ascii_case(label) {
+                return Some(cmd.name.clone());
+            }
+        }
+    }
+    None
+}
+
+fn shipped_builtin_command(primary: &str) -> Option<CommandDef> {
+    default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))
+}
+
+pub fn command_persist_rejected_message(storage_name: &str) -> String {
+    format!(
+        "command `{storage_name}` conflicts with a built-in command and cannot be written to the database"
+    )
+}
+
 /// True when a command row must not be written to shared storage (rolling upgrades).
 pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandDef) -> bool {
-    is_binary_overlay_command_name(storage_name)
+    if is_binary_overlay_command_name(storage_name)
         || is_binary_overlay_command_name(&cmd.name)
         || is_binary_overlay_behavior(&cmd.behavior)
         || cmd
             .aliases
             .iter()
             .any(|alias| is_binary_overlay_command_name(alias))
+    {
+        return true;
+    }
+
+    let storage_primary = builtin_command_for_label(storage_name);
+    let def_primary = builtin_command_for_label(&cmd.name);
+
+    if storage_primary.is_none() {
+        if def_primary.is_some() {
+            return true;
+        }
+        return cmd
+            .aliases
+            .iter()
+            .any(|alias| builtin_command_for_label(alias).is_some());
+    }
+
+    let primary = storage_primary.expect("label is reserved");
+    if !primary.eq_ignore_ascii_case(storage_name) {
+        return true;
+    }
+    if let Some(shipped) = shipped_builtin_command(&primary) {
+        let shipped_behavior = serde_json::to_value(&shipped.behavior).ok();
+        let cmd_behavior = serde_json::to_value(&cmd.behavior).ok();
+        if shipped_behavior != cmd_behavior {
+            return true;
+        }
+    }
+    match def_primary {
+        Some(owner) if owner.eq_ignore_ascii_case(&primary) => {}
+        _ if cmd.name.eq_ignore_ascii_case(&primary) => {}
+        _ => return true,
+    }
+    for alias in &cmd.aliases {
+        match builtin_command_for_label(alias) {
+            None => {}
+            Some(owner) if owner.eq_ignore_ascii_case(&primary) => {}
+            Some(_) => return true,
+        }
+    }
+    false
 }
 
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
@@ -764,5 +855,71 @@ mod rolling_upgrade_tests {
             log_event: String::new(),
         };
         assert!(rejects_binary_overlay_command_persist("customvc", &hijack));
+    }
+
+    #[test]
+    fn builtin_command_labels_cover_names_and_aliases() {
+        let labels = builtin_command_labels();
+        assert!(labels.iter().any(|l| l == "ban"));
+        assert!(labels.iter().any(|l| l == "yeet"));
+        assert!(labels.iter().any(|l| l == "kick"));
+        assert!(labels.iter().any(|l| l == "k"));
+        assert!(labels.iter().any(|l| l == "voice"));
+    }
+
+    #[test]
+    fn custom_command_cannot_claim_builtin_name_or_alias() {
+        let kick_hijack = CommandDef {
+            name: "kick".into(),
+            aliases: vec![],
+            category: "Moderation".into(),
+            description: "steal kick".into(),
+            usage: "!plugin".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist(
+            "myplugin",
+            &kick_hijack
+        ));
+
+        let alias_hijack = CommandDef {
+            name: "myplugin".into(),
+            aliases: vec!["K".into()],
+            category: "Moderation".into(),
+            description: "steal kick alias".into(),
+            usage: "!myplugin".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist(
+            "myplugin",
+            &alias_hijack
+        ));
+    }
+
+    #[test]
+    fn builtin_row_rejects_behavior_replacement() {
+        let shipped = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "stats")
+            .expect("stats");
+        let hijack = CommandDef {
+            behavior: Behavior::Help,
+            ..shipped
+        };
+        assert!(rejects_binary_overlay_command_persist("stats", &hijack));
     }
 }

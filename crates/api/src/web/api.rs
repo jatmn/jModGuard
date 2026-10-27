@@ -628,7 +628,7 @@ fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef) -> ApiResul
     }
     if crate::defaults::rejects_binary_overlay_command_persist(storage_name, cmd) {
         return Err(ApiError(anyhow::anyhow!(
-            "command `{storage_name}` is merged from the running binary and cannot be written to the database"
+            crate::defaults::command_persist_rejected_message(storage_name)
         )));
     }
     Ok(())

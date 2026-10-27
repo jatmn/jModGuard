@@ -2914,6 +2914,119 @@ async fn voice_command_cannot_be_replaced_via_api_control_dispatch() {
     cleanup_db(&tmp);
 }
 
+fn custom_command_hijack(
+    name: &str,
+    aliases: Vec<String>,
+    behavior: crate::types::Behavior,
+) -> CommandDef {
+    CommandDef {
+        name: name.into(),
+        aliases,
+        category: "Utility".into(),
+        description: "custom".into(),
+        usage: format!("!{name}"),
+        enabled: true,
+        permission: "everyone".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior,
+        response: String::new(),
+        log_event: String::new(),
+    }
+}
+
+#[test]
+fn builtin_command_cannot_be_replaced_via_db_writer() {
+    let tmp = tmp_db_path("builtin_db_writer_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let kick_steal = custom_command_hijack("kick", vec![], crate::types::Behavior::Help);
+    let error = tokio_test_block_on(upsert_command(&db, 0, "mykick", &kick_steal))
+        .expect_err("db writer must reject built-in name hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let alias_steal =
+        custom_command_hijack("mykick", vec!["yeet".into()], crate::types::Behavior::Help);
+    let alias_error = tokio_test_block_on(upsert_command(&db, 0, "mykick", &alias_steal))
+        .expect_err("db writer must reject built-in alias hijack");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
+    let tmp = tmp_db_path("builtin_dashboard_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let hijack = custom_command_hijack(
+        "myhelp",
+        vec!["commands".into()],
+        crate::types::Behavior::Say,
+    );
+    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "myhelp", &hijack))
+        .expect_err("dashboard writer must reject help alias hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_command_guild_override_still_allowed_when_behavior_matches() {
+    let tmp = tmp_db_path("builtin_ban_override_ok");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "guild-specific ban copy".into();
+    tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
+        .expect("guild ban override with shipped behavior must persist");
+    let stored = tokio_test_block_on(get_command_row(&db, 10, "ban"))
+        .unwrap()
+        .expect("ban row");
+    assert_eq!(stored.description, "guild-specific ban copy");
+    cleanup_db(&tmp);
+}
+
+#[tokio::test]
+async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
+    let tmp = tmp_db_path("builtin_api_control_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let wire = ConfigurationScope::Global.to_wire();
+    let hijack = custom_command_hijack("stats", vec![], crate::types::Behavior::Help);
+    let op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire,
+        name: "mystats".into(),
+        command: hijack,
+    };
+    let error = apply_control(&db, None, op, None)
+        .await
+        .expect_err("API upsert must reject built-in stats name hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
 #[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
