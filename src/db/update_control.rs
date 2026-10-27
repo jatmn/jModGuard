@@ -1163,27 +1163,9 @@ impl UpdateControl {
             let retry = existing.as_ref().filter(|active| active.phase.active() && recover
                 && active.bot.release.digest == bot_digest && active.api.release.digest == api_digest);
             let (target_bot, target_api) = if let Some(active) = retry {
-                if active.error.is_some() {
-                    let target_bot = updates::checked_install_candidate(
-                        bot.candidate.as_ref().map(serde_json::to_string).transpose()?,
-                        &bot.channel,
-                        bot.checked_at,
-                        bot.check_error.clone(),
-                        &bot_digest,
-                        now,
-                    )?;
-                    let target_api = updates::checked_install_candidate(
-                        api.candidate.as_ref().map(serde_json::to_string).transpose()?,
-                        &api.channel,
-                        api.checked_at,
-                        api.check_error.clone(),
-                        &api_digest,
-                        now,
-                    )?;
-                    (target_bot, target_api)
-                } else {
-                    (active.bot.release.clone(), active.api.release.clone())
-                }
+                // Recovering a failed paired upgrade keeps the pinned releases;
+                // re-validating against checked_at would falsely trip the stale rule.
+                (active.bot.release.clone(), active.api.release.clone())
             } else {
                 let target_bot = updates::checked_install_candidate(
                     bot.candidate.as_ref().map(serde_json::to_string).transpose()?,
