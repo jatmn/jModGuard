@@ -459,6 +459,10 @@ if (process.env.LAYOUT !== "legacy" && !labels["org.opencontainers.image.revisio
 JS
 }
 
+registry_promote_tag() {
+  run_docker buildx imagetools create "$@" || return 1
+}
+
 promote_image_tag() {
   local image="$1" tag="$2" digest="$3"
   local previous="" restored
@@ -467,7 +471,8 @@ promote_image_tag() {
   else
     PROMOTION_ROLLBACK+=("${image}:${tag}|")
   fi
-  run_docker buildx imagetools create --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null
+  registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
+    || return 1
   digest_matches_ref "${image}:${tag}" "$digest" || return 1
 }
 
@@ -791,6 +796,7 @@ publish_component_build() {
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
+    clear_publish_state "$component"
     return 0
   fi
   mode="${selection%%$'\t'*}"
@@ -843,12 +849,17 @@ publish_component_build() {
   channel="$(channel_for "$mode" "$label" || true)"
   assert_signing_secrets_not_staged_on_disk
   signing_secrets_in_environ && publish_fail 'signing secrets must not be present during image build'
+  run_selected_source_build() {
+    signing_secrets_in_environ && publish_fail 'signing secrets must not be present during selected-source build'
+    assert_signing_secrets_not_staged_on_disk
+    "$@"
+  }
   if [[ "$component" == "webui" ]]; then
     if [[ -f "$context/tools/webui/package-lock.json" ]]; then
-      npm ci --ignore-scripts --prefix "$context/tools/webui"
-      npm run build --prefix "$context/tools/webui"
+      run_selected_source_build npm ci --ignore-scripts --prefix "$context/tools/webui"
+      run_selected_source_build npm run build --prefix "$context/tools/webui"
     fi
-    node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
+    run_selected_source_build node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
   fi
   staging_ref="$(publish_staging_ref "$image" "$sha")"
   metadata_file="${scratch}/build-metadata.json"
@@ -856,7 +867,7 @@ publish_component_build() {
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout" "$staging_ref")
   [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
   build_cmd+=("--metadata-file" "$metadata_file")
-  run_docker "${build_cmd[@]:1}"
+  run_selected_source_build run_docker "${build_cmd[@]:1}"
   published_digest="$(digest_from_build_metadata "$metadata_file")" \
     || publish_fail 'build metadata did not report an image digest'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
