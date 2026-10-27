@@ -1532,9 +1532,11 @@ impl Supervisor {
                 self.restart.recovered();
             }
             if tokio::fs::metadata(&child.ready_file).await.is_err() {
+                let baked_child = child.path == self.baked;
                 ensure!(
                     self.rollback.is_some()
                         || child.release.is_none()
+                        || baked_child
                         || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
                     "replacement child readiness timed out"
                 );
@@ -1857,7 +1859,7 @@ impl Supervisor {
             .await?;
         let baked = self.baked.clone();
         let base_sha = self.base_sha.clone();
-        self.start(&baked, &base_sha, None).await?;
+        self.start(&baked, &base_sha, Some(release.clone())).await?;
         Ok(())
     }
 
