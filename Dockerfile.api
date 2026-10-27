@@ -33,7 +33,10 @@ RUN JMODGUARD_BUILD_SHA=${SOURCE_SHA} CARGO_NET_GIT_FETCH_WITH_CLI=true \
     && cp scripts/bootstrap-container.sh /app/release/bin/jmodguard-bootstrap \
     && cp LICENSE.md /app/release/share/jmodguard/LICENSE.md \
     && cd /app/release \
-    && sha256sum bin/jmodguard-api bin/jmodguard-launcher > share/jmodguard/files.sha256
+    && sha256sum bin/jmodguard-api bin/jmodguard-launcher > share/jmodguard/files.sha256 \
+    && mkdir -p /app/oci-layer/usr/local/bin /app/oci-layer/usr/local/share/jmodguard \
+    && cp -a bin/. /app/oci-layer/usr/local/bin/ \
+    && cp -a share/jmodguard/. /app/oci-layer/usr/local/share/jmodguard/
 
 FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 RUN apt-get update \
@@ -43,7 +46,7 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown jmodguard:jmodguard /data
 WORKDIR /data
-COPY --from=builder /app/release/ /usr/local/
+COPY --from=builder /app/oci-layer/ /
 ARG SOURCE_SHA=unknown
 VOLUME ["/data"]
 USER 10001
