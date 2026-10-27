@@ -483,7 +483,7 @@ rollback_promoted_tags() {
     previous="${entry#*|}"
     if [[ -n "$previous" ]]; then
       image="${image_tag%:*}"
-      run_docker buildx imagetools create --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
+      registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
     fi
   done
 }
@@ -791,6 +791,37 @@ clear_publish_state() {
   rm -f "$(publish_state_file "$component")"
 }
 
+publish_handoff_file() {
+  printf '%s/handoff.json' "$(publish_state_dir)"
+}
+
+write_publish_handoff() {
+  local component="$1" sign="$2"
+  COMPONENT="$component" SIGN="$sign" node --input-type=commonjs - <<'JS' >"$(publish_handoff_file)"
+const sign = process.env.SIGN === "true";
+process.stdout.write(JSON.stringify({ component: process.env.COMPONENT, sign }));
+JS
+}
+
+read_publish_handoff() {
+  local file
+  file="$(publish_handoff_file)"
+  [[ -f "$file" ]] || return 1
+  cat "$file"
+}
+
+validate_publish_state_for_signing() {
+  local component="$1" state="$2"
+  COMPONENT="$component" STATE_JSON="$state" node --input-type=commonjs - <<'JS' || publish_fail 'publish state does not match the requested component'
+const state = JSON.parse(process.env.STATE_JSON);
+const component = process.env.COMPONENT;
+if (state.component !== component) process.exit(1);
+if (state.image !== `ghcr.io/jatmn/jmodguard-${component}`) process.exit(2);
+if (!/^sha256:[0-9a-f]{64}$/.test(state.published_digest || "")) process.exit(3);
+if (!state.staging_ref || !state.staging_ref.startsWith(`ghcr.io/jatmn/jmodguard-${component}:`)) process.exit(4);
+JS
+}
+
 publish_component_build() {
   local component="$1"
   local selection mode ref head sha label image username token source_token scratch context channel layout published_digest resolved
@@ -799,6 +830,7 @@ publish_component_build() {
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
     clear_publish_state "$component"
+    write_publish_handoff "$component" false
     return 0
   fi
   mode="${selection%%$'\t'*}"
@@ -815,6 +847,7 @@ publish_component_build() {
       && ! changed_since_publication "$component" "$sha" "$image"; then
     echo "${component}: image inputs match the last publication; no rebuild"
     clear_publish_state "$component"
+    write_publish_handoff "$component" false
     return 0
   fi
   username="${GHCR_USERNAME:-}"
@@ -888,19 +921,31 @@ process.stdout.write(JSON.stringify({
 }));
 JS
 )"
+  write_publish_handoff "$component" true
   trap - EXIT
   cleanup_publish
 }
 
 publish_component_sign() {
   local component="$1"
-  local state image sha label mode channel published_digest staging_ref
+  local state image sha label mode channel published_digest staging_ref handoff sign_flag
   local username token source_token scratch
   local -a PROMOTION_ROLLBACK=()
+  if handoff="$(read_publish_handoff 2>/dev/null)"; then
+    sign_flag="$(HANDOFF_JSON="$handoff" node --input-type=commonjs -e 'process.stdout.write(String(JSON.parse(process.env.HANDOFF_JSON).sign))')"
+    if [[ "$(HANDOFF_JSON="$handoff" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.HANDOFF_JSON).component)')" != "$component" ]]; then
+      publish_fail 'publish handoff component mismatch'
+    fi
+    if [[ "$sign_flag" != "true" ]]; then
+      echo "${component}: build produced no verified image; skipping promotion"
+      return 0
+    fi
+  fi
   state="$(read_publish_state "$component")" || {
     echo "${component}: no verified image to sign; skipping promotion"
     return 0
   }
+  validate_publish_state_for_signing "$component" "$state"
   image="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).image)')"
   sha="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).sha)')"
   label="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).label || "")')"
@@ -930,9 +975,10 @@ publish_component_sign() {
   ensure_signing_secrets_captured
   persist_signing_secrets_to_files "$scratch"
   signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
+  assert_digest_matches_ref "$staging_ref" "$published_digest" \
+    || publish_fail 'staging reference does not match the verified build digest'
   sign_published_digest "$component" "$image" "$published_digest" \
     || publish_fail 'published image failed signing'
-  assert_digest_matches_ref "$staging_ref" "$published_digest"
   promote_with_rollback() {
     local tag="$1"
     promote_image_tag "$image" "$tag" "$published_digest" || {

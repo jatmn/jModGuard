@@ -11,9 +11,11 @@ const publication = fs.readFileSync(path.join(root, ".github/workflows/publish.y
 const combined = workflow + "\n" + publication.replace(/^  ci:\n[\s\S]*?(?=^  release:)/m, "");
 const jobs = new Map([...combined.matchAll(/^  ([a-z][a-z-]*):\n([\s\S]*?)(?=^  [a-z][a-z-]*:\n|$(?![\s\S]))/gm)]
   .map(match => [match[1], match[2]]));
-for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish"]) {
+for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish-build", "publish-sign"]) {
   assert.ok(jobs.has(name), "missing job: " + name);
 }
+const publishBuild = jobs.get("publish-build");
+const publishSign = jobs.get("publish-sign");
 assert.doesNotMatch(combined, /^  (?:pull_request_target|workflow_run):/m);
 assert.doesNotMatch(workflow, /\bself-hosted\b|^    paths(?:-ignore)?:/m);
 assert.match(workflow, /^permissions:\n  contents: read$/m);
@@ -29,14 +31,28 @@ assert.match(jobs.get("ci"), /test "\$PLAN_RESULT" = success && test "\$CHECK_RE
 assert.match(jobs.get("prepare-publication"), /needs\.ci\.result == 'success'/);
 assert.match(jobs.get("prepare-publication"), /github\.actor_id == '12479882'/);
 assert.match(jobs.get("prepare-publication"), /github\.triggering_actor == 'jatmn'/);
-assert.match(jobs.get("publish"), /needs\.prepare-publication\.result == 'success'/);
-assert.match(jobs.get("publish"), /packages: write/);
-assert.doesNotMatch(jobs.get("publish"), /contents: write/);
+assert.match(publishBuild, /needs\.prepare-publication\.result == 'success'/);
+assert.match(publishBuild, /packages: write/);
+assert.doesNotMatch(publishBuild, /contents: write/);
+assert.doesNotMatch(publishBuild, /JMODGUARD_UPDATE_SIGNING_KEY/);
+assert.doesNotMatch(publishBuild, /JMODGUARD_UPDATE_SIGNING_PASSWORD/);
+assert.match(publishBuild, /upload-artifact@/);
+assert.match(publishBuild, /publish-state-\$\{\{ matrix\.component \}\}/);
+assert.match(publishBuild, /should_sign/);
+assert.match(publishSign, /needs: \[.*publish-build.*\]/);
+assert.match(publishSign, /needs\.publish-build\.outputs\.should_sign == 'true'/);
+assert.match(publishSign, /download-artifact@/);
+assert.match(publishSign, /JMODGUARD_UPDATE_SIGNING_KEY/);
+assert.match(publishSign, /JMODGUARD_PUBLISH_PHASE: sign/);
+assert.doesNotMatch(publishSign, /JMODGUARD_PUBLISH_PHASE: build/);
+assert.match(publishSign, /packages: write/);
+assert.doesNotMatch(publishSign, /contents: write/);
 assert.match(jobs.get("release"), /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
 assert.match(jobs.get("release"), /sha: \$\{\{ steps\.release\.outputs\.sha \}\}/);
 assert.match(jobs.get("prepare-publication"), /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.release\.outputs\.created == 'true' && needs\.release\.outputs\.sha \|\| '' \}\}/);
 assert.match(jobs.get("prepare-publication"), /release_sha: \$\{\{ steps\.prepare\.outputs\.release_sha \}\}/);
-assert.match(jobs.get("publish"), /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
+assert.match(publishBuild, /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
+assert.match(publishSign, /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
 assert.doesNotMatch(combined, /gh pr merge|enablePullRequestAutoMerge|auto-merge/);
 for (const match of combined.matchAll(/^\s+(?:- )?uses: (\S+)/gm)) {
   if (match[1].startsWith("./")) continue;
@@ -212,12 +228,13 @@ try {
     } }));
   }
   context.needs["release-ci"].result = "failure";
-  assert.equal(condition(jobs.get("publish"), context), false, "failed differing source must block publication");
+  assert.equal(condition(publishBuild, context), false, "failed differing source must block publication");
   context.needs["release-ci"].result = "success";
   assert.deepEqual(matrix().include.map(item => item.groups), ["contracts"]);
   assert.ok(jobs.has("release-ci"), "differing release source requires validation");
   assert.match(jobs.get("release-ci"), /uses: \.\/\.github\/workflows\/ci\.yml/);
-  assert.match(jobs.get("publish"), /needs: \[.*release-ci.*\]/);
+  assert.match(publishBuild, /needs: \[.*release-ci.*\]/);
+  assert.match(publishSign, /needs: \[.*release-ci.*\]/);
   for (const source of [release, base]) {
     context.needs["prepare-publication"].outputs.release_sha = source;
     assert.ok(condition(jobs.get("release-ci"), context));
@@ -234,7 +251,13 @@ try {
       context.github.run_attempt = attempt;
       for (const result of ["failure", "cancelled", "skipped", "success"]) {
         context.needs["release-ci"].result = result;
-        assert.equal(condition(jobs.get("publish"), context), result === "success");
+        assert.equal(condition(publishBuild, context), result === "success");
+        context.needs["publish-build"] = { result: result, outputs: { should_sign: "true" } };
+        assert.equal(
+          condition(publishSign, context),
+          result === "success",
+          "signing must follow a successful build handoff",
+        );
       }
     }
   }
@@ -242,7 +265,11 @@ try {
     context.needs["prepare-publication"].outputs.release_sha = source;
     assert.equal(condition(jobs.get("release-ci"), context), false);
     context.needs["release-ci"].result = "skipped";
-    assert.ok(condition(jobs.get("publish"), context), "same-source and manual routes keep original checks");
+    assert.ok(condition(publishBuild, context), "same-source and manual routes keep original checks");
+    context.needs["publish-build"] = { result: "success", outputs: { should_sign: "false" } };
+    assert.equal(condition(publishSign, context), false, "skipped build must not run signing");
+    context.needs["publish-build"].outputs.should_sign = "true";
+    assert.ok(condition(publishSign, context), "verified build handoff must allow signing");
   }
 
   // Saved main and release plans both skip release creation before restoration,
