@@ -432,16 +432,25 @@ pub fn builtin_command_for_label(label: &str) -> Option<String> {
     None
 }
 
-fn shipped_builtin_command(primary: &str) -> Option<CommandDef> {
-    default_commands()
-        .into_iter()
-        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))
+pub fn command_persist_rejected_message(storage_name: &str) -> String {
+    format!("built-in command `{storage_name}` cannot be written to the database")
 }
 
-pub fn command_persist_rejected_message(storage_name: &str) -> String {
-    format!(
-        "command `{storage_name}` conflicts with a built-in command and cannot be written to the database"
-    )
+/// Primary shipped command name (not an alias).
+pub fn is_builtin_primary_command_name(name: &str) -> bool {
+    default_commands()
+        .iter()
+        .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
+}
+
+/// Overwrites any stored built-in rows with the running binary's shipped definitions.
+pub fn apply_shipped_builtin_commands(
+    commands: &mut std::collections::HashMap<String, CommandDef>,
+) {
+    for cmd in default_global_seed_commands() {
+        commands.insert(cmd.name.clone(), cmd);
+    }
+    merge_binary_overlay_commands(commands);
 }
 
 /// True when a command row must not be written to shared storage (rolling upgrades).
@@ -457,43 +466,21 @@ pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandD
         return true;
     }
 
-    let storage_primary = builtin_command_for_label(storage_name);
-    let def_primary = builtin_command_for_label(&cmd.name);
-
-    if storage_primary.is_none() {
-        if def_primary.is_some() {
-            return true;
-        }
-        return cmd
-            .aliases
-            .iter()
-            .any(|alias| builtin_command_for_label(alias).is_some());
-    }
-
-    let primary = storage_primary.expect("label is reserved");
-    if !primary.eq_ignore_ascii_case(storage_name) {
+    if is_builtin_primary_command_name(storage_name) {
         return true;
     }
-    if let Some(shipped) = shipped_builtin_command(&primary) {
-        let shipped_behavior = serde_json::to_value(&shipped.behavior).ok();
-        let cmd_behavior = serde_json::to_value(&cmd.behavior).ok();
-        if shipped_behavior != cmd_behavior {
-            return true;
-        }
+
+    if builtin_command_for_label(storage_name).is_some() {
+        return true;
     }
-    match def_primary {
-        Some(owner) if owner.eq_ignore_ascii_case(&primary) => {}
-        _ if cmd.name.eq_ignore_ascii_case(&primary) => {}
-        _ => return true,
+
+    if builtin_command_for_label(&cmd.name).is_some() {
+        return true;
     }
-    for alias in &cmd.aliases {
-        match builtin_command_for_label(alias) {
-            None => {}
-            Some(owner) if owner.eq_ignore_ascii_case(&primary) => {}
-            Some(_) => return true,
-        }
-    }
-    false
+
+    cmd.aliases
+        .iter()
+        .any(|alias| builtin_command_for_label(alias).is_some())
 }
 
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
@@ -911,15 +898,11 @@ mod rolling_upgrade_tests {
     }
 
     #[test]
-    fn builtin_row_rejects_behavior_replacement() {
+    fn builtin_row_rejects_even_identical_shipped_copy() {
         let shipped = default_commands()
             .into_iter()
             .find(|cmd| cmd.name == "stats")
             .expect("stats");
-        let hijack = CommandDef {
-            behavior: Behavior::Help,
-            ..shipped
-        };
-        assert!(rejects_binary_overlay_command_persist("stats", &hijack));
+        assert!(rejects_binary_overlay_command_persist("stats", &shipped));
     }
 }

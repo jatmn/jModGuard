@@ -1584,6 +1584,7 @@ mod tests {
     async fn slash_http_saves_registration_and_failure_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const FIXTURE_CMD: &str = "slashfixture";
         for (status, code) in [
             (200, 0),
             (403, 50013),
@@ -1685,8 +1686,27 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                command.name = FIXTURE_CMD.into();
+                command.aliases.clear();
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                 let before = db::get_primary_versions(&app.db).await.unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(db::get_primary_versions(&app.db).await.unwrap(), before);
@@ -1699,7 +1719,7 @@ mod tests {
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
                 command.description.push_str(" changed");
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1727,7 +1747,7 @@ mod tests {
                     );
                 }
                 assert!(app.finish_slash_resync(changed, Default::default()));
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
@@ -1782,7 +1802,7 @@ mod tests {
 
                 // A second save during a PUT must survive completion of the old pass.
                 command.description = "first concurrent edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let first = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1793,7 +1813,7 @@ mod tests {
                     async {
                         received.notified().await;
                         command.description = "second concurrent edit".into();
-                        db::upsert_command(&app.db, 10, "stats", &command)
+                        db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                             .await
                             .unwrap();
                         let second = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1830,7 +1850,7 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .find(|cmd| cmd["name"] == "stats")
+                        .find(|cmd| cmd["name"] == FIXTURE_CMD)
                         .unwrap();
                     assert_eq!(stats["description"], "second concurrent edit");
                 }
@@ -1838,7 +1858,7 @@ mod tests {
 
                 // A transient failure must retry without another configuration write.
                 command.description = "retry this edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1874,13 +1894,13 @@ mod tests {
                 // last successful payload must still send the restored value.
                 let restored = command.clone();
                 command.description = "uncertain edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let uncertain = app.pending_slash_registry_version().await.unwrap().unwrap();
                 response_status.store(503, Ordering::SeqCst);
                 assert!(!sync_slash_commands_versioned_http(&app, &http, guild, uncertain).await);
-                db::upsert_command(&app.db, 10, "stats", &restored)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &restored)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1990,11 +2010,30 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(target, &[10, 20]);
                 assert!(!app.finish_slash_resync(target, [10].into_iter().collect()));
-                let command = db::get_command_row(&app.db, 0, "stats")
+                let mut command = db::get_command_row(&app.db, 0, "stats")
                     .await
                     .unwrap()
                     .unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                command.name = FIXTURE_CMD.into();
+                command.aliases.clear();
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(

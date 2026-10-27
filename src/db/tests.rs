@@ -1598,11 +1598,12 @@ fn slash_registry_version_bumps_only_on_command_writes() {
         "settings must not bump slash_registry_version"
     );
 
-    let cmd = crate::defaults::default_commands()
+    let mut cmd = crate::defaults::default_commands()
         .into_iter()
         .next()
         .expect("defaults include commands");
-    tokio_test_block_on(crate::db::upsert_command(&db, 1, &cmd.name, &cmd)).unwrap();
+    cmd.name = "slashpressure".into();
+    tokio_test_block_on(crate::db::upsert_command(&db, 1, "slashpressure", &cmd)).unwrap();
     assert_eq!(
         tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
         s0 + 1,
@@ -2959,6 +2960,28 @@ fn builtin_command_cannot_be_replaced_via_db_writer() {
             .contains("cannot be written to the database"),
         "{alias_error:#}"
     );
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "guild-specific ban copy".into();
+    let ban_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
+        .expect_err("db writer must reject built-in ban edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.aliases = vec!["custom-ban-alias".into()];
+    let alias_edit_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
+        .expect_err("db writer must reject built-in alias edits");
+    assert!(
+        alias_edit_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_edit_error:#}"
+    );
     cleanup_db(&tmp);
 }
 
@@ -2974,32 +2997,41 @@ fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
         vec!["commands".into()],
         crate::types::Behavior::Say,
     );
-    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "myhelp", &hijack))
-        .expect_err("dashboard writer must reject help alias hijack");
+    let error = tokio_test_block_on(upsert_enrolled_command(
+        &db,
+        scope.clone(),
+        "myhelp",
+        &hijack,
+    ))
+    .expect_err("dashboard writer must reject help alias hijack");
     assert!(
         error
             .to_string()
             .contains("cannot be written to the database"),
         "{error:#}"
     );
-    cleanup_db(&tmp);
-}
-
-#[test]
-fn builtin_command_guild_override_still_allowed_when_behavior_matches() {
-    let tmp = tmp_db_path("builtin_ban_override_ok");
-    let db = Db::open(&tmp, 2).unwrap();
     let mut ban = crate::defaults::default_commands()
         .into_iter()
         .find(|cmd| cmd.name == "ban")
         .expect("ban");
-    ban.description = "guild-specific ban copy".into();
-    tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
-        .expect("guild ban override with shipped behavior must persist");
-    let stored = tokio_test_block_on(get_command_row(&db, 10, "ban"))
-        .unwrap()
-        .expect("ban row");
-    assert_eq!(stored.description, "guild-specific ban copy");
+    ban.description = "dashboard ban copy".into();
+    let ban_error = tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
+        .expect_err("dashboard writer must reject built-in ban description edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.aliases = vec!["extra-ban-alias".into()];
+    let alias_error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "ban", &ban))
+        .expect_err("dashboard writer must reject built-in ban alias edits");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
     cleanup_db(&tmp);
 }
 
@@ -3011,7 +3043,7 @@ async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
     let hijack = custom_command_hijack("stats", vec![], crate::types::Behavior::Help);
     let op = ControlOp::UpsertCommand {
         request: wire.clone(),
-        target: wire,
+        target: wire.clone(),
         name: "mystats".into(),
         command: hijack,
     };
@@ -3024,6 +3056,68 @@ async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
             .contains("cannot be written to the database"),
         "{error:#}"
     );
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "api ban copy".into();
+    let ban_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire.clone(),
+        name: "ban".into(),
+        command: ban.clone(),
+    };
+    let ban_error = apply_control(&db, None, ban_op, None)
+        .await
+        .expect_err("API upsert must reject built-in ban description edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.aliases = vec!["api-ban-alias".into()];
+    let alias_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire,
+        name: "ban".into(),
+        command: ban,
+    };
+    let alias_error = apply_control(&db, None, alias_op, None)
+        .await
+        .expect_err("API upsert must reject built-in ban alias edits");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_command_stored_guild_override_ignored_on_load() {
+    let tmp = tmp_db_path("builtin_guild_override_ignored");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    let mut override_row = shipped_ban.clone();
+    override_row.description = "legacy guild ban override".into();
+    override_row.aliases = vec!["legacy-ban-alias".into()];
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
+            params![10_i64, serde_json::to_string(&override_row)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(parts.commands["ban"].description, shipped_ban.description);
+    assert_eq!(parts.commands["ban"].aliases, shipped_ban.aliases);
     cleanup_db(&tmp);
 }
 
@@ -3287,7 +3381,15 @@ fn bot_bootstrap_upgrades_only_unchanged_legacy_setname_seed() {
     legacy.description =
         "Set the bot's nickname in this server (omit / clear / - to reset).".into();
     legacy.response = "Bot nickname set to {name}".into();
-    tokio_test_block_on(upsert_command(&db, GLOBAL_SCOPE, "setname", &legacy)).unwrap();
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE commands SET data = ?1 WHERE guild_id = ?2 AND name = 'setname'",
+            params![serde_json::to_string(&legacy)?, GLOBAL_SCOPE],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
     drop(db);
 
     let reopened = Db::open(&tmp, 2).unwrap();
@@ -3754,10 +3856,17 @@ fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
         assert!(parts.commands["stats"].matches("status"));
     }
     let custom = tokio_test_block_on(load_config_parts(&db, 125)).unwrap();
-    assert_eq!(custom.commands["stats"].permission, "everyone");
+    let shipped_stats = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "stats")
+        .expect("stats");
+    assert_eq!(
+        custom.commands["stats"].permission,
+        shipped_stats.permission
+    );
     assert_eq!(
         custom.commands["stats"].description,
-        "Operator customized Stats"
+        shipped_stats.description
     );
     assert_eq!(
         tokio_test_block_on(get_config_version(&db)).unwrap(),
@@ -3815,9 +3924,12 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
-    assert!(!parts.commands["stats"].matches("status"));
+    assert!(
+        parts.commands["stats"].matches("status"),
+        "shipped built-in stats must keep its aliases regardless of stored rows"
+    );
     assert!(parts.commands["custom"].matches("status"));
-    // Restoring a deleted default on a later boot must not steal the alias either.
+    // A missing global row must still resolve to the shipped built-in definition.
     tokio_test_block_on(db.with_conn(|conn| {
         conn.execute_bounded(
             "DELETE FROM commands WHERE name='stats'",
@@ -3830,7 +3942,7 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
-    assert!(!parts.commands["stats"].matches("status"));
+    assert!(parts.commands["stats"].matches("status"));
     assert!(parts.commands["custom"].matches("status"));
     drop(db);
     cleanup_db(&tmp);

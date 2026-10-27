@@ -1318,7 +1318,7 @@ impl ConfigurationSnapshotRows {
         for (name, def) in self.guild_commands {
             commands.insert(name, def);
         }
-        crate::defaults::merge_binary_overlay_commands(&mut commands);
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         let mut templates = std::collections::HashMap::new();
         for (event, def) in crate::defaults::default_templates() {
             let resolved = resolve(
@@ -1469,7 +1469,7 @@ pub async fn load_slash_commands_with_version(
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
-        crate::defaults::merge_binary_overlay_commands(&mut commands);
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })
@@ -1488,7 +1488,7 @@ pub async fn load_slash_commands_with_version_primary(
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
-        crate::defaults::merge_binary_overlay_commands(&mut commands);
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })

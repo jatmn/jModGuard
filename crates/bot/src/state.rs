@@ -3678,11 +3678,13 @@ mod tests {
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
         );
-        let cmd = crate::defaults::default_commands()
+        let mut cmd = crate::defaults::default_commands()
             .into_iter()
             .next()
             .expect("defaults");
-        tokio_test_block_on(db::upsert_command(&app.db, 1, &cmd.name, &cmd)).unwrap();
+        cmd.name = "slashpending".into();
+        cmd.aliases.clear();
+        tokio_test_block_on(db::upsert_command(&app.db, 1, "slashpending", &cmd)).unwrap();
         let pending = tokio_test_block_on(app.pending_slash_registry_version())
             .unwrap()
             .expect("command write must surface pending slash version");
