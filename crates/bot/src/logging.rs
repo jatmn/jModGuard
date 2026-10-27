@@ -635,7 +635,13 @@ fn channel_for(
     cfg: &crate::state::CachedGuildConfig,
     event: &str,
 ) -> Option<serenity::model::id::ChannelId> {
-    cfg.log_channels.get(event).copied()
+    if let Some(channel) = cfg.log_channels.get(event).copied() {
+        return Some(channel);
+    }
+    if event == "member_rejoin" {
+        return cfg.log_channels.get("member_join").copied();
+    }
+    None
 }
 
 /// Resolve one observed ban/unban against Discord's bounded recent audit window.

@@ -744,6 +744,8 @@ impl EventHandler for Handler {
             None,
         )
         .await;
+        crate::member_rejoin::maybe_emit_member_rejoin(&app, &ctx, guild_id, &new_member.user)
+            .await;
     }
 
     async fn guild_member_removal(
