@@ -2695,6 +2695,31 @@ fn seeded_commands_publish_a_primary_registry_version() {
 }
 
 #[test]
+fn voice_command_loads_from_binary_overlay_without_global_row() {
+    let tmp = tmp_db_path("voice_binary_overlay");
+    let db = Db::open(&tmp, 2).unwrap();
+    let global_voice: i64 = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE guild_id = 0 AND name = 'voice'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+    }))
+    .unwrap();
+    assert_eq!(
+        global_voice, 0,
+        "voice must not be seeded into shared global commands"
+    );
+    let parts = tokio_test_block_on(load_config_parts(&db, 42)).unwrap();
+    let voice = parts
+        .commands
+        .get("voice")
+        .expect("effective config must include binary overlay voice");
+    assert!(matches!(voice.behavior, crate::types::Behavior::Voice));
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();

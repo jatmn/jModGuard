@@ -288,6 +288,28 @@ pub(crate) fn mention_permission_in(
     }
 }
 
+/// Whether `member` may see `channel_id`, including overwrites and thread parents.
+pub(crate) fn member_can_view_channel(
+    guild: &serenity::model::guild::Guild,
+    member: &serenity::model::guild::Member,
+    channel_id: ChannelId,
+) -> bool {
+    let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
+        return false;
+    };
+    if !guild.roles.contains_key(&RoleId::new(guild.id.get()))
+        || member.roles.iter().any(|id| !guild.roles.contains_key(id))
+    {
+        return false;
+    }
+    let Some(partial) = partial_member(guild.id, &member.roles) else {
+        return false;
+    };
+    guild
+        .partial_member_permissions_in(channel, member.user.id, &partial)
+        .contains(Permissions::VIEW_CHANNEL)
+}
+
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
 fn partial_member(
     guild_id: GuildId,
@@ -1438,13 +1460,30 @@ fn cooldown_check(
     true
 }
 
-/// Resolves a user from a mention (`<@123>` / `<@!123>`), raw ID, or member
-/// name/nick search.
-pub async fn resolve_user(
-    ctx: &Context,
-    guild_id: GuildId,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserNameMatch {
+    Unique(serenity::model::id::UserId),
+    NotFound,
+    Ambiguous,
+}
+
+fn member_matches_name_token(member: &serenity::model::guild::Member, lower: &str) -> bool {
+    member.user.name.to_lowercase() == lower
+        || member
+            .nick
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase() == lower)
+        || member
+            .user
+            .global_name
+            .as_deref()
+            .is_some_and(|g| g.to_lowercase() == lower)
+}
+
+pub fn resolve_user_name_in_guild(
+    guild: &serenity::model::guild::Guild,
     token: &str,
-) -> Option<serenity::model::id::UserId> {
+) -> UserNameMatch {
     let trimmed = token.trim();
     if let Some(inner) = trimmed
         .strip_prefix("<@")
@@ -1452,36 +1491,62 @@ pub async fn resolve_user(
         .map(|t| t.trim_start_matches('!'))
         && let Ok(id) = inner.parse::<u64>()
     {
-        return Some(id.into());
+        return UserNameMatch::Unique(id.into());
     }
     if let Ok(id) = trimmed.parse::<u64>() {
-        return Some(id.into());
+        return UserNameMatch::Unique(id.into());
     }
-    let guild = ctx.cache.guild(guild_id)?;
     let lower = trimmed.to_lowercase();
-    guild
+    let matches = guild
         .members
-        .iter()
-        .find(|(_, m)| {
-            m.user.name.to_lowercase() == lower
-                || m.nick
-                    .as_deref()
-                    .map(|n| n.to_lowercase() == lower)
-                    .unwrap_or(false)
-                || m.user
-                    .global_name
-                    .as_deref()
-                    .map(|g| g.to_lowercase() == lower)
-                    .unwrap_or(false)
-        })
-        .map(|(_, m)| m.user.id)
+        .values()
+        .filter(|member| member_matches_name_token(member, &lower))
+        .map(|member| member.user.id)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => UserNameMatch::NotFound,
+        1 => UserNameMatch::Unique(matches[0]),
+        _ => UserNameMatch::Ambiguous,
+    }
+}
+
+/// Resolves a user from a mention, raw ID, or cached member name/nick search.
+pub fn resolve_user_name(ctx: &Context, guild_id: GuildId, token: &str) -> UserNameMatch {
+    let trimmed = token.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("<@")
+        .and_then(|t| t.strip_suffix('>'))
+        .map(|t| t.trim_start_matches('!'))
+        && let Ok(id) = inner.parse::<u64>()
+    {
+        return UserNameMatch::Unique(id.into());
+    }
+    if let Ok(id) = trimmed.parse::<u64>() {
+        return UserNameMatch::Unique(id.into());
+    }
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return UserNameMatch::NotFound;
+    };
+    resolve_user_name_in_guild(&guild, token)
+}
+
+/// Resolves a user from a mention (`<@123>` / `<@!123>`), raw ID, or member
+/// name/nick search.
+pub async fn resolve_user(
+    ctx: &Context,
+    guild_id: GuildId,
+    token: &str,
+) -> Option<serenity::model::id::UserId> {
+    match resolve_user_name(ctx, guild_id, token) {
+        UserNameMatch::Unique(id) => Some(id),
+        UserNameMatch::NotFound | UserNameMatch::Ambiguous => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Behavior;
-
     #[tokio::test]
     async fn slash_http_saves_registration_and_failure_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2013,7 +2078,7 @@ mod tests {
         ]);
         let not_cached = BehaviorOutcome {
             response: Some(templates::render(
-                super::voice_lookup::NOT_CACHED_TEMPLATE,
+                super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
                 &vars,
             )),
             vars: vars.clone(),
@@ -2047,6 +2112,24 @@ mod tests {
         assert_eq!(
             prefix_response_text(&command, &not_in_channel).as_deref(),
             Some(not_in_text.as_str())
+        );
+
+        let channel_unavailable = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let unavailable_text = render_outcome(&command, &channel_unavailable);
+        assert!(
+            unavailable_text.contains("cannot be reported"),
+            "{unavailable_text}"
+        );
+        assert!(
+            !unavailable_text.contains("not cached"),
+            "{unavailable_text}"
         );
     }
 
@@ -2346,6 +2429,49 @@ mod tests {
             super::mention_permission_in(&guild, ChannelId::new(CHANNEL), UserId::new(MEMBER), &[]),
             super::MentionPermission::Unknown,
             "missing everyone role is not a cached deny"
+        );
+    }
+
+    #[test]
+    fn member_cannot_view_channel_when_member_overwrite_denies_view() {
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::guild::{Guild, Member, Role};
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+
+        const GUILD: u64 = 100;
+        const ACTOR: u64 = 1;
+        const VOICE: u64 = 7;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.permissions = perms;
+            role
+        }
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(999);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Role(RoleId::new(GUILD)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+        let mut actor = Member::default();
+        actor.user.id = UserId::new(ACTOR);
+        actor.guild_id = guild.id;
+        assert!(
+            !super::member_can_view_channel(&guild, &actor, ChannelId::new(VOICE)),
+            "member-specific deny must hide the channel"
         );
     }
 

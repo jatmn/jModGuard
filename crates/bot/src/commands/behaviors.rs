@@ -583,12 +583,25 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Voice => {
             let mut args = env.args.clone();
-            let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
-                    .await?;
+            let token = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+            let target = match super::resolve_user_name(env.ctx, env.guild_id, &token) {
+                super::UserNameMatch::Unique(id) => id,
+                super::UserNameMatch::NotFound => {
+                    return Err(anyhow!("could not resolve user `{token}`"));
+                }
+                super::UserNameMatch::Ambiguous => {
+                    return Err(anyhow!(
+                        "ambiguous user `{token}`; use a mention or numeric user id"
+                    ));
+                }
+            };
             let target_user = user_lookup(env, target).await?;
-            let snapshot =
-                super::voice_lookup::snapshot_cached_voice(&env.ctx.cache, env.guild_id, target);
+            let snapshot = super::voice_lookup::snapshot_cached_voice(
+                &env.ctx.cache,
+                env.guild_id,
+                &env.actor_member,
+                target,
+            );
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             let response = match snapshot {
@@ -606,9 +619,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
                     crate::templates::render(super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE, &vars),
                 ),
-                super::voice_lookup::VoiceLookupSnapshot::NotCached => Some(
-                    crate::templates::render(super::voice_lookup::NOT_CACHED_TEMPLATE, &vars),
+                super::voice_lookup::VoiceLookupSnapshot::GuildNotCached => Some(
+                    crate::templates::render(super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE, &vars),
                 ),
+                super::voice_lookup::VoiceLookupSnapshot::ChannelUnavailable => {
+                    Some(crate::templates::render(
+                        super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                        &vars,
+                    ))
+                }
             };
             Ok(BehaviorOutcome {
                 response,

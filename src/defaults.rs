@@ -374,6 +374,29 @@ pub fn default_commands() -> Vec<CommandDef> {
     out
 }
 
+/// Built-in commands merged from the running binary but not written to global
+/// `commands` rows during rolling upgrades (older binaries cannot deserialize
+/// unknown `Behavior` kinds).
+pub const BINARY_OVERLAY_COMMAND_NAMES: &[&str] = &["voice"];
+
+/// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
+pub fn default_global_seed_commands() -> Vec<CommandDef> {
+    default_commands()
+        .into_iter()
+        .filter(|cmd| !BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str()))
+        .collect()
+}
+
+pub fn merge_binary_overlay_commands(commands: &mut std::collections::HashMap<String, CommandDef>) {
+    for cmd in default_commands() {
+        if BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str())
+            && !commands.contains_key(&cmd.name)
+        {
+            commands.insert(cmd.name.clone(), cmd);
+        }
+    }
+}
+
 fn aliases_for(name: &str) -> Vec<String> {
     match name {
         "ban" => vec!["yeet".into(), "b".into()],
@@ -635,6 +658,25 @@ pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {
 
 /// A sample custom command plan, used to demonstrate the step editor.
 #[allow(dead_code)]
+#[cfg(test)]
+mod rolling_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn voice_command_is_binary_overlay_not_global_seed() {
+        assert!(
+            default_commands().iter().any(|cmd| cmd.name == "voice"),
+            "voice must ship in the binary default list"
+        );
+        assert!(
+            !default_global_seed_commands()
+                .iter()
+                .any(|cmd| cmd.name == "voice"),
+            "voice must not be written to shared global command rows"
+        );
+    }
+}
+
 pub fn sample_plan_command() -> CommandDef {
     CommandDef {
         name: "welcome".into(),
