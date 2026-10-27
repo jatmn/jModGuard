@@ -1352,7 +1352,14 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
             }
             _ => &cmd.response,
         };
-        templates::render(response, &vars)
+        let rendered = templates::render(response, &vars);
+        if matches!(cmd.behavior, Behavior::Kick { .. } | Behavior::Ban { .. })
+            && !response.contains("{mod_reason_dm_clause}")
+            && let Some(clause) = vars.get("mod_reason_dm_clause")
+        {
+            return format!("{rendered}{clause}");
+        }
+        rendered
     } else if let Some(r) = &outcome.response {
         r.clone()
     } else {
@@ -2132,7 +2139,10 @@ mod tests {
 
         let mut custom = kick.clone();
         custom.response = "Custom kick {target}".into();
-        assert_eq!(render_outcome(&custom, &with_dm), "Custom kick Member");
+        assert_eq!(
+            render_outcome(&custom, &with_dm),
+            "Custom kick Member | Reason DM sent."
+        );
 
         with_dm.vars.remove("mod_reason_dm_clause");
         assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");

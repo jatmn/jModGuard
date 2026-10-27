@@ -112,6 +112,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
                 } => {
+                    let dm_reason = discord_reason.as_deref().unwrap_or(reason.as_str());
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
                     if continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -132,11 +134,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                             target,
                             &target_user.name,
                             &reason,
+                            dm_outcome,
                         )
                         .await;
                     }
-                    let dm_reason = discord_reason.as_deref().unwrap_or(reason.as_str());
-                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", dm_reason).await;
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
                     if !env.app.activation.may_record() {
@@ -235,6 +236,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                     target,
                                     &target_user.name,
                                     &reason,
+                                    dm_outcome,
                                 )
                                 .await;
                             }
@@ -347,6 +349,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -409,6 +412,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                dm_outcome,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -514,6 +518,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -578,6 +583,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -643,6 +649,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &n.to_string(),
+                None,
             )
             .await;
             Ok(BehaviorOutcome {
@@ -719,6 +726,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.actor,
                 "messages",
                 &format!("{n} deleted"),
+                None,
             )
             .await;
             vars.insert("count".into(), n.to_string());
@@ -787,6 +795,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.actor,
                 "channel",
                 &duration,
+                None,
             )
             .await;
             Ok(BehaviorOutcome {
@@ -1180,7 +1189,16 @@ async fn log_mod(
     target: serenity::model::id::UserId,
     target_name: &str,
     reason: &str,
+    dm: Option<mod_reason_dm::ModReasonDmOutcome>,
 ) {
+    let reason = match dm {
+        Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) | None => reason.to_string(),
+        Some(outcome) => format!(
+            "{}{}",
+            reason,
+            mod_reason_dm::render_mod_reason_dm_clause(outcome)
+        ),
+    };
     logging::emit_mod_action(
         env.app,
         enrollment,
@@ -1193,7 +1211,7 @@ async fn log_mod(
         env.actor.get(),
         env.actor_member.display_name(),
         env.channel_id.get(),
-        reason,
+        &reason,
     )
     .await;
 }

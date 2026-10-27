@@ -490,6 +490,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dm_delivery_truncated_success_body_is_uncertain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let response = if n == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        FIXTURE_PRIVATE_CHANNEL_JSON.len(),
+                        FIXTURE_PRIVATE_CHANNEL_JSON
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9999\r\nConnection: close\r\n\r\n{\"id\":".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        let channel = http
+            .create_private_channel(&serde_json::json!({"recipient_id": "91"}))
+            .await
+            .expect("channel open");
+        let err = channel.say(&http, "notice").await.unwrap_err();
+        server.abort();
+        assert_eq!(
+            classify_mod_reason_dm_delivery_error(&err),
+            ModReasonDmOutcome::Uncertain
+        );
+    }
+
+    #[tokio::test]
     async fn kick_reason_dm_opens_channel_before_member_removal() {
         use serenity::model::event::GuildCreateEvent;
         use serenity::model::guild::{Guild, Member};
