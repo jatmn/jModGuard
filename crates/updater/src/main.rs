@@ -10,6 +10,7 @@ use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::signature::{
     SCHEMA_MISMATCH, boot_repair_reason, registry_transient, signature_rejection_phrase,
 };
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -772,7 +773,7 @@ struct Supervisor {
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
-    pending_boot_mismatch: Option<PendingBootMismatch>,
+    pending_boot_mismatch: VecDeque<PendingBootMismatch>,
     pending_startup: Vec<StartupReceipt>,
     receipt_attempt: u32,
     receipt_not_before: Option<Instant>,
@@ -781,6 +782,58 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn queue_pending_boot_record(&mut self, release: ComponentRelease, reason: String) {
+        for pending in &mut self.pending_boot_mismatch {
+            if let PendingBootMismatch::Record {
+                release: existing,
+                reason: existing_reason,
+            } = pending
+            {
+                **existing = release;
+                *existing_reason = reason;
+                return;
+            }
+        }
+        self.pending_boot_mismatch
+            .push_back(PendingBootMismatch::Record {
+                release: Box::new(release),
+                reason,
+            });
+    }
+
+    fn queue_pending_boot_clear_retry(&mut self) {
+        if self
+            .pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Clear))
+        {
+            return;
+        }
+        self.pending_boot_mismatch
+            .push_back(PendingBootMismatch::Clear);
+    }
+
+    fn queue_pending_boot_clear_after_recovery(&mut self) {
+        self.pending_boot_mismatch
+            .retain(|pending| !matches!(pending, PendingBootMismatch::Record { .. }));
+        self.queue_pending_boot_clear_retry();
+    }
+
+    fn clear_pending_boot_mismatch(&mut self) {
+        self.pending_boot_mismatch.clear();
+    }
+
+    #[cfg(test)]
+    fn pending_boot_mismatch_labels(&self) -> Vec<&'static str> {
+        self.pending_boot_mismatch
+            .iter()
+            .map(|pending| match pending {
+                PendingBootMismatch::Record { .. } => "record",
+                PendingBootMismatch::Clear => "clear",
+            })
+            .collect()
+    }
+
     async fn hold_rejected_token(&mut self) -> Result<bool> {
         // Copy the fields the child borrow must not hold. A saved digest keeps
         // the candidate when this process no longer has a standby path.
@@ -1068,19 +1121,25 @@ impl Supervisor {
     }
 
     async fn flush_pending_boot_mismatch(&mut self) -> Result<()> {
-        if self.pending_boot_mismatch.is_none() || !self.receipt_wait_elapsed() {
+        if self.pending_boot_mismatch.is_empty() || !self.receipt_wait_elapsed() {
             return Ok(());
         }
-        let pending = self.pending_boot_mismatch.clone();
-        match pending {
-            Some(PendingBootMismatch::Record { release, reason }) => {
-                let on_baked = self
+        let index = self
+            .pending_boot_mismatch
+            .iter()
+            .position(|pending| match pending {
+                PendingBootMismatch::Clear => true,
+                PendingBootMismatch::Record { .. } => self
                     .running
                     .as_ref()
-                    .is_some_and(|child| child.path == self.baked);
-                if !on_baked {
-                    return Ok(());
-                }
+                    .is_some_and(|child| child.path == self.baked),
+            });
+        let Some(index) = index else {
+            return Ok(());
+        };
+        let pending = self.pending_boot_mismatch.remove(index).unwrap();
+        match pending {
+            PendingBootMismatch::Record { release, reason } => {
                 match self
                     .control
                     .record_boot_mismatch(db::BootMismatchRecord {
@@ -1095,30 +1154,30 @@ impl Supervisor {
                     .await
                 {
                     Ok(()) => {
-                        self.pending_boot_mismatch = None;
                         self.reset_receipt_backoff();
                     }
                     Err(error) if Self::receipt_not_saved(&error) => {
                         tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                        self.queue_pending_boot_record((*release).clone(), reason);
                         self.note_receipt_delay();
                     }
                     Err(error) => return Err(error),
                 }
             }
-            Some(PendingBootMismatch::Clear) => {
+            PendingBootMismatch::Clear => {
                 match self.control.clear_boot_mismatch(&self.role).await {
                     Ok(()) => {
-                        self.pending_boot_mismatch = None;
+                        self.clear_pending_boot_mismatch();
                         self.reset_receipt_backoff();
                     }
                     Err(error) if Self::receipt_not_saved(&error) => {
                         tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                        self.queue_pending_boot_clear_retry();
                         self.note_receipt_delay();
                     }
                     Err(error) => return Err(error),
                 }
             }
-            None => {}
         }
         Ok(())
     }
@@ -1559,7 +1618,7 @@ impl Supervisor {
                                 Ok(()) => {}
                                 Err(error) if Self::receipt_not_saved(&error) => {
                                     tracing::warn!("boot mismatch clear was not saved: {error:#}");
-                                    self.pending_boot_mismatch = Some(PendingBootMismatch::Clear);
+                                    self.queue_pending_boot_clear_after_recovery();
                                     self.note_receipt_delay();
                                 }
                                 Err(error) => return Err(error),
@@ -1745,10 +1804,7 @@ impl Supervisor {
             Ok(()) => Ok(()),
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
-                self.pending_boot_mismatch = Some(PendingBootMismatch::Record {
-                    release: Box::new(release.clone()),
-                    reason: reason.to_owned(),
-                });
+                self.queue_pending_boot_record(release.clone(), reason.to_owned());
                 self.note_receipt_delay();
                 Ok(())
             }
@@ -1759,12 +1815,12 @@ impl Supervisor {
     async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
         match self.control.clear_boot_mismatch(&self.role).await {
             Ok(()) => {
-                self.pending_boot_mismatch = None;
+                self.clear_pending_boot_mismatch();
                 Ok(())
             }
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch clear was not saved: {error:#}");
-                self.pending_boot_mismatch = Some(PendingBootMismatch::Clear);
+                self.queue_pending_boot_clear_retry();
                 self.note_receipt_delay();
                 Err(error)
             }
@@ -2943,7 +2999,7 @@ async fn main() -> Result<()> {
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
-        pending_boot_mismatch: None,
+        pending_boot_mismatch: VecDeque::new(),
         pending_startup,
         receipt_attempt: 0,
         receipt_not_before: None,

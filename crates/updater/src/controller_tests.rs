@@ -7,7 +7,7 @@ use db::{Db, DbOpenOptions, SqlExecutor, params};
 use jmodguard_updater::signature::{UNSIGNED_IMAGE, signature_tag_for_digest};
 use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 fn test_signing() -> &'static SigningFixture {
@@ -281,7 +281,7 @@ fn controller(
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
-        pending_boot_mismatch: None,
+        pending_boot_mismatch: VecDeque::new(),
         pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,
@@ -8375,5 +8375,82 @@ async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_f
     );
     server.abort();
     drop((api, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_boot_mismatch_clear_retry_keeps_record_and_successful_clear_drops_it() {
+    let root = std::env::temp_dir().join(format!(
+        "boot-mismatch-pending-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    db::record_boot_mismatch(
+        &db,
+        db::BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: db::BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: UNSIGNED_IMAGE.into(),
+        },
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let read_only = DbOpenOptions {
+        read_only: true,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let mut api = controller(
+        "api",
+        root.join("baked-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        UpdateControl::open(&read_only).unwrap().unwrap(),
+        &root,
+    );
+    let release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    api.queue_pending_boot_record(release.clone(), UNSIGNED_IMAGE.into());
+    api.queue_pending_boot_clear_retry();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "clear retry must not replace a pending record"
+    );
+    let writable = DbOpenOptions {
+        read_only: false,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    api.control = UpdateControl::open(&writable).unwrap().unwrap();
+    api.clear_boot_mismatch_when_saved().await.unwrap();
+    assert!(
+        api.pending_boot_mismatch_labels().is_empty(),
+        "successful clear must drop any stale pending record"
+    );
+    api.queue_pending_boot_record(release.clone(), UNSIGNED_IMAGE.into());
+    api.clear_boot_mismatch_when_saved().await.unwrap();
+    api.receipt_attempt = 0;
+    api.receipt_not_before = None;
+    api.flush_pending_boot_mismatch().await.unwrap();
+    let db = Db::open(&path, 2).unwrap();
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    drop(db);
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
