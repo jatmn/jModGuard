@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 pub(crate) const PRIOR_CASE_LIMIT: u32 = 8;
 const REASON_UNITS: usize = 160;
+const REJOIN_LOG_UTF16_BUDGET: usize = 2000;
+const REJOIN_NOTICE_UTF16_RESERVE: usize = 320;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RejoinNote {
@@ -43,8 +45,7 @@ pub(crate) fn build_rejoin_note(
         }
         return match ever_banned {
             Some(true) => Some(RejoinNote::BanHistoryOnly),
-            Some(false) => None,
-            None => Some(RejoinNote::BanHistoryOnly),
+            Some(false) | None => None,
         };
     }
     let lines = cases.entries.iter().map(format_case_line).collect();
@@ -160,7 +161,6 @@ pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
             truncated,
             index_incomplete,
         } => {
-            vars.insert("cases".into(), lines.join("\n"));
             let mut notice = String::new();
             if *index_incomplete {
                 notice =
@@ -175,6 +175,11 @@ pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
                     format!("{notice} {omitted}")
                 };
             }
+            let notice_reserve = REJOIN_NOTICE_UTF16_RESERVE.max(notice.encode_utf16().count());
+            vars.insert(
+                "cases".into(),
+                bound_rejoin_case_lines(lines, notice_reserve),
+            );
             vars.insert("notice".into(), notice);
         }
     }
@@ -224,6 +229,22 @@ fn format_case_time(ms: Option<i64>) -> String {
         .unwrap_or_else(|| "unavailable".into())
 }
 
+fn bound_rejoin_case_lines(lines: &[String], notice_reserve: usize) -> String {
+    let budget = REJOIN_LOG_UTF16_BUDGET.saturating_sub(notice_reserve);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for line in lines {
+        let line_units = line.encode_utf16().count();
+        let separator = if out.is_empty() { 0 } else { 1 };
+        if used + separator + line_units > budget {
+            break;
+        }
+        used += separator + line_units;
+        out.push(line.clone());
+    }
+    out.join("\n")
+}
+
 fn clip_units(text: &str, units: usize) -> String {
     let mut end = 0usize;
     for (count, (index, ch)) in text.char_indices().enumerate() {
@@ -255,7 +276,7 @@ pub(crate) async fn maybe_emit_member_rejoin(
         None,
     )
     .await
-    .is_some()
+    .0 == logging::Delivery::Sent
 }
 
 #[cfg(test)]

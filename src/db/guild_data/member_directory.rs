@@ -1511,11 +1511,14 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let done: bool = tx.query_row(
-                    "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
-                    params![scope.guild_id(), scope.enrollment.id.as_str()],
-                    |r| Ok(r.get(0)?),
-                )?;
+                let done: bool = tx
+                    .query_row(
+                        "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
                 tx.finish_read()?;
                 Ok(done)
             })
@@ -1959,7 +1962,25 @@ fn ingest_member_audits(
             };
             let payload = serde_json::to_string(&data)?;
             let case_id = random_id();
-            conn.member_execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)",params![scope.guild_id(),scope.enrollment.id.as_str(),case_id,key,payload])?;
+            conn.member_execute(
+                "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    case_id.as_str(),
+                    key,
+                    payload.as_str()
+                ],
+            )?;
+            conn.member_execute(
+                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?3,'$.subject_id') AS INTEGER),?4,json_extract(?3,'$.action'),CAST(json_extract(?3,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?3) AND json_extract(?3,'$.subject_id') IS NOT NULL AND json_extract(?3,'$.action') IS NOT NULL",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    payload.as_str(),
+                    case_id.as_str()
+                ],
+            )?;
         }
         conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1",params![scope.guild_id(),scope.enrollment.id.as_str(),audit.user_id,now_ms])?;
         inserted += 1;
@@ -2882,11 +2903,11 @@ impl GuildDataStore {
 
     /// Index-ordered case lookup: bound live cases before joining payloads.
     pub(crate) fn member_case_entries_lookup_sql() -> &'static str {
-        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT i.guild_id,i.enrollment_id,i.user_id,i.case_id,i.action_kind,i.occurred_at_ms FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(c.payload)<=65536 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(c.payload)<=65536 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
+        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT i.guild_id,i.enrollment_id,i.user_id,i.case_id,i.action_kind,i.occurred_at_ms FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(CAST(c.payload AS BLOB))<=65536 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(CAST(c.payload AS BLOB))<=65536 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
     }
 
     fn member_case_entries_oversized_sql() -> &'static str {
-        "SELECT EXISTS(SELECT 1 FROM (SELECT i.case_id FROM guild_member_case_index i INDEXED BY guild_member_cases_user WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) recent JOIN guild_cases c ON c.guild_id=?1 AND c.enrollment_id=?2 AND c.case_id=recent.case_id AND c.deleted=0 WHERE length(c.payload)>65536)"
+        "SELECT EXISTS(SELECT 1 FROM (SELECT i.case_id FROM guild_member_case_index i INDEXED BY guild_member_cases_user WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) recent JOIN guild_cases c ON c.guild_id=?1 AND c.enrollment_id=?2 AND c.case_id=recent.case_id AND c.deleted=0 WHERE length(CAST(c.payload AS BLOB))>65536)"
     }
 
     /// Bounded member-case lookup while `case_backfill_done` is false. Uses the

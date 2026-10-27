@@ -318,6 +318,65 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Inserts a guild case row without touching `guild_member_case_index` (tests only).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn insert_unindexed_case_for_test(
+        &self,
+        scope: GuildDataScope,
+        case_id: CaseId,
+        source_key: String,
+        payload: String,
+    ) -> Result<()> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            verify_scope(&tx, &expected, &scope, true)?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_rows(
+                "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    case_id.as_str(),
+                    source_key.as_str(),
+                    payload.as_str()
+                ],
+                1,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn remove_case_index_for_test(
+        &self,
+        scope: GuildDataScope,
+        case_id: CaseId,
+    ) -> Result<()> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            verify_scope(&tx, &expected, &scope, true)?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_rows(
+                "DELETE FROM guild_member_case_index WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    case_id.as_str()
+                ],
+                1,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn case(
         &self,
         scope: GuildDataScope,

@@ -748,21 +748,21 @@ impl EventHandler for Handler {
             .joined_at
             .map(|joined| joined.timestamp_millis())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        if app.rejoin_note_deliveries.should_attempt(
+        if app.rejoin_note_deliveries.begin_attempt(
             guild_id.get(),
             uid,
             joined_at_ms,
             membership_refresh,
-        ) && crate::member_rejoin::maybe_emit_member_rejoin(
-            &app,
-            &ctx,
-            guild_id,
-            &new_member.user,
-        )
-        .await
-        {
+        ) {
+            let sent = crate::member_rejoin::maybe_emit_member_rejoin(
+                &app,
+                &ctx,
+                guild_id,
+                &new_member.user,
+            )
+            .await;
             app.rejoin_note_deliveries
-                .mark_delivered(guild_id.get(), uid, joined_at_ms);
+                .finish_attempt(guild_id.get(), uid, joined_at_ms, sent);
         }
     }
 
@@ -902,7 +902,7 @@ impl EventHandler for Handler {
         }
         let mut extra = audit.unwrap_or_default();
         extra.insert("time".into(), observed_at);
-        let late_audit = logging::emit_member_event(
+        let (_, late_audit) = logging::emit_member_event(
             &app,
             &ctx,
             guild_id,

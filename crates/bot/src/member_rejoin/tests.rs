@@ -57,6 +57,11 @@ fn no_cases_and_complete_index_skips_note() {
 }
 
 #[test]
+fn profile_lookup_error_skips_ban_history_only_note() {
+    assert_eq!(build_rejoin_note(prior(vec![], false, true), None), None);
+}
+
+#[test]
 fn incomplete_index_without_ban_history_skips_note() {
     assert_eq!(
         build_rejoin_note(prior(vec![], false, false), Some(false)),
@@ -210,6 +215,42 @@ async fn collect_prior_cases_reads_store_rows_before_backfill_completes() {
 }
 
 #[tokio::test]
+async fn legacy_guild_case_without_index_is_not_listed_until_backfill() {
+    const GUILD: i64 = 10;
+    const SUBJECT: i64 = 88;
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let case_id = record_application(
+        &f.app,
+        Some(enrollment.clone()),
+        CaseAction::Ban,
+        CaseOutcome::Succeeded,
+        SUBJECT as u64,
+        Some(1),
+        Some("legacy-only".into()),
+        CaseEvidence::Unavailable,
+    )
+    .await
+    .expect("indexed case");
+    store
+        .remove_case_index_for_test(scope.clone(), case_id)
+        .await
+        .unwrap();
+    let cases = collect_prior_cases(&store, scope, SUBJECT).await.unwrap();
+    assert!(!cases.index_complete);
+    assert!(cases.entries.is_empty());
+}
+
+#[tokio::test]
 async fn indexed_cases_survive_stay_rows_in_store() {
     const GUILD: i64 = 10;
     const SUBJECT: i64 = 99;
@@ -341,6 +382,48 @@ async fn member_rejoin_falls_back_to_member_join_channel() {
 }
 
 #[tokio::test]
+async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
+    let f = Fixture::new();
+    f.app.activation.mark_lock_held(true);
+    const GUILD: u64 = 789;
+    const USER: u64 = 42;
+    const JOINED_AT_MS: i64 = 1_700_000_000_000;
+    let note = RejoinNote::IndexNotReady;
+    let vars = member_rejoin_vars(&user(USER), &note);
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    assert!(
+        f.app
+            .rejoin_note_deliveries
+            .begin_attempt(GUILD, USER, JOINED_AT_MS, false)
+    );
+    let sent = emit_to(
+        &f.app,
+        &sink,
+        GuildId::new(GUILD),
+        "member_rejoin",
+        vars.clone(),
+    )
+    .await
+        == Delivery::Sent;
+    f.app
+        .rejoin_note_deliveries
+        .finish_attempt(GUILD, USER, JOINED_AT_MS, sent);
+    assert!(sent);
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+    assert!(
+        !f.app
+            .rejoin_note_deliveries
+            .begin_attempt(GUILD, USER, JOINED_AT_MS, false),
+        "second join handler pass must not post again for the same join token"
+    );
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn ignored_user_skips_member_rejoin_note() {
     let f = Fixture::new();
     f.app.activation.mark_lock_held(true);
@@ -378,11 +461,11 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         .expect("guild_member_addition");
     let body = &source[start..start + 3_200];
     assert!(
-        body.contains("rejoin_note_deliveries.should_attempt"),
-        "join handler must admit rejoin notes via delivery state, not only membership_refresh"
+        body.contains("rejoin_note_deliveries.begin_attempt"),
+        "join handler must reserve rejoin delivery before awaiting Discord"
     );
     assert!(
-        body.contains("mark_delivered"),
+        body.contains("finish_attempt"),
         "join handler must record successful rejoin delivery"
     );
     assert_eq!(

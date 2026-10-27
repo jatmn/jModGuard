@@ -240,31 +240,51 @@ pub struct MemberJoinContext {
 /// Suppresses duplicate member-rejoin notes for the same join token while still
 /// allowing redelivery after a failed first attempt.
 #[derive(Default)]
+struct RejoinNoteDeliveryState {
+    delivered: HashMap<(u64, u64, i64), Instant>,
+    in_flight: std::collections::HashSet<(u64, u64, i64)>,
+}
+
+#[derive(Default)]
 pub struct RejoinNoteDeliveries {
-    inner: Mutex<HashMap<(u64, u64, i64), Instant>>,
+    inner: Mutex<RejoinNoteDeliveryState>,
 }
 
 impl RejoinNoteDeliveries {
-    pub fn should_attempt(
+    pub fn begin_attempt(
         &self,
         guild: u64,
         user: u64,
         joined_at_ms: i64,
         membership_refresh: bool,
     ) -> bool {
-        if membership_refresh {
-            return true;
+        let key = (guild, user, joined_at_ms);
+        let mut state = self.inner.lock();
+        state
+            .delivered
+            .retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
+        if state.in_flight.contains(&key) {
+            return false;
         }
-        self.inner
-            .lock()
-            .get(&(guild, user, joined_at_ms))
-            .is_none_or(|delivered| delivered.elapsed() >= MEMBER_JOINS_KEEP)
+        if !membership_refresh
+            && state
+                .delivered
+                .get(&key)
+                .is_some_and(|delivered| delivered.elapsed() < MEMBER_JOINS_KEEP)
+        {
+            return false;
+        }
+        state.in_flight.insert(key);
+        true
     }
 
-    pub fn mark_delivered(&self, guild: u64, user: u64, joined_at_ms: i64) {
-        let mut entries = self.inner.lock();
-        entries.retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
-        entries.insert((guild, user, joined_at_ms), Instant::now());
+    pub fn finish_attempt(&self, guild: u64, user: u64, joined_at_ms: i64, sent: bool) {
+        let key = (guild, user, joined_at_ms);
+        let mut state = self.inner.lock();
+        state.in_flight.remove(&key);
+        if sent {
+            state.delivered.insert(key, Instant::now());
+        }
     }
 }
 
@@ -2258,7 +2278,7 @@ pub(crate) async fn emit_member_event(
     user: &serenity::model::user::User,
     extra: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
-) -> Option<BTreeMap<String, String>> {
+) -> (Delivery, Option<BTreeMap<String, String>>) {
     let account_created = user.created_at();
     let account_age_seconds =
         (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
@@ -2292,7 +2312,6 @@ pub(crate) async fn emit_member_event(
         },
     )
     .await
-    .1
 }
 
 /// Emits a departure after the paced member check proved the captured stay is
