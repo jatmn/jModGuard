@@ -224,6 +224,20 @@ impl Registry {
                 phrase: signature::BAD_IMAGE_SIGNATURE,
             }
         );
+        for layer in manifest.layers.iter().rev() {
+            let signature_b64 = layer
+                .annotations
+                .get("dev.cosignproject.cosign/signature")
+                .map(String::as_str);
+            if let Some(signature_b64) = signature_b64 {
+                let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
+                if let Ok(envelope) =
+                    signature::envelope_from_cosign_payload(&payload, signature_b64)
+                {
+                    return Ok(envelope);
+                }
+            }
+        }
         let layer = &manifest.layers[0];
         let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
         let signature_b64 = layer
@@ -461,17 +475,34 @@ impl Registry {
             config.config.labels.get("io.jmodguard.release-id") == Some(&release.release_id),
             "release ID changed"
         );
-        let layer = manifest.layers.last().context("image has no final layer")?;
-        let bytes = self.blob(repo, layer, MAX_LAYER).await?;
-        extract_layer(&bytes, &layer.media_type, requested)
+        let mut found = HashMap::new();
+        let mut remaining: Vec<&str> = requested.to_vec();
+        for layer in manifest.layers.iter().rev() {
+            if remaining.is_empty() {
+                break;
+            }
+            let bytes = self.blob(repo, layer, MAX_LAYER).await?;
+            let partial = extract_layer_files(&bytes, &layer.media_type, &remaining)?;
+            for path in partial.keys() {
+                remaining.retain(|wanted| wanted != path);
+            }
+            found.extend(partial);
+        }
+        ensure!(
+            found.len() == requested.len(),
+            "release image is missing a required file"
+        );
+        Ok(found)
     }
 }
 
-fn extract_layer(
+fn extract_layer_files(
     bytes: &[u8],
     media: &str,
     requested: &[&str],
 ) -> Result<HashMap<String, Vec<u8>>> {
+    let wanted: HashSet<&str> = requested.iter().copied().collect();
+    ensure!(wanted.len() == requested.len(), "duplicate file request");
     let reader: Box<dyn Read + '_> = match media {
         "application/vnd.oci.image.layer.v1.tar+gzip"
         | "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
@@ -481,8 +512,6 @@ fn extract_layer(
         _ => bail!("unsupported image layer compression"),
     };
     let mut archive = tar::Archive::new(reader);
-    let wanted: HashSet<&str> = requested.iter().copied().collect();
-    ensure!(wanted.len() == requested.len(), "duplicate file request");
     let mut found = HashMap::new();
     let mut total = 0u64;
     let mut count = 0usize;
@@ -501,6 +530,9 @@ fn extract_layer(
             "unsafe layer path"
         );
         let name = normalized.to_owned();
+        if !wanted.contains(name.as_str()) {
+            continue;
+        }
         let kind = entry.header().entry_type();
         ensure!(
             kind.is_file() || kind.is_dir(),
@@ -509,19 +541,26 @@ fn extract_layer(
         let size = entry.size();
         total = total.checked_add(size).context("layer size overflow")?;
         ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
-        if wanted.contains(name.as_str()) {
-            ensure!(
-                kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
-                "invalid or duplicate release file"
-            );
-            let mut data = Vec::with_capacity(size as usize);
-            entry.read_to_end(&mut data)?;
-            ensure!(data.len() as u64 == size, "truncated release file");
-            found.insert(name, data);
-        }
+        ensure!(
+            kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
+            "invalid or duplicate release file"
+        );
+        let mut data = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut data)?;
+        ensure!(data.len() as u64 == size, "truncated release file");
+        found.insert(name, data);
     }
+    Ok(found)
+}
+
+fn extract_layer(
+    bytes: &[u8],
+    media: &str,
+    requested: &[&str],
+) -> Result<HashMap<String, Vec<u8>>> {
+    let found = extract_layer_files(bytes, media, requested)?;
     ensure!(
-        found.len() == wanted.len(),
+        found.len() == requested.len(),
         "release layer is missing a required file"
     );
     Ok(found)
@@ -623,6 +662,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn collects_requested_files_across_multiple_layers() {
+        let bin_layer = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"\x7fELFbody",
+            tar::EntryType::Regular,
+        )]);
+        let manifest_layer = layer(&[(
+            "usr/local/share/jmodguard/files.sha256",
+            b"deadbeef  usr/local/bin/jmodguard-api\n",
+            tar::EntryType::Regular,
+        )]);
+        let bin = extract_layer_files(
+            &bin_layer,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap();
+        let manifest = extract_layer_files(
+            &manifest_layer,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            &["usr/local/share/jmodguard/files.sha256"],
+        )
+        .unwrap();
+        let mut merged = bin;
+        merged.extend(manifest);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains_key("usr/local/bin/jmodguard-api"));
+        assert!(merged.contains_key("usr/local/share/jmodguard/files.sha256"));
     }
 
     #[test]

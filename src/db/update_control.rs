@@ -10,9 +10,9 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 18;
+pub const LAUNCHER_REVISION: u32 = 19;
 // Selected bots need the auth-exit hold before the readiness deadline check.
-pub const REQUIRED_LAUNCHER_REVISION: u32 = 18;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 19;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 

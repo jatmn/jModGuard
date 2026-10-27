@@ -1489,7 +1489,15 @@ impl Supervisor {
                                 .as_ref()
                                 .is_some_and(|installed| &installed.digest == digest)
                         {
-                            self.clear_boot_mismatch_when_saved().await?;
+                            match self.clear_boot_mismatch_when_saved().await {
+                                Ok(()) => {}
+                                Err(error) if Self::receipt_not_saved(&error) => {
+                                    tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                                    self.note_receipt_delay();
+                                    return Ok(false);
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                     }
                 }
@@ -1617,7 +1625,7 @@ impl Supervisor {
     }
 
     async fn record_boot_mismatch_for_installed(
-        &self,
+        &mut self,
         release: &ComponentRelease,
         reason: &str,
     ) -> Result<()> {
@@ -1637,18 +1645,20 @@ impl Supervisor {
             Ok(()) => Ok(()),
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
-                Ok(())
+                self.note_receipt_delay();
+                Err(error)
             }
             Err(error) => Err(error),
         }
     }
 
-    async fn clear_boot_mismatch_when_saved(&self) -> Result<()> {
+    async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
         match self.control.clear_boot_mismatch(&self.role).await {
             Ok(()) => Ok(()),
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch clear was not saved: {error:#}");
-                Ok(())
+                self.note_receipt_delay();
+                Err(error)
             }
             Err(error) => Err(error),
         }
