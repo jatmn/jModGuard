@@ -205,14 +205,15 @@ impl Registry {
         Ok(body)
     }
 
-    async fn signature_envelope_bytes(&self, repo: &str, body: &[u8]) -> Result<Vec<u8>> {
+    async fn signature_envelope_candidates(&self, repo: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut candidates = Vec::new();
         if serde_json::from_slice::<serde_json::Value>(body)
             .ok()
             .is_some_and(|value| {
                 value.get("payloadType").is_some() && value.get("payload").is_some()
             })
         {
-            return Ok(body.to_vec());
+            candidates.push(body.to_vec());
         }
         let manifest: Manifest =
             serde_json::from_slice(body).map_err(|_| signature::ImageSignatureRejection {
@@ -234,20 +235,17 @@ impl Registry {
                 if let Ok(envelope) =
                     signature::envelope_from_cosign_payload(&payload, signature_b64)
                 {
-                    return Ok(envelope);
+                    candidates.push(envelope);
                 }
             }
         }
-        let layer = &manifest.layers[0];
-        let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
-        let signature_b64 = layer
-            .annotations
-            .get("dev.cosignproject.cosign/signature")
-            .map(String::as_str)
-            .ok_or(signature::ImageSignatureRejection {
+        ensure!(
+            !candidates.is_empty(),
+            signature::ImageSignatureRejection {
                 phrase: signature::BAD_IMAGE_SIGNATURE,
-            })?;
-        signature::envelope_from_cosign_payload(&payload, signature_b64)
+            }
+        );
+        Ok(candidates)
     }
 
     async fn verify_manifest(
@@ -258,14 +256,22 @@ impl Registry {
         manifest_bytes: &[u8],
     ) -> Result<()> {
         let signature = self.signature_body(repo, manifest_digest).await?;
-        let envelope = self.signature_envelope_bytes(repo, &signature).await?;
-        signature::verify_manifest_signature(
-            component,
-            manifest_digest,
-            manifest_bytes,
-            &envelope,
-            Utc::now(),
-        )
+        let envelopes = self.signature_envelope_candidates(repo, &signature).await?;
+        let now = Utc::now();
+        let mut last = None;
+        for envelope in envelopes {
+            match signature::verify_manifest_signature(
+                component,
+                manifest_digest,
+                manifest_bytes,
+                &envelope,
+                now,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap())
     }
 
     async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {

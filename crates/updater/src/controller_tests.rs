@@ -281,6 +281,7 @@ fn controller(
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
+        pending_boot_mismatch: None,
         pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,

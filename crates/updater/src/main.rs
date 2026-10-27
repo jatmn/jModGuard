@@ -676,6 +676,15 @@ struct PendingFailure {
     launcher: Option<(String, String)>,
 }
 
+#[derive(Clone)]
+enum PendingBootMismatch {
+    Record {
+        release: ComponentRelease,
+        reason: String,
+    },
+    Clear,
+}
+
 /// Startup receipts the API cannot store until the bot is the writer.
 /// Order is activation, then observation, then a failed handoff.
 #[derive(Clone, PartialEq, Eq)]
@@ -763,6 +772,7 @@ struct Supervisor {
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
+    pending_boot_mismatch: Option<PendingBootMismatch>,
     pending_startup: Vec<StartupReceipt>,
     receipt_attempt: u32,
     receipt_not_before: Option<Instant>,
@@ -1053,6 +1063,55 @@ impl Supervisor {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        Ok(())
+    }
+
+    async fn flush_pending_boot_mismatch(&mut self) -> Result<()> {
+        if self.pending_boot_mismatch.is_none() || !self.receipt_wait_elapsed() {
+            return Ok(());
+        }
+        let pending = self.pending_boot_mismatch.clone();
+        match pending {
+            Some(PendingBootMismatch::Record { release, reason }) => {
+                match self
+                    .control
+                    .record_boot_mismatch(db::BootMismatchRecord {
+                        component: self.role.clone(),
+                        running: self.base_sha.clone(),
+                        expected: db::BootMismatchExpected {
+                            release_id: release.release_id.clone(),
+                            source_sha: release.source_sha.clone(),
+                        },
+                        reason: reason.clone(),
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        self.pending_boot_mismatch = None;
+                        self.reset_receipt_backoff();
+                    }
+                    Err(error) if Self::receipt_not_saved(&error) => {
+                        tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                        self.note_receipt_delay();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Some(PendingBootMismatch::Clear) => {
+                match self.control.clear_boot_mismatch(&self.role).await {
+                    Ok(()) => {
+                        self.pending_boot_mismatch = None;
+                        self.reset_receipt_backoff();
+                    }
+                    Err(error) if Self::receipt_not_saved(&error) => {
+                        tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                        self.note_receipt_delay();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {}
         }
         Ok(())
     }
@@ -1493,8 +1552,8 @@ impl Supervisor {
                                 Ok(()) => {}
                                 Err(error) if Self::receipt_not_saved(&error) => {
                                     tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                                    self.pending_boot_mismatch = Some(PendingBootMismatch::Clear);
                                     self.note_receipt_delay();
-                                    return Ok(false);
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -1645,8 +1704,12 @@ impl Supervisor {
             Ok(()) => Ok(()),
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                self.pending_boot_mismatch = Some(PendingBootMismatch::Record {
+                    release: release.clone(),
+                    reason: reason.to_owned(),
+                });
                 self.note_receipt_delay();
-                Err(error)
+                Ok(())
             }
             Err(error) => Err(error),
         }
@@ -1654,9 +1717,15 @@ impl Supervisor {
 
     async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
         match self.control.clear_boot_mismatch(&self.role).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if matches!(self.pending_boot_mismatch, Some(PendingBootMismatch::Clear)) {
+                    self.pending_boot_mismatch = None;
+                }
+                Ok(())
+            }
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                self.pending_boot_mismatch = Some(PendingBootMismatch::Clear);
                 self.note_receipt_delay();
                 Err(error)
             }
@@ -2368,6 +2437,7 @@ impl Supervisor {
     async fn tick_control(&mut self) -> Result<bool> {
         self.flush_startup_receipts().await?;
         self.flush_pending_failure().await?;
+        self.flush_pending_boot_mismatch().await?;
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
@@ -2827,6 +2897,7 @@ async fn main() -> Result<()> {
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
+        pending_boot_mismatch: None,
         pending_startup,
         receipt_attempt: 0,
         receipt_not_before: None,

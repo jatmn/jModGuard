@@ -170,20 +170,19 @@ pub fn envelope_from_cosign_payload(payload: &[u8], signature_b64: &str) -> Resu
         .map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
         })?;
-    let keys = trusted_keys().map_err(|_| ImageSignatureRejection {
-        phrase: BAD_IMAGE_SIGNATURE,
-    })?;
-    let trusted = keys
-        .iter()
-        .find(|key| key.key.verify(payload, &signature_bytes).is_ok())
-        .ok_or(ImageSignatureRejection {
-            phrase: UNTRUSTED_IMAGE_SIGNATURE_KEY,
-        })?;
+    let keyid = trusted_keys()
+        .ok()
+        .and_then(|keys| {
+            keys.iter()
+                .find(|key| key.key.verify(payload, &signature_bytes).is_ok())
+                .map(|key| key.keyid.clone())
+        })
+        .unwrap_or_default();
     let envelope = serde_json::json!({
         "payloadType": PAYLOAD_TYPE,
         "payload": STANDARD.encode(payload),
         "signatures": [{
-            "keyid": trusted.keyid,
+            "keyid": keyid,
             "sig": signature_b64
         }]
     });

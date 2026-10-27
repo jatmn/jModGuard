@@ -9,7 +9,7 @@ use axum::{
 use jmodguard_updater::oci::Registry;
 use jmodguard_updater::signature::{
     BAD_IMAGE_SIGNATURE, EXPIRED_IMAGE_SIGNATURE, UNSIGNED_IMAGE, UNTRUSTED_IMAGE_SIGNATURE_KEY,
-    signature_tag_for_digest,
+    signature_rejection_phrase, signature_tag_for_digest,
 };
 use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice, image as signed_image};
 use std::{collections::HashMap, sync::Arc, sync::OnceLock};
@@ -180,6 +180,31 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "api",
         b"\x7fELFsigned",
         "development",
+        "2020-01-01T00:00:00Z",
+        'b',
+    );
+    signing().sign(
+        &mut objects,
+        "api",
+        &release.digest,
+        "2027-12-31T00:00:00Z",
+        SigningKeyChoice::Current,
+    );
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    registry.discover("api", "latest").await.unwrap();
+    server.abort();
+
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
         "2027-12-31T00:00:00Z",
         'a',
     );
@@ -231,6 +256,8 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "2027-12-31T00:00:00Z",
         'g',
     );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
     signing().sign(
         &mut objects,
         "api",
@@ -244,6 +271,9 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
     })
     .await;
     let error = registry.discover("api", "latest").await.unwrap_err();
-    assert!(error.to_string().contains(UNTRUSTED_IMAGE_SIGNATURE_KEY));
+    assert_eq!(
+        signature_rejection_phrase(&error),
+        Some(UNTRUSTED_IMAGE_SIGNATURE_KEY)
+    );
     server.abort();
 }

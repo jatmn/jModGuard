@@ -89,7 +89,24 @@ impl SigningFixture {
         for (digest, bytes) in blobs {
             objects.insert(digest, bytes);
         }
-        objects.insert(tag, manifest);
+        if let Some(existing) = objects.get(&tag) {
+            let mut existing_manifest: serde_json::Value =
+                serde_json::from_slice(existing).unwrap();
+            let new_manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            if let (Some(old_layers), Some(new_layers)) = (
+                existing_manifest
+                    .get_mut("layers")
+                    .and_then(|value| value.as_array_mut()),
+                new_manifest
+                    .get("layers")
+                    .and_then(|value| value.as_array()),
+            ) {
+                old_layers.extend(new_layers.iter().cloned());
+            }
+            objects.insert(tag, serde_json::to_vec(&existing_manifest).unwrap());
+        } else {
+            objects.insert(tag, manifest);
+        }
     }
 }
 
@@ -120,7 +137,7 @@ pub fn image(
             "io.jmodguard.base-abi":"debian-bookworm-amd64",
             "io.jmodguard.update-control":"3", "io.jmodguard.upgrade-min-core":"15",
             "io.jmodguard.upgrade-min-guild":"1", "io.jmodguard.guild-schema":"14",
-            "io.jmodguard.launcher-revision":"18", "io.jmodguard.min-launcher-revision":"18",
+            "io.jmodguard.launcher-revision":"19", "io.jmodguard.min-launcher-revision":"19",
             "org.opencontainers.image.revision":sha
         }}
     }))
