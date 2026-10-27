@@ -177,7 +177,9 @@ must not be reported as live Bunny proof or measured resource usage.
 The attachment and repeated-text rules now use bounded Gateway exact-image and
 exact-trimmed-text paths, in test or delete-and-ban mode; see `docs/IMAGE-SPAM.md`.
 Never restore the count-only trigger or route matches into the generic punishment
-executor. Require an exact common distinct-hash set or exact trimmed text across
+executor. The separate attachment burst times out the same attachment across
+channels and posts a Release/Ban review; it is not count-only detection, does
+not use account age, and does not change the exact-image size check. Require an exact common distinct-hash set or exact trimmed text across
 channels, preserve original observation time and invalidation/replay guards, and
 keep work/metadata bounds with no background task queue. Test reports are Discord
 logs only, with no SQL cases. Enforcement rechecks membership/exemptions, deletes

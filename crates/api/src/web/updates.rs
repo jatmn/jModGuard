@@ -10,9 +10,13 @@ use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::timeout;
 use tower_sessions::Session;
 
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -34,7 +38,7 @@ fn check_failure(err: &anyhow::Error) -> (StatusCode, Json<Value>) {
 }
 
 pub fn release_check_is_stale(checked_at: Option<i64>, now: i64) -> bool {
-    checked_at.is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+    db::release_check_is_stale(checked_at, now)
 }
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -536,6 +540,342 @@ async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow:
     Ok(())
 }
 
+pub const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+pub const RELEASE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Drain the background release-check task after HTTP graceful shutdown.
+pub const RELEASE_CHECK_SHUTDOWN_DRAIN: Duration = Duration::from_secs(60);
+
+fn control_link_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
+}
+
+fn warn_record_release_check(component: &str, error: &anyhow::Error) {
+    if control_link_unavailable(error) {
+        tracing::warn!(component, "control link unavailable during release check");
+    } else {
+        tracing::warn!(component, "failed to record release check: {error:#}");
+    }
+}
+
+/// Outcome of one [`record_release_checks`] pass.
+pub struct ReleaseCheckBatch {
+    pub finished: bool,
+    /// Components whose update lease was held; skip automatic install this tick.
+    pub lease_held: HashSet<&'static str>,
+}
+
+async fn record_release_check(
+    app: &Arc<ApiState>,
+    component: &str,
+    channel: &str,
+    candidate: Option<ComponentRelease>,
+    error: Option<String>,
+    now: i64,
+) -> anyhow::Result<()> {
+    via_bot!(
+        app,
+        db::record_update_check(
+            &app.db,
+            component,
+            channel,
+            candidate.clone(),
+            error.clone(),
+            now
+        ),
+        db::ControlOp::RecordUpdateCheck {
+            component: component.to_owned(),
+            channel: channel.to_owned(),
+            candidate,
+            error,
+            now,
+        }
+    )?;
+    Ok(())
+}
+
+/// Record configured-channel digest lookups through the bot writer. Discovery is
+/// injected so tests do not call the registry.
+pub async fn record_release_checks<F>(
+    app: &Arc<ApiState>,
+    mut discover: F,
+    lookup_timeout: Duration,
+    mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> ReleaseCheckBatch
+where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+{
+    let mut lease_held = HashSet::new();
+    for component in ["bot", "api", "webui"] {
+        let state = match db::component_update(&app.db, component).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(component, "release read failed: {error:#}");
+                continue;
+            }
+        };
+        let channel = state.channel.clone();
+        let lease = format!("{:032x}", rand::random::<u128>());
+        let claim_now = chrono::Utc::now().timestamp();
+        let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(component, "release check skipped: {error:#}");
+                continue;
+            }
+        };
+        if !claimed {
+            tracing::debug!(component, "release check skipped: update lease held");
+            lease_held.insert(component);
+            continue;
+        }
+        let work = with_update_lease(Some(app), &app.db, component, &lease, 240, async {
+            let outcome = tokio::select! {
+                biased;
+                _ = &mut shutdown => anyhow::bail!("release check shutdown"),
+                outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
+            };
+            let now = chrono::Utc::now().timestamp();
+            match outcome {
+                Err(_) => {
+                    record_release_check(
+                        app,
+                        component,
+                        &channel,
+                        None,
+                        Some("release lookup timed out".into()),
+                        now,
+                    )
+                    .await
+                    .inspect_err(|error| warn_record_release_check(component, error))?;
+                }
+                Ok(Err(error)) => {
+                    let message = format!("{error:#}");
+                    record_release_check(app, component, &channel, None, Some(message), now)
+                        .await
+                        .inspect_err(|error| warn_record_release_check(component, error))?;
+                }
+                Ok(Ok(release)) => {
+                    let record = if let Err(error) = release.validate() {
+                        Err(format!("{error:#}"))
+                    } else if release.component != component || release.channel != channel {
+                        Err("candidate component or channel mismatch".into())
+                    } else {
+                        Ok(release)
+                    };
+                    match record {
+                        Ok(release) => {
+                            record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                Some(release),
+                                None,
+                                now,
+                            )
+                            .await
+                            .inspect_err(|error| warn_record_release_check(component, error))?;
+                        }
+                        Err(message) => {
+                            record_release_check(
+                                app,
+                                component,
+                                &channel,
+                                None,
+                                Some(message),
+                                now,
+                            )
+                            .await
+                            .inspect_err(|error| warn_record_release_check(component, error))?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        match work.await {
+            Ok(()) => {}
+            Err(error) if error.to_string() == "release check shutdown" => {
+                return ReleaseCheckBatch {
+                    finished: false,
+                    lease_held,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(component, "background release check failed: {error:#}");
+                lease_held.insert(component);
+            }
+        }
+    }
+    ReleaseCheckBatch {
+        finished: true,
+        lease_held,
+    }
+}
+
+/// Promoted channels may install on a cadence. `latest` cannot, and cadence
+/// `off` never does. This is the same pair `set_update_policy` allows.
+pub fn scheduled_auto_install_allowed(channel: &str, cadence: &str) -> bool {
+    matches!(channel, "stable" | "nightly") && matches!(cadence, "daily" | "weekly" | "monthly")
+}
+
+/// Unattended apply gates for [`poll_scheduled_installs`] and
+/// [`run_release_check_loop`]. Production passes [`ScheduledInstallPolicy::from_env`];
+/// integration tests inject explicit values instead of mutating process env.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledInstallPolicy {
+    pub unattended_updates: bool,
+    pub apply_enabled: bool,
+}
+
+impl ScheduledInstallPolicy {
+    pub fn from_env() -> Self {
+        Self {
+            unattended_updates: enabled("JMODGUARD_UNATTENDED_UPDATES"),
+            apply_enabled: enabled("JMODGUARD_UPDATE_APPLY_ENABLED"),
+        }
+    }
+
+    pub fn enabled(unattended_updates: bool, apply_enabled: bool) -> Self {
+        Self {
+            unattended_updates,
+            apply_enabled,
+        }
+    }
+
+    pub fn allows_scheduled_install(&self) -> bool {
+        self.unattended_updates && self.apply_enabled
+    }
+}
+
+/// The install half of [`poll_all`]. Flags still default off. Rows that are
+/// not a stable or nightly cadence are left untouched.
+pub async fn poll_scheduled_installs(
+    app: &Arc<ApiState>,
+    skip_lease_held: &HashSet<&'static str>,
+    policy: ScheduledInstallPolicy,
+) {
+    if !policy.allows_scheduled_install() {
+        return;
+    }
+    for component in ["bot", "api", "webui"] {
+        if skip_lease_held.contains(component) {
+            continue;
+        }
+        let state = match db::component_update(&app.db, component).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(component, "automatic update skipped: {error:#}");
+                continue;
+            }
+        };
+        if !scheduled_auto_install_allowed(&state.channel, &state.cadence) {
+            continue;
+        }
+        if let Err(error) = automatic_install(app, component).await {
+            tracing::warn!(component, "automatic update skipped: {error:#}");
+        }
+    }
+}
+
+/// Coalesced or interval-based tick source for [`run_release_check_loop`].
+pub struct ReleaseCheckTick {
+    inner: ReleaseCheckTickInner,
+}
+
+enum ReleaseCheckTickInner {
+    Interval(tokio::time::Interval),
+    Coalescing {
+        notify: Arc<Notify>,
+        parked: Option<tokio::sync::watch::Sender<u32>>,
+    },
+}
+
+impl ReleaseCheckTick {
+    pub fn interval(duration: Duration) -> Self {
+        let mut tick = tokio::time::interval(duration);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            inner: ReleaseCheckTickInner::Interval(tick),
+        }
+    }
+
+    pub fn coalescing(notify: Arc<Notify>, parked: tokio::sync::watch::Sender<u32>) -> Self {
+        Self {
+            inner: ReleaseCheckTickInner::Coalescing {
+                notify,
+                parked: Some(parked),
+            },
+        }
+    }
+
+    pub fn fire(&self) {
+        if let ReleaseCheckTickInner::Coalescing { notify, .. } = &self.inner {
+            notify.notify_one();
+        }
+    }
+
+    async fn wait_for_tick(&mut self, shutdown: Pin<Box<dyn Future<Output = ()> + Send>>) -> bool {
+        match &mut self.inner {
+            ReleaseCheckTickInner::Interval(tick) => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown => false,
+                    _ = tick.tick() => true,
+                }
+            }
+            ReleaseCheckTickInner::Coalescing { notify, .. } => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown => false,
+                    _ = notify.notified() => true,
+                }
+            }
+        }
+    }
+
+    fn signal_parked(&self) {
+        if let ReleaseCheckTickInner::Coalescing {
+            parked: Some(tx), ..
+        } = &self.inner
+        {
+            let _ = tx.send_if_modified(|generation| {
+                *generation += 1;
+                true
+            });
+        }
+    }
+}
+
+/// Background release checks for the configured channel. Each tick records the
+/// digest, then runs [`poll_scheduled_installs`] for stable and nightly
+/// cadences. `latest` and cadence `off` stay record-only. A tick finishes
+/// before the next one starts.
+pub async fn run_release_check_loop<F, S>(
+    app: Arc<ApiState>,
+    mut tick: ReleaseCheckTick,
+    lookup_timeout: Duration,
+    mut discover: F,
+    shutdown: S,
+    policy: ScheduledInstallPolicy,
+) where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+    S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
+{
+    loop {
+        if !tick.wait_for_tick(shutdown()).await {
+            break;
+        }
+        let batch = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()).await;
+        if !batch.finished {
+            break;
+        }
+        poll_scheduled_installs(&app, &batch.lease_held, policy).await;
+        tick.signal_parked();
+    }
+}
+
 /// Read-only release poll. A changed candidate is logged and not recorded.
 /// Discovery is injected so tests do not call the registry.
 pub async fn poll_releases(
@@ -570,21 +910,16 @@ pub async fn poll_releases(
     }
 }
 
-/// API process timer is independent of browser sessions and auto-apply policy.
+/// Log-only registry poll plus the scheduled install. The hourly task does not
+/// call this: it records through [`record_release_checks`], then
+/// [`poll_scheduled_installs`], so a second unrecorded lookup does not run.
 pub async fn poll_all(app: &Arc<ApiState>) {
     poll_releases(app, async |component, channel| {
         let registry = Registry::ghcr()?;
         Ok(registry.discover(component, channel).await?.digest)
     })
     .await;
-    for component in ["bot", "api", "webui"] {
-        if enabled("JMODGUARD_UNATTENDED_UPDATES")
-            && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")
-            && let Err(error) = automatic_install(app, component).await
-        {
-            tracing::warn!(component, "automatic update skipped: {error:#}");
-        }
-    }
+    poll_scheduled_installs(app, &HashSet::new(), ScheduledInstallPolicy::from_env()).await;
 }
 
 async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Result<()> {
@@ -641,13 +976,10 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
         }
     };
     if component == "webui" {
-        let worker = Arc::clone(app);
         let lease = lease.expect("WebUI install owns its lease");
-        tokio::spawn(async move {
-            if let Err(error) = run_webui_install(&worker, release, &lease).await {
-                tracing::error!("automatic WebUI install failed: {error:#}");
-            }
-        });
+        if let Err(error) = run_webui_install(app, release, &lease).await {
+            tracing::error!("automatic WebUI install failed: {error:#}");
+        }
     }
     Ok(())
 }
@@ -979,6 +1311,20 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_auto_install_allows_only_promoted_cadences() {
+        for cadence in ["daily", "weekly", "monthly"] {
+            assert!(scheduled_auto_install_allowed("stable", cadence));
+            assert!(scheduled_auto_install_allowed("nightly", cadence));
+        }
+        for channel in ["latest", "stable", "nightly"] {
+            assert!(!scheduled_auto_install_allowed(channel, "off"));
+        }
+        for cadence in ["daily", "weekly", "monthly"] {
+            assert!(!scheduled_auto_install_allowed("latest", cadence));
+        }
+    }
 
     #[tokio::test]
     async fn live_webui_worker_renews_lease_through_slow_work() {

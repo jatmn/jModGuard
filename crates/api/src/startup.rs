@@ -255,11 +255,68 @@ mod tests {
             Ok::<_, anyhow::Error>("digest".to_owned())
         })
         .await;
+        let candidates_before = [
+            db::component_update(&app.db, "bot")
+                .await
+                .unwrap()
+                .candidate,
+            db::component_update(&app.db, "api")
+                .await
+                .unwrap()
+                .candidate,
+            db::component_update(&app.db, "webui")
+                .await
+                .unwrap()
+                .candidate,
+        ];
+        crate::web::updates::record_release_checks(
+            &app,
+            |_component, _channel| {
+                Box::pin(async move {
+                    Ok(db::ComponentRelease {
+                        upgrade: None,
+                        component: "bot".into(),
+                        channel: "latest".into(),
+                        release_id: "x".into(),
+                        source_sha: "a".repeat(40),
+                        published_at: "2026-10-01T00:00:00Z".into(),
+                        image: "ghcr.io/jatmn/jmodguard-bot".into(),
+                        digest: format!("sha256:{}", "b".repeat(64)),
+                        min_schema: db::CORE_SCHEMA_VERSION,
+                        max_schema: db::CORE_SCHEMA_VERSION,
+                        result_schema: db::CORE_SCHEMA_VERSION,
+                        min_api: 1,
+                        max_api: 1,
+                        launcher_protocol: 1,
+                        launcher: None,
+                        base_abi: "debian-bookworm-amd64".into(),
+                    })
+                })
+            },
+            std::time::Duration::from_millis(50),
+            Box::pin(std::future::pending()),
+        )
+        .await;
         assert_eq!(
             probe.immediate(),
             0,
             "API startup and the release check must not open a write transaction"
         );
+        let candidates_after = [
+            db::component_update(&app.db, "bot")
+                .await
+                .unwrap()
+                .candidate,
+            db::component_update(&app.db, "api")
+                .await
+                .unwrap()
+                .candidate,
+            db::component_update(&app.db, "webui")
+                .await
+                .unwrap()
+                .candidate,
+        ];
+        assert_eq!(candidates_before, candidates_after);
         assert_eq!(app.db.read_terminal_defaults().unwrap(), before_defaults);
         assert_eq!(
             db::get_config_version(&app.db).await.unwrap(),

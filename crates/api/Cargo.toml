@@ -32,5 +32,5 @@ jmodguard = { path = "../..", features = ["test-support"] }
 tower = "0.5.3"
 async-trait = "0.1"
 jmodguard-bot = { path = "../bot" } # HTTP-to-worker regression fixtures only
-libsql = { version = "0.9.30", default-features = false, features = ["core"] }
+libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 libc = "0.2"

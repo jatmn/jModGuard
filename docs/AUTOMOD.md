@@ -30,6 +30,10 @@ escalation accurate without false positives.
   rule editor. Test mode logs only; enforcement deletes matched messages and bans.
   Creates and attachment-changing edits participate.
 - See [exact-image and repeated-text settings](IMAGE-SPAM.md).
+- A separate attachment burst can time out the same image posted in two or
+  more channels within a few seconds, then ask moderators to release or ban.
+  It does not use the exact-image thresholds or account age. See
+  [IMAGE-SPAM.md](IMAGE-SPAM.md).
 
 ### 3. `repeat_text` — exact trimmed text
 - The same author posts the same trimmed string across distinct channels.
