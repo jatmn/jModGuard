@@ -97,10 +97,10 @@ An owner install request requires a successful release check for the currently s
 
 ## Image signatures
 
-GitHub Actions builds and pushes each component’s immutable source-SHA tag (and a
-version tag when the publication plan includes one), verifies the image, signs that
-digest with a pinned cosign key pair, and only then moves `latest`, `stable`, or
-`nightly`. Each signature is stored in the registry as a `sha256-<digest>.sig`
+GitHub Actions builds and pushes each component image to a staging reference,
+captures the build output digest, verifies the image, signs that digest with a
+pinned cosign key pair, and only then promotes the immutable source-SHA tag,
+any planned version tag, and `latest`, `stable`, or `nightly`. Each signature is stored in the registry as a `sha256-<digest>.sig`
 artifact using the cosign simple-signing envelope. Signatures carry an
 `io.jmodguard.not-after` annotation set to 366 days after the image
 `io.jmodguard.published-at` label. Historical dashboard rollback images carry only
