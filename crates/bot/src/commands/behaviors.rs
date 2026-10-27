@@ -18,27 +18,29 @@ fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
 
 fn refuse_bot_target(env: &CmdEnv<'_>, target: serenity::model::id::UserId) -> Result<()> {
     if target == env.ctx.cache.current_user().id {
-        return Err(anyhow!("cannot moderate the bot"));
+        let message = jmodguard::templates::render_bounded(
+            jmodguard::defaults::CANNOT_MODERATE_BOT_TEMPLATE,
+            &std::collections::BTreeMap::from([("command".into(), env.cmd.name.clone())]),
+            2000,
+        );
+        return Err(anyhow!(message));
     }
     Ok(())
 }
 
-async fn optional_mod_reason_dm(
+async fn mod_reason_dm_after_success(
     env: &CmdEnv<'_>,
     target: serenity::model::id::UserId,
     action: &str,
     reason: &str,
-) -> Result<Option<mod_reason_dm::ModReasonDmOutcome>> {
+) -> Option<mod_reason_dm::ModReasonDmOutcome> {
     if !env.dm {
-        return Ok(None);
+        return None;
     }
     if !env.app.activation.may_record() {
-        return Err(anyhow!("writer lease is not held"));
+        return Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
     }
-    let reason = jmodguard::ban_reason::without_tag(reason);
-    let outcome = mod_reason_dm::send_mod_reason_dm(env, target, action, reason).await;
-    mod_reason_dm::dm_outcome_allows_moderation(outcome)?;
-    Ok(Some(outcome))
+    Some(mod_reason_dm::send_mod_reason_dm(env, target, action, reason).await)
 }
 
 fn apply_mod_reason_dm_clause(
@@ -76,7 +78,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|g| g.members.get(&target).cloned());
             refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
-            let dm_outcome = optional_mod_reason_dm(env, target, "banned", &reason).await?;
+            let mut dm_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -224,6 +226,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                 )
                                 .await;
                             }
+                            dm_outcome =
+                                mod_reason_dm_after_success(env, target, "banned", &reason).await;
                         }
                         crate::db::guild_data::CaseOutcome::Failed => {
                             return Err(discord
@@ -348,7 +352,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
             refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
-            let dm_outcome = optional_mod_reason_dm(env, target, "kicked", &reason).await?;
             lease_held(env)?;
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
@@ -375,6 +378,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await;
             lease_held(env)?;
             discord?;
+            let dm_outcome = mod_reason_dm_after_success(env, target, "kicked", &reason).await;
             log_mod(
                 env,
                 enrollment.clone(),

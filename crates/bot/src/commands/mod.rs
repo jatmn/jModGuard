@@ -431,10 +431,39 @@ pub struct CmdEnv<'a> {
     pub actor: serenity::model::id::UserId,
     pub actor_member: serenity::model::guild::Member,
     pub args: Args,
-    /// When true, DM the moderation reason to the target before kick/ban.
+    /// When true, DM the moderation reason to the target after a successful kick/ban.
     pub dm: bool,
     /// Source message (prefix commands) — None for slash commands.
     pub source_message: Option<serenity::model::id::MessageId>,
+}
+
+impl<'a> CmdEnv<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        app: &'a Arc<BotState>,
+        ctx: &'a Context,
+        cmd: &'a CommandDef,
+        guild_id: GuildId,
+        channel_id: serenity::model::id::ChannelId,
+        actor: serenity::model::id::UserId,
+        actor_member: serenity::model::guild::Member,
+        args: Args,
+        dm: bool,
+        source_message: Option<serenity::model::id::MessageId>,
+    ) -> Self {
+        Self {
+            app,
+            ctx,
+            cmd,
+            guild_id,
+            channel_id,
+            actor,
+            actor_member,
+            args,
+            dm,
+            source_message,
+        }
+    }
 }
 
 pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<()> {
@@ -616,18 +645,18 @@ pub async fn handle_prefix(
     } else {
         false
     };
-    let env = CmdEnv {
+    let env = CmdEnv::new(
         app,
         ctx,
-        cmd: &cmd,
+        &cmd,
         guild_id,
-        channel_id: msg.channel_id,
-        actor: msg.author.id,
-        actor_member: member,
+        msg.channel_id,
+        msg.author.id,
+        member,
         args,
         dm,
-        source_message: Some(msg.id),
-    };
+        Some(msg.id),
+    );
     tracing::info!(
         "command `{}` invoked by {} in guild {} (channel {})",
         cmd.name,
@@ -1013,18 +1042,18 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     }
 
     let (arg_parts, dm) = options_to_args_with_dm(&cmd, &slash.options);
-    let env = CmdEnv {
+    let env = CmdEnv::new(
         app,
         ctx,
-        cmd: &cmd,
+        &cmd,
         guild_id,
-        channel_id: slash.channel_id,
-        actor: actor_id,
-        actor_member: member,
-        args: Args::from_parts(arg_parts),
+        slash.channel_id,
+        actor_id,
+        member,
+        Args::from_parts(arg_parts),
         dm,
-        source_message: None,
-    };
+        None,
+    );
     match run_command(env).await {
         Ok(outcome) => {
             if deliver_slash_success(&app.activation, &ctx.http, &slash, deferred, &cmd, &outcome)

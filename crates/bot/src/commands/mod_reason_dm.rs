@@ -1,6 +1,5 @@
 //! Optional moderator reason DM before kick or ban.
 
-use anyhow::{Result, anyhow};
 use serenity::model::id::UserId;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -15,6 +14,7 @@ pub(crate) const MOD_REASON_DM_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) enum ModReasonDmOutcome {
     Sent,
     NotSent,
+    Uncertain,
     Cancelled,
 }
 
@@ -51,7 +51,7 @@ where
 {
     match tokio::time::timeout(MOD_REASON_DM_TIMEOUT, future).await {
         Ok(outcome) => outcome,
-        Err(_) => ModReasonDmOutcome::NotSent,
+        Err(_) => ModReasonDmOutcome::Uncertain,
     }
 }
 
@@ -73,22 +73,28 @@ pub(crate) fn render_mod_reason_dm_body(vars: &BTreeMap<String, String>) -> Stri
     jmodguard::templates::render_bounded(jmodguard::defaults::MOD_REASON_DM_TEMPLATE, vars, 2000)
 }
 
+/// Production DM text preparation: strips ban attempt tags before render.
+pub(crate) fn render_mod_reason_dm_body_for_reason(
+    guild: &str,
+    action: &str,
+    reason: &str,
+    actor: &str,
+) -> String {
+    let clean = jmodguard::ban_reason::without_tag(reason);
+    let vars = mod_reason_dm_vars(guild, action, clean, actor);
+    render_mod_reason_dm_body(&vars)
+}
+
 pub(crate) fn render_mod_reason_dm_clause(outcome: ModReasonDmOutcome) -> String {
     let status = match outcome {
         ModReasonDmOutcome::Sent => jmodguard::defaults::MOD_REASON_DM_STATUS_SENT,
         ModReasonDmOutcome::NotSent => jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT,
+        ModReasonDmOutcome::Uncertain => jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN,
         ModReasonDmOutcome::Cancelled => return String::new(),
     };
     let mut vars = BTreeMap::new();
     vars.insert("dm_status".into(), status.into());
     jmodguard::templates::render(jmodguard::defaults::MOD_REASON_DM_CLAUSE_TEMPLATE, &vars)
-}
-
-pub(crate) fn dm_outcome_allows_moderation(outcome: ModReasonDmOutcome) -> Result<()> {
-    if outcome == ModReasonDmOutcome::Cancelled {
-        return Err(anyhow!("writer lease is not held"));
-    }
-    Ok(())
 }
 
 pub(crate) async fn send_mod_reason_dm(
@@ -113,14 +119,13 @@ async fn send_mod_reason_dm_inner(
         .map(|g| g.name.clone())
         .unwrap_or_else(|| env.guild_id.to_string());
     let actor = format!("{} (<@{}>)", env.actor_member.display_name(), env.actor);
-    let vars = mod_reason_dm_vars(&guild, action, reason, &actor);
-    let text = render_mod_reason_dm_body(&vars);
+    let text = render_mod_reason_dm_body_for_reason(&guild, action, reason, &actor);
 
     let channel = match crate::discord::race_discord_call(
         &env.app.activation,
         env.ctx
             .http
-            .create_private_channel(&serde_json::json!({"recipient_id": target.get()})),
+            .create_private_channel(&serde_json::json!({"recipient_id": target.to_string()})),
     )
     .await
     {
@@ -183,42 +188,16 @@ mod tests {
     }
 
     #[test]
-    fn without_tag_strips_attempt_marker_before_dm_render() {
-        let vars = mod_reason_dm_vars(
-            "Guild",
-            "ban",
-            jmodguard::ban_reason::without_tag("[jmg:0123456789abcdef0123] secret"),
-            "Mod",
-        );
-        let body = render_mod_reason_dm_body(&vars);
+    fn production_dm_render_strips_ban_attempt_tag() {
+        let tag = jmodguard::ban_reason::BanAttemptTag::new();
+        let reason = jmodguard::ban_reason::discord_reason("secret", Some(&tag));
+        let body = render_mod_reason_dm_body_for_reason("Guild", "ban", &reason, "Mod");
         assert!(!body.contains("[jmg:"));
         assert!(body.contains("secret"));
     }
 
-    fn try_moderation(dm: ModReasonDmOutcome, ban_calls: &mut u32) -> Result<()> {
-        dm_outcome_allows_moderation(dm)?;
-        *ban_calls += 1;
-        Ok(())
-    }
-
     #[test]
-    fn dm_outcome_decision_table() {
-        let mut ban_calls = 0u32;
-        assert!(try_moderation(ModReasonDmOutcome::Cancelled, &mut ban_calls).is_err());
-        assert_eq!(ban_calls, 0);
-
-        for outcome in [ModReasonDmOutcome::NotSent, ModReasonDmOutcome::Sent] {
-            ban_calls = 0;
-            assert!(try_moderation(outcome, &mut ban_calls).is_ok());
-            assert_eq!(ban_calls, 1);
-            ban_calls = 0;
-            assert!(try_moderation(outcome, &mut ban_calls).is_ok());
-            assert_eq!(ban_calls, 1, "second command is separate, not a retry");
-        }
-    }
-
-    #[test]
-    fn dm_clause_renders_sent_and_not_sent() {
+    fn dm_clause_renders_sent_not_sent_and_uncertain() {
         assert!(
             render_mod_reason_dm_clause(ModReasonDmOutcome::Sent)
                 .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT,)
@@ -226,6 +205,10 @@ mod tests {
         assert!(
             render_mod_reason_dm_clause(ModReasonDmOutcome::NotSent)
                 .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_NOT_SENT,)
+        );
+        assert!(
+            render_mod_reason_dm_clause(ModReasonDmOutcome::Uncertain)
+                .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_UNCERTAIN,)
         );
         assert!(render_mod_reason_dm_clause(ModReasonDmOutcome::Cancelled).is_empty());
     }
@@ -255,13 +238,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn slow_dm_future_times_out_as_not_sent() {
+    async fn slow_dm_future_times_out_as_uncertain() {
         let outcome = bounded_mod_reason_dm_future(async {
             tokio::time::sleep(MOD_REASON_DM_TIMEOUT + Duration::from_millis(250)).await;
             ModReasonDmOutcome::Sent
         })
         .await;
-        assert_eq!(outcome, ModReasonDmOutcome::NotSent);
+        assert_eq!(outcome, ModReasonDmOutcome::Uncertain);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

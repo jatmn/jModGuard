@@ -491,6 +491,10 @@ pub const MOD_REASON_DM_TEMPLATE: &str =
 pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";
 pub const MOD_REASON_DM_STATUS_SENT: &str = "Reason DM sent.";
 pub const MOD_REASON_DM_STATUS_NOT_SENT: &str = "Reason DM not sent.";
+pub const MOD_REASON_DM_STATUS_UNCERTAIN: &str = "Reason DM delivery uncertain.";
+
+/// User-facing error when kick/ban targets the bot itself.
+pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{command}`.";
 
 /// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
 ///
