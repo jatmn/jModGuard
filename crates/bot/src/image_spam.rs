@@ -40,6 +40,8 @@ struct Post {
     serial: u64,
     at: Instant,
     files: Vec<Attachment>,
+    /// Captured with this physical observation, never looked up from a later stage.
+    burst_ids: Vec<(u64, u64)>,
     /// Distinct computed hashes; no image bytes are retained.
     hashes: Option<Vec<Hash>>,
     valid: bool,
@@ -271,6 +273,7 @@ struct Job {
     author: u64,
     token: (u64, u64),
     posts: Vec<Post>,
+    burst_ids: Vec<(u64, u64)>,
 }
 #[derive(Debug, Clone, PartialEq)]
 enum AnalysisGate {
@@ -292,7 +295,10 @@ enum AnalysisGate {
         status: u16,
     },
     ContentEncoding,
-    SizeMismatch,
+    SizeMismatch {
+        declared: u64,
+        received: u64,
+    },
     Timeout {
         timeout_secs: u64,
         elapsed_ms: u64,
@@ -313,7 +319,7 @@ impl AnalysisGate {
                 bytes,
                 byte_limit,
             } => format!(
-                "Stopped at the process request budget ({requests}/{request_limit} requests, {bytes}/{byte_limit} bytes)."
+                "Stopped at the process budget ({requests}/{request_limit} requests, {bytes}/{byte_limit} bytes)."
             ),
             Self::GuildBudget {
                 requests,
@@ -331,9 +337,9 @@ impl AnalysisGate {
             Self::ContentEncoding => {
                 "Stopped because the response was content-encoded.".to_string()
             }
-            Self::SizeMismatch => {
-                "Stopped because the body length did not match the declared size.".to_string()
-            }
+            Self::SizeMismatch { declared, received } => format!(
+                "Stopped because the body length did not match the declared size (declared {declared}, received {received})."
+            ),
             Self::Timeout {
                 timeout_secs,
                 elapsed_ms,
@@ -353,7 +359,7 @@ impl AnalysisGate {
             Self::AuthorBudget { .. } => "author_budget",
             Self::HttpStatus { .. } => "http_status",
             Self::ContentEncoding => "content_encoding",
-            Self::SizeMismatch => "size_mismatch",
+            Self::SizeMismatch { .. } => "size_mismatch",
             Self::Timeout { .. } => "timeout",
             Self::Transport => "transport",
             Self::BodyRead => "body_read",
@@ -421,6 +427,21 @@ impl Detector {
     #[cfg(test)]
     pub(crate) fn process_budget_requests(&self) -> u64 {
         self.state.lock().budget.requests
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_budget_bytes(&self) -> u64 {
+        self.state.lock().budget.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guild_budget_requests(&self, guild: u64) -> u64 {
+        self.state
+            .lock()
+            .guilds
+            .get(&guild)
+            .map(|guild| guild.budget.requests)
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -802,6 +823,7 @@ impl Detector {
             return AdmitOutcome::Rejected;
         }
         post.cost = 256
+            + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
             + post
                 .files
                 .iter()
@@ -1176,6 +1198,10 @@ fn candidate_job(
         return None;
     }
     Some(Job {
+        burst_ids: posts
+            .iter()
+            .flat_map(|post| post.burst_ids.iter().copied())
+            .collect(),
         guild,
         author,
         token,
@@ -1219,6 +1245,7 @@ fn replace_existing(
     state.bytes = state.bytes.saturating_sub(old.cost);
     old.serial = serial;
     old.files = post.files.clone();
+    old.burst_ids = post.burst_ids.clone();
     old.hashes = None;
     old.at = post.at;
     old.edited_ms = post.edited_ms;
@@ -1226,6 +1253,7 @@ fn replace_existing(
     old.valid = true;
     old.own_delete = Weak::new();
     old.cost = 256
+        + post.burst_ids.len() * std::mem::size_of::<(u64, u64)>()
         + post
             .files
             .iter()
@@ -1272,16 +1300,19 @@ fn spawn_image_job(
     job: Job,
     policy: Policy,
     channel: u64,
-) {
+    burst: &mut crate::attachment_burst::Handoff,
+) -> bool {
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
         detector.capacity_drop();
-        return;
+        return false;
     };
+    burst.hand_to_job();
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
         run_job(&app, &ctx, job, policy, channel, permit).await;
     });
+    true
 }
 
 fn live(p: &Post, policy: &Policy, now: Instant) -> bool {
@@ -1423,6 +1454,98 @@ fn is_image_attachment(
     }
 }
 
+const BURST_FILES: usize = 10;
+
+fn burst_files(
+    attachments: &[serenity::model::channel::Attachment],
+) -> Vec<crate::attachment_burst::FileMeta> {
+    let mut files = Vec::new();
+    for attachment in attachments {
+        if files.len() >= BURST_FILES {
+            break;
+        }
+        if attachment.size == 0 {
+            continue;
+        }
+        if !is_image_attachment(
+            attachment.width.is_some(),
+            attachment.height.is_some(),
+            attachment.content_type.as_deref(),
+            &attachment.filename,
+        ) {
+            continue;
+        }
+        if files
+            .iter()
+            .any(|file: &crate::attachment_burst::FileMeta| {
+                file.attachment_id == attachment.id.get()
+            })
+        {
+            continue;
+        }
+        files.push(crate::attachment_burst::FileMeta {
+            attachment_id: attachment.id.get(),
+            size: u64::from(attachment.size),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone().unwrap_or_default(),
+        });
+    }
+    files
+}
+
+fn burst_instant(
+    received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
+    occurred_ms: i64,
+    window_secs: u64,
+) -> Option<Instant> {
+    let age_ms = received_at.timestamp_millis() - occurred_ms;
+    if age_ms < 0 || age_ms as u64 > window_secs.saturating_mul(1000) {
+        return None;
+    }
+    received.checked_sub(Duration::from_millis(age_ms as u64))
+}
+
+fn burst_handoff(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    place: (u64, u64, u64, u64),
+    attachments: &[serenity::model::channel::Attachment],
+    occurred_ms: i64,
+    received: Instant,
+    admission: (chrono::DateTime<chrono::Utc>, u64, Option<i64>),
+) -> crate::attachment_burst::Handoff {
+    let (guild, author, channel, message) = place;
+    if !app.attachment_burst.accepts() {
+        return crate::attachment_burst::Handoff::inert();
+    }
+    let at = burst_instant(
+        received,
+        admission.0,
+        occurred_ms,
+        app.attachment_burst.window_secs(),
+    );
+    let files = burst_files(attachments);
+    crate::attachment_burst::Handoff::stage_at(
+        app,
+        ctx,
+        crate::attachment_burst::Sighting {
+            guild,
+            author,
+            channel,
+            message,
+            at: at.unwrap_or(received),
+        },
+        files,
+        crate::attachment_burst::Admission {
+            revision: admission.1,
+            edited_ms: admission.2,
+            received,
+            eligible: at.is_some(),
+        },
+    )
+}
+
 /// Called before the generic automod bot-author exemption. Unknown membership and
 /// webhooks are skipped; no privileged role/bot exemption is inferred.
 pub fn observe(
@@ -1432,12 +1555,35 @@ pub fn observe(
     msg: &Message,
     received: Instant,
     received_at: chrono::DateTime<chrono::Utc>,
-    revision: u64,
+    revisions: (u64, u64),
 ) {
+    let (revision, burst_revision) = revisions;
     let Some(guild) = msg.guild_id else { return };
     if msg.author.id == ctx.cache.current_user().id || msg.webhook_id.is_some() {
         return;
     }
+    let mut burst = if msg.edited_timestamp.is_some() || burst_files(&msg.attachments).is_empty() {
+        crate::attachment_burst::Handoff::inert()
+    } else {
+        burst_handoff(
+            app,
+            ctx,
+            (
+                guild.get(),
+                msg.author.id.get(),
+                msg.channel_id.get(),
+                msg.id.get(),
+            ),
+            &msg.attachments,
+            msg.timestamp.timestamp_millis(),
+            received,
+            (
+                received_at,
+                burst_revision,
+                Some(msg.timestamp.timestamp_millis()),
+            ),
+        )
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         return;
     };
@@ -1512,6 +1658,7 @@ pub fn observe(
             channel: msg.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -1532,8 +1679,16 @@ pub fn observe(
         msg.channel_id.get(),
         msg.id.get(),
         false,
+    ) && !spawn_image_job(
+        app,
+        ctx,
+        detector,
+        job,
+        policy,
+        msg.channel_id.get(),
+        &mut burst,
     ) {
-        spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
+        burst.finish_incomplete();
     }
 }
 
@@ -1543,8 +1698,9 @@ pub(crate) fn observe_update(
     cfg: &CachedGuildConfig,
     event: &MessageUpdateEvent,
     update: &crate::handlers::UpdateObservation,
-    revision: u64,
+    revisions: (u64, u64),
 ) {
+    let (revision, burst_revision) = revisions;
     let Some(guild) = event.guild_id else { return };
     if matches!(event.webhook_id, Some(Some(_))) {
         return;
@@ -1555,6 +1711,38 @@ pub(crate) fn observe_update(
     let channel = event.channel_id.get();
     let message = event.id.get();
     let guild_id = guild.get();
+    let mut burst = if let Some(author) = update
+        .author
+        .or_else(|| app.attachment_burst.author_of(guild_id, channel, message))
+        .filter(|author| *author != ctx.cache.current_user().id.get())
+    {
+        let occurred_ms = event
+            .edited_timestamp
+            .map(|stamp| stamp.timestamp_millis())
+            .unwrap_or_else(|| update.received_at.timestamp_millis());
+        burst_handoff(
+            app,
+            ctx,
+            (guild_id, author, channel, message),
+            attachments,
+            occurred_ms,
+            update.received,
+            (
+                update.received_at,
+                burst_revision,
+                event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
+            ),
+        )
+    } else {
+        app.attachment_burst.invalidate_message_at(
+            guild_id,
+            channel,
+            message,
+            false,
+            event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
+        );
+        crate::attachment_burst::Handoff::inert()
+    };
     let Some(rule) = cfg.rules.get("attachment_flood") else {
         app.image_spam.invalidate(guild_id, channel, message);
         return;
@@ -1645,6 +1833,7 @@ pub(crate) fn observe_update(
             channel: event.channel_id.get(),
             serial: 0,
             at,
+            burst_ids: burst.observations(),
             files,
             hashes: None,
             valid: true,
@@ -1658,8 +1847,18 @@ pub(crate) fn observe_update(
         update.received,
         true,
     );
-    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
-        spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get());
+    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true)
+        && !spawn_image_job(
+            app,
+            ctx,
+            detector,
+            job,
+            policy,
+            event.channel_id.get(),
+            &mut burst,
+        )
+    {
+        burst.finish_incomplete();
     }
 }
 
@@ -1673,7 +1872,12 @@ fn analysis_gate_from_download(
         DownloadError::BodyRead => AnalysisGate::BodyRead,
         DownloadError::HttpStatus(status) => AnalysisGate::HttpStatus { status },
         DownloadError::ContentEncoding => AnalysisGate::ContentEncoding,
-        DownloadError::SizeMismatch => AnalysisGate::SizeMismatch,
+        DownloadError::SizeMismatch {
+            declared, received, ..
+        } => AnalysisGate::SizeMismatch { declared, received },
+        DownloadError::ByteAllowance { .. } => {
+            unreachable!("byte admission returns its captured process-budget gate");
+        }
         DownloadError::Capture => {
             unreachable!("in-memory exact-image hashing does not write a capture file");
         }
@@ -1757,10 +1961,16 @@ fn warn_incomplete_analysis(gate: &AnalysisGate, guild: u64, author: u64) {
             elapsed_ms,
             sentence
         ),
-        AnalysisGate::ContentEncoding
-        | AnalysisGate::SizeMismatch
-        | AnalysisGate::Transport
-        | AnalysisGate::BodyRead => {
+        AnalysisGate::SizeMismatch { declared, received } => tracing::warn!(
+            gate = gate_name,
+            scope,
+            guild_id = guild,
+            author_id = author,
+            declared_size = declared,
+            received_size = received,
+            sentence
+        ),
+        AnalysisGate::ContentEncoding | AnalysisGate::Transport | AnalysisGate::BodyRead => {
             tracing::warn!(
                 gate = gate_name,
                 scope,
@@ -1772,6 +1982,225 @@ fn warn_incomplete_analysis(gate: &AnalysisGate, guild: u64, author: u64) {
     }
 }
 
+enum RetryAdmit {
+    Ready,
+    Miss(AnalysisGate),
+    Stale,
+}
+
+enum ExactCheckFailure {
+    Download(DownloadError),
+    Gate(AnalysisGate),
+}
+
+#[derive(Clone, Copy)]
+struct DownloadAccount {
+    guild: u64,
+    author: u64,
+    token: (u64, u64),
+}
+
+impl Detector {
+    fn process_budget_gate_locked(budget: &Budget, limits: &Limits) -> AnalysisGate {
+        AnalysisGate::ProcessBudget {
+            requests: budget.requests,
+            request_limit: limits.requests_per_minute,
+            bytes: budget.bytes,
+            byte_limit: limits.bytes_per_minute,
+        }
+    }
+
+    /// Admit one extra GET in the current budget window. Request capacity is
+    /// charged only when the byte budget can cover a non-empty body.
+    fn admit_exact_retry(&self, account: DownloadAccount) -> RetryAdmit {
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        if !state.budget.fits(
+            now,
+            1,
+            0,
+            self.limits.requests_per_minute,
+            self.limits.bytes_per_minute,
+        ) {
+            return RetryAdmit::Miss(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        let spare = self
+            .limits
+            .bytes_per_minute
+            .saturating_sub(state.budget.bytes);
+        let Some(guild) = state.guilds.get_mut(&account.guild) else {
+            return RetryAdmit::Stale;
+        };
+        if !guild
+            .budget
+            .fits(now, 1, 0, self.limits.requests_per_guild_minute, u64::MAX)
+        {
+            return RetryAdmit::Miss(AnalysisGate::GuildBudget {
+                requests: guild.budget.requests,
+                request_limit: self.limits.requests_per_guild_minute,
+            });
+        }
+        let Some(author) = guild.authors.get_mut(&account.author) else {
+            return RetryAdmit::Stale;
+        };
+        if author.token != account.token {
+            return RetryAdmit::Stale;
+        }
+        if !author
+            .budget
+            .fits(now, 1, 0, self.limits.requests_per_author_minute, u64::MAX)
+        {
+            return RetryAdmit::Miss(AnalysisGate::AuthorBudget {
+                requests: author.budget.requests,
+                request_limit: self.limits.requests_per_author_minute,
+            });
+        }
+        if spare == 0 || self.limits.max_file_bytes == 0 {
+            return RetryAdmit::Miss(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        author.budget.charge(1, 0);
+        guild.budget.charge(1, 0);
+        state.budget.charge(1, 0);
+        RetryAdmit::Ready
+    }
+
+    fn charge_downloaded_bytes(
+        &self,
+        bytes: u64,
+        account: DownloadAccount,
+    ) -> Result<(), AnalysisGate> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        if !state.budget.fits(
+            now,
+            0,
+            bytes,
+            self.limits.requests_per_minute,
+            self.limits.bytes_per_minute,
+        ) {
+            return Err(Self::process_budget_gate_locked(
+                &state.budget,
+                &self.limits,
+            ));
+        }
+        state.budget.charge(0, bytes);
+        if let Some(guild) = state.guilds.get_mut(&account.guild) {
+            if guild.budget.fits(
+                now,
+                0,
+                bytes,
+                self.limits.requests_per_guild_minute,
+                u64::MAX,
+            ) {
+                guild.budget.charge(0, bytes);
+            }
+            if let Some(author) = guild.authors.get_mut(&account.author)
+                && author.token == account.token
+                && author.budget.fits(
+                    now,
+                    0,
+                    bytes,
+                    self.limits.requests_per_author_minute,
+                    u64::MAX,
+                )
+            {
+                author.budget.charge(0, bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Declared bytes were charged when the job was reserved. Charge each chunk's
+/// excess in the current window under the process budget lock before hashing.
+/// Consumed capacity therefore survives stream failure, timeout and cancellation.
+fn admit_stream_bytes<'a>(
+    detector: &'a Detector,
+    account: DownloadAccount,
+    mut prepaid: u64,
+    denied: &'a mut Option<AnalysisGate>,
+) -> impl FnMut(u64) -> bool + 'a {
+    move |bytes| {
+        let covered = bytes.min(prepaid);
+        if let Err(gate) = detector.charge_downloaded_bytes(bytes - covered, account) {
+            // Keep the denial-time totals even if another job renews or charges
+            // the process window before this attempt's error is reported.
+            *denied = Some(gate);
+            return false;
+        }
+        prepaid -= covered;
+        true
+    }
+}
+
+/// Hash one exact-check attachment. A body that ends short of the declared size
+/// is fetched once more when process, guild, and author request budgets and the
+/// process byte budget admit that GET. Oversized bodies and every other download
+/// error are not retried. The hash is streamed; image bytes are not retained.
+async fn hash_for_exact_check(
+    detector: &Detector,
+    account: DownloadAccount,
+    file: &Attachment,
+    timeout: Duration,
+) -> Result<Hash, ExactCheckFailure> {
+    let max_file_bytes = detector.limits.max_file_bytes;
+    let mut denied = None;
+    match detector
+        .hasher()
+        .hash(
+            file,
+            timeout,
+            max_file_bytes,
+            admit_stream_bytes(detector, account, file.size, &mut denied),
+        )
+        .await
+    {
+        Ok((hash, _)) => Ok(hash),
+        Err(error) if error.is_retryable_size_mismatch() => {
+            retry_exact_check(detector, account, file, timeout, error).await
+        }
+        Err(error) => {
+            Err(denied.map_or(ExactCheckFailure::Download(error), ExactCheckFailure::Gate))
+        }
+    }
+}
+
+async fn retry_exact_check(
+    detector: &Detector,
+    account: DownloadAccount,
+    file: &Attachment,
+    timeout: Duration,
+    truncated: DownloadError,
+) -> Result<Hash, ExactCheckFailure> {
+    let max_file_bytes = detector.limits.max_file_bytes;
+    match detector.admit_exact_retry(account) {
+        RetryAdmit::Ready => {}
+        RetryAdmit::Miss(gate) => return Err(ExactCheckFailure::Gate(gate)),
+        RetryAdmit::Stale => return Err(ExactCheckFailure::Download(truncated)),
+    }
+    let mut denied = None;
+    detector
+        .hasher()
+        .hash(
+            file,
+            timeout,
+            max_file_bytes,
+            admit_stream_bytes(detector, account, 0, &mut denied),
+        )
+        .await
+        .map(|(hash, _)| hash)
+        .map_err(|error| denied.map_or(ExactCheckFailure::Download(error), ExactCheckFailure::Gate))
+}
+
 async fn run_job(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1780,6 +2209,8 @@ async fn run_job(
     channel: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let pending_burst =
+        crate::attachment_burst::PendingBurst::new(app, ctx, std::mem::take(&mut job.burst_ids));
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
     let started = Instant::now();
@@ -1798,17 +2229,30 @@ async fn run_job(
     if !failed {
         // One whole job deadline, not a fresh unbounded deadline per attachment.
         let outcome = tokio::time::timeout(job_timeout, async {
+            let account = DownloadAccount {
+                guild: job.guild,
+                author: job.author,
+                token: job.token,
+            };
             for post in &mut job.posts {
-                if post.hashes.is_some() {
+                if let Some(hashes) = post.hashes.clone() {
+                    pending_burst.resolve_cached(&post.files, &hashes);
                     continue;
                 }
                 let mut unique = BTreeSet::new();
                 for file in &post.files {
-                    match detector.hasher.hash(file, job_timeout).await {
-                        Ok(hash) => unique.insert(hash),
-                        Err(error) => {
+                    match hash_for_exact_check(detector, account, file, job_timeout).await {
+                        Ok(hash) => {
+                            pending_burst.resolve_hash(file.id, hash);
+                            unique.insert(hash);
+                        }
+                        Err(ExactCheckFailure::Download(error)) => {
                             job_gate = analysis_gate_from_download(error, timeout_secs, started);
-                            return Err(error);
+                            return Err(());
+                        }
+                        Err(ExactCheckFailure::Gate(gate)) => {
+                            job_gate = gate;
+                            return Err(());
                         }
                     };
                 }
@@ -1819,7 +2263,7 @@ async fn run_job(
         .await;
         failed = match outcome {
             Ok(Ok(())) => false,
-            Ok(Err(_)) => true,
+            Ok(Err(())) => true,
             Err(_) => {
                 job_gate = AnalysisGate::Timeout {
                     timeout_secs,
@@ -2134,6 +2578,7 @@ mod tests {
             own_delete: Weak::new(),
             cost: 0,
             revision: 0,
+            burst_ids: Vec::new(),
             files: values
                 .iter()
                 .enumerate()
@@ -2203,6 +2648,7 @@ mod tests {
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         first.edited_ms = 1;
+        first.burst_ids = vec![(1, 10), (2, 11)];
         assert!(matches!(
             d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted
@@ -2222,6 +2668,7 @@ mod tests {
         changed.edited_ms = 9;
         changed.revision = d.revision();
         changed.hashes = None;
+        changed.burst_ids = vec![(50, 20), (51, 21)];
         changed.files = vec![
             Attachment::new(
                 10,
@@ -2246,6 +2693,7 @@ mod tests {
         ));
         let stored = &d.state.lock().guilds[&1].authors[&2].posts[0];
         assert_eq!(file_key(stored), vec![(50, 3), (51, 3)]);
+        assert_eq!(stored.burst_ids, vec![(50, 20), (51, 21)]);
         assert!(stored.hashes.is_none());
         assert_eq!(stored.at, now + Duration::from_secs(2));
     }
@@ -3209,6 +3657,7 @@ mod tests {
         let Report::Verified(image_match) = complete_report(
             &detector,
             Job {
+                burst_ids: Vec::new(),
                 guild: 1,
                 author: 2,
                 token: (0, 0),
@@ -3229,6 +3678,7 @@ mod tests {
         assert_eq!(
             detector.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -3424,6 +3874,181 @@ mod tests {
         drop(runner);
         drop(socket);
         ctx
+    }
+
+    #[tokio::test]
+    async fn observe_records_the_same_image_across_two_channels() {
+        let path = std::env::temp_dir().join(format!(
+            "attachment_burst_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = crate::state::BotState::new(
+            jmodguard::config::BotProcessConfig::default(),
+            crate::db::Db::open(&path, 2).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
+        let cfg = crate::state::CachedGuildConfig {
+            version: 0,
+            durable_version: 0,
+            loaded_at: Instant::now(),
+            settings: crate::types::GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
+        let post = |channel: u64, message: u64, attachment: u64| {
+            let mut msg = serenity::model::channel::Message::default();
+            msg.id = serenity::model::id::MessageId::new(message);
+            msg.channel_id = serenity::model::id::ChannelId::new(channel);
+            msg.guild_id = Some(serenity::model::id::GuildId::new(1));
+            msg.author.id = serenity::model::id::UserId::new(author);
+            msg.timestamp = serenity::model::timestamp::Timestamp::now();
+            msg.attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": attachment.to_string(),
+                    "filename": "spam.png",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                    "width": 8,
+                    "height": 8,
+                    "content_type": "image/png"
+                }))
+                .unwrap(),
+            ];
+            msg
+        };
+        let now = Instant::now();
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 0);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(11, 101, 1001),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        let event = serde_json::from_value(serde_json::json!({
+            "id": "101",
+            "channel_id": "11",
+            "guild_id": "1",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339(),
+            "attachments": [{
+                "id": "1001",
+                "filename": "spam.png",
+                "size": 42,
+                "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                "width": 8,
+                "height": 8,
+                "content_type": "image/png"
+            }]
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &event,
+            &crate::handlers::UpdateObservation {
+                author: Some(author),
+                received: now,
+                received_at: chrono::Utc::now(),
+            },
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(app.attachment_burst.hits(), 1);
+        tokio::task::yield_now().await;
+        // This author-less edit has no exact-image or text candidate and no
+        // logging snippet; burst must use its own physical-message identity.
+        assert!(app.image_spam.author_of(1, 11, 101).is_none());
+        assert!(app.text_spam.author_of(1, 11, 101).is_none());
+        let removed = serde_json::from_value(serde_json::json!({
+            "id": "101", "channel_id": "11", "guild_id": "1",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339(), "attachments": []
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &removed,
+            &crate::handlers::UpdateObservation {
+                author: None,
+                received: now,
+                received_at: chrono::Utc::now(),
+            },
+            (1, app.attachment_burst.revision()),
+        );
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(12, 102, 1002),
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            2,
+            "attachment removal clears the old hit latch"
+        );
+        let mut ordinary = post(13, 103, 1003);
+        ordinary.attachments.clear();
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &ordinary,
+            now,
+            chrono::Utc::now(),
+            (1, app.attachment_burst.revision()),
+        );
+        assert!(
+            app.attachment_burst.author_of(1, 13, 103).is_none(),
+            "ordinary creates do not acquire burst metadata"
+        );
+        drop(app);
+        jmodguard::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     async fn image_dispatch_race(
@@ -4343,6 +4968,7 @@ mod tests {
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let stored = posts[0].hashes.clone().expect("admission stored hashes");
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -4361,6 +4987,7 @@ mod tests {
         );
         assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
         let failed_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -4428,7 +5055,7 @@ mod tests {
         let vars = report_vars(Report::Unverified(gate), 2, 100, &policy());
         let notice = automod_notice(&vars);
         assert!(notice.contains("Exact image check incomplete"));
-        assert!(notice.contains("Stopped at the process request budget"));
+        assert!(notice.contains("Stopped at the process budget"));
         assert!(!notice.contains("Verified identical image bytes"));
         assert!(!notice.contains("log only"));
         assert!(!notice.contains("http"));
@@ -4630,6 +5257,7 @@ mod tests {
 
     struct LoopbackFixture {
         hits: Arc<std::sync::atomic::AtomicUsize>,
+        first_response_gate: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         task: tokio::task::JoinHandle<()>,
         addr: std::net::SocketAddr,
         body_read_hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -4652,6 +5280,7 @@ mod tests {
             let body_read_addr = body_read_listener.local_addr().unwrap();
             body_read_listener.set_nonblocking(true).unwrap();
             let body_read_task = tokio::spawn(async move {
+                let mut retry_hits = 0;
                 let listener = TcpListener::from_std(body_read_listener).unwrap();
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -4660,23 +5289,71 @@ mod tests {
                     body_read_seen.fetch_add(1, Ordering::SeqCst);
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf).await;
-                    let response =
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
-                    let _ = stream.write_all(response).await;
+                    let request = String::from_utf8_lossy(&buf);
+                    if request.contains("partial") || request.contains("pending") {
+                        if request.contains("retry") {
+                            retry_hits += 1;
+                            if retry_hits == 1 {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab",
+                                ).await;
+                                continue;
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nabcdefgh\r\n",
+                        ).await;
+                        // Deliver a valid chunk before failing or holding the body open.
+                        tokio::time::sleep(if request.contains("pending") {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::from_millis(50)
+                        })
+                        .await;
+                        if request.contains("cap") {
+                            let _ = stream.write_all(b"1\r\ni\r\n0\r\n\r\n").await;
+                        }
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab",
+                        ).await;
+                    }
                     let _ = stream.shutdown().await;
                 }
             });
             let hits = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&hits);
+            let retry0 = Arc::new(AtomicUsize::new(0));
+            let retry1 = Arc::new(AtomicUsize::new(0));
+            let concurrent = Arc::new(tokio::sync::Barrier::new(2));
+            let concurrent_retries = Arc::new(AtomicUsize::new(0));
+            let first_response_gate = Arc::new(Mutex::new(None::<Arc<tokio::sync::Barrier>>));
+            let response_gate = Arc::clone(&first_response_gate);
             let server =
                 Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(move |_| {
                     let hits = Arc::clone(&seen);
+                    let retry0 = Arc::clone(&retry0);
+                    let retry1 = Arc::clone(&retry1);
+                    let concurrent = Arc::clone(&concurrent);
+                    let concurrent_retries = Arc::clone(&concurrent_retries);
+                    let response_gate = Arc::clone(&response_gate);
                     async move {
                         Ok::<_, std::convert::Infallible>(service_fn(
                             move |request: hyper::Request<Body>| {
                                 hits.fetch_add(1, Ordering::SeqCst);
+                                let path = request.uri().path().to_string();
+                                let retry0 = Arc::clone(&retry0);
+                                let retry1 = Arc::clone(&retry1);
+                                let concurrent = Arc::clone(&concurrent);
+                                let concurrent_retries = Arc::clone(&concurrent_retries);
+                                let response_gate = Arc::clone(&response_gate);
                                 async move {
-                                    let response = match request.uri().path() {
+                                    let gate = response_gate.lock().take();
+                                    if let Some(gate) = gate {
+                                        gate.wait().await;
+                                        gate.wait().await;
+                                    }
+                                    let response = match path.as_str() {
                                         "/too_many" => Response::builder()
                                             .status(429)
                                             .body(Body::empty())
@@ -4694,11 +5371,42 @@ mod tests {
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                             Response::new(Body::from("abc"))
                                         }
+                                        "/concurrent_long" => {
+                                            concurrent.wait().await;
+                                            Response::new(Body::from("abcdefgh"))
+                                        }
+                                        "/concurrent_retry" => {
+                                            if concurrent_retries.fetch_add(1, Ordering::SeqCst) < 2
+                                            {
+                                                concurrent.wait().await;
+                                                Response::new(Body::from("ab"))
+                                            } else {
+                                                concurrent.wait().await;
+                                                Response::new(Body::from("abcde"))
+                                            }
+                                        }
                                         "/short" => Response::new(Body::from("ab")),
                                         "/long" => Response::new(Body::from("abcd")),
+                                        "/long0" => Response::new(Body::from("aaaa")),
+                                        "/long1" => Response::new(Body::from("bbbb")),
+                                        "/retry0" => {
+                                            if retry0.fetch_add(1, Ordering::SeqCst) == 0 {
+                                                Response::new(Body::from("aa"))
+                                            } else {
+                                                Response::new(Body::from("aaa"))
+                                            }
+                                        }
+                                        "/retry1" => {
+                                            if retry1.fetch_add(1, Ordering::SeqCst) == 0 {
+                                                Response::new(Body::from("bb"))
+                                            } else {
+                                                Response::new(Body::from("bbb"))
+                                            }
+                                        }
                                         "/hash0" => Response::new(Body::from("aaa")),
                                         "/hash1" => Response::new(Body::from("bbb")),
                                         "/hash2" => Response::new(Body::from("ccc")),
+                                        "/hash3" => Response::new(Body::from("ddd")),
                                         _ => Response::new(Body::from("abc")),
                                     };
                                     Ok::<_, std::convert::Infallible>(response)
@@ -4714,6 +5422,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             Self {
                 hits,
+                first_response_gate,
                 task,
                 addr,
                 body_read_hits,
@@ -4816,6 +5525,23 @@ mod tests {
         }
     }
 
+    fn rewrite_job_downloads_pair(
+        job: &mut Job,
+        fixture: &LoopbackFixture,
+        size: u64,
+        even_path: &str,
+        odd_path: &str,
+    ) {
+        for post in &mut job.posts {
+            post.hashes = None;
+            for (index, file) in post.files.iter_mut().enumerate() {
+                file.size = size;
+                let path = if index % 2 == 0 { even_path } else { odd_path };
+                file.set_request_uri_str_for_test(&fixture.url(path));
+            }
+        }
+    }
+
     fn rewrite_job_downloads_shared_pair(job: &mut Job, fixture: &LoopbackFixture) {
         for post in &mut job.posts {
             post.hashes = None;
@@ -4883,6 +5609,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_image_job_cannot_consume_a_newer_burst_generation() {
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut old_job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        let post = &old_job.posts[0];
+        let file = &post.files[0];
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: post.channel,
+            message: post.id,
+            at: now,
+        };
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: file.id,
+            size: file.size,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut handoff =
+            crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        old_job.burst_ids = handoff.hand_to_job();
+        app.image_spam.invalidate(1, post.channel, post.id);
+        app.attachment_burst
+            .invalidate_message(1, post.channel, post.id, false);
+        app.attachment_burst.prepare_sighting(sighting, &[u64::MAX]);
+        let newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let new_generation = app.attachment_burst.staged_generation(file.id).unwrap();
+        let attachment_id = file.id;
+        let permit = app.image_spam.try_acquire_job_slot();
+        run_job(&app, &ctx, old_job, policy, 102, permit).await;
+        assert_eq!(
+            app.attachment_burst.staged_generation(attachment_id),
+            Some(new_generation),
+            "stale job must leave the replacement stage for its owner"
+        );
+        assert!(
+            app.attachment_burst
+                .resolve_hash_at(attachment_id, new_generation, [7; 32])
+                .is_none()
+        );
+        assert!(
+            app.attachment_burst
+                .staged_generation(attachment_id)
+                .is_none(),
+            "newer owner can settle its own hash"
+        );
+        drop(newer);
+    }
+
+    #[tokio::test]
+    async fn delayed_image_hash_cannot_consume_a_newer_burst_generation() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        rewrite_job_downloads(&mut job, &fixture.url("/hash0"), 3);
+        job.posts[0].files[0].set_request_uri_str_for_test(&fixture.url("/slow"));
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let sighting = crate::attachment_burst::Sighting {
+            guild: 1,
+            author: 2,
+            channel: job.posts[0].channel,
+            message: job.posts[0].id,
+            at: now,
+        };
+        let id = job.posts[0].files[0].id;
+        let meta = || crate::attachment_burst::FileMeta {
+            attachment_id: id,
+            size: 3,
+            filename: "spam.png".into(),
+            content_type: "image/png".into(),
+        };
+        let mut old = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        job.burst_ids = old.hand_to_job();
+        let task_app = Arc::clone(&app);
+        let task_ctx = ctx.clone();
+        let task = tokio::spawn(async move {
+            let permit = task_app.image_spam.try_acquire_job_slot();
+            run_job(&task_app, &task_ctx, job, policy, 102, permit).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.hit_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hash request started");
+        app.attachment_burst
+            .invalidate_message(1, sighting.channel, sighting.message, false);
+        app.attachment_burst.prepare_sighting(sighting, &[u64::MAX]);
+        let mut newer = crate::attachment_burst::Handoff::stage(&app, &ctx, sighting, vec![meta()]);
+        let generation = app.attachment_burst.staged_generation(id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.attachment_burst.staged_generation(id),
+            Some(generation),
+            "late hash must not resolve the replacement observation"
+        );
+        let owned = crate::attachment_burst::PendingBurst::new(&app, &ctx, newer.hand_to_job());
+        owned.resolve_hash(id, [7; 32]);
+        assert!(
+            app.attachment_burst.staged_generation(id).is_none(),
+            "replacement job retains ownership of its hash"
+        );
+    }
+
+    #[tokio::test]
     async fn run_job_notice_process_budget_gate() {
         let (app, policy, token) = image_run_job_test_app(Limits {
             requests_per_minute: 5,
@@ -4898,7 +5747,7 @@ mod tests {
             post.hashes = None;
         }
         let vars = run_job_capture_automod(&app, job, policy, 102).await;
-        assert_incomplete_automod(&vars, "Stopped at the process request budget");
+        assert_incomplete_automod(&vars, "Stopped at the process budget");
     }
 
     #[tokio::test]
@@ -4978,28 +5827,698 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn run_job_notice_short_body_gate() {
-        let fixture = LoopbackFixture::start();
-        run_incomplete_gate_case(
-            Limits::default(),
-            &fixture.url("/short"),
-            3,
-            "Stopped because the body length did not match the declared size.",
-        )
-        .await;
+    fn with_captured_logs<F>(future: F) -> String
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Clone for CapturedLog {
+            fn clone(&self) -> Self {
+                Self(Arc::clone(&self.0))
+            }
+        }
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturedLog(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(future);
+        });
+        String::from_utf8(buffer.lock().expect("log buffer").clone()).unwrap()
+    }
+
+    #[test]
+    fn concurrent_exact_streams_cannot_hash_against_the_same_spare_bytes() {
+        for retry in [false, true] {
+            let logs = with_captured_logs(async {
+                let fixture = LoopbackFixture::start();
+                let (app, policy, token) = image_run_job_test_app(Limits {
+                    bytes_per_minute: 41,
+                    ..Limits::default()
+                })
+                .await;
+                let now = Instant::now();
+                let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                rewrite_job_downloads(
+                    &mut job,
+                    &fixture.url(if retry {
+                        "/concurrent_retry"
+                    } else {
+                        "/concurrent_long"
+                    }),
+                    3,
+                );
+                // Two overlapping real reservations leave five spare process bytes.
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                assert_eq!(app.image_spam.process_budget_bytes(), 36);
+                let account = DownloadAccount {
+                    guild: 1,
+                    author: 2,
+                    token,
+                };
+                let file = &job.posts[0].files[0];
+                let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(
+                        hash_for_exact_check(
+                            &app.image_spam,
+                            account,
+                            file,
+                            Duration::from_secs(1)
+                        ),
+                        hash_for_exact_check(
+                            &app.image_spam,
+                            account,
+                            file,
+                            Duration::from_secs(1)
+                        ),
+                    )
+                })
+                .await
+                .expect("both synchronized responses must finish");
+                assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+                assert_eq!(app.image_spam.process_budget_bytes(), 41);
+                assert_eq!(fixture.hit_count(), if retry { 4 } else { 2 });
+            });
+            assert_eq!(
+                logs.matches("hashed a completed body").count(),
+                1,
+                "only exclusively admitted bytes may reach hashing; retry={retry}: {logs}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn run_job_notice_long_body_gate() {
+    async fn partial_exact_streams_keep_bytes_charged_after_failure_or_drop() {
+        for retry in [false, true] {
+            for ending in ["body_read", "cap", "timeout", "cancel"] {
+                let fixture = LoopbackFixture::start();
+                let (app, policy, token) = image_run_job_test_app(Limits {
+                    bytes_per_minute: 30,
+                    max_file_bytes: 8,
+                    ..Limits::default()
+                })
+                .await;
+                let now = Instant::now();
+                let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+                clear_stored_hashes(&app.image_spam);
+                let path = match ending {
+                    "body_read" => "partial",
+                    "cap" => "partial-cap",
+                    _ => "pending",
+                };
+                let uri = format!(
+                    "http://{}/{}{}",
+                    fixture.body_read_addr,
+                    if retry { "retry-" } else { "" },
+                    path
+                );
+                rewrite_job_downloads(&mut job, &uri, 3);
+                assert!(matches!(
+                    app.image_spam.reserve(&mut job, &policy, now),
+                    ReserveOutcome::Ok
+                ));
+                let account = DownloadAccount {
+                    guild: 1,
+                    author: 2,
+                    token,
+                };
+                let file = &job.posts[0].files[0];
+                let timeout = if ending == "timeout" {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(1)
+                };
+                let download = hash_for_exact_check(&app.image_spam, account, file, timeout);
+                if ending == "cancel" {
+                    // The whole-job deadline drops a live body future.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), download)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    let expected = match ending {
+                        "timeout" => DownloadError::Timeout,
+                        "cap" => DownloadError::SizeMismatch {
+                            declared: 3,
+                            received: 9,
+                            kind: jmodguard::image_spam::SizeMismatchKind::Rejected,
+                        },
+                        _ => DownloadError::BodyRead,
+                    };
+                    assert!(
+                        matches!(download.await, Err(ExactCheckFailure::Download(error)) if error == expected)
+                    );
+                }
+                assert_eq!(fixture.body_read_hit_count(), if retry { 2 } else { 1 });
+                assert_eq!(
+                    app.image_spam.process_budget_requests(),
+                    if retry { 7 } else { 6 }
+                );
+                assert_eq!(
+                    app.image_spam.process_budget_bytes(),
+                    if retry { 26 } else { 23 },
+                    "the admitted eight-byte chunk must stay charged: retry={retry}, ending={ending}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_job_notice_short_body_gate() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 2,
+                "a truncated body is fetched once more and then left unverified"
+            );
+            assert_incomplete_automod(
+                &vars,
+                "Stopped because the body length did not match the declared size",
+            );
+            assert!(
+                vars["content"].contains("declared 3") && vars["content"].contains("received 2"),
+                "{}",
+                vars["content"]
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 7);
+            assert_eq!(app.image_spam.process_budget_bytes(), 20);
+        });
+        assert!(logs.contains("declared_size=3"), "{logs}");
+        assert!(logs.contains("received_size=2"), "{logs}");
+        assert!(logs.contains("size_mismatch"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+        assert!(!logs.contains("cdn.discordapp.com"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_matching_declared_size_verifies() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads_shared_pair(&mut job, &fixture);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(fixture.hit_count(), before + 6);
+            let notice = automod_notice(&vars);
+            assert!(
+                notice.contains("Verified identical image bytes"),
+                "{notice}"
+            );
+            assert!(!notice.contains("Exact image check incomplete"), "{notice}");
+            assert!(
+                notice.contains("9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"),
+                "{notice}"
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 18);
+        });
+        assert!(!logs.contains("declared_size"), "{logs}");
+        assert!(!logs.contains("size_mismatch"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_declared_smaller_completed_body_is_hashed() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads_pair(&mut job, &fixture, 3, "/long0", "/long1");
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 6,
+                "a completed body within the cap is hashed without a retry"
+            );
+            let notice = automod_notice(&vars);
+            assert!(
+                notice.contains("Verified identical image bytes"),
+                "{notice}"
+            );
+            assert!(!notice.contains("Exact image check incomplete"), "{notice}");
+            assert!(
+                notice.contains("61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("81cc5b17018674b401b42f35ba07bb79e211239c23bffe658da1577e3e646877"),
+                "{notice}"
+            );
+            assert!(!notice.contains("http://"), "{notice}");
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 24);
+        });
+        assert!(logs.contains("declared_size=3"), "{logs}");
+        assert!(logs.contains("received_size=4"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+        assert!(!logs.contains("cdn.discordapp.com"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_uses_the_second_fetch() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads_pair(&mut job, &fixture, 3, "/retry0", "/retry1");
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 8,
+                "each short body is fetched once more and the second body is hashed"
+            );
+            let notice = automod_notice(&vars);
+            assert!(
+                notice.contains("Verified identical image bytes"),
+                "{notice}"
+            );
+            assert!(!notice.contains("Exact image check incomplete"), "{notice}");
+            assert!(
+                notice.contains("9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"),
+                "{notice}"
+            );
+            assert!(
+                !notice
+                    .contains("961b6dd3ede3cb8ecbaacbd68de040cd78eb2ed5889130cceb4c49268ea4d506"),
+                "{notice}"
+            );
+            assert_eq!(fixture.hit_count(), before + 8);
+            assert_eq!(app.image_spam.process_budget_requests(), 8);
+            assert_eq!(app.image_spam.process_budget_bytes(), 24);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 8);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 8);
+        });
+        assert!(!logs.contains("size_mismatch"), "{logs}");
+    }
+
+    async fn run_job_current_budget_window_case(scope: &str) {
         let fixture = LoopbackFixture::start();
-        run_incomplete_gate_case(
-            Limits::default(),
-            &fixture.url("/long"),
-            3,
-            "Stopped because the body length did not match the declared size.",
-        )
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        *fixture.first_response_gate.lock() = Some(Arc::clone(&gate));
+        let (app, policy, token) = image_run_job_test_app(Limits {
+            requests_per_minute: if scope == "process" { 6 } else { 100 },
+            requests_per_guild_minute: if scope == "guild" { 6 } else { 100 },
+            requests_per_author_minute: if scope == "author" { 6 } else { 100 },
+            bytes_per_minute: if scope == "bytes" { 18 } else { 1000 },
+            ..Limits::default()
+        })
         .await;
+        let now = Instant::now();
+        let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+        clear_stored_hashes(&app.image_spam);
+        match scope {
+            "bytes" | "extra-retention" => {
+                rewrite_job_downloads_pair(&mut job, &fixture, 3, "/long0", "/long1");
+            }
+            "retry-retention" => {
+                rewrite_job_downloads_pair(&mut job, &fixture, 3, "/retry0", "/retry1");
+            }
+            _ => rewrite_job_downloads(&mut job, &fixture.url("/short"), 3),
+        }
+        {
+            let mut state = app.image_spam.state.lock();
+            state.budget.start = now - Duration::from_secs(60);
+        }
+        let expire_after_reservation = async {
+            gate.wait().await;
+            {
+                let mut state = app.image_spam.state.lock();
+                assert_eq!((state.budget.requests, state.budget.bytes), (6, 18));
+                let reserved_at = state.budget.start;
+                assert!(reserved_at >= now);
+                // Model expiry during the real HTTP await. The captured job-start
+                // clock precedes expiry; the next actual admission follows it.
+                let start = reserved_at - Duration::from_secs(60) + Duration::from_nanos(1);
+                assert!(Instant::now() > reserved_at + Duration::from_nanos(1));
+                state.budget.start = start;
+                let guild = state.guilds.get_mut(&1).unwrap();
+                guild.budget.start = start;
+                guild.authors.get_mut(&2).unwrap().budget.start = start;
+            }
+            gate.wait().await;
+        };
+        let (vars, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                run_job_capture_automod(&app, job, policy, 102),
+                expire_after_reservation
+            )
+        })
+        .await
+        .expect("the first HTTP response must be released and the job must finish");
+        let (gets, expected_requests, expected_bytes) = match scope {
+            "bytes" | "extra-retention" => (6, 0, 6),
+            "retry-retention" => (8, 2, 6),
+            _ => (2, 1, 2),
+        };
+        assert_eq!(fixture.hit_count(), gets, "{scope}: actual HTTP requests");
+        if gets == 2 {
+            assert_incomplete_automod(
+                &vars,
+                "Stopped because the body length did not match the declared size",
+            );
+        } else {
+            let notice = automod_notice(&vars);
+            assert!(
+                notice.contains("Verified identical image bytes"),
+                "{notice}"
+            );
+            let digest = if scope == "retry-retention" {
+                "9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"
+            } else {
+                "61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"
+            };
+            assert!(notice.contains(digest), "{notice}");
+        }
+        let budget_gate = {
+            let mut state = app.image_spam.state.lock();
+            state.budget.reset(Instant::now());
+            Detector::process_budget_gate_locked(&state.budget, &app.image_spam.limits)
+        };
+        let AnalysisGate::ProcessBudget {
+            requests, bytes, ..
+        } = budget_gate
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (requests, bytes),
+            (expected_requests, expected_bytes),
+            "{scope}: newly admitted charges must survive the next current-window read"
+        );
+        assert_eq!(app.image_spam.guild_budget_requests(1), expected_requests);
+        assert_eq!(
+            app.image_spam.author_budget_requests(1, 2),
+            expected_requests
+        );
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_process_retry() {
+        run_job_current_budget_window_case("process").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_guild_retry() {
+        run_job_current_budget_window_case("guild").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_author_retry() {
+        run_job_current_budget_window_case("author").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_extra_byte_admission() {
+        run_job_current_budget_window_case("bytes").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_retry_charge_retention() {
+        run_job_current_budget_window_case("retry-retention").await;
+    }
+
+    #[tokio::test]
+    async fn run_job_current_budget_window_extra_charge_retention() {
+        run_job_current_budget_window_case("extra-retention").await;
+    }
+
+    #[test]
+    fn run_job_oversized_body_is_rejected_without_retry() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let before = fixture.hit_count();
+            run_incomplete_gate_case(
+                Limits {
+                    max_file_bytes: 3,
+                    ..Limits::default()
+                },
+                &fixture.url("/long"),
+                3,
+                "Stopped because the body length did not match the declared size",
+            )
+            .await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 1,
+                "a body over the file cap is not retried"
+            );
+        });
+        assert!(logs.contains("declared_size=3"), "{logs}");
+        assert!(logs.contains("received_size=4"), "{logs}");
+        assert!(logs.contains("size_mismatch"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_when_request_budget_is_full() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 6,
+                requests_per_guild_minute: 6,
+                requests_per_author_minute: 6,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 1,
+                "a retry GET is not sent when the request budget is already full"
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the process budget");
+        });
+        assert!(logs.contains("process_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_at_guild_request_budget() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 100,
+                requests_per_guild_minute: 6,
+                requests_per_author_minute: 100,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(fixture.hit_count(), before + 1);
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the guild request budget");
+        });
+        assert!(logs.contains("guild_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_short_body_retry_stops_at_author_request_budget() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                requests_per_minute: 100,
+                requests_per_guild_minute: 100,
+                requests_per_author_minute: 6,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads(&mut job, &fixture.url("/short"), 3);
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(fixture.hit_count(), before + 1);
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.guild_budget_requests(1), 6);
+            assert_eq!(app.image_spam.author_budget_requests(1, 2), 6);
+            assert_incomplete_automod(&vars, "Stopped at the author request budget");
+        });
+        assert!(logs.contains("author_budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn run_job_longer_body_stops_when_byte_budget_covers_only_the_declared_size() {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                bytes_per_minute: 18,
+                ..Limits::default()
+            })
+            .await;
+            let now = Instant::now();
+            let mut job = admit_three_channel_job(&app.image_spam, token, &policy, now);
+            clear_stored_hashes(&app.image_spam);
+            rewrite_job_downloads_pair(&mut job, &fixture, 3, "/long0", "/long1");
+            let before = fixture.hit_count();
+            let vars = run_job_capture_automod(&app, job, policy, 102).await;
+            assert_eq!(
+                fixture.hit_count(),
+                before + 1,
+                "a longer body is not hashed when the byte budget only covers the declared size"
+            );
+            assert_eq!(app.image_spam.process_budget_requests(), 6);
+            assert_eq!(app.image_spam.process_budget_bytes(), 18);
+            assert_incomplete_automod(
+                &vars,
+                "Stopped at the process budget (6/120 requests, 18/18 bytes).",
+            );
+            let notice = automod_notice(&vars);
+            assert!(
+                !notice
+                    .contains("61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4"),
+                "{notice}"
+            );
+        });
+        assert!(logs.contains("process_budget"), "{logs}");
+        assert!(!logs.contains("received_size=4"), "{logs}");
+        assert!(!logs.contains("process request budget"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    fn byte_denial_keeps_its_budget_window(retry: bool) {
+        let logs = with_captured_logs(async {
+            let fixture = LoopbackFixture::start();
+            let byte_limit = if retry { 20 } else { 18 };
+            let (app, policy, token) = image_run_job_test_app(Limits {
+                bytes_per_minute: byte_limit,
+                ..Limits::default()
+            })
+            .await;
+            let detector = &app.image_spam;
+            let started = Instant::now();
+            let mut job = admit_three_channel_job(detector, token, &policy, started);
+            clear_stored_hashes(detector);
+            rewrite_job_downloads(
+                &mut job,
+                &fixture.url(if retry { "/retry0" } else { "/long0" }),
+                3,
+            );
+            assert!(matches!(
+                detector.reserve(&mut job, &policy, started),
+                ReserveOutcome::Ok
+            ));
+            let account = DownloadAccount {
+                guild: 1,
+                author: 2,
+                token,
+            };
+            let failure = hash_for_exact_check(
+                detector,
+                account,
+                &job.posts[0].files[0],
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the actual body must exhaust byte admission");
+            let requests = if retry { 7 } else { 6 };
+            assert_eq!(fixture.hit_count(), if retry { 2 } else { 1 });
+            assert_eq!(detector.process_budget_requests(), requests);
+            assert_eq!(detector.process_budget_bytes(), 18);
+
+            // Model another job renewing and charging the process window before
+            // run_job renders this download failure. No clock sleeps or HTTP mocks.
+            detector.state.lock().budget.start = Instant::now() - Duration::from_secs(60);
+            assert!(detector.charge_downloaded_bytes(1, account).is_ok());
+            assert_eq!(detector.process_budget_requests(), 0);
+            assert_eq!(detector.process_budget_bytes(), 1);
+            let gate = match failure {
+                ExactCheckFailure::Download(error) => {
+                    analysis_gate_from_download(error, 1, started)
+                }
+                ExactCheckFailure::Gate(gate) => gate,
+            };
+            warn_incomplete_analysis(&gate, 1, 2);
+            let vars = report_vars(Report::Unverified(gate), 2, 102, &policy);
+            assert_incomplete_automod(
+                &vars,
+                &format!(
+                    "Stopped at the process budget ({requests}/120 requests, 18/{byte_limit} bytes)."
+                ),
+            );
+        });
+        assert!(
+            logs.contains(if retry { "requests=7" } else { "requests=6" }),
+            "{logs}"
+        );
+        assert!(logs.contains("bytes=18"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
+    #[test]
+    fn initial_byte_denial_keeps_its_budget_window() {
+        byte_denial_keeps_its_budget_window(false);
+    }
+
+    #[test]
+    fn retry_byte_denial_keeps_its_budget_window() {
+        byte_denial_keeps_its_budget_window(true);
     }
 
     #[tokio::test]
@@ -5210,6 +6729,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5231,6 +6751,7 @@ mod tests {
             .expect("first job stores hashes");
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let failed = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5263,6 +6784,7 @@ mod tests {
             .unwrap();
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let none_job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5279,6 +6801,7 @@ mod tests {
             CompleteOutcome::Dropped
         );
         let different = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5321,6 +6844,7 @@ mod tests {
         ));
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let store = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5421,6 +6945,7 @@ mod tests {
         clear_stored_hashes(&d);
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
         let job = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5665,6 +7190,7 @@ mod tests {
             .collect();
         assert!(stored.iter().all(|hashes| hashes.is_some()));
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -5693,6 +7219,7 @@ mod tests {
         assert_eq!(
             d.complete(
                 Job {
+                    burst_ids: Vec::new(),
                     guild: 1,
                     author: 2,
                     token: (0, 0),
@@ -5733,6 +7260,7 @@ mod tests {
                 .hashes = None;
         }
         let mut stale = Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author: 2,
             token: (0, 0),
@@ -6045,6 +7573,7 @@ mod tests {
             })
             .collect();
         Job {
+            burst_ids: Vec::new(),
             guild: 1,
             author,
             token,
@@ -6246,5 +7775,316 @@ mod tests {
         );
         assert_eq!(sink.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(app.image_spam.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+    }
+    #[tokio::test]
+    async fn late_create_after_delete_is_not_admitted() {
+        let path = std::env::temp_dir().join(format!(
+            "attachment_burst_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = crate::state::BotState::new(
+            jmodguard::config::BotProcessConfig::default(),
+            crate::db::Db::open(&path, 2).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = delete_context(Arc::clone(&http)).await;
+        let cfg = crate::state::CachedGuildConfig {
+            version: 0,
+            durable_version: 0,
+            loaded_at: Instant::now(),
+            settings: crate::types::GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
+        let post = |channel: u64, message: u64, attachment: u64| {
+            let mut msg = serenity::model::channel::Message::default();
+            msg.id = serenity::model::id::MessageId::new(message);
+            msg.channel_id = serenity::model::id::ChannelId::new(channel);
+            msg.guild_id = Some(serenity::model::id::GuildId::new(1));
+            msg.author.id = serenity::model::id::UserId::new(author);
+            msg.timestamp = serenity::model::timestamp::Timestamp::now();
+            msg.attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": attachment.to_string(),
+                    "filename": "spam.png",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/spam.png",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/spam.png",
+                    "width": 8,
+                    "height": 8,
+                    "content_type": "image/png"
+                }))
+                .unwrap(),
+            ];
+            msg
+        };
+        let now = Instant::now();
+        let captured_revision = (app.image_spam.revision(), app.attachment_burst.revision());
+        // The create handler is waiting on its configuration read; delete arrives first.
+        app.image_spam.deleted(1, 10, 100);
+        app.attachment_burst.forget_message(1, 10, 100);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(10, 100, 1000),
+            now,
+            chrono::Utc::now(),
+            captured_revision,
+        );
+        assert_eq!(app.attachment_burst.hits(), 0);
+        observe(
+            &app,
+            &ctx,
+            &cfg,
+            &post(11, 101, 1001),
+            now,
+            chrono::Utc::now(),
+            (app.image_spam.revision(), app.attachment_burst.revision()),
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "deleted create was reintroduced as proving burst message"
+        );
+        drop(app);
+        jmodguard::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_duplicate_completion_uses_real_jobs() {
+        let fixture = LoopbackFixture::start();
+        let (app, policy, token) = image_run_job_test_app(Limits::default()).await;
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let now = Instant::now();
+        let mut jobs = Vec::new();
+        for n in 0..4u64 {
+            let message = 1000 + n;
+            let channel = 100 + n;
+            let mut item = post(message, channel, now, &[1, 1, 2]);
+            item.hashes = None;
+            item.revision = app.image_spam.revision();
+            let mut metadata = Vec::new();
+            for (i, file) in item.files.iter_mut().enumerate() {
+                let id = message * 10 + i as u64 + 1;
+                *file = Attachment::new(
+                    channel,
+                    id,
+                    3,
+                    &format!("https://cdn.discordapp.com/attachments/{channel}/{id}/image.png"),
+                    10,
+                )
+                .unwrap();
+                let path = match (n, i) {
+                    (1, _) => "/hash2",
+                    (3, _) => "/hash3",
+                    (2, 0 | 1) => "/hash0",
+                    (2, 2) => "/hash1",
+                    _ => "/ok",
+                };
+                file.set_request_uri_str_for_test(&fixture.url(path));
+                metadata.push(crate::attachment_burst::FileMeta {
+                    attachment_id: id,
+                    size: 3,
+                    filename: if (n == 1 || n == 2) && i == 2 {
+                        "shared.png".into()
+                    } else {
+                        format!("unique-{n}-{i}.png")
+                    },
+                    content_type: "image/png".into(),
+                });
+            }
+            let mut handoff = crate::attachment_burst::Handoff::stage(
+                &app,
+                &ctx,
+                crate::attachment_burst::Sighting {
+                    guild: 1,
+                    author: 2,
+                    channel,
+                    message,
+                    at: now,
+                },
+                metadata,
+            );
+            item.burst_ids = handoff.observations();
+            let outcome = app.image_spam.admit(1, 2, item, token, &policy, now, false);
+            match outcome {
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    jobs.push((channel, job, permit));
+                }
+                AdmitOutcome::Admitted => assert!(n < 2),
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(
+            jobs.len(),
+            2,
+            "two jobs hold the default two concurrency permits"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "no metadata hit before hashing"
+        );
+        // The latest admitted job runs first and caches all four real posts' hash sets.
+        let (channel, fast, permit) = jobs.pop().unwrap();
+        run_job(&app, &ctx, fast, policy.clone(), channel, permit).await;
+        assert_eq!(
+            fixture.hit_count(),
+            12,
+            "all files completed actual loopback hashing"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "fresh hashing found no shared bytes across target posts"
+        );
+        assert!(
+            app.image_spam.state.lock().guilds[&1].authors[&2]
+                .posts
+                .iter()
+                .all(|p| p.hashes.is_some())
+        );
+        let posts = app.image_spam.state.lock().guilds[&1].authors[&2]
+            .posts
+            .clone();
+        let a = posts
+            .iter()
+            .find(|p| p.id == 1002)
+            .unwrap()
+            .hashes
+            .as_ref()
+            .unwrap();
+        let b = posts
+            .iter()
+            .find(|p| p.id == 1001)
+            .unwrap()
+            .hashes
+            .as_ref()
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 1);
+        assert!(
+            a.iter().all(|hash| !b.contains(hash)),
+            "independent exact hashes are disjoint"
+        );
+        for (channel, job, permit) in jobs {
+            run_job(&app, &ctx, job, policy.clone(), channel, permit).await;
+        }
+        assert_eq!(
+            fixture.hit_count(),
+            12,
+            "cached jobs did not download again"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            0,
+            "fully hashed disjoint posts falsely matched via duplicate-file metadata fallback"
+        );
+    }
+    #[tokio::test]
+    async fn completed_job_counts_prior_fallback_observation() {
+        let fixture = LoopbackFixture::start();
+        let (app, _, _) = image_run_job_test_app(Limits::default()).await;
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let mut rule = cfg.rules["attachment_flood"].clone();
+        rule.params["min_channels"] = 2.into();
+        rule.params["min_attachments"] = 1.into();
+        crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let policy = policy_for_config(&cfg, &cfg.rules["attachment_flood"]).unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let ctx = delete_context(Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(fixture.url(""))
+                .ratelimiter_disabled(true)
+                .build(),
+        ))
+        .await;
+        let now = Instant::now();
+        for n in 0..2 {
+            let channel = 10 + n;
+            let message = 100 + n;
+            let id = 1000 + n;
+            let mut item = post(message, channel, now, &[3]);
+            item.hashes = None;
+            item.revision = app.image_spam.revision();
+            item.files = vec![
+                Attachment::new(
+                    channel,
+                    id,
+                    3,
+                    &format!("https://cdn.discordapp.com/attachments/{channel}/{id}/x.png"),
+                    10,
+                )
+                .unwrap(),
+            ];
+            item.files[0].set_request_uri_str_for_test(&fixture.url("/ok"));
+            let mut handoff = crate::attachment_burst::Handoff::stage(
+                &app,
+                &ctx,
+                crate::attachment_burst::Sighting {
+                    guild: 1,
+                    author: 2,
+                    channel,
+                    message,
+                    at: now,
+                },
+                vec![crate::attachment_burst::FileMeta {
+                    attachment_id: id,
+                    size: 3,
+                    filename: format!("{id}.png"),
+                    content_type: "image/png".into(),
+                }],
+            );
+            item.burst_ids = handoff.observations();
+            match app.image_spam.admit(1, 2, item, token, &policy, now, false) {
+                AdmitOutcome::Admitted => assert_eq!(n, 0),
+                AdmitOutcome::Matched(job) => {
+                    handoff.hand_to_job();
+                    let permit = app.image_spam.try_acquire_job_slot();
+                    run_job(&app, &ctx, job, policy.clone(), channel, permit).await;
+                }
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(
+            fixture.hit_count(),
+            2,
+            "both posts must finish real hashing"
+        );
+        assert_eq!(
+            app.attachment_burst.hits(),
+            1,
+            "two identical completed images failed the default two-channel burst threshold"
+        );
     }
 }

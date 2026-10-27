@@ -528,6 +528,7 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 app.automod.prune();
                 app.image_spam.prune();
+                app.attachment_burst.prune();
                 app.text_spam.prune();
             }
         });

@@ -1627,6 +1627,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         Admission::Immediate,
         || true,
         false,
+        Vec::new(),
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);

@@ -3,6 +3,7 @@
 use anyhow::{Context as _, Result};
 use jmodguard_api::config::ApiProcessConfig;
 use jmodguard_api::{health, init_tracing, shutdown_signal, web};
+use jmodguard_updater::oci::Registry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,13 +105,24 @@ async fn main() -> Result<()> {
                 // a background task on a process that then failed to listen.
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
-                tokio::spawn(async move {
-                    let mut interval=tokio::time::interval(Duration::from_secs(3600));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        interval.tick().await;
-                        web::updates::poll_all(&update_app).await;
-                    }
+                let release_check = tokio::spawn(async move {
+                    web::updates::run_release_check_loop(
+                        update_app,
+                        web::updates::ReleaseCheckTick::interval(
+                            web::updates::RELEASE_CHECK_INTERVAL,
+                        ),
+                        web::updates::RELEASE_LOOKUP_TIMEOUT,
+                        |component, channel| {
+                            let (component, channel) = (component.to_owned(), channel.to_owned());
+                            Box::pin(async move {
+                                let registry = Registry::ghcr()?;
+                                registry.discover(&component, &channel).await
+                            })
+                        },
+                        || Box::pin(shutdown_signal()),
+                        web::updates::ScheduledInstallPolicy::from_env(),
+                    )
+                    .await;
                 });
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
@@ -128,7 +140,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
-                Ok::<_, anyhow::Error>(Some(web_app))
+                Ok::<_, anyhow::Error>(Some((web_app, release_check)))
             } => result,
             _ = shutdown_signal() => {
                 tracing::info!("shutdown during API startup");
@@ -139,16 +151,29 @@ async fn main() -> Result<()> {
     })
     .await?;
 
-    let Some(web_app) = web_app else {
+    let Some((web_app, release_check)) = web_app else {
         tracing::info!("API process stopped");
         return Ok(());
     };
 
     tracing::info!("API listening on http://{web_bind}");
-    axum::serve(listener, web_app)
+    let serve_result = axum::serve(listener, web_app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("web server error")?;
+        .context("web server error");
+    match tokio::time::timeout(web::updates::RELEASE_CHECK_SHUTDOWN_DRAIN, release_check).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("release check task stopped with error: {error}");
+        }
+        Err(_) => {
+            tracing::warn!(
+                "release check task did not finish within {:?}",
+                web::updates::RELEASE_CHECK_SHUTDOWN_DRAIN
+            );
+        }
+    }
+    serve_result?;
     jmodguard::log_shutdown_finished("api");
     tracing::info!("API process stopped");
     Ok(())
