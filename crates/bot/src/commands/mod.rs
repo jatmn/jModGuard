@@ -2567,12 +2567,6 @@ mod tests {
         }];
         guild.channels.insert(channel.id, channel);
 
-        let mut cached = Member::default();
-        cached.user.id = UserId::new(AUTHOR);
-        cached.guild_id = guild.id;
-        cached.roles = vec![RoleId::new(ROLE)];
-        guild.members.insert(cached.user.id, cached);
-
         let voice_state = serde_json::from_value::<VoiceState>(serde_json::json!({
             "channel_id": VOICE.to_string(),
             "deaf": false,
@@ -2600,12 +2594,28 @@ mod tests {
         assert_ne!(from_gateway.user.id, UserId::new(AUTHOR));
 
         let actor = UserId::new(AUTHOR);
-        let actor_member = cache
-            .guild(GuildId::new(GUILD))
-            .and_then(|g| g.members.get(&actor).cloned())
-            .or(Some(from_gateway))
-            .map(|member| super::actor_member_for_command(actor, member))
-            .expect("prefix dispatch must resolve a member");
+        assert!(
+            cache
+                .guild(GuildId::new(GUILD))
+                .is_none_or(|g| !g.members.contains_key(&actor)),
+            "fixture must exercise the gateway partial path, not a cached author row"
+        );
+        assert_eq!(
+            snapshot_cached_voice(
+                &cache,
+                GuildId::new(GUILD),
+                from_gateway.user.id,
+                &from_gateway.roles,
+                UserId::new(TARGET),
+            ),
+            VoiceLookupSnapshot::InChannel {
+                channel_id: VOICE,
+                channel_name: "Secret".into(),
+            },
+            "default partial user id must not drive member-specific view denies"
+        );
+        let actor_member =
+            super::actor_member_for_command(actor, from_gateway);
         assert_eq!(actor_member.user.id, actor);
 
         let snapshot = snapshot_cached_voice(
