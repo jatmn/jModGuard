@@ -1857,7 +1857,7 @@ impl Supervisor {
             .await?;
         let baked = self.baked.clone();
         let base_sha = self.base_sha.clone();
-        self.start(&baked, &base_sha, Some(release.clone())).await?;
+        self.start(&baked, &base_sha, None).await?;
         Ok(())
     }
 

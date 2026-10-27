@@ -507,6 +507,7 @@ impl Registry {
     }
 }
 
+#[cfg(test)]
 fn resolve_requested_files_from_layers(
     layers: &[(&[u8], &str)],
     requested: &[&str],
@@ -588,6 +589,7 @@ fn merge_layer_into_found(
     let mut archive = tar::Archive::new(reader);
     let mut total = 0u64;
     let mut count = 0usize;
+    let mut layer_paths = HashSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         count += 1;
@@ -632,8 +634,9 @@ fn merge_layer_into_found(
             kind.is_file() || kind.is_dir(),
             "link or special file in release layer"
         );
+        ensure!(kind.is_file() && size <= MAX_FILE, "invalid release file");
         ensure!(
-            kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
+            layer_paths.insert(name.clone()),
             "invalid or duplicate release file"
         );
         let mut data = Vec::with_capacity(size as usize);
@@ -903,6 +906,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+    }
+
+    #[test]
+    fn older_layer_duplicate_binary_does_not_block_inventory_resolution() {
+        let newer = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"\x7fELFbody",
+            tar::EntryType::Regular,
+        )]);
+        let older = layer(&[
+            (
+                "usr/local/bin/jmodguard-api",
+                b"stale",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                b"deadbeef  usr/local/bin/jmodguard-api\n",
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let merged = resolve_requested_files_from_layers(
+            &[
+                (
+                    newer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    older.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &[
+                "usr/local/bin/jmodguard-api",
+                "usr/local/share/jmodguard/files.sha256",
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+        assert_eq!(
+            merged["usr/local/share/jmodguard/files.sha256"],
+            b"deadbeef  usr/local/bin/jmodguard-api\n"
+        );
     }
 
     #[test]
