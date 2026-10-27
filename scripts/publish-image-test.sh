@@ -323,6 +323,10 @@ mock_publish_helpers() {
     fi
     if [[ "$1" == buildx ]]; then
       if [[ "$2" == imagetools ]]; then
+        if [[ "$*" == *'{{json .Image}}'* ]]; then
+          printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"}}}'
+          return 0
+        fi
         printf '{"digest":"sha256:%064d","size":10}\n' 0
         return 0
       fi
@@ -347,6 +351,8 @@ mock_publish_helpers() {
   sign_published_digest() {
     printf 'sign %s %s %s\n' "$1" "$2" "$3" >>"$TRACE_FILE"
     require_signing_secrets
+    image_published_at "${2}@${3}" >/dev/null \
+      || publish_fail 'published image lacks io.jmodguard.published-at'
     [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
   }
 }
@@ -622,6 +628,10 @@ for component in bot api; do
     || fail "historical ${component} must receive the legacy final-image check"
   [[ "$BUILD_LINE" != *'io.jmodguard.launcher-protocol'* ]] \
     || fail "historical ${component} must not claim updater compatibility"
+  printf '%s\n' "$BUILD_LINE" | grep -q 'io.jmodguard.published-at=' \
+    || fail "historical ${component} must label a publication timestamp for signing"
+  printf '%s\n' "${CALLS[@]}" | grep -q "^sign ${component} " \
+    || fail "historical ${component} must sign before promoting latest"
   printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
     || fail "verified historical ${component} may still move latest for dashboard rollback"
 done
@@ -1040,5 +1050,19 @@ assert_eq "$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')" \
 trace="$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')"
 printf '%s' "$trace" | grep -v '^::add-mask::' | grep -Eq 'secret-key|secret-pass' \
   && fail 'redactor output must not echo signing secrets outside masking'
+
+reload_publisher
+run_docker() {
+  printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T17:00:00Z"}}}'
+}
+got="$(image_published_at "ghcr.io/jatmn/jmodguard-bot@sha256:$(printf 'a%.0s' {1..64})")"
+assert_eq "$got" "2026-10-27T17:00:00Z"
+
+reload_publisher
+readarray -d '' -t legacy_sign_args < <(build_args bot "$HEAD_SHA" "" . stable legacy)
+printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.published-at=' \
+  || fail 'legacy builds must carry a publication timestamp for signing'
+printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol=1' \
+  && fail 'legacy builds must not claim updater compatibility'
 
 echo 'publish-image-test: ok'

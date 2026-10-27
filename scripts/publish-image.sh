@@ -292,6 +292,8 @@ JS
     else
       args+=(--label "io.jmodguard.launcher-protocol=1")
     fi
+  else
+    args+=(--label "io.jmodguard.published-at=${published_at}")
   fi
   args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
   if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
@@ -495,17 +497,10 @@ require_signing_secrets() {
 image_published_at() {
   local ref="$1"
   local raw
-  raw="$(run_docker buildx imagetools inspect "$ref" --format '{{json .}}')"
+  raw="$(run_docker buildx imagetools inspect "$ref" --format '{{json .Image}}')"
   IMAGE_JSON="$raw" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.IMAGE_JSON || "{}");
-function labelsFrom(value) {
-  if (!value || typeof value !== "object") return null;
-  if (value.config?.Labels) return value.config.Labels;
-  if (value.Config?.Labels) return value.Config.Labels;
-  if (value.Image && typeof value.Image === "object") return labelsFrom(value.Image);
-  return null;
-}
-const labels = labelsFrom(data) || labelsFrom(data.Manifest) || labelsFrom(data.Image) || {};
+const labels = (data.config && data.config.Labels) || (data.Config && data.Config.Labels) || {};
 const published = labels["io.jmodguard.published-at"] || "";
 if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(published)) process.exit(2);
 process.stdout.write(published);
