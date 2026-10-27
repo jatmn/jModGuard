@@ -293,6 +293,7 @@ JS
       args+=(--label "io.jmodguard.launcher-protocol=1")
     fi
   else
+    # Dashboard rollback images are signed but must not advertise updater metadata.
     args+=(--label "io.jmodguard.published-at=${published_at}")
   fi
   args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
