@@ -494,13 +494,7 @@ impl Registry {
         let mut mask = LayerMask::default();
         for layer in manifest.layers.iter().rev() {
             let bytes = self.blob(repo, layer, MAX_LAYER).await?;
-            merge_layer_into_found(
-                &bytes,
-                &layer.media_type,
-                &wanted,
-                &mut found,
-                &mut mask,
-            )?;
+            merge_layer_into_found(&bytes, &layer.media_type, &wanted, &mut found, &mut mask)?;
             if found.len() == requested.len() {
                 break;
             }
@@ -913,11 +907,7 @@ mod tests {
 
     #[test]
     fn directory_whiteout_hides_requested_descendants() {
-        let newer = layer(&[(
-            "usr/local/.wh.bin",
-            b"",
-            tar::EntryType::Regular,
-        )]);
+        let newer = layer(&[("usr/local/.wh.bin", b"", tar::EntryType::Regular)]);
         let older = layer(&[(
             "usr/local/bin/jmodguard-api",
             b"stale",
@@ -945,11 +935,7 @@ mod tests {
 
     #[test]
     fn opaque_whiteout_hides_lower_layer_descendants() {
-        let newer = layer(&[(
-            "usr/local/bin/.wh..opq",
-            b"",
-            tar::EntryType::Regular,
-        )]);
+        let newer = layer(&[("usr/local/bin/.wh..opq", b"", tar::EntryType::Regular)]);
         let older = layer(&[(
             "usr/local/bin/jmodguard-api",
             b"stale",
