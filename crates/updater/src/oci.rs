@@ -4,8 +4,8 @@ use crate::signature;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use jmodguard::db::ComponentRelease;
-use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use reqwest::StatusCode;
+use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -137,14 +137,8 @@ impl Registry {
         accept: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
-        let (status, body, headers) = self
-            .get_limited_status(url, token, accept, limit)
-            .await?;
-        ensure!(
-            status.is_success(),
-            "registry returned HTTP {}",
-            status
-        );
+        let (status, body, headers) = self.get_limited_status(url, token, accept, limit).await?;
+        ensure!(status.is_success(), "registry returned HTTP {}", status);
         Ok((body, headers))
     }
 
@@ -205,12 +199,26 @@ impl Registry {
                 phrase: signature::UNSIGNED_IMAGE,
             });
         }
-        ensure!(
-            status.is_success(),
-            "registry returned HTTP {}",
-            status
-        );
+        ensure!(status.is_success(), "registry returned HTTP {}", status);
         Ok(body)
+    }
+
+    async fn signature_envelope_bytes(&self, repo: &str, body: &[u8]) -> Result<Vec<u8>> {
+        if serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                value.get("payloadType").is_some() && value.get("payload").is_some()
+            })
+        {
+            return Ok(body.to_vec());
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(body).context("invalid signature manifest")?;
+        ensure!(
+            manifest.schema_version == 2 && !manifest.layers.is_empty(),
+            "unsupported signature manifest"
+        );
+        self.blob(repo, &manifest.layers[0], MAX_MANIFEST).await
     }
 
     async fn verify_manifest(
@@ -221,11 +229,12 @@ impl Registry {
         manifest_bytes: &[u8],
     ) -> Result<()> {
         let signature = self.signature_body(repo, manifest_digest).await?;
+        let envelope = self.signature_envelope_bytes(repo, &signature).await?;
         signature::verify_manifest_signature(
             component,
             manifest_digest,
             manifest_bytes,
-            &signature,
+            &envelope,
             Utc::now(),
         )
     }

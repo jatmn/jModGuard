@@ -912,12 +912,13 @@ pub async fn read_boot_mismatch_map(db: &Db) -> Result<BootMismatchMap> {
     db.with_conn(|conn| read_boot_mismatch_map_conn(conn)).await
 }
 
-pub fn write_boot_mismatch_map_conn(
-    conn: &impl SqlExecutor,
-    map: &BootMismatchMap,
-) -> Result<()> {
+pub fn write_boot_mismatch_map_conn(conn: &impl SqlExecutor, map: &BootMismatchMap) -> Result<()> {
     if map.is_empty() {
-        conn.execute("DELETE FROM meta WHERE key=?1", params![UPDATE_BOOT_MISMATCH_META])?;
+        conn.execute_rows(
+            "DELETE FROM meta WHERE key=?1",
+            params![UPDATE_BOOT_MISMATCH_META],
+            1,
+        )?;
         return Ok(());
     }
     write_meta_string_conn(
@@ -929,7 +930,6 @@ pub fn write_boot_mismatch_map_conn(
 }
 
 pub async fn record_boot_mismatch(db: &Db, record: BootMismatchRecord) -> Result<()> {
-    let record = record;
     db.with_conn(move |conn| {
         let mut map = read_boot_mismatch_map_conn(conn)?;
         map.insert(record.component.clone(), record);
@@ -1964,6 +1964,50 @@ mod tests {
         request_component_install(&db, "webui", &webui.digest, 7401)
             .await
             .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_last_boot_mismatch_deletes_meta_key() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_boot_mismatch_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let record = BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: "bad image signature".into(),
+        };
+        record_boot_mismatch(&db, record).await.unwrap();
+        assert!(
+            read_boot_mismatch_map(&db)
+                .await
+                .unwrap()
+                .contains_key("api")
+        );
+        db.with_conn(|conn| {
+            assert!(meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?.is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        clear_boot_mismatch(&db, "api").await.unwrap();
+        assert!(read_boot_mismatch_map(&db).await.unwrap().is_empty());
+        db.with_conn(|conn| {
+            assert!(meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

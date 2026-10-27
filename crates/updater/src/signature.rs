@@ -4,7 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Utc};
 use ring::digest::{SHA256, digest};
-use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -87,8 +87,20 @@ fn decode_pem_spki(pem: &str) -> Result<Vec<u8>> {
         .context("invalid signing public key PEM")
 }
 
+fn sec1_p256_public_key(der: &[u8]) -> Result<Vec<u8>> {
+    if der.len() == 65 && der.first() == Some(&0x04) {
+        return Ok(der.to_vec());
+    }
+    ensure!(
+        der.len() >= 65 && der[der.len() - 65] == 0x04,
+        "invalid signing public key"
+    );
+    Ok(der[der.len() - 65..].to_vec())
+}
+
 fn trusted_key(pem: &str) -> Result<TrustedKey> {
     let spki = decode_pem_spki(pem)?;
+    let sec1 = sec1_p256_public_key(&spki).context("invalid signing public key PEM")?;
     let keyid = digest(&SHA256, &spki);
     let keyid = keyid
         .as_ref()
@@ -97,7 +109,7 @@ fn trusted_key(pem: &str) -> Result<TrustedKey> {
         .collect::<String>();
     Ok(TrustedKey {
         keyid,
-        key: UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, spki),
+        key: UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, sec1),
     })
 }
 
@@ -107,8 +119,7 @@ fn previous_key_paths() -> Vec<PathBuf> {
         paths.push(PathBuf::from(root).join("deploy/update-signing-previous.pub"));
     }
     paths.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/update-signing-previous.pub"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/update-signing-previous.pub"),
     );
     paths
 }
@@ -163,8 +174,7 @@ pub fn verify_manifest_signature(
     signature_body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let envelope: Envelope =
-        serde_json::from_slice(signature_body).context(BAD_IMAGE_SIGNATURE)?;
+    let envelope: Envelope = serde_json::from_slice(signature_body).context(BAD_IMAGE_SIGNATURE)?;
     ensure!(
         envelope.payload_type == PAYLOAD_TYPE,
         ImageSignatureRejection {
@@ -181,9 +191,7 @@ pub fn verify_manifest_signature(
     let payload_bytes = STANDARD
         .decode(&envelope.payload)
         .context(BAD_IMAGE_SIGNATURE)?;
-    let signature_bytes = STANDARD
-        .decode(&entry.sig)
-        .context(BAD_IMAGE_SIGNATURE)?;
+    let signature_bytes = STANDARD.decode(&entry.sig).context(BAD_IMAGE_SIGNATURE)?;
     let keys = trusted_keys().context(BAD_IMAGE_SIGNATURE)?;
     let trusted = keys
         .iter()
@@ -295,13 +303,22 @@ pub fn registry_unreachable_reason(error: &anyhow::Error) -> Option<&'static str
 }
 
 pub fn boot_repair_reason(error: &anyhow::Error) -> Option<&'static str> {
-    signature_rejection_phrase(error).or_else(|| registry_unreachable_reason(error))
+    if let Some(phrase) = signature_rejection_phrase(error) {
+        return Some(phrase);
+    }
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == BAD_IMAGE_SIGNATURE)
+    {
+        return Some(BAD_IMAGE_SIGNATURE);
+    }
+    registry_unreachable_reason(error)
 }
 
 pub mod test_support {
     use super::*;
     use ring::rand::SystemRandom;
-    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
     use serde_json::json;
 
     pub fn generate_key_pair() -> (String, String) {

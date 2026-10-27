@@ -7,13 +7,11 @@ use axum::{
     routing::get,
 };
 use jmodguard_updater::oci::Registry;
-use jmodguard_updater::signing_fixture::{
-    SigningFixture, SigningKeyChoice, image as signed_image,
-};
 use jmodguard_updater::signature::{
     BAD_IMAGE_SIGNATURE, EXPIRED_IMAGE_SIGNATURE, UNSIGNED_IMAGE, UNTRUSTED_IMAGE_SIGNATURE_KEY,
     signature_tag_for_digest,
 };
+use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice, image as signed_image};
 use std::{collections::HashMap, sync::Arc, sync::OnceLock};
 use tokio::sync::RwLock;
 

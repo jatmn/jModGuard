@@ -4,10 +4,8 @@
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
+use jmodguard_updater::signature::{UNSIGNED_IMAGE, signature_tag_for_digest};
 use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice};
-use jmodguard_updater::signature::{
-    UNSIGNED_IMAGE, signature_tag_for_digest,
-};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};

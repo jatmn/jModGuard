@@ -8,7 +8,7 @@ use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
 use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::signature::{
-    boot_repair_reason, registry_transient, signature_rejection_phrase, SCHEMA_MISMATCH,
+    SCHEMA_MISMATCH, boot_repair_reason, registry_transient, signature_rejection_phrase,
 };
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -1607,10 +1607,7 @@ impl Supervisor {
     }
 
     fn baked_supports_guild(&self, state: &db::ComponentUpdate) -> bool {
-        state
-            .observed
-            .as_ref()
-            .and_then(|seen| seen.guild_schema)
+        state.observed.as_ref().and_then(|seen| seen.guild_schema)
             == Some(self.baked_compatibility.guild)
     }
 

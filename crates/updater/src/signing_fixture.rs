@@ -14,6 +14,12 @@ pub struct SigningFixture {
     pub previous_private_pem: Option<String>,
 }
 
+impl Default for SigningFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SigningFixture {
     pub fn new() -> Self {
         let (public_pem, private_pem) = generate_key_pair();
@@ -37,10 +43,7 @@ impl SigningFixture {
 
     pub fn apply_env(&self) {
         unsafe {
-            std::env::set_var(
-                "JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM",
-                &self.public_pem,
-            );
+            std::env::set_var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM", &self.public_pem);
         }
         if let Some(public) = self.previous_public_pem.as_ref() {
             let root = std::env::var("JMODGUARD_REPO_ROOT").unwrap_or_else(|_| {
@@ -71,13 +74,7 @@ impl SigningFixture {
             ),
             SigningKeyChoice::Unknown => {
                 let (public, private) = generate_key_pair();
-                let body = sign_manifest(
-                    &private,
-                    &public,
-                    component,
-                    manifest_digest,
-                    not_after,
-                );
+                let body = sign_manifest(&private, &public, component, manifest_digest, not_after);
                 let tag = signature_tag_for_digest(manifest_digest).unwrap();
                 objects.insert(tag, body);
                 return;
@@ -125,13 +122,13 @@ pub fn image(
     {
         let mut tar = tar::Builder::new(&mut tar_bytes);
         let name = format!("usr/local/bin/jmodguard-{role}");
-        let inventory = format!(
-            "{hash}  bin/jmodguard-{role}\n",
-            hash = sha256_hex(binary)
-        );
+        let inventory = format!("{hash}  bin/jmodguard-{role}\n", hash = sha256_hex(binary));
         for (path, bytes) in [
             (name.as_str(), binary),
-            ("usr/local/share/jmodguard/files.sha256", inventory.as_bytes()),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                inventory.as_bytes(),
+            ),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);

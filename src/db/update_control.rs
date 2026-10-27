@@ -963,14 +963,20 @@ impl UpdateControl {
 
     pub async fn record_boot_mismatch(&self, record: BootMismatchRecord) -> Result<()> {
         if !self.writes_locally() {
-            anyhow::bail!("boot mismatch records require a local writer");
+            return self
+                .forward_process(ControlOp::RecordBootMismatch { record })
+                .await;
         }
         record_boot_mismatch(&self.db, record).await
     }
 
     pub async fn clear_boot_mismatch(&self, component: &str) -> Result<()> {
         if !self.writes_locally() {
-            anyhow::bail!("boot mismatch records require a local writer");
+            return self
+                .forward_process(ControlOp::ClearBootMismatch {
+                    component: component.to_owned(),
+                })
+                .await;
         }
         clear_boot_mismatch(&self.db, component).await
     }
