@@ -28,7 +28,8 @@ fn refuse_bot_target(env: &CmdEnv<'_>, target: serenity::model::id::UserId) -> R
     Ok(())
 }
 
-async fn mod_reason_dm_after_success(
+/// Sends the optional reason DM while the target can still receive guild DMs.
+async fn mod_reason_dm_if_requested(
     env: &CmdEnv<'_>,
     target: serenity::model::id::UserId,
     action: &str,
@@ -161,6 +162,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     let discord_reason =
                         crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -226,8 +228,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                 )
                                 .await;
                             }
-                            dm_outcome =
-                                mod_reason_dm_after_success(env, target, "banned", &reason).await;
                         }
                         crate::db::guild_data::CaseOutcome::Failed => {
                             return Err(discord
@@ -353,6 +353,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
+            let dm_outcome = mod_reason_dm_if_requested(env, target, "kicked", &reason).await;
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
                 member.kick_with_reason(&env.ctx.http, &reason),
@@ -378,7 +379,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await;
             lease_held(env)?;
             discord?;
-            let dm_outcome = mod_reason_dm_after_success(env, target, "kicked", &reason).await;
             log_mod(
                 env,
                 enrollment.clone(),

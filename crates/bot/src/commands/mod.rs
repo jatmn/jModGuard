@@ -431,7 +431,7 @@ pub struct CmdEnv<'a> {
     pub actor: serenity::model::id::UserId,
     pub actor_member: serenity::model::guild::Member,
     pub args: Args,
-    /// When true, DM the moderation reason to the target after a successful kick/ban.
+    /// When true, DM the moderation reason to the target before kick/ban.
     pub dm: bool,
     /// Source message (prefix commands) — None for slash commands.
     pub source_message: Option<serenity::model::id::MessageId>,
