@@ -23,6 +23,24 @@ fn user(id: u64) -> User {
     user
 }
 
+fn cases_from_pages(pages: &[MemberHistoryPage]) -> (Vec<MemberHistoryEntry>, bool) {
+    let limit = PRIOR_CASE_LIMIT as usize;
+    let mut cases = Vec::new();
+    for page in pages {
+        for entry in &page.entries {
+            if entry.case_id.is_none() {
+                continue;
+            }
+            if cases.len() < limit {
+                cases.push(entry.clone());
+            } else {
+                return (cases, true);
+            }
+        }
+    }
+    (cases, false)
+}
+
 #[test]
 fn no_cases_and_not_ever_banned_skips_note() {
     let page = MemberHistoryPage {
@@ -42,7 +60,7 @@ fn no_cases_and_not_ever_banned_skips_note() {
         }],
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let (cases, truncated) = cases_from_pages(&[page]);
     assert_eq!(build_rejoin_note(cases, false, truncated), None);
 }
 
@@ -57,7 +75,7 @@ fn ever_banned_without_index_uses_not_ready_wording() {
         entries: vec![],
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let (cases, truncated) = cases_from_pages(&[page]);
     let note = build_rejoin_note(cases, true, truncated).unwrap();
     assert_eq!(note, RejoinNote::IndexNotReady);
     let vars = member_rejoin_vars(&user(42), &note);
@@ -97,7 +115,7 @@ fn three_cases_newest_first_with_tag_stripped() {
             .collect(),
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let (cases, truncated) = cases_from_pages(&[page]);
     let note = build_rejoin_note(cases, false, truncated).unwrap();
     let RejoinNote::Cases { lines, truncated } = note else {
         panic!("expected cases");
@@ -134,7 +152,7 @@ fn truncation_notice_when_more_than_eight_cases_exist() {
         entries,
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page]);
+    let (cases, truncated) = cases_from_pages(&[page]);
     assert!(truncated);
     assert_eq!(cases.len(), PRIOR_CASE_LIMIT as usize);
     let note = build_rejoin_note(cases, false, truncated).unwrap();
@@ -195,7 +213,7 @@ fn paginate_past_stay_rows_on_first_page() {
         entries: vec![case_row(1_000, "case-two"), case_row(500, "case-three")],
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page1, page2]);
+    let (cases, truncated) = cases_from_pages(&[page1, page2]);
     assert_eq!(cases.len(), 3);
     assert!(!truncated);
     let note = build_rejoin_note(cases, false, truncated).unwrap();
@@ -217,7 +235,7 @@ fn timeline_cursor_after_stays_does_not_imply_case_truncation() {
         entries: vec![stay_row(500, "stay-c")],
         next_cursor: None,
     };
-    let (cases, truncated) = collect_prior_cases_from_pages(&[page1, page2]);
+    let (cases, truncated) = cases_from_pages(&[page1, page2]);
     assert_eq!(cases.len(), 1);
     assert!(!truncated);
 }
@@ -241,7 +259,7 @@ fn template_with_eight_long_reasons_stays_within_discord_limit() {
             source_kind: None,
         })
         .collect();
-    let (cases, truncated) = collect_prior_cases_from_pages(&[MemberHistoryPage {
+    let (cases, truncated) = cases_from_pages(&[MemberHistoryPage {
         entries,
         next_cursor: None,
     }]);

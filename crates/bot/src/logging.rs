@@ -868,6 +868,7 @@ pub(crate) async fn emit_to_if(
         commit,
         false,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -893,6 +894,7 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         commit,
         true,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -918,6 +920,7 @@ async fn emit_to_observed(
         || true,
         false,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -943,6 +946,7 @@ pub(crate) async fn emit_with_components(
         commit,
         true,
         components,
+        None,
     )
     .await
     .0
@@ -982,6 +986,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     components: Vec<CreateActionRow>,
+    rejoin_enrich_user: Option<&serenity::model::user::User>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1049,6 +1054,24 @@ async fn emit_to_observed_with_audit(
                 vars.extend(context);
             }
             // Moderator-ID exclusions can only be evaluated after attribution.
+            if cfg
+                .log_filters
+                .get(event)
+                .is_some_and(|filter| excluded(filter, &vars))
+            {
+                return Ok(Delivery::Unconfigured);
+            }
+        }
+        if event == "member_rejoin" {
+            if let Some(user) = rejoin_enrich_user {
+                if !crate::member_rejoin::enrich_member_rejoin_vars(app, guild_id, user, &mut vars)
+                    .await
+                {
+                    return Ok(Delivery::Unconfigured);
+                }
+            } else if !vars.contains_key("cases") && !vars.contains_key("notice") {
+                return Ok(Delivery::Unconfigured);
+            }
             if cfg
                 .log_filters
                 .get(event)
@@ -2231,6 +2254,11 @@ pub(crate) async fn emit_member_event(
         || true,
         false,
         Vec::new(),
+        if event == "member_rejoin" {
+            Some(user)
+        } else {
+            None
+        },
     )
     .await
     .1
@@ -2260,6 +2288,7 @@ pub(crate) async fn emit_verified_member_departure(
         || true,
         false,
         Vec::new(),
+        None,
     )
     .await;
 }

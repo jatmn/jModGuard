@@ -1,10 +1,9 @@
 //! Optional prior-case note when a member joins and the guild store already has cases.
 
-use crate::db::guild_data::{
-    GuildDataScope, GuildDataStore, MemberHistoryEntry, MemberHistoryPage,
-};
+use crate::db::guild_data::{GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use crate::logging;
 use crate::state::BotState;
+#[cfg(test)]
 use crate::templates;
 use serenity::model::id::GuildId;
 use serenity::model::user::User;
@@ -12,7 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) const PRIOR_CASE_LIMIT: u32 = 8;
-const HISTORY_PAGE: u32 = 50;
 const REASON_UNITS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,65 +31,63 @@ pub(crate) fn build_rejoin_note(
     Some(RejoinNote::Cases { lines, truncated })
 }
 
-/// Walks mixed member-history pages until eight case rows are collected or the
-/// timeline ends. `truncated` is true only when a ninth case row exists.
-pub(crate) fn collect_prior_cases_from_pages(
-    pages: &[MemberHistoryPage],
-) -> (Vec<MemberHistoryEntry>, bool) {
-    let limit = PRIOR_CASE_LIMIT as usize;
-    let mut cases = Vec::new();
-    for page in pages {
-        for entry in &page.entries {
-            if entry.case_id.is_none() {
-                continue;
-            }
-            if cases.len() < limit {
-                cases.push(entry.clone());
-            } else {
-                return (cases, true);
-            }
-        }
-    }
-    (cases, false)
-}
-
 pub(crate) async fn collect_prior_cases(
     store: &GuildDataStore,
     scope: GuildDataScope,
     user_id: i64,
 ) -> Result<(Vec<MemberHistoryEntry>, bool), anyhow::Error> {
-    let limit = PRIOR_CASE_LIMIT as usize;
-    let mut cases = Vec::new();
-    let mut after = None;
-    loop {
-        let page = store
-            .member_history(scope.clone(), user_id, after, HISTORY_PAGE)
-            .await?;
-        for entry in page.entries {
-            if entry.case_id.is_none() {
-                continue;
-            }
-            if cases.len() < limit {
-                cases.push(entry);
-            } else {
-                return Ok((cases, true));
-            }
-        }
-        if page.next_cursor.is_none() {
-            return Ok((cases, false));
-        }
-        after = page.next_cursor;
-    }
+    store
+        .member_case_entries(scope, user_id, PRIOR_CASE_LIMIT)
+        .await
 }
 
-pub(crate) fn member_rejoin_vars(user: &User, note: &RejoinNote) -> BTreeMap<String, String> {
-    let display = user
-        .global_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(user.name.as_str());
-    let mut vars = templates::user_vars(user.id.get(), &user.name, display);
+/// Loads case lines for a member rejoin report after log delivery admission.
+pub(crate) async fn enrich_member_rejoin_vars(
+    app: &Arc<BotState>,
+    guild_id: GuildId,
+    user: &User,
+    vars: &mut BTreeMap<String, String>,
+) -> bool {
+    let Some(enrollment) = crate::cases::capture(app, guild_id.get()).await else {
+        return false;
+    };
+    let Ok((store, scope)) = app.tenant.live(enrollment).await else {
+        return false;
+    };
+    let user_id = user.id.get() as i64;
+    let ever_banned = match store.get_member(scope.clone(), user_id).await {
+        Ok(Some(profile)) => profile.ever_banned,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id,
+                "member rejoin profile unavailable: {error:#}"
+            );
+            false
+        }
+    };
+    let collected = collect_prior_cases(&store, scope, user_id).await;
+    let note = match collected {
+        Ok((cases, truncated)) => build_rejoin_note(cases, ever_banned, truncated),
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id,
+                "member rejoin case history unavailable: {error:#}"
+            );
+            None
+        }
+    };
+    let Some(note) = note else {
+        return false;
+    };
+    vars.extend(rejoin_note_vars(&note));
+    true
+}
+
+pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
     match note {
         RejoinNote::IndexNotReady => {
             vars.insert("cases".into(), String::new());
@@ -112,6 +108,19 @@ pub(crate) fn member_rejoin_vars(user: &User, note: &RejoinNote) -> BTreeMap<Str
             );
         }
     }
+    vars
+}
+
+#[cfg(test)]
+pub(crate) fn member_rejoin_vars(user: &User, note: &RejoinNote) -> BTreeMap<String, String> {
+    let display = user
+        .global_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(user.name.as_str());
+    let mut vars = templates::user_vars(user.id.get(), &user.name, display);
+    vars.extend(rejoin_note_vars(note));
     vars
 }
 
@@ -157,42 +166,16 @@ pub(crate) async fn maybe_emit_member_rejoin(
     guild_id: GuildId,
     user: &User,
 ) {
-    let Some(enrollment) = crate::cases::capture(app, guild_id.get()).await else {
-        return;
-    };
-    let Ok((store, scope)) = app.tenant.live(enrollment).await else {
-        return;
-    };
-    let user_id = user.id.get() as i64;
-    let ever_banned = match store.get_member(scope.clone(), user_id).await {
-        Ok(Some(profile)) => profile.ever_banned,
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(
-                guild_id = guild_id.get(),
-                user_id,
-                "member rejoin profile unavailable: {error:#}"
-            );
-            false
-        }
-    };
-    let collected = collect_prior_cases(&store, scope, user_id).await;
-    let note = match collected {
-        Ok((cases, truncated)) => build_rejoin_note(cases, ever_banned, truncated),
-        Err(error) => {
-            tracing::warn!(
-                guild_id = guild_id.get(),
-                user_id,
-                "member rejoin case history unavailable: {error:#}"
-            );
-            None
-        }
-    };
-    let Some(note) = note else {
-        return;
-    };
-    let vars = member_rejoin_vars(user, &note);
-    logging::emit_member_event(app, ctx, guild_id, "member_rejoin", user, vars, None).await;
+    logging::emit_member_event(
+        app,
+        ctx,
+        guild_id,
+        "member_rejoin",
+        user,
+        BTreeMap::new(),
+        None,
+    )
+    .await;
 }
 
 #[cfg(test)]
