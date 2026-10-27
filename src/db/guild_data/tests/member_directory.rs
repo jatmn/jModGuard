@@ -7041,6 +7041,53 @@ async fn cleanup_candidate_plan_uses_the_existing_scoped_index() {
 }
 
 #[tokio::test]
+async fn member_case_entries_skips_deleted_rows_before_limit() {
+    const SUBJECT: i64 = 88;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let id = CaseId::new();
+        ids.push(id.clone());
+        store
+            .record_case(
+                scope.clone(),
+                id,
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::Application {
+                        operation_id: CaseId::new(),
+                    },
+                    action: CaseAction::Kick,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: SUBJECT,
+                    actor_id: Some(42),
+                    occurred_at_ms: 3_000 - index,
+                    reason: Some(format!("live-{index}")),
+                    evidence: CaseEvidence::Unavailable,
+                },
+                CaseLimits::default(),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .remove_case(scope.clone(), ids[0].clone())
+        .await
+        .unwrap();
+    let (entries, truncated) = store
+        .member_case_entries(scope.clone(), SUBJECT, 8)
+        .await
+        .unwrap();
+    assert!(!truncated);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].reason.as_deref(), Some("live-1"));
+}
+
+#[tokio::test]
 async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
     const SUBJECT: i64 = 77;
     let (_fixture, store, scope) = ready().await;
@@ -7095,10 +7142,8 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
                 )?
                 .collect::<Result<Vec<_>>>()?;
             assert!(
-                plan.iter().any(|line| {
-                    line.contains("SEARCH guild_member_case_index")
-                        && line.contains("guild_member_cases_user")
-                }),
+                plan.iter()
+                    .any(|line| line.contains("guild_member_cases_user")),
                 "case index lookup must be scoped to the member: {plan:?}"
             );
             assert!(

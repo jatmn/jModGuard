@@ -15,30 +15,60 @@ const REASON_UNITS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RejoinNote {
-    Cases { lines: Vec<String>, truncated: bool },
+    Cases {
+        lines: Vec<String>,
+        truncated: bool,
+        index_incomplete: bool,
+    },
     IndexNotReady,
+    BanHistoryOnly,
 }
 
-pub(crate) fn build_rejoin_note(
-    cases: Vec<MemberHistoryEntry>,
-    ever_banned: bool,
-    truncated: bool,
-) -> Option<RejoinNote> {
-    if cases.is_empty() {
-        return ever_banned.then_some(RejoinNote::IndexNotReady);
+#[derive(Debug, Clone)]
+pub(crate) struct PriorCases {
+    pub entries: Vec<MemberHistoryEntry>,
+    pub truncated: bool,
+    pub index_complete: bool,
+}
+
+pub(crate) fn build_rejoin_note(cases: PriorCases, ever_banned: bool) -> Option<RejoinNote> {
+    if cases.entries.is_empty() {
+        if !cases.index_complete {
+            return Some(RejoinNote::IndexNotReady);
+        }
+        if ever_banned {
+            return Some(RejoinNote::BanHistoryOnly);
+        }
+        return None;
     }
-    let lines = cases.iter().map(format_case_line).collect();
-    Some(RejoinNote::Cases { lines, truncated })
+    let lines = cases.entries.iter().map(format_case_line).collect();
+    Some(RejoinNote::Cases {
+        lines,
+        truncated: cases.truncated,
+        index_incomplete: !cases.index_complete,
+    })
 }
 
 pub(crate) async fn collect_prior_cases(
     store: &GuildDataStore,
     scope: GuildDataScope,
     user_id: i64,
-) -> Result<(Vec<MemberHistoryEntry>, bool), anyhow::Error> {
-    store
-        .member_case_entries(scope, user_id, PRIOR_CASE_LIMIT)
-        .await
+) -> Result<PriorCases, anyhow::Error> {
+    let index_complete = store.member_case_index_complete(scope.clone()).await?;
+    let (entries, truncated) = if index_complete {
+        store
+            .member_case_entries(scope, user_id, PRIOR_CASE_LIMIT)
+            .await?
+    } else {
+        store
+            .member_subject_case_entries(scope, user_id, PRIOR_CASE_LIMIT)
+            .await?
+    };
+    Ok(PriorCases {
+        entries,
+        truncated,
+        index_complete,
+    })
 }
 
 /// Loads case lines for a member rejoin report after log delivery admission.
@@ -48,11 +78,27 @@ pub(crate) async fn enrich_member_rejoin_vars(
     user: &User,
     vars: &mut BTreeMap<String, String>,
 ) -> bool {
-    let Some(enrollment) = crate::cases::capture(app, guild_id.get()).await else {
-        return false;
+    let guild = i64::try_from(guild_id.get()).unwrap_or(0);
+    let enrollment = match crate::db::guild_enrollment(&app.db, guild).await {
+        Ok(Some(enrollment)) => enrollment,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                "member rejoin enrollment lookup failed: {error:#}"
+            );
+            return false;
+        }
     };
-    let Ok((store, scope)) = app.tenant.live(enrollment).await else {
-        return false;
+    let (store, scope) = match app.tenant.live(enrollment).await {
+        Ok(live) => live,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                "member rejoin guild store unavailable: {error:#}"
+            );
+            return false;
+        }
     };
     let user_id = user.id.get() as i64;
     let ever_banned = match store.get_member(scope.clone(), user_id).await {
@@ -69,7 +115,7 @@ pub(crate) async fn enrich_member_rejoin_vars(
     };
     let collected = collect_prior_cases(&store, scope, user_id).await;
     let note = match collected {
-        Ok((cases, truncated)) => build_rejoin_note(cases, ever_banned, truncated),
+        Ok(cases) => build_rejoin_note(cases, ever_banned),
         Err(error) => {
             tracing::warn!(
                 guild_id = guild_id.get(),
@@ -96,16 +142,34 @@ pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
                 "Ban history is recorded; indexed case lines are not ready yet.".into(),
             );
         }
-        RejoinNote::Cases { lines, truncated } => {
-            vars.insert("cases".into(), lines.join("\n"));
+        RejoinNote::BanHistoryOnly => {
+            vars.insert("cases".into(), String::new());
             vars.insert(
                 "notice".into(),
-                if *truncated {
-                    "Older cases are omitted from this note.".into()
-                } else {
-                    String::new()
-                },
+                "Recorded ban history exists; no case details are available to list.".into(),
             );
+        }
+        RejoinNote::Cases {
+            lines,
+            truncated,
+            index_incomplete,
+        } => {
+            vars.insert("cases".into(), lines.join("\n"));
+            let mut notice = String::new();
+            if *index_incomplete {
+                notice =
+                    "Case index backfill is still running; additional history may appear later."
+                        .into();
+            }
+            if *truncated {
+                let omitted = "Older cases are omitted from this note.";
+                notice = if notice.is_empty() {
+                    omitted.into()
+                } else {
+                    format!("{notice} {omitted}")
+                };
+            }
+            vars.insert("notice".into(), notice);
         }
     }
     vars
@@ -131,12 +195,21 @@ fn format_case_line(entry: &MemberHistoryEntry) -> String {
     let mut line = format!("- `{action}` · {outcome} · `{time}`");
     if let Some(reason) = entry.reason.as_deref().filter(|value| !value.is_empty()) {
         let clean = jmodguard::ban_reason::without_tag(reason);
-        let clipped = clip_units(clean, REASON_UNITS);
+        let clipped = clip_units(&sanitize_reason_for_report(clean), REASON_UNITS);
         if !clipped.is_empty() {
             line.push_str(&format!(" — {clipped}"));
         }
     }
     line
+}
+
+fn sanitize_reason_for_report(text: &str) -> String {
+    let single_line = text.replace(['\r', '\n'], " ");
+    single_line
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
 }
 
 fn format_case_time(ms: Option<i64>) -> String {

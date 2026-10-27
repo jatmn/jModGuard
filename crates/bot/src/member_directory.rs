@@ -454,7 +454,7 @@ async fn member_records_ban(
         .is_some_and(|member| member.is_banned)
 }
 
-pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) {
+pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) -> bool {
     let Some((store, scope)) = live_observation(
         app,
         member.guild_id.get(),
@@ -463,25 +463,29 @@ pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) 
     )
     .await
     else {
-        return;
+        return false;
     };
-    if let Err(error) = store
+    match store
         .observe_member(scope.clone(), from_member(member, observed_at_ms, true))
         .await
     {
-        tracing::warn!(
-            guild_id = member.guild_id.get(),
-            user_id = member.user.id.get(),
-            "member join observation failed: {error:#}"
-        );
-        mark_gap(
-            app,
-            &store,
-            scope,
-            Some(member.user.id.get() as i64),
-            "member join persistence unavailable",
-        )
-        .await;
+        Ok(outcome) => outcome.membership_refresh,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = member.guild_id.get(),
+                user_id = member.user.id.get(),
+                "member join observation failed: {error:#}"
+            );
+            mark_gap(
+                app,
+                &store,
+                scope,
+                Some(member.user.id.get() as i64),
+                "member join persistence unavailable",
+            )
+            .await;
+            false
+        }
     }
 }
 
