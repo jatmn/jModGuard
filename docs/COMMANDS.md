@@ -11,9 +11,9 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 
 | Command | Category | Permission | Description |
 |---|---|---|---|
-| `!ban <user> [reason]` | Moderation | mod | Ban a user (aliases: `!yeet`, `!b`) |
+| `!ban <user> [reason] [--dm]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
-| `!kick <user> [reason]` | Moderation | mod | Kick a user (`!k`) |
+| `!kick <user> [reason] [--dm]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
 | `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
@@ -31,6 +31,8 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
 | `!about` | Utility | everyone | Bot info |
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
+
+`/kick` and `/ban` accept an optional boolean `dm` to DM the reason to the target.
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,

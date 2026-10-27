@@ -3,6 +3,7 @@
 //! cooldown, behavior execution), and mirror to Discord slash commands.
 
 pub mod behaviors;
+pub mod mod_reason_dm;
 pub mod plans;
 
 use anyhow::Result;
@@ -63,6 +64,10 @@ impl Args {
 
     pub fn is_empty(&self) -> bool {
         self.pos >= self.parts.len()
+    }
+
+    pub(crate) fn strip_dm_flag(&mut self) -> bool {
+        mod_reason_dm::take_prefix_dm_flag(&mut self.parts)
     }
 }
 
@@ -426,6 +431,8 @@ pub struct CmdEnv<'a> {
     pub actor: serenity::model::id::UserId,
     pub actor_member: serenity::model::guild::Member,
     pub args: Args,
+    /// When true, DM the moderation reason to the target before kick/ban.
+    pub dm: bool,
     /// Source message (prefix commands) — None for slash commands.
     pub source_message: Option<serenity::model::id::MessageId>,
 }
@@ -603,6 +610,8 @@ pub async fn handle_prefix(
         return Ok(true);
     }
 
+    let mut args = Args::new(raw_args);
+    let dm = args.strip_dm_flag();
     let env = CmdEnv {
         app,
         ctx,
@@ -611,7 +620,8 @@ pub async fn handle_prefix(
         channel_id: msg.channel_id,
         actor: msg.author.id,
         actor_member: member,
-        args: Args::new(raw_args),
+        args,
+        dm,
         source_message: Some(msg.id),
     };
     tracing::info!(
@@ -998,7 +1008,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         return;
     }
 
-    let args = Args::from_parts(options_to_args(&cmd, &slash.options));
+    let (arg_parts, dm) = options_to_args_with_dm(&cmd, &slash.options);
     let env = CmdEnv {
         app,
         ctx,
@@ -1007,7 +1017,8 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         channel_id: slash.channel_id,
         actor: actor_id,
         actor_member: member,
-        args,
+        args: Args::from_parts(arg_parts),
+        dm,
         source_message: None,
     };
     match run_command(env).await {
@@ -1065,9 +1076,16 @@ fn option_value_string(value: Option<CommandDataOptionValue>) -> String {
     }
 }
 
-fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String> {
+pub(crate) fn options_to_args_with_dm(
+    cmd: &CommandDef,
+    options: &[(String, String)],
+) -> (Vec<String>, bool) {
+    let dm = mod_reason_dm::slash_dm_flag(options);
     let mut out = Vec::new();
     for spec in behaviors::slash_spec(&cmd.behavior) {
+        if mod_reason_dm::slash_option_excluded_from_args(spec.name) {
+            continue;
+        }
         let s = options
             .iter()
             .find(|(n, _)| n == spec.name)
@@ -1077,7 +1095,7 @@ fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String
             out.push(s);
         }
     }
-    out
+    (out, dm)
 }
 
 async fn respond(
@@ -1284,6 +1302,16 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
             }
             (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => {
                 "Slowmode set to {duration}"
+            }
+            (Behavior::Kick { .. }, "Kicked {target} | {reason}")
+                if vars.contains_key("mod_reason_dm_clause") =>
+            {
+                "Kicked {target} | {reason}{mod_reason_dm_clause}"
+            }
+            (Behavior::Ban { .. }, "Banned {target} | {reason}")
+                if vars.contains_key("mod_reason_dm_clause") =>
+            {
+                "Banned {target} | {reason}{mod_reason_dm_clause}"
             }
             _ => &cmd.response,
         };
@@ -1994,6 +2022,67 @@ mod tests {
             vars: BTreeMap::new(),
             suppress_response,
         }
+    }
+
+    #[test]
+    fn slash_dm_option_sets_flag_without_polluting_reason_args() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let (args, dm) = options_to_args_with_dm(
+            &kick,
+            &[("user".into(), "42".into()), ("dm".into(), "true".into())],
+        );
+        assert!(dm);
+        assert_eq!(args, vec!["42"]);
+        assert!(!args.iter().any(|part| part == "true"));
+
+        let ban = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap();
+        let (args, dm) = options_to_args_with_dm(
+            &ban,
+            &[("user".into(), "7".into()), ("dm".into(), "false".into())],
+        );
+        assert!(!dm);
+        assert_eq!(args, vec!["7"]);
+
+        let (args, dm) = options_to_args_with_dm(
+            &ban,
+            &[("user".into(), "7".into()), ("dm".into(), "true".into())],
+        );
+        assert!(dm);
+        assert_eq!(args, vec!["7"]);
+    }
+
+    #[test]
+    fn shipped_kick_ban_response_adds_dm_clause_only_for_defaults() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let mut with_dm = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam".into()),
+                ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&kick, &with_dm),
+            "Kicked Member | spam | Reason DM sent."
+        );
+
+        let mut custom = kick.clone();
+        custom.response = "Custom kick {target}".into();
+        assert_eq!(render_outcome(&custom, &with_dm), "Custom kick Member");
+
+        with_dm.vars.remove("mod_reason_dm_clause");
+        assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");
     }
 
     #[test]

@@ -6,13 +6,50 @@ use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
-use super::{Args, BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
+use super::{Args, BehaviorOutcome, CmdEnv, mod_reason_dm, refuse_fenced_discord_mutation};
 
 fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
     if env.app.activation.may_record() {
         Ok(())
     } else {
         Err(anyhow!("writer lease is not held"))
+    }
+}
+
+fn refuse_bot_target(env: &CmdEnv<'_>, target: serenity::model::id::UserId) -> Result<()> {
+    if target == env.ctx.cache.current_user().id {
+        return Err(anyhow!("cannot moderate the bot"));
+    }
+    Ok(())
+}
+
+async fn optional_mod_reason_dm(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+    action: &str,
+    reason: &str,
+) -> Result<Option<mod_reason_dm::ModReasonDmOutcome>> {
+    if !env.dm {
+        return Ok(None);
+    }
+    if !env.app.activation.may_record() {
+        return Err(anyhow!("writer lease is not held"));
+    }
+    let reason = jmodguard::ban_reason::without_tag(reason);
+    let outcome = mod_reason_dm::send_mod_reason_dm(env, target, action, reason).await;
+    mod_reason_dm::dm_outcome_allows_moderation(outcome)?;
+    Ok(Some(outcome))
+}
+
+fn apply_mod_reason_dm_clause(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    dm: Option<mod_reason_dm::ModReasonDmOutcome>,
+) {
+    if let Some(outcome) = dm {
+        vars.insert(
+            "mod_reason_dm_clause".into(),
+            mod_reason_dm::render_mod_reason_dm_clause(outcome),
+        );
     }
 }
 use crate::types::Behavior;
@@ -37,7 +74,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
+            refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
+            let dm_outcome = optional_mod_reason_dm(env, target, "banned", &reason).await?;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -201,6 +240,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -306,7 +346,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
+            refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
+            let dm_outcome = optional_mod_reason_dm(env, target, "kicked", &reason).await?;
             lease_held(env)?;
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
@@ -345,6 +387,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -1421,11 +1464,12 @@ fn opt(
 }
 
 pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
-    use CommandOptionType::{Channel, Integer, String as Str, User};
+    use CommandOptionType::{Boolean, Channel, Integer, String as Str, User};
     match behavior {
         Behavior::Ban { .. } => vec![
             opt("user", User, true, "User to ban"),
             opt("reason", Str, false, "Ban reason"),
+            opt("dm", Boolean, false, "DM the reason"),
         ],
         Behavior::Unban { .. } => vec![
             opt("user", User, true, "User to unban"),
@@ -1434,6 +1478,7 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Kick { .. } => vec![
             opt("user", User, true, "User to kick"),
             opt("reason", Str, false, "Kick reason"),
+            opt("dm", Boolean, false, "DM the reason"),
         ],
         Behavior::Timeout { .. } => vec![
             opt("user", User, true, "User to timeout"),
@@ -1777,7 +1822,8 @@ mod tests {
             ("action".into(), "dryrun".into()),
             ("value".into(), "off".into()),
         ];
-        let mut slash = Args::from_parts(super::super::options_to_args(&command, &options));
+        let mut slash =
+            Args::from_parts(super::super::options_to_args_with_dm(&command, &options).0);
         assert_eq!(
             rule_action_and_id(&mut slash, "list"),
             ("dryrun".into(), "repeat_text".into())
@@ -1821,6 +1867,19 @@ mod tests {
         assert!(rule.params.get("mode").is_none());
     }
     use crate::types::Behavior;
+
+    #[test]
+    fn kick_ban_slash_specs_include_optional_dm_flag() {
+        let kick_specs = slash_spec(&Behavior::Kick {
+            default_reason: "Kicked by a moderator".into(),
+        });
+        assert!(kick_specs.iter().any(|o| o.name == "dm"));
+        let ban_specs = slash_spec(&Behavior::Ban {
+            default_reason: "Banned by a moderator".into(),
+            delete_days: 0,
+        });
+        assert!(ban_specs.iter().any(|o| o.name == "dm"));
+    }
 
     #[test]
     fn setname_slash_name_option_is_optional() {

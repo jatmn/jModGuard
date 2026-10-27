@@ -483,6 +483,15 @@ pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
 pub const ATTACHMENT_BURST_BANNED: &str = "banned";
 pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
 
+/// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
+pub const MOD_REASON_DM_TEMPLATE: &str =
+    "You were {action} from **{guild}**.\nReason: {reason}\n— {actor}";
+
+/// Shipped kick/ban confirmation clause when a reason DM was requested.
+pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";
+pub const MOD_REASON_DM_STATUS_SENT: &str = "Reason DM sent.";
+pub const MOD_REASON_DM_STATUS_NOT_SENT: &str = "Reason DM not sent.";
+
 /// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
 ///
 /// These stay out of [`default_templates`] so startup does not insert new
