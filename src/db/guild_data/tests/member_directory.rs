@@ -7076,7 +7076,7 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
             .unwrap();
     }
     let (entries, truncated) = store
-        .member_case_entries(scope.clone(), SUBJECT, 8)
+        .member_case_entries(scope.clone(), SUBJECT, 8, CaseLimits::default())
         .await
         .unwrap();
     assert!(truncated);
@@ -7093,7 +7093,8 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
                         scope.guild_id(),
                         scope.enrollment.id.as_str(),
                         SUBJECT,
-                        9_i64
+                        9_i64,
+                        CaseLimits::default().max_record_bytes as i64
                     ],
                     |row| Ok(row.get::<String>(3)?),
                 )?
@@ -7170,7 +7171,7 @@ async fn member_case_entries_reports_stale_while_index_backfill_pending() {
         .await
         .unwrap();
     let err = store
-        .member_case_entries(scope, SUBJECT, 8)
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
         .await
         .unwrap_err();
     assert!(
@@ -7242,7 +7243,7 @@ async fn member_case_entries_reports_stale_for_nonempty_partial_index_during_bac
         .await
         .unwrap();
     let err = store
-        .member_case_entries(scope.clone(), SUBJECT, 8)
+        .member_case_entries(scope.clone(), SUBJECT, 8, CaseLimits::default())
         .await
         .unwrap_err();
     assert!(
@@ -7254,7 +7255,10 @@ async fn member_case_entries_reports_stale_for_nonempty_partial_index_during_bac
         .backfill_member_case_index(scope.clone(), 42, 100)
         .await
         .unwrap();
-    let (entries, _) = store.member_case_entries(scope, SUBJECT, 8).await.unwrap();
+    let (entries, _) = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].occurred_at_ms, Some(950));
 }
@@ -7292,9 +7296,60 @@ async fn member_case_entries_after_backfill_includes_newly_recorded_cases() {
         )
         .await
         .unwrap();
-    let (entries, _) = store.member_case_entries(scope, SUBJECT, 8).await.unwrap();
+    let (entries, _) = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].occurred_at_ms, Some(5_000));
+}
+
+#[tokio::test]
+async fn member_case_entries_rejects_oversized_case_payload() {
+    const SUBJECT: i64 = 55;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .backfill_member_case_index(scope.clone(), 42, 100)
+        .await
+        .unwrap();
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Kick,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: SUBJECT,
+                actor_id: Some(42),
+                occurred_at_ms: 4_000,
+                reason: Some("budgeted read".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    let tiny = CaseLimits {
+        max_record_bytes: 1,
+        ..CaseLimits::default()
+    };
+    let err = store
+        .member_case_entries(scope, SUBJECT, 8, tiny)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<CaseError>()
+            .is_some_and(|e| matches!(e, CaseError::Limit)),
+        "indexed case rows must honor the per-record read budget: {err:#}"
+    );
 }
 
 #[tokio::test]
@@ -7308,7 +7363,12 @@ async fn member_case_entries_index_gap_is_scoped_to_member() {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
             let plan = stmt
                 .query_map(
-                    params![scope.guild_id(), scope.enrollment.id.as_str(), SUBJECT],
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        SUBJECT,
+                        CaseLimits::default().max_record_bytes as i64
+                    ],
                     |row| Ok(row.get::<String>(3)?),
                 )?
                 .collect::<Result<Vec<_>>>()?;

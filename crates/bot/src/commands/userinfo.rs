@@ -1,6 +1,6 @@
 //! `!userinfo` / `/userinfo` — cached member snapshot plus warns and case history.
 
-use crate::db::guild_data::{GuildDataScope, GuildDataStore, MemberHistoryEntry};
+use crate::db::guild_data::{CaseLimits, GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::voice::VoiceState;
@@ -503,7 +503,12 @@ async fn load_case_lines_from_store(
     target: UserId,
 ) -> CasesField {
     let loaded = store
-        .member_case_entries(scope, target.get() as i64, CASE_LINE_LIMIT)
+        .member_case_entries(
+            scope,
+            target.get() as i64,
+            CASE_LINE_LIMIT,
+            CaseLimits::default(),
+        )
         .await;
     match loaded {
         Ok((entries, _truncated)) => {
