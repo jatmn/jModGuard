@@ -1,8 +1,11 @@
 //! Anonymous, digest-pinned reads of the project's public GHCR OCI images.
 //! Registry tags are discovery pointers; a queued install keeps its digest.
+use crate::signature;
 use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use jmodguard::db::ComponentRelease;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH};
+use reqwest::StatusCode;
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -134,6 +137,24 @@ impl Registry {
         accept: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+        let (status, body, headers) = self
+            .get_limited_status(url, token, accept, limit)
+            .await?;
+        ensure!(
+            status.is_success(),
+            "registry returned HTTP {}",
+            status
+        );
+        Ok((body, headers))
+    }
+
+    async fn get_limited_status(
+        &self,
+        url: String,
+        token: Option<&str>,
+        accept: Option<&str>,
+        limit: usize,
+    ) -> Result<(StatusCode, Vec<u8>, reqwest::header::HeaderMap)> {
         let mut request = self.http.get(url);
         if let Some(token) = token {
             request = request.bearer_auth(token);
@@ -142,13 +163,10 @@ impl Registry {
             request = request.header(ACCEPT, accept);
         }
         let mut response = request.send().await.map_err(reqwest::Error::without_url)?;
-        ensure!(
-            response.status().is_success(),
-            "registry returned HTTP {}",
-            response.status()
-        );
+        let status = response.status();
         if let Some(raw) = response.headers().get(CONTENT_LENGTH)
             && let Ok(length) = raw.to_str()?.parse::<u64>()
+            && status.is_success()
         {
             ensure!(length <= limit as u64, "registry object exceeds size limit");
         }
@@ -165,10 +183,54 @@ impl Registry {
             );
             body.extend_from_slice(&chunk);
         }
-        Ok((body, headers))
+        if status.is_success()
+            && let Some(raw) = headers.get(CONTENT_LENGTH)
+            && let Ok(length) = raw.to_str()?.parse::<usize>()
+            && body.len() != length
+        {
+            bail!("incomplete registry body");
+        }
+        Ok((status, body, headers))
     }
 
-    async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String)> {
+    async fn signature_body(&self, repo: &str, manifest_digest: &str) -> Result<Vec<u8>> {
+        let tag = signature::signature_tag_for_digest(manifest_digest)?;
+        let token = self.token(repo).await?;
+        let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
+        let (status, body, _) = self
+            .get_limited_status(url, token.as_deref(), None, MAX_MANIFEST)
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            bail!(signature::ImageSignatureRejection {
+                phrase: signature::UNSIGNED_IMAGE,
+            });
+        }
+        ensure!(
+            status.is_success(),
+            "registry returned HTTP {}",
+            status
+        );
+        Ok(body)
+    }
+
+    async fn verify_manifest(
+        &self,
+        component: &str,
+        repo: &str,
+        manifest_digest: &str,
+        manifest_bytes: &[u8],
+    ) -> Result<()> {
+        let signature = self.signature_body(repo, manifest_digest).await?;
+        signature::verify_manifest_signature(
+            component,
+            manifest_digest,
+            manifest_bytes,
+            &signature,
+            Utc::now(),
+        )
+    }
+
+    async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {
         ensure!(
             !reference.contains('/') && !reference.contains('?') && !reference.contains('#'),
             "invalid image reference"
@@ -203,7 +265,7 @@ impl Registry {
                 "invalid image layer descriptor"
             );
         }
-        Ok((parsed, digest))
+        Ok((parsed, digest, bytes))
     }
 
     async fn blob(&self, repo: &str, descriptor: &Descriptor, limit: usize) -> Result<Vec<u8>> {
@@ -268,7 +330,9 @@ impl Registry {
             "invalid channel"
         );
         let repo = repository(component)?;
-        let (manifest, image_digest) = self.manifest(repo, reference).await?;
+        let (manifest, image_digest, manifest_bytes) = self.manifest(repo, reference).await?;
+        self.verify_manifest(component, repo, &image_digest, &manifest_bytes)
+            .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config.architecture == "amd64" && config.os == "linux",
@@ -356,7 +420,10 @@ impl Registry {
             !requested.is_empty() && requested.len() <= 16,
             "invalid file request"
         );
-        let (manifest, _) = self.manifest(repo, &release.digest).await?;
+        let (manifest, digest, manifest_bytes) = self.manifest(repo, &release.digest).await?;
+        ensure!(digest == release.digest, "manifest digest mismatch");
+        self.verify_manifest(&release.component, repo, &digest, &manifest_bytes)
+            .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config

@@ -7,6 +7,9 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
 use jmodguard_updater::oci::{Registry, sha256_hex};
+use jmodguard_updater::signature::{
+    boot_repair_reason, registry_transient, signature_rejection_phrase, SCHEMA_MISMATCH,
+};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -551,6 +554,19 @@ async fn watch_child_health_from(
     }
 }
 
+async fn discard_stale_staging_files(dir: &Path) {
+    let Ok(entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut entries = entries;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".stage-") {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 async fn stage(
     registry: &Registry,
     release: &ComponentRelease,
@@ -582,16 +598,24 @@ async fn stage(
     );
     // PID 1 reads only this fixed directory; TMPDIR is allowed to differ.
     tokio::fs::create_dir_all(&dir).await?;
+    discard_stale_staging_files(dir).await;
     let target = dir.join(format!("{}-{hash}", release.component));
     let temp = dir.join(format!(".stage-{:032x}", rand::random::<u128>()));
-    tokio::fs::write(&temp, binary).await?;
-    tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).await?;
-    tokio::fs::rename(&temp, &target).await?;
-    ensure!(
-        sha256_hex(&tokio::fs::read(&target).await?) == hash,
-        "staged binary hash mismatch"
-    );
-    Ok(target)
+    let staged: Result<PathBuf> = async {
+        tokio::fs::write(&temp, binary).await?;
+        tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).await?;
+        ensure!(
+            sha256_hex(&tokio::fs::read(&temp).await?) == hash,
+            "staged binary hash mismatch"
+        );
+        tokio::fs::rename(&temp, &target).await?;
+        Ok(target)
+    }
+    .await;
+    if staged.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    staged
 }
 
 fn observation(
@@ -1318,6 +1342,14 @@ impl Supervisor {
         }
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
+            let state = self.control.component(&self.role).await?;
+            if state
+                .installed
+                .as_ref()
+                .is_some_and(|installed| installed.digest == release.digest)
+            {
+                self.control.clear_boot_mismatch(&self.role).await?;
+            }
         }
         self.end_idle().await?;
         let child = match launch(path, sha, release).await {
@@ -1566,6 +1598,70 @@ impl Supervisor {
         Ok(false)
     }
 
+    fn baked_supports_schema(&self, schema: i64) -> bool {
+        if self.role == "bot" {
+            (15..=self.baked_compatibility.core).contains(&schema)
+        } else {
+            schema == self.baked_compatibility.core
+        }
+    }
+
+    fn baked_supports_guild(&self, state: &db::ComponentUpdate) -> bool {
+        state
+            .observed
+            .as_ref()
+            .and_then(|seen| seen.guild_schema)
+            == Some(self.baked_compatibility.guild)
+    }
+
+    async fn record_boot_mismatch_for_installed(
+        &self,
+        release: &ComponentRelease,
+        reason: &str,
+    ) -> Result<()> {
+        self.control
+            .record_boot_mismatch(db::BootMismatchRecord {
+                component: self.role.clone(),
+                running: self.base_sha.clone(),
+                expected: db::BootMismatchExpected {
+                    release_id: release.release_id.clone(),
+                    source_sha: release.source_sha.clone(),
+                },
+                reason: reason.to_owned(),
+            })
+            .await
+    }
+
+    async fn boot_fallback_from_installed(
+        &mut self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+        reason: &str,
+    ) -> Result<()> {
+        let schema = self.control.schema_version().await?;
+        if !self.baked_supports_schema(schema) {
+            bail!("baked application cannot open database; use owner recovery");
+        }
+        if !self.baked_supports_guild(state) {
+            self.record_boot_mismatch_for_installed(release, SCHEMA_MISMATCH)
+                .await?;
+            bail!("baked application cannot open database; use owner recovery");
+        }
+        tracing::error!(
+            component = %self.role,
+            digest = %release.digest,
+            baked_sha = %self.base_sha,
+            reason = reason,
+            "installed release could not be restored from the registry; starting baked application"
+        );
+        self.record_boot_mismatch_for_installed(release, reason)
+            .await?;
+        let baked = self.baked.clone();
+        let base_sha = self.base_sha.clone();
+        self.start(&baked, &base_sha, None).await?;
+        Ok(())
+    }
+
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some((failed, error)) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
@@ -1601,15 +1697,28 @@ impl Supervisor {
                 release.base_abi == self.base_abi,
                 "installed application requires a different base ABI"
             );
-            let path = stage(
+            match stage(
                 &self.registry,
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
             )
-            .await?;
-            self.start(&path, &release.source_sha, Some(release.clone()))
-                .await?;
+            .await
+            {
+                Ok(path) => {
+                    self.control.clear_boot_mismatch(&self.role).await?;
+                    self.start(&path, &release.source_sha, Some(release.clone()))
+                        .await?;
+                }
+                Err(error) => {
+                    if let Some(reason) = boot_repair_reason(&error) {
+                        return self
+                            .boot_fallback_from_installed(state, release, reason)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             // A baked bot owns migrations. A protocol-aware observation alone
             // does not make an uninstalled, queued release a managed baseline.
@@ -2060,8 +2169,13 @@ impl Supervisor {
         {
             Ok(path) => path,
             Err(error) => {
-                self.record_component_failure(candidate, format!("download: {error:#}"))
-                    .await?;
+                if registry_transient(&error) {
+                    return Ok(false);
+                }
+                let message = signature_rejection_phrase(&error)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("download: {error:#}"));
+                self.record_component_failure(candidate, message).await?;
                 return Ok(false);
             }
         };
@@ -2639,6 +2753,8 @@ async fn main() -> Result<()> {
         }
         Vec::new()
     };
+    let staging = PathBuf::from("/tmp/jmodguard-updates");
+    discard_stale_staging_files(&staging).await;
     let mut supervisor = Supervisor {
         role,
         base_sha,
@@ -2667,7 +2783,7 @@ async fn main() -> Result<()> {
         before_idle_gate: None,
         #[cfg(test)]
         after_idle_gate: None,
-        staging: PathBuf::from("/tmp/jmodguard-updates"),
+        staging,
         prepared: None,
         standby: None,
         rejected_candidate: None,

@@ -882,6 +882,75 @@ pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Re
     }).await
 }
 
+pub const UPDATE_BOOT_MISMATCH_META: &str = "update_boot_mismatch_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootMismatchExpected {
+    pub release_id: String,
+    pub source_sha: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootMismatchRecord {
+    pub component: String,
+    pub running: String,
+    pub expected: BootMismatchExpected,
+    pub reason: String,
+}
+
+pub type BootMismatchMap = std::collections::BTreeMap<String, BootMismatchRecord>;
+
+pub fn read_boot_mismatch_map_conn(conn: &impl SqlExecutor) -> Result<BootMismatchMap> {
+    let raw = meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?;
+    match raw {
+        None => Ok(BootMismatchMap::new()),
+        Some(value) => Ok(serde_json::from_str(&value)?),
+    }
+}
+
+pub async fn read_boot_mismatch_map(db: &Db) -> Result<BootMismatchMap> {
+    db.with_conn(|conn| read_boot_mismatch_map_conn(conn)).await
+}
+
+pub fn write_boot_mismatch_map_conn(
+    conn: &impl SqlExecutor,
+    map: &BootMismatchMap,
+) -> Result<()> {
+    if map.is_empty() {
+        conn.execute("DELETE FROM meta WHERE key=?1", params![UPDATE_BOOT_MISMATCH_META])?;
+        return Ok(());
+    }
+    write_meta_string_conn(
+        conn,
+        UPDATE_BOOT_MISMATCH_META,
+        &serde_json::to_string(map)?,
+    )?;
+    Ok(())
+}
+
+pub async fn record_boot_mismatch(db: &Db, record: BootMismatchRecord) -> Result<()> {
+    let record = record;
+    db.with_conn(move |conn| {
+        let mut map = read_boot_mismatch_map_conn(conn)?;
+        map.insert(record.component.clone(), record);
+        write_boot_mismatch_map_conn(conn, &map)?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn clear_boot_mismatch(db: &Db, component: &str) -> Result<()> {
+    let component = component.to_owned();
+    db.with_conn(move |conn| {
+        let mut map = read_boot_mismatch_map_conn(conn)?;
+        if map.remove(&component).is_some() {
+            write_boot_mismatch_map_conn(conn, &map)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

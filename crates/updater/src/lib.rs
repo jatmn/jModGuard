@@ -2,7 +2,10 @@
 //! the owner API and the role-specific service launcher.
 
 pub mod oci;
+pub mod signature;
 pub mod storage;
+
+pub mod signing_fixture;
 
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::{self, ComponentRelease, Db};

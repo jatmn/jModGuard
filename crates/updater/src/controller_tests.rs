@@ -4,9 +4,22 @@
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
+use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice};
+use jmodguard_updater::signature::{
+    UNSIGNED_IMAGE, signature_tag_for_digest,
+};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+fn test_signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::new();
+        fixture.apply_env();
+        fixture
+    })
+}
 
 async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) -> Response {
     match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
@@ -54,6 +67,13 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     objects.insert(config_hash, config);
     objects.insert(layer_hash, layer);
     objects.insert(manifest_hash.clone(), manifest);
+    test_signing().sign(
+        objects,
+        role,
+        &manifest_hash,
+        "2027-12-31T00:00:00Z",
+        SigningKeyChoice::Current,
+    );
     ComponentRelease {
         component: role.into(),
         channel: "latest".into(),
@@ -8016,6 +8036,172 @@ async fn baked_auth_rejection_after_ready_is_held() {
     assert!(!ready_file.exists());
     assert_eq!(independent_exit_starts(&root).await, ["baked-bot.start"]);
     bot.end_idle().await.unwrap();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn registry_with_objects(
+    objects: HashMap<String, Vec<u8>>,
+) -> (Registry, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    (registry, server)
+}
+
+#[tokio::test]
+async fn bad_signature_leaves_running_child_without_rollback() {
+    let root = std::env::temp_dir().join(format!("sig-rollback-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let running = executable(&root, "running-bot").await;
+    let candidate_bin = executable(&root, "candidate-bot").await;
+    let mut objects = HashMap::new();
+    let release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(candidate_bin).await.unwrap(),
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.insert(tag, b"broken-signature".to_vec());
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    control
+        .checked("bot", "latest", Some(release.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    let mut bot = controller("bot", running.clone(), registry, control.clone(), &root);
+    bot.start(&running, &"b".repeat(40), None).await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    bot.reported = true;
+    for _ in 0..10 {
+        bot.tick().await.unwrap();
+    }
+    assert!(bot.running.is_some());
+    assert!(bot.rollback.is_none());
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_ignores_leftover_stage_file() {
+    let root = std::env::temp_dir().join(format!("sig-stage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let mut objects = HashMap::new();
+    let mut release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let release_json = serde_json::to_string(&release).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, state='running' WHERE component='bot'",
+            params![release_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let staging = root.join("staged-bot");
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    tokio::fs::write(staging.join(".stage-deadbeef"), b"short")
+        .await
+        .unwrap();
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
+    let stage_marker = staging.join(".stage-deadbeef");
+    bot.staging = staging;
+    bot.running = None;
+    for _ in 0..20 {
+        if bot.tick().await.unwrap() {
+            break;
+        }
+    }
+    assert!(bot.running.is_some());
+    assert!(!tokio::fs::try_exists(stage_marker).await.unwrap());
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn boot_repair_starts_baked_when_signature_missing_and_schema_fits() {
+    let root = std::env::temp_dir().join(format!("sig-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let mut objects = HashMap::new();
+    let release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release;
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let release_json = serde_json::to_string(&release).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: "b".repeat(40),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "b".repeat(40),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=100, state='running' WHERE component='bot'",
+            params![release_json, observed_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    bot.running = None;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+    }
+    assert!(bot.running.is_some());
+    let mismatches = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatches["bot"].reason, UNSIGNED_IMAGE);
+    server.abort();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

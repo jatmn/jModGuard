@@ -108,6 +108,22 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
+The launcher verifies every digest before it downloads image layers or stages an
+executable. Unsigned, cryptographically invalid, expired, and untrusted-key
+signatures are refused with a permanent error. Registry outages and other
+transient fetch failures are retried and are not recorded as signature rejections.
+The same verification runs during boot repair when ephemeral staging files are
+missing. If the installed release cannot be re-downloaded or verified, the
+launcher starts the baked application only when the database core and observed
+guild schemas still fit that binary; otherwise moderation stays stopped until
+owner recovery. Boot repair ignores `JMODGUARD_UNATTENDED_UPDATES`. When the
+running digest again matches the installed release, the durable
+`update_boot_mismatch_v1` record for that component is cleared.
+
+After a manual in-app install, select that same published image as the Bunny
+container image so a pod replacement already contains the verified binary. The bot
+does not publish images.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
