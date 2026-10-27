@@ -300,9 +300,10 @@ while the bot process is stopped. Schema and base changes ship in new images.
 Self-update stays off by default and is owner-triggered only. Signing is
 tracked in issue 188.
 
-This release requires launcher revision 7 for safe rejected-token holds. A
-launcher-aware protocol-3 baseline installs the required launcher before the
-application. Older baselines require new images for both the bot and the API.
+This release requires launcher revision 19 (`REQUIRED_LAUNCHER_REVISION`) for safe
+rejected-token holds and signed-image verification. A launcher-aware protocol-3
+baseline installs the required launcher before the application. Older baselines
+require new images for both the bot and the API.
 
 ### Bot container
 

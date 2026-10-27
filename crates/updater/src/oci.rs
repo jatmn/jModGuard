@@ -18,6 +18,7 @@ const MAX_CONFIG: usize = 256 * 1024;
 const MAX_LAYER: usize = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
+const MAX_SIGNATURE_LAYERS: usize = 8;
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -205,49 +206,6 @@ impl Registry {
         Ok(body)
     }
 
-    async fn signature_envelope_candidates(&self, repo: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut candidates = Vec::new();
-        if serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .is_some_and(|value| {
-                value.get("payloadType").is_some() && value.get("payload").is_some()
-            })
-        {
-            return Ok(vec![body.to_vec()]);
-        }
-        let manifest: Manifest =
-            serde_json::from_slice(body).map_err(|_| signature::ImageSignatureRejection {
-                phrase: signature::BAD_IMAGE_SIGNATURE,
-            })?;
-        ensure!(
-            manifest.schema_version == 2 && !manifest.layers.is_empty(),
-            signature::ImageSignatureRejection {
-                phrase: signature::BAD_IMAGE_SIGNATURE,
-            }
-        );
-        for layer in manifest.layers.iter().rev() {
-            let signature_b64 = layer
-                .annotations
-                .get("dev.cosignproject.cosign/signature")
-                .map(String::as_str);
-            if let Some(signature_b64) = signature_b64 {
-                let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
-                if let Ok(envelope) =
-                    signature::envelope_from_cosign_payload(&payload, signature_b64)
-                {
-                    candidates.push(envelope);
-                }
-            }
-        }
-        ensure!(
-            !candidates.is_empty(),
-            signature::ImageSignatureRejection {
-                phrase: signature::BAD_IMAGE_SIGNATURE,
-            }
-        );
-        Ok(candidates)
-    }
-
     async fn verify_manifest(
         &self,
         component: &str,
@@ -256,10 +214,54 @@ impl Registry {
         manifest_bytes: &[u8],
     ) -> Result<()> {
         let signature = self.signature_body(repo, manifest_digest).await?;
-        let envelopes = self.signature_envelope_candidates(repo, &signature).await?;
         let now = Utc::now();
+        if serde_json::from_slice::<serde_json::Value>(&signature)
+            .ok()
+            .is_some_and(|value| {
+                value.get("payloadType").is_some() && value.get("payload").is_some()
+            })
+        {
+            return signature::verify_manifest_signature(
+                component,
+                manifest_digest,
+                manifest_bytes,
+                &signature,
+                now,
+            );
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&signature).map_err(|_| signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            })?;
+        ensure!(
+            manifest.schema_version == 2 && !manifest.layers.is_empty(),
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
+        );
         let mut last = None;
-        for envelope in envelopes {
+        let mut tried = 0usize;
+        for layer in manifest.layers.iter().rev() {
+            if tried >= MAX_SIGNATURE_LAYERS {
+                break;
+            }
+            let signature_b64 = layer
+                .annotations
+                .get("dev.cosignproject.cosign/signature")
+                .map(String::as_str);
+            if signature_b64.is_none() {
+                continue;
+            }
+            tried += 1;
+            let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
+            let envelope =
+                match signature::envelope_from_cosign_payload(&payload, signature_b64.unwrap()) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        last = Some(error);
+                        continue;
+                    }
+                };
             match signature::verify_manifest_signature(
                 component,
                 manifest_digest,
@@ -271,7 +273,12 @@ impl Registry {
                 Err(error) => last = Some(error),
             }
         }
-        Err(last.unwrap())
+        Err(last.unwrap_or_else(|| {
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
+            .into()
+        }))
     }
 
     async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {
@@ -481,27 +488,117 @@ impl Registry {
             config.config.labels.get("io.jmodguard.release-id") == Some(&release.release_id),
             "release ID changed"
         );
-        let mut found = HashMap::new();
-        let mut remaining: Vec<&str> = requested.to_vec();
+        let mut layer_bytes = Vec::with_capacity(manifest.layers.len());
         for layer in manifest.layers.iter().rev() {
-            if remaining.is_empty() {
-                break;
-            }
             let bytes = self.blob(repo, layer, MAX_LAYER).await?;
-            let partial = extract_layer_files(&bytes, &layer.media_type, &remaining)?;
-            for path in partial.keys() {
-                remaining.retain(|wanted| wanted != path);
-            }
-            found.extend(partial);
+            layer_bytes.push((bytes, layer.media_type.clone()));
         }
-        ensure!(
-            found.len() == requested.len(),
-            "release image is missing a required file"
-        );
-        Ok(found)
+        let layer_views = layer_bytes
+            .iter()
+            .map(|(bytes, media)| (bytes.as_slice(), media.as_str()))
+            .collect::<Vec<_>>();
+        resolve_requested_files_from_layers(&layer_views, requested)
     }
 }
 
+fn resolve_requested_files_from_layers(
+    layers: &[(&[u8], &str)],
+    requested: &[&str],
+) -> Result<HashMap<String, Vec<u8>>> {
+    let wanted: HashSet<&str> = requested.iter().copied().collect();
+    ensure!(wanted.len() == requested.len(), "duplicate file request");
+    let mut found = HashMap::new();
+    let mut hidden = HashSet::new();
+    for (bytes, media) in layers {
+        merge_layer_into_found(bytes, media, &wanted, &mut found, &mut hidden)?;
+    }
+    ensure!(
+        found.len() == requested.len(),
+        "release image is missing a required file"
+    );
+    Ok(found)
+}
+
+fn merge_layer_into_found(
+    bytes: &[u8],
+    media: &str,
+    wanted: &HashSet<&str>,
+    found: &mut HashMap<String, Vec<u8>>,
+    hidden: &mut HashSet<String>,
+) -> Result<()> {
+    let reader: Box<dyn Read + '_> = match media {
+        "application/vnd.oci.image.layer.v1.tar+gzip"
+        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
+            Box::new(flate2::read::GzDecoder::new(bytes))
+        }
+        "application/vnd.oci.image.layer.v1.tar" => Box::new(bytes),
+        _ => bail!("unsupported image layer compression"),
+    };
+    let mut archive = tar::Archive::new(reader);
+    let mut total = 0u64;
+    let mut count = 0usize;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        count += 1;
+        ensure!(count <= 256, "too many layer entries");
+        let path = entry.path()?;
+        let raw = path.to_str().context("non-UTF8 layer path")?;
+        let normalized = raw.trim_start_matches("./");
+        ensure!(
+            !normalized.is_empty()
+                && std::path::Path::new(normalized)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+            "unsafe layer path"
+        );
+        let size = entry.size();
+        total = total.checked_add(size).context("layer size overflow")?;
+        ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
+        if let Some(deleted) = whiteout_target(normalized) {
+            hidden.insert(deleted.clone());
+            found.remove(&deleted);
+            continue;
+        }
+        let name = normalized.to_owned();
+        if !wanted.contains(name.as_str()) {
+            continue;
+        }
+        if hidden.contains(&name) {
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        ensure!(
+            kind.is_file() || kind.is_dir(),
+            "link or special file in release layer"
+        );
+        ensure!(
+            kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
+            "invalid or duplicate release file"
+        );
+        let mut data = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut data)?;
+        ensure!(data.len() as u64 == size, "truncated release file");
+        found.insert(name, data);
+    }
+    Ok(())
+}
+
+fn whiteout_target(normalized: &str) -> Option<String> {
+    let path = std::path::Path::new(normalized);
+    let file = path.file_name().and_then(|name| name.to_str())?;
+    let target = file.strip_prefix(".wh.")?;
+    if target.is_empty() || target == ".wh..opq" {
+        return None;
+    }
+    let deleted = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(target))
+        .unwrap_or_else(|| std::path::PathBuf::from(target));
+    deleted.to_str().map(|value| value.to_owned())
+}
+
+#[cfg(test)]
 fn extract_layer_files(
     bytes: &[u8],
     media: &str,
@@ -535,6 +632,9 @@ fn extract_layer_files(
                     .all(|part| matches!(part, Component::Normal(_))),
             "unsafe layer path"
         );
+        let size = entry.size();
+        total = total.checked_add(size).context("layer size overflow")?;
+        ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
         let name = normalized.to_owned();
         if !wanted.contains(name.as_str()) {
             continue;
@@ -544,9 +644,6 @@ fn extract_layer_files(
             kind.is_file() || kind.is_dir(),
             "link or special file in release layer"
         );
-        let size = entry.size();
-        total = total.checked_add(size).context("layer size overflow")?;
-        ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
         ensure!(
             kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
             "invalid or duplicate release file"
@@ -670,23 +767,77 @@ mod tests {
             b"deadbeef  usr/local/bin/jmodguard-api\n",
             tar::EntryType::Regular,
         )]);
-        let bin = extract_layer_files(
-            &bin_layer,
+        let merged = resolve_requested_files_from_layers(
+            &[
+                (
+                    manifest_layer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    bin_layer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &[
+                "usr/local/bin/jmodguard-api",
+                "usr/local/share/jmodguard/files.sha256",
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+        assert_eq!(
+            merged["usr/local/share/jmodguard/files.sha256"],
+            b"deadbeef  usr/local/bin/jmodguard-api\n"
+        );
+    }
+
+    #[test]
+    fn whiteout_in_newer_layer_hides_older_file() {
+        let older = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"stale",
+            tar::EntryType::Regular,
+        )]);
+        let newer = layer(&[(
+            "usr/local/bin/.wh.jmodguard-api",
+            b"",
+            tar::EntryType::Regular,
+        )]);
+        let err = resolve_requested_files_from_layers(
+            &[
+                (
+                    newer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    older.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing a required file"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn layer_size_limit_counts_skipped_entries() {
+        let huge = vec![0u8; (MAX_UNPACKED as usize) + 1];
+        let blob = layer(&[("ignored/huge", huge.as_slice(), tar::EntryType::Regular)]);
+        let err = extract_layer_files(
+            &blob,
             "application/vnd.oci.image.layer.v1.tar+gzip",
             &["usr/local/bin/jmodguard-api"],
         )
-        .unwrap();
-        let manifest = extract_layer_files(
-            &manifest_layer,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            &["usr/local/share/jmodguard/files.sha256"],
-        )
-        .unwrap();
-        let mut merged = bin;
-        merged.extend(manifest);
-        assert_eq!(merged.len(), 2);
-        assert!(merged.contains_key("usr/local/bin/jmodguard-api"));
-        assert!(merged.contains_key("usr/local/share/jmodguard/files.sha256"));
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unpacked layer exceeds limit"),
+            "{err:#}"
+        );
     }
 
     #[test]

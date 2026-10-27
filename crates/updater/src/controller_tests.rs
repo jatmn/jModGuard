@@ -69,7 +69,7 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
         objects,
         role,
         &manifest_hash,
-        "2027-12-31T00:00:00Z",
+        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
         SigningKeyChoice::Current,
     );
     ComponentRelease {
@@ -8144,7 +8144,17 @@ async fn bad_signature_leaves_running_child_without_rollback() {
         bot.tick().await.unwrap();
     }
     assert!(bot.running.is_some());
+    assert_eq!(bot.running.as_ref().unwrap().path, running);
     assert!(bot.rollback.is_none());
+    let state = control.component("bot").await.unwrap();
+    assert!(
+        state
+            .check_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("signature")),
+        "expected signature rejection to be recorded: {:?}",
+        state.check_error
+    );
     server.abort();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
@@ -8247,12 +8257,13 @@ async fn boot_repair_starts_baked_when_signature_missing_and_schema_fits() {
     })
     .await
     .unwrap();
-    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
     bot.running = None;
     for _ in 0..20 {
         bot.tick().await.unwrap();
     }
     assert!(bot.running.is_some());
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
     let mismatches = db::read_boot_mismatch_map(&db).await.unwrap();
     assert_eq!(mismatches["bot"].reason, UNSIGNED_IMAGE);
     let state = control.component("bot").await.unwrap();
@@ -8284,7 +8295,7 @@ async fn cosign_publisher_signature_verifies_during_staging() {
         "bot",
         &baked,
         "latest",
-        "2027-12-31T00:00:00Z",
+        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
         'c',
     );
     let (registry, server) = registry_with_objects(objects).await;
@@ -8344,7 +8355,7 @@ async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_f
     })
     .await
     .unwrap();
-    let mut api = controller("api", baked, registry, control.clone(), &root);
+    let mut api = controller("api", baked.clone(), registry, control.clone(), &root);
     api.running = None;
     api.restore(&control.component("api").await.unwrap())
         .await
@@ -8353,6 +8364,7 @@ async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_f
         api.running.is_some(),
         "compatible API must start baked fallback even when installed staging fails"
     );
+    assert_eq!(api.running.as_ref().unwrap().path, baked);
     let state = control.component("api").await.unwrap();
     assert_eq!(
         state

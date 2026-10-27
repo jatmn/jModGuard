@@ -11,7 +11,9 @@ use jmodguard_updater::signature::{
     BAD_IMAGE_SIGNATURE, EXPIRED_IMAGE_SIGNATURE, UNSIGNED_IMAGE, UNTRUSTED_IMAGE_SIGNATURE_KEY,
     signature_rejection_phrase, signature_tag_for_digest,
 };
-use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice, image as signed_image};
+use jmodguard_updater::signing_fixture::{
+    SigningFixture, SigningKeyChoice, image as signed_image, signature_not_after_far_future,
+};
 use std::{collections::HashMap, sync::Arc, sync::OnceLock};
 use tokio::sync::RwLock;
 
@@ -59,7 +61,7 @@ fn image(fixture: &mut RegistryFixture, binary: &[u8], channel: &str, source: ch
         "api",
         binary,
         channel,
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         source,
     );
     fixture.objects = objects;
@@ -139,7 +141,7 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "api",
         b"\x7fELFsigned",
         "development",
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         'a',
     );
     let tag = signature_tag_for_digest(&release.digest).unwrap();
@@ -187,7 +189,7 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         &mut objects,
         "api",
         &release.digest,
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         SigningKeyChoice::Current,
     );
     let (registry, _, server) = start_registry(RegistryFixture {
@@ -205,7 +207,7 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "api",
         b"\x7fELFsigned",
         "development",
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         'a',
     );
     let tag = signature_tag_for_digest(&release.digest).unwrap();
@@ -228,14 +230,14 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "api",
         b"\x7fELFsigned",
         "development",
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         'f',
     );
     rotation.sign(
         &mut objects,
         "api",
         &release.digest,
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         SigningKeyChoice::Previous,
     );
     let (registry, _, server) = start_registry(RegistryFixture {
@@ -253,7 +255,7 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         "api",
         b"\x7fELFsigned",
         "development",
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         'g',
     );
     let tag = signature_tag_for_digest(&release.digest).unwrap();
@@ -262,7 +264,7 @@ async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
         &mut objects,
         "api",
         &release.digest,
-        "2027-12-31T00:00:00Z",
+        &signature_not_after_far_future(),
         SigningKeyChoice::Unknown,
     );
     let (registry, _, server) = start_registry(RegistryFixture {

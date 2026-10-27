@@ -931,9 +931,11 @@ pub fn write_boot_mismatch_map_conn(conn: &impl SqlExecutor, map: &BootMismatchM
 
 pub async fn record_boot_mismatch(db: &Db, record: BootMismatchRecord) -> Result<()> {
     db.with_conn(move |conn| {
-        let mut map = read_boot_mismatch_map_conn(conn)?;
+        let tx = conn.transaction_immediate()?;
+        let mut map = read_boot_mismatch_map_conn(&tx)?;
         map.insert(record.component.clone(), record);
-        write_boot_mismatch_map_conn(conn, &map)?;
+        write_boot_mismatch_map_conn(&tx, &map)?;
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -942,10 +944,12 @@ pub async fn record_boot_mismatch(db: &Db, record: BootMismatchRecord) -> Result
 pub async fn clear_boot_mismatch(db: &Db, component: &str) -> Result<()> {
     let component = component.to_owned();
     db.with_conn(move |conn| {
-        let mut map = read_boot_mismatch_map_conn(conn)?;
+        let tx = conn.transaction_immediate()?;
+        let mut map = read_boot_mismatch_map_conn(&tx)?;
         if map.remove(&component).is_some() {
-            write_boot_mismatch_map_conn(conn, &map)?;
+            write_boot_mismatch_map_conn(&tx, &map)?;
         }
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -1964,6 +1968,54 @@ mod tests {
         request_component_install(&db, "webui", &webui.digest, 7401)
             .await
             .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_boot_mismatch_updates_keep_both_components() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_boot_mismatch_race_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        for round in 0..50 {
+            let bot = BootMismatchRecord {
+                component: "bot".into(),
+                running: format!("sha256:{:064x}", round),
+                expected: BootMismatchExpected {
+                    release_id: format!("bot-{round}"),
+                    source_sha: "b".repeat(40),
+                },
+                reason: "unsigned image".into(),
+            };
+            let api = BootMismatchRecord {
+                component: "api".into(),
+                running: format!("sha256:{:064x}", round + 1),
+                expected: BootMismatchExpected {
+                    release_id: format!("api-{round}"),
+                    source_sha: "c".repeat(40),
+                },
+                reason: "bad image signature".into(),
+            };
+            let (bot_write, api_write) = tokio::join!(
+                record_boot_mismatch(&db, bot),
+                record_boot_mismatch(&db, api)
+            );
+            bot_write.unwrap();
+            api_write.unwrap();
+            let map = read_boot_mismatch_map(&db).await.unwrap();
+            assert_eq!(map["bot"].expected.release_id, format!("bot-{round}"));
+            assert_eq!(map["api"].expected.release_id, format!("api-{round}"));
+            let (clear_bot, clear_api) = tokio::join!(
+                clear_boot_mismatch(&db, "bot"),
+                clear_boot_mismatch(&db, "api")
+            );
+            clear_bot.unwrap();
+            clear_api.unwrap();
+        }
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

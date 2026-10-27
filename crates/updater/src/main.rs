@@ -679,7 +679,7 @@ struct PendingFailure {
 #[derive(Clone)]
 enum PendingBootMismatch {
     Record {
-        release: ComponentRelease,
+        release: Box<ComponentRelease>,
         reason: String,
     },
     Clear,
@@ -1074,6 +1074,13 @@ impl Supervisor {
         let pending = self.pending_boot_mismatch.clone();
         match pending {
             Some(PendingBootMismatch::Record { release, reason }) => {
+                let on_baked = self
+                    .running
+                    .as_ref()
+                    .is_some_and(|child| child.path == self.baked);
+                if !on_baked {
+                    return Ok(());
+                }
                 match self
                     .control
                     .record_boot_mismatch(db::BootMismatchRecord {
@@ -1678,9 +1685,43 @@ impl Supervisor {
         }
     }
 
-    fn baked_supports_guild(&self, state: &db::ComponentUpdate) -> bool {
-        state.observed.as_ref().and_then(|seen| seen.guild_schema)
-            == Some(self.baked_compatibility.guild)
+    async fn required_guild_schema_for_fallback(
+        &self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+    ) -> Result<i64> {
+        let mut required = release
+            .upgrade
+            .as_ref()
+            .context("installed release lacks guild schema metadata")?
+            .guild_schema;
+        if let Some(observed) = state.observed.as_ref().and_then(|seen| seen.guild_schema) {
+            required = required.max(observed);
+        }
+        let counterpart = if self.role == "bot" { "api" } else { "bot" };
+        let other = self.control.component(counterpart).await?;
+        if let Some(observed) = other.observed.as_ref().and_then(|seen| seen.guild_schema) {
+            required = required.max(observed);
+        }
+        if let Some(installed) = other
+            .installed
+            .as_ref()
+            .and_then(|candidate| candidate.upgrade.as_ref())
+        {
+            required = required.max(installed.guild_schema);
+        }
+        Ok(required)
+    }
+
+    async fn baked_supports_guild_for_fallback(
+        &self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+    ) -> Result<bool> {
+        let required = self
+            .required_guild_schema_for_fallback(state, release)
+            .await?;
+        Ok(self.baked_compatibility.guild >= required)
     }
 
     async fn record_boot_mismatch_for_installed(
@@ -1705,7 +1746,7 @@ impl Supervisor {
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                 self.pending_boot_mismatch = Some(PendingBootMismatch::Record {
-                    release: release.clone(),
+                    release: Box::new(release.clone()),
                     reason: reason.to_owned(),
                 });
                 self.note_receipt_delay();
@@ -1718,9 +1759,7 @@ impl Supervisor {
     async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
         match self.control.clear_boot_mismatch(&self.role).await {
             Ok(()) => {
-                if matches!(self.pending_boot_mismatch, Some(PendingBootMismatch::Clear)) {
-                    self.pending_boot_mismatch = None;
-                }
+                self.pending_boot_mismatch = None;
                 Ok(())
             }
             Err(error) if Self::receipt_not_saved(&error) => {
@@ -1743,7 +1782,10 @@ impl Supervisor {
         if !self.baked_supports_schema(schema) {
             bail!("baked application cannot open database; use owner recovery");
         }
-        if !self.baked_supports_guild(state) {
+        if !self
+            .baked_supports_guild_for_fallback(state, release)
+            .await?
+        {
             self.record_boot_mismatch_for_installed(release, SCHEMA_MISMATCH)
                 .await?;
             bail!("baked application cannot open database; use owner recovery");
@@ -2270,6 +2312,11 @@ impl Supervisor {
             Ok(path) => path,
             Err(error) => {
                 if registry_transient(&error) {
+                    tracing::warn!(
+                        component = %self.role,
+                        digest = %candidate.digest,
+                        "registry download stalled on transient error: {error:#}"
+                    );
                     return Ok(false);
                 }
                 let message = signature_rejection_phrase(&error)

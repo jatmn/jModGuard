@@ -2,10 +2,18 @@
 use crate::oci::sha256_hex;
 use crate::signature::signature_tag_for_digest;
 use crate::signature::test_support::{generate_key_pair, sign_manifest_cosign};
+use chrono::{Duration, Utc};
 use jmodguard::db::ComponentRelease;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
+
+/// Signature expiry far enough ahead that date-sensitive tests stay deterministic.
+pub fn signature_not_after_far_future() -> String {
+    (Utc::now() + Duration::days(3650))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
 
 pub struct SigningFixture {
     pub public_pem: String,

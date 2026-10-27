@@ -30,9 +30,10 @@ bot's active lease and exits with code 78
 (`DISCORD_TOKEN_REJECTED_EXIT_CODE`, shared by bot and launcher). The launcher
 holds that bot without immediate restart or rollback and logs once per hold entry:
 `discord token rejected; bot held, fix token and restart container`.
-This release requires launcher revision 7 or newer, which handles exit 78 before
-checking the selected child's readiness deadline. Older launchers must install the
-required launcher before starting either a pending selection or a restored install;
+This release requires launcher revision 19 or newer (`REQUIRED_LAUNCHER_REVISION`),
+which handles exit 78 before checking the selected child's readiness deadline.
+Older launchers must install the required launcher before starting either a pending
+selection or a restored install;
 in-process idling cannot protect an unready selected child from their timeout.
 The bot never writes the Discord-ready marker for a rejected token.
 Fix the token and restart the container to resume immediately. As a fallback,
