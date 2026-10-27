@@ -95,10 +95,10 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     let (registry, state, server) = start_registry(fixture).await;
     let approved = registry.discover("api", "latest").await.unwrap();
     assert_eq!(approved.channel, "latest");
-    assert_eq!(approved.launcher.as_ref().unwrap().revision, 18);
-    assert_eq!(approved.required_launcher(), 18);
-    assert!(approved.supports_launcher(17).is_err());
-    approved.supports_launcher(18).unwrap();
+    assert_eq!(approved.launcher.as_ref().unwrap().revision, 19);
+    assert_eq!(approved.required_launcher(), 19);
+    assert!(approved.supports_launcher(18).is_err());
+    approved.supports_launcher(19).unwrap();
     assert_eq!(approved.digest, old);
     state.write().await.tag = new.clone();
     assert_eq!(
