@@ -488,16 +488,28 @@ impl Registry {
             config.config.labels.get("io.jmodguard.release-id") == Some(&release.release_id),
             "release ID changed"
         );
-        let mut layer_bytes = Vec::with_capacity(manifest.layers.len());
+        let wanted: HashSet<&str> = requested.iter().copied().collect();
+        ensure!(wanted.len() == requested.len(), "duplicate file request");
+        let mut found = HashMap::new();
+        let mut hidden = HashSet::new();
         for layer in manifest.layers.iter().rev() {
             let bytes = self.blob(repo, layer, MAX_LAYER).await?;
-            layer_bytes.push((bytes, layer.media_type.clone()));
+            merge_layer_into_found(
+                &bytes,
+                &layer.media_type,
+                &wanted,
+                &mut found,
+                &mut hidden,
+            )?;
+            if found.len() == requested.len() {
+                break;
+            }
         }
-        let layer_views = layer_bytes
-            .iter()
-            .map(|(bytes, media)| (bytes.as_slice(), media.as_str()))
-            .collect::<Vec<_>>();
-        resolve_requested_files_from_layers(&layer_views, requested)
+        ensure!(
+            found.len() == requested.len(),
+            "release image is missing a required file"
+        );
+        Ok(found)
     }
 }
 
@@ -559,7 +571,9 @@ fn merge_layer_into_found(
         ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
         if let Some(deleted) = whiteout_target(normalized) {
             hidden.insert(deleted.clone());
-            found.remove(&deleted);
+            if !found.contains_key(&deleted) {
+                found.remove(&deleted);
+            }
             continue;
         }
         let name = normalized.to_owned();
@@ -567,6 +581,9 @@ fn merge_layer_into_found(
             continue;
         }
         if hidden.contains(&name) {
+            continue;
+        }
+        if found.contains_key(&name) {
             continue;
         }
         let kind = entry.header().entry_type();
@@ -832,6 +849,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+    }
+
+    #[test]
+    fn older_whiteout_does_not_remove_newer_resolution() {
+        let newer = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"fresh",
+            tar::EntryType::Regular,
+        )]);
+        let older = layer(&[(
+            "usr/local/bin/.wh.jmodguard-api",
+            b"",
+            tar::EntryType::Regular,
+        )]);
+        let merged = resolve_requested_files_from_layers(
+            &[
+                (
+                    newer.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    older.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"fresh");
     }
 
     #[test]
