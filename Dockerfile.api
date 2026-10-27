@@ -47,7 +47,6 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown jmodguard:jmodguard /data
 WORKDIR /data
-COPY --from=builder /app/deploy/ /usr/local/share/jmodguard/deploy/
 COPY --from=builder /app/oci-layer/ /
 ARG SOURCE_SHA=unknown
 VOLUME ["/data"]
