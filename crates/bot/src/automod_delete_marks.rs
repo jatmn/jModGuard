@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 const AUTOMOD_DELETE_MARK_TTL: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_AUTOMOD_DELETE_MARKS: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnconfirmedMarkRemoval {
+    /// Mark removed without a gateway observation to replay.
+    Removed,
+    /// Gateway suppressed a plain delete while REST was pending; emit `message_delete`.
+    ReplayPlainDelete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GatewayDeleteObservation {
     Automod {
@@ -145,12 +153,22 @@ impl AutomodDeleteMarks {
         channel: u64,
         message: u64,
         now: Instant,
-    ) {
+    ) -> UnconfirmedMarkRemoval {
         self.prune(now);
         let key = (guild, channel, message);
-        if self.entries.get(&key).is_some_and(|entry| !entry.confirmed) {
-            self.order.retain(|candidate| *candidate != key);
-            self.entries.remove(&key);
+        let Some(entry) = self.entries.get(&key) else {
+            return UnconfirmedMarkRemoval::Removed;
+        };
+        if entry.confirmed {
+            return UnconfirmedMarkRemoval::Removed;
+        }
+        let replay = entry.gateway_pending;
+        self.order.retain(|candidate| *candidate != key);
+        self.entries.remove(&key);
+        if replay {
+            UnconfirmedMarkRemoval::ReplayPlainDelete
+        } else {
+            UnconfirmedMarkRemoval::Removed
         }
     }
 
@@ -226,10 +244,15 @@ impl AutomodDeleteMarkAccess {
             .confirm(guild, channel, message, Instant::now())
     }
 
-    pub(crate) fn remove_unconfirmed(&self, guild: u64, channel: u64, message: u64) {
+    pub(crate) fn remove_unconfirmed(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+    ) -> UnconfirmedMarkRemoval {
         self.inner
             .lock()
-            .remove_unconfirmed(guild, channel, message, Instant::now());
+            .remove_unconfirmed(guild, channel, message, Instant::now())
     }
 }
 

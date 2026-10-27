@@ -640,7 +640,7 @@ fn peek_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Optio
 }
 
 /// Resolves the log channel for an event type from the cached config.
-fn channel_for(
+pub(crate) fn channel_for(
     cfg: &crate::state::CachedGuildConfig,
     event: &str,
 ) -> Option<serenity::model::id::ChannelId> {
@@ -2212,29 +2212,54 @@ pub(crate) fn message_delete_report_peek(
     }
 }
 
-fn automod_delete_report(
+pub(crate) fn automod_delete_report(
     app: &BotState,
     guild_id: GuildId,
     channel: ChannelId,
     id: MessageId,
     rule_id: &str,
     rule_name: &str,
+    retained: Option<&MessageSnapshot>,
 ) -> MessageReport {
     let mut vars = message_vars(guild_id, channel, id);
-    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
-        vars.extend(templates::user_vars(
-            snippet.author,
-            &snippet.author.to_string(),
-            &snippet.author.to_string(),
-        ));
-    }
+    apply_delete_snippet(app, guild_id, channel, id, &mut vars, false);
     vars.insert("rule_id".into(), rule_id.to_owned());
     vars.insert("rule".into(), rule_name.to_owned());
-    MessageReport {
+    let mut report = MessageReport {
         guild_id,
         event: "automod_delete",
         vars,
+    };
+    if let Some(row) = retained {
+        apply_retained_delete(&mut report, Some(row));
     }
+    report
+}
+
+pub(crate) fn peel_automod_from_bulk(
+    report: &Option<MessageReport>,
+    automod_individual: bool,
+) -> bool {
+    match report {
+        None => automod_individual,
+        Some(report) if report.event == "automod_delete" => automod_individual,
+        _ => false,
+    }
+}
+
+pub(crate) async fn emit_plain_message_delete(
+    app: &std::sync::Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+) {
+    let mut report = message_delete_report(app, guild_id, channel, id);
+    if let Some(row) = retained {
+        apply_retained_delete(&mut report, Some(row));
+    }
+    emit_to(app, sink, report.guild_id, report.event, report.vars).await;
 }
 
 /// Gateway delete logging. Returns `None` when an automod delete is pending REST
@@ -2253,7 +2278,7 @@ pub(crate) fn observed_delete_report(
         id.get(),
     ) {
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
-            automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name)
+            automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
         }
         GatewayDeleteObservation::PendingAutomod => return None,
         GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
@@ -2266,6 +2291,7 @@ pub(crate) fn observed_delete_report(
 
 /// After REST confirms an automod delete that already produced a plain gateway
 /// `message_delete`, emit the dedicated `automod_delete` report.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_reconciled_automod_delete(
     app: &std::sync::Arc<BotState>,
     sink: &impl LogDelivery,
@@ -2274,6 +2300,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
     message: u64,
     rule_id: &str,
     rule_name: &str,
+    retained: Option<&MessageSnapshot>,
 ) {
     let report = automod_delete_report(
         app,
@@ -2282,6 +2309,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
         MessageId::new(message),
         rule_id,
         rule_name,
+        retained,
     );
     emit_to(app, sink, report.guild_id, report.event, report.vars).await;
 }

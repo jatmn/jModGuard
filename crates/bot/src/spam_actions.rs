@@ -538,14 +538,28 @@ async fn punish_proven_match(
                         *message,
                         &rule_id,
                         &rule_name,
+                        None,
                     )
                     .await;
                 }
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                app.automod_delete_marks
-                    .remove_unconfirmed(found.guild, *channel, *message);
+                if app
+                    .automod_delete_marks
+                    .remove_unconfirmed(found.guild, *channel, *message)
+                    == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                {
+                    crate::logging::emit_plain_message_delete(
+                        app,
+                        http,
+                        GuildId::new(found.guild),
+                        ChannelId::new(*channel),
+                        MessageId::new(*message),
+                        None,
+                    )
+                    .await;
+                }
                 delete_outcome(&error)
             }
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,

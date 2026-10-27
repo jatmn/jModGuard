@@ -237,7 +237,7 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
     assert_eq!(reconcile, Some(("badword".into(), "Bad words".into())));
     let sink = Sink::default();
     let (rule_id, rule_name) = reconcile.unwrap();
-    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &rule_id, &rule_name).await;
+    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &rule_id, &rule_name, None).await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
     assert!(
         !f.app
@@ -273,7 +273,17 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
         .confirm(789, 456, 123)
         .expect("spam reconcile");
     let sink = Sink::default();
-    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &reconcile.0, &reconcile.1).await;
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &reconcile.0,
+        &reconcile.1,
+        None,
+    )
+    .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
     assert!(
         sink.messages.lock().unwrap()[0]
@@ -377,7 +387,17 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
         Delivery::Unconfigured
     );
     let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123).unwrap();
-    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &reconcile.0, &reconcile.1).await;
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &reconcile.0,
+        &reconcile.1,
+        None,
+    )
+    .await;
     assert!(sink.messages.lock().unwrap().is_empty());
 }
 
@@ -420,4 +440,88 @@ async fn bulk_mix_splits_automod_from_plain_ids() {
     .expect("plain");
     assert_eq!(automod.event, "automod_delete");
     assert_eq!(plain.event, "message_delete");
+}
+
+#[tokio::test]
+async fn rest_failure_replays_plain_delete_after_gateway_pending() {
+    use crate::automod_delete_marks::UnconfirmedMarkRemoval;
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            None,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123),
+        UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    let sink = Sink::default();
+    emit_plain_message_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        None,
+    )
+    .await;
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn automod_delete_report_peeks_snippet_identity() {
+    let f = Fixture::new();
+    remember_message(&f.app, 789, 456, 123, Some(42), Some("hello"), None);
+    let automod = automod_delete_report(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        "badword",
+        "Bad words",
+        None,
+    );
+    assert_eq!(automod.vars["user_id"], "42");
+    let plain = message_delete_report(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(plain.vars["user_id"], "42");
+}
+
+#[test]
+fn bulk_peel_only_when_automod_individually_routable() {
+    let automod = Some(MessageReport {
+        guild_id: GuildId::new(789),
+        event: "automod_delete",
+        vars: BTreeMap::new(),
+    });
+    assert!(!peel_automod_from_bulk(&automod, false));
+    assert!(peel_automod_from_bulk(&automod, true));
+    assert!(!peel_automod_from_bulk(&None, false));
+    assert!(peel_automod_from_bulk(&None, true));
+
+    let mut bulk_only = BulkTranscript::new(2);
+    if peel_automod_from_bulk(&automod, false) {
+        bulk_only.peel_automod_delete();
+    } else {
+        bulk_only.push_unknown(MessageId::new(10));
+    }
+    assert_eq!(bulk_only.total, 2);
+    assert!(bulk_only.worth_sending());
 }

@@ -1466,6 +1466,9 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             .collect()
                     })
                     .unwrap_or_default();
+                let automod_individual = config
+                    .as_ref()
+                    .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
                 let mut single = None;
                 let mut single_unknown = false;
                 for chunk in ids.chunks(100) {
@@ -1490,9 +1493,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         *id,
                                         row.as_ref(),
                                     );
-                                    if report
-                                        .as_ref()
-                                        .is_none_or(|report| report.event == "automod_delete")
+                                    if logging::peel_automod_from_bulk(&report, automod_individual)
                                     {
                                         transcript.peel_automod_delete();
                                         if let Some(report) = report {
@@ -1523,6 +1524,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                     *channel,
                                     chunk,
                                     &mut transcript,
+                                    automod_individual,
                                 );
                             } else {
                                 single_unknown = true;
@@ -1636,13 +1638,11 @@ fn peel_automod_bulk_chunk(
     channel: ChannelId,
     ids: &[MessageId],
     transcript: &mut logging::BulkTranscript,
+    automod_individual: bool,
 ) {
     for id in ids {
         let report = logging::observed_delete_report(app, guild, channel, *id, None);
-        if report
-            .as_ref()
-            .is_none_or(|report| report.event == "automod_delete")
-        {
+        if logging::peel_automod_from_bulk(&report, automod_individual) {
             transcript.peel_automod_delete();
             if let Some(report) = report {
                 submit_report(app, context, report);
@@ -1661,7 +1661,7 @@ fn submit_peeled_bulk_deletes(
     ids: Vec<MessageId>,
 ) {
     let mut transcript = logging::BulkTranscript::new(ids.len());
-    peel_automod_bulk_chunk(app, context, guild, channel, &ids, &mut transcript);
+    peel_automod_bulk_chunk(app, context, guild, channel, &ids, &mut transcript, true);
     if !transcript.worth_sending() {
         return;
     }
@@ -2130,6 +2130,7 @@ mod tests {
             ChannelId::new(456),
             &[MessageId::new(10), MessageId::new(11)],
             &mut transcript,
+            true,
         );
         assert_eq!(transcript.unknown, 1);
         assert!(

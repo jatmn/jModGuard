@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serenity::client::Context;
 use serenity::model::guild::Member;
-use serenity::model::id::{GuildId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -449,14 +449,27 @@ async fn automod_try_delete_message(
                 app.automod_delete_marks.confirm(guild_id, channel, message)
             {
                 logging::emit_reconciled_automod_delete(
-                    app, http, guild_id, channel, message, &rule_id, &rule_name,
+                    app, http, guild_id, channel, message, &rule_id, &rule_name, None,
                 )
                 .await;
             }
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
-            app.automod_delete_marks
-                .remove_unconfirmed(guild_id, channel, message);
+            if app
+                .automod_delete_marks
+                .remove_unconfirmed(guild_id, channel, message)
+                == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+            {
+                logging::emit_plain_message_delete(
+                    app,
+                    http,
+                    GuildId::new(guild_id),
+                    ChannelId::new(channel),
+                    MessageId::new(message),
+                    None,
+                )
+                .await;
+            }
             app.remembered_discord_targets.remember_rest_rejection(
                 recovery,
                 &error,
