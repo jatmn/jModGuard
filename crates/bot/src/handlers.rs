@@ -748,10 +748,11 @@ impl EventHandler for Handler {
             .joined_at
             .map(|joined| joined.timestamp_millis())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        if app
-            .rejoin_note_deliveries
-            .begin_attempt(guild_id.get(), uid, joined_at_ms)
-        {
+        if let Some(in_flight) = app.rejoin_note_deliveries.begin_in_flight(
+            guild_id.get(),
+            uid,
+            joined_at_ms,
+        ) {
             let sent = crate::member_rejoin::maybe_emit_member_rejoin(
                 &app,
                 &ctx,
@@ -759,8 +760,7 @@ impl EventHandler for Handler {
                 &new_member.user,
             )
             .await;
-            app.rejoin_note_deliveries
-                .finish_attempt(guild_id.get(), uid, joined_at_ms, sent);
+            in_flight.complete(sent);
         }
     }
 

@@ -250,7 +250,60 @@ pub struct RejoinNoteDeliveries {
     inner: Mutex<RejoinNoteDeliveryState>,
 }
 
+/// Clears an in-flight rejoin attempt when the handler future is canceled.
+pub struct RejoinNoteInFlight<'a> {
+    deliveries: &'a RejoinNoteDeliveries,
+    guild: u64,
+    user: u64,
+    joined_at_ms: i64,
+    finished: bool,
+}
+
+impl<'a> RejoinNoteInFlight<'a> {
+    fn new(
+        deliveries: &'a RejoinNoteDeliveries,
+        guild: u64,
+        user: u64,
+        joined_at_ms: i64,
+    ) -> Self {
+        Self {
+            deliveries,
+            guild,
+            user,
+            joined_at_ms,
+            finished: false,
+        }
+    }
+
+    pub fn complete(mut self, sent: bool) {
+        self.finished = true;
+        self.deliveries
+            .finish_attempt(self.guild, self.user, self.joined_at_ms, sent);
+    }
+}
+
+impl Drop for RejoinNoteInFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.deliveries
+                .finish_attempt(self.guild, self.user, self.joined_at_ms, false);
+        }
+    }
+}
+
 impl RejoinNoteDeliveries {
+    pub fn begin_in_flight(
+        &self,
+        guild: u64,
+        user: u64,
+        joined_at_ms: i64,
+    ) -> Option<RejoinNoteInFlight<'_>> {
+        if !self.begin_attempt(guild, user, joined_at_ms) {
+            return None;
+        }
+        Some(RejoinNoteInFlight::new(self, guild, user, joined_at_ms))
+    }
+
     pub fn begin_attempt(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
         let key = (guild, user, joined_at_ms);
         let mut state = self.inner.lock();

@@ -472,10 +472,31 @@ fn case_text_budget_appends_more_suffix() {
         index_incomplete: false,
     };
     let vars = member_rejoin_vars(&user(42), &note);
+    let last_line = vars["cases"]
+        .lines()
+        .next_back()
+        .expect("budgeted cases text");
     assert!(
-        vars["cases"].contains("+") && vars["cases"].contains("more"),
-        "cases: {}",
+        last_line
+            .strip_prefix('+')
+            .and_then(|rest| rest.strip_suffix(" more"))
+            .and_then(|count| count.parse::<usize>().ok())
+            .is_some_and(|count| count > 0),
+        "cases must end with a +N more overflow marker, got: {}",
         vars["cases"]
+    );
+}
+
+#[test]
+fn canceled_rejoin_attempt_allows_redelivery() {
+    let deliveries = crate::logging::RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(1, 2, 3)
+        .expect("first attempt must start");
+    drop(guard);
+    assert!(
+        deliveries.begin_attempt(1, 2, 3),
+        "canceled attempt must clear in-flight state"
     );
 }
 
@@ -517,11 +538,11 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         .expect("guild_member_addition");
     let body = &source[start..start + 3_200];
     assert!(
-        body.contains("rejoin_note_deliveries") && body.contains("begin_attempt"),
+        body.contains("rejoin_note_deliveries") && body.contains("begin_in_flight"),
         "join handler must reserve rejoin delivery before awaiting Discord"
     );
     assert!(
-        body.contains("finish_attempt"),
+        body.contains("in_flight.complete"),
         "join handler must record successful rejoin delivery"
     );
     assert_eq!(
