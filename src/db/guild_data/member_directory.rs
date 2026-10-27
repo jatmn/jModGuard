@@ -1182,8 +1182,8 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,bot_id)?;
             let (after,done):(Option<String>,bool)=tx.query_row("SELECT case_backfill_after,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if done {tx.finish_read()?;return Ok(true)}
-            let legacy_cases: i64=tx.query_row("SELECT COUNT(*) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
-            if legacy_cases==0 {
+            let legacy_cases: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 LIMIT 1)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
+            if !legacy_cases {
                 tx.ensure_mutation_receipt()?;
                 tx.member_execute("UPDATE guild_member_seed SET case_backfill_after=NULL,case_backfill_done=1 WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
                 let pending=tx.query_row("SELECT run_kind,phase,status FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<String>(2)?))).optional()?;
@@ -1948,7 +1948,18 @@ fn ingest_member_audits(
             };
             let payload = serde_json::to_string(&data)?;
             let case_id = random_id();
-            conn.member_execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)",params![scope.guild_id(),scope.enrollment.id.as_str(),case_id,key,payload])?;
+            conn.member_execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)",params![scope.guild_id(),scope.enrollment.id.as_str(),case_id.as_str(),key,payload])?;
+            conn.member_execute(
+                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    audit.user_id,
+                    case_id.as_str(),
+                    action,
+                    audit.occurred_at_ms
+                ],
+            )?;
         }
         conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1",params![scope.guild_id(),scope.enrollment.id.as_str(),audit.user_id,now_ms])?;
         inserted += 1;
@@ -2851,7 +2862,7 @@ impl GuildDataStore {
 
     /// True when this member still has selected cases that are not in the subject index.
     pub(crate) fn member_case_entries_index_gap_sql() -> &'static str {
-        "SELECT EXISTS(SELECT 1 FROM guild_member_case_index i WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 AND NOT EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0)) OR ((SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2)=0 AND EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=?1 AND c.enrollment_id=?2 AND c.deleted=0 AND length(CAST(c.payload AS BLOB))<=?4 AND json_valid(c.payload) AND CAST(json_extract(c.payload,'$.subject_id') AS INTEGER)=?3 AND NOT EXISTS(SELECT 1 FROM guild_member_case_index i WHERE i.guild_id=c.guild_id AND i.enrollment_id=c.enrollment_id AND i.case_id=c.case_id) LIMIT 1))"
+        "SELECT EXISTS(SELECT 1 FROM guild_member_case_index i WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 AND NOT EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0))"
     }
 
     /// Recent moderation cases for one member, newest first. Fetches at most
@@ -2925,20 +2936,17 @@ impl GuildDataStore {
                     .optional()?
                     .unwrap_or(false);
                 if !backfill_done {
-                    let index_gap: bool = tx.query_row(
-                        GuildDataStore::member_case_entries_index_gap_sql(),
-                        params![
-                            scope.guild_id(),
-                            scope.enrollment.id.as_str(),
-                            user_id,
-                            max_record_bytes
-                        ],
-                        |r| Ok(r.get(0)?),
-                    )?;
-                    if index_gap {
-                        tx.finish_read()?;
-                        return Err(MemberSyncError::Stale.into());
-                    }
+                    tx.finish_read()?;
+                    return Err(MemberSyncError::Stale.into());
+                }
+                let index_gap: bool = tx.query_row(
+                    GuildDataStore::member_case_entries_index_gap_sql(),
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+                    |r| Ok(r.get(0)?),
+                )?;
+                if index_gap {
+                    tx.finish_read()?;
+                    return Err(MemberSyncError::Stale.into());
                 }
                 tx.finish_read()?;
                 Ok((entries, truncated))

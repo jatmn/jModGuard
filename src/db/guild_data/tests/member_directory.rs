@@ -7419,22 +7419,116 @@ async fn member_case_entries_index_gap_is_scoped_to_member() {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
             let plan = stmt
                 .query_map(
-                    params![
-                        scope.guild_id(),
-                        scope.enrollment.id.as_str(),
-                        SUBJECT,
-                        CaseLimits::default().max_record_bytes as i64
-                    ],
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), SUBJECT],
                     |row| Ok(row.get::<String>(3)?),
                 )?
                 .collect::<Result<Vec<_>>>()?;
             assert!(
-                plan.iter()
-                    .any(|line| { line.contains("guild_cases") && line.contains("SEARCH") }),
-                "index gap check must seek cases by scope, not scan history: {plan:?}"
+                plan.iter().any(|line| {
+                    line.contains("guild_member_cases_user") && line.contains("user_id=?")
+                }),
+                "orphan index gap check must be scoped to the member: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("SCAN guild_cases")),
+                "gap check must not scan retained case history: {plan:?}"
             );
             Ok(())
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn record_case_commits_when_member_case_trigger_populates_index() {
+    const SUBJECT: i64 = 44;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let case_id = CaseId::new();
+    assert_eq!(
+        store
+            .record_case(
+                scope.clone(),
+                case_id.clone(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::Application {
+                        operation_id: CaseId::new(),
+                    },
+                    action: CaseAction::Kick,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: SUBJECT,
+                    actor_id: Some(42),
+                    occurred_at_ms: 8_000,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                CaseLimits::default(),
+            )
+            .await
+            .unwrap(),
+        RecordCase::Created(case_id)
+    );
+    let indexed = store
+        .db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM guild_member_case_index WHERE guild_id=10 AND enrollment_id=?1 AND user_id=?2",
+                params![scope.enrollment.id.as_str(), SUBJECT],
+                |row| Ok(row.get::<i64>(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(indexed, 1);
+}
+
+#[tokio::test]
+async fn member_case_entries_includes_audit_import_after_backfill() {
+    const SUBJECT: i64 = 97;
+    let (_fixture, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), 3_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_audit_recovery_page(
+            scope.clone(),
+            claim,
+            vec![MemberAuditSnapshot {
+                entry_id: 501,
+                user_id: SUBJECT,
+                executor_id: Some(99),
+                action: MemberAuditAction::Ban,
+                occurred_at_ms: 12_000,
+                reason: Some("imported".into()),
+            }],
+            (None, true),
+            3_001,
+            15_000,
+        )
+        .await
+        .unwrap();
+    let (entries, _) = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "ban");
+    assert_eq!(entries[0].occurred_at_ms, Some(12_000));
 }

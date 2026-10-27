@@ -369,37 +369,65 @@ fn paginate_case_lines_past_stay_rows_on_first_page() {
     assert!(body.contains("`ban`"));
 }
 
-#[test]
-fn rest_lookup_failure_still_renders_warns_and_cases() {
-    let mut snapshot = MemberSnapshot {
-        user_id: 91,
-        username: None,
-        global_name: None,
-        nick: None,
-        joined_at: None,
-        roles: vec![],
-        roles_cached: false,
-        voice: VoiceSnapshot::NotCached,
-        member_cached: false,
-        guild_cached: false,
-    };
-    apply_missing_user_identity(&mut snapshot);
-    let lines = vec![format_case_line(
-        "warn",
-        Some("succeeded"),
-        Some(1_600_000_000_000),
-        None,
-    )];
-    let body = render_userinfo_message(
-        jmodguard::defaults::USER_INFO_TEMPLATE,
-        &snapshot,
-        &WarnsField::Count(3),
-        lines,
+#[tokio::test]
+async fn rest_lookup_failure_still_renders_warns_and_cases() {
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_rest_fail_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
     );
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    crate::db::add_warn(&app.db, 10, 91, 7, "warned")
+        .await
+        .unwrap();
+    crate::cases::record(
+        &app,
+        Some(enrollment.clone()),
+        CaseAction::Warning,
+        CaseOutcome::Succeeded,
+        91,
+        Some(7),
+        Some("logged".into()),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    let cache = Arc::new(Cache::new());
+    remember_guild(&cache, 10, None, None);
+    let ctx = test_context(cache).await;
+    let cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|c| matches!(c.behavior, jmodguard::types::Behavior::UserInfo))
+        .unwrap();
+    let actor = target_member(10, 7, None);
+    let env = crate::commands::CmdEnv {
+        app: &app,
+        ctx: &ctx,
+        cmd: &cmd,
+        guild_id: GuildId::new(10),
+        channel_id: ChannelId::new(1),
+        actor: UserId::new(7),
+        actor_member: actor,
+        args: Args::new("91"),
+        source_message: None,
+    };
+    let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
+    let outcome = super::run(&env, Some(enrollment), &mut vars).await.unwrap();
+    let body = outcome.response.unwrap();
     assert!(body.contains(MISSING));
-    assert!(body.contains("**Warnings:** 3"));
-    assert!(body.contains("`warn`"));
+    assert!(body.contains("**Warnings:** 1"));
+    assert!(body.contains("`warning`"));
     assert!(!body.contains("Discord API error"));
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -479,10 +507,52 @@ fn clip_drops_roles_but_keeps_user_id() {
     assert!(body.contains("clipped"));
 }
 
-#[test]
-fn omitted_user_argument_defaults_to_actor() {
-    let mut args = Args::new("");
-    assert!(args.next_arg().is_none());
+#[tokio::test]
+async fn omitted_user_argument_defaults_to_actor() {
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_actor_default_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    let cache = Arc::new(Cache::new());
+    remember_guild(&cache, 10, Some(target_member(10, 7, None)), None);
+    let ctx = test_context(cache).await;
+    let cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|c| matches!(c.behavior, jmodguard::types::Behavior::UserInfo))
+        .unwrap();
+    let actor = target_member(10, 7, Some("Mod"));
+    let env = crate::commands::CmdEnv {
+        app: &app,
+        ctx: &ctx,
+        cmd: &cmd,
+        guild_id: GuildId::new(10),
+        channel_id: ChannelId::new(1),
+        actor: UserId::new(7),
+        actor_member: actor,
+        args: Args::new(""),
+        source_message: None,
+    };
+    let target = super::resolve_userinfo_target(&env, &mut env.args.clone())
+        .await
+        .unwrap();
+    assert_eq!(target, UserId::new(7));
+    let mut args_other = Args::new("91");
+    let other = super::resolve_userinfo_target(&env, &mut args_other)
+        .await
+        .unwrap();
+    assert_eq!(other, UserId::new(91));
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -514,9 +584,14 @@ fn default_template_renders_without_embedded_paths() {
 async fn ready_userinfo_case_index(app: &BotState, enrollment: &crate::db::GuildEnrollment) {
     let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
     store
-        .initialize_member_directory(scope, 100, 1_000)
+        .initialize_member_directory(scope.clone(), 100, 1_000)
         .await
         .unwrap();
+    while !store
+        .backfill_member_case_index(scope.clone(), 100, 100)
+        .await
+        .unwrap()
+    {}
 }
 
 #[tokio::test]
@@ -595,6 +670,11 @@ async fn retained_case_visible_after_join_depart_noise() {
         .initialize_member_directory(scope.clone(), 100, 1_000)
         .await
         .unwrap();
+    while !store
+        .backfill_member_case_index(scope.clone(), 100, 100)
+        .await
+        .unwrap()
+    {}
     crate::cases::record(
         &app,
         Some(enrollment.clone()),
