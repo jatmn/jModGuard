@@ -886,6 +886,7 @@ registry_inspect() {
   fi
   return 1
 }
+published_signature_still_valid() { return 0; }
 if changed_since_publication bot "$head" image; then
   fail 'docs-only change must not rebuild bot'
 fi
@@ -975,6 +976,7 @@ if ! changed_since_publication bot "$base" image; then
 fi
 
 reload_publisher
+published_signature_still_valid() { return 0; }
 match_base="$(git rev-parse HEAD)"
 echo changed >docs/new.md
 git add .
@@ -1605,6 +1607,28 @@ rollback_promoted_tags
 [[ "${ROLLBACK_TAG_DIGEST[${ROLLBACK_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PREV" ]] \
   || fail 'rollback must restore the first promoted tag to its previous digest'
 [[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
+
+reload_publisher
+SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
+export SIGNING_PUBLIC_KEY
+signature_skip_image='ghcr.io/jatmn/jmodguard-api'
+inspect_digest() {
+  [[ "$1" == "${signature_skip_image}:latest" ]] && printf '%s\t' "$MOCK_BUILD_DIGEST"
+}
+image_published_at() { printf '%s' '2026-10-01T00:00:00Z'; }
+not_after_from_published_at() { printf '%s' '2027-12-31T00:00:00Z'; }
+published_signature_still_valid "$signature_skip_image" \
+  && fail 'unsigned registry image must fail signature revalidation with cosign available'
+missing_cosign_path="$(mktemp -d "${TMPDIR:-/tmp}/publish-no-cosign-XXXXXX")"
+if (
+  export SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
+  PATH="$missing_cosign_path"
+  JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
+  published_signature_still_valid "$signature_skip_image"
+); then
+  fail 'missing cosign must fail closed instead of skipping signature revalidation'
+fi
+rm -rf "$missing_cosign_path"
 
 cleanup_test_signing
 trap - EXIT

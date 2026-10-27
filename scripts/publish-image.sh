@@ -281,10 +281,10 @@ changed_since_publication() {
 
 published_signature_still_valid() {
   local image="$1" digest published_at not_after
-  command -v cosign >/dev/null || return 0
-  [[ -f "$SIGNING_PUBLIC_KEY" ]] || return 0
+  command -v cosign >/dev/null || return 1
+  [[ -f "$SIGNING_PUBLIC_KEY" ]] || return 1
   if ! digest="$(inspect_digest "${image}:latest" 2>/dev/null | cut -f1)"; then
-    return 0
+    return 1
   fi
   if ! cosign verify \
       --key "$SIGNING_PUBLIC_KEY" \
