@@ -559,19 +559,6 @@ fn extract_layer_files(
     Ok(found)
 }
 
-fn extract_layer(
-    bytes: &[u8],
-    media: &str,
-    requested: &[&str],
-) -> Result<HashMap<String, Vec<u8>>> {
-    let found = extract_layer_files(bytes, media, requested)?;
-    ensure!(
-        found.len() == requested.len(),
-        "release layer is missing a required file"
-    );
-    Ok(found)
-}
-
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -632,12 +619,13 @@ mod tests {
             b"\x7fELFbody",
             tar::EntryType::Regular,
         )]);
-        let found = extract_layer(
+        let found = extract_layer_files(
             &good,
             "application/vnd.oci.image.layer.v1.tar+gzip",
             &["usr/local/bin/jmodguard-api"],
         )
         .unwrap();
+        assert_eq!(found.len(), 1);
         assert_eq!(found["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
         let duplicate = layer(&[
             (
@@ -652,7 +640,7 @@ mod tests {
             ),
         ]);
         assert!(
-            extract_layer(
+            extract_layer_files(
                 &duplicate,
                 "application/vnd.oci.image.layer.v1.tar+gzip",
                 &["usr/local/bin/jmodguard-api"]
@@ -661,7 +649,7 @@ mod tests {
         );
         let link = layer(&[("usr/local/bin/jmodguard-api", b"", tar::EntryType::Symlink)]);
         assert!(
-            extract_layer(
+            extract_layer_files(
                 &link,
                 "application/vnd.oci.image.layer.v1.tar+gzip",
                 &["usr/local/bin/jmodguard-api"]
