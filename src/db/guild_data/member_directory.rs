@@ -2830,6 +2830,11 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Index-ordered case lookup: bound the index walk before joining payloads.
+    pub(crate) fn member_case_entries_lookup_sql() -> &'static str {
+        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms FROM guild_member_case_index INDEXED BY guild_member_cases_user WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 ORDER BY occurred_at_ms DESC,case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
+    }
+
     /// Recent moderation cases for one member, newest first. Fetches at most
     /// `limit` rows and reports whether a newer ninth case exists.
     pub async fn member_case_entries(
@@ -2845,48 +2850,49 @@ impl GuildDataStore {
         );
         let fetch = limit + 1;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_snapshot()?;
-            verify_scope(&tx, &expected, &scope, true)?;
-            let sql = "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=i.guild_id AND s.enrollment_id=i.enrollment_id AND s.case_id=i.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM guild_member_case_index i JOIN guild_cases c USING(guild_id,enrollment_id,case_id) WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 AND c.deleted=0 ORDER BY coalesce(i.occurred_at_ms,0) DESC,i.case_id DESC LIMIT ?4";
-            let mut stmt = tx.prepare(sql)?;
-            let rows = stmt.query_map(
-                params![
-                    scope.guild_id(),
-                    scope.enrollment.id.as_str(),
-                    user_id,
-                    fetch as i64
-                ],
-                |r| {
-                    Ok(MemberHistoryEntry {
-                        kind: r.get(0)?,
-                        occurred_at_ms: r.get(1)?,
-                        observed_at_ms: None,
-                        stay_id: None,
-                        observation_id: None,
-                        case_id: Some(r.get::<String>(2)?),
-                        joined_at_ms: None,
-                        departed_at_ms: None,
-                        moderator_id: r.get(3)?,
-                        reason: r.get(4)?,
-                        outcome: r.get(5)?,
-                        source_kind: r.get(6)?,
-                    })
-                },
-            )?;
-            let mut entries = Vec::new();
-            for row in rows {
-                entries.push(row?);
-            }
-            drop(stmt);
-            let truncated = entries.len() > limit as usize;
-            if truncated {
-                entries.pop();
-            }
-            tx.finish_read()?;
-            Ok((entries, truncated))
-        })
-        .await
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let sql = GuildDataStore::member_case_entries_lookup_sql();
+                let mut stmt = tx.prepare(sql)?;
+                let rows = stmt.query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        user_id,
+                        fetch as i64
+                    ],
+                    |r| {
+                        Ok(MemberHistoryEntry {
+                            kind: r.get(0)?,
+                            occurred_at_ms: r.get(1)?,
+                            observed_at_ms: None,
+                            stay_id: None,
+                            observation_id: None,
+                            case_id: Some(r.get::<String>(2)?),
+                            joined_at_ms: None,
+                            departed_at_ms: None,
+                            moderator_id: r.get(3)?,
+                            reason: r.get(4)?,
+                            outcome: r.get(5)?,
+                            source_kind: r.get(6)?,
+                        })
+                    },
+                )?;
+                let mut entries = Vec::new();
+                for row in rows {
+                    entries.push(row?);
+                }
+                drop(stmt);
+                let truncated = entries.len() > limit as usize;
+                if truncated {
+                    entries.pop();
+                }
+                tx.finish_read()?;
+                Ok((entries, truncated))
+            })
+            .await
     }
 
     pub async fn claim_member_sync(

@@ -1,7 +1,7 @@
 use super::*;
 use crate::commands::Args;
 use crate::db::guild_data::{
-    CaseAction, CaseEvidence, CaseOutcome, MemberHistoryEntry, MemberHistoryPage,
+    CaseAction, CaseEvidence, CaseOutcome, MemberHistoryEntry, MemberHistoryPage, MemberObservation,
 };
 use crate::state::BotState;
 use serenity::all::{Cache, Guild, GuildCreateEvent, Member, Role, RoleId, User, UserId};
@@ -449,6 +449,101 @@ async fn integration_warn_and_case_rows() {
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn retained_case_visible_after_join_depart_noise() {
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_cases_db_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 100, 1_000)
+        .await
+        .unwrap();
+    crate::cases::record(
+        &app,
+        Some(enrollment.clone()),
+        CaseAction::Ban,
+        CaseOutcome::Succeeded,
+        91,
+        Some(7),
+        Some("still visible".into()),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    for round in 0..12_i64 {
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: 91,
+                    username: Some(Some("targetuser".into())),
+                    global_name: None,
+                    nickname: None,
+                    joined_at_ms: Some(500 + round),
+                    observed_at_ms: 10_000 + round,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .depart_member(scope.clone(), 91, 20_000 + round)
+            .await
+            .unwrap();
+    }
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    let lines = match cases {
+        CasesField::Lines(lines) => lines,
+        other => panic!("expected case lines, got {other:?}"),
+    };
+    assert!(
+        lines.iter().any(|line| line.contains("`ban`")),
+        "ban case must appear despite join/depart history: {lines:?}"
+    );
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn guild_create_voice_without_guild_id_is_not_rejected() {
+    let cache = Cache::new();
+    remember_guild(
+        &cache,
+        10,
+        Some(target_member(10, 91, None)),
+        Some(
+            serde_json::from_value(serde_json::json!({
+                "channel_id": "700",
+                "user_id": "91",
+                "session_id": "sess",
+                "deaf": false,
+                "mute": false,
+                "self_deaf": false,
+                "self_mute": false,
+                "self_video": false,
+                "suppress": false
+            }))
+            .unwrap(),
+        ),
+    );
+    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    assert!(matches!(
+        snapshot.voice,
+        VoiceSnapshot::Channel { id: 700, .. }
+    ));
 }
 
 async fn test_context(cache: Arc<Cache>) -> serenity::client::Context {
