@@ -302,6 +302,17 @@ impl GuildDataStore {
             if let Some(existing) = existing { tx.finish_read()?; return Ok(existing); }
             tx.ensure_mutation_receipt()?;
             tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()], 1)?;
+            tx.execute_rows(
+                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?5,'$.subject_id') AS INTEGER),?3,json_extract(?5,'$.action'),CAST(json_extract(?5,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?5) AND json_extract(?5,'$.subject_id') IS NOT NULL AND json_extract(?5,'$.action') IS NOT NULL",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    id.as_str(),
+                    source.as_str(),
+                    payload.as_str()
+                ],
+                1,
+            )?;
             tx.commit()?;
             Ok(RecordCase::Created(id))
         }).await

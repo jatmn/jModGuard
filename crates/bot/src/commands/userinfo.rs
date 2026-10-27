@@ -530,6 +530,7 @@ pub(crate) async fn run(
     if !snapshot_has_cached_user(&snapshot) {
         match rest_user_lookup(env, target).await {
             Ok((name, global)) => apply_rest_user(&mut snapshot, name, global),
+            Err(error) if error.to_string() == "writer lease is not held" => return Err(error),
             Err(_) => apply_missing_user_identity(&mut snapshot),
         }
     }

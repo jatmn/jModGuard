@@ -207,6 +207,66 @@ fn collect_case_entries_from_pages(pages: &[MemberHistoryPage]) -> Vec<MemberHis
     entries
 }
 
+#[tokio::test]
+async fn load_case_lines_from_store_past_stay_rows_on_first_page() {
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_store_cases_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    crate::cases::record(
+        &app,
+        Some(enrollment.clone()),
+        CaseAction::Ban,
+        CaseOutcome::Succeeded,
+        91,
+        Some(7),
+        Some("indexed ban".into()),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    for round in 0..8_i64 {
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: 91,
+                    username: Some(Some("targetuser".into())),
+                    global_name: None,
+                    nickname: None,
+                    joined_at_ms: Some(500 + round),
+                    observed_at_ms: 10_000 + round,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .depart_member(scope.clone(), 91, 20_000 + round)
+            .await
+            .unwrap();
+    }
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    let lines = match cases {
+        CasesField::Lines(lines) => lines,
+        other => panic!("expected case lines, got {other:?}"),
+    };
+    assert!(lines.iter().any(|line| line.contains("`ban`")));
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn paginate_case_lines_past_stay_rows_on_first_page() {
     let page1 = MemberHistoryPage {
@@ -395,6 +455,18 @@ fn default_template_renders_without_embedded_paths() {
     assert!(body.contains("**ID:** `5`"));
 }
 
+async fn ready_userinfo_case_index(app: &BotState, enrollment: &crate::db::GuildEnrollment) {
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 100, 1_000)
+        .await
+        .unwrap();
+    store
+        .backfill_member_case_index(scope, 100, 8)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn integration_warn_and_case_rows() {
     let path = std::env::temp_dir().join(format!("userinfo_db_{:032x}.db", rand::random::<u128>()));
@@ -406,6 +478,7 @@ async fn integration_warn_and_case_rows() {
         .unwrap()
         .unwrap();
     app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
     crate::db::add_warn(&app.db, 10, 91, 7, "first")
         .await
         .unwrap();
@@ -468,6 +541,10 @@ async fn retained_case_visible_after_join_depart_noise() {
     let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
     store
         .initialize_member_directory(scope.clone(), 100, 1_000)
+        .await
+        .unwrap();
+    store
+        .backfill_member_case_index(scope.clone(), 100, 8)
         .await
         .unwrap();
     crate::cases::record(

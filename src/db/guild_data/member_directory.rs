@@ -2832,7 +2832,7 @@ impl GuildDataStore {
 
     /// Index-ordered case lookup: bound the index walk before joining payloads.
     pub(crate) fn member_case_entries_lookup_sql() -> &'static str {
-        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms FROM guild_member_case_index INDEXED BY guild_member_cases_user WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 ORDER BY occurred_at_ms DESC,case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
+        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT i.guild_id,i.enrollment_id,i.user_id,i.case_id,i.action_kind,i.occurred_at_ms FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
     }
 
     /// Primary read used before returning indexed case rows during upgrade backfill.
@@ -2894,11 +2894,14 @@ impl GuildDataStore {
                 if truncated {
                     entries.pop();
                 }
-                let backfill_done: bool = tx.query_row(
-                    GuildDataStore::member_case_entries_backfill_gate_sql(),
-                    params![scope.guild_id(), scope.enrollment.id.as_str()],
-                    |r| Ok(r.get(0)?),
-                )?;
+                let backfill_done: bool = tx
+                    .query_row(
+                        GuildDataStore::member_case_entries_backfill_gate_sql(),
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
                 if !backfill_done {
                     tx.finish_read()?;
                     return Err(MemberSyncError::Stale.into());
