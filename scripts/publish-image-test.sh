@@ -252,7 +252,10 @@ BUILD_LINE=""
 GITHUB_TOKEN_SEEN=""
 FAIL_BUILD=0
 FAIL_VERIFY=0
+FAIL_SIGN=0
 PUBLISH_SHA="$HEAD_SHA"
+SIGNING_KEY_VALUE=fixture-signing-key
+SIGNING_PASSWORD_VALUE=fixture-signing-password
 SOURCE_LAYOUT=current
 TRACE_FILE=""
 PUBLISH_TEST_TRACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-traces-XXXXXX")"
@@ -338,7 +341,13 @@ mock_publish_helpers() {
   }
   redact_tokens() {
     printf 'mask tokens\n' >>"$TRACE_FILE"
-    GHCR_TOKEN="$1" SOURCE_TOKEN="$2" node -e 'process.stdout.write(JSON.stringify({GHCR_TOKEN:process.env.GHCR_TOKEN,GITHUB_TOKEN:process.env.SOURCE_TOKEN}))' >"${TRACE_FILE}.redactor"
+    GHCR_TOKEN="$1" SOURCE_TOKEN="$2" SIGNING_KEY="${3:-}" SIGNING_PASSWORD="${4:-}" \
+      node -e 'process.stdout.write(JSON.stringify({GHCR_TOKEN:process.env.GHCR_TOKEN,GITHUB_TOKEN:process.env.SOURCE_TOKEN,SIGNING_KEY:process.env.SIGNING_KEY,SIGNING_PASSWORD:process.env.SIGNING_PASSWORD}))' >"${TRACE_FILE}.redactor"
+  }
+  sign_published_digest() {
+    printf 'sign %s %s %s\n' "$1" "$2" "$3" >>"$TRACE_FILE"
+    require_signing_secrets
+    [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
   }
 }
 
@@ -372,7 +381,9 @@ exercise_publish() {
   GHCR_USERNAME=publisher
   GHCR_TOKEN=test-secret
   GITHUB_TOKEN="$source_token"
-  export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
+  [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY+set}" ]] || JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+  [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD+set}" ]] || JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+  export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
   if [[ "$mode" == manual ]]; then
     ref="${9:-refs/tags/v1}"
     sha="$BASE_SHA"
@@ -458,9 +469,10 @@ printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" 
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' \
   || fail 'verified main image must move latest by digest'
 verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify api ' | head -1 | cut -d: -f1)"
+sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^sign api ' | head -1 | cut -d: -f1)"
 promote_line="$(printf '%s\n' "${CALLS[@]}" | grep -n 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' | head -1 | cut -d: -f1)"
-[[ -n "$verify_line" && -n "$promote_line" && "$verify_line" -lt "$promote_line" ]] \
-  || fail 'latest must move after effective-image verification'
+[[ -n "$verify_line" && -n "$sign_line" && -n "$promote_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$promote_line" ]] \
+  || fail 'latest must move only after verification and signing'
 [[ "$GITHUB_TOKEN_SEEN" == test-secret ]] || fail "build secret must fall back to GHCR token, got '$GITHUB_TOKEN_SEEN'"
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'publish must remove the worktree'
 printf '%s\n' "${CALLS[@]}" | grep -q 'test-secret' && fail 'secret must not appear on argv'
@@ -490,10 +502,11 @@ printf '%s\n' "${CALLS[@]}" | grep -q -- '--tag ghcr.io/jatmn/jmodguard-bot:late
   && fail 'failed Stable verification promoted latest'
 exercise_publish 1 0 manual '' "$stable_plan" bot
 verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify bot ' | head -1 | cut -d: -f1)"
+sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^sign bot ' | head -1 | cut -d: -f1)"
 latest_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' | head -1 | cut -d: -f1)"
 stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' | head -1 | cut -d: -f1)"
-[[ -n "$verify_line" && -n "$latest_line" && -n "$stable_line" && "$verify_line" -lt "$latest_line" && "$verify_line" -lt "$stable_line" ]] \
-  || fail 'Stable publication must promote both moving pointers after verification'
+[[ -n "$verify_line" && -n "$sign_line" && -n "$latest_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$latest_line" && "$sign_line" -lt "$stable_line" ]] \
+  || fail 'Stable publication must sign before promoting moving pointers'
 
 # Automatic releases build R, not workflow commit H, for every eligible package.
 release_plan="$(plan_json release refs/tags/v1.2.3 "$HEAD_SHA" "$BASE_SHA" v1.2.3)"
@@ -504,9 +517,10 @@ for component in bot api webui; do
   [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
     || fail "$component release must retain its version tag"
   verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^verify $component " | cut -d: -f1)"
+  sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^sign $component " | cut -d: -f1)"
   stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:stable" | cut -d: -f1)"
-  [[ -n "$verify_line" && -n "$stable_line" && "$verify_line" -lt "$stable_line" ]] \
-    || fail "$component release must verify before promoting Stable"
+  [[ -n "$verify_line" && -n "$sign_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$stable_line" ]] \
+    || fail "$component release must sign before promoting Stable"
 
   # Reject mismatched source, workflow identity and version before registry login.
   for bad_plan in \
@@ -912,6 +926,7 @@ run_docker() {
   return 0
 }
 verify_published_image() { :; }
+sign_published_digest() { :; }
 if ( publish_component bot ) >/dev/null 2>&1; then
   fail 'first partial build must fail'
 fi
@@ -928,6 +943,7 @@ publish_component bot
 # Retried job must republish its planned SHA even if latest now points at a newer commit.
 reload_publisher
 verify_published_image() { :; }
+sign_published_digest() { :; }
 EXPORTS=0
 PLAN_JSON="$(plan_json main "" "$base" "$base" "")"
 export PLAN_JSON
@@ -982,5 +998,47 @@ publish_component bot
 [[ "$EXPORTS" -eq 1 ]] || fail "retried job must rebuild, got $EXPORTS exports"
 
 popd >/dev/null
+
+reload_publisher
+FAIL_SIGN=0
+JMODGUARD_UPDATE_SIGNING_KEY=""
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+if ( exercise_publish 1 ) >/dev/null 2>&1; then
+  fail 'missing signing key must fail publication'
+fi
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+  && fail 'missing signing key must not promote tags'
+
+reload_publisher
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD=""
+export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+if ( exercise_publish 1 ) >/dev/null 2>&1; then
+  fail 'missing signing password must fail publication'
+fi
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+  && fail 'missing signing password must not promote tags'
+
+FAIL_SIGN=1
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+if ( exercise_publish 1 ) >/dev/null 2>&1; then
+  fail 'failed signing must fail publication'
+fi
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+  && fail 'failed signing must not promote tags'
+FAIL_SIGN=0
+unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+
+assert_eq "$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')" \
+  $'::add-mask::a%25b\n::add-mask::c%0Ad\n::add-mask::secret-key\n::add-mask::secret-pass'
+trace="$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')"
+printf '%s' "$trace" | grep -v '^::add-mask::' | grep -Eq 'secret-key|secret-pass' \
+  && fail 'redactor output must not echo signing secrets outside masking'
 
 echo 'publish-image-test: ok'

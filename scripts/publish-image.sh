@@ -13,6 +13,11 @@ publish_fail() {
 
 run_git() { git "$@" || publish_fail "git failed: $*"; }
 run_docker() { docker "$@" || publish_fail "docker failed: $*"; }
+run_cosign() { cosign "$@" || publish_fail "cosign failed: $*"; }
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGNING_PUBLIC_KEY="${REPO_ROOT}/deploy/update-signing.pub"
+IMAGE_SIGNING_RE='^ghcr\.io/jatmn/jmodguard-(bot|api|webui)$'
 read_publication_plan() {
   if [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" ]]; then
     printf '%s\n' "$JMODGUARD_PUBLICATION_PLAN"
@@ -463,12 +468,78 @@ verify_published_image() {
 }
 
 redact_tokens() {
-  GHCR_TOKEN="$1" GITHUB_TOKEN_VALUE="$2" node --input-type=commonjs - <<'JS'
-for (const value of [process.env.GHCR_TOKEN, process.env.GITHUB_TOKEN_VALUE]) {
+  GHCR_TOKEN="${1:-}" GITHUB_TOKEN_VALUE="${2:-}" SIGNING_KEY="${3:-}" SIGNING_PASSWORD="${4:-}" \
+    node --input-type=commonjs - <<'JS'
+for (const value of [
+  process.env.GHCR_TOKEN,
+  process.env.GITHUB_TOKEN_VALUE,
+  process.env.SIGNING_KEY,
+  process.env.SIGNING_PASSWORD,
+]) {
+  if (!value) continue;
   const escaped = value.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
   process.stdout.write(`::add-mask::${escaped}\n`);
 }
 JS
+}
+
+require_signing_secrets() {
+  [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]] \
+    || publish_fail 'JMODGUARD_UPDATE_SIGNING_KEY is empty; image signing is required before tags move'
+  [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]] \
+    || publish_fail 'JMODGUARD_UPDATE_SIGNING_PASSWORD is empty; image signing is required before tags move'
+  [[ -f "$SIGNING_PUBLIC_KEY" ]] \
+    || publish_fail 'committed signing public key is missing'
+}
+
+image_published_at() {
+  local ref="$1"
+  local raw
+  raw="$(run_docker buildx imagetools inspect "$ref" --format '{{json .}}')"
+  IMAGE_JSON="$raw" node --input-type=commonjs - <<'JS'
+const data = JSON.parse(process.env.IMAGE_JSON || "{}");
+function labelsFrom(value) {
+  if (!value || typeof value !== "object") return null;
+  if (value.config?.Labels) return value.config.Labels;
+  if (value.Config?.Labels) return value.Config.Labels;
+  if (value.Image && typeof value.Image === "object") return labelsFrom(value.Image);
+  return null;
+}
+const labels = labelsFrom(data) || labelsFrom(data.Manifest) || labelsFrom(data.Image) || {};
+const published = labels["io.jmodguard.published-at"] || "";
+if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(published)) process.exit(2);
+process.stdout.write(published);
+JS
+}
+
+not_after_from_published_at() {
+  PUBLISHED_AT="$1" node --input-type=commonjs - <<'JS'
+const published = process.env.PUBLISHED_AT || "";
+const date = new Date(published);
+if (Number.isNaN(date.getTime())) process.exit(2);
+date.setUTCDate(date.getUTCDate() + 366);
+process.stdout.write(date.toISOString().replace(/\.\d{3}Z$/, "Z"));
+JS
+}
+
+sign_published_digest() {
+  local component="$1" image="$2" digest="$3"
+  local published_at not_after
+  [[ "$image" =~ $IMAGE_SIGNING_RE ]] || publish_fail 'invalid image signing reference'
+  require_signing_secrets
+  published_at="$(image_published_at "${image}@${digest}")" \
+    || publish_fail 'published image lacks io.jmodguard.published-at'
+  not_after="$(not_after_from_published_at "$published_at")" \
+    || publish_fail 'cannot compute image signature expiry'
+  COSIGN_PASSWORD="${JMODGUARD_UPDATE_SIGNING_PASSWORD}" run_cosign sign \
+    --key "env://JMODGUARD_UPDATE_SIGNING_KEY" \
+    --tlog-upload=false \
+    --annotation "io.jmodguard.not-after=${not_after}" \
+    "${image}@${digest}"
+  run_cosign verify \
+    --key "$SIGNING_PUBLIC_KEY" \
+    --insecure-ignore-tlog=true \
+    "${image}@${digest}"
 }
 
 scratch_dir() {
@@ -509,7 +580,7 @@ publish_component() {
   if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
     source_token="$token"
   fi
-  redact_tokens "$token" "$source_token"
+  redact_tokens "$token" "$source_token" "${JMODGUARD_UPDATE_SIGNING_KEY:-}" "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}"
   export GITHUB_TOKEN="$source_token"
   scratch="$(scratch_dir publish)"
   context="${scratch}/source"
@@ -544,6 +615,7 @@ publish_component() {
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
   verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
+  sign_published_digest "$component" "$image" "$published_digest"
   if [[ "$channel" != "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
     IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:latest")"

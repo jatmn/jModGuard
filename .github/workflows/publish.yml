@@ -161,7 +161,10 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
       - name: Publish changed component
         env:
           COMPONENT: ${{ matrix.component }}
+          JMODGUARD_UPDATE_SIGNING_KEY: ${{ secrets.JMODGUARD_UPDATE_SIGNING_KEY }}
+          JMODGUARD_UPDATE_SIGNING_PASSWORD: ${{ secrets.JMODGUARD_UPDATE_SIGNING_PASSWORD }}
         run: bash scripts/publish-image.sh "$COMPONENT"

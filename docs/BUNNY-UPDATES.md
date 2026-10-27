@@ -95,6 +95,15 @@ The update policy supports Off, Daily, Weekly, and Monthly UTC windows for promo
 
 An owner install request requires a successful release check for the currently selected channel within the last two hours. If the last check failed or expired, use **Check now** before installing; this applies to the service application, launcher, and WebUI controls.
 
+## Image signatures
+
+Release images are signed in GitHub Actions with a pinned cosign key pair before
+`latest`, a release channel tag, or a source-SHA tag moves. Each signature is stored
+in the registry as a `sha256-<digest>.sig` artifact using the cosign simple-signing
+envelope. Signatures carry an `io.jmodguard.not-after` annotation set to 366 days
+after the image `io.jmodguard.published-at` label. The private signing key is not
+stored in this repository; publication fails closed when that Actions secret is missing.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.

@@ -118,7 +118,10 @@ If a release was created before the action, preparation, or artifact upload fail
 to retain its plan, start a fresh owner-dispatched **Publish** run on `main` with
 `source=refs/tags/<created-tag>`. An empty source runs checks only; a later ordinary
 main run cannot recreate the already-consumed release output. Start a new run for
-a deliberate new selection. The publisher verifies image contents before promoting moving tags.
+a deliberate new selection. The publisher verifies image contents, signs each pushed
+digest with the pinned update key, and verifies that signature with the committed
+public key before promoting moving tags. The private signing key is stored only as
+a GitHub Actions secret; an empty signing secret fails publication before any tag moves.
 Nightly tags never move `latest`. An explicit rerun republishes its pinned source.
 
 Each component compares its actual production inputs against the source revision
