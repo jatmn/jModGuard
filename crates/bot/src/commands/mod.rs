@@ -2614,8 +2614,7 @@ mod tests {
             },
             "default partial user id must not drive member-specific view denies"
         );
-        let actor_member =
-            super::actor_member_for_command(actor, from_gateway);
+        let actor_member = super::actor_member_for_command(actor, from_gateway);
         assert_eq!(actor_member.user.id, actor);
 
         let snapshot = snapshot_cached_voice(

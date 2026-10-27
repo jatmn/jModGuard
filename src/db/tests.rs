@@ -2770,6 +2770,25 @@ fn voice_dashboard_disable_save_cannot_persist_voice_behavior() {
             .contains("cannot be written to the database"),
         "{error:#}"
     );
+    let before = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+    let alias_scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let alias_error = tokio_test_block_on(upsert_enrolled_command(
+        &db,
+        alias_scope,
+        "voicealias",
+        &voice,
+    ))
+    .expect_err("overlay behavior must not persist under another command name");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    let after = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
     cleanup_db(&tmp);
 }
 
