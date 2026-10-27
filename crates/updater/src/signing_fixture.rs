@@ -1,7 +1,7 @@
 //! Registry fixture helpers for signature verification tests.
 use crate::oci::sha256_hex;
 use crate::signature::signature_tag_for_digest;
-use crate::signature::test_support::{generate_key_pair, sign_manifest};
+use crate::signature::test_support::{generate_key_pair, sign_manifest_cosign};
 use jmodguard::db::ComponentRelease;
 use serde_json::json;
 use std::collections::HashMap;
@@ -74,15 +74,23 @@ impl SigningFixture {
             ),
             SigningKeyChoice::Unknown => {
                 let (public, private) = generate_key_pair();
-                let body = sign_manifest(&private, &public, component, manifest_digest, not_after);
+                let (manifest, blobs) =
+                    sign_manifest_cosign(&private, &public, component, manifest_digest, not_after);
                 let tag = signature_tag_for_digest(manifest_digest).unwrap();
-                objects.insert(tag, body);
+                for (digest, bytes) in blobs {
+                    objects.insert(digest, bytes);
+                }
+                objects.insert(tag, manifest);
                 return;
             }
         };
-        let body = sign_manifest(private, public, component, manifest_digest, not_after);
+        let (manifest, blobs) =
+            sign_manifest_cosign(private, public, component, manifest_digest, not_after);
         let tag = signature_tag_for_digest(manifest_digest).unwrap();
-        objects.insert(tag, body);
+        for (digest, bytes) in blobs {
+            objects.insert(digest, bytes);
+        }
+        objects.insert(tag, manifest);
     }
 }
 

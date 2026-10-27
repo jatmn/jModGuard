@@ -49,6 +49,8 @@ struct Descriptor {
     size: u64,
     #[serde(rename = "mediaType")]
     media_type: String,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,13 +214,27 @@ impl Registry {
         {
             return Ok(body.to_vec());
         }
-        let manifest: Manifest = serde_json::from_slice(body)
-            .map_err(|_| anyhow::anyhow!(signature::BAD_IMAGE_SIGNATURE))?;
+        let manifest: Manifest = serde_json::from_slice(body).map_err(|_| {
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
+        })?;
         ensure!(
             manifest.schema_version == 2 && !manifest.layers.is_empty(),
-            signature::BAD_IMAGE_SIGNATURE
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
         );
-        self.blob(repo, &manifest.layers[0], MAX_MANIFEST).await
+        let layer = &manifest.layers[0];
+        let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
+        let signature_b64 = layer
+            .annotations
+            .get("dev.cosignproject.cosign/signature")
+            .map(String::as_str)
+            .ok_or(signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            })?;
+        signature::envelope_from_cosign_payload(&payload, signature_b64)
     }
 
     async fn verify_manifest(

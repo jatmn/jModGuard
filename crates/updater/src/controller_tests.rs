@@ -8218,6 +8218,7 @@ async fn boot_repair_starts_baked_when_signature_missing_and_schema_fits() {
     release.max_schema = db::CORE_SCHEMA_VERSION;
     release.result_schema = db::CORE_SCHEMA_VERSION;
     release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let installed_digest = release.digest.clone();
     let release_json = serde_json::to_string(&release).unwrap();
     let observed = db::ComponentObservation {
         guild_schema: Some(db::guild_data::SCHEMA_VERSION),
@@ -8253,7 +8254,109 @@ async fn boot_repair_starts_baked_when_signature_missing_and_schema_fits() {
     assert!(bot.running.is_some());
     let mismatches = db::read_boot_mismatch_map(&db).await.unwrap();
     assert_eq!(mismatches["bot"].reason, UNSIGNED_IMAGE);
+    let state = control.component("bot").await.unwrap();
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "baked boot repair must not clear the installed selection"
+    );
     server.abort();
     drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn cosign_publisher_signature_verifies_during_staging() {
+    use jmodguard_updater::signing_fixture::image as signed_image;
+    let root = std::env::temp_dir().join(format!("cosign-stage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = tokio::fs::read(executable(&root, "baked-bot").await)
+        .await
+        .unwrap();
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        test_signing(),
+        "bot",
+        &baked,
+        "latest",
+        "2027-12-31T00:00:00Z",
+        'c',
+    );
+    let (registry, server) = registry_with_objects(objects).await;
+    let staging = root.join("staged");
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    stage(&registry, &release, "jmodguard-bot", &staging)
+        .await
+        .expect("cosign publisher artifact must verify during staging");
+    server.abort();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_fails() {
+    let root = std::env::temp_dir().join(format!("api-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let mut objects = HashMap::new();
+    let release = image(&mut objects, "api", &tokio::fs::read(baked.clone()).await.unwrap());
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release;
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    let installed_digest = release.digest.clone();
+    let release_json = serde_json::to_string(&release).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: release.source_sha.clone(),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: release.source_sha.clone(),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=100, state='running' WHERE component='api'",
+            params![release_json, observed_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut api = controller("api", baked, registry, control.clone(), &root);
+    api.running = None;
+    api.restore(&control.component("api").await.unwrap())
+        .await
+        .unwrap();
+    assert!(
+        api.running.is_some(),
+        "compatible API must start baked fallback even when installed staging fails"
+    );
+    let state = control.component("api").await.unwrap();
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(installed_digest.as_str())
+    );
+    server.abort();
+    drop((api, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

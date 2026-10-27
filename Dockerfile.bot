@@ -45,6 +45,7 @@ RUN apt-get update \
     && chown jmodguard:jmodguard /data
 WORKDIR /data
 COPY --from=builder /app/release/ /usr/local/
+COPY --from=builder /app/deploy/ /usr/local/share/jmodguard/deploy/
 ARG SOURCE_SHA=unknown
 VOLUME ["/data"]
 USER 10001

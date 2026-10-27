@@ -118,6 +118,9 @@ fn previous_key_paths() -> Vec<PathBuf> {
     if let Ok(root) = std::env::var("JMODGUARD_REPO_ROOT") {
         paths.push(PathBuf::from(root).join("deploy/update-signing-previous.pub"));
     }
+    paths.push(
+        PathBuf::from("/usr/local/share/jmodguard/deploy/update-signing-previous.pub"),
+    );
     paths
 }
 
@@ -164,6 +167,36 @@ pub fn signature_tag_for_digest(manifest_digest: &str) -> Result<String> {
     ))
 }
 
+pub fn envelope_from_cosign_payload(payload: &[u8], signature_b64: &str) -> Result<Vec<u8>> {
+    let signature_bytes = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        })?;
+    let keys = trusted_keys().map_err(|_| ImageSignatureRejection {
+        phrase: BAD_IMAGE_SIGNATURE,
+    })?;
+    let trusted = keys
+        .iter()
+        .find(|key| key.key.verify(payload, &signature_bytes).is_ok())
+        .ok_or(ImageSignatureRejection {
+            phrase: UNTRUSTED_IMAGE_SIGNATURE_KEY,
+        })?;
+    let envelope = serde_json::json!({
+        "payloadType": PAYLOAD_TYPE,
+        "payload": STANDARD.encode(payload),
+        "signatures": [{
+            "keyid": trusted.keyid,
+            "sig": signature_b64
+        }]
+    });
+    serde_json::to_vec(&envelope).map_err(|_| {
+        anyhow::Error::new(ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        })
+    })
+}
+
 pub fn verify_manifest_signature(
     component: &str,
     manifest_digest: &str,
@@ -171,7 +204,11 @@ pub fn verify_manifest_signature(
     signature_body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let envelope: Envelope = serde_json::from_slice(signature_body).context(BAD_IMAGE_SIGNATURE)?;
+    let envelope: Envelope = serde_json::from_slice(signature_body).map_err(|_| {
+        ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        }
+    })?;
     ensure!(
         envelope.payload_type == PAYLOAD_TYPE,
         ImageSignatureRejection {
@@ -185,11 +222,19 @@ pub fn verify_manifest_signature(
         }
     );
     let entry = &envelope.signatures[0];
-    let payload_bytes = STANDARD
-        .decode(&envelope.payload)
-        .context(BAD_IMAGE_SIGNATURE)?;
-    let signature_bytes = STANDARD.decode(&entry.sig).context(BAD_IMAGE_SIGNATURE)?;
-    let keys = trusted_keys().context(BAD_IMAGE_SIGNATURE)?;
+    let payload_bytes = STANDARD.decode(&envelope.payload).map_err(|_| {
+        ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        }
+    })?;
+    let signature_bytes = STANDARD.decode(&entry.sig).map_err(|_| {
+        ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        }
+    })?;
+    let keys = trusted_keys().map_err(|_| ImageSignatureRejection {
+        phrase: BAD_IMAGE_SIGNATURE,
+    })?;
     let trusted = keys
         .iter()
         .find(|key| key.keyid == entry.keyid)
@@ -202,8 +247,11 @@ pub fn verify_manifest_signature(
         .map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
         })?;
-    let payload: SimpleSigningPayload =
-        serde_json::from_slice(&payload_bytes).context(BAD_IMAGE_SIGNATURE)?;
+    let payload: SimpleSigningPayload = serde_json::from_slice(&payload_bytes).map_err(|_| {
+        ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        }
+    })?;
     ensure!(
         payload.critical.kind == SIGNATURE_TYPE,
         ImageSignatureRejection {
@@ -276,6 +324,7 @@ pub fn registry_transient(error: &anyhow::Error) -> bool {
     }
     let message = error.to_string();
     message.contains("incomplete registry body")
+        || message.contains("error decoding response body")
         || message.contains("registry connection")
         || message.contains("registry returned HTTP 5")
         || message.contains("registry returned HTTP 408")
@@ -334,6 +383,66 @@ pub mod test_support {
             STANDARD.encode(pkcs8.as_ref())
         );
         (public_pem, private_pem)
+    }
+
+    /// Build the OCI manifest Cosign stores at the `.sig` tag, plus blob payloads.
+    pub fn sign_manifest_cosign(
+        private_pem: &str,
+        public_pem: &str,
+        component: &str,
+        manifest_digest: &str,
+        not_after: &str,
+    ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let rng = SystemRandom::new();
+        let pkcs8 = STANDARD
+            .decode(
+                private_pem
+                    .lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8, &rng).unwrap();
+        let payload = serde_json::to_vec(&json!({
+            "critical": {
+                "identity": {"docker-reference": docker_reference(component).unwrap()},
+                "image": {"docker-manifest-digest": manifest_digest},
+                "type": SIGNATURE_TYPE
+            },
+            "optional": {"io.jmodguard.not-after": not_after}
+        }))
+        .unwrap();
+        let signature = key_pair.sign(&rng, &payload).unwrap();
+        let sig_b64 = STANDARD.encode(signature.as_ref());
+        let config = b"{}";
+        let config_digest = format!("sha256:{}", crate::oci::sha256_hex(config));
+        let payload_digest = format!("sha256:{}", crate::oci::sha256_hex(&payload));
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len()
+            },
+            "layers": [{
+                "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json",
+                "digest": payload_digest,
+                "size": payload.len(),
+                "annotations": {
+                    "dev.cosignproject.cosign/signature": sig_b64
+                }
+            }]
+        }))
+        .unwrap();
+        (
+            manifest,
+            vec![
+                (config_digest, config.to_vec()),
+                (payload_digest, payload),
+            ],
+        )
     }
 
     pub fn sign_manifest(

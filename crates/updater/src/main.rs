@@ -1342,14 +1342,6 @@ impl Supervisor {
         }
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
-            let state = self.control.component(&self.role).await?;
-            if state
-                .installed
-                .as_ref()
-                .is_some_and(|installed| installed.digest == release.digest)
-            {
-                self.control.clear_boot_mismatch(&self.role).await?;
-            }
         }
         self.end_idle().await?;
         let child = match launch(path, sha, release).await {
@@ -1487,6 +1479,16 @@ impl Supervisor {
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
                     self.clear_rejected_marker().await;
+                    if let Some(release) = &release {
+                        let state = self.control.component(&self.role).await?;
+                        if state
+                            .installed
+                            .as_ref()
+                            .is_some_and(|installed| installed.digest == release.digest)
+                        {
+                            self.clear_boot_mismatch_when_saved().await?;
+                        }
+                    }
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("activation receipt was not saved: {error:#}");
@@ -1616,7 +1618,8 @@ impl Supervisor {
         release: &ComponentRelease,
         reason: &str,
     ) -> Result<()> {
-        self.control
+        match self
+            .control
             .record_boot_mismatch(db::BootMismatchRecord {
                 component: self.role.clone(),
                 running: self.base_sha.clone(),
@@ -1627,6 +1630,25 @@ impl Supervisor {
                 reason: reason.to_owned(),
             })
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if Self::receipt_not_saved(&error) => {
+                tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn clear_boot_mismatch_when_saved(&self) -> Result<()> {
+        match self.control.clear_boot_mismatch(&self.role).await {
+            Ok(()) => Ok(()),
+            Err(error) if Self::receipt_not_saved(&error) => {
+                tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn boot_fallback_from_installed(
@@ -1655,7 +1677,8 @@ impl Supervisor {
             .await?;
         let baked = self.baked.clone();
         let base_sha = self.base_sha.clone();
-        self.start(&baked, &base_sha, None).await?;
+        let release = release.clone();
+        self.start(&baked, &base_sha, Some(release)).await?;
         Ok(())
     }
 
@@ -1703,7 +1726,6 @@ impl Supervisor {
             .await
             {
                 Ok(path) => {
-                    self.control.clear_boot_mismatch(&self.role).await?;
                     self.start(&path, &release.source_sha, Some(release.clone()))
                         .await?;
                 }
