@@ -95,6 +95,19 @@ The API records each component's configured channel digest about once an hour th
 
 An owner install request requires a successful release check for the currently selected channel within the last two hours. If the last check failed or expired, use **Check now** before installing; this applies to the service application, launcher, and WebUI controls.
 
+## Image signatures
+
+GitHub Actions builds and pushes each component image to a staging reference,
+captures the build output digest, verifies the image, signs that digest with a
+pinned cosign key pair, and only then promotes the immutable source-SHA tag,
+any planned version tag, and `latest`, `stable`, or `nightly`. Each signature is stored in the registry as a `sha256-<digest>.sig`
+artifact using the cosign simple-signing envelope. Signatures carry an
+`io.jmodguard.not-after` annotation set to 366 days after the image
+`io.jmodguard.published-at` label. Historical dashboard rollback images carry only
+that publication timestamp for signing, not updater compatibility labels. The matching
+cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
+repository; publication fails closed when that Actions secret is missing.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
