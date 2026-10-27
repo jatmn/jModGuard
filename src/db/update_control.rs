@@ -1166,7 +1166,7 @@ impl UpdateControl {
                                           pinned: &ComponentRelease,
                                           digest: &str|
              -> ComponentRelease {
-                for source in [state.installed.as_ref(), state.candidate.as_ref()] {
+                for source in [state.candidate.as_ref(), state.installed.as_ref()] {
                     if let Some(release) = source.filter(|release| release.digest == digest) {
                         return release.clone();
                     }
