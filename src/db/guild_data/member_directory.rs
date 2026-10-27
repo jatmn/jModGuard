@@ -2889,6 +2889,31 @@ impl GuildDataStore {
                 if truncated {
                     entries.pop();
                 }
+                if entries.is_empty() {
+                    let backfill_done: bool = tx.query_row(
+                        "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )?;
+                    if !backfill_done {
+                        let pending = tx
+                            .query_row(
+                                "SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 AND json_valid(payload) AND CAST(json_extract(payload,'$.subject_id') AS INTEGER)=?3 LIMIT 1",
+                                params![
+                                    scope.guild_id(),
+                                    scope.enrollment.id.as_str(),
+                                    user_id
+                                ],
+                                |_| Ok(()),
+                            )
+                            .optional()?
+                            .is_some();
+                        if pending {
+                            tx.finish_read()?;
+                            return Err(MemberSyncError::Stale.into());
+                        }
+                    }
+                }
                 tx.finish_read()?;
                 Ok((entries, truncated))
             })

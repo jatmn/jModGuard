@@ -7110,3 +7110,61 @@ async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn member_case_entries_reports_stale_while_index_backfill_pending() {
+    const SUBJECT: i64 = 88;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: SUBJECT,
+                actor_id: Some(42),
+                occurred_at_ms: 3_000,
+                reason: Some("legacy".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    let enrollment_id = scope.enrollment.id.clone();
+    store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_member_case_index WHERE guild_id=10 AND enrollment_id=?1 AND user_id=?2",
+                params![enrollment_id.as_str(), SUBJECT],
+                65_536,
+            )?;
+            conn.execute_bounded(
+                "UPDATE guild_member_seed SET case_backfill_done=0 WHERE guild_id=10 AND enrollment_id=?1",
+                params![enrollment_id.as_str()],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let err = store
+        .member_case_entries(scope, SUBJECT, 8)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<MemberSyncError>()
+            .is_some_and(|e| matches!(e, MemberSyncError::Stale)),
+        "expected stale while index backfill is pending, got {err:#}"
+    );
+}
