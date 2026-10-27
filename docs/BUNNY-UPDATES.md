@@ -97,12 +97,16 @@ An owner install request requires a successful release check for the currently s
 
 ## Image signatures
 
-Release images are signed in GitHub Actions with a pinned cosign key pair before
-`latest`, a release channel tag, or a source-SHA tag moves. Each signature is stored
-in the registry as a `sha256-<digest>.sig` artifact using the cosign simple-signing
-envelope. Signatures carry an `io.jmodguard.not-after` annotation set to 366 days
-after the image `io.jmodguard.published-at` label. The private signing key is not
-stored in this repository; publication fails closed when that Actions secret is missing.
+GitHub Actions builds and pushes each component’s immutable source-SHA tag (and a
+version tag when the publication plan includes one), verifies the image, signs that
+digest with a pinned cosign key pair, and only then moves `latest`, `stable`, or
+`nightly`. Each signature is stored in the registry as a `sha256-<digest>.sig`
+artifact using the cosign simple-signing envelope. Signatures carry an
+`io.jmodguard.not-after` annotation set to 366 days after the image
+`io.jmodguard.published-at` label. Historical dashboard rollback images carry only
+that publication timestamp for signing, not updater compatibility labels. The private
+signing key is not stored in this repository; publication fails closed when that
+Actions secret is missing.
 
 ## Schema upgrades and recovery
 
