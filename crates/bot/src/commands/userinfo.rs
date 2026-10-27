@@ -535,10 +535,10 @@ pub(crate) async fn run(
     }
 
     let warns =
-        match crate::db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
+        match crate::db::count_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
             .await
         {
-            Ok(rows) => WarnsField::Count(rows.len()),
+            Ok(count) => WarnsField::Count(count),
             Err(_) => WarnsField::Unavailable,
         };
 
