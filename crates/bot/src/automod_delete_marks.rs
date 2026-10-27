@@ -101,8 +101,8 @@ impl AutomodDeleteMarks {
         }
     }
 
-    /// Consumes a mark for one gateway delete. Unconfirmed marks count when the
-    /// REST delete has already started (race before `Finished(Ok)`).
+    /// Consumes a confirmed mark for one gateway delete. Unconfirmed marks are
+    /// left in place until REST settles or `remove_unconfirmed` runs.
     pub(crate) fn take(
         &mut self,
         guild: u64,
@@ -112,6 +112,10 @@ impl AutomodDeleteMarks {
     ) -> Option<(String, String)> {
         self.prune(now);
         let key = (guild, channel, message);
+        let entry = self.entries.get(&key)?;
+        if !entry.confirmed {
+            return None;
+        }
         let entry = self.entries.remove(&key)?;
         self.order.retain(|candidate| *candidate != key);
         Some((entry.rule_id, entry.rule_name))
@@ -225,11 +229,22 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
+        assert!(marks.take(1, 2, 3, now).is_none());
+        marks.remove_unconfirmed(1, 2, 3, now);
+        assert!(!marks.contains(1, 2, 3));
+    }
+
+    #[test]
+    fn unconfirmed_mark_stays_until_confirm_or_remove() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        assert!(marks.contains(1, 2, 3));
+        assert!(marks.take(1, 2, 3, now).is_none());
+        marks.confirm(1, 2, 3, now);
         assert_eq!(
             marks.take(1, 2, 3, now),
             Some(("badword".into(), "Bad word".into()))
         );
-        marks.remove_unconfirmed(1, 2, 3, now);
-        assert!(!marks.contains(1, 2, 3));
     }
 }

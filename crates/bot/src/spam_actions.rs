@@ -501,6 +501,8 @@ async fn punish_proven_match(
         } else {
             None
         };
+        app.automod_delete_marks
+            .insert(found.guild, *channel, *message, rule, name);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
@@ -523,9 +525,21 @@ async fn punish_proven_match(
             own_deletes.push(deleted);
         }
         let outcome = match result {
-            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
-            Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
-            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+                app.automod_delete_marks
+                    .confirm(found.guild, *channel, *message);
+                CaseOutcome::Succeeded
+            }
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                app.automod_delete_marks
+                    .remove_unconfirmed(found.guild, *channel, *message);
+                delete_outcome(&error)
+            }
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+                app.automod_delete_marks
+                    .remove_unconfirmed(found.guild, *channel, *message);
+                CaseOutcome::Uncertain
+            }
         };
         app.spam_gate.finish_delete(
             found.guild,
@@ -1542,6 +1556,15 @@ pub(crate) mod tests {
                 && output.contains(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING),
             "{output}"
         );
+        let report = crate::logging::observed_delete_report(
+            &app,
+            GuildId::new(10),
+            ChannelId::new(11),
+            MessageId::new(42),
+            None,
+        );
+        assert_eq!(report.event, "automod_delete");
+        assert_eq!(report.vars["rule"], "Repeated text");
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);

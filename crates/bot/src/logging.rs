@@ -1711,6 +1711,15 @@ impl BulkTranscript {
         self.filtered += 1;
     }
 
+    pub fn peel_automod_delete(&mut self) {
+        self.total = self.total.saturating_sub(1);
+    }
+
+    pub fn worth_sending(&self) -> bool {
+        self.total > 0
+            && (self.retained > 0 || self.unavailable > 0 || self.unknown > 0 || self.filtered > 0)
+    }
+
     fn finish(&self) -> Vec<u8> {
         let mut text = String::with_capacity(self.bytes.saturating_add(200));
         text.push_str("jModGuard last-observed deleted messages\n\n");

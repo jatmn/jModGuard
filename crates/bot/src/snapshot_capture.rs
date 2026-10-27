@@ -973,9 +973,14 @@ fn estimated_bytes(observation: &SnapshotObservation) -> usize {
 }
 
 fn capture_enabled(config: &crate::state::CachedGuildConfig) -> bool {
-    ["message_edit", "message_delete", "message_bulk_delete"]
-        .iter()
-        .any(|event| config.log_channels.contains_key(*event))
+    [
+        "message_edit",
+        "message_delete",
+        "message_bulk_delete",
+        "automod_delete",
+    ]
+    .iter()
+    .any(|event| config.log_channels.contains_key(*event))
 }
 
 // Admission stays next to the write for both a drain and each pressure-split
@@ -1484,6 +1489,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         row.as_ref(),
                                     );
                                     if report.event == "automod_delete" {
+                                        transcript.peel_automod_delete();
                                         submit_report(&app, &work.context, report);
                                     } else if row
                                         .as_ref()
@@ -1503,9 +1509,14 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             tracing::warn!("message snapshot delete unavailable: {error:#}");
                             app.snapshots.gap_scope(&work.scope);
                             if *bulk {
-                                for id in chunk {
-                                    transcript.push_unknown(*id);
-                                }
+                                peel_automod_bulk_chunk(
+                                    &app,
+                                    &work.context,
+                                    *guild,
+                                    *channel,
+                                    chunk,
+                                    &mut transcript,
+                                );
                             } else {
                                 single_unknown = true;
                             }
@@ -1514,7 +1525,9 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
                 app.snapshots.mark_deleted(*guild, *channel, ids);
                 if *bulk {
-                    submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
+                    if transcript.worth_sending() {
+                        submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
+                    }
                 } else if let Some(id) = ids.first() {
                     let mut report = logging::observed_delete_report(
                         &app,
@@ -1608,6 +1621,25 @@ fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePerm
     }
 }
 
+fn peel_automod_bulk_chunk(
+    app: &Arc<BotState>,
+    context: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+    transcript: &mut logging::BulkTranscript,
+) {
+    for id in ids {
+        let report = logging::observed_delete_report(app, guild, channel, *id, None);
+        if report.event == "automod_delete" {
+            transcript.peel_automod_delete();
+            submit_report(app, context, report);
+        } else {
+            transcript.push_unknown(*id);
+        }
+    }
+}
+
 fn submit_peeled_bulk_deletes(
     app: &Arc<BotState>,
     context: &Context,
@@ -1615,21 +1647,10 @@ fn submit_peeled_bulk_deletes(
     channel: ChannelId,
     ids: Vec<MessageId>,
 ) {
-    let mut plain = Vec::new();
-    for id in ids {
-        let report = logging::observed_delete_report(app, guild, channel, id, None);
-        if report.event == "automod_delete" {
-            submit_report(app, context, report);
-        } else {
-            plain.push(id);
-        }
-    }
-    if plain.is_empty() {
+    let mut transcript = logging::BulkTranscript::new(ids.len());
+    peel_automod_bulk_chunk(app, context, guild, channel, &ids, &mut transcript);
+    if !transcript.worth_sending() {
         return;
-    }
-    let mut transcript = logging::BulkTranscript::new(plain.len());
-    for id in plain {
-        transcript.push_unknown(id);
     }
     submit_bulk_report(app, context, guild, channel, transcript);
 }
@@ -2045,6 +2066,145 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_snapshot_storage_failure_peels_automod_marks() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_bulk_del_err_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = Arc::new(BotState::new(cfg, db).unwrap());
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "automod_delete", 456)
+            .await
+            .unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_bulk_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots.content_access.lock().insert(789);
+        app.automod_delete_marks
+            .insert(789, 456, 10, "badword", "Bad words");
+        app.automod_delete_marks.confirm(789, 456, 10);
+        store.close_membership(scope.clone()).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let epoch = app.snapshots.epoch.load(Ordering::Acquire);
+        assert!(
+            store
+                .take_snapshots_at_epoch(scope.clone(), 456, vec![10, 11], now, epoch)
+                .await
+                .is_err(),
+            "closed membership must fail snapshot reads for the delete worker Err path"
+        );
+        let ctx = test_delete_context().await;
+        let mut transcript = logging::BulkTranscript::new(2);
+        peel_automod_bulk_chunk(
+            &app,
+            &ctx,
+            GuildId::new(789),
+            ChannelId::new(456),
+            &[MessageId::new(10), MessageId::new(11)],
+            &mut transcript,
+        );
+        assert_eq!(transcript.unknown, 1);
+        assert!(
+            !app.automod_delete_marks.inner.lock().contains(789, 456, 10),
+            "automod mark must be consumed for the peeled id"
+        );
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    async fn test_delete_context() -> Context {
+        use serenity::gateway::{
+            Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
+            ShardRunnerOptions,
+        };
+        use serenity::model::gateway::{GatewayIntents, ShardInfo};
+        use serenity::model::id::ShardId;
+        let http = Arc::new(serenity::http::Http::new("fixture"));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Arc::new(tokio::sync::Mutex::new(format!(
+            "ws://{}",
+            listener.local_addr().unwrap()
+        )));
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let intents = GatewayIntents::empty();
+        let shard = Shard::new(
+            Arc::clone(&url),
+            "fixture",
+            ShardInfo {
+                id: ShardId(0),
+                total: 1,
+            },
+            intents,
+            None,
+        )
+        .await
+        .unwrap();
+        let socket = accept.await.unwrap();
+        let data = Arc::default();
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let (manager, _) = ShardManager::new(ShardManagerOptions {
+            data: Arc::clone(&data),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            shard_index: 0,
+            shard_init: 0,
+            shard_total: 1,
+            ws_url: url,
+            cache: Arc::clone(&cache),
+            http: Arc::clone(&http),
+            intents,
+            presence: None,
+        });
+        let runner = ShardRunner::new(ShardRunnerOptions {
+            data: Arc::clone(&data),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            manager: Arc::clone(&manager),
+            shard,
+            cache: Arc::clone(&cache),
+            http: Arc::clone(&http),
+        });
+        let ctx = Context {
+            data,
+            shard: ShardMessenger::new(&runner),
+            shard_id: ShardId(0),
+            http,
+            cache,
+        };
+        manager.shutdown_all().await;
+        drop(runner);
+        drop(socket);
+        ctx
     }
 
     #[tokio::test]

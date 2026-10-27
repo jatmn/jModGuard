@@ -200,6 +200,54 @@ async fn double_emit_path_consumes_mark_once() {
 }
 
 #[tokio::test]
+async fn gateway_delete_before_rest_confirm_stays_plain_delete() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
+        .await
+        .unwrap();
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let report = observed_delete_report(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        None,
+    );
+    assert_eq!(report.event, "message_delete");
+    assert!(
+        f.app
+            .automod_delete_marks
+            .inner
+            .lock()
+            .contains(789, 456, 123)
+    );
+    f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    assert!(
+        !f.app
+            .automod_delete_marks
+            .inner
+            .lock()
+            .contains(789, 456, 123)
+    );
+}
+
+#[test]
+fn bulk_transcript_peel_automod_suppresses_empty_bulk() {
+    let mut all_automod = BulkTranscript::new(2);
+    all_automod.peel_automod_delete();
+    all_automod.peel_automod_delete();
+    assert!(!all_automod.worth_sending());
+
+    let mut mixed = BulkTranscript::new(2);
+    mixed.peel_automod_delete();
+    mixed.push_unknown(MessageId::new(11));
+    assert_eq!(mixed.total, 1);
+    assert!(mixed.worth_sending());
+}
+
+#[tokio::test]
 async fn bulk_mix_splits_automod_from_plain_ids() {
     let f = Fixture::new();
     f.app
