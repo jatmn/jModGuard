@@ -997,6 +997,7 @@ pub(super) fn upgrade_legacy_kick_ban_usage_conn(conn: &mut Connection) -> Resul
     let changed = total_changes(&tx)? > before;
     if changed {
         bump_config_version_conn(&tx)?;
+        bump_slash_registry_version_conn(&tx)?;
     }
     if changed || meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER)?.is_none() {
         write_meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER, "1")?;

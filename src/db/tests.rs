@@ -730,6 +730,7 @@ fn legacy_kick_ban_usage_upgraded_when_seed_already_satisfied() {
         Ok(())
     }))
     .unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     let usage: String = tokio_test_block_on(db.with_conn(|conn| {
@@ -742,6 +743,11 @@ fn legacy_kick_ban_usage_upgraded_when_seed_already_satisfied() {
     }))
     .unwrap();
     assert_eq!(usage, "!kick <user> [--dm] [reason]");
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1,
+        "legacy kick/ban usage upgrade must bump slash_registry_version when command rows change"
+    );
     cleanup_db(&tmp);
 }
 
