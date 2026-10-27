@@ -56,9 +56,7 @@ pub(crate) fn capture_member_snapshot(
     let user_id = target.get();
     let global_user = cache.user(target);
     let username = global_user.as_ref().map(|u| u.name.clone());
-    let global_name = global_user
-        .as_ref()
-        .and_then(|u| u.global_name.clone());
+    let global_name = global_user.as_ref().and_then(|u| u.global_name.clone());
 
     let Some(guild) = cache.guild(guild_id) else {
         return MemberSnapshot {
@@ -78,9 +76,7 @@ pub(crate) fn capture_member_snapshot(
     let member = guild.members.get(&target);
     let member_cached = member.is_some();
     let nick = member.and_then(|m| m.nick.clone());
-    let joined_at = member
-        .and_then(|m| m.joined_at)
-        .map(|ts| ts.to_string());
+    let joined_at = member.and_then(|m| m.joined_at).map(|ts| ts.to_string());
     let username = username.or_else(|| member.map(|m| m.user.name.clone()));
     let global_name = global_name.or_else(|| member.and_then(|m| m.user.global_name.clone()));
 
@@ -232,9 +228,8 @@ pub(crate) fn userinfo_template_vars(
     clipped: &str,
 ) -> BTreeMap<String, String> {
     let account_created = UserId::new(snapshot.user_id).created_at();
-    let account_age_seconds = (chrono::Utc::now().timestamp()
-        - account_created.unix_timestamp())
-        .max(0) as u64;
+    let account_age_seconds =
+        (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
     let fallback_id = snapshot.user_id.to_string();
     let display = snapshot
         .nick
@@ -247,7 +242,10 @@ pub(crate) fn userinfo_template_vars(
     vars.insert("display".into(), display.to_string());
     vars.insert(
         "username".into(),
-        snapshot.username.clone().unwrap_or_else(|| MISSING.to_string()),
+        snapshot
+            .username
+            .clone()
+            .unwrap_or_else(|| MISSING.to_string()),
     );
     vars.insert(
         "global_name".into(),
@@ -316,7 +314,15 @@ pub(crate) fn render_userinfo_with_cases(
     };
     let mut clipped = String::new();
     let cases_for_pass = cases.clone();
-    if fits(template, snapshot, warns, &cases_for_pass, &roles, &lines, &clipped) {
+    if fits(
+        template,
+        snapshot,
+        warns,
+        &cases_for_pass,
+        &roles,
+        &lines,
+        &clipped,
+    ) {
         return render_pass(
             template,
             snapshot,
@@ -330,7 +336,15 @@ pub(crate) fn render_userinfo_with_cases(
     roles.clear();
     clipped = CLIPPED_SUFFIX.to_string();
     let cases_for_pass = cases.clone();
-    if fits(template, snapshot, warns, &cases_for_pass, &roles, &lines, &clipped) {
+    if fits(
+        template,
+        snapshot,
+        warns,
+        &cases_for_pass,
+        &roles,
+        &lines,
+        &clipped,
+    ) {
         return render_pass(
             template,
             snapshot,
@@ -344,8 +358,12 @@ pub(crate) fn render_userinfo_with_cases(
     while lines.len() > 1 {
         lines.pop();
         let trimmed = CasesField::Lines(lines.clone());
-        if fits(template, snapshot, warns, &trimmed, &roles, &lines, &clipped) {
-            return render_pass(template, snapshot, warns, &trimmed, &roles, &lines, &clipped);
+        if fits(
+            template, snapshot, warns, &trimmed, &roles, &lines, &clipped,
+        ) {
+            return render_pass(
+                template, snapshot, warns, &trimmed, &roles, &lines, &clipped,
+            );
         }
     }
     jmodguard::templates::render_bounded(
@@ -396,10 +414,7 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-pub(crate) async fn resolve_userinfo_target(
-    env: &CmdEnv<'_>,
-    args: &mut Args,
-) -> Result<UserId> {
+pub(crate) async fn resolve_userinfo_target(env: &CmdEnv<'_>, args: &mut Args) -> Result<UserId> {
     match args.next_arg() {
         Some(token) => super::resolve_user(env.ctx, env.guild_id, &token)
             .await
@@ -424,11 +439,8 @@ pub(crate) async fn rest_user_lookup(
     env: &CmdEnv<'_>,
     target: UserId,
 ) -> Result<(String, Option<String>)> {
-    let call = crate::discord::race_discord_call(
-        &env.app.activation,
-        env.ctx.http.get_user(target),
-    )
-    .await;
+    let call =
+        crate::discord::race_discord_call(&env.app.activation, env.ctx.http.get_user(target)).await;
     match call {
         crate::discord::DiscordCall::Cancelled => Err(anyhow!("writer lease is not held")),
         crate::discord::DiscordCall::Finished(Ok(user)) => {
@@ -505,29 +517,27 @@ pub(crate) async fn run(
         }
     }
 
-    let warns = match crate::db::list_warns(
-        &env.app.db,
-        env.guild_id.get() as i64,
-        target.get() as i64,
-    )
-    .await
-    {
-        Ok(rows) => WarnsField::Count(rows.len()),
-        Err(_) => WarnsField::Unavailable,
-    };
+    let warns =
+        match crate::db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
+            .await
+        {
+            Ok(rows) => WarnsField::Count(rows.len()),
+            Err(_) => WarnsField::Unavailable,
+        };
 
     let cases = load_case_lines(env, enrollment, target).await;
-    let case_lines = match &cases {
-        CasesField::Lines(lines) => lines.clone(),
-        _ => Vec::new(),
+    let template = jmodguard::defaults::USER_INFO_TEMPLATE;
+    let response = match cases {
+        CasesField::Unavailable => render_userinfo_with_cases(
+            template,
+            &snapshot,
+            &warns,
+            CasesField::Unavailable,
+            Vec::new(),
+        ),
+        CasesField::None => render_userinfo_message(template, &snapshot, &warns, Vec::new()),
+        CasesField::Lines(lines) => render_userinfo_message(template, &snapshot, &warns, lines),
     };
-    let response = render_userinfo_with_cases(
-        jmodguard::defaults::USER_INFO_TEMPLATE,
-        &snapshot,
-        &warns,
-        cases,
-        case_lines,
-    );
     vars.insert("target_id".into(), target.to_string());
     Ok(BehaviorOutcome {
         response: Some(response),

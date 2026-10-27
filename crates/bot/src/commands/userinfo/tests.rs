@@ -60,18 +60,21 @@ fn cached_member_renders_profile_warns_and_cases() {
         &cache,
         10,
         Some(member),
-        Some(serde_json::from_value(serde_json::json!({
-            "guild_id": "10",
-            "channel_id": "700",
-            "user_id": "91",
-            "session_id": "sess",
-            "deaf": false,
-            "mute": false,
-            "self_deaf": false,
-            "self_mute": false,
-            "self_video": false,
-            "suppress": false
-        })).unwrap()),
+        Some(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": "10",
+                "channel_id": "700",
+                "user_id": "91",
+                "session_id": "sess",
+                "deaf": false,
+                "mute": false,
+                "self_deaf": false,
+                "self_mute": false,
+                "self_video": false,
+                "suppress": false
+            }))
+            .unwrap(),
+        ),
     );
     let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
     assert!(snapshot.member_cached);
@@ -105,7 +108,12 @@ fn cached_member_renders_profile_warns_and_cases() {
 fn case_reason_strips_ban_tag() {
     let tag = jmodguard::ban_reason::BanAttemptTag::new();
     let reason = jmodguard::ban_reason::discord_reason("spam links", Some(&tag));
-    let line = format_case_line("ban", Some("succeeded"), Some(1_700_000_000_000), Some(&reason));
+    let line = format_case_line(
+        "ban",
+        Some("succeeded"),
+        Some(1_700_000_000_000),
+        Some(&reason),
+    );
     assert!(line.contains("spam links"));
     assert!(!line.contains("jmg:"));
 }
@@ -184,7 +192,9 @@ fn uncached_user_requires_rest_lookup() {
 
 #[test]
 fn clip_drops_roles_but_keeps_user_id() {
-    let roles: Vec<String> = (0..80).map(|i| format!("role-{i}-with-long-name")).collect();
+    let roles: Vec<String> = (0..80)
+        .map(|i| format!("role-{i}-with-long-name"))
+        .collect();
     let snapshot = MemberSnapshot {
         user_id: 42,
         username: Some("u".into()),
@@ -244,8 +254,7 @@ fn default_template_renders_without_embedded_paths() {
 
 #[tokio::test]
 async fn integration_warn_and_case_rows() {
-    let path =
-        std::env::temp_dir().join(format!("userinfo_db_{:032x}.db", rand::random::<u128>()));
+    let path = std::env::temp_dir().join(format!("userinfo_db_{:032x}.db", rand::random::<u128>()));
     let app = Arc::new(
         BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
     );
