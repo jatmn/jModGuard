@@ -488,6 +488,16 @@ const data = JSON.parse(process.env.REDACTOR_INPUT);
 process.stdout.write(data.GITHUB_TOKEN || "");
 JS
 )" == test-secret ]] || fail 'redactor must receive the source token'
+[[ "$(REDACTOR_INPUT="$REDACTOR_INPUT" node --input-type=commonjs - <<'JS'
+const data = JSON.parse(process.env.REDACTOR_INPUT);
+process.stdout.write(data.SIGNING_KEY || "");
+JS
+)" == "$SIGNING_KEY_VALUE" ]] || fail 'redactor must receive the signing key'
+[[ "$(REDACTOR_INPUT="$REDACTOR_INPUT" node --input-type=commonjs - <<'JS'
+const data = JSON.parse(process.env.REDACTOR_INPUT);
+process.stdout.write(data.SIGNING_PASSWORD || "");
+JS
+)" == "$SIGNING_PASSWORD_VALUE" ]] || fail 'redactor must receive the signing password'
 
 exercise_publish 1 1
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'failed build must still remove the worktree'
@@ -1053,6 +1063,8 @@ printf '%s' "$trace" | grep -v '^::add-mask::' | grep -Eq 'secret-key|secret-pas
 
 reload_publisher
 run_docker() {
+  [[ "$*" == *'{{json .Image}}'* ]] \
+    || fail 'image_published_at must read Buildx Image JSON'
   printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T17:00:00Z"}}}'
 }
 got="$(image_published_at "ghcr.io/jatmn/jmodguard-bot@sha256:$(printf 'a%.0s' {1..64})")"
@@ -1064,5 +1076,36 @@ printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.published-at=' \
   || fail 'legacy builds must carry a publication timestamp for signing'
 printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol=1' \
   && fail 'legacy builds must not claim updater compatibility'
+
+grep -q 'BEGIN PUBLIC KEY' "$root/deploy/update-signing.pub" \
+  || fail 'deploy/update-signing.pub must contain the committed production cosign public key'
+grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENbnym' "$root/deploy/update-signing.pub" \
+  && fail 'deploy signing pubkey must not be the offline test fixture'
+
+reload_publisher
+COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.log"
+: >"$COSIGN_TRACE"
+run_cosign() {
+  printf 'cosign %s\n' "$*" >>"$COSIGN_TRACE"
+  return 0
+}
+run_docker() {
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then
+    if [[ "$*" == *'{{json .Image}}'* ]]; then
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T17:00:00Z"}}}'
+      return 0
+    fi
+    printf '{"digest":"sha256:%064d","size":10}\n' 1
+    return 0
+  fi
+  return 0
+}
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+sign_published_digest bot ghcr.io/jatmn/jmodguard-bot "sha256:$(printf 'a%.0s' {1..64})"
+grep -q 'cosign sign' "$COSIGN_TRACE" || fail 'production signing must invoke cosign sign'
+grep -q 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
+unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
 
 echo 'publish-image-test: ok'

@@ -121,7 +121,7 @@ main run cannot recreate the already-consumed release output. Start a new run fo
 a deliberate new selection. For each rebuilt component the publisher pushes the
 immutable source-SHA tag and any version label, verifies the image contents, signs
 that digest with the pinned update key, and verifies the signature with the committed
-public key before moving `latest`, `stable`, or `nightly`. The private signing key
+public key at `deploy/update-signing.pub` before moving `latest`, `stable`, or `nightly`. The private signing key
 is stored only as a GitHub Actions secret; an empty signing secret fails publication
 before any moving tag is updated.
 Nightly tags never move `latest`. An explicit rerun republishes its pinned source.

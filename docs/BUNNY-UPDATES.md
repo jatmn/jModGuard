@@ -104,9 +104,9 @@ digest with a pinned cosign key pair, and only then moves `latest`, `stable`, or
 artifact using the cosign simple-signing envelope. Signatures carry an
 `io.jmodguard.not-after` annotation set to 366 days after the image
 `io.jmodguard.published-at` label. Historical dashboard rollback images carry only
-that publication timestamp for signing, not updater compatibility labels. The private
-signing key is not stored in this repository; publication fails closed when that
-Actions secret is missing.
+that publication timestamp for signing, not updater compatibility labels. The matching
+cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
+repository; publication fails closed when that Actions secret is missing.
 
 ## Schema upgrades and recovery
 

@@ -611,6 +611,9 @@ publish_component() {
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
   verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
+  IFS=$'\t' read -r verified_digest _verified_size <<<"$(inspect_digest "${image}:${sha}")"
+  [[ "$verified_digest" == "$published_digest" ]] \
+    || publish_fail 'source-SHA tag digest changed during verification'
   sign_published_digest "$component" "$image" "$published_digest"
   if [[ "$channel" != "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
