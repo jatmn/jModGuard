@@ -37,9 +37,26 @@ COSIGN_PASSWORD="$TEST_SIGNING_PASSWORD" cosign generate-key-pair \
   --output-key-prefix "$TEST_SIGNING_DIR/update-signing"
 SIGNING_KEY_VALUE="$(<"$TEST_SIGNING_DIR/update-signing.key")"
 SIGNING_PASSWORD_VALUE="$TEST_SIGNING_PASSWORD"
+TEST_SIGNING_PUBLIC_KEY="$TEST_SIGNING_DIR/update-signing.pub"
+MOCK_BUILD_DIGEST="sha256:$(printf '0%.0s' {1..64})"
+
+staging_ref() {
+  publish_staging_ref "ghcr.io/jatmn/jmodguard-${1}" "${2:-$HEAD_SHA}"
+}
+
+assert_signing_secrets_not_in_environ() {
+  signing_secrets_in_environ && fail 'signing secrets must not remain in the process environment'
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == JMODGUARD_UPDATE_SIGNING_KEY=* || "$line" == JMODGUARD_UPDATE_SIGNING_PASSWORD=* ]] \
+      && fail "signing secret leaked in environ: ${line%%=*}"
+  done <"/proc/self/environ"
+}
 
 # shellcheck disable=SC1091
 JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
+SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
+export SIGNING_PUBLIC_KEY
 
 HEAD_SHA="$(printf 'a%.0s' {1..40})"
 BASE_SHA="$(printf 'b%.0s' {1..40})"
@@ -170,17 +187,17 @@ contains_arg() {
   return 1
 }
 
-readarray -d '' -t nightly_args < <(build_args bot "$HEAD_SHA" "nightly-20260915-${HEAD_SHA:0:12}" . nightly)
+readarray -d '' -t nightly_args < <(build_args bot "$HEAD_SHA" "nightly-20260915-${HEAD_SHA:0:12}" . nightly current "$(staging_ref bot)")
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${nightly_args[@]}" \
   && fail 'nightly must not move latest'
-contains_arg "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}" "${nightly_args[@]}" \
-  || fail 'nightly must tag the SHA'
+contains_arg "$(staging_ref bot)" "${nightly_args[@]}" \
+  || fail 'nightly must tag the staging reference'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly-20260915-${HEAD_SHA:0:12}" "${nightly_args[@]}" \
   && fail 'nightly must not push the unique label before verification and signing'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly" "${nightly_args[@]}" \
   && fail 'Nightly pointer must move only after verification'
 
-readarray -d '' -t stable_args < <(build_args bot "$HEAD_SHA" v1.2.3 . stable)
+readarray -d '' -t stable_args < <(build_args bot "$HEAD_SHA" v1.2.3 . stable current "$(staging_ref bot)")
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${stable_args[@]}" \
   && fail 'stable must not move latest before verification'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
@@ -192,7 +209,7 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
 # Migration 0016 is already active; advertising 15 admitted a bot-only migration
 # and then stranded the old API behind the same compatibility check.
 for component in bot api webui; do
-  readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" .)
+  readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" . "" current "$(staging_ref "$component")")
   for field in min-schema max-schema result-schema; do
     contains_arg "io.jmodguard.${field}=20" "${schema_args[@]}" \
       || fail "${component} must advertise current schema20 (${field})"
@@ -205,19 +222,19 @@ for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-sche
 done
 
 # Capability labels come from the selected source, independently of SHA.
-readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" .)
-for field in launcher-revision=18 min-launcher-revision=18; do
+readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
+for field in launcher-revision=17 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 18;$/pub const LAUNCHER_REVISION: u32 = 19;/' \
-    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 18;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 19;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 17;$/pub const LAUNCHER_REVISION: u32 = 18;/' \
+    -e 's/^pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;$/pub const REQUIRED_LAUNCHER_REVISION: u32 = 8;/' \
     src/db/update_control.rs > "$launcher_source/src/db/update_control.rs"
-readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source")
-for field in launcher-revision=19 min-launcher-revision=19; do
+readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
+for field in launcher-revision=18 min-launcher-revision=8; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 rm -rf "$launcher_source"
@@ -226,7 +243,7 @@ rm -rf "$launcher_source"
 schema_source="$(mktemp -d)"
 mkdir -p "$schema_source/src"
 sed -e '/include_str!("..\/migrations\/001[6789]_/d' -e '/include_str!("..\/migrations\/0020_/d' src/db.rs >"$schema_source/src/db.rs"
-readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source")
+readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source" "" current "$(staging_ref bot "$BASE_SHA")")
 contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
 
 for field in min-schema max-schema result-schema; do
@@ -239,14 +256,14 @@ sed -e '/include_str!("..\/migrations\/001[789]_/d' -e '/include_str!("..\/migra
 mkdir -p "$schema_source/crates/updater/src"
 printf 'min_schema: 15,\nmax_schema: 15,\n' >"$schema_source/crates/updater/src/main.rs"
 for component in bot api; do
-  readarray -d '' -t broken_launcher_args < <(build_args "$component" "$BASE_SHA" "" "$schema_source")
+  readarray -d '' -t broken_launcher_args < <(build_args "$component" "$BASE_SHA" "" "$schema_source" "" current "$(staging_ref "$component" "$BASE_SHA")")
   contains_arg "io.jmodguard.result-schema=16" "${broken_launcher_args[@]}" \
     || fail 'historical schema16 labels must remain truthful'
   contains_arg "io.jmodguard.launcher-protocol=1" "${broken_launcher_args[@]}" \
     && fail 'historical schema15-reporting launcher must not be installable on schema16'
 done
 printf 'invalid source\n' >"$schema_source/src/db.rs"
-if (build_args bot "$HEAD_SHA" "" "$schema_source") >/dev/null 2>&1; then
+if (build_args bot "$HEAD_SHA" "" "$schema_source" "" current "$(staging_ref bot)") >/dev/null 2>&1; then
   fail 'unknown schema must not produce installable image labels'
 fi
 rm -rf "$schema_source"
@@ -254,6 +271,8 @@ rm -rf "$schema_source"
 reload_publisher() {
   # shellcheck disable=SC1091
   JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
+  SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
+  export SIGNING_PUBLIC_KEY
 }
 
 plan_json() {
@@ -298,6 +317,7 @@ mock_publish_helpers() {
     printf 'verify %s %s@%s %s\n' "$1" "$2" "$3" "${5:-current}" >>"$TRACE_FILE"
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
   }
+  verify_image_runtime_configuration() { :; }
 
   # The browser bundle itself is tested by package-webui-test.mjs. Here prove
   # publication installs/builds in the selected source worktree before packaging.
@@ -349,15 +369,24 @@ mock_publish_helpers() {
     fi
     if [[ "$1" == buildx ]]; then
       if [[ "$2" == build ]]; then
-        [[ -z "${JMODGUARD_UPDATE_SIGNING_KEY:-}" && -z "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]] \
-          || fail 'signing secrets must not be exported during image build'
+        assert_signing_secrets_not_in_environ
+        local arg prev=""
+        local wrote_metadata=0
+        for arg in "$@"; do
+          if [[ "$prev" == --metadata-file ]]; then
+            printf '{"containerimage.digest":"%s"}\n' "$MOCK_BUILD_DIGEST" >"$arg"
+            wrote_metadata=1
+          fi
+          prev="$arg"
+        done
+        [[ "$wrote_metadata" == 1 ]] || fail 'image build must record digest metadata'
       fi
       if [[ "$2" == imagetools ]]; then
         if [[ "$*" == *'{{json .Image}}'* ]]; then
-          printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"}}}'
+          printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
           return 0
         fi
-        printf '{"digest":"sha256:%064d","size":10}\n' 0
+        printf '{"digest":"%s","size":10}\n' "$MOCK_BUILD_DIGEST"
         return 0
       fi
       printf '%s\n' "$*" >"${TRACE_FILE}.build"
@@ -462,8 +491,11 @@ exercise_publish() {
     ( publish_component "$component" ) >/dev/null 2>&1 || publish_rc=$?
     [[ "$publish_rc" -ne 0 ]] || fail 'failed build must not succeed'
   else
-    ( publish_component "$component" ) >/dev/null 2>&1 || publish_rc=$?
+    local publish_err
+    publish_err="$(mktemp "${scratch}/publish-err-XXXXXX")"
+    ( publish_component "$component" ) >"$publish_err" 2>&1 || publish_rc=$?
     if [[ "$publish_rc" -ne 0 ]]; then
+      PUBLISH_LAST_ERROR="$(<"$publish_err")"
       TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
       load_trace
       rm -rf "$scratch"
@@ -472,6 +504,7 @@ exercise_publish() {
       SOURCE_LAYOUT=current
       return "$publish_rc"
     fi
+    rm -f "$publish_err"
   fi
   TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
   load_trace
@@ -506,11 +539,16 @@ printf '%s\n' "${CALLS[@]}" | grep -q 'plan get' \
 printf '%s\n' "${CALLS[@]}" | grep -qE 'docker |secret get|mask tokens' \
   && fail "skip without credentials must not touch docker or secrets: ${CALLS[*]}"
 
-exercise_publish 1
+exercise_publish 1 || fail "main publication exercise failed: ${PUBLISH_LAST_ERROR:-unknown}"
 printf '%s\n' "$BUILD_LINE" | grep -q -- '--provenance=false' || fail 'build must disable provenance'
 printf '%s\n' "$BUILD_LINE" | grep -q -- '--sbom=false' || fail 'build must disable sbom'
 printf '%s\n' "$BUILD_LINE" | grep -q 'linux/amd64' || fail 'build must be linux/amd64'
-printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" || fail 'build must tag the SHA'
+printf '%s\n' "$BUILD_LINE" | grep -q -- '--metadata-file' || fail 'build must record output digest metadata'
+printf '%s\n' "$BUILD_LINE" | grep -q "$(staging_ref api)" || fail 'build must tag the staging reference'
+printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" \
+  && fail 'build must not push the source-SHA tag before verification and signing'
+grep -Fq 'digest_from_build_metadata' "$root/scripts/publish-image.sh" \
+  || fail 'publisher must read the build output digest from metadata'
 [[ "$BUILD_LINE" != *'--tag ghcr.io/jatmn/jmodguard-api:latest'* ]] \
   || fail 'main build must not move latest before verification'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' \
@@ -569,8 +607,8 @@ stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmo
 release_plan="$(plan_json release refs/tags/v1.2.3 "$HEAD_SHA" "$BASE_SHA" v1.2.3)"
 for component in bot api webui; do
   exercise_publish 0 0 release '' "$release_plan" "$component"
-  [[ "$BUILD_LINE" == *"--tag ghcr.io/jatmn/jmodguard-${component}:${BASE_SHA}"* ]] \
-    || fail "$component release must build the selected release SHA"
+  [[ "$BUILD_LINE" == *"$(staging_ref "$component" "$BASE_SHA")"* ]] \
+    || fail "$component release must build the selected release SHA to staging"
   [[ "$BUILD_LINE" != *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
     || fail "$component release must not push the version tag before signing"
   verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^verify $component " | cut -d: -f1)"
@@ -660,13 +698,13 @@ JS
 done
 
 exercise_publish 0 0 manual
-printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${BASE_SHA}" \
-  || fail 'manual publication must build the planned SHA even when compare would skip'
+printf '%s\n' "$BUILD_LINE" | grep -q "$(staging_ref api "$BASE_SHA")" \
+  || fail 'manual publication must build the planned SHA to staging even when compare would skip'
 
 for component in bot api webui; do
   exercise_publish 0 0 manual '' '' "$component" 0 current "$BASE_SHA"
-  printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-${component}:${BASE_SHA}" \
-    || fail "manual SHA publication must still build ${component}"
+  printf '%s\n' "$BUILD_LINE" | grep -q "$(staging_ref "$component" "$BASE_SHA")" \
+    || fail "manual SHA publication must still build ${component} to staging"
   printf '%s\n' "${CALLS[@]}" | grep -q "^verify ${component} " \
     || fail "manual SHA publication must verify ${component} before promotion"
 done
@@ -680,7 +718,10 @@ for component in bot api; do
     || fail "historical ${component} must receive the legacy final-image check"
   [[ "$BUILD_LINE" != *'io.jmodguard.launcher-protocol'* ]] \
     || fail "historical ${component} must not claim updater compatibility"
-  printf '%s\n' "$BUILD_LINE" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+  if ( PUBLISHED_AT='2026-10-27T99:00:00Z' not_after_from_published_at "$PUBLISHED_AT" ) >/dev/null 2>&1; then
+  fail 'invalid publication timestamps must not compute expiry'
+fi
+printf '%s\n' "$BUILD_LINE" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
     || fail "historical ${component} must label a valid publication timestamp for signing"
   printf '%s\n' "${CALLS[@]}" | grep -q "^sign ${component} " \
     || fail "historical ${component} must sign before promoting latest"
@@ -696,6 +737,13 @@ reload_publisher
 run_docker() {
   case "$1" in
     pull|rm) return 0 ;;
+    buildx)
+      if [[ "$2" == imagetools && "$*" == *'{{json .Image}}'* ]]; then
+        printf '%s' '{"config":{"Entrypoint":[]}}'
+        return 0
+      fi
+      return 0
+      ;;
     create)
       [[ "$2" == --entrypoint && "$3" == /usr/local/bin/jmodguard-bot ]] \
         || fail 'historical verifier must inspect the direct-entrypoint image'
@@ -975,31 +1023,69 @@ run_git() {
 }
 read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
 redact_tokens() { :; }
+record_buildx_tag() {
+  local prev="" arg
+  for arg in "$@"; do
+    if [[ "$prev" == --tag ]]; then
+      REGISTRY["$arg"]="$manifest"
+    fi
+    prev="$arg"
+  done
+}
+record_imagetools_promote() {
+  local prev="" arg
+  for arg in "$@"; do
+    if [[ "$prev" == --tag ]]; then
+      REGISTRY["$arg"]="$manifest"
+    fi
+    prev="$arg"
+  done
+}
+published_signature_still_valid() { return 0; }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
-  if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi
-  if [[ "$1" == buildx ]]; then
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    record_imagetools_promote "$@"
+    return 0
+  fi
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then
+    if [[ "$*" == *'{{json .Image}}'* ]]; then
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
+      return 0
+    fi
+    printf '{"digest":"sha256:%064d","size":10}\n' 0
+    return 0
+  fi
+  if [[ "$1" == buildx && "$2" == build ]]; then
     EXPORTS=$((EXPORTS + 1))
-    REGISTRY["${image}:latest"]="$manifest"
+    local prev="" arg
+    for arg in "$@"; do
+      if [[ "$prev" == --metadata-file ]]; then
+        printf '{"containerimage.digest":"sha256:%064d"}\n' 0 >"$arg"
+      fi
+      prev="$arg"
+    done
+    record_buildx_tag "$@"
     if [[ "$EXPORTS" -eq 1 ]]; then
       publish_fail 'docker failed: buildx build'
     fi
-    REGISTRY["${image}:${base}"]="$manifest"
     return 0
   fi
   return 0
 }
 verify_published_image() { :; }
+verify_image_runtime_configuration() { :; }
 sign_published_digest() { :; }
 if ( publish_component bot ) >/dev/null 2>&1; then
   fail 'first partial build must fail'
 fi
 # Subshell cannot keep REGISTRY updates; replay the first-push side effect.
+REGISTRY["$(staging_ref bot "$base")"]="$manifest"
 REGISTRY["${image}:latest"]="$manifest"
 EXPORTS=1
 [[ -z "${REGISTRY[${image}:${base}]:-}" ]] || fail 'failed first push must not record the SHA tag'
 publish_component bot
-[[ "${REGISTRY[${image}:${base}]}" == "${REGISTRY[${image}:latest]}" ]] || fail 'retry must repair the SHA tag'
+[[ "${REGISTRY[${image}:${base}]:-}" == "${REGISTRY[${image}:latest]:-}" ]] || fail 'retry must repair the SHA tag'
 [[ "$EXPORTS" -eq 2 ]] || fail "partial repair expected 2 exports, got $EXPORTS"
 publish_component bot
 [[ "$EXPORTS" -eq 2 ]] || fail 'matching latest and SHA tags must skip a third build'
@@ -1053,13 +1139,35 @@ read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
 redact_tokens() { :; }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
-  if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi
-  if [[ "$1" == buildx ]]; then
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    record_imagetools_promote "$@"
+    return 0
+  fi
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then
+    if [[ "$*" == *'{{json .Image}}'* ]]; then
+      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z"},"Entrypoint":["/usr/local/bin/jmodguard-bootstrap"]}}'
+      return 0
+    fi
+    printf '{"digest":"sha256:%064d","size":10}\n' 0
+    return 0
+  fi
+  if [[ "$1" == buildx && "$2" == build ]]; then
     EXPORTS=$((EXPORTS + 1))
+    local prev="" arg
+    for arg in "$@"; do
+      if [[ "$prev" == --metadata-file ]]; then
+        printf '{"containerimage.digest":"sha256:%064d"}\n' 0 >"$arg"
+      fi
+      prev="$arg"
+    done
+    record_buildx_tag "$@"
     return 0
   fi
   return 0
 }
+verify_published_image() { :; }
+verify_image_runtime_configuration() { :; }
+sign_published_digest() { :; }
 publish_component bot
 [[ "$EXPORTS" -eq 1 ]] || fail "retried job must rebuild, got $EXPORTS exports"
 
@@ -1100,6 +1208,30 @@ FAIL_SIGN=0
 unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
 
 reload_publisher
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+capture_signing_secrets
+assert_signing_secrets_not_in_environ
+_JMG_SIGNING_KEY=""
+_JMG_SIGNING_PASSWORD=""
+
+reload_publisher
+WRONG_SIGNING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wrong-signing-XXXXXX")"
+COSIGN_PASSWORD="$TEST_SIGNING_PASSWORD" cosign generate-key-pair --output-key-prefix "$WRONG_SIGNING_DIR/wrong"
+JMODGUARD_UPDATE_SIGNING_KEY="$(<"$WRONG_SIGNING_DIR/wrong.key")"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$TEST_SIGNING_PASSWORD"
+if exercise_publish 1 >/dev/null 2>&1; then
+  fail 'mismatched signing key must fail before image build'
+else
+  :
+fi
+if printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build'; then
+  fail 'mismatched signing key must not build images'
+fi
+rm -rf "$WRONG_SIGNING_DIR"
+unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+
+reload_publisher
 assert_eq "$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')" \
   $'::add-mask::a%25b\n::add-mask::c%0Ad\n::add-mask::secret-key\n::add-mask::secret-pass'
 trace="$(redact_tokens 'a%b' $'c\nd' 'secret-key' 'secret-pass')"
@@ -1116,7 +1248,7 @@ got="$(image_published_at "ghcr.io/jatmn/jmodguard-bot@sha256:$(printf 'a%.0s' {
 assert_eq "$got" "2026-10-27T17:00:00Z"
 
 reload_publisher
-readarray -d '' -t legacy_sign_args < <(build_args bot "$HEAD_SHA" "" . stable legacy)
+readarray -d '' -t legacy_sign_args < <(build_args bot "$HEAD_SHA" "" . stable legacy "$(staging_ref bot)")
 printf '%s\n' "${legacy_sign_args[@]}" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
   || fail 'legacy builds must carry a valid publication timestamp for signing'
 printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol=1' \
@@ -1147,13 +1279,21 @@ run_docker() {
 }
 PROD_SIGN_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
 PROD_SIGN_IMAGE=ghcr.io/jatmn/jmodguard-bot
+PROD_SIGN_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/prod-sign-XXXXXX")"
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 capture_signing_secrets
+persist_signing_secrets_to_files "$PROD_SIGN_SCRATCH"
+assert_signing_secrets_not_in_environ
+PROD_SIGN_KEY_FILE="${PROD_SIGN_SCRATCH}/signing.key"
 sign_published_digest bot "$PROD_SIGN_IMAGE" "$PROD_SIGN_DIGEST"
 grep -Fq 'cosign sign --yes' "$COSIGN_TRACE" || fail 'production signing must pass --yes to cosign sign'
 grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production signing must target the verified digest reference'
-grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" || fail 'production signing must use the env signing key reference'
+grep -Fq "cosign sign --yes --key ${PROD_SIGN_KEY_FILE}" "$COSIGN_TRACE" \
+  || fail 'production signing must use a key file'
+rm -rf "$PROD_SIGN_SCRATCH"
+grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" \
+  && fail 'production signing must not pass the private key through the environment'
 grep -Fq 'io.jmodguard.not-after=' "$COSIGN_TRACE" || fail 'production signing must attach the expiry annotation'
 grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
 grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'

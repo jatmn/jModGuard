@@ -20,16 +20,50 @@ SIGNING_PUBLIC_KEY="${REPO_ROOT}/deploy/update-signing.pub"
 IMAGE_SIGNING_RE='^ghcr\.io/jatmn/jmodguard-(bot|api|webui)$'
 _JMG_SIGNING_KEY=""
 _JMG_SIGNING_PASSWORD=""
+_JMG_SIGNING_KEY_FILE=""
+_JMG_SIGNING_PASSWORD_FILE=""
 
 capture_signing_secrets() {
   if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]]; then
     _JMG_SIGNING_KEY="$JMODGUARD_UPDATE_SIGNING_KEY"
-    unset JMODGUARD_UPDATE_SIGNING_KEY
+    _JMG_SIGNING_KEY_FILE=""
+    _JMG_SIGNING_PASSWORD_FILE=""
   fi
   if [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]]; then
     _JMG_SIGNING_PASSWORD="$JMODGUARD_UPDATE_SIGNING_PASSWORD"
-    unset JMODGUARD_UPDATE_SIGNING_PASSWORD
+    _JMG_SIGNING_KEY_FILE=""
+    _JMG_SIGNING_PASSWORD_FILE=""
   fi
+  unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+}
+
+signing_secrets_in_environ() {
+  [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" || -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]]
+}
+
+persist_signing_secrets_to_files() {
+  local dir="$1"
+  _JMG_SIGNING_KEY_FILE="${dir}/signing.key"
+  _JMG_SIGNING_PASSWORD_FILE="${dir}/signing.password"
+  printf '%s' "$_JMG_SIGNING_KEY" >"$_JMG_SIGNING_KEY_FILE"
+  printf '%s' "$_JMG_SIGNING_PASSWORD" >"$_JMG_SIGNING_PASSWORD_FILE"
+  chmod 600 "$_JMG_SIGNING_KEY_FILE" "$_JMG_SIGNING_PASSWORD_FILE"
+  _JMG_SIGNING_KEY=""
+  _JMG_SIGNING_PASSWORD=""
+}
+
+load_signing_secrets_from_files() {
+  [[ -f "$_JMG_SIGNING_KEY_FILE" && -f "$_JMG_SIGNING_PASSWORD_FILE" ]] \
+    || publish_fail 'signing secret files are missing'
+  _JMG_SIGNING_KEY="$(<"$_JMG_SIGNING_KEY_FILE")"
+  _JMG_SIGNING_PASSWORD="$(<"$_JMG_SIGNING_PASSWORD_FILE")"
+}
+
+publish_staging_ref() {
+  local image="$1" sha="$2"
+  local run_id="${GITHUB_RUN_ID:-0}"
+  local attempt="${GITHUB_RUN_ATTEMPT:-1}"
+  printf '%s:_publish-%s-%s-%s' "$image" "${sha:0:12}" "$run_id" "$attempt"
 }
 read_publication_plan() {
   if [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" ]]; then
@@ -212,7 +246,40 @@ changed_since_publication() {
   fi
   latest="$(registry_inspect "${image}:latest" --raw)" || return 0
   immutable="$(registry_inspect "${image}:${previous}" --raw)" || return 0
-  [[ -z "${latest//[[:space:]]/}" || "$latest" != "$immutable" ]]
+  if [[ -z "${latest//[[:space:]]/}" || "$latest" != "$immutable" ]]; then
+    return 0
+  fi
+  if ! published_signature_still_valid "$image"; then
+    return 0
+  fi
+  return 1
+}
+
+published_signature_still_valid() {
+  local image="$1" digest published_at not_after
+  command -v cosign >/dev/null || return 0
+  [[ -f "$SIGNING_PUBLIC_KEY" ]] || return 0
+  if ! digest="$(inspect_digest "${image}:latest" 2>/dev/null | cut -f1)"; then
+    return 0
+  fi
+  if ! cosign verify \
+      --key "$SIGNING_PUBLIC_KEY" \
+      --insecure-ignore-tlog=true \
+      "${image}@${digest}" >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! published_at="$(image_published_at "${image}@${digest}" 2>/dev/null)"; then
+    return 1
+  fi
+  if ! not_after="$(not_after_from_published_at "$published_at" 2>/dev/null)"; then
+    return 1
+  fi
+  NOT_AFTER="$not_after" node --input-type=commonjs - <<'JS' || return 1
+const deadline = new Date(process.env.NOT_AFTER || "");
+if (Number.isNaN(deadline.getTime())) process.exit(2);
+if (Date.now() >= deadline.getTime()) process.exit(3);
+JS
+  return 0
 }
 
 build_args() {
@@ -222,6 +289,7 @@ build_args() {
   local context="$4"
   local channel="${5:-}"
   local layout="${6:-current}"
+  local staging_ref="${7:?staging image reference is required}"
   local image="ghcr.io/jatmn/jmodguard-${component}"
   local release_channel="${channel:-development}"
   local published_at
@@ -309,9 +377,78 @@ JS
     # Dashboard rollback images are signed but must not advertise updater metadata.
     args+=(--label "io.jmodguard.published-at=${published_at}")
   fi
-  args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
+  args+=(--build-arg "SOURCE_SHA=${sha}" --tag "$staging_ref")
   args+=("$context")
   printf '%s\0' "${args[@]}"
+}
+
+digest_from_build_metadata() {
+  local metadata_file="$1"
+  METADATA_FILE="$metadata_file" node --input-type=commonjs - <<'JS'
+const fs = require("node:fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(process.env.METADATA_FILE, "utf8"));
+} catch {
+  process.exit(2);
+}
+const digest = data["containerimage.digest"] || data.containerimage?.digest || "";
+if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(3);
+process.stdout.write(digest);
+JS
+}
+
+assert_digest_matches_ref() {
+  local ref="$1" expected_digest="$2"
+  local resolved
+  IFS=$'\t' read -r resolved _ <<<"$(inspect_digest "$ref")"
+  [[ "$resolved" == "$expected_digest" ]] \
+    || publish_fail "registry reference ${ref} points at ${resolved}, expected ${expected_digest}"
+}
+
+verify_image_runtime_configuration() {
+  local component="$1" ref="$2" layout="${3:-current}"
+  local raw expected
+  raw="$(run_docker buildx imagetools inspect "$ref" --format '{{json .Image}}')"
+  if [[ "$component" == "webui" ]]; then
+    expected='["/docker-entrypoint.sh"]'
+  elif [[ "$layout" == "legacy" ]]; then
+    expected='[]'
+  else
+    expected='["/usr/local/bin/jmodguard-bootstrap"]'
+  fi
+  IMAGE_JSON="$raw" EXPECTED_ENTRYPOINT="$expected" LAYOUT="$layout" node --input-type=commonjs - <<'JS'
+const data = JSON.parse(process.env.IMAGE_JSON || "{}");
+const labels = (data.config && data.config.Labels) || (data.Config && data.Config.Labels) || {};
+const entrypoint = (data.config && data.config.Entrypoint) || (data.Config && data.Config.Entrypoint) || [];
+const expected = JSON.parse(process.env.EXPECTED_ENTRYPOINT || "[]");
+if (JSON.stringify(entrypoint) !== JSON.stringify(expected)) process.exit(2);
+if (process.env.LAYOUT !== "legacy" && !labels["org.opencontainers.image.revision"]) process.exit(3);
+JS
+}
+
+promote_image_tag() {
+  local image="$1" tag="$2" digest="$3"
+  local previous="" restored
+  if previous="$(inspect_digest "${image}:${tag}" 2>/dev/null | cut -f1)"; then
+    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
+  else
+    PROMOTION_ROLLBACK+=("${image}:${tag}|")
+  fi
+  run_docker buildx imagetools create --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null
+  assert_digest_matches_ref "${image}:${tag}" "$digest"
+}
+
+rollback_promoted_tags() {
+  local entry image_tag previous image
+  for entry in "${PROMOTION_ROLLBACK[@]:-}"; do
+    image_tag="${entry%%|*}"
+    previous="${entry#*|}"
+    if [[ -n "$previous" ]]; then
+      image="${image_tag%:*}"
+      run_docker buildx imagetools create --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 checked_request() {
@@ -477,6 +614,7 @@ verify_published_image() {
       (cd "$scratch" && sha256sum -c share/jmodguard/files.sha256 >/dev/null) || publish_fail 'effective service binaries do not match image inventory'
     fi
   fi
+  verify_image_runtime_configuration "$component" "$ref" "$layout"
   run_docker rm "$cid" >/dev/null
   rm -rf "$scratch"
 }
@@ -498,12 +636,31 @@ JS
 }
 
 require_signing_secrets() {
+  if [[ -z "$_JMG_SIGNING_KEY" && -n "$_JMG_SIGNING_KEY_FILE" ]]; then
+    load_signing_secrets_from_files
+  fi
   [[ -n "$_JMG_SIGNING_KEY" ]] \
     || publish_fail 'JMODGUARD_UPDATE_SIGNING_KEY is empty; image signing is required before tags move'
   [[ -n "$_JMG_SIGNING_PASSWORD" ]] \
     || publish_fail 'JMODGUARD_UPDATE_SIGNING_PASSWORD is empty; image signing is required before tags move'
   [[ -f "$SIGNING_PUBLIC_KEY" ]] \
     || publish_fail 'committed signing public key is missing'
+}
+
+validate_signing_key_pair() {
+  local scratch extracted_pub pass
+  [[ -f "$_JMG_SIGNING_KEY_FILE" && -f "$_JMG_SIGNING_PASSWORD_FILE" ]] \
+    || publish_fail 'signing secret files are missing'
+  scratch="$(mktemp -d "${TMPDIR:-.tmp}/signing-validate-XXXXXX")"
+  extracted_pub="$scratch/extracted.pub"
+  pass="$(<"$_JMG_SIGNING_PASSWORD_FILE")"
+  (
+    export COSIGN_PASSWORD="$pass"
+    cosign public-key --key "$_JMG_SIGNING_KEY_FILE" --outfile "$extracted_pub"
+  ) || publish_fail 'signing private key is malformed'
+  diff -q "$extracted_pub" "$SIGNING_PUBLIC_KEY" >/dev/null \
+    || publish_fail 'signing private key does not match deploy/update-signing.pub'
+  rm -rf "$scratch"
 }
 
 image_published_at() {
@@ -515,6 +672,10 @@ const data = JSON.parse(process.env.IMAGE_JSON || "{}");
 const labels = (data.config && data.config.Labels) || (data.Config && data.Config.Labels) || {};
 const published = labels["io.jmodguard.published-at"] || "";
 if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(published)) process.exit(2);
+const parsed = new Date(published);
+if (Number.isNaN(parsed.getTime()) || parsed.toISOString().replace(/\.\d{3}Z$/, "Z") !== published) {
+  process.exit(2);
+}
 process.stdout.write(published);
 JS
 }
@@ -531,19 +692,20 @@ JS
 
 sign_published_digest() {
   local component="$1" image="$2" digest="$3"
-  local published_at not_after
+  local published_at not_after pass
   [[ "$image" =~ $IMAGE_SIGNING_RE ]] || publish_fail 'invalid image signing reference'
-  require_signing_secrets
+  [[ -f "$_JMG_SIGNING_KEY_FILE" && -f "$_JMG_SIGNING_PASSWORD_FILE" ]] \
+    || publish_fail 'signing secret files are missing'
   published_at="$(image_published_at "${image}@${digest}")" \
     || publish_fail 'published image lacks io.jmodguard.published-at'
   not_after="$(not_after_from_published_at "$published_at")" \
     || publish_fail 'cannot compute image signature expiry'
+  pass="$(<"$_JMG_SIGNING_PASSWORD_FILE")"
   (
-    export COSIGN_PASSWORD="$_JMG_SIGNING_PASSWORD"
-    export JMODGUARD_UPDATE_SIGNING_KEY="$_JMG_SIGNING_KEY"
+    export COSIGN_PASSWORD="$pass"
     run_cosign sign \
       --yes \
-      --key "env://JMODGUARD_UPDATE_SIGNING_KEY" \
+      --key "$_JMG_SIGNING_KEY_FILE" \
       --tlog-upload=false \
       --annotation "io.jmodguard.not-after=${not_after}" \
       "${image}@${digest}"
@@ -563,7 +725,8 @@ scratch_dir() {
 publish_component() {
   local component="$1"
   local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest resolved
-  local -a build_cmd
+  local staging_ref metadata_file
+  local -a build_cmd PROMOTION_ROLLBACK=()
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
@@ -579,6 +742,7 @@ publish_component() {
     resolve_source manual "$sha" "$head" >/dev/null
   fi
   image="ghcr.io/jatmn/jmodguard-${component}"
+  capture_signing_secrets
   if [[ "$mode" == "main" && "${GITHUB_RUN_ATTEMPT:-1}" == "1" ]] \
       && ! changed_since_publication "$component" "$sha" "$image"; then
     echo "${component}: image inputs match the last publication; no rebuild"
@@ -592,9 +756,7 @@ publish_component() {
   if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
     source_token="$token"
   fi
-  capture_signing_secrets
   require_signing_secrets
-  redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   export GITHUB_TOKEN="$source_token"
   scratch="$(scratch_dir publish)"
   context="${scratch}/source"
@@ -605,6 +767,10 @@ publish_component() {
     rm -rf "$JMODGUARD_PUBLISH_CLEANUP_SCRATCH"
   }
   trap cleanup_publish EXIT
+  persist_signing_secrets_to_files "$scratch"
+  signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
+  validate_signing_key_pair
+  redact_tokens "$token" "$source_token" "$(<"$_JMG_SIGNING_KEY_FILE")" "$(<"$_JMG_SIGNING_PASSWORD_FILE")"
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
@@ -624,26 +790,35 @@ publish_component() {
     fi
     node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
   fi
-  readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout")
+  staging_ref="$(publish_staging_ref "$image" "$sha")"
+  metadata_file="${scratch}/build-metadata.json"
+  readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout" "$staging_ref")
   [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
+  build_cmd+=("--metadata-file" "$metadata_file")
   run_docker "${build_cmd[@]:1}"
-  IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
+  published_digest="$(digest_from_build_metadata "$metadata_file")" \
+    || publish_fail 'build metadata did not report an image digest'
+  assert_digest_matches_ref "$staging_ref" "$published_digest"
   verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
   sign_published_digest "$component" "$image" "$published_digest"
+  assert_digest_matches_ref "$staging_ref" "$published_digest"
+  promote_with_rollback() {
+    local tag="$1"
+    promote_image_tag "$image" "$tag" "$published_digest" || {
+      rollback_promoted_tags
+      publish_fail "failed to promote ${image}:${tag}"
+    }
+  }
+  promote_with_rollback "$sha"
+  assert_digest_matches_ref "${image}:${sha}" "$published_digest"
   if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
-    run_docker buildx imagetools create --prefer-index=false --tag "${image}:${label}" "${image}@${published_digest}" >/dev/null
-    IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:${label}")"
-    [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'version tag pointer differs from verified image digest'
+    promote_with_rollback "$label"
   fi
   if [[ "$channel" != "nightly" ]]; then
-    run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
-    IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:latest")"
-    [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'latest pointer differs from verified image digest'
+    promote_with_rollback latest
   fi
   if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
-    run_docker buildx imagetools create --prefer-index=false --tag "${image}:${channel}" "${image}@${published_digest}" >/dev/null
-    IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:${channel}")"
-    [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'release channel pointer differs from verified image digest'
+    promote_with_rollback "$channel"
   fi
   echo "Published ${image}:${sha}"
   trap - EXIT
