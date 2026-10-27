@@ -7,6 +7,17 @@ use std::time::{Duration, Instant};
 const AUTOMOD_DELETE_MARK_TTL: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_AUTOMOD_DELETE_MARKS: usize = 4096;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewayDeleteObservation {
+    Automod {
+        rule_id: String,
+        rule_name: String,
+    },
+    /// Gateway arrived before REST confirmation; suppress interim plain logging.
+    PendingAutomod,
+    Plain,
+}
+
 #[derive(Clone)]
 struct AutomodDeleteMark {
     rule_id: String,
@@ -80,20 +91,30 @@ impl AutomodDeleteMarks {
         );
     }
 
-    pub(crate) fn note_gateway_delete(
+    /// Records a gateway delete and classifies it under one lock so REST
+    /// confirmation cannot race between `note_gateway_delete` and `take`.
+    pub(crate) fn observe_gateway_delete(
         &mut self,
         guild: u64,
         channel: u64,
         message: u64,
         now: Instant,
-    ) {
+    ) -> GatewayDeleteObservation {
         self.prune(now);
         let key = (guild, channel, message);
-        if let Some(entry) = self.entries.get_mut(&key)
-            && !entry.confirmed
-        {
-            entry.gateway_pending = true;
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return GatewayDeleteObservation::Plain;
+        };
+        if entry.confirmed {
+            let entry = self.entries.remove(&key).expect("entry present");
+            self.order.retain(|candidate| *candidate != key);
+            return GatewayDeleteObservation::Automod {
+                rule_id: entry.rule_id,
+                rule_name: entry.rule_name,
+            };
         }
+        entry.gateway_pending = true;
+        GatewayDeleteObservation::PendingAutomod
     }
 
     /// Marks REST success. When the gateway delete already logged as plain
@@ -135,6 +156,7 @@ impl AutomodDeleteMarks {
 
     /// Consumes a confirmed mark for one gateway delete. Unconfirmed marks are
     /// left in place until REST settles or `remove_unconfirmed` runs.
+    #[cfg(test)]
     pub(crate) fn take(
         &mut self,
         guild: u64,
@@ -182,10 +204,15 @@ impl AutomodDeleteMarkAccess {
             .insert(guild, channel, message, rule_id, rule_name, Instant::now());
     }
 
-    pub(crate) fn note_gateway_delete(&self, guild: u64, channel: u64, message: u64) {
+    pub(crate) fn observe_gateway_delete(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+    ) -> GatewayDeleteObservation {
         self.inner
             .lock()
-            .note_gateway_delete(guild, channel, message, Instant::now());
+            .observe_gateway_delete(guild, channel, message, Instant::now())
     }
 
     pub(crate) fn confirm(
@@ -203,12 +230,6 @@ impl AutomodDeleteMarkAccess {
         self.inner
             .lock()
             .remove_unconfirmed(guild, channel, message, Instant::now());
-    }
-
-    pub(crate) fn take(&self, guild: u64, channel: u64, message: u64) -> Option<(String, String)> {
-        self.inner
-            .lock()
-            .take(guild, channel, message, Instant::now())
     }
 }
 
@@ -296,11 +317,29 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        marks.note_gateway_delete(1, 2, 3, now);
-        assert!(marks.take(1, 2, 3, now).is_none());
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
         assert_eq!(
             marks.confirm(1, 2, 3, now),
             Some(("badword".into(), "Bad word".into()))
+        );
+        assert!(!marks.contains(1, 2, 3));
+    }
+
+    #[test]
+    fn observe_gateway_delete_is_atomic_with_confirm() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        marks.confirm(1, 2, 3, now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, now),
+            GatewayDeleteObservation::Automod {
+                rule_id: "badword".into(),
+                rule_name: "Bad word".into(),
+            }
         );
         assert!(!marks.contains(1, 2, 3));
     }

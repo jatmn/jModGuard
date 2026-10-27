@@ -3728,7 +3728,8 @@ mod tests {
             ChannelId::new(70),
             MessageId::new(42),
             None,
-        );
+        )
+        .expect("plain delete");
         assert_eq!(report.event, "message_delete");
         drop(app);
         let _ = std::fs::remove_file(&path);

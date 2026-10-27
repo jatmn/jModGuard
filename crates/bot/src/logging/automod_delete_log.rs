@@ -106,7 +106,8 @@ async fn confirmed_mark_emits_automod_delete_not_plain_delete() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("automod report");
     assert_eq!(report.event, "automod_delete");
     assert_eq!(report.vars["rule"], "Bad words");
     let sink = Sink::default();
@@ -122,7 +123,8 @@ async fn confirmed_mark_emits_automod_delete_not_plain_delete() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("plain follow-up");
     assert_eq!(plain.event, "message_delete");
 }
 
@@ -142,7 +144,8 @@ async fn automod_delete_channel_falls_back_to_message_delete() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("report");
     let sink = Sink::default();
     emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
     assert_eq!(sink.messages.lock().unwrap()[0].0, ChannelId::new(456));
@@ -157,7 +160,8 @@ async fn unrelated_delete_stays_plain() {
         ChannelId::new(456),
         MessageId::new(999),
         None,
-    );
+    )
+    .expect("plain delete");
     assert_eq!(report.event, "message_delete");
 }
 
@@ -171,7 +175,8 @@ async fn restart_substitute_has_no_mark() {
         ChannelId::new(2),
         MessageId::new(3),
         None,
-    );
+    )
+    .expect("plain delete");
     assert_eq!(report.event, "message_delete");
 }
 
@@ -188,7 +193,8 @@ async fn double_emit_path_consumes_mark_once() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("first");
     assert_eq!(first.event, "automod_delete");
     let second = observed_delete_report(
         &f.app,
@@ -196,7 +202,8 @@ async fn double_emit_path_consumes_mark_once() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("second");
     assert_eq!(second.event, "message_delete");
 }
 
@@ -209,14 +216,16 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
     f.app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
-    let report = observed_delete_report(
-        &f.app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-        None,
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            None,
+        )
+        .is_none()
     );
-    assert_eq!(report.event, "message_delete");
     assert!(
         f.app
             .automod_delete_marks
@@ -236,6 +245,41 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
             .inner
             .lock()
             .contains(789, 456, 123)
+    );
+}
+
+#[tokio::test]
+async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
+        .await
+        .unwrap();
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "repeated_text", "Repeated text");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            None,
+        )
+        .is_none()
+    );
+    let reconcile = f
+        .app
+        .automod_delete_marks
+        .confirm(789, 456, 123)
+        .expect("spam reconcile");
+    let sink = Sink::default();
+    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &reconcile.0, &reconcile.1).await;
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+    assert!(
+        sink.messages.lock().unwrap()[0]
+            .1
+            .to_string()
+            .contains("Repeated text")
     );
 }
 
@@ -285,11 +329,55 @@ async fn automod_delete_fallback_inherits_message_delete_ignore_filter() {
         ChannelId::new(456),
         MessageId::new(123),
         None,
-    );
+    )
+    .expect("report");
     report.vars.insert("user_id".into(), "42".into());
     let sink = Sink::default();
     let delivery = emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
     assert_eq!(delivery, Delivery::Unconfigured);
+    assert!(sink.messages.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    set_log_filter(
+        &f.app,
+        "message_delete",
+        Some(r#"{"users":["42"],"channels":[]}"#),
+    )
+    .await;
+    remember_message(&f.app, 789, 456, 123, Some(42), None, None);
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            None,
+        )
+        .is_none()
+    );
+    let peek = message_delete_report_peek(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(peek.vars["user_id"], "42");
+    let sink = Sink::default();
+    assert_eq!(
+        emit_to(&f.app, &sink, peek.guild_id, peek.event, peek.vars).await,
+        Delivery::Unconfigured
+    );
+    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123).unwrap();
+    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &reconcile.0, &reconcile.1).await;
     assert!(sink.messages.lock().unwrap().is_empty());
 }
 
@@ -320,14 +408,16 @@ async fn bulk_mix_splits_automod_from_plain_ids() {
         ChannelId::new(456),
         MessageId::new(10),
         None,
-    );
+    )
+    .expect("automod");
     let plain = observed_delete_report(
         &f.app,
         GuildId::new(789),
         ChannelId::new(456),
         MessageId::new(11),
         None,
-    );
+    )
+    .expect("plain");
     assert_eq!(automod.event, "automod_delete");
     assert_eq!(plain.event, "message_delete");
 }

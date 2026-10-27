@@ -503,6 +503,7 @@ fn fingerprint<T: Hash>(value: &T) -> u64 {
 pub struct SnippetCache {
     inner: Mutex<HashMap<(u64, u64, u64), Snippet>>,
 }
+#[derive(Clone)]
 struct Snippet {
     at: Instant,
     guild: u64,
@@ -628,6 +629,14 @@ fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Optio
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
     cache.remove(&(guild, channel, message))
+}
+
+fn peek_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
+    let cache = app.log_snippets.inner.lock();
+    cache
+        .get(&(guild, channel, message))
+        .filter(|snippet| snippet.at.elapsed() < SNIPPET_KEEP)
+        .cloned()
 }
 
 /// Resolves the log channel for an event type from the cached config.
@@ -2148,6 +2157,28 @@ pub(crate) fn message_update_report(
     })
 }
 
+fn apply_delete_snippet(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    vars: &mut BTreeMap<String, String>,
+    consume_snippet: bool,
+) {
+    let snippet = if consume_snippet {
+        take_snippet(app, guild_id.get(), channel.get(), id.get())
+    } else {
+        peek_snippet(app, guild_id.get(), channel.get(), id.get())
+    };
+    if let Some(snippet) = snippet {
+        vars.extend(templates::user_vars(
+            snippet.author,
+            &snippet.author.to_string(),
+            &snippet.author.to_string(),
+        ));
+    }
+}
+
 pub(crate) fn message_delete_report(
     app: &BotState,
     guild_id: GuildId,
@@ -2155,13 +2186,25 @@ pub(crate) fn message_delete_report(
     id: MessageId,
 ) -> MessageReport {
     let mut vars = message_vars(guild_id, channel, id);
-    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
-        vars.extend(templates::user_vars(
-            snippet.author,
-            &snippet.author.to_string(),
-            &snippet.author.to_string(),
-        ));
+    apply_delete_snippet(app, guild_id, channel, id, &mut vars, true);
+    MessageReport {
+        guild_id,
+        event: "message_delete",
+        vars,
     }
+}
+
+/// Builds a plain-delete report without consuming the cached snippet (tests and
+/// gateway-first reconciliation that still need author context later).
+#[cfg(test)]
+pub(crate) fn message_delete_report_peek(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+) -> MessageReport {
+    let mut vars = message_vars(guild_id, channel, id);
+    apply_delete_snippet(app, guild_id, channel, id, &mut vars, false);
     MessageReport {
         guild_id,
         event: "message_delete",
@@ -2194,28 +2237,31 @@ fn automod_delete_report(
     }
 }
 
-/// Gateway delete logging: plain `message_delete` unless an automod mark exists.
+/// Gateway delete logging. Returns `None` when an automod delete is pending REST
+/// confirmation so callers do not emit a premature plain `message_delete`.
 pub(crate) fn observed_delete_report(
     app: &BotState,
     guild_id: GuildId,
     channel: ChannelId,
     id: MessageId,
     retained: Option<&MessageSnapshot>,
-) -> MessageReport {
-    app.automod_delete_marks
-        .note_gateway_delete(guild_id.get(), channel.get(), id.get());
-    let mut report = if let Some((rule_id, rule_name)) =
-        app.automod_delete_marks
-            .take(guild_id.get(), channel.get(), id.get())
-    {
-        automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name)
-    } else {
-        message_delete_report(app, guild_id, channel, id)
+) -> Option<MessageReport> {
+    use crate::automod_delete_marks::GatewayDeleteObservation;
+    let mut report = match app.automod_delete_marks.observe_gateway_delete(
+        guild_id.get(),
+        channel.get(),
+        id.get(),
+    ) {
+        GatewayDeleteObservation::Automod { rule_id, rule_name } => {
+            automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name)
+        }
+        GatewayDeleteObservation::PendingAutomod => return None,
+        GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
     };
     if let Some(row) = retained {
         apply_retained_delete(&mut report, Some(row));
     }
-    report
+    Some(report)
 }
 
 /// After REST confirms an automod delete that already produced a plain gateway

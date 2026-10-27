@@ -1374,14 +1374,15 @@ impl EventHandler for Handler {
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        if !hooked {
-            let report = logging::observed_delete_report(
+        if !hooked
+            && let Some(report) = logging::observed_delete_report(
                 &self.app,
                 guild_id,
                 channel_id,
                 deleted_message_id,
                 None,
-            );
+            )
+        {
             logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
         }
     }
@@ -1423,10 +1424,12 @@ impl EventHandler for Handler {
             for id in ids {
                 let report =
                     logging::observed_delete_report(&self.app, guild_id, channel_id, id, None);
-                if report.event == "automod_delete" {
-                    logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
-                } else {
-                    plain.push(id);
+                match report {
+                    Some(report) if report.event == "automod_delete" => {
+                        logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
+                    }
+                    None => {}
+                    Some(_) => plain.push(id),
                 }
             }
             if !plain.is_empty() {

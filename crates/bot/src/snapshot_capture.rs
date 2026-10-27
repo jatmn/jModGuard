@@ -301,14 +301,15 @@ impl SnapshotIngress {
                         vec![event.message_id],
                         false,
                     );
-                    if !queued {
-                        let report = logging::observed_delete_report(
+                    if !queued
+                        && let Some(report) = logging::observed_delete_report(
                             app,
                             guild,
                             event.channel_id,
                             event.message_id,
                             None,
-                        );
+                        )
+                    {
                         submit_report(app, &context, report);
                     }
                 }
@@ -1106,9 +1107,10 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         ids,
                         bulk: false,
                     } => {
-                        if let Some(id) = ids.first() {
-                            let mut report =
-                                logging::observed_delete_report(&app, guild, channel, *id, None);
+                        if let Some(id) = ids.first()
+                            && let Some(mut report) =
+                                logging::observed_delete_report(&app, guild, channel, *id, None)
+                        {
                             report
                                 .vars
                                 .insert("coverage".into(), "snapshot storage unavailable".into());
@@ -1488,9 +1490,14 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         *id,
                                         row.as_ref(),
                                     );
-                                    if report.event == "automod_delete" {
+                                    if report
+                                        .as_ref()
+                                        .is_none_or(|report| report.event == "automod_delete")
+                                    {
                                         transcript.peel_automod_delete();
-                                        submit_report(&app, &work.context, report);
+                                        if let Some(report) = report {
+                                            submit_report(&app, &work.context, report);
+                                        }
                                     } else if row
                                         .as_ref()
                                         .and_then(|row| row.fields.author_id)
@@ -1528,14 +1535,15 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     if transcript.worth_sending() {
                         submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
                     }
-                } else if let Some(id) = ids.first() {
-                    let mut report = logging::observed_delete_report(
+                } else if let Some(id) = ids.first()
+                    && let Some(mut report) = logging::observed_delete_report(
                         &app,
                         *guild,
                         *channel,
                         *id,
                         single.as_ref(),
-                    );
+                    )
+                {
                     if single_unknown {
                         report
                             .vars
@@ -1631,9 +1639,14 @@ fn peel_automod_bulk_chunk(
 ) {
     for id in ids {
         let report = logging::observed_delete_report(app, guild, channel, *id, None);
-        if report.event == "automod_delete" {
+        if report
+            .as_ref()
+            .is_none_or(|report| report.event == "automod_delete")
+        {
             transcript.peel_automod_delete();
-            submit_report(app, context, report);
+            if let Some(report) = report {
+                submit_report(app, context, report);
+            }
         } else {
             transcript.push_unknown(*id);
         }

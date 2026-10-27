@@ -526,8 +526,21 @@ async fn punish_proven_match(
         }
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
-                app.automod_delete_marks
-                    .confirm(found.guild, *channel, *message);
+                if let Some((rule_id, rule_name)) =
+                    app.automod_delete_marks
+                        .confirm(found.guild, *channel, *message)
+                {
+                    crate::logging::emit_reconciled_automod_delete(
+                        app,
+                        http,
+                        found.guild,
+                        *channel,
+                        *message,
+                        &rule_id,
+                        &rule_name,
+                    )
+                    .await;
+                }
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
@@ -1562,7 +1575,8 @@ pub(crate) mod tests {
             ChannelId::new(11),
             MessageId::new(42),
             None,
-        );
+        )
+        .expect("automod delete");
         assert_eq!(report.event, "automod_delete");
         assert_eq!(report.vars["rule"], "Repeated text");
         drop(app);
