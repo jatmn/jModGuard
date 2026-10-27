@@ -1378,7 +1378,7 @@ impl Supervisor {
         if self.hold_rejected_token().await? {
             return Ok(false);
         }
-        let (release, seen) = {
+        let (release, seen, running_from_baked) = {
             let Some(child) = self.running.as_mut() else {
                 return Ok(false);
             };
@@ -1424,6 +1424,7 @@ impl Supervisor {
                     self.enabled,
                     &self.baked_compatibility,
                 ),
+                child.path == self.baked,
             )
         };
         self.restart.recovered();
@@ -1482,10 +1483,11 @@ impl Supervisor {
                     self.clear_rejected_marker().await;
                     if let Some(digest) = installed_digest.as_ref() {
                         let state = self.control.component(&self.role).await?;
-                        if state
-                            .installed
-                            .as_ref()
-                            .is_some_and(|installed| &installed.digest == digest)
+                        if !running_from_baked
+                            && state
+                                .installed
+                                .as_ref()
+                                .is_some_and(|installed| &installed.digest == digest)
                         {
                             self.clear_boot_mismatch_when_saved().await?;
                         }
