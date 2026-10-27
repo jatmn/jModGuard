@@ -1,11 +1,15 @@
 //! `!userinfo` / `/userinfo` — cached member snapshot plus warns and case history.
 
+use crate::db::guild_data::{MemberHistoryEntry, MemberHistoryPage};
 use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use serenity::model::voice::VoiceState;
 use std::collections::BTreeMap;
 
 use super::{Args, BehaviorOutcome, CmdEnv};
+
+pub(crate) const CASE_LINE_LIMIT: usize = 8;
+const HISTORY_PAGE: u32 = 50;
 
 pub(crate) const MISSING: &str = "missing";
 pub(crate) const VOICE_NOT_IN: &str = "not in a voice channel";
@@ -148,6 +152,48 @@ pub(crate) fn apply_rest_user(snapshot: &mut MemberSnapshot, name: String, globa
     if snapshot.global_name.is_none() {
         snapshot.global_name = global;
     }
+}
+
+pub(crate) fn apply_missing_user_identity(snapshot: &mut MemberSnapshot) {
+    if snapshot.username.is_none() {
+        snapshot.username = Some(MISSING.to_string());
+    }
+    if snapshot.global_name.is_none() {
+        snapshot.global_name = Some(MISSING.to_string());
+    }
+}
+
+/// Adds case rows from one mixed history page. Returns true when a ninth case exists.
+pub(crate) fn absorb_case_page(
+    cases: &mut Vec<MemberHistoryEntry>,
+    page: &MemberHistoryPage,
+    limit: usize,
+) -> bool {
+    for entry in &page.entries {
+        if entry.case_id.is_none() {
+            continue;
+        }
+        if cases.len() < limit {
+            cases.push(entry.clone());
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn case_lines_from_entries(entries: &[MemberHistoryEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            format_case_line(
+                &entry.kind,
+                entry.outcome.as_deref(),
+                entry.occurred_at_ms,
+                entry.reason.as_deref(),
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn format_voice(voice: &VoiceSnapshot) -> String {
@@ -468,26 +514,25 @@ async fn load_case_lines(
     let Ok((store, scope)) = live else {
         return CasesField::Unavailable;
     };
-    let page = store
-        .member_history(scope, target.get() as i64, None, 8)
-        .await;
-    let Ok(page) = page else {
-        return CasesField::Unavailable;
-    };
-    let lines: Vec<String> = page
-        .entries
-        .into_iter()
-        .filter(|entry| entry.case_id.is_some())
-        .take(8)
-        .map(|entry| {
-            format_case_line(
-                &entry.kind,
-                entry.outcome.as_deref(),
-                entry.occurred_at_ms,
-                entry.reason.as_deref(),
-            )
-        })
-        .collect();
+    let limit = CASE_LINE_LIMIT;
+    let mut entries = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .member_history(scope.clone(), target.get() as i64, after, HISTORY_PAGE)
+            .await;
+        let Ok(page) = page else {
+            return CasesField::Unavailable;
+        };
+        if absorb_case_page(&mut entries, &page, limit) {
+            break;
+        }
+        if page.next_cursor.is_none() {
+            break;
+        }
+        after = page.next_cursor;
+    }
+    let lines = case_lines_from_entries(&entries);
     if lines.is_empty() {
         CasesField::None
     } else {
@@ -507,13 +552,7 @@ pub(crate) async fn run(
     if !snapshot_has_cached_user(&snapshot) {
         match rest_user_lookup(env, target).await {
             Ok((name, global)) => apply_rest_user(&mut snapshot, name, global),
-            Err(error) => {
-                return Ok(BehaviorOutcome {
-                    response: Some(error.to_string()),
-                    vars: vars.clone(),
-                    suppress_response: false,
-                });
-            }
+            Err(_) => apply_missing_user_identity(&mut snapshot),
         }
     }
 

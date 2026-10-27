@@ -1,6 +1,8 @@
 use super::*;
 use crate::commands::Args;
-use crate::db::guild_data::{CaseAction, CaseEvidence, CaseOutcome};
+use crate::db::guild_data::{
+    CaseAction, CaseEvidence, CaseOutcome, MemberHistoryEntry, MemberHistoryPage,
+};
 use crate::state::BotState;
 use serenity::all::{Cache, Guild, GuildCreateEvent, Member, Role, RoleId, User, UserId};
 use serenity::model::id::{ChannelId, GuildId};
@@ -141,6 +143,130 @@ fn history_unavailable_does_not_say_none() {
     );
     assert!(body.contains(CASES_UNAVAILABLE));
     assert!(!body.to_lowercase().contains("none"));
+}
+
+fn stay_row(at: i64, stay_id: &str) -> MemberHistoryEntry {
+    MemberHistoryEntry {
+        kind: "join".into(),
+        occurred_at_ms: Some(at),
+        observed_at_ms: None,
+        stay_id: Some(stay_id.into()),
+        observation_id: None,
+        case_id: None,
+        joined_at_ms: Some(at),
+        departed_at_ms: None,
+        moderator_id: None,
+        reason: None,
+        outcome: None,
+        source_kind: None,
+    }
+}
+
+fn case_row(at: i64, case_id: &str) -> MemberHistoryEntry {
+    MemberHistoryEntry {
+        kind: "ban".into(),
+        occurred_at_ms: Some(at),
+        observed_at_ms: None,
+        stay_id: None,
+        observation_id: None,
+        case_id: Some(case_id.into()),
+        joined_at_ms: None,
+        departed_at_ms: None,
+        moderator_id: None,
+        reason: None,
+        outcome: Some("succeeded".into()),
+        source_kind: None,
+    }
+}
+
+fn collect_case_entries_from_pages(pages: &[MemberHistoryPage]) -> Vec<MemberHistoryEntry> {
+    let limit = CASE_LINE_LIMIT;
+    let mut entries = Vec::new();
+    for page in pages {
+        if absorb_case_page(&mut entries, page, limit) {
+            break;
+        }
+    }
+    entries
+}
+
+#[test]
+fn paginate_case_lines_past_stay_rows_on_first_page() {
+    let page1 = MemberHistoryPage {
+        entries: vec![
+            stay_row(9_000, "stay-a"),
+            stay_row(8_000, "stay-b"),
+            stay_row(7_000, "stay-c"),
+            stay_row(6_000, "stay-d"),
+            stay_row(5_000, "stay-e"),
+            stay_row(4_000, "stay-f"),
+            stay_row(3_000, "stay-g"),
+            case_row(2_000, "case-one"),
+        ],
+        next_cursor: Some("2000:ban:case-one".into()),
+    };
+    let page2 = MemberHistoryPage {
+        entries: vec![case_row(1_000, "case-two")],
+        next_cursor: None,
+    };
+    let entries = collect_case_entries_from_pages(&[page1, page2]);
+    assert_eq!(entries.len(), 2);
+    let lines = case_lines_from_entries(&entries);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("`ban`"));
+    let snapshot = MemberSnapshot {
+        user_id: 91,
+        username: Some("u".into()),
+        global_name: None,
+        nick: None,
+        joined_at: None,
+        roles: vec![],
+        roles_cached: true,
+        voice: VoiceSnapshot::NotInChannel,
+        member_cached: true,
+        guild_cached: true,
+    };
+    let body = render_userinfo_message(
+        jmodguard::defaults::USER_INFO_TEMPLATE,
+        &snapshot,
+        &WarnsField::Count(0),
+        lines,
+    );
+    assert!(!body.contains(CASES_NONE));
+    assert!(body.contains("`ban`"));
+}
+
+#[test]
+fn rest_lookup_failure_still_renders_warns_and_cases() {
+    let mut snapshot = MemberSnapshot {
+        user_id: 91,
+        username: None,
+        global_name: None,
+        nick: None,
+        joined_at: None,
+        roles: vec![],
+        roles_cached: false,
+        voice: VoiceSnapshot::NotCached,
+        member_cached: false,
+        guild_cached: false,
+    };
+    apply_missing_user_identity(&mut snapshot);
+    let lines = vec![format_case_line(
+        "warn",
+        Some("succeeded"),
+        Some(1_600_000_000_000),
+        None,
+    )];
+    let body = render_userinfo_message(
+        jmodguard::defaults::USER_INFO_TEMPLATE,
+        &snapshot,
+        &WarnsField::Count(3),
+        lines,
+    );
+    assert!(body.contains(MISSING));
+    assert!(body.contains("**Warnings:** 3"));
+    assert!(body.contains("`warn`"));
+    assert!(!body.contains("Discord API error"));
 }
 
 #[test]
