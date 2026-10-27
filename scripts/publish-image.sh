@@ -18,6 +18,19 @@ run_cosign() { cosign "$@" || publish_fail "cosign failed: $*"; }
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIGNING_PUBLIC_KEY="${REPO_ROOT}/deploy/update-signing.pub"
 IMAGE_SIGNING_RE='^ghcr\.io/jatmn/jmodguard-(bot|api|webui)$'
+_JMG_SIGNING_KEY=""
+_JMG_SIGNING_PASSWORD=""
+
+capture_signing_secrets() {
+  if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]]; then
+    _JMG_SIGNING_KEY="$JMODGUARD_UPDATE_SIGNING_KEY"
+    unset JMODGUARD_UPDATE_SIGNING_KEY
+  fi
+  if [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]]; then
+    _JMG_SIGNING_PASSWORD="$JMODGUARD_UPDATE_SIGNING_PASSWORD"
+    unset JMODGUARD_UPDATE_SIGNING_PASSWORD
+  fi
+}
 read_publication_plan() {
   if [[ -n "${JMODGUARD_PUBLICATION_PLAN:-}" ]]; then
     printf '%s\n' "$JMODGUARD_PUBLICATION_PLAN"
@@ -297,9 +310,6 @@ JS
     args+=(--label "io.jmodguard.published-at=${published_at}")
   fi
   args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
-  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
-    args+=(--tag "${image}:${label}")
-  fi
   args+=("$context")
   printf '%s\0' "${args[@]}"
 }
@@ -442,7 +452,8 @@ source_image_layout() {
 }
 
 verify_published_image() {
-  local component="$1" image="$2" context="$3" layout="${4:-current}" scratch cid entry
+  local component="$1" image="$2" digest="$3" context="$4" layout="${5:-current}" scratch cid entry ref
+  ref="${image}@${digest}"
   scratch="$(scratch_dir image-verify)"
   if [[ "$component" == "webui" ]]; then
     entry=/webui/index.html
@@ -451,8 +462,8 @@ verify_published_image() {
   else
     entry=/usr/local/bin/jmodguard-bootstrap
   fi
-  run_docker pull --platform linux/amd64 "$image" >/dev/null
-  cid="$(run_docker create --entrypoint "$entry" "$image")"
+  run_docker pull --platform linux/amd64 "$ref" >/dev/null
+  cid="$(run_docker create --entrypoint "$entry" "$ref")"
   if [[ "$component" == "webui" ]]; then
     run_docker cp "$cid:/webui/." "$scratch/" >/dev/null
     diff -r "$context/dist/webui" "$scratch" >/dev/null || publish_fail 'published WebUI files differ from the packaged assets'
@@ -487,9 +498,9 @@ JS
 }
 
 require_signing_secrets() {
-  [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" ]] \
+  [[ -n "$_JMG_SIGNING_KEY" ]] \
     || publish_fail 'JMODGUARD_UPDATE_SIGNING_KEY is empty; image signing is required before tags move'
-  [[ -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]] \
+  [[ -n "$_JMG_SIGNING_PASSWORD" ]] \
     || publish_fail 'JMODGUARD_UPDATE_SIGNING_PASSWORD is empty; image signing is required before tags move'
   [[ -f "$SIGNING_PUBLIC_KEY" ]] \
     || publish_fail 'committed signing public key is missing'
@@ -527,11 +538,16 @@ sign_published_digest() {
     || publish_fail 'published image lacks io.jmodguard.published-at'
   not_after="$(not_after_from_published_at "$published_at")" \
     || publish_fail 'cannot compute image signature expiry'
-  COSIGN_PASSWORD="${JMODGUARD_UPDATE_SIGNING_PASSWORD}" run_cosign sign \
-    --key "env://JMODGUARD_UPDATE_SIGNING_KEY" \
-    --tlog-upload=false \
-    --annotation "io.jmodguard.not-after=${not_after}" \
-    "${image}@${digest}"
+  (
+    export COSIGN_PASSWORD="$_JMG_SIGNING_PASSWORD"
+    export JMODGUARD_UPDATE_SIGNING_KEY="$_JMG_SIGNING_KEY"
+    run_cosign sign \
+      --yes \
+      --key "env://JMODGUARD_UPDATE_SIGNING_KEY" \
+      --tlog-upload=false \
+      --annotation "io.jmodguard.not-after=${not_after}" \
+      "${image}@${digest}"
+  )
   run_cosign verify \
     --key "$SIGNING_PUBLIC_KEY" \
     --insecure-ignore-tlog=true \
@@ -576,7 +592,9 @@ publish_component() {
   if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
     source_token="$token"
   fi
-  redact_tokens "$token" "$source_token" "${JMODGUARD_UPDATE_SIGNING_KEY:-}" "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}"
+  capture_signing_secrets
+  require_signing_secrets
+  redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   export GITHUB_TOKEN="$source_token"
   scratch="$(scratch_dir publish)"
   context="${scratch}/source"
@@ -610,11 +628,13 @@ publish_component() {
   [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
-  verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
-  IFS=$'\t' read -r verified_digest _verified_size <<<"$(inspect_digest "${image}:${sha}")"
-  [[ "$verified_digest" == "$published_digest" ]] \
-    || publish_fail 'source-SHA tag digest changed during verification'
+  verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
   sign_published_digest "$component" "$image" "$published_digest"
+  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
+    run_docker buildx imagetools create --prefer-index=false --tag "${image}:${label}" "${image}@${published_digest}" >/dev/null
+    IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:${label}")"
+    [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'version tag pointer differs from verified image digest'
+  fi
   if [[ "$channel" != "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
     IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:latest")"
