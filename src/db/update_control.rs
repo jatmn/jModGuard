@@ -1162,10 +1162,24 @@ impl UpdateControl {
             let api = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component='api'", updates::COLS), (), updates::row_update)?;
             let retry = existing.as_ref().filter(|active| active.phase.active() && recover
                 && active.bot.release.digest == bot_digest && active.api.release.digest == api_digest);
+            let recover_pinned_release = |state: &updates::ComponentUpdate,
+                                          pinned: &ComponentRelease,
+                                          digest: &str|
+             -> ComponentRelease {
+                for source in [state.installed.as_ref(), state.candidate.as_ref()] {
+                    if let Some(release) = source.filter(|release| release.digest == digest) {
+                        return release.clone();
+                    }
+                }
+                pinned.clone()
+            };
             let (target_bot, target_api) = if let Some(active) = retry {
-                // Recovering a failed paired upgrade keeps the pinned releases;
-                // re-validating against checked_at would falsely trip the stale rule.
-                (active.bot.release.clone(), active.api.release.clone())
+                // Recovering a failed paired upgrade keeps the pinned digests but
+                // must honor refreshed installed/candidate metadata for that digest.
+                (
+                    recover_pinned_release(&bot, &active.bot.release, &bot_digest),
+                    recover_pinned_release(&api, &active.api.release, &api_digest),
+                )
             } else {
                 let target_bot = updates::checked_install_candidate(
                     bot.candidate.as_ref().map(serde_json::to_string).transpose()?,
