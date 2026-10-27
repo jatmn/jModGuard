@@ -418,7 +418,7 @@ fn automod_member_target(
 }
 
 async fn automod_try_delete_message(
-    app: &BotState,
+    app: &std::sync::Arc<BotState>,
     http: &serenity::http::Http,
     guild_id: u64,
     channel: u64,
@@ -445,7 +445,14 @@ async fn automod_try_delete_message(
     .await
     {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
-            app.automod_delete_marks.confirm(guild_id, channel, message);
+            if let Some((rule_id, rule_name)) =
+                app.automod_delete_marks.confirm(guild_id, channel, message)
+            {
+                logging::emit_reconciled_automod_delete(
+                    app, http, guild_id, channel, message, &rule_id, &rule_name,
+                )
+                .await;
+            }
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
             app.automod_delete_marks

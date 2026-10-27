@@ -645,6 +645,19 @@ fn channel_for(
     cfg.log_channels.get(event).copied()
 }
 
+fn log_filter_for<'a>(
+    cfg: &'a crate::state::CachedGuildConfig,
+    event: &str,
+) -> Option<&'a db::LogFilter> {
+    if event == "automod_delete" {
+        return cfg
+            .log_filters
+            .get("automod_delete")
+            .or(cfg.log_filters.get("message_delete"));
+    }
+    cfg.log_filters.get(event)
+}
+
 /// Resolve one observed ban/unban against Discord's bounded recent audit window.
 /// The claim is shared by persisted gateway-ban details and the Discord report.
 pub(crate) async fn lookup_member_audit(
@@ -1025,11 +1038,7 @@ async fn emit_to_observed_with_audit(
         let Some(channel_id) = channel_for(&cfg, event) else {
             return Ok(Delivery::Unconfigured);
         };
-        if cfg
-            .log_filters
-            .get(event)
-            .is_some_and(|filter| excluded(filter, &vars))
-        {
+        if log_filter_for(&cfg, event).is_some_and(|filter| excluded(filter, &vars)) {
             return Ok(Delivery::Unconfigured);
         }
         if member_audit_action(event).is_some() {
@@ -1050,11 +1059,7 @@ async fn emit_to_observed_with_audit(
                 vars.extend(context);
             }
             // Moderator-ID exclusions can only be evaluated after attribution.
-            if cfg
-                .log_filters
-                .get(event)
-                .is_some_and(|filter| excluded(filter, &vars))
-            {
+            if log_filter_for(&cfg, event).is_some_and(|filter| excluded(filter, &vars)) {
                 return Ok(Delivery::Unconfigured);
             }
         }
@@ -2197,6 +2202,8 @@ pub(crate) fn observed_delete_report(
     id: MessageId,
     retained: Option<&MessageSnapshot>,
 ) -> MessageReport {
+    app.automod_delete_marks
+        .note_gateway_delete(guild_id.get(), channel.get(), id.get());
     let mut report = if let Some((rule_id, rule_name)) =
         app.automod_delete_marks
             .take(guild_id.get(), channel.get(), id.get())
@@ -2209,6 +2216,28 @@ pub(crate) fn observed_delete_report(
         apply_retained_delete(&mut report, Some(row));
     }
     report
+}
+
+/// After REST confirms an automod delete that already produced a plain gateway
+/// `message_delete`, emit the dedicated `automod_delete` report.
+pub(crate) async fn emit_reconciled_automod_delete(
+    app: &std::sync::Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+    rule_id: &str,
+    rule_name: &str,
+) {
+    let report = automod_delete_report(
+        app,
+        GuildId::new(guild_id),
+        ChannelId::new(channel),
+        MessageId::new(message),
+        rule_id,
+        rule_name,
+    );
+    emit_to(app, sink, report.guild_id, report.event, report.vars).await;
 }
 
 /// Emits a mod-action event with actor context (used by command behaviors).

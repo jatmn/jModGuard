@@ -2,6 +2,7 @@ use super::*;
 use crate::config::BotProcessConfig;
 use crate::db::Db;
 use crate::state::BotState;
+use jmodguard::db::SqlExecutor;
 use serenity::model::id::{ChannelId, GuildId, MessageId};
 use std::sync::Arc;
 
@@ -200,7 +201,7 @@ async fn double_emit_path_consumes_mark_once() {
 }
 
 #[tokio::test]
-async fn gateway_delete_before_rest_confirm_stays_plain_delete() {
+async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
         .await
@@ -223,7 +224,12 @@ async fn gateway_delete_before_rest_confirm_stays_plain_delete() {
             .lock()
             .contains(789, 456, 123)
     );
-    f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123);
+    assert_eq!(reconcile, Some(("badword".into(), "Bad words".into())));
+    let sink = Sink::default();
+    let (rule_id, rule_name) = reconcile.unwrap();
+    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &rule_id, &rule_name).await;
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
     assert!(
         !f.app
             .automod_delete_marks
@@ -231,6 +237,60 @@ async fn gateway_delete_before_rest_confirm_stays_plain_delete() {
             .lock()
             .contains(789, 456, 123)
     );
+}
+
+async fn set_log_filter(app: &BotState, event: &str, data: Option<&str>) {
+    let event = event.to_string();
+    let data = data.map(str::to_string);
+    app.db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "DELETE FROM log_filters WHERE guild_id=789 AND event_type=?1",
+                db::params![event.clone()],
+                65_536,
+            )?;
+            if let Some(data) = data {
+                conn.execute_bounded(
+                    "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,?1,?2)",
+                    db::params![event, data],
+                    65_536,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    app.invalidate_configs();
+}
+
+#[tokio::test]
+async fn automod_delete_fallback_inherits_message_delete_ignore_filter() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    set_log_filter(
+        &f.app,
+        "message_delete",
+        Some(r#"{"users":["42"],"channels":[]}"#),
+    )
+    .await;
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    f.app.automod_delete_marks.confirm(789, 456, 123);
+    let mut report = observed_delete_report(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        None,
+    );
+    report.vars.insert("user_id".into(), "42".into());
+    let sink = Sink::default();
+    let delivery = emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
+    assert_eq!(delivery, Delivery::Unconfigured);
+    assert!(sink.messages.lock().unwrap().is_empty());
 }
 
 #[test]

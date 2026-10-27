@@ -12,6 +12,7 @@ struct AutomodDeleteMark {
     rule_id: String,
     rule_name: String,
     confirmed: bool,
+    gateway_pending: bool,
     expires: Instant,
 }
 
@@ -73,17 +74,48 @@ impl AutomodDeleteMarks {
                 rule_id: rule_id.to_owned(),
                 rule_name: rule_name.to_owned(),
                 confirmed: false,
+                gateway_pending: false,
                 expires: now + AUTOMOD_DELETE_MARK_TTL,
             },
         );
     }
 
-    pub(crate) fn confirm(&mut self, guild: u64, channel: u64, message: u64, now: Instant) {
+    pub(crate) fn note_gateway_delete(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        now: Instant,
+    ) {
         self.prune(now);
         let key = (guild, channel, message);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.confirmed = true;
+        if let Some(entry) = self.entries.get_mut(&key)
+            && !entry.confirmed
+        {
+            entry.gateway_pending = true;
         }
+    }
+
+    /// Marks REST success. When the gateway delete already logged as plain
+    /// `message_delete`, returns rule identity so the caller can emit
+    /// `automod_delete` after settlement.
+    pub(crate) fn confirm(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        now: Instant,
+    ) -> Option<(String, String)> {
+        self.prune(now);
+        let key = (guild, channel, message);
+        let entry = self.entries.get_mut(&key)?;
+        entry.confirmed = true;
+        if !entry.gateway_pending {
+            return None;
+        }
+        let entry = self.entries.remove(&key)?;
+        self.order.retain(|candidate| *candidate != key);
+        Some((entry.rule_id, entry.rule_name))
     }
 
     pub(crate) fn remove_unconfirmed(
@@ -150,10 +182,21 @@ impl AutomodDeleteMarkAccess {
             .insert(guild, channel, message, rule_id, rule_name, Instant::now());
     }
 
-    pub(crate) fn confirm(&self, guild: u64, channel: u64, message: u64) {
+    pub(crate) fn note_gateway_delete(&self, guild: u64, channel: u64, message: u64) {
         self.inner
             .lock()
-            .confirm(guild, channel, message, Instant::now());
+            .note_gateway_delete(guild, channel, message, Instant::now());
+    }
+
+    pub(crate) fn confirm(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+    ) -> Option<(String, String)> {
+        self.inner
+            .lock()
+            .confirm(guild, channel, message, Instant::now())
     }
 
     pub(crate) fn remove_unconfirmed(&self, guild: u64, channel: u64, message: u64) {
@@ -207,7 +250,7 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "invite", "Invites", now);
-        marks.confirm(1, 2, 3, now);
+        assert!(marks.confirm(1, 2, 3, now).is_none());
         assert_eq!(
             marks.take(1, 2, 3, now),
             Some(("invite".into(), "Invites".into()))
@@ -241,10 +284,24 @@ mod tests {
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.contains(1, 2, 3));
         assert!(marks.take(1, 2, 3, now).is_none());
-        marks.confirm(1, 2, 3, now);
+        assert!(marks.confirm(1, 2, 3, now).is_none());
         assert_eq!(
             marks.take(1, 2, 3, now),
             Some(("badword".into(), "Bad word".into()))
         );
+    }
+
+    #[test]
+    fn gateway_first_confirm_returns_rule_for_reconcile_emit() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        marks.note_gateway_delete(1, 2, 3, now);
+        assert!(marks.take(1, 2, 3, now).is_none());
+        assert_eq!(
+            marks.confirm(1, 2, 3, now),
+            Some(("badword".into(), "Bad word".into()))
+        );
+        assert!(!marks.contains(1, 2, 3));
     }
 }
