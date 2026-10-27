@@ -499,6 +499,9 @@ async fn automod_try_delete_message(
                     settlement.retained.as_ref(),
                 )
                 .await;
+            } else {
+                app.automod_delete_marks
+                    .remove_unconfirmed(guild_id, channel, message);
             }
         }
     }

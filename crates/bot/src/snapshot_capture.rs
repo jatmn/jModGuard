@@ -325,9 +325,7 @@ impl SnapshotIngress {
                         ids.clone(),
                         true,
                     );
-                    if !queued
-                        && let Some(permit) = acquire_report_slot(app)
-                    {
+                    if !queued && let Some(permit) = acquire_report_slot(app) {
                         let app = Arc::clone(app);
                         let context = context.clone();
                         let channel_id = event.channel_id;

@@ -384,16 +384,6 @@ impl AutomodDeleteMarkAccess {
             .lock()
             .take_stored_retained(guild, channel, message, Instant::now())
     }
-
-    #[cfg(test)]
-    pub(crate) fn retained_count(&self) -> usize {
-        self.inner.lock().retained_count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.inner.lock().len()
-    }
 }
 
 #[cfg(test)]
@@ -573,6 +563,21 @@ mod tests {
                 .map(|r| r.fields.content.clone()),
             Some(Some("atomic body".into()))
         );
+    }
+
+    #[test]
+    fn cancel_without_gateway_observation_clears_unconfirmed_mark() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        assert!(marks.contains(1, 2, 3));
+        assert!(
+            marks
+                .take_uncertain_gateway_settlement(1, 2, 3, now)
+                .is_none()
+        );
+        marks.remove_unconfirmed(1, 2, 3, now);
+        assert!(!marks.contains(1, 2, 3));
     }
 
     #[test]

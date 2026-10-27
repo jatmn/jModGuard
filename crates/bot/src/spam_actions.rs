@@ -579,6 +579,25 @@ async fn punish_proven_match(
                         settlement.retained.as_ref(),
                     )
                     .await;
+                } else {
+                    let removal = app.automod_delete_marks.remove_unconfirmed(
+                        found.guild,
+                        *channel,
+                        *message,
+                    );
+                    if removal.action
+                        == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                    {
+                        crate::logging::emit_plain_message_delete(
+                            app,
+                            http,
+                            GuildId::new(found.guild),
+                            ChannelId::new(*channel),
+                            MessageId::new(*message),
+                            removal.retained.as_ref(),
+                        )
+                        .await;
+                    }
                 }
                 CaseOutcome::Uncertain
             }
