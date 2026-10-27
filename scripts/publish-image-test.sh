@@ -32,7 +32,8 @@ TEST_SIGNING_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '\n/=')"
 cleanup_test_signing() {
   rm -rf "$TEST_SIGNING_DIR"
 }
-trap cleanup_test_signing EXIT
+TEST_SIGNING_TRAP="$(trap -p EXIT || true)"
+trap 'cleanup_test_signing' EXIT
 COSIGN_PASSWORD="$TEST_SIGNING_PASSWORD" cosign generate-key-pair \
   --output-key-prefix "$TEST_SIGNING_DIR/update-signing"
 SIGNING_KEY_VALUE="$(<"$TEST_SIGNING_DIR/update-signing.key")"
@@ -271,6 +272,7 @@ rm -rf "$schema_source"
 reload_publisher() {
   # shellcheck disable=SC1091
   JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
+  eval "$(declare -f sign_published_digest | sed '1s/^sign_published_digest/_real_sign_published_digest/')"
   SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
   export SIGNING_PUBLIC_KEY
 }
@@ -411,12 +413,15 @@ mock_publish_helpers() {
     GHCR_TOKEN="$1" SOURCE_TOKEN="$2" SIGNING_KEY="${3:-}" SIGNING_PASSWORD="${4:-}" \
       node -e 'process.stdout.write(JSON.stringify({GHCR_TOKEN:process.env.GHCR_TOKEN,GITHUB_TOKEN:process.env.SOURCE_TOKEN,SIGNING_KEY:process.env.SIGNING_KEY,SIGNING_PASSWORD:process.env.SIGNING_PASSWORD}))' >"${TRACE_FILE}.redactor"
   }
+  run_cosign() {
+    printf 'cosign %s\n' "$*" >>"$TRACE_FILE"
+    [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
+  }
   sign_published_digest() {
     printf 'sign %s %s %s\n' "$1" "$2" "$3" >>"$TRACE_FILE"
-    require_signing_secrets
-    image_published_at "${2}@${3}" >/dev/null \
-      || publish_fail 'published image lacks io.jmodguard.published-at'
-    [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
+    SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
+    export SIGNING_PUBLIC_KEY
+    _real_sign_published_digest "$1" "$2" "$3"
   }
 }
 
@@ -475,6 +480,8 @@ exercise_publish() {
   local scratch saved_tmp
   saved_tmp="${TMPDIR:-/tmp}"
   scratch="$(mktemp -d "${saved_tmp}/publish-exercise-XXXXXX")"
+  JMODGUARD_PUBLISH_STATE_DIR="$(mktemp -d "${saved_tmp}/publish-state-XXXXXX")"
+  export JMODGUARD_PUBLISH_STATE_DIR
   TMPDIR="$scratch"
   export TMPDIR
   reload_publisher
@@ -513,8 +520,9 @@ exercise_publish() {
   TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
   load_trace
   [[ -z "$(ls -A "$scratch" 2>/dev/null || true)" ]] || fail "scratch leftover: $(ls -A "$scratch")"
-  rm -rf "$scratch"
+  rm -rf "$scratch" "$JMODGUARD_PUBLISH_STATE_DIR"
   TMPDIR="$saved_tmp"
+  unset JMODGUARD_PUBLISH_STATE_DIR
   export TMPDIR
   SOURCE_LAYOUT=current
 }
@@ -1184,8 +1192,6 @@ JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing key must fail publication'
 fi
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
-  && fail 'missing signing key must not build images'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'missing signing key must not promote tags'
 
@@ -1195,8 +1201,6 @@ JMODGUARD_UPDATE_SIGNING_PASSWORD=""
 if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing password must fail publication'
 fi
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
-  && fail 'missing signing password must not build images'
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
   && fail 'missing signing password must not promote tags'
 
@@ -1260,8 +1264,9 @@ printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol
 
 grep -q 'BEGIN PUBLIC KEY' "$root/deploy/update-signing.pub" \
   || fail 'deploy/update-signing.pub must contain the committed production cosign public key'
-grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENbnym' "$root/deploy/update-signing.pub" \
-  && fail 'deploy signing pubkey must not be the offline test fixture'
+PROD_SIGNING_FINGERPRINT="$(openssl pkey -pubin -in "$root/deploy/update-signing.pub" -outform DER | openssl dgst -sha256 | awk '{print $2}')"
+assert_eq "$PROD_SIGNING_FINGERPRINT" "d36f7ae0529b99c64f662c319855648309c7e0d6f92895b777193bae52136d17" \
+  || fail 'deploy/update-signing.pub fingerprint changed unexpectedly'
 
 reload_publisher
 COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.log"
@@ -1304,6 +1309,9 @@ grep -Fq ' -a io.jmodguard.not-after=' "$COSIGN_TRACE" \
   || grep -Fq -- '-a io.jmodguard.not-after=' "$COSIGN_TRACE" \
   || fail 'cosign sign must pass -a for the expiry annotation'
 grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
+grep -Fq -- "--key ${SIGNING_PUBLIC_KEY}" "$COSIGN_TRACE" \
+  || grep -Fq -- "--key $root/deploy/update-signing.pub" "$COSIGN_TRACE" \
+  || fail 'production verification must use the committed cosign public key'
 grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'
 _JMG_SIGNING_KEY=""
 _JMG_SIGNING_PASSWORD=""
@@ -1422,5 +1430,9 @@ rollback_promoted_tags
 [[ "${ROLLBACK_TAG_DIGEST[${ROLLBACK_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PREV" ]] \
   || fail 'rollback must restore the first promoted tag to its previous digest'
 [[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
+
+cleanup_test_signing
+trap - EXIT
+eval "${TEST_SIGNING_TRAP#trap -- }" 2>/dev/null || true
 
 echo 'publish-image-test: ok'

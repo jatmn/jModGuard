@@ -756,11 +756,38 @@ scratch_dir() {
   mktemp -d "${TMPDIR:-.tmp}/${prefix}-XXXXXX"
 }
 
-publish_component() {
+publish_state_dir() {
+  local base="${JMODGUARD_PUBLISH_STATE_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}/jmodguard-publish-state}}"
+  mkdir -p "$base"
+  printf '%s' "$base"
+}
+
+publish_state_file() {
   local component="$1"
-  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest resolved
+  printf '%s/%s.json' "$(publish_state_dir)" "$component"
+}
+
+write_publish_state() {
+  local component="$1" payload="$2"
+  printf '%s\n' "$payload" >"$(publish_state_file "$component")"
+}
+
+read_publish_state() {
+  local component="$1" file
+  file="$(publish_state_file "$component")"
+  [[ -f "$file" ]] || return 1
+  cat "$file"
+}
+
+clear_publish_state() {
+  local component="$1"
+  rm -f "$(publish_state_file "$component")"
+}
+
+publish_component_build() {
+  local component="$1"
+  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest resolved
   local staging_ref metadata_file
-  local -a build_cmd PROMOTION_ROLLBACK=()
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
@@ -776,10 +803,10 @@ publish_component() {
     resolve_source manual "$sha" "$head" >/dev/null
   fi
   image="ghcr.io/jatmn/jmodguard-${component}"
-  capture_signing_secrets
   if [[ "$mode" == "main" && "${GITHUB_RUN_ATTEMPT:-1}" == "1" ]] \
       && ! changed_since_publication "$component" "$sha" "$image"; then
     echo "${component}: image inputs match the last publication; no rebuild"
+    clear_publish_state "$component"
     return 0
   fi
   username="${GHCR_USERNAME:-}"
@@ -790,7 +817,6 @@ publish_component() {
   if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
     source_token="$token"
   fi
-  require_signing_secrets
   export GITHUB_TOKEN="$source_token"
   scratch="$(scratch_dir publish)"
   context="${scratch}/source"
@@ -801,8 +827,7 @@ publish_component() {
     rm -rf "$JMODGUARD_PUBLISH_CLEANUP_SCRATCH"
   }
   trap cleanup_publish EXIT
-  validate_signing_key_pair
-  redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
+  redact_tokens "$token" "$source_token" "" ""
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
@@ -810,12 +835,14 @@ publish_component() {
   layout="$(source_image_layout "$component" "$context")"
   if [[ "$component" == "webui" && "$layout" == "legacy" ]]; then
     echo 'webui: selected source predates the independent WebUI package; no image to publish'
+    clear_publish_state "$component"
     trap - EXIT
     cleanup_publish
     return 0
   fi
   channel="$(channel_for "$mode" "$label" || true)"
   assert_signing_secrets_not_staged_on_disk
+  signing_secrets_in_environ && publish_fail 'signing secrets must not be present during image build'
   if [[ "$component" == "webui" ]]; then
     if [[ -f "$context/tools/webui/package-lock.json" ]]; then
       npm ci --ignore-scripts --prefix "$context/tools/webui"
@@ -825,6 +852,7 @@ publish_component() {
   fi
   staging_ref="$(publish_staging_ref "$image" "$sha")"
   metadata_file="${scratch}/build-metadata.json"
+  local -a build_cmd=()
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout" "$staging_ref")
   [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
   build_cmd+=("--metadata-file" "$metadata_file")
@@ -833,6 +861,58 @@ publish_component() {
     || publish_fail 'build metadata did not report an image digest'
   assert_digest_matches_ref "$staging_ref" "$published_digest"
   verify_published_image "$component" "$image" "$published_digest" "$context" "$layout"
+  write_publish_state "$component" "$(COMPONENT="$component" IMAGE="$image" SHA="$sha" LABEL="$label" MODE="$mode" CHANNEL="$channel" DIGEST="$published_digest" STAGING_REF="$staging_ref" node --input-type=commonjs - <<'JS'
+process.stdout.write(JSON.stringify({
+  component: process.env.COMPONENT,
+  image: process.env.IMAGE,
+  sha: process.env.SHA,
+  label: process.env.LABEL,
+  mode: process.env.MODE,
+  channel: process.env.CHANNEL,
+  published_digest: process.env.DIGEST,
+  staging_ref: process.env.STAGING_REF,
+}));
+JS
+)"
+  trap - EXIT
+  cleanup_publish
+}
+
+publish_component_sign() {
+  local component="$1"
+  local state image sha label mode channel published_digest staging_ref
+  local username token source_token scratch
+  local -a PROMOTION_ROLLBACK=()
+  state="$(read_publish_state "$component")" || {
+    echo "${component}: no verified image to sign; skipping promotion"
+    return 0
+  }
+  image="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).image)')"
+  sha="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).sha)')"
+  label="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).label || "")')"
+  mode="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).mode)')"
+  channel="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).channel || "")')"
+  published_digest="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).published_digest)')"
+  staging_ref="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).staging_ref)')"
+  if [[ -z "$_JMG_SIGNING_KEY" || -z "$_JMG_SIGNING_PASSWORD" ]]; then
+    capture_signing_secrets
+  fi
+  username="${GHCR_USERNAME:-}"
+  [[ -n "$username" ]] || publish_fail 'Set GHCR_USERNAME to the GitHub account owning the GHCR credential'
+  token="${GHCR_TOKEN:-}"
+  [[ -n "$token" ]] || publish_fail 'GHCR_TOKEN is empty; provide the workflow package-write token'
+  source_token="${GITHUB_TOKEN:-}"
+  if [[ -z "$source_token" || "$source_token" == '$GITHUB_TOKEN' ]]; then
+    source_token="$token"
+  fi
+  require_signing_secrets
+  scratch="$(scratch_dir publish-sign)"
+  trap 'rm -rf "$scratch"' EXIT
+  validate_signing_key_pair
+  redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
+  export DOCKER_CONFIG="${scratch}/docker"
+  mkdir -m 700 "$DOCKER_CONFIG"
+  printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
   ensure_signing_secrets_captured
   persist_signing_secrets_to_files "$scratch"
   signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
@@ -856,9 +936,34 @@ publish_component() {
   if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
     promote_with_rollback "$channel"
   fi
+  clear_publish_state "$component"
   echo "Published ${image}:${sha}"
   trap - EXIT
-  cleanup_publish
+  rm -rf "$scratch"
+}
+
+publish_component() {
+  local component="$1"
+  local phase="${JMODGUARD_PUBLISH_PHASE:-all}"
+  if [[ "$phase" == all ]]; then
+    if [[ -n "${JMODGUARD_UPDATE_SIGNING_KEY:-}" || -n "${JMODGUARD_UPDATE_SIGNING_PASSWORD:-}" ]]; then
+      capture_signing_secrets
+      validate_signing_key_pair
+    fi
+  fi
+  case "$phase" in
+    build) publish_component_build "$component" || return $? ;;
+    sign) publish_component_sign "$component" || return $? ;;
+    all)
+      publish_component_build "$component" || return $?
+      if [[ -f "$(publish_state_file "$component")" ]]; then
+        publish_component_sign "$component" || return $?
+      fi
+      ;;
+    *)
+      publish_fail "unknown JMODGUARD_PUBLISH_PHASE: ${phase}"
+      ;;
+  esac
 }
 
 publish_image_main() {

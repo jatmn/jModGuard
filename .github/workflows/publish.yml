@@ -162,9 +162,17 @@ jobs:
           node-version: '24'
           package-manager-cache: false
       - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
-      - name: Publish changed component
+      - name: Build and verify component image
         env:
           COMPONENT: ${{ matrix.component }}
+          JMODGUARD_PUBLISH_PHASE: build
+          JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
+        run: bash scripts/publish-image.sh "$COMPONENT"
+      - name: Sign and promote component image
+        env:
+          COMPONENT: ${{ matrix.component }}
+          JMODGUARD_PUBLISH_PHASE: sign
+          JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
           JMODGUARD_UPDATE_SIGNING_KEY: ${{ secrets.JMODGUARD_UPDATE_SIGNING_KEY }}
           JMODGUARD_UPDATE_SIGNING_PASSWORD: ${{ secrets.JMODGUARD_UPDATE_SIGNING_PASSWORD }}
         run: bash scripts/publish-image.sh "$COMPONENT"
