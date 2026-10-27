@@ -8115,18 +8115,54 @@ async fn registry_with_objects(
 async fn bad_signature_leaves_running_child_without_rollback() {
     let root = std::env::temp_dir().join(format!("sig-rollback-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
     let running = executable(&root, "running-bot").await;
     let candidate_bin = executable(&root, "candidate-bot").await;
     let mut objects = HashMap::new();
-    let release = image(
+    let mut running_release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(running).await.unwrap(),
+    );
+    let mut release = image(
         &mut objects,
         "bot",
         &tokio::fs::read(candidate_bin).await.unwrap(),
     );
+    for item in [&mut running_release, &mut release] {
+        item.min_schema = db::CORE_SCHEMA_VERSION;
+        item.max_schema = db::CORE_SCHEMA_VERSION;
+        item.result_schema = db::CORE_SCHEMA_VERSION;
+        item.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    }
     let tag = signature_tag_for_digest(&release.digest).unwrap();
     objects.insert(tag, b"broken-signature".to_vec());
     let (registry, server) = registry_with_objects(objects).await;
     let (db, control) = open_launcher_db(&root).await;
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    control
+        .checked("bot", "latest", Some(running_release.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &running_release.digest, now())
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(running_release.digest.as_str()),
+        "installed release must be active before the bad signature attempt"
+    );
     control
         .checked("bot", "latest", Some(release.clone()), None, now())
         .await
@@ -8134,26 +8170,28 @@ async fn bad_signature_leaves_running_child_without_rollback() {
     db::request_component_install(&db, "bot", &release.digest, now())
         .await
         .unwrap();
-    let mut bot = controller("bot", running.clone(), registry, control.clone(), &root);
-    bot.start(&running, &"b".repeat(40), None).await.unwrap();
-    wait_for_bot_ready(&mut bot).await;
-    let seen = control.component("bot").await.unwrap().observed.unwrap();
-    control.running("api", None, seen, now()).await.unwrap();
-    bot.reported = true;
+    tokio::fs::write(root.join("events"), "").await.unwrap();
     for _ in 0..10 {
         bot.tick().await.unwrap();
     }
     assert!(bot.running.is_some());
-    assert_eq!(bot.running.as_ref().unwrap().path, running);
     assert!(bot.rollback.is_none());
     let state = control.component("bot").await.unwrap();
     assert!(
         state
-            .check_error
+            .last_error
             .as_deref()
             .is_some_and(|msg| msg.contains("signature")),
-        "expected signature rejection to be recorded: {:?}",
-        state.check_error
+        "expected signature rejection during staging to be recorded: {:?}",
+        state.last_error
+    );
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(running_release.digest.as_str()),
+        "signature rejection must leave the running installed release in place"
     );
     server.abort();
     drop((bot, db));
@@ -8327,6 +8365,7 @@ async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_f
     release.min_schema = db::CORE_SCHEMA_VERSION;
     release.max_schema = db::CORE_SCHEMA_VERSION;
     release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
     let installed_digest = release.digest.clone();
     let release_json = serde_json::to_string(&release).unwrap();
     let observed = db::ComponentObservation {

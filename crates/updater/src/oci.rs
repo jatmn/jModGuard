@@ -511,6 +511,9 @@ fn resolve_requested_files_from_layers(
     let mut hidden = HashSet::new();
     for (bytes, media) in layers {
         merge_layer_into_found(bytes, media, &wanted, &mut found, &mut hidden)?;
+        if found.len() == requested.len() {
+            break;
+        }
     }
     ensure!(
         found.len() == requested.len(),
@@ -790,6 +793,45 @@ mod tests {
             merged["usr/local/share/jmodguard/files.sha256"],
             b"deadbeef  usr/local/bin/jmodguard-api\n"
         );
+    }
+
+    #[test]
+    fn stops_after_all_requested_files_are_resolved() {
+        let combined = layer(&[
+            (
+                "usr/local/bin/jmodguard-api",
+                b"\x7fELFbody",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                b"deadbeef  usr/local/bin/jmodguard-api\n",
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let noise = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"shadow",
+            tar::EntryType::Regular,
+        )]);
+        let merged = resolve_requested_files_from_layers(
+            &[
+                (
+                    combined.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+                (
+                    noise.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                ),
+            ],
+            &[
+                "usr/local/bin/jmodguard-api",
+                "usr/local/share/jmodguard/files.sha256",
+            ],
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
     }
 
     #[test]
