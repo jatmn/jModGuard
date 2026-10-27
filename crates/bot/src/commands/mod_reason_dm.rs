@@ -18,17 +18,13 @@ pub(crate) enum ModReasonDmOutcome {
     Cancelled,
 }
 
+/// Recognize `--dm` only in the documented position: immediately after the target user.
 pub(crate) fn take_prefix_dm_flag(parts: &mut Vec<String>) -> bool {
-    let mut dm = false;
-    parts.retain(|part| {
-        if part == "--dm" {
-            dm = true;
-            false
-        } else {
-            true
-        }
-    });
-    dm
+    if parts.len() >= 2 && parts[1] == "--dm" {
+        parts.remove(1);
+        return true;
+    }
+    false
 }
 
 pub(crate) fn slash_dm_flag(options: &[(String, String)]) -> bool {
@@ -159,13 +155,13 @@ async fn fixture_context_for_dm_order_test(
     http: std::sync::Arc<serenity::http::Http>,
     cache: std::sync::Arc<serenity::cache::Cache>,
 ) -> serenity::client::Context {
-    use std::sync::Arc;
     use serenity::client::Context;
     use serenity::gateway::{
         Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner, ShardRunnerOptions,
     };
     use serenity::model::gateway::{GatewayIntents, ShardInfo};
     use serenity::model::id::ShardId;
+    use std::sync::Arc;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -249,6 +245,11 @@ mod tests {
         let mut embedded = vec!["123".into(), "foo--dm".into(), "bar".into()];
         assert!(!take_prefix_dm_flag(&mut embedded));
         assert_eq!(embedded, vec!["123", "foo--dm", "bar"]);
+
+        let mut reason_mentions =
+            vec!["123".into(), "follow".into(), "--dm".into(), "rules".into()];
+        assert!(!take_prefix_dm_flag(&mut reason_mentions));
+        assert_eq!(reason_mentions, vec!["123", "follow", "--dm", "rules"]);
     }
 
     #[test]
@@ -283,6 +284,17 @@ mod tests {
 
     #[test]
     fn dm_clause_renders_sent_not_sent_and_uncertain() {
+        for outcome in [
+            ModReasonDmOutcome::Sent,
+            ModReasonDmOutcome::NotSent,
+            ModReasonDmOutcome::Uncertain,
+        ] {
+            let clause = render_mod_reason_dm_clause(outcome);
+            assert!(
+                clause.starts_with(" | "),
+                "confirmation must join with the shipped separator: {clause:?}"
+            );
+        }
         assert!(
             render_mod_reason_dm_clause(ModReasonDmOutcome::Sent)
                 .contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT,)

@@ -2062,6 +2062,22 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_commands_keep_literal_dm_tokens_in_args() {
+        let say = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "say")
+            .unwrap();
+        let mut args = Args::new("use --dm");
+        let dm = if mod_reason_dm::command_supports_reason_dm(&say.behavior) {
+            args.strip_dm_flag()
+        } else {
+            false
+        };
+        assert!(!dm);
+        assert_eq!(args.rest(), "use --dm");
+    }
+
+    #[test]
     fn slash_dm_option_sets_flag_without_polluting_reason_args() {
         let kick = crate::defaults::default_commands()
             .into_iter()

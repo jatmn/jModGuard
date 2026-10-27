@@ -79,6 +79,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|g| g.members.get(&target).cloned());
             refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
+            #[allow(unused_assignments)]
             let mut dm_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
@@ -92,14 +93,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::member_directory::BanContinuation::Stop => {
                     return Err(anyhow!("writer lease is not held"));
                 }
-                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                crate::member_directory::BanContinuation::AlreadyFinished {
+                    reason: _finished_reason,
+                } => {
                     crate::cases::settle_present_application_ban(
                         env.app,
                         enrollment.clone(),
                         target.get(),
-                        reason.as_deref(),
+                        _finished_reason.as_deref(),
                     )
                     .await;
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
@@ -127,6 +131,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         )
                         .await;
                     }
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
                     if !env.app.activation.may_record() {
@@ -1874,15 +1879,26 @@ mod tests {
 
     #[test]
     fn kick_ban_slash_specs_include_optional_dm_flag() {
+        use serenity::model::application::CommandOptionType;
         let kick_specs = slash_spec(&Behavior::Kick {
             default_reason: "Kicked by a moderator".into(),
         });
-        assert!(kick_specs.iter().any(|o| o.name == "dm"));
+        let kick_dm = kick_specs
+            .iter()
+            .find(|o| o.name == "dm")
+            .expect("kick dm option");
+        assert_eq!(kick_dm.kind, CommandOptionType::Boolean);
+        assert!(!kick_dm.required);
         let ban_specs = slash_spec(&Behavior::Ban {
             default_reason: "Banned by a moderator".into(),
             delete_days: 0,
         });
-        assert!(ban_specs.iter().any(|o| o.name == "dm"));
+        let ban_dm = ban_specs
+            .iter()
+            .find(|o| o.name == "dm")
+            .expect("ban dm option");
+        assert_eq!(ban_dm.kind, CommandOptionType::Boolean);
+        assert!(!ban_dm.required);
     }
 
     #[test]

@@ -123,7 +123,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "ban",
         "Moderation",
         "Ban a user from the server.",
-        "!ban <user> [reason]",
+        "!ban <user> [--dm] [reason]",
         "mod",
         Behavior::Ban {
             default_reason: "Banned by a moderator".into(),
@@ -150,7 +150,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "kick",
         "Moderation",
         "Kick a user from the server.",
-        "!kick <user> [reason]",
+        "!kick <user> [--dm] [reason]",
         "mod",
         Behavior::Kick {
             default_reason: "Kicked by a moderator".into(),
