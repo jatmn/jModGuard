@@ -7,6 +7,9 @@ pub mod storage;
 
 pub mod signing_fixture;
 
+#[cfg(test)]
+mod compatible_control_tests;
+
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::{self, ComponentRelease, Db};
 
@@ -28,6 +31,12 @@ pub async fn compatible_control(
         schema >= release.min_schema && schema <= release.max_schema,
         "candidate cannot open current database schema"
     );
+    if release.component != "webui" {
+        ensure!(
+            release.result_schema == schema,
+            db::APP_ONLY_SCHEMA_CHANGE_REFUSED
+        );
+    }
     let own = db.component(&release.component).await?;
     if release.component != "webui" {
         launcher_compatible(release, &release.base_abi)?;
@@ -94,9 +103,12 @@ pub async fn compatible_control(
             .as_ref()
             .context("candidate lacks guild schema metadata; use a coordinated baseline release")?
             .guild_schema;
+        let current_guild = current
+            .guild_schema
+            .context("current guild schema unknown")?;
         ensure!(
-            current.guild_schema == Some(guild) && observed.guild_schema == Some(guild),
-            "database schema changes require Update bot and API together"
+            current_guild == guild && observed.guild_schema == Some(guild),
+            db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
     }
     Ok(())

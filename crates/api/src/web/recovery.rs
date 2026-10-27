@@ -754,6 +754,8 @@ mod tests {
         let control = UpdateControl::open(&writable).unwrap().unwrap();
         assert!(control.writes_locally());
         let now = chrono::Utc::now().timestamp();
+        let store_schema = db::CORE_SCHEMA_VERSION + 1;
+        let store_guild = db::guild_data::SCHEMA_VERSION;
         for (role, digit) in [("bot", 'a'), ("api", 'b')] {
             let release = ComponentRelease {
                 component: role.into(),
@@ -763,9 +765,9 @@ mod tests {
                 published_at: "2026-10-01T00:00:00Z".into(),
                 image: format!("ghcr.io/jatmn/jmodguard-{role}"),
                 digest: format!("sha256:{}", digit.to_string().repeat(64)),
-                min_schema: db::CORE_SCHEMA_VERSION + 2,
-                max_schema: db::CORE_SCHEMA_VERSION + 2,
-                result_schema: db::CORE_SCHEMA_VERSION + 2,
+                min_schema: store_schema,
+                max_schema: store_schema,
+                result_schema: store_schema,
                 min_api: 1,
                 max_api: 1,
                 launcher_protocol: 1,
@@ -778,7 +780,7 @@ mod tests {
                     control_protocol: db::UPDATE_CONTROL_PROTOCOL,
                     min_core: 15,
                     min_guild: 1,
-                    guild_schema: db::guild_data::SCHEMA_VERSION + 1,
+                    guild_schema: store_guild,
                 }),
             };
             control
@@ -795,12 +797,12 @@ mod tests {
                         admin_sha256: None,
                         base_image_sha: "d".repeat(40),
                         started_at: now,
-                        min_schema: db::CORE_SCHEMA_VERSION + 1,
-                        max_schema: db::CORE_SCHEMA_VERSION + 1,
+                        min_schema: store_schema,
+                        max_schema: store_schema,
                         api_capability: 1,
                         self_update_enabled: true,
                         base_abi: "debian-bookworm-amd64".into(),
-                        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+                        guild_schema: Some(store_guild),
                         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
                         launcher_revision: 0,
                     },

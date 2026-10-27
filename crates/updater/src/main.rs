@@ -3296,12 +3296,12 @@ mod tests {
         compatible(&db, &candidate, 100).await.unwrap();
         let mut guild_upgrade = candidate.clone();
         guild_upgrade.upgrade.as_mut().unwrap().guild_schema += 1;
-        assert!(
+        assert_eq!(
             compatible(&db, &guild_upgrade, 100)
                 .await
                 .unwrap_err()
-                .to_string()
-                .contains("together")
+                .to_string(),
+            db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
 
         // Preserve the refusal of a counterpart or rollback binary from before
