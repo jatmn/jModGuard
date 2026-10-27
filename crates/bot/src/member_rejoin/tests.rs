@@ -398,7 +398,7 @@ async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
     assert!(
         f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS, false)
+            .begin_attempt(GUILD, USER, JOINED_AT_MS)
     );
     let sent = emit_to(
         &f.app,
@@ -417,10 +417,66 @@ async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
     assert!(
         !f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS, false),
+            .begin_attempt(GUILD, USER, JOINED_AT_MS),
         "second join handler pass must not post again for the same join token"
     );
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn delivered_rejoin_note_is_deduped_after_membership_refresh() {
+    let f = Fixture::new();
+    f.app.activation.mark_lock_held(true);
+    const GUILD: u64 = 789;
+    const USER: u64 = 42;
+    const JOINED_AT_MS: i64 = 1_700_000_000_001;
+    let note = RejoinNote::IndexNotReady;
+    let vars = member_rejoin_vars(&user(USER), &note);
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    assert!(
+        f.app
+            .rejoin_note_deliveries
+            .begin_attempt(GUILD, USER, JOINED_AT_MS)
+    );
+    let sent = emit_to(
+        &f.app,
+        &sink,
+        GuildId::new(GUILD),
+        "member_rejoin",
+        vars.clone(),
+    )
+    .await
+        == Delivery::Sent;
+    f.app
+        .rejoin_note_deliveries
+        .finish_attempt(GUILD, USER, JOINED_AT_MS, sent);
+    assert!(sent);
+    assert!(
+        !f.app
+            .rejoin_note_deliveries
+            .begin_attempt(GUILD, USER, JOINED_AT_MS),
+        "membership refresh must not bypass a delivered rejoin receipt"
+    );
+}
+
+#[test]
+fn case_text_budget_appends_more_suffix() {
+    let lines = vec!["- `ban` · succeeded · `2026-01-01T00:00:00Z` — x".repeat(400); 6];
+    let note = RejoinNote::Cases {
+        lines,
+        truncated: false,
+        index_incomplete: false,
+    };
+    let vars = member_rejoin_vars(&user(42), &note);
+    assert!(
+        vars["cases"].contains("+") && vars["cases"].contains("more"),
+        "cases: {}",
+        vars["cases"]
+    );
 }
 
 #[tokio::test]
@@ -461,7 +517,7 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         .expect("guild_member_addition");
     let body = &source[start..start + 3_200];
     assert!(
-        body.contains("rejoin_note_deliveries.begin_attempt"),
+        body.contains("rejoin_note_deliveries") && body.contains("begin_attempt"),
         "join handler must reserve rejoin delivery before awaiting Discord"
     );
     assert!(

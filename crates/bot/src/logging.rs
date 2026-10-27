@@ -251,13 +251,7 @@ pub struct RejoinNoteDeliveries {
 }
 
 impl RejoinNoteDeliveries {
-    pub fn begin_attempt(
-        &self,
-        guild: u64,
-        user: u64,
-        joined_at_ms: i64,
-        membership_refresh: bool,
-    ) -> bool {
+    pub fn begin_attempt(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
         let key = (guild, user, joined_at_ms);
         let mut state = self.inner.lock();
         state
@@ -266,11 +260,10 @@ impl RejoinNoteDeliveries {
         if state.in_flight.contains(&key) {
             return false;
         }
-        if !membership_refresh
-            && state
-                .delivered
-                .get(&key)
-                .is_some_and(|delivered| delivered.elapsed() < MEMBER_JOINS_KEEP)
+        if state
+            .delivered
+            .get(&key)
+            .is_some_and(|delivered| delivered.elapsed() < MEMBER_JOINS_KEEP)
         {
             return false;
         }

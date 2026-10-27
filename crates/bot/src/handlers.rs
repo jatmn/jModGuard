@@ -728,7 +728,7 @@ impl EventHandler for Handler {
         let uid = new_member.user.id.get();
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
-        let membership_refresh = crate::member_directory::observe_join(
+        let _membership_refresh = crate::member_directory::observe_join(
             &app,
             &new_member,
             chrono::Utc::now().timestamp_millis(),
@@ -748,12 +748,10 @@ impl EventHandler for Handler {
             .joined_at
             .map(|joined| joined.timestamp_millis())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        if app.rejoin_note_deliveries.begin_attempt(
-            guild_id.get(),
-            uid,
-            joined_at_ms,
-            membership_refresh,
-        ) {
+        if app
+            .rejoin_note_deliveries
+            .begin_attempt(guild_id.get(), uid, joined_at_ms)
+        {
             let sent = crate::member_rejoin::maybe_emit_member_rejoin(
                 &app,
                 &ctx,
