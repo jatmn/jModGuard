@@ -1186,6 +1186,13 @@ impl GuildDataStore {
             if legacy_cases==0 {
                 tx.ensure_mutation_receipt()?;
                 tx.member_execute("UPDATE guild_member_seed SET case_backfill_after=NULL,case_backfill_done=1 WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
+                let pending=tx.query_row("SELECT run_kind,phase,status FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<String>(2)?))).optional()?;
+                if let Some((kind,phase,state))=pending && phase=="complete" && state=="waiting" {
+                    tx.member_execute("UPDATE guild_member_sync SET status='complete',status_reason=NULL,completed_at_ms=coalesce(completed_at_ms,unixepoch()*1000),last_success_at_ms=coalesce(completed_at_ms,unixepoch()*1000),last_success_processed=processed,last_success_inserted=inserted,last_success_updated=updated,last_success_unchanged=unchanged,progress_revision=progress_revision+1 WHERE guild_id=?1",params![scope.guild_id()])?;
+                    if kind=="reconcile" {tx.member_execute("UPDATE guild_member_seed SET reconciliation_needed=0,reconciliation_reason=NULL,gap_at_ms=NULL WHERE guild_id=?1 AND gap_generation=(SELECT reconcile_gap_generation FROM guild_member_sync WHERE guild_id=?1)",params![scope.guild_id()])?;}
+                    if kind=="initial"{tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=coalesce(initial_completed_at_ms,unixepoch()*1000) WHERE guild_id=?1",params![scope.guild_id()])?;}
+                    if kind=="initial"{tx.member_execute("INSERT OR IGNORE INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=?1 AND reconciliation_needed=1 AND initial_completed_at_ms IS NOT NULL",params![scope.guild_id()])?;}
+                }
                 tx.commit()?;
                 return Ok(true);
             }
