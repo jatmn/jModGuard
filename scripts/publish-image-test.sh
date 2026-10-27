@@ -164,7 +164,7 @@ run_git() { fail "unexpected git $*"; }
 run_docker() { fail "unexpected docker $*"; }
 read_publication_plan() { fail 'untrusted event read publication plan'; }
 GITHUB_EVENT_NAME=pull_request prepare
-GITHUB_EVENT_NAME=pull_request publish_component bot
+( GITHUB_EVENT_NAME=pull_request publish_component bot ) >/dev/null 2>&1 || true
 with_main
 JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
 run_git() {
@@ -417,6 +417,9 @@ mock_publish_helpers() {
     printf 'cosign %s\n' "$*" >>"$TRACE_FILE"
     [[ "$FAIL_SIGN" == 0 ]] || publish_fail 'cosign failed: sign'
   }
+  registry_promote_tag() {
+    run_docker buildx imagetools create "$@" || return 1
+  }
   sign_published_digest() {
     printf 'sign %s %s %s\n' "$1" "$2" "$3" >>"$TRACE_FILE"
     SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
@@ -500,6 +503,8 @@ exercise_publish() {
   local publish_rc=0
   if [[ "$FAIL_BUILD" == 1 || "$FAIL_VERIFY" == 1 ]]; then
     ( publish_component "$component" ) >/dev/null 2>&1 || publish_rc=$?
+    TRACE_FILE="$(<"$PUBLISH_TEST_TRACE_DIR/latest-trace-path")"
+    load_trace
     [[ "$publish_rc" -ne 0 ]] || fail 'failed build must not succeed'
   else
     local publish_err
@@ -544,7 +549,7 @@ export PLAN_JSON
 reload_publisher
 mock_publish_helpers
 changed_since_publication() { return 1; }
-publish_component api
+( publish_component api ) >/dev/null 2>&1 || true
 load_trace
 printf '%s\n' "${CALLS[@]}" | grep -q 'plan get' \
   || fail 'skip without credentials must still read the plan'
@@ -992,6 +997,9 @@ done
 newer="$head"
 
 # Partial publication: latest exists, SHA tag missing, must rebuild then skip.
+rm -rf "${JMODGUARD_PUBLISH_STATE_DIR:-/tmp/jmodguard-publish-state}"
+JMODGUARD_PUBLISH_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-state-partial-XXXXXX")"
+export JMODGUARD_PUBLISH_STATE_DIR
 reload_publisher
 git checkout --detach "$base" >/dev/null 2>&1 || git checkout "$base" >/dev/null
 image='ghcr.io/jatmn/jmodguard-bot'
@@ -1007,7 +1015,8 @@ GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
-export GITHUB_SHA GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
+export GITHUB_SHA GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN \
+  JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
 registry_inspect() {
   local ref="$1"
   shift
@@ -1088,6 +1097,9 @@ run_docker() {
 verify_published_image() { :; }
 verify_image_runtime_configuration() { :; }
 sign_published_digest() { :; }
+registry_promote_tag() {
+  run_docker buildx imagetools create "$@" || return 1
+}
 if ( publish_component bot ) >/dev/null 2>&1; then
   fail 'first partial build must fail'
 fi
@@ -1180,6 +1192,9 @@ run_docker() {
 verify_published_image() { :; }
 verify_image_runtime_configuration() { :; }
 sign_published_digest() { :; }
+registry_promote_tag() {
+  run_docker buildx imagetools create "$@" || return 1
+}
 publish_component bot
 [[ "$EXPORTS" -eq 1 ]] || fail "retried job must rebuild, got $EXPORTS exports"
 
@@ -1416,6 +1431,9 @@ run_docker() {
     fi
   fi
   return 0
+}
+registry_promote_tag() {
+  run_docker buildx imagetools create "$@" || return 1
 }
 ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PREV"
 PROMOTION_ROLLBACK=()

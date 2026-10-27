@@ -44,7 +44,10 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown jmodguard:jmodguard /data
 WORKDIR /data
+<<<<<<< HEAD
 COPY --from=builder /app/deploy/ /usr/local/share/jmodguard/deploy/
+=======
+>>>>>>> origin/cursor/sign-release-images-3fd7
 COPY --from=builder /app/release/bin/ /usr/local/bin/
 COPY --from=builder /app/release/share/jmodguard/ /usr/local/share/jmodguard/
 ARG SOURCE_SHA=unknown
