@@ -577,6 +577,20 @@ pub async fn record_enrolled_ban_if_absent(
             tx.finish_read()?;
             return Ok(None);
         }
+        if let Some(operation_id) = operation_id.as_deref() {
+            let ended_same: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM bans
+                    WHERE guild_id=?1 AND user_id=?2 AND active=0 AND operation_id=?3
+                )",
+                params![guild_id, user_id, operation_id],
+                |row| Ok(row.get(0)?),
+            )?;
+            if ended_same {
+                tx.finish_read()?;
+                return Ok(None);
+            }
+        }
         let same_attempt: Option<i64> = match operation_id.as_deref() {
             Some(operation_id) => tx
                 .query_row(

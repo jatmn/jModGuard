@@ -423,6 +423,26 @@ impl TenantRuntime {
         Ok(Some(scope))
     }
 
+    pub async fn open_configured_stores(&self) -> Vec<GuildDataStore> {
+        let mut out = Vec::new();
+        for resolved in &self.inner.credentials {
+            match open_runtime_store(&self.core, resolved).await {
+                Ok(handle) => {
+                    if self.ensure_writer_epoch(&handle).await.is_ok() {
+                        out.push(handle);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        store_id = %resolved.registration.id().as_str(),
+                        "scheduled work store open deferred: {error:#}"
+                    );
+                }
+            }
+        }
+        out
+    }
+
     pub async fn scope(&self, enrollment: GuildEnrollment) -> Result<GuildDataScope> {
         let placement = guild_placement(&self.core, enrollment.guild_id)
             .await?

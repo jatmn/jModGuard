@@ -13,6 +13,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 |---|---|---|---|
 | `!ban <user> [reason]` | Moderation | mod | Ban a user (aliases: `!yeet`, `!b`) |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
+| `!softban <user> [days] [reason]` | Moderation | mod | Ban with message delete (default 1 day, 0–7) then unban |
 | `!kick <user> [reason]` | Moderation | mod | Kick a user (`!k`) |
 | `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |

@@ -27,6 +27,7 @@ const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
     include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
 const LOCAL_WRITE_FENCE_SCHEMA: &str =
     include_str!("../../migrations/guild/0015_local_write_fence.sql");
+const SCHEDULED_WORK_SCHEMA: &str = include_str!("../../migrations/guild/0016_scheduled_work.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -39,6 +40,8 @@ pub use case_history::*;
 mod cases;
 pub use cases::*;
 mod erasure;
+mod scheduled_work;
+pub use scheduled_work::*;
 mod snapshots;
 pub use snapshots::*;
 mod member_directory;
@@ -280,6 +283,17 @@ fn verify_identity_version(
             ),
             (15, "table", "guild_local_write_fence guild_writer_epoch"),
             (15, "trigger", "guild_case_settle_retain"),
+            (17, "table", "guild_scheduled_work"),
+            (
+                17,
+                "index",
+                "guild_scheduled_work_due guild_scheduled_work_one_open",
+            ),
+            (
+                17,
+                "trigger",
+                "guild_scheduled_work_insert guild_scheduled_work_update guild_scheduled_work_delete",
+            ),
         ];
         for (version, kind, names) in required {
             if wanted >= *version {
@@ -415,6 +429,9 @@ fn initialize_store(
         if version < 15 {
             tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
         }
+        if version < 17 {
+            tx.execute_batch_bounded(SCHEDULED_WORK_SCHEMA, 32_000_000)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -440,6 +457,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SCHEDULED_WORK_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -524,6 +542,7 @@ impl GuildDataStore {
                     (MEMBER_UNRESOLVED_AUDITS_SCHEMA, 13),
                     (MEMBER_CASE_RETAIN_REVISION_SCHEMA, 14),
                     (LOCAL_WRITE_FENCE_SCHEMA, 15),
+                    (SCHEDULED_WORK_SCHEMA, 17),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

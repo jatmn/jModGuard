@@ -207,6 +207,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::Softban {
+            default_reason,
+            delete_days,
+        } => {
+            let (target, target_user, reason) =
+                crate::softban::run_softban(env, default_reason, *delete_days).await?;
+            vars.insert("target".into(), target_user);
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason);
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+                suppress_response: false,
+            })
+        }
         Behavior::Unban { default_reason } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
@@ -1426,6 +1441,16 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Ban { .. } => vec![
             opt("user", User, true, "User to ban"),
             opt("reason", Str, false, "Ban reason"),
+        ],
+        Behavior::Softban { .. } => vec![
+            opt("user", User, true, "User to softban"),
+            opt(
+                "days",
+                Integer,
+                false,
+                "Delete message days (0-7, default 1)",
+            ),
+            opt("reason", Str, false, "Softban reason"),
         ],
         Behavior::Unban { .. } => vec![
             opt("user", User, true, "User to unban"),

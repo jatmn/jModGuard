@@ -1054,6 +1054,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_member_audit_recovery"
                     | "guild_member_case_index"
                     | "guild_member_unresolved_audits"
+                    | "guild_scheduled_work"
                     | "webui_managed_assets"
                     | "component_updates"
                     | "mutation_receipts"

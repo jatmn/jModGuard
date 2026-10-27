@@ -147,6 +147,20 @@ pub fn default_commands() -> Vec<CommandDef> {
         vec![],
     ));
     out.push(cmd(
+        "softban",
+        "Moderation",
+        "Ban a user, delete recent messages, then unban them.",
+        "!softban <user> [days] [reason]",
+        "mod",
+        Behavior::Softban {
+            default_reason: "Softbanned by a moderator".into(),
+            delete_days: 1,
+        },
+        "Softbanned {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
         "kick",
         "Moderation",
         "Kick a user from the server.",

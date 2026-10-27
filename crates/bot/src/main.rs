@@ -293,6 +293,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        tokio::spawn(async move {
+            jmodguard_bot::scheduled_work::run(app, http).await;
+        });
+    }
+
     // One sequential administrative worker plus bounded periodic history cleanup.
     {
         let app = Arc::clone(&app);
