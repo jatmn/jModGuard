@@ -394,6 +394,13 @@ pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
     is_binary_overlay_command_name(&cmd.name) || is_binary_overlay_behavior(&cmd.behavior)
 }
 
+/// True when a command row must not be written to shared storage (rolling upgrades).
+pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandDef) -> bool {
+    is_binary_overlay_command_name(storage_name)
+        || is_binary_overlay_command_name(&cmd.name)
+        || is_binary_overlay_behavior(&cmd.behavior)
+}
+
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
 pub fn default_global_seed_commands() -> Vec<CommandDef> {
     default_commands()

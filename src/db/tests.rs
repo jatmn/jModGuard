@@ -2747,6 +2747,37 @@ fn voice_command_cannot_be_persisted_to_the_database() {
             .contains("cannot be written to the database"),
         "{renamed_error:#}"
     );
+    let alias2_error = tokio_test_block_on(upsert_command(&db, 0, "voicealias2", &voice))
+        .expect_err("overlay behavior must not be stored under voicealias2");
+    assert!(
+        alias2_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias2_error:#}"
+    );
+    let ban_shell = CommandDef {
+        name: "ban".into(),
+        behavior: crate::types::Behavior::Voice,
+        aliases: vec![],
+        category: "Moderation".into(),
+        description: "x".into(),
+        usage: "!ban".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let ban_row_error = tokio_test_block_on(upsert_command(&db, 0, "ban", &ban_shell))
+        .expect_err("voice behavior must not be stored on the ban row");
+    assert!(
+        ban_row_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_row_error:#}"
+    );
     cleanup_db(&tmp);
 }
 
