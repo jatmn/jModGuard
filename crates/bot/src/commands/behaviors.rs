@@ -581,6 +581,44 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::Voice => {
+            let mut args = env.args.clone();
+            let target =
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
+                    .await?;
+            let target_user = user_lookup(env, target).await?;
+            let snapshot = super::voice_lookup::snapshot_cached_voice(
+                &env.ctx.cache,
+                env.guild_id,
+                target,
+            );
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            let response = match snapshot {
+                super::voice_lookup::VoiceLookupSnapshot::InChannel {
+                    channel_id,
+                    channel_name,
+                } => {
+                    vars.insert("channel".into(), channel_name);
+                    vars.insert("channel_id".into(), channel_id.to_string());
+                    None
+                }
+                super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
+                    crate::templates::render(
+                        super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                        &vars,
+                    ),
+                ),
+                super::voice_lookup::VoiceLookupSnapshot::NotCached => Some(
+                    crate::templates::render(super::voice_lookup::NOT_CACHED_TEMPLATE, &vars),
+                ),
+            };
+            Ok(BehaviorOutcome {
+                response,
+                vars,
+                suppress_response: false,
+            })
+        }
         Behavior::Banlist => {
             let limit: i64 = env.args.peek().and_then(|s| s.parse().ok()).unwrap_or(25);
             let bans = db::list_bans(&env.app.db, env.guild_id.get() as i64, limit).await?;
@@ -1449,7 +1487,9 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("user", User, true, "User to warn"),
             opt("reason", Str, true, "Warning reason"),
         ],
-        Behavior::Warns | Behavior::WarnClear => vec![opt("user", User, true, "User")],
+        Behavior::Warns | Behavior::WarnClear | Behavior::Voice => {
+            vec![opt("user", User, true, "User")]
+        }
         Behavior::Purge { .. } => {
             vec![opt("count", Integer, false, "Number of messages (max 100)")]
         }

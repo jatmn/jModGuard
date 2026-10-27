@@ -252,6 +252,17 @@ pub fn default_commands() -> Vec<CommandDef> {
         vec![],
     ));
     out.push(cmd(
+        "voice",
+        "Moderation",
+        "Report which voice channel a user is in (gateway cache).",
+        "!voice <user>",
+        "mod",
+        Behavior::Voice,
+        "**{target}** is in **{channel}** (`{channel_id}`)",
+        "",
+        vec![],
+    ));
+    out.push(cmd(
         "setname",
         "Admin",
         "Queue the bot's nickname in this server (omit / clear / - to reset).",

@@ -4,6 +4,7 @@
 
 pub mod behaviors;
 pub mod plans;
+pub mod voice_lookup;
 
 use anyhow::Result;
 use serenity::builder::{Builder, CreateCommand, CreateCommandOption, EditInteractionResponse};
