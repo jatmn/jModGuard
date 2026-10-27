@@ -7039,3 +7039,74 @@ async fn cleanup_candidate_plan_uses_the_existing_scoped_index() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn member_case_entries_lookup_is_index_bounded_before_payload_join() {
+    const SUBJECT: i64 = 77;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for index in 0..25 {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::new(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::Application {
+                        operation_id: CaseId::new(),
+                    },
+                    action: CaseAction::Kick,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: SUBJECT,
+                    actor_id: Some(42),
+                    occurred_at_ms: 2_000_000 - index,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                CaseLimits::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let (entries, truncated) = store
+        .member_case_entries(scope.clone(), SUBJECT, 8)
+        .await
+        .unwrap();
+    assert!(truncated);
+    assert_eq!(entries.len(), 8);
+    assert_eq!(entries[0].occurred_at_ms, Some(2_000_000));
+    store
+        .db
+        .with_conn(move |conn| {
+            let sql = GuildDataStore::member_case_entries_lookup_sql();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let plan = stmt
+                .query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        SUBJECT,
+                        9_i64
+                    ],
+                    |row| Ok(row.get::<String>(3)?),
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            assert!(
+                plan.iter().any(|line| {
+                    line.contains("SEARCH guild_member_case_index")
+                        && line.contains("guild_member_cases_user")
+                }),
+                "case index lookup must be scoped to the member: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "case lookup must not sort the full history: {plan:?}"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
