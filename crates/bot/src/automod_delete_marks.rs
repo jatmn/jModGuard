@@ -44,11 +44,15 @@ pub(crate) struct AutomodDeleteMarks {
 impl AutomodDeleteMarks {
     fn prune(&mut self, now: Instant) {
         while let Some(key) = self.order.front().copied() {
-            let expired = self
-                .entries
-                .get(&key)
-                .is_none_or(|entry| entry.expires <= now);
-            if !expired {
+            let Some(entry) = self.entries.get_mut(&key) else {
+                self.order.pop_front();
+                continue;
+            };
+            if entry.expires > now {
+                break;
+            }
+            if entry.gateway_pending && !entry.confirmed {
+                entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
                 break;
             }
             self.order.pop_front();
@@ -120,6 +124,7 @@ impl AutomodDeleteMarks {
             };
         }
         entry.gateway_pending = true;
+        entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
         GatewayDeleteObservation::PendingAutomod
     }
 
@@ -326,6 +331,19 @@ mod tests {
             marks.take(1, 2, 3, now),
             Some(("badword".into(), "Bad word".into()))
         );
+    }
+
+    #[test]
+    fn gateway_pending_mark_survives_prune_until_settled() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        marks.prune(now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
+        assert!(marks.contains(1, 2, 3));
     }
 
     #[test]

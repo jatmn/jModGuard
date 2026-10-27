@@ -2240,11 +2240,49 @@ pub(crate) fn peel_automod_from_bulk(
     report: &Option<MessageReport>,
     automod_individual: bool,
 ) -> bool {
-    match report {
-        None => automod_individual,
-        Some(report) if report.event == "automod_delete" => automod_individual,
-        _ => false,
-    }
+    automod_individual
+        && matches!(
+            report,
+            None | Some(MessageReport {
+                event: "automod_delete",
+                ..
+            })
+        )
+}
+
+pub(crate) fn stash_pending_automod_retained(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    row: MessageSnapshot,
+) {
+    app.pending_automod_delete_retained
+        .lock()
+        .insert((guild, channel, message), row);
+}
+
+pub(crate) fn take_pending_automod_retained(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+) -> Option<MessageSnapshot> {
+    app.pending_automod_delete_retained
+        .lock()
+        .remove(&(guild, channel, message))
+}
+
+fn settle_automod_retained(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    retained: Option<&MessageSnapshot>,
+) -> Option<MessageSnapshot> {
+    retained
+        .cloned()
+        .or_else(|| take_pending_automod_retained(app, guild, channel, message))
 }
 
 pub(crate) async fn emit_plain_message_delete(
@@ -2255,8 +2293,9 @@ pub(crate) async fn emit_plain_message_delete(
     id: MessageId,
     retained: Option<&MessageSnapshot>,
 ) {
+    let retained = settle_automod_retained(app, guild_id.get(), channel.get(), id.get(), retained);
     let mut report = message_delete_report(app, guild_id, channel, id);
-    if let Some(row) = retained {
+    if let Some(row) = retained.as_ref() {
         apply_retained_delete(&mut report, Some(row));
     }
     emit_to(app, sink, report.guild_id, report.event, report.vars).await;
@@ -2280,7 +2319,18 @@ pub(crate) fn observed_delete_report(
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
             automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
         }
-        GatewayDeleteObservation::PendingAutomod => return None,
+        GatewayDeleteObservation::PendingAutomod => {
+            if let Some(row) = retained {
+                stash_pending_automod_retained(
+                    app,
+                    guild_id.get(),
+                    channel.get(),
+                    id.get(),
+                    row.clone(),
+                );
+            }
+            return None;
+        }
         GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
     };
     if let Some(row) = retained {
@@ -2302,6 +2352,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
     rule_name: &str,
     retained: Option<&MessageSnapshot>,
 ) {
+    let retained = settle_automod_retained(app, guild_id, channel, message, retained);
     let report = automod_delete_report(
         app,
         GuildId::new(guild_id),
@@ -2309,7 +2360,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
         MessageId::new(message),
         rule_id,
         rule_name,
-        retained,
+        retained.as_ref(),
     );
     emit_to(app, sink, report.guild_id, report.event, report.vars).await;
 }

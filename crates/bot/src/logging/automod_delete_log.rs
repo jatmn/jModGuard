@@ -525,3 +525,115 @@ fn bulk_peel_only_when_automod_individually_routable() {
     assert_eq!(bulk_only.total, 2);
     assert!(bulk_only.worth_sending());
 }
+
+fn sample_retained(content: &str) -> crate::db::guild_data::MessageSnapshot {
+    use crate::db::guild_data::{MessageSnapshot, SnapshotFields};
+    MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: SnapshotFields {
+            content: Some(content.into()),
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 1,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_000,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: true,
+        content_supplied: true,
+        attachments_supplied: false,
+    }
+}
+
+#[tokio::test]
+async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let retained = sample_retained("kept through settlement");
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+        )
+        .is_none()
+    );
+    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123).unwrap();
+    let sink = Sink::default();
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &reconcile.0,
+        &reconcile.1,
+        None,
+    )
+    .await;
+    let body = sink.messages.lock().unwrap()[0].1.to_string();
+    assert!(body.contains("kept through settlement"));
+}
+
+#[tokio::test]
+async fn rest_failure_replay_uses_stashed_retained_snapshot() {
+    use crate::automod_delete_marks::UnconfirmedMarkRemoval;
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let retained = sample_retained("plain replay body");
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+        )
+        .is_none()
+    );
+    assert_eq!(
+        f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123),
+        UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    let sink = Sink::default();
+    emit_plain_message_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        None,
+    )
+    .await;
+    let body = sink.messages.lock().unwrap()[0].1.to_string();
+    assert!(body.contains("plain replay body"));
+}
+
+#[test]
+fn bulk_only_config_keeps_pending_automod_in_transcript() {
+    let mut bulk_only = BulkTranscript::new(2);
+    assert!(!peel_automod_from_bulk(&None, false));
+    bulk_only.push_unknown(MessageId::new(10));
+    assert_eq!(bulk_only.total, 2);
+    assert!(bulk_only.worth_sending());
+}
