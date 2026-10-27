@@ -1972,15 +1972,6 @@ fn ingest_member_audits(
                     payload.as_str()
                 ],
             )?;
-            conn.member_execute(
-                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?3,'$.subject_id') AS INTEGER),?4,json_extract(?3,'$.action'),CAST(json_extract(?3,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?3) AND json_extract(?3,'$.subject_id') IS NOT NULL AND json_extract(?3,'$.action') IS NOT NULL",
-                params![
-                    scope.guild_id(),
-                    scope.enrollment.id.as_str(),
-                    payload.as_str(),
-                    case_id.as_str()
-                ],
-            )?;
         }
         conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1",params![scope.guild_id(),scope.enrollment.id.as_str(),audit.user_id,now_ms])?;
         inserted += 1;

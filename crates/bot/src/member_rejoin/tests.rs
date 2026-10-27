@@ -598,6 +598,10 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         1,
         "join handler must not double-post the prior-case note"
     );
+    assert!(
+        body.contains("if membership_refresh"),
+        "stale or superseded join observations must not emit rejoin notes"
+    );
 }
 
 struct Fixture {
