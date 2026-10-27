@@ -126,3 +126,8 @@ async fn update_control_accepts_equal_schema() {
         .await
         .expect("equal schema should be admitted");
 }
+
+#[test]
+fn app_only_schema_refuse_requires_launcher_revision_eighteen() {
+    assert_eq!(jmodguard::db::LAUNCHER_REVISION, 18);
+}

@@ -551,6 +551,10 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     }
     assert_eq!(restarted.len(), 5);
     assert!(Db::open_with(opts.clone()).is_err());
+    assert_eq!(
+        control.upgrade().await.unwrap().unwrap().phase,
+        Phase::Complete
+    );
     let events = tokio::fs::read_to_string(root.join("events"))
         .await
         .unwrap();
@@ -572,15 +576,46 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     // must fetch the installed selection without launching either old app.
     restart(&mut bot).await;
     restart(&mut api).await;
+    let error = bot.tick().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("installed application cannot open database; use owner recovery"),
+        "{error:#}"
+    );
+    // Simulated migration advanced the store; owner publication must refresh
+    // installed metadata before cold supervisors reuse the managed selection.
+    let migrated = db::CORE_SCHEMA_VERSION + 1;
+    let guild = db::guild_data::SCHEMA_VERSION;
+    for release in [&mut bot_release, &mut api_release] {
+        release.min_schema = migrated;
+        release.max_schema = migrated;
+        release.result_schema = migrated;
+        release.upgrade.as_mut().unwrap().guild_schema = guild;
+    }
+    for release in [&bot_release, &api_release] {
+        let installed = serde_json::to_string(release).unwrap();
+        let candidate = installed.clone();
+        let component = release.component.clone();
+        let changed = db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1, candidate=?2 WHERE component=?3",
+                    params![installed, candidate, component],
+                    128 * 1024,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    restart(&mut bot).await;
+    restart(&mut api).await;
     bot.tick().await.unwrap();
     api.tick().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     bot.tick().await.unwrap();
     api.tick().await.unwrap();
-    assert_eq!(
-        control.upgrade().await.unwrap().unwrap().phase,
-        Phase::Complete
-    );
     let events = tokio::fs::read_to_string(root.join("events"))
         .await
         .unwrap();
@@ -620,6 +655,19 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         assert!(api.maintenance.is_some());
         assert!(control.abort_upgrade(&failed.id).await.is_err());
         tokio::fs::remove_file(root.join(failure)).await.unwrap();
+        let stamp = now();
+        for release in [&bot_release, &api_release] {
+            control
+                .checked(
+                    &release.component,
+                    "latest",
+                    Some(release.clone()),
+                    None,
+                    stamp,
+                )
+                .await
+                .unwrap();
+        }
         control
             .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, true, now())
             .await

@@ -10,7 +10,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 17;
+pub const LAUNCHER_REVISION: u32 = 18;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
@@ -1163,10 +1163,44 @@ impl UpdateControl {
             let retry = existing.as_ref().filter(|active| active.phase.active() && recover
                 && active.bot.release.digest == bot_digest && active.api.release.digest == api_digest);
             let (target_bot, target_api) = if let Some(active) = retry {
-                (active.bot.release.clone(), active.api.release.clone())
+                if active.error.is_some() {
+                    let target_bot = updates::checked_install_candidate(
+                        bot.candidate.as_ref().map(serde_json::to_string).transpose()?,
+                        &bot.channel,
+                        bot.checked_at,
+                        bot.check_error.clone(),
+                        &bot_digest,
+                        now,
+                    )?;
+                    let target_api = updates::checked_install_candidate(
+                        api.candidate.as_ref().map(serde_json::to_string).transpose()?,
+                        &api.channel,
+                        api.checked_at,
+                        api.check_error.clone(),
+                        &api_digest,
+                        now,
+                    )?;
+                    (target_bot, target_api)
+                } else {
+                    (active.bot.release.clone(), active.api.release.clone())
+                }
             } else {
-            let target_bot = updates::checked_install_candidate(bot.candidate.as_ref().map(serde_json::to_string).transpose()?, &bot.channel, bot.checked_at, bot.check_error.clone(), &bot_digest, now)?;
-            let target_api = updates::checked_install_candidate(api.candidate.as_ref().map(serde_json::to_string).transpose()?, &api.channel, api.checked_at, api.check_error.clone(), &api_digest, now)?;
+                let target_bot = updates::checked_install_candidate(
+                    bot.candidate.as_ref().map(serde_json::to_string).transpose()?,
+                    &bot.channel,
+                    bot.checked_at,
+                    bot.check_error.clone(),
+                    &bot_digest,
+                    now,
+                )?;
+                let target_api = updates::checked_install_candidate(
+                    api.candidate.as_ref().map(serde_json::to_string).transpose()?,
+                    &api.channel,
+                    api.checked_at,
+                    api.check_error.clone(),
+                    &api_digest,
+                    now,
+                )?;
                 (target_bot, target_api)
             };
             target_bot.validate()?;
