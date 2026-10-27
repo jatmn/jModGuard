@@ -260,12 +260,7 @@ pub struct RejoinNoteInFlight<'a> {
 }
 
 impl<'a> RejoinNoteInFlight<'a> {
-    fn new(
-        deliveries: &'a RejoinNoteDeliveries,
-        guild: u64,
-        user: u64,
-        joined_at_ms: i64,
-    ) -> Self {
+    fn new(deliveries: &'a RejoinNoteDeliveries, guild: u64, user: u64, joined_at_ms: i64) -> Self {
         Self {
             deliveries,
             guild,

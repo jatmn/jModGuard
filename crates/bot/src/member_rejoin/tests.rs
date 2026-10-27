@@ -475,12 +475,13 @@ fn case_text_inline_more_substrings_do_not_satisfy_overflow_marker() {
     };
     let vars = member_rejoin_vars(&user(42), &note);
     let last_line = vars["cases"].lines().next_back().expect("cases text");
+    let overflow_count = last_line
+        .strip_prefix('+')
+        .and_then(|rest| rest.strip_suffix(" more"))
+        .and_then(|count| count.parse::<usize>().ok())
+        .filter(|&count| count > 0);
     assert!(
-        !last_line
-            .strip_prefix('+')
-            .and_then(|rest| rest.strip_suffix(" more"))
-            .and_then(|count| count.parse::<usize>().ok())
-            .is_some_and(|count| count > 0),
+        overflow_count.is_none(),
         "inline +N more text must not count as the overflow marker: {}",
         vars["cases"]
     );
@@ -522,10 +523,7 @@ fn near_full_case_budget_still_shows_omission_marker() {
         index_incomplete: false,
     };
     let vars = member_rejoin_vars(&user(42), &note);
-    let last_line = vars["cases"]
-        .lines()
-        .next_back()
-        .expect("cases text");
+    let last_line = vars["cases"].lines().next_back().expect("cases text");
     assert!(
         last_line
             .strip_prefix('+')
