@@ -758,9 +758,6 @@ pub struct BotState {
     pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pub(crate) automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess,
-    /// Retained snapshot rows held while gateway-first automod deletes await REST.
-    pub(crate) pending_automod_delete_retained:
-        Mutex<HashMap<(u64, u64, u64), crate::db::guild_data::MessageSnapshot>>,
     gateway_manual_ban_audit_entries: Mutex<GatewayManualBanAuditQueue>,
     gateway_ban_flights: [Arc<Mutex<GatewayBanFlight>>; 256],
     pending_audit_links: Mutex<PendingAuditLinks>,
@@ -866,7 +863,6 @@ impl BotState {
             automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess {
                 inner: Mutex::new(crate::automod_delete_marks::AutomodDeleteMarks::default()),
             },
-            pending_automod_delete_retained: Mutex::new(HashMap::new()),
             gateway_manual_ban_audit_entries: Mutex::new(GatewayManualBanAuditQueue::default()),
             gateway_ban_flights: {
                 // A restart lost earlier in-flight observations. New rows must

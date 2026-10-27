@@ -445,19 +445,25 @@ async fn automod_try_delete_message(
     .await
     {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
-            if let Some((rule_id, rule_name)) =
-                app.automod_delete_marks.confirm(guild_id, channel, message)
-            {
+            if let Some(settlement) = app.automod_delete_marks.confirm(guild_id, channel, message) {
                 logging::emit_reconciled_automod_delete(
-                    app, http, guild_id, channel, message, &rule_id, &rule_name, None,
+                    app,
+                    http,
+                    guild_id,
+                    channel,
+                    message,
+                    &settlement.rule_id,
+                    &settlement.rule_name,
+                    settlement.retained.as_ref(),
                 )
                 .await;
             }
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
-            if app
+            let removal = app
                 .automod_delete_marks
-                .remove_unconfirmed(guild_id, channel, message)
+                .remove_unconfirmed(guild_id, channel, message);
+            if removal.action
                 == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
             {
                 logging::emit_plain_message_delete(
@@ -466,7 +472,7 @@ async fn automod_try_delete_message(
                     GuildId::new(guild_id),
                     ChannelId::new(channel),
                     MessageId::new(message),
-                    None,
+                    removal.retained.as_ref(),
                 )
                 .await;
             }
@@ -477,7 +483,24 @@ async fn automod_try_delete_message(
                 Instant::now(),
             );
         }
-        crate::discord::DiscordCall::Cancelled => {}
+        crate::discord::DiscordCall::Cancelled => {
+            if let Some(settlement) = app
+                .automod_delete_marks
+                .take_uncertain_gateway_settlement(guild_id, channel, message)
+            {
+                logging::emit_reconciled_automod_delete(
+                    app,
+                    http,
+                    guild_id,
+                    channel,
+                    message,
+                    &settlement.rule_id,
+                    &settlement.rule_name,
+                    settlement.retained.as_ref(),
+                )
+                .await;
+            }
+        }
     }
 }
 

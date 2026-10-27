@@ -2250,29 +2250,6 @@ pub(crate) fn peel_automod_from_bulk(
         )
 }
 
-pub(crate) fn stash_pending_automod_retained(
-    app: &BotState,
-    guild: u64,
-    channel: u64,
-    message: u64,
-    row: MessageSnapshot,
-) {
-    app.pending_automod_delete_retained
-        .lock()
-        .insert((guild, channel, message), row);
-}
-
-pub(crate) fn take_pending_automod_retained(
-    app: &BotState,
-    guild: u64,
-    channel: u64,
-    message: u64,
-) -> Option<MessageSnapshot> {
-    app.pending_automod_delete_retained
-        .lock()
-        .remove(&(guild, channel, message))
-}
-
 fn settle_automod_retained(
     app: &BotState,
     guild: u64,
@@ -2280,9 +2257,10 @@ fn settle_automod_retained(
     message: u64,
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageSnapshot> {
-    retained
-        .cloned()
-        .or_else(|| take_pending_automod_retained(app, guild, channel, message))
+    retained.cloned().or_else(|| {
+        app.automod_delete_marks
+            .take_stored_retained(guild, channel, message)
+    })
 }
 
 pub(crate) async fn emit_plain_message_delete(
@@ -2311,26 +2289,17 @@ pub(crate) fn observed_delete_report(
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
+    let retained_for_mark = retained.cloned();
     let mut report = match app.automod_delete_marks.observe_gateway_delete(
         guild_id.get(),
         channel.get(),
         id.get(),
+        retained_for_mark,
     ) {
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
             automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
         }
-        GatewayDeleteObservation::PendingAutomod => {
-            if let Some(row) = retained {
-                stash_pending_automod_retained(
-                    app,
-                    guild_id.get(),
-                    channel.get(),
-                    id.get(),
-                    row.clone(),
-                );
-            }
-            return None;
-        }
+        GatewayDeleteObservation::PendingAutomod => return None,
         GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
     };
     if let Some(row) = retained {

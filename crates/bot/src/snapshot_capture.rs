@@ -325,13 +325,18 @@ impl SnapshotIngress {
                         ids.clone(),
                         true,
                     );
-                    if !queued {
+                    if !queued
+                        && let Some(permit) = acquire_report_slot(app)
+                    {
                         let app = Arc::clone(app);
                         let context = context.clone();
                         let channel_id = event.channel_id;
                         tokio::spawn(async move {
-                            submit_peeled_bulk_deletes(&app, &context, guild, channel_id, ids)
-                                .await;
+                            let _permit = permit;
+                            submit_peeled_bulk_deletes_admitted(
+                                &app, &context, guild, channel_id, ids,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -1637,7 +1642,7 @@ fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePerm
     }
 }
 
-fn peel_automod_bulk_chunk(
+pub(crate) fn peel_automod_bulk_chunk(
     app: &Arc<BotState>,
     context: &Context,
     guild: GuildId,
@@ -1666,6 +1671,24 @@ async fn submit_peeled_bulk_deletes(
     channel: ChannelId,
     ids: Vec<MessageId>,
 ) {
+    let Some(permit) = acquire_report_slot(app) else {
+        return;
+    };
+    let app = Arc::clone(app);
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
+    });
+}
+
+async fn submit_peeled_bulk_deletes_admitted(
+    app: &Arc<BotState>,
+    context: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: Vec<MessageId>,
+) {
     let automod_individual = app
         .configs
         .get(&app.db, guild.get())
@@ -1685,7 +1708,7 @@ async fn submit_peeled_bulk_deletes(
     if !transcript.worth_sending() {
         return;
     }
-    submit_bulk_report(app, context, guild, channel, transcript);
+    logging::emit_retained_bulk(app, context, guild, channel, transcript).await;
 }
 
 fn submit_bulk_report(
@@ -2407,6 +2430,38 @@ mod tests {
         assert!(retained.content_truncated);
         assert_eq!(retained.content_original_bytes, Some(long.len() as i64));
         assert_eq!(retained.content.as_deref().unwrap().len(), MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn saturated_report_slots_block_bulk_fallback_tasks() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_bulk_fallback_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let held: Vec<_> = (0..32)
+            .map(|_| {
+                app.snapshots
+                    .report_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        let before = app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(acquire_report_slot(&app).is_none());
+        let after = app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

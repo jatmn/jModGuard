@@ -526,7 +526,7 @@ async fn punish_proven_match(
         }
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
-                if let Some((rule_id, rule_name)) =
+                if let Some(settlement) =
                     app.automod_delete_marks
                         .confirm(found.guild, *channel, *message)
                 {
@@ -536,18 +536,19 @@ async fn punish_proven_match(
                         found.guild,
                         *channel,
                         *message,
-                        &rule_id,
-                        &rule_name,
-                        None,
+                        &settlement.rule_id,
+                        &settlement.rule_name,
+                        settlement.retained.as_ref(),
                     )
                     .await;
                 }
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                if app
-                    .automod_delete_marks
-                    .remove_unconfirmed(found.guild, *channel, *message)
+                let removal =
+                    app.automod_delete_marks
+                        .remove_unconfirmed(found.guild, *channel, *message);
+                if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
                     crate::logging::emit_plain_message_delete(
@@ -556,13 +557,31 @@ async fn punish_proven_match(
                         GuildId::new(found.guild),
                         ChannelId::new(*channel),
                         MessageId::new(*message),
-                        None,
+                        removal.retained.as_ref(),
                     )
                     .await;
                 }
                 delete_outcome(&error)
             }
-            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+                if let Some(settlement) = app
+                    .automod_delete_marks
+                    .take_uncertain_gateway_settlement(found.guild, *channel, *message)
+                {
+                    crate::logging::emit_reconciled_automod_delete(
+                        app,
+                        http,
+                        found.guild,
+                        *channel,
+                        *message,
+                        &settlement.rule_id,
+                        &settlement.rule_name,
+                        settlement.retained.as_ref(),
+                    )
+                    .await;
+                }
+                CaseOutcome::Uncertain
+            }
         };
         app.spam_gate.finish_delete(
             found.guild,

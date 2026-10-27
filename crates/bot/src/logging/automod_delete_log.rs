@@ -234,10 +234,23 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
             .contains(789, 456, 123)
     );
     let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123);
-    assert_eq!(reconcile, Some(("badword".into(), "Bad words".into())));
+    assert_eq!(
+        reconcile.as_ref().map(|s| s.rule_id.as_str()),
+        Some("badword")
+    );
     let sink = Sink::default();
-    let (rule_id, rule_name) = reconcile.unwrap();
-    emit_reconciled_automod_delete(&f.app, &sink, 789, 456, 123, &rule_id, &rule_name, None).await;
+    let reconcile = reconcile.unwrap();
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &reconcile.rule_id,
+        &reconcile.rule_name,
+        reconcile.retained.as_ref(),
+    )
+    .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
     assert!(
         !f.app
@@ -279,9 +292,9 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
         789,
         456,
         123,
-        &reconcile.0,
-        &reconcile.1,
-        None,
+        &reconcile.rule_id,
+        &reconcile.rule_name,
+        reconcile.retained.as_ref(),
     )
     .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
@@ -393,9 +406,9 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
         789,
         456,
         123,
-        &reconcile.0,
-        &reconcile.1,
-        None,
+        &reconcile.rule_id,
+        &reconcile.rule_name,
+        reconcile.retained.as_ref(),
     )
     .await;
     assert!(sink.messages.lock().unwrap().is_empty());
@@ -464,10 +477,8 @@ async fn rest_failure_replays_plain_delete_after_gateway_pending() {
         )
         .is_none()
     );
-    assert_eq!(
-        f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123),
-        UnconfirmedMarkRemoval::ReplayPlainDelete
-    );
+    let removal = f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    assert_eq!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
     let sink = Sink::default();
     emit_plain_message_delete(
         &f.app,
@@ -475,7 +486,7 @@ async fn rest_failure_replays_plain_delete_after_gateway_pending() {
         GuildId::new(789),
         ChannelId::new(456),
         MessageId::new(123),
-        None,
+        removal.retained.as_ref(),
     )
     .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
@@ -541,7 +552,7 @@ fn sample_retained(content: &str) -> crate::db::guild_data::MessageSnapshot {
         first_observed_at_ms: 1,
         last_observed_at_ms: 1,
         edit_at_ms: None,
-        expires_at_ms: 86_400_000,
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 86_400_000,
         generation: 1,
         coverage_epoch: 1,
         continuous: true,
@@ -579,9 +590,9 @@ async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
         789,
         456,
         123,
-        &reconcile.0,
-        &reconcile.1,
-        None,
+        &reconcile.rule_id,
+        &reconcile.rule_name,
+        reconcile.retained.as_ref(),
     )
     .await;
     let body = sink.messages.lock().unwrap()[0].1.to_string();
@@ -611,10 +622,8 @@ async fn rest_failure_replay_uses_stashed_retained_snapshot() {
         )
         .is_none()
     );
-    assert_eq!(
-        f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123),
-        UnconfirmedMarkRemoval::ReplayPlainDelete
-    );
+    let removal = f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    assert_eq!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
     let sink = Sink::default();
     emit_plain_message_delete(
         &f.app,
@@ -622,11 +631,53 @@ async fn rest_failure_replay_uses_stashed_retained_snapshot() {
         GuildId::new(789),
         ChannelId::new(456),
         MessageId::new(123),
-        None,
+        removal.retained.as_ref(),
     )
     .await;
     let body = sink.messages.lock().unwrap()[0].1.to_string();
     assert!(body.contains("plain replay body"));
+}
+
+#[tokio::test]
+async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let retained = sample_retained("after uncertain REST");
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+        )
+        .is_none()
+    );
+    let settlement = f
+        .app
+        .automod_delete_marks
+        .take_uncertain_gateway_settlement(789, 456, 123)
+        .expect("gateway pending settlement");
+    let sink = Sink::default();
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &settlement.rule_id,
+        &settlement.rule_name,
+        settlement.retained.as_ref(),
+    )
+    .await;
+    let body = sink.messages.lock().unwrap()[0].1.to_string();
+    assert!(body.contains("after uncertain REST"));
 }
 
 #[test]
@@ -636,4 +687,29 @@ fn bulk_only_config_keeps_pending_automod_in_transcript() {
     bulk_only.push_unknown(MessageId::new(10));
     assert_eq!(bulk_only.total, 2);
     assert!(bulk_only.worth_sending());
+}
+
+#[test]
+fn unhooked_bulk_chunk_keeps_gateway_pending_in_transcript_without_individual_route() {
+    let f = Fixture::new();
+    f.app
+        .automod_delete_marks
+        .insert(789, 456, 10, "badword", "Bad words");
+    let mut transcript = BulkTranscript::new(2);
+    for id in [10_u64, 11] {
+        let report = observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(id),
+            None,
+        );
+        if peel_automod_from_bulk(&report, false) {
+            transcript.peel_automod_delete();
+        } else {
+            transcript.push_unknown(MessageId::new(id));
+        }
+    }
+    assert_eq!(transcript.total, 2);
+    assert!(transcript.worth_sending());
 }
