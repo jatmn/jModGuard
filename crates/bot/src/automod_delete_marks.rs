@@ -54,8 +54,6 @@ impl AutomodDeleteMarks {
             self.order.pop_front();
             self.entries.remove(&key);
         }
-        self.entries.retain(|_, entry| entry.expires > now);
-        self.order.retain(|key| self.entries.contains_key(key));
     }
 
     fn evict_one(&mut self) {
@@ -265,16 +263,11 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        assert!(
-            marks
-                .take(
-                    1,
-                    2,
-                    3,
-                    now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1)
-                )
-                .is_none()
-        );
+        assert!(marks.confirm(1, 2, 3, now).is_none());
+        let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(expired);
+        assert!(marks.take(1, 2, 3, expired).is_none());
+        assert!(!marks.contains(1, 2, 3));
     }
 
     #[test]

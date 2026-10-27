@@ -477,7 +477,23 @@ async fn automod_try_delete_message(
                 Instant::now(),
             );
         }
-        crate::discord::DiscordCall::Cancelled => {}
+        crate::discord::DiscordCall::Cancelled => {
+            if app
+                .automod_delete_marks
+                .remove_unconfirmed(guild_id, channel, message)
+                == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+            {
+                logging::emit_plain_message_delete(
+                    app,
+                    http,
+                    GuildId::new(guild_id),
+                    ChannelId::new(channel),
+                    MessageId::new(message),
+                    None,
+                )
+                .await;
+            }
+        }
     }
 }
 

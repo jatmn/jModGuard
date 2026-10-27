@@ -326,7 +326,13 @@ impl SnapshotIngress {
                         true,
                     );
                     if !queued {
-                        submit_peeled_bulk_deletes(app, &context, guild, event.channel_id, ids);
+                        let app = Arc::clone(app);
+                        let context = context.clone();
+                        let channel_id = event.channel_id;
+                        tokio::spawn(async move {
+                            submit_peeled_bulk_deletes(&app, &context, guild, channel_id, ids)
+                                .await;
+                        });
                     }
                 }
             }
@@ -1123,7 +1129,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         ids,
                         bulk: true,
                     } => {
-                        submit_peeled_bulk_deletes(&app, &work.context, guild, channel, ids);
+                        submit_peeled_bulk_deletes(&app, &work.context, guild, channel, ids).await;
                     }
                     _ => {}
                 }
@@ -1653,15 +1659,29 @@ fn peel_automod_bulk_chunk(
     }
 }
 
-fn submit_peeled_bulk_deletes(
+async fn submit_peeled_bulk_deletes(
     app: &Arc<BotState>,
     context: &Context,
     guild: GuildId,
     channel: ChannelId,
     ids: Vec<MessageId>,
 ) {
+    let automod_individual = app
+        .configs
+        .get(&app.db, guild.get())
+        .await
+        .ok()
+        .is_some_and(|cfg| logging::channel_for(&cfg, "automod_delete").is_some());
     let mut transcript = logging::BulkTranscript::new(ids.len());
-    peel_automod_bulk_chunk(app, context, guild, channel, &ids, &mut transcript, true);
+    peel_automod_bulk_chunk(
+        app,
+        context,
+        guild,
+        channel,
+        &ids,
+        &mut transcript,
+        automod_individual,
+    );
     if !transcript.worth_sending() {
         return;
     }
@@ -2163,9 +2183,10 @@ mod tests {
             .await
             .unwrap();
         // Test-only loopback WebSocket URL for a local accept() fixture, not production traffic.
+        let addr = listener.local_addr().unwrap();
         let url = Arc::new(tokio::sync::Mutex::new(format!(
-            "ws://{}",
-            listener.local_addr().unwrap()
+            "ws://127.0.0.1:{}",
+            addr.port()
         )));
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
