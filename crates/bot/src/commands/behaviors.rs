@@ -587,11 +587,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
-            let snapshot = super::voice_lookup::snapshot_cached_voice(
-                &env.ctx.cache,
-                env.guild_id,
-                target,
-            );
+            let snapshot =
+                super::voice_lookup::snapshot_cached_voice(&env.ctx.cache, env.guild_id, target);
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             let response = match snapshot {
@@ -601,13 +598,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 } => {
                     vars.insert("channel".into(), channel_name);
                     vars.insert("channel_id".into(), channel_id.to_string());
-                    None
+                    Some(crate::templates::render(
+                        super::voice_lookup::IN_CHANNEL_TEMPLATE,
+                        &vars,
+                    ))
                 }
                 super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
-                    crate::templates::render(
-                        super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
-                        &vars,
-                    ),
+                    crate::templates::render(super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE, &vars),
                 ),
                 super::voice_lookup::VoiceLookupSnapshot::NotCached => Some(
                     crate::templates::render(super::voice_lookup::NOT_CACHED_TEMPLATE, &vars),

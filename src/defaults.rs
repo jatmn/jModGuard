@@ -258,7 +258,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "!voice <user>",
         "mod",
         Behavior::Voice,
-        "**{target}** is in **{channel}** (`{channel_id}`)",
+        "",
         "",
         vec![],
     ));

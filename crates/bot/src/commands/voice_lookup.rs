@@ -4,6 +4,8 @@ use serenity::model::guild::Guild;
 use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::model::voice::VoiceState;
 
+/// Shipped success line when the member is in a cached voice channel.
+pub const IN_CHANNEL_TEMPLATE: &str = "**{target}** is in **{channel}** (`{channel_id}`)";
 /// Rendered when the member has no cached voice state or left a channel.
 pub const NOT_IN_CHANNEL_TEMPLATE: &str = "**{target}** is not in a voice channel.";
 /// Rendered when the guild or voice-state cache is empty (for example right after a restart).
@@ -134,7 +136,10 @@ mod tests {
         channel
     }
 
-    fn cache_with_guild(voice_states: HashMap<UserId, VoiceState>, channels: Vec<GuildChannel>) -> Arc<serenity::cache::Cache> {
+    fn cache_with_guild(
+        voice_states: HashMap<UserId, VoiceState>,
+        channels: Vec<GuildChannel>,
+    ) -> Arc<serenity::cache::Cache> {
         let cache = Arc::new(serenity::cache::Cache::new());
         let mut guild = Guild::default();
         guild.id = GuildId::new(GUILD);
@@ -152,7 +157,10 @@ mod tests {
     #[test]
     fn cached_voice_state_returns_channel_name_and_id() {
         let mut states = HashMap::new();
-        states.insert(UserId::new(TARGET), voice_state(TARGET, Some(VOICE_CHANNEL)));
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
         let snapshot = snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET));
         assert_eq!(
@@ -207,7 +215,10 @@ mod tests {
     #[test]
     fn foreign_guild_channel_is_not_cached() {
         let mut states = HashMap::new();
-        states.insert(UserId::new(TARGET), voice_state(TARGET, Some(VOICE_CHANNEL)));
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
         let cache = cache_with_guild(states, vec![]);
         let mut foreign_guild = Guild::default();
         foreign_guild.id = GuildId::new(OTHER_GUILD);
@@ -242,7 +253,10 @@ mod tests {
             }
         }
         let mut states = HashMap::new();
-        states.insert(UserId::new(TARGET), voice_state(TARGET, Some(VOICE_CHANNEL)));
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
         let cache = cache_with_guild(states, vec![voice_channel("Lounge")]);
         let snapshot = snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET));
         drop(cache);
@@ -259,7 +273,10 @@ mod tests {
     fn long_channel_names_are_clipped() {
         let long = "x".repeat(CHANNEL_NAME_CLIP + 10);
         let mut states = HashMap::new();
-        states.insert(UserId::new(TARGET), voice_state(TARGET, Some(VOICE_CHANNEL)));
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
         let cache = cache_with_guild(states, vec![voice_channel(&long)]);
         let snapshot = snapshot_cached_voice(&cache, GuildId::new(GUILD), UserId::new(TARGET));
         let VoiceLookupSnapshot::InChannel { channel_name, .. } = snapshot else {
@@ -428,7 +445,11 @@ mod tests {
             "{:?}",
             outcome.response
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "voice must not call Discord");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "voice must not call Discord"
+        );
 
         server.abort();
         drop(app);

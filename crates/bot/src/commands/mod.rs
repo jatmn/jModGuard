@@ -1998,6 +1998,60 @@ mod tests {
     }
 
     #[test]
+    fn voice_not_cached_and_not_in_channel_replies_reach_operators() {
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        assert!(
+            command.response.is_empty(),
+            "voice must use outcome.response like warns/banlist"
+        );
+        let vars = BTreeMap::from([
+            ("target".into(), "Alice".into()),
+            ("target_id".into(), "42".into()),
+        ]);
+        let not_cached = BehaviorOutcome {
+            response: Some(
+                templates::render(
+                    super::voice_lookup::NOT_CACHED_TEMPLATE,
+                    &vars,
+                ),
+            ),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_cached_text = render_outcome(&command, &not_cached);
+        assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
+        assert!(!not_cached_text.contains("{channel_id}"), "{not_cached_text}");
+        assert_eq!(
+            prefix_response_text(&command, &not_cached).as_deref(),
+            Some(not_cached_text.as_str())
+        );
+
+        let not_in_channel = BehaviorOutcome {
+            response: Some(
+                templates::render(
+                    super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                    &vars,
+                ),
+            ),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_in_text = render_outcome(&command, &not_in_channel);
+        assert!(
+            not_in_text.contains("not in a voice channel"),
+            "{not_in_text}"
+        );
+        assert!(!not_in_text.contains("{channel_id}"), "{not_in_text}");
+        assert_eq!(
+            prefix_response_text(&command, &not_in_channel).as_deref(),
+            Some(not_in_text.as_str())
+        );
+    }
+
+    #[test]
     fn compact_duration_responses_preserve_stored_and_custom_templates() {
         for (name, stored, seconds, compact, legacy) in [
             (
