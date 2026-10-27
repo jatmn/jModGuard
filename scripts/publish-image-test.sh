@@ -1311,16 +1311,71 @@ rm -rf "$phase_state_dir"
 unset JMODGUARD_PUBLISH_PHASE FAIL_SIGN
 
 reload_publisher
+mock_publish_helpers
 handoff_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-handoff-XXXXXX")"
 JMODGUARD_PUBLISH_STATE_DIR="$handoff_dir"
 export JMODGUARD_PUBLISH_STATE_DIR
 write_publish_handoff api false
 JMODGUARD_PUBLISH_PHASE=sign
 export JMODGUARD_PUBLISH_PHASE
+with_main
 output="$(publish_component api 2>&1)" || fail 'sign phase must succeed when handoff marks no verified image'
 [[ "$output" == *'skipping promotion'* ]] || fail "expected sign skip message, got: $output"
 [[ -f "$handoff_dir/api.json" ]] && fail 'sign skip must not require component state file'
 rm -rf "$handoff_dir"
+unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
+
+# Sign phase must derive digest and promotion targets from the plan and registry, not build state.
+reload_publisher
+mock_publish_helpers
+FAIL_SIGN=0
+trusted_sign_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-trusted-sign-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$trusted_sign_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+FORGED_SHA="$(printf 'f%.0s' {1..40})"
+FORGED_DIGEST="sha256:$(printf 'f%.0s' {1..64})"
+TRUSTED_STAGING="$(staging_ref api)"
+write_publish_state api "$(COMPONENT=api IMAGE=ghcr.io/jatmn/jmodguard-api SHA="$FORGED_SHA" LABEL="" MODE=main CHANNEL="" DIGEST="$FORGED_DIGEST" STAGING_REF="$TRUSTED_STAGING" node --input-type=commonjs - <<'JS'
+process.stdout.write(JSON.stringify({
+  component: process.env.COMPONENT,
+  image: process.env.IMAGE,
+  sha: process.env.SHA,
+  label: process.env.LABEL,
+  mode: process.env.MODE,
+  channel: process.env.CHANNEL,
+  published_digest: process.env.DIGEST,
+  staging_ref: process.env.STAGING_REF,
+}));
+JS
+)"
+write_publish_handoff api true
+JMODGUARD_PUBLISH_PHASE=sign
+export JMODGUARD_PUBLISH_PHASE
+with_main
+GHCR_USERNAME=publisher
+GHCR_TOKEN=test-secret
+GITHUB_TOKEN=""
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
+JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON \
+  JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
+if ( publish_component api ) >/dev/null 2>&1; then
+  fail 'sign phase must reject build state that disagrees with the trusted publication plan'
+fi
+rm -f "$trusted_sign_dir/api.json"
+: >"$TRACE_FILE"
+( publish_component api ) >/dev/null 2>&1 || fail 'sign phase must succeed from trusted plan and registry without build state'
+load_trace
+printf '%s\n' "${CALLS[@]}" | grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
+  || fail 'sign phase must sign the registry digest for the trusted staging reference'
+printf '%s\n' "${CALLS[@]}" | grep -q "@${MOCK_BUILD_DIGEST}" \
+  || fail 'sign phase must promote the trusted registry digest, not forged build state'
+printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" \
+  || fail 'sign phase must promote tags derived from the publication plan SHA'
+printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
+  && fail 'sign phase must not promote tags from forged build state'
+rm -rf "$trusted_sign_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
 reload_publisher

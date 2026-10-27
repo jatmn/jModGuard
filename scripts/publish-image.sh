@@ -810,15 +810,26 @@ read_publish_handoff() {
   cat "$file"
 }
 
-validate_publish_state_for_signing() {
-  local component="$1" state="$2"
-  COMPONENT="$component" STATE_JSON="$state" node --input-type=commonjs - <<'JS' || publish_fail 'publish state does not match the requested component'
+assert_publish_state_matches_trusted() {
+  local component="$1" state="$2" image="$3" sha="$4" label="$5" mode="$6" channel="$7" staging_ref="$8" published_digest="$9"
+  COMPONENT="$component" STATE_JSON="$state" IMAGE="$image" SHA="$sha" LABEL="$label" MODE="$mode" CHANNEL="$channel" \
+    STAGING_REF="$staging_ref" PUBLISHED_DIGEST="$published_digest" node --input-type=commonjs - <<'JS' \
+    || publish_fail 'publish state does not match trusted publication targets'
 const state = JSON.parse(process.env.STATE_JSON);
 const component = process.env.COMPONENT;
-if (state.component !== component) process.exit(1);
-if (state.image !== `ghcr.io/jatmn/jmodguard-${component}`) process.exit(2);
-if (!/^sha256:[0-9a-f]{64}$/.test(state.published_digest || "")) process.exit(3);
-if (!state.staging_ref || !state.staging_ref.startsWith(`ghcr.io/jatmn/jmodguard-${component}:`)) process.exit(4);
+const trusted = {
+  component,
+  image: process.env.IMAGE,
+  sha: process.env.SHA,
+  label: process.env.LABEL || "",
+  mode: process.env.MODE,
+  channel: process.env.CHANNEL || "",
+  staging_ref: process.env.STAGING_REF,
+  published_digest: process.env.PUBLISHED_DIGEST,
+};
+for (const key of Object.keys(trusted)) {
+  if (state[key] !== trusted[key]) process.exit(1);
+}
 JS
 }
 
@@ -928,31 +939,48 @@ JS
 
 publish_component_sign() {
   local component="$1"
-  local state image sha label mode channel published_digest staging_ref handoff sign_flag
+  local selection mode ref head resolved sha label image channel published_digest staging_ref
+  local state handoff sign_flag handoff_sign_expected=""
   local username token source_token scratch
   local -a PROMOTION_ROLLBACK=()
+  selection="$(checked_request)" || return $?
+  if [[ "$selection" == "skip" ]]; then
+    echo 'Test-only build; no image publication'
+    return 0
+  fi
+  mode="${selection%%$'\t'*}"
+  local rest="${selection#*$'\t'}"
+  ref="${rest%%$'\t'*}"
+  head="${rest#*$'\t'}"
   if handoff="$(read_publish_handoff 2>/dev/null)"; then
     sign_flag="$(HANDOFF_JSON="$handoff" node --input-type=commonjs -e 'process.stdout.write(String(JSON.parse(process.env.HANDOFF_JSON).sign))')"
     if [[ "$(HANDOFF_JSON="$handoff" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.HANDOFF_JSON).component)')" != "$component" ]]; then
       publish_fail 'publish handoff component mismatch'
     fi
+    handoff_sign_expected="$sign_flag"
     if [[ "$sign_flag" != "true" ]]; then
       echo "${component}: build produced no verified image; skipping promotion"
       return 0
     fi
   fi
-  state="$(read_publish_state "$component")" || {
+  resolved="$(read_plan "$mode" "$ref" "$head")" || return $?
+  IFS=$'\t' read -r sha label <<<"$resolved"
+  if [[ "$mode" == "manual" || "$mode" == "release" ]]; then
+    resolve_source manual "$sha" "$head" >/dev/null
+  fi
+  image="ghcr.io/jatmn/jmodguard-${component}"
+  staging_ref="$(publish_staging_ref "$image" "$sha")"
+  channel="$(channel_for "$mode" "$label" || true)"
+  if ! published_digest="$(inspect_digest "$staging_ref" 2>/dev/null | cut -f1)"; then
+    if [[ "$handoff_sign_expected" == "true" ]]; then
+      publish_fail 'verified staging image is missing from the registry'
+    fi
     echo "${component}: no verified image to sign; skipping promotion"
     return 0
-  }
-  validate_publish_state_for_signing "$component" "$state"
-  image="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).image)')"
-  sha="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).sha)')"
-  label="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).label || "")')"
-  mode="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).mode)')"
-  channel="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).channel || "")')"
-  published_digest="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).published_digest)')"
-  staging_ref="$(STATE_JSON="$state" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).staging_ref)')"
+  fi
+  if state="$(read_publish_state "$component" 2>/dev/null)"; then
+    assert_publish_state_matches_trusted "$component" "$state" "$image" "$sha" "$label" "$mode" "$channel" "$staging_ref" "$published_digest"
+  fi
   if [[ -z "$_JMG_SIGNING_KEY" || -z "$_JMG_SIGNING_PASSWORD" ]]; then
     capture_signing_secrets
   fi
