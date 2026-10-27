@@ -7305,6 +7305,62 @@ async fn member_case_entries_after_backfill_includes_newly_recorded_cases() {
 }
 
 #[tokio::test]
+async fn member_case_entries_honors_default_read_budget_after_large_policy_write() {
+    const SUBJECT: i64 = 77;
+    let (_fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .backfill_member_case_index(scope.clone(), 42, 100)
+        .await
+        .unwrap();
+    let write_limits = CaseLimits {
+        max_record_bytes: 1_048_576,
+        ..CaseLimits::default()
+    };
+    let case_id = CaseId::new();
+    let huge_reason = "x".repeat(262_144);
+    store
+        .record_case(
+            scope.clone(),
+            case_id.clone(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: SUBJECT,
+                actor_id: Some(42),
+                occurred_at_ms: 6_000,
+                reason: Some(huge_reason),
+                evidence: CaseEvidence::Unavailable,
+            },
+            write_limits,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .case(scope.clone(), case_id.clone(), CaseLimits::default())
+            .await
+            .is_err()
+    );
+    let err = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<CaseError>()
+            .is_some_and(|e| matches!(e, CaseError::Limit)),
+        "userinfo case lookup must reject payloads beyond the default read budget: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn member_case_entries_rejects_oversized_case_payload() {
     const SUBJECT: i64 = 55;
     let (_fixture, store, scope) = ready().await;

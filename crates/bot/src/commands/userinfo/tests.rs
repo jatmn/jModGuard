@@ -1,7 +1,8 @@
 use super::*;
 use crate::commands::Args;
 use crate::db::guild_data::{
-    CaseAction, CaseEvidence, CaseOutcome, MemberHistoryEntry, MemberHistoryPage, MemberObservation,
+    CaseAction, CaseData, CaseEvidence, CaseId, CaseLimits, CaseOutcome, CaseSource,
+    MemberHistoryEntry, MemberHistoryPage, MemberObservation,
 };
 use crate::state::BotState;
 use serenity::all::{Cache, Guild, GuildCreateEvent, Member, Role, RoleId, User, UserId};
@@ -262,6 +263,61 @@ async fn load_case_lines_from_store_past_stay_rows_on_first_page() {
         other => panic!("expected case lines, got {other:?}"),
     };
     assert!(lines.iter().any(|line| line.contains("`ban`")));
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn load_case_lines_from_store_rejects_default_budget_oversize_payload() {
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_store_budget_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    store
+        .backfill_member_case_index(scope.clone(), 100, 100)
+        .await
+        .unwrap();
+    let write_limits = CaseLimits {
+        max_record_bytes: 1_048_576,
+        ..CaseLimits::default()
+    };
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 91,
+                actor_id: Some(7),
+                occurred_at_ms: 3_000,
+                reason: Some("z".repeat(262_144)),
+                evidence: CaseEvidence::Unavailable,
+            },
+            write_limits,
+        )
+        .await
+        .unwrap();
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    assert!(
+        matches!(cases, CasesField::Unavailable),
+        "oversize indexed case must not surface through userinfo: {cases:?}"
+    );
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
