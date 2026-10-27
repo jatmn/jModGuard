@@ -8302,7 +8302,11 @@ async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_f
     tokio::fs::create_dir_all(&root).await.unwrap();
     let baked = executable(&root, "baked-api").await;
     let mut objects = HashMap::new();
-    let release = image(&mut objects, "api", &tokio::fs::read(baked.clone()).await.unwrap());
+    let release = image(
+        &mut objects,
+        "api",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
     let tag = signature_tag_for_digest(&release.digest).unwrap();
     objects.remove(&tag);
     let (registry, server) = registry_with_objects(objects).await;

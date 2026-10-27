@@ -169,6 +169,8 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
         Some("4"),
         Some("5"),
         Some("6"),
+        Some("7"),
+        Some("17"),
     ] {
         let root = temp_root("rev2");
         let db_path = root.join("core.db");

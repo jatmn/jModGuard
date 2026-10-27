@@ -1467,6 +1467,7 @@ impl Supervisor {
                 Err(error) => return Err(error),
             }
         } else {
+            let installed_digest = release.as_ref().map(|release| release.digest.clone());
             let saved = if release.is_none() {
                 self.control.baked_running(&self.role, seen, now()).await
             } else {
@@ -1479,12 +1480,12 @@ impl Supervisor {
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
                     self.clear_rejected_marker().await;
-                    if let Some(release) = &release {
+                    if let Some(digest) = installed_digest.as_ref() {
                         let state = self.control.component(&self.role).await?;
                         if state
                             .installed
                             .as_ref()
-                            .is_some_and(|installed| installed.digest == release.digest)
+                            .is_some_and(|installed| &installed.digest == digest)
                         {
                             self.clear_boot_mismatch_when_saved().await?;
                         }

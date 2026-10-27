@@ -214,11 +214,10 @@ impl Registry {
         {
             return Ok(body.to_vec());
         }
-        let manifest: Manifest = serde_json::from_slice(body).map_err(|_| {
-            signature::ImageSignatureRejection {
+        let manifest: Manifest =
+            serde_json::from_slice(body).map_err(|_| signature::ImageSignatureRejection {
                 phrase: signature::BAD_IMAGE_SIGNATURE,
-            }
-        })?;
+            })?;
         ensure!(
             manifest.schema_version == 2 && !manifest.layers.is_empty(),
             signature::ImageSignatureRejection {

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use ring::digest::{SHA256, digest};
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const UNSIGNED_IMAGE: &str = "unsigned image";
 pub const BAD_IMAGE_SIGNATURE: &str = "bad image signature";
@@ -118,9 +118,6 @@ fn previous_key_paths() -> Vec<PathBuf> {
     if let Ok(root) = std::env::var("JMODGUARD_REPO_ROOT") {
         paths.push(PathBuf::from(root).join("deploy/update-signing-previous.pub"));
     }
-    paths.push(
-        PathBuf::from("/usr/local/share/jmodguard/deploy/update-signing-previous.pub"),
-    );
     paths
 }
 
@@ -204,11 +201,10 @@ pub fn verify_manifest_signature(
     signature_body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let envelope: Envelope = serde_json::from_slice(signature_body).map_err(|_| {
-        ImageSignatureRejection {
+    let envelope: Envelope =
+        serde_json::from_slice(signature_body).map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
-        }
-    })?;
+        })?;
     ensure!(
         envelope.payload_type == PAYLOAD_TYPE,
         ImageSignatureRejection {
@@ -222,16 +218,17 @@ pub fn verify_manifest_signature(
         }
     );
     let entry = &envelope.signatures[0];
-    let payload_bytes = STANDARD.decode(&envelope.payload).map_err(|_| {
-        ImageSignatureRejection {
+    let payload_bytes =
+        STANDARD
+            .decode(&envelope.payload)
+            .map_err(|_| ImageSignatureRejection {
+                phrase: BAD_IMAGE_SIGNATURE,
+            })?;
+    let signature_bytes = STANDARD
+        .decode(&entry.sig)
+        .map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
-        }
-    })?;
-    let signature_bytes = STANDARD.decode(&entry.sig).map_err(|_| {
-        ImageSignatureRejection {
-            phrase: BAD_IMAGE_SIGNATURE,
-        }
-    })?;
+        })?;
     let keys = trusted_keys().map_err(|_| ImageSignatureRejection {
         phrase: BAD_IMAGE_SIGNATURE,
     })?;
@@ -247,11 +244,10 @@ pub fn verify_manifest_signature(
         .map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
         })?;
-    let payload: SimpleSigningPayload = serde_json::from_slice(&payload_bytes).map_err(|_| {
-        ImageSignatureRejection {
+    let payload: SimpleSigningPayload =
+        serde_json::from_slice(&payload_bytes).map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
-        }
-    })?;
+        })?;
     ensure!(
         payload.critical.kind == SIGNATURE_TYPE,
         ImageSignatureRejection {
@@ -388,7 +384,7 @@ pub mod test_support {
     /// Build the OCI manifest Cosign stores at the `.sig` tag, plus blob payloads.
     pub fn sign_manifest_cosign(
         private_pem: &str,
-        public_pem: &str,
+        _public_pem: &str,
         component: &str,
         manifest_digest: &str,
         not_after: &str,
@@ -438,10 +434,7 @@ pub mod test_support {
         .unwrap();
         (
             manifest,
-            vec![
-                (config_digest, config.to_vec()),
-                (payload_digest, payload),
-            ],
+            vec![(config_digest, config.to_vec()), (payload_digest, payload)],
         )
     }
 

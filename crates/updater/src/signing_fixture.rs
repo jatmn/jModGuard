@@ -46,13 +46,12 @@ impl SigningFixture {
             std::env::set_var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM", &self.public_pem);
         }
         if let Some(public) = self.previous_public_pem.as_ref() {
-            let root = std::env::var("JMODGUARD_REPO_ROOT").unwrap_or_else(|_| {
-                std::env::temp_dir()
-                    .join(format!("jmodguard-signing-{:032x}", rand::random::<u128>()))
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            let deploy = std::path::Path::new(&root).join("deploy");
+            let root = std::env::temp_dir()
+                .join(format!("jmodguard-signing-{:032x}", rand::random::<u128>()));
+            unsafe {
+                std::env::set_var("JMODGUARD_REPO_ROOT", root.as_os_str());
+            }
+            let deploy = root.join("deploy");
             std::fs::create_dir_all(&deploy).unwrap();
             std::fs::write(deploy.join("update-signing-previous.pub"), public).unwrap();
         }
