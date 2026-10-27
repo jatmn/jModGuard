@@ -1308,6 +1308,19 @@ rm -rf "$phase_state_dir"
 unset JMODGUARD_PUBLISH_PHASE FAIL_SIGN
 
 reload_publisher
+handoff_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-handoff-XXXXXX")"
+JMODGUARD_PUBLISH_STATE_DIR="$handoff_dir"
+export JMODGUARD_PUBLISH_STATE_DIR
+write_publish_handoff api false
+JMODGUARD_PUBLISH_PHASE=sign
+export JMODGUARD_PUBLISH_PHASE
+output="$(publish_component api 2>&1)" || fail 'sign phase must succeed when handoff marks no verified image'
+[[ "$output" == *'skipping promotion'* ]] || fail "expected sign skip message, got: $output"
+[[ -f "$handoff_dir/api.json" ]] && fail 'sign skip must not require component state file'
+rm -rf "$handoff_dir"
+unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
+
+reload_publisher
 PROD_PROMOTE_CREATE=0
 ROLLBACK_PROMOTE_IMAGE=ghcr.io/jatmn/jmodguard-api
 ROLLBACK_PROMOTE_DIGEST="sha256:$(printf 'c%.0s' {1..64})"

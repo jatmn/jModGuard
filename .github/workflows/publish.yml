@@ -124,6 +124,8 @@ jobs:
 
   publish-build:
     name: Publish build / ${{ matrix.component }}
+    outputs:
+      should_sign: ${{ steps.handoff.outputs.should_sign }}
     needs: [ci, release, prepare-publication, release-ci]
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
@@ -167,6 +169,22 @@ jobs:
           JMODGUARD_PUBLISH_PHASE: build
           JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
         run: bash scripts/publish-image.sh "$COMPONENT"
+      - id: handoff
+        name: Record publish handoff
+        if: always()
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          dir="${RUNNER_TEMP}/jmodguard-publish-state"
+          mkdir -p "$dir"
+          if [[ -f "$dir/${COMPONENT}.json" ]]; then
+            echo should_sign=true >>"$GITHUB_OUTPUT"
+          else
+            echo should_sign=false >>"$GITHUB_OUTPUT"
+            if [[ ! -f "$dir/handoff.json" ]]; then
+              printf '{"component":"%s","sign":false}\n' "$COMPONENT" >"$dir/handoff.json"
+            fi
+          fi
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
@@ -181,6 +199,7 @@ jobs:
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
       needs.publish-build.result == 'success' &&
+      needs.publish-build.outputs.should_sign == 'true' &&
       github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request' &&
       (needs.release-ci.result == 'success' ||
        (needs.release-ci.result == 'skipped' &&
@@ -215,7 +234,7 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - uses: actions/download-artifact@fa0a81b6868b9c0b188dd8e825494aabb200ee93 # v4.1.8
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: publish-state-${{ matrix.component }}
           path: ${{ runner.temp }}/jmodguard-publish-state
