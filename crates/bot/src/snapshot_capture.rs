@@ -1102,13 +1102,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         bulk: false,
                     } => {
                         if let Some(id) = ids.first() {
-                            let mut report = logging::observed_delete_report(
-                                &app,
-                                guild,
-                                channel,
-                                *id,
-                                None,
-                            );
+                            let mut report =
+                                logging::observed_delete_report(&app, guild, channel, *id, None);
                             report
                                 .vars
                                 .insert("coverage".into(), "snapshot storage unavailable".into());

@@ -3484,13 +3484,7 @@ mod tests {
         )
         .await;
         let _ = stub.finish();
-        assert!(
-            !app
-                .automod_delete_marks
-                .inner
-                .lock()
-                .contains(10, 70, 42)
-        );
+        assert!(!app.automod_delete_marks.inner.lock().contains(10, 70, 42));
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);
@@ -3561,7 +3555,13 @@ mod tests {
                             }
                         }
                         let header = String::from_utf8_lossy(&buf);
-                        let method = header.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("");
+                        let method = header
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("");
                         if method == "DELETE" && header.contains("/messages/") {
                             server_delete_seen.store(true, Ordering::Relaxed);
                             assert!(
@@ -3714,13 +3714,7 @@ mod tests {
         .await;
         stop.store(true, Ordering::Relaxed);
         let _ = server.join();
-        assert!(
-            !app
-                .automod_delete_marks
-                .inner
-                .lock()
-                .contains(10, 70, 42)
-        );
+        assert!(!app.automod_delete_marks.inner.lock().contains(10, 70, 42));
         let report = observed_delete_report(
             &app,
             GuildId::new(10),

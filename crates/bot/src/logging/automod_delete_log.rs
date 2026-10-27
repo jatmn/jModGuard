@@ -12,8 +12,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("automod_delete_log_{:032x}", rand::random::<u128>()));
+        let path = std::env::temp_dir().join(format!(
+            "automod_delete_log_{:032x}",
+            rand::random::<u128>()
+        ));
         let db = Db::open(&path, 2).unwrap();
         let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = 4;
@@ -57,7 +59,10 @@ fn automod_delete_template_fits_discord_limit() {
         .expect("automod_delete template");
     let mut vars = BTreeMap::from([
         ("channel".into(), "<#456>".into()),
-        ("message_url".into(), "https://discord.com/channels/789/456/123".into()),
+        (
+            "message_url".into(),
+            "https://discord.com/channels/789/456/123".into(),
+        ),
         ("mention".into(), "<@42>".into()),
         ("rule".into(), "Bad words".into()),
         ("rule_id".into(), "badword".into()),
@@ -158,13 +163,7 @@ async fn unrelated_delete_stays_plain() {
 #[tokio::test]
 async fn restart_substitute_has_no_mark() {
     let f = Fixture::new();
-    assert!(
-        !f.app
-            .automod_delete_marks
-            .inner
-            .lock()
-            .contains(1, 2, 3)
-    );
+    assert!(!f.app.automod_delete_marks.inner.lock().contains(1, 2, 3));
     let report = observed_delete_report(
         &f.app,
         GuildId::new(1),

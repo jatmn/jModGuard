@@ -39,17 +39,12 @@ impl AutomodDeleteMarks {
     }
 
     fn evict_one(&mut self) {
-        if let Some(key) = self
-            .order
-            .front()
-            .copied()
-            .or_else(|| {
-                self.entries
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.expires)
-                    .map(|(key, _)| *key)
-            })
-        {
+        if let Some(key) = self.order.front().copied().or_else(|| {
+            self.entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| *key)
+        }) {
             self.order.retain(|candidate| *candidate != key);
             self.entries.remove(&key);
         }
@@ -100,11 +95,7 @@ impl AutomodDeleteMarks {
     ) {
         self.prune(now);
         let key = (guild, channel, message);
-        if self
-            .entries
-            .get(&key)
-            .is_some_and(|entry| !entry.confirmed)
-        {
+        if self.entries.get(&key).is_some_and(|entry| !entry.confirmed) {
             self.order.retain(|candidate| *candidate != key);
             self.entries.remove(&key);
         }
@@ -121,9 +112,7 @@ impl AutomodDeleteMarks {
     ) -> Option<(String, String)> {
         self.prune(now);
         let key = (guild, channel, message);
-        let Some(entry) = self.entries.remove(&key) else {
-            return None;
-        };
+        let entry = self.entries.remove(&key)?;
         self.order.retain(|candidate| *candidate != key);
         Some((entry.rule_id, entry.rule_name))
     }
@@ -169,13 +158,10 @@ impl AutomodDeleteMarkAccess {
             .remove_unconfirmed(guild, channel, message, Instant::now());
     }
 
-    pub(crate) fn take(
-        &self,
-        guild: u64,
-        channel: u64,
-        message: u64,
-    ) -> Option<(String, String)> {
-        self.inner.lock().take(guild, channel, message, Instant::now())
+    pub(crate) fn take(&self, guild: u64, channel: u64, message: u64) -> Option<(String, String)> {
+        self.inner
+            .lock()
+            .take(guild, channel, message, Instant::now())
     }
 }
 
@@ -188,7 +174,16 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        assert!(marks.take(1, 2, 3, now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1)).is_none());
+        assert!(
+            marks
+                .take(
+                    1,
+                    2,
+                    3,
+                    now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1)
+                )
+                .is_none()
+        );
     }
 
     #[test]

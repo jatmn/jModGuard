@@ -2188,11 +2188,10 @@ pub(crate) fn observed_delete_report(
     id: MessageId,
     retained: Option<&MessageSnapshot>,
 ) -> MessageReport {
-    let mut report = if let Some((rule_id, rule_name)) = app.automod_delete_marks.take(
-        guild_id.get(),
-        channel.get(),
-        id.get(),
-    ) {
+    let mut report = if let Some((rule_id, rule_name)) =
+        app.automod_delete_marks
+            .take(guild_id.get(), channel.get(), id.get())
+    {
         automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name)
     } else {
         message_delete_report(app, guild_id, channel, id)
