@@ -299,12 +299,12 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     let new_bot = executable(&root, "new-bot").await;
     let new_api = executable(&root, "new-api").await;
     let mut objects = HashMap::new();
-    let bot_release = image(
+    let mut bot_release = image(
         &mut objects,
         "bot",
         &tokio::fs::read(new_bot).await.unwrap(),
     );
-    let api_release = image(
+    let mut api_release = image(
         &mut objects,
         "api",
         &tokio::fs::read(new_api).await.unwrap(),
@@ -413,6 +413,14 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             db::CORE_SCHEMA_VERSION
         );
     }
+    let schema = control.schema_version().await.unwrap();
+    let guild = db::guild_data::SCHEMA_VERSION;
+    for release in [&mut bot_release, &mut api_release] {
+        release.min_schema = schema;
+        release.max_schema = schema;
+        release.result_schema = schema;
+        release.upgrade.as_mut().unwrap().guild_schema = guild;
+    }
     for release in [&bot_release, &api_release] {
         control
             .checked(
@@ -425,11 +433,9 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             .await
             .unwrap();
     }
-    assert!(
-        compatible_control(&control, &bot_release, now())
-            .await
-            .is_err()
-    );
+    compatible_control(&control, &bot_release, now())
+        .await
+        .expect("same-schema pair should be admitted");
     let operation = control
         .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, false, now())
         .await
@@ -1017,9 +1023,9 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
     control.running("api", None, seen, now()).await.unwrap();
     let mut objects = HashMap::new();
     let mut target = image(&mut objects, "bot", b"\x7fELFfixture");
-    target.min_schema = 16;
-    target.max_schema = 16;
-    target.result_schema = 16;
+    target.min_schema = 15;
+    target.max_schema = 15;
+    target.result_schema = 15;
     target.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
     let mut api = target.clone();
     api.component = "api".into();

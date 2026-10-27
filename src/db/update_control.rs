@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
 pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
+pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
+    "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
 pub const LAUNCHER_REVISION: u32 = 17;
@@ -1192,6 +1194,14 @@ impl UpdateControl {
                     "current guild schema compatibility cannot be verified");
                 bot_seen.guild_schema.context("current guild schema unknown")?
             };
+            anyhow::ensure!(
+                target_bot.result_schema == schema && target_api.result_schema == schema,
+                APP_ONLY_SCHEMA_CHANGE_REFUSED
+            );
+            anyhow::ensure!(
+                bot_contract.guild_schema == from_guild,
+                APP_ONLY_SCHEMA_CHANGE_REFUSED
+            );
             anyhow::ensure!(schema >= bot_contract.min_core && schema <= target_bot.result_schema
                 && from_guild >= bot_contract.min_guild && from_guild <= bot_contract.guild_schema,
                 "release cannot upgrade the current databases; downgrades are not allowed");
@@ -1742,7 +1752,7 @@ mod tests {
 
     #[tokio::test]
     async fn pair_pins_both_candidates_and_fences_irreversible_recovery() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION + 1, guild_data::SCHEMA_VERSION + 1).await;
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
         assert!(f.queue(false, 7400).await.is_err());
         let op = f.queue(false, 100).await.unwrap();
         assert_eq!(op.phase, UpgradePhase::Preparing);
@@ -1817,7 +1827,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_invalidates_local_proof_and_control_survives_newer_app_schema() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION + 1, guild_data::SCHEMA_VERSION).await;
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
         let op = f.queue(false, 100).await.unwrap();
         for role in ["bot", "api"] {
             f.control.join_upgrade(&op.id, role, role).await.unwrap();
@@ -1885,7 +1895,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_application_can_admit_explicit_owner_recovery_without_fresh_heartbeat() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION + 1, guild_data::SCHEMA_VERSION).await;
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
         for role in ["bot", "api"] {
             let release = f.control.component(role).await.unwrap().candidate.unwrap();
             f.control
@@ -2265,6 +2275,44 @@ mod tests {
             );
         }
         assert!(f.control.upgrade().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn app_only_paired_queue_refuses_higher_result_schema() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let schema = f.control.schema_version().await.unwrap();
+        for role in ["bot", "api"] {
+            let mut release = f.control.component(role).await.unwrap().candidate.unwrap();
+            release.min_schema = schema + 1;
+            release.max_schema = schema + 1;
+            release.result_schema = schema + 1;
+            f.control
+                .checked(role, "latest", Some(release), None, 200)
+                .await
+                .unwrap();
+        }
+        let error = f.queue(false, 200).await.unwrap_err();
+        assert_eq!(error.to_string(), APP_ONLY_SCHEMA_CHANGE_REFUSED);
+        assert_eq!(f.control.schema_version().await.unwrap(), schema);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn app_only_paired_queue_refuses_guild_schema_change() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let mut release = f.control.component("bot").await.unwrap().candidate.unwrap();
+        release.upgrade.as_mut().unwrap().guild_schema = guild_data::SCHEMA_VERSION + 1;
+        f.control
+            .checked("bot", "latest", Some(release.clone()), None, 200)
+            .await
+            .unwrap();
+        let mut api = f.control.component("api").await.unwrap().candidate.unwrap();
+        api.upgrade.as_mut().unwrap().guild_schema = guild_data::SCHEMA_VERSION + 1;
+        f.control
+            .checked("api", "latest", Some(api), None, 200)
+            .await
+            .unwrap();
+        let error = f.queue(false, 200).await.unwrap_err();
+        assert_eq!(error.to_string(), APP_ONLY_SCHEMA_CHANGE_REFUSED);
     }
 
     #[tokio::test(flavor = "multi_thread")]

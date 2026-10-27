@@ -99,6 +99,8 @@ An owner install request requires a successful release check for the currently s
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
 
+Schema changes ship only in a new container image. The updater refuses an app-only install or switch whose target core or guild schema differs from the live database. An older image refuses a newer database: opening the store fails before any migration SQL runs, and the updater cannot undo a migration that already landed.
+
 The private API-to-bot control link supports either update order for these compatible
 switches. An updated bot accepts correctly signed previous API frames that omit
 both direction and route; frames that include either field must include both with
