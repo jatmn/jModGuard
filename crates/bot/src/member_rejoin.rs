@@ -225,7 +225,11 @@ fn format_case_line(entry: &MemberHistoryEntry) -> String {
 }
 
 fn sanitize_reason_for_report(text: &str) -> String {
-    let single_line = text.replace(['\r', '\n'], " ");
+    let single_line = text
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     single_line
         .replace('\\', "\\\\")
         .replace('`', "\\`")

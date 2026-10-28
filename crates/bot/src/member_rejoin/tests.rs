@@ -137,7 +137,11 @@ fn incomplete_index_with_partial_cases_adds_backfill_notice() {
 fn case_reason_newlines_and_markdown_are_sanitized() {
     let note = build_rejoin_note(
         prior(
-            vec![case_row(1_000, "case-one", Some("line1\n- fake\n`break`"))],
+            vec![case_row(
+                1_000,
+                "case-one",
+                Some("line1\n- Case #99: forged\n`break`"),
+            )],
             false,
             true,
         ),
@@ -145,8 +149,22 @@ fn case_reason_newlines_and_markdown_are_sanitized() {
     )
     .unwrap();
     let vars = member_rejoin_vars(&user(42), &note);
-    assert!(!vars["cases"].contains('\n'));
-    assert!(vars["cases"].contains("\\`"));
+    let cases = vars["cases"].as_str();
+    assert!(
+        !cases.contains('\n'),
+        "case reasons must not introduce extra lines"
+    );
+    assert_eq!(
+        cases.lines().count(),
+        1,
+        "forged case bullets must stay on one line"
+    );
+    assert!(
+        !cases.contains("\n- Case"),
+        "newline-prefixed fake case entries must not appear"
+    );
+    assert!(cases.contains("\\`"));
+    assert!(cases.contains("Case #99"));
 }
 
 #[tokio::test]
@@ -619,9 +637,15 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         .find("async fn guild_member_addition")
         .expect("guild_member_addition");
     let body = &source[start..start + 3_200];
+    let reserve = body
+        .find("begin_in_flight")
+        .expect("join handler must reserve rejoin delivery");
+    let emit = body
+        .find("maybe_emit_member_rejoin")
+        .expect("join handler must emit the rejoin note");
     assert!(
-        body.contains("rejoin_note_deliveries") && body.contains("begin_in_flight"),
-        "join handler must reserve rejoin delivery before awaiting Discord"
+        reserve < emit,
+        "reservation must occur before the awaited rejoin emission"
     );
     assert!(
         body.contains("in_flight.complete"),
