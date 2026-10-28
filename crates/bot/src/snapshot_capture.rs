@@ -1483,9 +1483,6 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 let automod_individual = config
                     .as_ref()
                     .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
-                let bulk_configured = config
-                    .as_ref()
-                    .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
                 let mut single = None;
                 let mut single_unknown = false;
                 for chunk in ids.chunks(100) {
@@ -1509,8 +1506,6 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         *channel,
                                         *id,
                                         row.as_ref(),
-                                        automod_individual,
-                                        bulk_configured,
                                     );
                                     if logging::peel_automod_from_bulk(&report, automod_individual)
                                     {
@@ -1523,8 +1518,26 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         .and_then(|row| row.fields.author_id)
                                         .is_some_and(|author| ignored_authors.contains(&author))
                                     {
+                                        if report.is_none() {
+                                            logging::note_pending_bulk_delete(
+                                                &app,
+                                                *guild,
+                                                *channel,
+                                                &mut transcript,
+                                                *id,
+                                            );
+                                        }
                                         transcript.push_filtered();
                                     } else {
+                                        if report.is_none() {
+                                            logging::note_pending_bulk_delete(
+                                                &app,
+                                                *guild,
+                                                *channel,
+                                                &mut transcript,
+                                                *id,
+                                            );
+                                        }
                                         transcript.push(*id, row.as_ref());
                                     }
                                 } else {
@@ -1544,7 +1557,6 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                     chunk,
                                     &mut transcript,
                                     automod_individual,
-                                    bulk_configured,
                                 );
                             } else {
                                 single_unknown = true;
@@ -1554,8 +1566,19 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
                 app.snapshots.mark_deleted(*guild, *channel, ids);
                 if *bulk {
+                    let pending = transcript.pending_automod.clone();
                     if transcript.worth_sending() {
                         submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
+                    } else if !pending.is_empty() {
+                        logging::settle_bulk_delivery(
+                            &app,
+                            work.context.http.as_ref(),
+                            *guild,
+                            *channel,
+                            &pending,
+                            false,
+                        )
+                        .await;
                     }
                 } else if let Some(id) = ids.first()
                     && let Some(mut report) = logging::observed_delete_report(
@@ -1651,7 +1674,6 @@ pub(crate) fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSe
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn peel_automod_bulk_chunk(
     app: &Arc<BotState>,
     context: &Context,
@@ -1660,24 +1682,18 @@ pub(crate) fn peel_automod_bulk_chunk(
     ids: &[MessageId],
     transcript: &mut logging::BulkTranscript,
     automod_individual: bool,
-    bulk_configured: bool,
 ) {
     for id in ids {
-        let report = logging::observed_bulk_delete_report(
-            app,
-            guild,
-            channel,
-            *id,
-            None,
-            automod_individual,
-            bulk_configured,
-        );
+        let report = logging::observed_bulk_delete_report(app, guild, channel, *id, None);
         if logging::peel_automod_from_bulk(&report, automod_individual) {
             transcript.peel_automod_delete();
             if let Some(report) = report {
                 submit_report(app, context, report);
             }
         } else {
+            if report.is_none() {
+                logging::note_pending_bulk_delete(app, guild, channel, transcript, *id);
+            }
             transcript.push_unknown(*id);
         }
     }
@@ -1691,6 +1707,9 @@ async fn submit_peeled_bulk_deletes(
     ids: Vec<MessageId>,
 ) {
     let Some(permit) = acquire_report_slot(app) else {
+        // The transcript cannot be sent. Still observe pending ids so a later
+        // REST failure can fall back instead of finding no bulk delivery.
+        abandon_unsent_bulk_deletes(app, context, guild, channel, &ids).await;
         return;
     };
     let app = Arc::clone(app);
@@ -1699,6 +1718,34 @@ async fn submit_peeled_bulk_deletes(
         let _permit = permit;
         submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
     });
+}
+
+async fn abandon_unsent_bulk_deletes(
+    app: &Arc<BotState>,
+    context: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+) {
+    let cfg = app.configs.get(&app.db, guild.get()).await.ok();
+    let automod_individual = cfg
+        .as_ref()
+        .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+    let mut transcript = logging::BulkTranscript::new(ids.len());
+    peel_automod_bulk_chunk(
+        app,
+        context,
+        guild,
+        channel,
+        ids,
+        &mut transcript,
+        automod_individual,
+    );
+    let pending = transcript.pending_automod;
+    if !pending.is_empty() {
+        logging::settle_bulk_delivery(app, context.http.as_ref(), guild, channel, &pending, false)
+            .await;
+    }
 }
 
 async fn submit_peeled_bulk_deletes_admitted(
@@ -1712,9 +1759,6 @@ async fn submit_peeled_bulk_deletes_admitted(
     let automod_individual = cfg
         .as_ref()
         .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
-    let bulk_configured = cfg
-        .as_ref()
-        .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
     let mut transcript = logging::BulkTranscript::new(ids.len());
     peel_automod_bulk_chunk(
         app,
@@ -1724,12 +1768,37 @@ async fn submit_peeled_bulk_deletes_admitted(
         &ids,
         &mut transcript,
         automod_individual,
-        bulk_configured,
     );
+    let pending = transcript.pending_automod.clone();
     if !transcript.worth_sending() {
+        if !pending.is_empty() {
+            logging::settle_bulk_delivery(
+                app,
+                context.http.as_ref(),
+                guild,
+                channel,
+                &pending,
+                false,
+            )
+            .await;
+        }
         return;
     }
-    logging::emit_retained_bulk(app, context, guild, channel, transcript).await;
+    if !pending.is_empty() {
+        logging::begin_bulk_delivery(app, guild, channel, &pending);
+    }
+    let delivered = logging::emit_retained_bulk(app, context, guild, channel, transcript).await;
+    if !pending.is_empty() {
+        logging::settle_bulk_delivery(
+            app,
+            context.http.as_ref(),
+            guild,
+            channel,
+            &pending,
+            delivered,
+        )
+        .await;
+    }
 }
 
 fn submit_bulk_report(
@@ -1739,14 +1808,45 @@ fn submit_bulk_report(
     channel: ChannelId,
     transcript: logging::BulkTranscript,
 ) {
+    let pending = transcript.pending_automod.clone();
+    if !pending.is_empty() {
+        logging::begin_bulk_delivery(app, guild, channel, &pending);
+    }
     let Some(permit) = acquire_report_slot(app) else {
+        if !pending.is_empty() {
+            let app = Arc::clone(app);
+            let context = context.clone();
+            tokio::spawn(async move {
+                logging::settle_bulk_delivery(
+                    &app,
+                    context.http.as_ref(),
+                    guild,
+                    channel,
+                    &pending,
+                    false,
+                )
+                .await;
+            });
+        }
         return;
     };
     let app = Arc::clone(app);
     let context = context.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        logging::emit_retained_bulk(&app, &context, guild, channel, transcript).await;
+        let delivered =
+            logging::emit_retained_bulk(&app, &context, guild, channel, transcript).await;
+        if !pending.is_empty() {
+            logging::settle_bulk_delivery(
+                &app,
+                context.http.as_ref(),
+                guild,
+                channel,
+                &pending,
+                delivered,
+            )
+            .await;
+        }
     });
 }
 
@@ -2196,7 +2296,6 @@ mod tests {
             ChannelId::new(456),
             &[MessageId::new(10), MessageId::new(11)],
             &mut transcript,
-            true,
             true,
         );
         assert_eq!(transcript.unknown, 1);

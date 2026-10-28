@@ -889,8 +889,6 @@ async fn account_pending_bulk(
             ChannelId::new(456),
             MessageId::new(id),
             row,
-            automod_individual,
-            bulk_configured,
         );
         if peel_automod_from_bulk(&report, automod_individual) {
             transcript.peel_automod_delete();
@@ -931,15 +929,15 @@ async fn account_pending_bulk(
                 crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete,
                 "{automod} {message} {bulk} {outcome:?}"
             );
-            assert_eq!(removal.covered_by_bulk, kept_pending);
-            emit_replayed_plain_delete(
+            assert!(!removal.covered_by_bulk, "{automod} {message} {bulk}");
+            assert!(!removal.bulk_inflight);
+            replay_unconfirmed_plain_delete(
                 &f.app,
                 &sink,
                 GuildId::new(789),
                 ChannelId::new(456),
                 MessageId::new(123),
-                removal.retained.as_ref(),
-                removal.covered_by_bulk,
+                &removal,
             )
             .await;
         }
@@ -968,14 +966,14 @@ async fn account_pending_bulk(
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
-                    emit_replayed_plain_delete(
+                    assert!(!removal.covered_by_bulk);
+                    replay_unconfirmed_plain_delete(
                         &f.app,
                         &sink,
                         GuildId::new(789),
                         ChannelId::new(456),
                         MessageId::new(123),
-                        removal.retained.as_ref(),
-                        removal.covered_by_bulk,
+                        &removal,
                     )
                     .await;
                 }
@@ -1046,9 +1044,18 @@ async fn account_pending_bulk(
         }
         BulkOutcome::Failure | BulkOutcome::Race => {
             if filter_channel {
+                assert_eq!(messages.len(), 1, "{label}");
                 assert!(
-                    messages.is_empty(),
-                    "channel filter still delivered the fallback: {label}"
+                    bodies
+                        .iter()
+                        .any(|body| body.contains("excluded by channel filter")),
+                    "{label}"
+                );
+                assert!(
+                    bodies
+                        .iter()
+                        .all(|body| !body.contains("bulk fallback body")),
+                    "channel filter exposed retained text: {label}"
                 );
                 assert!(!kept_pending, "{label}");
             } else if filter_author {
@@ -1079,14 +1086,237 @@ async fn account_pending_bulk(
                 assert!(!automod_logged, "{label}");
             } else if bulk {
                 assert!(kept_pending, "bulk-only pending id was peeled: {label}");
+                assert_eq!(messages.len(), 1, "{label}");
                 assert!(
-                    messages.is_empty(),
-                    "bulk transcript would be duplicated: {label}"
+                    bodies.iter().any(|body| body.contains("903")
+                        && body.contains("last observed: bulk fallback body")),
+                    "undelivered bulk did not fall back: {label}"
                 );
+                assert!(!automod_logged, "{label}");
             } else {
                 assert!(messages.is_empty(), "{label}");
             }
         }
     }
     assert!(messages.len() <= 1, "duplicate report: {label}");
+}
+
+fn observe_bulk_only_pending(f: &Fixture) -> crate::automod_delete_marks::AutomodDeleteAttempt {
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut retained = sample_retained("bulk fallback body");
+    retained.continuous = false;
+    assert!(
+        observed_bulk_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+        )
+        .is_none(),
+        "observing a pending delete must not emit"
+    );
+    attempt
+}
+
+async fn replay_bulk_only_rest_failure(
+    f: &Fixture,
+    attempt: crate::automod_delete_marks::AutomodDeleteAttempt,
+    sink: &Sink,
+) -> crate::automod_delete_marks::UnconfirmedRemoval {
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert_eq!(
+        removal.action,
+        crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    removal
+}
+
+fn sink_bodies(sink: &Sink) -> Vec<String> {
+    sink.messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(channel, body)| format!("{channel} {body}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn bulk_only_slot_saturation_replays_one_log_when_rest_fails() {
+    for rest_during_inflight in [false, true] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        let attempt = observe_bulk_only_pending(&f);
+        let pending = [MessageId::new(123)];
+        begin_bulk_delivery(&f.app, GuildId::new(789), ChannelId::new(456), &pending);
+        let held: Vec<_> = (0..32)
+            .map(|_| crate::snapshot_capture::acquire_report_slot(&f.app).unwrap())
+            .collect();
+        assert!(
+            crate::snapshot_capture::acquire_report_slot(&f.app).is_none(),
+            "report slots must be saturated"
+        );
+        let sink = Sink::default();
+        if rest_during_inflight {
+            let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+            assert!(removal.bulk_inflight);
+            assert!(!removal.covered_by_bulk);
+            assert!(
+                sink.messages.lock().unwrap().is_empty(),
+                "in-flight bulk must defer the fallback"
+            );
+            settle_bulk_delivery(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                ChannelId::new(456),
+                &pending,
+                false,
+            )
+            .await;
+        } else {
+            settle_bulk_delivery(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                ChannelId::new(456),
+                &pending,
+                false,
+            )
+            .await;
+            let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+            assert!(!removal.bulk_inflight);
+            assert!(!removal.covered_by_bulk);
+        }
+        drop(held);
+        let bodies = sink_bodies(&sink);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(
+            bodies[0].contains("903") && bodies[0].contains("last observed: bulk fallback body"),
+            "{bodies:?}"
+        );
+        assert!(
+            !bodies[0].contains("Automod deleted"),
+            "fallback must not be labeled automod: {bodies:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bulk_only_filtered_or_blocked_bulk_replays_one_log_when_rest_fails() {
+    for blocked in [false, true] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        if blocked {
+            f.app.invalidate_configs();
+            f.app
+                .remembered_discord_targets
+                .remember_permanent_for_test(
+                    crate::discord::DiscordRestTarget::GuildChannel {
+                        guild: 789,
+                        channel: 903,
+                    },
+                    std::time::Instant::now(),
+                );
+        } else {
+            set_log_filter(
+                &f.app,
+                "message_bulk_delete",
+                Some(r#"{"users":[],"channels":["456"]}"#),
+            )
+            .await;
+        }
+        let cfg = f.app.configs.get(&f.app.db, 789).await.unwrap();
+        assert!(
+            bulk_log_suppressed(&f.app, &cfg, 789, ChannelId::new(456)),
+            "blocked={blocked}"
+        );
+        let attempt = observe_bulk_only_pending(&f);
+        let pending = [MessageId::new(123)];
+        begin_bulk_delivery(&f.app, GuildId::new(789), ChannelId::new(456), &pending);
+        let sink = Sink::default();
+        settle_bulk_delivery(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            ChannelId::new(456),
+            &pending,
+            false,
+        )
+        .await;
+        let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+        assert!(!removal.covered_by_bulk);
+        let bodies = sink_bodies(&sink);
+        assert_eq!(bodies.len(), 1, "blocked={blocked} {bodies:?}");
+        assert!(bodies[0].contains("903"), "{bodies:?}");
+        assert!(
+            !bodies[0].contains("bulk fallback body"),
+            "filtered bulk exposed retained text: {bodies:?}"
+        );
+        let expected = if blocked {
+            "bulk destination unavailable"
+        } else {
+            "excluded by channel filter"
+        };
+        assert!(bodies[0].contains(expected), "{bodies:?}");
+    }
+}
+
+#[tokio::test]
+async fn delivered_bulk_suppresses_the_rest_failure_replay() {
+    for rest_during_inflight in [false, true] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        let attempt = observe_bulk_only_pending(&f);
+        let pending = [MessageId::new(123)];
+        begin_bulk_delivery(&f.app, GuildId::new(789), ChannelId::new(456), &pending);
+        let sink = Sink::default();
+        if rest_during_inflight {
+            let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+            assert!(removal.bulk_inflight);
+            assert!(!removal.covered_by_bulk);
+            assert!(sink.messages.lock().unwrap().is_empty());
+        }
+        settle_bulk_delivery(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            ChannelId::new(456),
+            &pending,
+            true,
+        )
+        .await;
+        if !rest_during_inflight {
+            let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+            assert!(removal.covered_by_bulk);
+            assert!(!removal.bulk_inflight);
+        }
+        assert!(
+            sink.messages.lock().unwrap().is_empty(),
+            "a delivered bulk must not be logged again"
+        );
+    }
 }

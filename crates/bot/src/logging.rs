@@ -2132,6 +2132,8 @@ pub(crate) struct BulkTranscript {
     pub unknown: usize,
     pub omitted: usize,
     pub filtered: usize,
+    /// Pending automod ids kept in this transcript. Covered only after delivery.
+    pub pending_automod: Vec<MessageId>,
     included_authors: HashSet<i64>,
     bytes: usize,
     entries: Vec<String>,
@@ -2146,6 +2148,7 @@ impl BulkTranscript {
             unknown: 0,
             omitted: 0,
             filtered: 0,
+            pending_automod: Vec::new(),
             included_authors: HashSet::new(),
             bytes: "jModGuard last-observed deleted messages\n\n".len(),
             entries: Vec::new(),
@@ -2199,6 +2202,10 @@ impl BulkTranscript {
 
     pub fn peel_automod_delete(&mut self) {
         self.total = self.total.saturating_sub(1);
+    }
+
+    pub fn keep_pending_automod(&mut self, id: MessageId) {
+        self.pending_automod.push(id);
     }
 
     pub fn worth_sending(&self) -> bool {
@@ -2341,13 +2348,124 @@ async fn deliver_bulk_text_fallback_parts(
     (delivered, terminal_error, failure_recovery)
 }
 
+pub(crate) fn bulk_log_suppressed(
+    app: &BotState,
+    cfg: &crate::state::CachedGuildConfig,
+    guild_id: u64,
+    source: ChannelId,
+) -> bool {
+    let Some(destination) = channel_for(cfg, "message_bulk_delete") else {
+        return true;
+    };
+    let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: guild_id,
+        channel: destination.get(),
+    };
+    if app
+        .remembered_discord_targets
+        .blocked(rest_target, Instant::now())
+    {
+        return true;
+    }
+    let vars = BTreeMap::from([
+        ("channel".into(), format!("<#{source}>")),
+        ("channel_id".into(), source.to_string()),
+    ]);
+    cfg.log_filters
+        .get("message_bulk_delete")
+        .is_some_and(|filter| excluded(filter, &vars))
+}
+
+pub(crate) fn begin_bulk_delivery(
+    app: &BotState,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+) {
+    let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
+    app.automod_delete_marks
+        .begin_bulk_delivery(guild.get(), channel.get(), &raw);
+}
+
+/// Keep a pending automod id in this transcript and mark delivery in flight.
+/// Call this before the next await so a REST failure cannot treat the id as
+/// uncovered and also leave it in a transcript that is still going out.
+pub(crate) fn note_pending_bulk_delete(
+    app: &BotState,
+    guild: GuildId,
+    channel: ChannelId,
+    transcript: &mut BulkTranscript,
+    id: MessageId,
+) {
+    transcript.keep_pending_automod(id);
+    begin_bulk_delivery(app, guild, channel, &[id]);
+}
+
+pub(crate) async fn settle_bulk_delivery(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+    delivered: bool,
+) {
+    let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
+    let deferred =
+        app.automod_delete_marks
+            .finish_bulk_delivery(guild.get(), channel.get(), &raw, delivered);
+    for item in deferred {
+        emit_replayed_plain_delete(
+            app,
+            sink,
+            guild,
+            channel,
+            MessageId::new(item.message),
+            item.retained.as_ref(),
+            false,
+        )
+        .await;
+    }
+}
+
+pub(crate) async fn replay_unconfirmed_plain_delete(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    removal: &crate::automod_delete_marks::UnconfirmedRemoval,
+) {
+    if matches!(
+        app.automod_delete_marks.claim_or_defer_plain_replay(
+            guild_id.get(),
+            channel.get(),
+            id.get(),
+            removal.retained.clone(),
+        ),
+        crate::automod_delete_marks::BulkPlainReplay::Covered
+            | crate::automod_delete_marks::BulkPlainReplay::Deferred
+    ) {
+        return;
+    }
+    emit_replayed_plain_delete(
+        app,
+        sink,
+        guild_id,
+        channel,
+        id,
+        removal.retained.as_ref(),
+        false,
+    )
+    .await;
+}
+
 pub(crate) async fn emit_retained_bulk(
     app: &Arc<BotState>,
     ctx: &Context,
     guild: GuildId,
     channel: ChannelId,
     transcript: BulkTranscript,
-) {
+) -> bool {
     let vars = BTreeMap::from([
         ("channel".into(), format!("<#{channel}>")),
         ("channel_id".into(), channel.to_string()),
@@ -2368,7 +2486,7 @@ pub(crate) async fn emit_retained_bulk(
     ]);
     let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
         record_delivery_failure(app);
-        return;
+        return false;
     };
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
     let started = Instant::now();
@@ -2381,28 +2499,18 @@ pub(crate) async fn emit_retained_bulk(
         Ok(Ok(cfg)) => cfg,
         _ => {
             record_delivery_failure(app);
-            return;
+            return false;
         }
     };
     let Some(destination) = channel_for(&cfg, "message_bulk_delete") else {
-        return;
+        return false;
     };
     let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild.get(),
         channel: destination.get(),
     };
-    if app
-        .remembered_discord_targets
-        .blocked(rest_target, Instant::now())
-    {
-        return;
-    }
-    if cfg
-        .log_filters
-        .get("message_bulk_delete")
-        .is_some_and(|filter| excluded(filter, &vars))
-    {
-        return;
+    if bulk_log_suppressed(app, &cfg, guild.get(), channel) {
+        return false;
     }
     if cfg
         .log_filters
@@ -2431,8 +2539,8 @@ pub(crate) async fn emit_retained_bulk(
             .unwrap_or_else(|| default_template("message_bulk_delete"));
         let rendered = templates::render_bounded(template, &display, 2000);
         let left = deadline.saturating_sub(started.elapsed());
-        if left.is_zero()
-            || !matches!(
+        let sent = !left.is_zero()
+            && matches!(
                 tokio::time::timeout(
                     left,
                     crate::discord::race_discord_call(
@@ -2442,11 +2550,11 @@ pub(crate) async fn emit_retained_bulk(
                 )
                 .await,
                 Ok(crate::discord::DiscordCall::Finished(Ok(_)))
-            )
-        {
+            );
+        if !sent {
             record_delivery_failure(app);
         }
-        return;
+        return sent;
     }
     let template = cfg
         .templates
@@ -2508,7 +2616,7 @@ pub(crate) async fn emit_retained_bulk(
         }
         _ => {
             record_delivery_failure(app);
-            return;
+            return false;
         }
     }
     finish_bulk_channel_delivery(
@@ -2518,6 +2626,7 @@ pub(crate) async fn emit_retained_bulk(
         delivered,
         terminal_error.as_ref(),
     );
+    delivered
 }
 
 fn finish_bulk_channel_delivery(
@@ -2802,21 +2911,16 @@ async fn emit_failure_bulk(
         guild: guild_id.get(),
         channel: destination.get(),
     };
-    if app
-        .remembered_discord_targets
-        .blocked(rest_target, Instant::now())
-    {
-        return;
-    }
     let filter = cfg.log_filters.get("message_bulk_delete");
-    if filter.is_some_and(|filter| {
+    let channel_ignored = filter.is_some_and(|filter| {
         filter
             .channels
             .iter()
             .any(|ignored| ignored == &channel.to_string())
-    }) {
-        return;
-    }
+    });
+    let destination_blocked = app
+        .remembered_discord_targets
+        .blocked(rest_target, Instant::now());
     let author = retained.and_then(|row| row.fields.author_id);
     let author_ignored = author.is_some_and(|author| {
         filter.is_some_and(|filter| {
@@ -2826,10 +2930,17 @@ async fn emit_failure_bulk(
                 .any(|ignored| ignored == &author.to_string())
         })
     });
+    let hide_text = channel_ignored || destination_blocked || author_ignored;
     let mut transcript = BulkTranscript::new(1);
-    let details = if author_ignored {
+    let details = if hide_text {
         transcript.push_filtered();
-        "excluded by user filter".to_string()
+        if destination_blocked {
+            "bulk destination unavailable".to_string()
+        } else if channel_ignored {
+            "excluded by channel filter".to_string()
+        } else {
+            "excluded by user filter".to_string()
+        }
     } else if let Some(row) = retained {
         transcript.push(id, Some(row));
         let text = retained_content_with_limit(row, 500);
@@ -2890,29 +3001,19 @@ pub(crate) fn observed_delete_report(
     id: MessageId,
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
-    classify_observed_delete(app, guild_id, channel, id, retained, false)
+    classify_observed_delete(app, guild_id, channel, id, retained)
 }
 
-/// Bulk-delete observation. A pending automod id is marked covered only when this
-/// bulk transcript will actually be delivered and no individual automod route will
-/// take the id back out.
+/// Bulk-delete observation. A pending id is not covered here. Coverage is set
+/// only after the transcript that kept the id is actually delivered.
 pub(crate) fn observed_bulk_delete_report(
     app: &BotState,
     guild_id: GuildId,
     channel: ChannelId,
     id: MessageId,
     retained: Option<&MessageSnapshot>,
-    automod_individual: bool,
-    bulk_configured: bool,
 ) -> Option<MessageReport> {
-    classify_observed_delete(
-        app,
-        guild_id,
-        channel,
-        id,
-        retained,
-        bulk_configured && !automod_individual,
-    )
+    observed_delete_report(app, guild_id, channel, id, retained)
 }
 
 fn classify_observed_delete(
@@ -2921,26 +3022,15 @@ fn classify_observed_delete(
     channel: ChannelId,
     id: MessageId,
     retained: Option<&MessageSnapshot>,
-    include_pending_in_bulk: bool,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
     let retained_for_mark = retained.cloned();
-    let observation = if include_pending_in_bulk {
-        app.automod_delete_marks.observe_bulk_gateway_delete(
-            guild_id.get(),
-            channel.get(),
-            id.get(),
-            retained_for_mark,
-            true,
-        )
-    } else {
-        app.automod_delete_marks.observe_gateway_delete(
-            guild_id.get(),
-            channel.get(),
-            id.get(),
-            retained_for_mark,
-        )
-    };
+    let observation = app.automod_delete_marks.observe_gateway_delete(
+        guild_id.get(),
+        channel.get(),
+        id.get(),
+        retained_for_mark,
+    );
     let mut report = match observation {
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
             automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)

@@ -41,8 +41,26 @@ pub(crate) struct UnconfirmedRemoval {
     pub retained: Option<MessageSnapshot>,
     /// Automod settlement for a younger confirmed sibling deferred until this removal.
     pub released_settlement: Option<AutomodSettlement>,
-    /// The gateway bulk transcript already includes this pending delete.
+    /// The bulk transcript that included this delete was delivered.
     pub covered_by_bulk: bool,
+    /// This delete is in a bulk transcript whose delivery has not settled.
+    pub bulk_inflight: bool,
+}
+
+pub(crate) struct DeferredBulkReplay {
+    pub message: u64,
+    pub retained: Option<MessageSnapshot>,
+}
+
+/// What a failed REST delete should do with a pending id that stayed in a bulk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkPlainReplay {
+    /// The transcript that kept this delete was delivered.
+    Covered,
+    /// Delivery has not settled; emit only if it fails.
+    Deferred,
+    /// No delivered or in-flight bulk covers this delete.
+    Emit,
 }
 
 /// Per-REST-delete attempt identity for one message target.
@@ -67,8 +85,16 @@ struct MessageGatewayState {
     retained: Option<MessageSnapshot>,
     /// Gateway delete already produced or reserved a report class for this message.
     settled: bool,
-    /// Pending id stayed in a bulk transcript that will be delivered.
-    covered_by_bulk: bool,
+}
+
+/// Delivery of one message that stayed in a bulk transcript.
+/// `covered` is set only after that transcript is actually delivered.
+struct BulkLogState {
+    inflight: bool,
+    covered: bool,
+    deferred: bool,
+    deferred_retained: Option<MessageSnapshot>,
+    started: Instant,
 }
 
 #[derive(Default)]
@@ -78,6 +104,8 @@ pub(crate) struct AutomodDeleteMarks {
     entries: HashMap<MarkKey, AutomodDeleteMark>,
     by_message: HashMap<MessageTarget, Vec<MarkKey>>,
     gateway: HashMap<MessageTarget, MessageGatewayState>,
+    /// Pending ids kept in a bulk transcript, keyed until delivery settles.
+    bulk_logs: HashMap<MessageTarget, BulkLogState>,
     mark_expiry_heap: BinaryHeap<Reverse<(Instant, MarkKey)>>,
     gateway_retained_expiry_heap: BinaryHeap<Reverse<(i64, MessageTarget)>>,
 }
@@ -281,6 +309,7 @@ impl AutomodDeleteMarks {
     }
 
     fn prune(&mut self, now: Instant) {
+        self.expire_bulk_logs(now);
         let wall = now_ms();
         self.clear_expired_retained(wall);
         while let Some(Reverse((heap_expires, key))) = self.mark_expiry_heap.peek().copied() {
@@ -472,6 +501,7 @@ impl AutomodDeleteMarks {
                 retained: None,
                 released_settlement: None,
                 covered_by_bulk: false,
+                bulk_inflight: false,
             };
         };
         if entry.confirmed {
@@ -480,8 +510,10 @@ impl AutomodDeleteMarks {
                 retained: None,
                 released_settlement: None,
                 covered_by_bulk: false,
+                bulk_inflight: false,
             };
         }
+        let (covered_by_bulk, bulk_inflight) = self.bulk_coverage(target);
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
         let retained = Self::settlement_retained_for(&gateway, entry.retained.clone());
         let remaining_attempts = self
@@ -506,8 +538,125 @@ impl AutomodDeleteMarks {
             },
             retained,
             released_settlement,
-            covered_by_bulk: gateway.covered_by_bulk,
+            covered_by_bulk,
+            bulk_inflight,
         }
+    }
+
+    fn expire_bulk_logs(&mut self, now: Instant) {
+        self.bulk_logs.retain(|_, state| {
+            now.checked_duration_since(state.started)
+                .is_none_or(|age| age < AUTOMOD_DELETE_MARK_TTL)
+        });
+    }
+
+    fn bulk_coverage(&self, target: MessageTarget) -> (bool, bool) {
+        match self.bulk_logs.get(&target) {
+            Some(state) => (state.covered, state.inflight),
+            None => (false, false),
+        }
+    }
+
+    pub(crate) fn begin_bulk_delivery(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        ids: &[u64],
+        now: Instant,
+    ) {
+        self.expire_bulk_logs(now);
+        for message in ids {
+            let target = Self::message_target(guild, channel, *message);
+            let pending = self
+                .gateway
+                .get(&target)
+                .is_some_and(|state| state.observed && !state.settled);
+            if !pending {
+                continue;
+            }
+            if self.bulk_logs.len() >= MAX_AUTOMOD_DELETE_MARKS
+                && !self.bulk_logs.contains_key(&target)
+            {
+                continue;
+            }
+            let state = self.bulk_logs.entry(target).or_insert(BulkLogState {
+                inflight: false,
+                covered: false,
+                deferred: false,
+                deferred_retained: None,
+                started: now,
+            });
+            if state.covered {
+                continue;
+            }
+            state.inflight = true;
+            state.started = now;
+        }
+    }
+
+    pub(crate) fn finish_bulk_delivery(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        ids: &[u64],
+        delivered: bool,
+    ) -> Vec<DeferredBulkReplay> {
+        let mut replay = Vec::new();
+        for message in ids {
+            let target = Self::message_target(guild, channel, *message);
+            if delivered {
+                if let Some(state) = self.bulk_logs.get_mut(&target) {
+                    state.inflight = false;
+                    state.covered = true;
+                    state.deferred = false;
+                    state.deferred_retained = None;
+                }
+                continue;
+            }
+            if self
+                .bulk_logs
+                .get(&target)
+                .is_some_and(|state| state.covered)
+            {
+                continue;
+            }
+            let Some(state) = self.bulk_logs.remove(&target) else {
+                continue;
+            };
+            if state.deferred {
+                replay.push(DeferredBulkReplay {
+                    message: *message,
+                    retained: state.deferred_retained,
+                });
+            }
+        }
+        replay
+    }
+
+    /// Decide under one lock so a delivery settlement cannot land between the
+    /// coverage read and storing the fallback.
+    pub(crate) fn claim_or_defer_plain_replay(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        retained: Option<MessageSnapshot>,
+    ) -> BulkPlainReplay {
+        let Some(state) = self
+            .bulk_logs
+            .get_mut(&Self::message_target(guild, channel, message))
+        else {
+            return BulkPlainReplay::Emit;
+        };
+        if state.covered {
+            return BulkPlainReplay::Covered;
+        }
+        if state.inflight {
+            state.deferred = true;
+            state.deferred_retained = retained;
+            return BulkPlainReplay::Deferred;
+        }
+        BulkPlainReplay::Emit
     }
 
     /// REST remained uncertain after a gateway observation; emit without retrying Discord.
@@ -706,32 +855,41 @@ impl AutomodDeleteMarkAccess {
         message: u64,
         retained: Option<MessageSnapshot>,
     ) -> GatewayDeleteObservation {
-        self.observe_bulk_gateway_delete(guild, channel, message, retained, false)
+        self.inner
+            .lock()
+            .observe_gateway_delete(guild, channel, message, retained, Instant::now())
     }
 
-    /// Like [`Self::observe_gateway_delete`]. When `include_pending_in_bulk` is set,
-    /// a still-pending observation is marked as already represented by the bulk
-    /// transcript so a later REST failure does not log it a second time.
-    pub(crate) fn observe_bulk_gateway_delete(
+    /// A pending id stayed in a bulk transcript.
+    /// Coverage stays false until [`Self::finish_bulk_delivery`] reports success.
+    pub(crate) fn begin_bulk_delivery(&self, guild: u64, channel: u64, ids: &[u64]) {
+        self.inner
+            .lock()
+            .begin_bulk_delivery(guild, channel, ids, Instant::now());
+    }
+
+    pub(crate) fn finish_bulk_delivery(
+        &self,
+        guild: u64,
+        channel: u64,
+        ids: &[u64],
+        delivered: bool,
+    ) -> Vec<DeferredBulkReplay> {
+        self.inner
+            .lock()
+            .finish_bulk_delivery(guild, channel, ids, delivered)
+    }
+
+    pub(crate) fn claim_or_defer_plain_replay(
         &self,
         guild: u64,
         channel: u64,
         message: u64,
         retained: Option<MessageSnapshot>,
-        include_pending_in_bulk: bool,
-    ) -> GatewayDeleteObservation {
-        let mut marks = self.inner.lock();
-        let observation =
-            marks.observe_gateway_delete(guild, channel, message, retained, Instant::now());
-        if include_pending_in_bulk
-            && matches!(observation, GatewayDeleteObservation::PendingAutomod)
-            && let Some(state) = marks.gateway.get_mut(&(guild, channel, message))
-            && state.observed
-            && !state.settled
-        {
-            state.covered_by_bulk = true;
-        }
-        observation
+    ) -> BulkPlainReplay {
+        self.inner
+            .lock()
+            .claim_or_defer_plain_replay(guild, channel, message, retained)
     }
 
     pub(crate) fn confirm(

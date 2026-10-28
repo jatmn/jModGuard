@@ -1481,9 +1481,6 @@ impl EventHandler for Handler {
             let automod_individual = cfg
                 .as_ref()
                 .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
-            let bulk_configured = cfg
-                .as_ref()
-                .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
             let mut transcript = logging::BulkTranscript::new(ids.len());
             crate::snapshot_capture::peel_automod_bulk_chunk(
                 &self.app,
@@ -1493,11 +1490,36 @@ impl EventHandler for Handler {
                 &ids,
                 &mut transcript,
                 automod_individual,
-                bulk_configured,
             );
+            let pending = transcript.pending_automod.clone();
             if transcript.worth_sending() {
-                logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)
+                if !pending.is_empty() {
+                    logging::begin_bulk_delivery(&self.app, guild_id, channel_id, &pending);
+                }
+                let delivered =
+                    logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)
+                        .await;
+                if !pending.is_empty() {
+                    logging::settle_bulk_delivery(
+                        &self.app,
+                        ctx.http.as_ref(),
+                        guild_id,
+                        channel_id,
+                        &pending,
+                        delivered,
+                    )
                     .await;
+                }
+            } else if !pending.is_empty() {
+                logging::settle_bulk_delivery(
+                    &self.app,
+                    ctx.http.as_ref(),
+                    guild_id,
+                    channel_id,
+                    &pending,
+                    false,
+                )
+                .await;
             }
         }
     }

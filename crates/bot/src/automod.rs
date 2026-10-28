@@ -503,7 +503,7 @@ async fn automod_try_delete_message(
                 message,
                 delete_attempt,
             );
-            if let Some(settlement) = removal.released_settlement {
+            if let Some(settlement) = removal.released_settlement.as_ref() {
                 logging::emit_reconciled_automod_delete(
                     app,
                     http,
@@ -519,14 +519,13 @@ async fn automod_try_delete_message(
             if removal.action
                 == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
             {
-                logging::emit_replayed_plain_delete(
+                logging::replay_unconfirmed_plain_delete(
                     app,
                     http,
                     GuildId::new(guild_id),
                     ChannelId::new(channel),
                     MessageId::new(message),
-                    removal.retained.as_ref(),
-                    removal.covered_by_bulk,
+                    &removal,
                 )
                 .await;
             }
@@ -573,7 +572,7 @@ async fn automod_try_delete_message(
                     message,
                     delete_attempt,
                 );
-                if let Some(settlement) = removal.released_settlement {
+                if let Some(settlement) = removal.released_settlement.as_ref() {
                     logging::emit_reconciled_automod_delete(
                         app,
                         http,
@@ -589,14 +588,13 @@ async fn automod_try_delete_message(
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
-                    logging::emit_replayed_plain_delete(
+                    logging::replay_unconfirmed_plain_delete(
                         app,
                         http,
                         GuildId::new(guild_id),
                         ChannelId::new(channel),
                         MessageId::new(message),
-                        removal.retained.as_ref(),
-                        removal.covered_by_bulk,
+                        &removal,
                     )
                     .await;
                 }

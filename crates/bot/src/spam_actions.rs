@@ -582,7 +582,7 @@ async fn punish_proven_match(
                     *message,
                     delete_attempt,
                 );
-                if let Some(settlement) = removal.released_settlement {
+                if let Some(settlement) = removal.released_settlement.clone() {
                     crate::logging::spawn_reconciled_automod_delete(
                         std::sync::Arc::clone(app),
                         Arc::clone(&http),
@@ -597,14 +597,13 @@ async fn punish_proven_match(
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
-                    crate::logging::emit_replayed_plain_delete(
+                    crate::logging::replay_unconfirmed_plain_delete(
                         app,
                         http.as_ref(),
                         GuildId::new(found.guild),
                         ChannelId::new(*channel),
                         MessageId::new(*message),
-                        removal.retained.as_ref(),
-                        removal.covered_by_bulk,
+                        &removal,
                     )
                     .await;
                 }
@@ -636,7 +635,7 @@ async fn punish_proven_match(
                         *message,
                         delete_attempt,
                     );
-                    if let Some(settlement) = removal.released_settlement {
+                    if let Some(settlement) = removal.released_settlement.clone() {
                         crate::logging::spawn_reconciled_automod_delete(
                             std::sync::Arc::clone(app),
                             Arc::clone(&http),
@@ -651,14 +650,13 @@ async fn punish_proven_match(
                     if removal.action
                         == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                     {
-                        crate::logging::emit_replayed_plain_delete(
+                        crate::logging::replay_unconfirmed_plain_delete(
                             app,
                             http.as_ref(),
                             GuildId::new(found.guild),
                             ChannelId::new(*channel),
                             MessageId::new(*message),
-                            removal.retained.as_ref(),
-                            removal.covered_by_bulk,
+                            &removal,
                         )
                         .await;
                     }
