@@ -201,6 +201,17 @@ pub async fn add_warn(
     .await
 }
 
+pub async fn count_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<usize> {
+    db.with_conn(move |conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM warns WHERE guild_id = ?1 AND user_id = ?2",
+            params![guild_id, user_id],
+            |row| Ok(row.get::<i64>(0)? as usize),
+        )
+    })
+    .await
+}
+
 pub async fn list_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<Vec<WarnRow>> {
     db.with_conn(move |conn| {
         let mut stmt = conn.prepare(

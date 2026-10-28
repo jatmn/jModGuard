@@ -1048,6 +1048,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_member_sync"
                     | "guild_member_directory"
                     | "guild_member_pending_bans"
+                    | "guild_member_pending_rejoin_notes"
                     | "guild_member_stays"
                     | "guild_member_state_observations"
                     | "guild_member_target_checks"

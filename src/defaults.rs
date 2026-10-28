@@ -4,6 +4,8 @@
 
 use crate::types::{ActionDef, Behavior, CommandDef, PlanStep, RULE_IDS, RuleDef};
 use serde_json::json;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 pub fn default_rules() -> Vec<RuleDef> {
     let mut out = Vec::with_capacity(RULE_IDS.len());
@@ -116,6 +118,25 @@ fn action(
     }
 }
 
+/// Writable non-built-in command for configuration writer and API tests.
+pub fn custom_command_fixture(name: &str) -> CommandDef {
+    CommandDef {
+        name: name.into(),
+        aliases: vec![],
+        category: "Fixture".into(),
+        description: "fixture".into(),
+        usage: format!("!{name}"),
+        enabled: true,
+        permission: "everyone".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: Behavior::Say,
+        response: String::new(),
+        log_event: String::new(),
+    }
+}
+
 #[allow(clippy::vec_init_then_push)]
 pub fn default_commands() -> Vec<CommandDef> {
     let mut out = Vec::new();
@@ -208,6 +229,17 @@ pub fn default_commands() -> Vec<CommandDef> {
         vec![],
     ));
     out.push(cmd(
+        "userinfo",
+        "Moderation",
+        "Show a member's cached profile, warnings, and recent cases.",
+        "!userinfo [user]",
+        "mod",
+        Behavior::UserInfo,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
         "purge",
         "Moderation",
         "Delete the last N messages in this channel.",
@@ -249,6 +281,17 @@ pub fn default_commands() -> Vec<CommandDef> {
         Behavior::Banlist,
         "",
         "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "voice",
+        "Moderation",
+        "Report which voice channel a user is in (gateway cache).",
+        "!voice <user>",
+        "mod",
+        Behavior::Voice,
+        "",
+        "",
         vec![],
     ));
     out.push(cmd(
@@ -363,6 +406,198 @@ pub fn default_commands() -> Vec<CommandDef> {
     out
 }
 
+/// Built-in commands merged from the running binary but not written to global
+/// `commands` rows during rolling upgrades (older binaries cannot deserialize
+/// unknown `Behavior` kinds).
+pub const BINARY_OVERLAY_COMMAND_NAMES: &[&str] = &["voice"];
+
+pub fn is_binary_overlay_command_name(name: &str) -> bool {
+    BINARY_OVERLAY_COMMAND_NAMES
+        .iter()
+        .any(|overlay| overlay.eq_ignore_ascii_case(name))
+}
+
+/// Behaviors merged from the running binary and never written to shared `commands` rows.
+pub fn is_binary_overlay_behavior(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Voice)
+}
+
+pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
+    is_binary_overlay_command_name(&cmd.name) || is_binary_overlay_behavior(&cmd.behavior)
+}
+
+fn builtin_command_labels_lower() -> &'static HashSet<String> {
+    static LABELS: OnceLock<HashSet<String>> = OnceLock::new();
+    LABELS.get_or_init(|| {
+        let mut labels = HashSet::new();
+        for cmd in default_commands() {
+            labels.insert(cmd.name.to_ascii_lowercase());
+            for alias in &cmd.aliases {
+                labels.insert(alias.to_ascii_lowercase());
+            }
+        }
+        labels
+    })
+}
+
+/// Every shipped command name and alias (derived from [`default_commands`]).
+pub fn builtin_command_labels() -> Vec<String> {
+    let mut labels: Vec<String> = builtin_command_labels_lower().iter().cloned().collect();
+    labels.sort();
+    labels
+}
+
+/// Canonical primary command name when `label` matches a shipped name or alias.
+pub fn builtin_command_for_label(label: &str) -> Option<String> {
+    for cmd in default_commands() {
+        if cmd.name.eq_ignore_ascii_case(label) {
+            return Some(cmd.name.clone());
+        }
+        for alias in &cmd.aliases {
+            if alias.eq_ignore_ascii_case(label) {
+                return Some(cmd.name.clone());
+            }
+        }
+    }
+    None
+}
+
+pub fn command_persist_rejected_message(storage_name: &str) -> String {
+    format!("built-in command `{storage_name}` cannot be written to the database")
+}
+
+/// Primary shipped command name (not an alias).
+pub fn is_builtin_primary_command_name(name: &str) -> bool {
+    default_commands()
+        .iter()
+        .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
+}
+
+/// Shipped built-in for runtime enforcement and API reads.
+/// Stored rows do not contribute definition or access controls.
+pub fn effective_builtin_command(
+    primary: &str,
+    _stored: Option<&CommandDef>,
+) -> Option<CommandDef> {
+    default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))
+}
+
+fn install_shipped_builtin(
+    commands: &mut std::collections::HashMap<String, CommandDef>,
+    shipped: CommandDef,
+) {
+    let stale: Vec<String> = commands
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(&shipped.name))
+        .cloned()
+        .collect();
+    for key in stale {
+        commands.remove(&key);
+    }
+    commands.insert(shipped.name.clone(), shipped);
+}
+
+/// Removes legacy rows and aliases that compete with shipped built-in labels.
+pub fn resolve_legacy_builtin_command_collisions(
+    commands: &mut std::collections::HashMap<String, CommandDef>,
+) {
+    let shadow_keys: Vec<String> = commands
+        .keys()
+        .filter(|key| {
+            builtin_command_for_label(key).is_some_and(|primary| !primary.eq_ignore_ascii_case(key))
+        })
+        .cloned()
+        .collect();
+    for key in shadow_keys {
+        commands.remove(&key);
+    }
+    for (key, command) in commands.iter_mut() {
+        if is_builtin_primary_command_name(key) {
+            continue;
+        }
+        command
+            .aliases
+            .retain(|alias| builtin_command_for_label(alias).is_none());
+    }
+}
+
+/// Effective command map for one guild: guild rows overlay global rows, then
+/// shipped built-ins replace any stored primary (`apply_shipped_builtin_commands`).
+pub fn effective_command_registry(
+    global_commands: &std::collections::HashMap<String, CommandDef>,
+    guild_commands: &std::collections::HashMap<String, CommandDef>,
+) -> std::collections::HashMap<String, CommandDef> {
+    let mut commands = global_commands.clone();
+    for (name, def) in guild_commands {
+        commands.insert(name.clone(), def.clone());
+    }
+    apply_shipped_builtin_commands(&mut commands);
+    commands
+}
+
+/// Replaces built-in primaries with the shipped command. Stored rows do not
+/// contribute definition or access controls.
+pub fn apply_shipped_builtin_commands(
+    commands: &mut std::collections::HashMap<String, CommandDef>,
+) {
+    for shipped in default_global_seed_commands() {
+        install_shipped_builtin(commands, shipped);
+    }
+    merge_binary_overlay_commands(commands);
+    resolve_legacy_builtin_command_collisions(commands);
+}
+
+/// True when a command row must not be written to shared storage (rolling upgrades).
+pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandDef) -> bool {
+    if is_binary_overlay_command_name(storage_name)
+        || is_binary_overlay_command_name(&cmd.name)
+        || is_binary_overlay_behavior(&cmd.behavior)
+        || cmd
+            .aliases
+            .iter()
+            .any(|alias| is_binary_overlay_command_name(alias))
+    {
+        return true;
+    }
+
+    if is_builtin_primary_command_name(storage_name) {
+        return true;
+    }
+
+    if builtin_command_for_label(storage_name).is_some() {
+        return true;
+    }
+
+    if builtin_command_for_label(&cmd.name).is_some() {
+        return true;
+    }
+
+    cmd.aliases
+        .iter()
+        .any(|alias| builtin_command_for_label(alias).is_some())
+}
+
+/// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
+pub fn default_global_seed_commands() -> Vec<CommandDef> {
+    default_commands()
+        .into_iter()
+        .filter(|cmd| !BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str()))
+        .collect()
+}
+
+/// Inserts shipped binary-overlay commands, replacing any legacy stored row (including
+/// guild-persisted `voice` rows from older builds). Stored access controls are ignored.
+pub fn merge_binary_overlay_commands(commands: &mut std::collections::HashMap<String, CommandDef>) {
+    for shipped in default_commands() {
+        if !BINARY_OVERLAY_COMMAND_NAMES.contains(&shipped.name.as_str()) {
+            continue;
+        }
+        install_shipped_builtin(commands, shipped);
+    }
+}
+
 fn aliases_for(name: &str) -> Vec<String> {
     match name {
         "ban" => vec!["yeet".into(), "b".into()],
@@ -470,6 +705,9 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// `!userinfo` / `/userinfo` reply body (rendered and clipped to 2000 UTF-16 units).
+pub const USER_INFO_TEMPLATE: &str = "**User info**\n**ID:** `{user_id}`\n**Username:** {username}\n**Global name:** {global_name}\n**Nick:** {nick}\n**Account:** {account_created} ({account_age})\n**Joined:** {joined_at}\n**Roles:** {roles}\n**Voice:** {voice}\n**Warnings:** {warns}\n**Cases:**\n{cases}{clipped}";
+
 /// Appended to an attachment-burst review after a moderator uses a button.
 pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";
 pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
@@ -552,6 +790,10 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
         (
             "thread_delete",
             "**:thread: Thread deleted**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "member_rejoin",
+            "**:arrows_counterclockwise: {user} rejoined with prior moderation**\n\n**User:** {mention} (`{user_id}`)\n{cases}\n{notice}",
         ),
     ]
 }
@@ -675,5 +917,238 @@ pub fn sample_plan_command() -> CommandDef {
         },
         response: String::new(),
         log_event: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod rolling_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_builtin_ignores_stored_access_and_definition() {
+        let shipped = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban");
+        let stored = CommandDef {
+            enabled: false,
+            permission: "owner".into(),
+            roles: vec![555],
+            channels: vec![777],
+            cooldown_secs: 42,
+            description: "legacy".into(),
+            aliases: vec!["legacy-alias".into()],
+            behavior: Behavior::Say,
+            ..shipped.clone()
+        };
+        let merged = effective_builtin_command("ban", Some(&stored)).expect("ban");
+        assert_eq!(merged.description, shipped.description);
+        assert_eq!(merged.aliases, shipped.aliases);
+        assert!(matches!(merged.behavior, Behavior::Ban { .. }));
+        assert_eq!(merged.enabled, shipped.enabled);
+        assert_eq!(merged.permission, shipped.permission);
+        assert_eq!(merged.roles, shipped.roles);
+        assert_eq!(merged.channels, shipped.channels);
+        assert_eq!(merged.cooldown_secs, shipped.cooldown_secs);
+        let mut commands = std::collections::HashMap::from([("Ban".into(), stored)]);
+        apply_shipped_builtin_commands(&mut commands);
+        assert!(!commands.contains_key("Ban"));
+        assert_eq!(commands["ban"].enabled, shipped.enabled);
+        assert_eq!(commands["ban"].permission, shipped.permission);
+        assert_eq!(commands["ban"].cooldown_secs, shipped.cooldown_secs);
+    }
+
+    #[test]
+    fn resolve_legacy_builtin_command_collisions_strips_reserved_aliases() {
+        let mut commands = std::collections::HashMap::from([
+            (
+                "custom".into(),
+                CommandDef {
+                    name: "custom".into(),
+                    aliases: vec!["status".into(), "mine".into()],
+                    category: String::new(),
+                    description: "x".into(),
+                    usage: "!custom".into(),
+                    enabled: true,
+                    permission: "everyone".into(),
+                    roles: vec![],
+                    channels: vec![],
+                    cooldown_secs: 0,
+                    behavior: Behavior::Say,
+                    response: String::new(),
+                    log_event: String::new(),
+                },
+            ),
+            (
+                "yeet".into(),
+                CommandDef {
+                    name: "yeet".into(),
+                    aliases: vec![],
+                    category: String::new(),
+                    description: "shadow".into(),
+                    usage: "!yeet".into(),
+                    enabled: true,
+                    permission: "everyone".into(),
+                    roles: vec![],
+                    channels: vec![],
+                    cooldown_secs: 0,
+                    behavior: Behavior::Help,
+                    response: String::new(),
+                    log_event: String::new(),
+                },
+            ),
+        ]);
+        resolve_legacy_builtin_command_collisions(&mut commands);
+        assert!(!commands.contains_key("yeet"));
+        assert!(!commands["custom"].matches("status"));
+        assert!(commands["custom"].matches("mine"));
+    }
+
+    #[test]
+    fn merge_binary_overlay_commands_replaces_stale_voice_rows() {
+        let voice = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        let mut commands = std::collections::HashMap::from([(
+            "voice".into(),
+            CommandDef {
+                name: "voice".into(),
+                description: "legacy guild row".into(),
+                behavior: Behavior::Say,
+                enabled: false,
+                aliases: vec!["vc".into()],
+                category: "Custom".into(),
+                usage: "!voice".into(),
+                permission: "owner".into(),
+                roles: vec![],
+                channels: vec![],
+                cooldown_secs: 99,
+                response: "stale".into(),
+                log_event: "stale".into(),
+            },
+        )]);
+        assert!(
+            commands.contains_key("voice"),
+            "legacy row must exist before merge"
+        );
+        merge_binary_overlay_commands(&mut commands);
+        assert_eq!(commands["voice"].description, voice.description);
+        assert_eq!(commands["voice"].enabled, voice.enabled);
+        assert_eq!(commands["voice"].permission, voice.permission);
+        assert_eq!(commands["voice"].roles, voice.roles);
+        assert_eq!(commands["voice"].channels, voice.channels);
+        assert_eq!(commands["voice"].cooldown_secs, voice.cooldown_secs);
+        assert_eq!(commands["voice"].aliases, voice.aliases);
+        assert!(matches!(commands["voice"].behavior, Behavior::Voice));
+    }
+
+    #[test]
+    fn voice_command_is_binary_overlay_not_global_seed() {
+        assert!(
+            default_commands().iter().any(|cmd| cmd.name == "voice"),
+            "voice must ship in the binary default list"
+        );
+        assert!(
+            !default_global_seed_commands()
+                .iter()
+                .any(|cmd| cmd.name == "voice"),
+            "voice must not be written to shared global command rows"
+        );
+    }
+
+    #[test]
+    fn voice_behavior_is_binary_overlay_even_when_renamed() {
+        let voice = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        let renamed = CommandDef {
+            name: "vc".into(),
+            ..voice
+        };
+        assert!(command_def_is_binary_overlay(&renamed));
+    }
+
+    #[test]
+    fn voice_alias_cannot_replace_builtin_command() {
+        let hijack = CommandDef {
+            name: "customvc".into(),
+            aliases: vec!["voice".into()],
+            category: "Moderation".into(),
+            description: "steal voice".into(),
+            usage: "!customvc".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist("customvc", &hijack));
+    }
+
+    #[test]
+    fn builtin_command_labels_cover_names_and_aliases() {
+        let labels = builtin_command_labels();
+        assert!(labels.iter().any(|l| l == "ban"));
+        assert!(labels.iter().any(|l| l == "yeet"));
+        assert!(labels.iter().any(|l| l == "kick"));
+        assert!(labels.iter().any(|l| l == "k"));
+        assert!(labels.iter().any(|l| l == "voice"));
+    }
+
+    #[test]
+    fn custom_command_cannot_claim_builtin_name_or_alias() {
+        let kick_hijack = CommandDef {
+            name: "kick".into(),
+            aliases: vec![],
+            category: "Moderation".into(),
+            description: "steal kick".into(),
+            usage: "!plugin".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist(
+            "myplugin",
+            &kick_hijack
+        ));
+
+        let alias_hijack = CommandDef {
+            name: "myplugin".into(),
+            aliases: vec!["K".into()],
+            category: "Moderation".into(),
+            description: "steal kick alias".into(),
+            usage: "!myplugin".into(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Help,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        assert!(rejects_binary_overlay_command_persist(
+            "myplugin",
+            &alias_hijack
+        ));
+    }
+
+    #[test]
+    fn builtin_row_rejects_even_identical_shipped_copy() {
+        let shipped = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "stats")
+            .expect("stats");
+        assert!(rejects_binary_overlay_command_persist("stats", &shipped));
     }
 }

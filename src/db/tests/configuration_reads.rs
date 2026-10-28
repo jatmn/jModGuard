@@ -98,8 +98,7 @@ async fn configuration_layers_preserve_global_guild_order_and_exact_key_semantic
         let mut rule = crate::defaults::default_rules()[0].clone();
         rule.enabled = guild != 0;
         upsert_rule(&f.db, guild, "fixture", &rule).await.unwrap();
-        let mut command = crate::defaults::default_commands()[0].clone();
-        command.name = "fixture".into();
+        let mut command = crate::defaults::custom_command_fixture("fixture");
         command.description = label.into();
         upsert_command(&f.db, guild, "fixture", &command)
             .await
@@ -313,8 +312,7 @@ async fn web_config_snapshot_matches_layer_helpers_without_receipts() {
     upsert_rule(&f.db, 0, "invite", &rule).await.unwrap();
     rule.enabled = true;
     upsert_rule(&f.db, 10, "invite", &rule).await.unwrap();
-    let mut command = crate::defaults::default_commands()[0].clone();
-    command.name = "snapshot".into();
+    let mut command = crate::defaults::custom_command_fixture("snapshot");
     command.description = "global".into();
     upsert_command(&f.db, 0, "snapshot", &command)
         .await

@@ -1018,6 +1018,104 @@ impl LogDelivery for Sink {
 }
 
 #[tokio::test]
+async fn member_rejoin_delivers_when_indexed_case_exceeds_read_budget() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseError, CaseEvidence, CaseId, CaseLimits, CaseOutcome, CaseSource,
+    };
+    const GUILD: i64 = 10;
+    const SUBJECT: i64 = 91;
+    assert_eq!(CaseLimits::default().max_record_bytes, 65_536);
+
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 100, 1_000)
+        .await
+        .unwrap();
+    while !store
+        .backfill_member_case_index(scope.clone(), 100, 100)
+        .await
+        .unwrap()
+    {}
+    let write_limits = CaseLimits {
+        max_record_bytes: 1_048_576,
+        ..CaseLimits::default()
+    };
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: SUBJECT,
+                actor_id: Some(7),
+                occurred_at_ms: 3_000,
+                reason: Some("z".repeat(262_144)),
+                evidence: CaseEvidence::Unavailable,
+            },
+            write_limits,
+        )
+        .await
+        .unwrap();
+    let read_error = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap_err();
+    assert!(
+        read_error
+            .downcast_ref::<CaseError>()
+            .is_some_and(|error| matches!(error, CaseError::Limit)),
+        "default read budget must still refuse the oversize case: {read_error:#}"
+    );
+
+    db::upsert_log_channel(&f.app.db, GUILD, "member_rejoin", 456)
+        .await
+        .unwrap();
+    let mut user = serenity::model::user::User::default();
+    user.id = serenity::model::id::UserId::new(SUBJECT as u64);
+    user.name = "member".into();
+    let vars = crate::templates::user_vars(user.id.get(), &user.name, &user.name);
+    let sink = Sink::default();
+    let (delivery, _) = super::emit_to_observed_with_audit(
+        &f.app,
+        &sink,
+        GuildId::new(GUILD as u64),
+        "member_rejoin",
+        vars,
+        None,
+        Admission::Immediate,
+        || true,
+        false,
+        Vec::new(),
+        Some(&user),
+    )
+    .await;
+    assert_eq!(delivery, Delivery::Sent);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    let content = messages[0].1["content"].as_str().unwrap();
+    assert!(
+        content.contains("read budget"),
+        "rejoin note omitted the budget notice: {content}"
+    );
+    assert!(
+        !content.contains(&"z".repeat(32)),
+        "rejoin note included the oversize reason"
+    );
+    assert!(content.contains("91"), "{content}");
+}
+
+#[tokio::test]
 async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "system", 456)
@@ -1628,6 +1726,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         || true,
         false,
         Vec::new(),
+        None,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);
@@ -3979,4 +4078,198 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         .await
         .unwrap();
     server.abort();
+}
+
+#[test]
+fn rejoin_note_canceled_in_flight_allows_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, "stay-7")
+        .expect("first delivery attempt must reserve the stay");
+    drop(guard);
+    assert!(
+        deliveries.begin_attempt(9, 8, "stay-7"),
+        "canceled handler must release the in-flight stay"
+    );
+}
+
+#[test]
+fn rejoin_note_successful_delivery_blocks_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, "stay-7")
+        .expect("delivery attempt must start");
+    guard.complete(true);
+    assert!(
+        !deliveries.begin_attempt(9, 8, "stay-7"),
+        "delivered stay must be deduped"
+    );
+}
+
+#[test]
+fn rejoin_note_failed_delivery_allows_redelivery() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(9, 8, "stay-7")
+        .expect("delivery attempt must start");
+    guard.complete(false);
+    assert!(
+        deliveries.begin_attempt(9, 8, "stay-7"),
+        "failed delivery must not mark the stay as delivered"
+    );
+}
+
+#[test]
+fn rejoin_note_undelivered_retry_expires() {
+    use std::time::Duration;
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(9, 8, "stay-expire", false);
+    assert!(deliveries.pending_redelivery(9, 8, "stay-expire"));
+    deliveries.test_age_undelivered(
+        9,
+        8,
+        "stay-expire",
+        MEMBER_JOINS_KEEP + Duration::from_secs(1),
+    );
+    assert!(
+        !deliveries.pending_redelivery(9, 8, "stay-expire"),
+        "stale undelivered state must not retry forever"
+    );
+}
+
+#[test]
+fn retain_current_stay_preserves_other_members_delivery_state() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(10, 77, "stay-a")
+        .expect("first member reserves delivery");
+    deliveries.retain_current_stay(10, 88, "stay-b");
+    assert!(
+        !deliveries.begin_attempt(10, 77, "stay-a"),
+        "another member's refresh must not release an in-flight stay"
+    );
+    drop(guard);
+}
+
+#[test]
+fn rejoin_delivery_burst_respects_settled_entry_cap() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let overflow = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..overflow {
+        let stay = format!("stay-{index}");
+        deliveries.finish_attempt(1, index as u64, &stay, true);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "delivered stays must stay within the hard cap"
+    );
+    deliveries.finish_attempt(1, 9_999, "stay-retry", false);
+    assert!(
+        deliveries.pending_redelivery(1, 9_999, "stay-retry"),
+        "fresh undelivered stays must survive eviction of older settled entries"
+    );
+}
+
+#[test]
+fn rejoin_failed_delivery_burst_respects_cap_and_queue() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let overflow = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..overflow {
+        let stay = format!("stay-{index}");
+        deliveries.finish_attempt(1, index as u64, &stay, false);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "failed stays must stay within the hard cap"
+    );
+    for _ in 0..512 {
+        deliveries.finish_attempt(1, 99_999, "stay-hot", false);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "repeated retries must not grow settled entries past the cap"
+    );
+    assert!(
+        deliveries.test_undelivered_queue_len() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "undelivered ordering index must stay within the same cap as live entries"
+    );
+    assert!(
+        deliveries.test_delivered_queue_len() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "delivered ordering index must stay within the same cap as live entries"
+    );
+    assert!(
+        deliveries.pending_redelivery(1, 99_999, "stay-hot"),
+        "the newest failed stay must remain retryable in memory"
+    );
+}
+
+#[test]
+fn rejoin_departure_churn_drops_ordering_tokens() {
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(1, 1, "anchor", false);
+    let churn = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..churn {
+        let stay = format!("stay-{index}");
+        let user = 10_000 + index as u64;
+        deliveries.finish_attempt(2, user, &stay, false);
+        deliveries.clear_member(2, user);
+    }
+    assert_eq!(
+        deliveries.test_settled_entry_count(),
+        1,
+        "only the anchor stay should remain"
+    );
+    assert!(
+        deliveries.test_undelivered_queue_len() <= 1,
+        "departures must remove ordering tokens, not leave them behind a live front"
+    );
+    assert!(deliveries.pending_redelivery(1, 1, "anchor"));
+    assert_eq!(deliveries.test_delivered_queue_len(), 0);
+    for index in 0..churn {
+        let stay = format!("sent-{index}");
+        let user = 30_000 + index as u64;
+        deliveries.finish_attempt(3, user, &stay, true);
+        deliveries.clear_member(3, user);
+    }
+    assert_eq!(
+        deliveries.test_delivered_queue_len(),
+        0,
+        "departures must remove delivered ordering tokens too"
+    );
+    assert_eq!(deliveries.test_undelivered_queue_len(), 1);
+}
+
+#[test]
+fn rejoin_stay_replacement_bounds_both_order_indexes() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let churn = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..churn {
+        let failed = format!("failed-{index}");
+        deliveries.finish_attempt(7, 7, &failed, false);
+        deliveries.retain_current_stay(7, 7, "current-failed");
+        let sent = format!("sent-{index}");
+        deliveries.finish_attempt(8, 8, &sent, true);
+        deliveries.retain_current_stay(8, 8, "current-sent");
+    }
+    deliveries.finish_attempt(7, 7, "current-failed", false);
+    deliveries.finish_attempt(8, 8, "current-sent", true);
+    deliveries.retain_current_stay(7, 7, "current-failed");
+    deliveries.retain_current_stay(8, 8, "current-sent");
+    assert_eq!(deliveries.test_settled_entry_count(), 2);
+    assert_eq!(deliveries.test_undelivered_queue_len(), 1);
+    assert_eq!(deliveries.test_delivered_queue_len(), 1);
+    assert!(deliveries.pending_redelivery(7, 7, "current-failed"));
+    assert!(
+        !deliveries.begin_attempt(8, 8, "current-sent"),
+        "the retained successful stay must still be deduped"
+    );
+}
+
+#[test]
+fn rejoin_note_leave_clears_member_state() {
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(9, 8, "stay-leave", false);
+    deliveries.clear_member(9, 8);
+    assert!(!deliveries.pending_redelivery(9, 8, "stay-leave"));
+    assert!(deliveries.begin_attempt(9, 8, "stay-leave"));
 }

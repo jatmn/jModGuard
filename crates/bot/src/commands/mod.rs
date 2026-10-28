@@ -5,9 +5,14 @@
 pub mod behaviors;
 pub mod mod_reason_dm;
 pub mod plans;
+pub mod userinfo;
+pub mod voice_lookup;
 
 use anyhow::Result;
-use serenity::builder::{Builder, CreateCommand, CreateCommandOption, EditInteractionResponse};
+use serenity::builder::{
+    Builder, CreateAllowedMentions, CreateCommand, CreateCommandOption, CreateMessage,
+    EditInteractionResponse,
+};
 use serenity::client::Context;
 use serenity::model::application::{CommandDataOptionValue, CommandOptionType, Interaction};
 use serenity::model::prelude::{ChannelId, GuildId, Permissions, Role, RoleId, UserId};
@@ -292,6 +297,80 @@ pub(crate) fn mention_permission_in(
     }
 }
 
+/// Whether `user_id` with `role_ids` may see `channel_id`, including overwrites
+/// and thread parents. Prefer the gateway author id over `Member::user.id` when
+/// the member payload omitted `user` (prefix commands).
+pub(crate) fn member_can_view_channel(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::VIEW_CHANNEL,
+    )
+}
+
+/// Parent `VIEW_CHANNEL` does not grant access to a private thread. Effective
+/// `MANAGE_THREADS` does. The gateway cache does not store other users' thread
+/// membership, so an uncached membership does not grant access.
+pub(crate) fn private_thread_visible_to(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    let Some(channel) = cached_channel(guild, channel_id) else {
+        return true;
+    };
+    if channel.kind != serenity::model::channel::ChannelType::PrivateThread {
+        return true;
+    }
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::MANAGE_THREADS,
+    ) || cached_caller_is_thread_member(channel, user_id)
+}
+
+fn member_has_channel_permission(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+    permission: Permissions,
+) -> bool {
+    let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
+        return false;
+    };
+    if !guild.roles.contains_key(&RoleId::new(guild.id.get()))
+        || role_ids.iter().any(|id| !guild.roles.contains_key(id))
+    {
+        return false;
+    }
+    let Some(partial) = partial_member(guild.id, role_ids) else {
+        return false;
+    };
+    guild
+        .partial_member_permissions_in(channel, user_id, &partial)
+        .contains(permission)
+}
+
+/// `GuildChannel.member` is the current gateway user and has no user id.
+/// It must not be treated as this caller's membership.
+fn cached_caller_is_thread_member(
+    _thread: &serenity::model::channel::GuildChannel,
+    _actor: UserId,
+) -> bool {
+    false
+}
+
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
 fn partial_member(
     guild_id: GuildId,
@@ -324,6 +403,16 @@ fn is_thread(kind: serenity::model::channel::ChannelType) -> bool {
             | serenity::model::channel::ChannelType::PrivateThread
             | serenity::model::channel::ChannelType::NewsThread
     )
+}
+
+fn cached_channel(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+) -> Option<&serenity::model::channel::GuildChannel> {
+    guild
+        .channels
+        .get(&channel_id)
+        .or_else(|| guild.threads.iter().find(|thread| thread.id == channel_id))
 }
 
 fn channel_for_member_permissions(
@@ -365,9 +454,35 @@ pub fn guild_permissions(
     Permissions::from_bits_truncate(bits)
 }
 
+/// Gateway `Member` payloads must use the message/interaction author id for
+/// permission checks. `PartialMember::user` is often null and `Member::from`
+/// then fills a default user id that must not win over the cached member row.
+fn actor_member_for_command(
+    actor: UserId,
+    member: serenity::model::guild::Member,
+) -> serenity::model::guild::Member {
+    let mut member = member;
+    member.user.id = actor;
+    member
+}
+
+/// Discord supplies the caller's current roles on each message/interaction; the
+/// guild member cache can lag behind role removals. Prefer invocation data when
+/// present and use the cache only as a fallback.
+fn resolve_actor_member_for_enforcement(
+    actor: UserId,
+    member_from_invocation: Option<serenity::model::guild::Member>,
+    cached_member: Option<serenity::model::guild::Member>,
+) -> Option<serenity::model::guild::Member> {
+    member_from_invocation
+        .or(cached_member)
+        .map(|member| actor_member_for_command(actor, member))
+}
+
 /// Resolves (guild roles, caller member) for command enforcement, preferring
-/// the cache and falling back to an HTTP guild fetch. Never holds a cache
-/// reference across `.await`.
+/// invocation-supplied member data when present and falling back to the guild
+/// member cache, then an HTTP guild fetch. Never holds a cache reference across
+/// `.await`.
 async fn guild_snapshot(
     ctx: &Context,
     guild_id: GuildId,
@@ -375,14 +490,18 @@ async fn guild_snapshot(
     actor: UserId,
 ) -> Option<(StdHashMap<RoleId, Role>, serenity::model::guild::Member)> {
     if let Some(guild) = ctx.cache.guild(guild_id) {
-        let member = member_from_msg.or_else(|| guild.members.get(&actor).cloned());
+        let member = resolve_actor_member_for_enforcement(
+            actor,
+            member_from_msg,
+            guild.members.get(&actor).cloned(),
+        );
         return member.map(|m| (guild.roles.clone(), m));
     }
     tracing::warn!("guild {guild_id} not in cache; falling back to HTTP fetch");
     match ctx.http.get_guild(guild_id).await {
         Ok(guild) => {
             // REST guild payload carries roles but no member map.
-            let member = member_from_msg;
+            let member = resolve_actor_member_for_enforcement(actor, member_from_msg, None);
             member.map(|m| (guild.roles.clone(), m))
         }
         Err(e) => {
@@ -668,8 +787,16 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            send_prefix_command_error(app, msg.channel_id, http, guild_id.get(), &cmd.name, &e)
-                .await;
+            send_prefix_command_error(
+                app,
+                msg.channel_id,
+                http,
+                guild_id.get(),
+                &cmd.name,
+                &e,
+                suppress_untrusted_mentions(&cmd.behavior),
+            )
+            .await;
             return Ok(true);
         }
     };
@@ -987,7 +1114,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("interaction: config load failed: {e:#}");
-            respond(&app.activation, &slash, ctx, deferred, "internal error").await;
+            respond(
+                &app.activation,
+                &slash,
+                ctx,
+                deferred,
+                "internal error",
+                false,
+            )
+            .await;
             return;
         }
     };
@@ -997,7 +1132,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             "no slash command matched `{}` in guild {guild_id}",
             slash.name
         );
-        respond(&app.activation, &slash, ctx, deferred, "unknown command").await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            "unknown command",
+            false,
+        )
+        .await;
         return;
     };
     let cmd = cmd.clone();
@@ -1020,6 +1163,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             ctx,
             deferred,
             "guild not cached / member data unavailable",
+            false,
         )
         .await;
         return;
@@ -1027,7 +1171,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, slash.channel_id)
     {
-        respond(&app.activation, &slash, ctx, deferred, &reason.to_string()).await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            &reason.to_string(),
+            false,
+        )
+        .await;
         return;
     }
     if !cooldown_check(app, guild_id, actor_id, &cmd) {
@@ -1037,6 +1189,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             ctx,
             deferred,
             "that command is on cooldown",
+            false,
         )
         .await;
         return;
@@ -1076,7 +1229,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         }
         Err(e) => {
             let text = format!("error: {e:#}");
-            respond(&app.activation, &slash, ctx, deferred, &text).await;
+            respond(
+                &app.activation,
+                &slash,
+                ctx,
+                deferred,
+                &text,
+                suppress_untrusted_mentions(&cmd.behavior),
+            )
+            .await;
         }
     }
 }
@@ -1088,9 +1249,12 @@ async fn send_prefix_command_error(
     guild_id: u64,
     command_name: &str,
     error: &anyhow::Error,
+    suppress_mentions: bool,
 ) {
     let reply = format!("error: {error:#}");
-    if raced_channel_say(app, channel_id, http, guild_id, reply).await == RacedWrite::Cutoff {
+    if raced_channel_text(app, channel_id, http, guild_id, reply, suppress_mentions).await
+        == RacedWrite::Cutoff
+    {
         tracing::warn!(
             "command `{command_name}` error reply suppressed after writer cutoff: {error:#}"
         );
@@ -1142,9 +1306,17 @@ async fn respond(
     ctx: &Context,
     deferred: bool,
     text: &str,
+    suppress_mentions: bool,
 ) {
     let delivered = if deferred {
-        raced_slash_edit(activation, &ctx.http, slash.token.as_str(), text).await
+        raced_slash_edit(
+            activation,
+            &ctx.http,
+            slash.token.as_str(),
+            text,
+            suppress_mentions,
+        )
+        .await
     } else {
         raced_slash_create_message(
             activation,
@@ -1153,6 +1325,7 @@ async fn respond(
             slash.token.as_str(),
             text,
             true,
+            suppress_mentions,
         )
         .await
     };
@@ -1181,12 +1354,35 @@ fn raced_write_chain(first: RacedWrite, second: RacedWrite) -> RacedWrite {
     }
 }
 
+fn suppress_untrusted_mentions(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::UserInfo)
+}
+
+fn no_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new()
+        .all_users(false)
+        .all_roles(false)
+        .everyone(false)
+        .replied_user(false)
+}
+
 async fn raced_channel_say(
     app: &Arc<BotState>,
     channel_id: ChannelId,
     http: &serenity::http::Http,
     guild_id: u64,
     text: String,
+) -> RacedWrite {
+    raced_channel_text(app, channel_id, http, guild_id, text, false).await
+}
+
+async fn raced_channel_text(
+    app: &Arc<BotState>,
+    channel_id: ChannelId,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    text: String,
+    suppress_mentions: bool,
 ) -> RacedWrite {
     let target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild_id,
@@ -1201,7 +1397,21 @@ async fn raced_channel_say(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    match crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await {
+    let call = if suppress_mentions {
+        crate::discord::race_discord_call(
+            &app.activation,
+            channel_id.send_message(
+                http,
+                CreateMessage::new()
+                    .content(text)
+                    .allowed_mentions(no_mentions()),
+            ),
+        )
+        .await
+    } else {
+        crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await
+    };
+    match call {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             app.remembered_discord_targets.forget(target);
             RacedWrite::Finished
@@ -1225,15 +1435,13 @@ async fn raced_slash_edit(
     http: &serenity::http::Http,
     token: &str,
     content: &str,
+    suppress_mentions: bool,
 ) -> RacedWrite {
-    match crate::discord::race_discord_call(
-        activation,
-        EditInteractionResponse::new()
-            .content(content)
-            .execute(http, token),
-    )
-    .await
-    {
+    let mut edit = EditInteractionResponse::new().content(content);
+    if suppress_mentions {
+        edit = edit.allowed_mentions(no_mentions());
+    }
+    match crate::discord::race_discord_call(activation, edit.execute(http, token)).await {
         crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
         crate::discord::DiscordCall::Finished(Err(error)) => {
             tracing::warn!("failed to edit slash response: {error}");
@@ -1250,15 +1458,17 @@ async fn raced_slash_create_message(
     token: &str,
     content: &str,
     ephemeral: bool,
+    suppress_mentions: bool,
 ) -> RacedWrite {
+    let mut message = serenity::builder::CreateInteractionResponseMessage::new()
+        .content(content)
+        .ephemeral(ephemeral);
+    if suppress_mentions {
+        message = message.allowed_mentions(no_mentions());
+    }
     match crate::discord::race_discord_call(
         activation,
-        serenity::builder::CreateInteractionResponse::Message(
-            serenity::builder::CreateInteractionResponseMessage::new()
-                .content(content)
-                .ephemeral(ephemeral),
-        )
-        .execute(http, (id, token)),
+        serenity::builder::CreateInteractionResponse::Message(message).execute(http, (id, token)),
     )
     .await
     {
@@ -1281,6 +1491,7 @@ async fn deliver_slash_success(
 ) -> RacedWrite {
     let answer = slash_answer(cmd, outcome);
     let text = render_outcome(cmd, outcome);
+    let suppress_mentions = suppress_untrusted_mentions(&cmd.behavior);
     match answer {
         SlashAnswer::Withdraw => {
             if deferred {
@@ -1294,13 +1505,21 @@ async fn deliver_slash_success(
                     slash.token.as_str(),
                     &text,
                     true,
+                    suppress_mentions,
                 )
                 .await
             }
         }
         SlashAnswer::Public | SlashAnswer::Ephemeral => {
             if deferred {
-                raced_slash_edit(activation, http, slash.token.as_str(), &text).await
+                raced_slash_edit(
+                    activation,
+                    http,
+                    slash.token.as_str(),
+                    &text,
+                    suppress_mentions,
+                )
+                .await
             } else {
                 raced_slash_create_message(
                     activation,
@@ -1309,6 +1528,7 @@ async fn deliver_slash_success(
                     slash.token.as_str(),
                     &text,
                     answer != SlashAnswer::Public,
+                    suppress_mentions,
                 )
                 .await
             }
@@ -1333,6 +1553,15 @@ fn truncate_to_char_limit(text: &str, max_units: usize) -> String {
 
 fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     const DISCORD_MESSAGE_LIMIT: usize = 2000;
+    // Commands that publish behavior text leave `response` empty. That text is
+    // already produced (warnings, ban reasons, regex samples, help, voice).
+    // It is never a template, and kick/ban variables must not be applied to it.
+    if cmd.response.is_empty() {
+        return match outcome.response.as_deref() {
+            Some(text) => truncate_to_char_limit(text, DISCORD_MESSAGE_LIMIT),
+            None => "done".to_string(),
+        };
+    }
     let clause = outcome
         .vars
         .get("mod_reason_dm_clause")
@@ -1340,62 +1569,52 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
         .unwrap_or("");
     let clause_units = clause.chars().count();
     let body_limit = DISCORD_MESSAGE_LIMIT.saturating_sub(clause_units);
-    if !cmd.response.is_empty() {
-        let mut vars = outcome.vars.clone();
-        vars.insert(
-            "response".into(),
-            outcome.response.clone().unwrap_or_default(),
-        );
-        // Keep stored defaults readable by older bots during a rollout or
-        // rollback. Only the current process substitutes compact presentation;
-        // other custom response text and raw numeric variables stay unchanged.
-        let response = match (&cmd.behavior, cmd.response.as_str()) {
-            (Behavior::Timeout { .. }, "Timed out {target} for {minutes} minutes | {reason}") => {
-                "Timed out {target} for {duration} | {reason}"
-            }
-            (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => {
-                "Slowmode set to {duration}"
-            }
-            (Behavior::Kick { .. }, "Kicked {target} | {reason}")
-                if vars.contains_key("mod_reason_dm_clause") =>
-            {
-                "Kicked {target} | {reason}{mod_reason_dm_clause}"
-            }
-            (Behavior::Ban { .. }, "Banned {target} | {reason}")
-                if vars.contains_key("mod_reason_dm_clause") =>
-            {
-                "Banned {target} | {reason}{mod_reason_dm_clause}"
-            }
-            _ => &cmd.response,
-        };
-        if response.contains("{mod_reason_dm_clause}") {
-            return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
+    let mut vars = outcome.vars.clone();
+    vars.insert(
+        "response".into(),
+        outcome.response.clone().unwrap_or_default(),
+    );
+    // Keep stored defaults readable by older bots during a rollout or
+    // rollback. Only the current process substitutes compact presentation;
+    // other custom response text and raw numeric variables stay unchanged.
+    let response = match (&cmd.behavior, cmd.response.as_str()) {
+        (Behavior::Timeout { .. }, "Timed out {target} for {minutes} minutes | {reason}") => {
+            "Timed out {target} for {duration} | {reason}"
         }
-        let mut render_vars = vars.clone();
-        render_vars.remove("mod_reason_dm_clause");
-        let rendered = templates::render_bounded(response, &render_vars, body_limit);
-        if !clause.is_empty()
-            && matches!(
-                (&cmd.behavior, response),
-                (
-                    Behavior::Kick { .. },
-                    "Kicked {target} | {reason}"
-                        | "Kicked {target} | {reason}{mod_reason_dm_clause}"
-                ) | (
-                    Behavior::Ban { .. },
-                    "Banned {target} | {reason}"
-                        | "Banned {target} | {reason}{mod_reason_dm_clause}"
-                )
-            )
+        (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => "Slowmode set to {duration}",
+        (Behavior::Kick { .. }, "Kicked {target} | {reason}")
+            if vars.contains_key("mod_reason_dm_clause") =>
         {
-            return format!("{rendered}{clause}");
+            "Kicked {target} | {reason}{mod_reason_dm_clause}"
         }
-        rendered
-    } else if let Some(r) = &outcome.response {
-        truncate_to_char_limit(r, body_limit)
-    } else {
-        "done".to_string()
+        (Behavior::Ban { .. }, "Banned {target} | {reason}")
+            if vars.contains_key("mod_reason_dm_clause") =>
+        {
+            "Banned {target} | {reason}{mod_reason_dm_clause}"
+        }
+        _ => &cmd.response,
+    };
+    if response.contains("{mod_reason_dm_clause}") {
+        return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
     }
+    let mut render_vars = vars.clone();
+    render_vars.remove("mod_reason_dm_clause");
+    let rendered = templates::render_bounded(response, &render_vars, body_limit);
+    if !clause.is_empty()
+        && matches!(
+            (&cmd.behavior, response),
+            (
+                Behavior::Kick { .. },
+                "Kicked {target} | {reason}" | "Kicked {target} | {reason}{mod_reason_dm_clause}"
+            ) | (
+                Behavior::Ban { .. },
+                "Banned {target} | {reason}" | "Banned {target} | {reason}{mod_reason_dm_clause}"
+            )
+        )
+    {
+        return format!("{rendered}{clause}");
+    }
+    rendered
 }
 
 /// Text to post in the invocation channel after a prefix command, or None
@@ -1467,7 +1686,14 @@ async fn withdraw_deferred_slash_answer(
     };
     raced_write_chain(
         delete,
-        raced_slash_edit(activation, http, token, WITHDRAW_DEFERRED_FALLBACK_CONTENT).await,
+        raced_slash_edit(
+            activation,
+            http,
+            token,
+            WITHDRAW_DEFERRED_FALLBACK_CONTENT,
+            false,
+        )
+        .await,
     )
 }
 
@@ -1483,7 +1709,15 @@ async fn send_outcome(
     outcome: BehaviorOutcome,
 ) {
     if let Some(text) = prefix_response_text(cmd, &outcome)
-        && raced_channel_say(app, channel_id, http, guild_id.get(), text).await
+        && raced_channel_text(
+            app,
+            channel_id,
+            http,
+            guild_id.get(),
+            text,
+            suppress_untrusted_mentions(&cmd.behavior),
+        )
+        .await
             == RacedWrite::Cutoff
     {
         return;
@@ -1540,6 +1774,76 @@ fn cooldown_check(
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserNameMatch {
+    Unique(serenity::model::id::UserId),
+    NotFound,
+    Ambiguous,
+}
+
+/// A mention or raw id token. Zero and values that do not fit in a snowflake
+/// are `None`; this does not call [`UserId::new`].
+fn user_id_from_token(trimmed: &str) -> Option<UserId> {
+    if let Some(inner) = trimmed
+        .strip_prefix("<@")
+        .and_then(|token| token.strip_suffix('>'))
+        .map(|token| token.trim_start_matches('!'))
+    {
+        return inner.parse().ok();
+    }
+    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return trimmed.parse().ok();
+    }
+    None
+}
+
+fn member_matches_name_token(member: &serenity::model::guild::Member, lower: &str) -> bool {
+    member.user.name.to_lowercase() == lower
+        || member
+            .nick
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase() == lower)
+        || member
+            .user
+            .global_name
+            .as_deref()
+            .is_some_and(|g| g.to_lowercase() == lower)
+}
+
+pub fn resolve_user_name_in_guild(
+    guild: &serenity::model::guild::Guild,
+    token: &str,
+) -> UserNameMatch {
+    let trimmed = token.trim();
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
+    }
+    let lower = trimmed.to_lowercase();
+    let matches = guild
+        .members
+        .values()
+        .filter(|member| member_matches_name_token(member, &lower))
+        .map(|member| member.user.id)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => UserNameMatch::NotFound,
+        1 => UserNameMatch::Unique(matches[0]),
+        _ => UserNameMatch::Ambiguous,
+    }
+}
+
+/// Resolves a user from a mention, raw ID, or cached member name/nick search.
+pub fn resolve_user_name(ctx: &Context, guild_id: GuildId, token: &str) -> UserNameMatch {
+    let trimmed = token.trim();
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
+    }
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return UserNameMatch::NotFound;
+    };
+    resolve_user_name_in_guild(&guild, token)
+}
+
 /// Resolves a user from a mention (`<@123>` / `<@!123>`), raw ID, or member
 /// name/nick search.
 pub async fn resolve_user(
@@ -1547,47 +1851,21 @@ pub async fn resolve_user(
     guild_id: GuildId,
     token: &str,
 ) -> Option<serenity::model::id::UserId> {
-    let trimmed = token.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("<@")
-        .and_then(|t| t.strip_suffix('>'))
-        .map(|t| t.trim_start_matches('!'))
-        && let Ok(id) = inner.parse::<u64>()
-    {
-        return Some(id.into());
+    match resolve_user_name(ctx, guild_id, token) {
+        UserNameMatch::Unique(id) => Some(id),
+        UserNameMatch::NotFound | UserNameMatch::Ambiguous => None,
     }
-    if let Ok(id) = trimmed.parse::<u64>() {
-        return Some(id.into());
-    }
-    let guild = ctx.cache.guild(guild_id)?;
-    let lower = trimmed.to_lowercase();
-    guild
-        .members
-        .iter()
-        .find(|(_, m)| {
-            m.user.name.to_lowercase() == lower
-                || m.nick
-                    .as_deref()
-                    .map(|n| n.to_lowercase() == lower)
-                    .unwrap_or(false)
-                || m.user
-                    .global_name
-                    .as_deref()
-                    .map(|g| g.to_lowercase() == lower)
-                    .unwrap_or(false)
-        })
-        .map(|(_, m)| m.user.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Behavior;
-
     #[tokio::test]
     async fn slash_http_saves_registration_and_failure_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const FIXTURE_CMD: &str = "slashfixture";
         for (status, code) in [
             (200, 0),
             (403, 50013),
@@ -1685,12 +1963,26 @@ mod tests {
             if status == 200 {
                 assert!(sync_slash_commands_versioned_http(&app, &http, guild, target).await);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
-                let mut command = db::get_command_row(&app.db, 0, "stats")
+                let mut command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
                     .await
-                    .unwrap()
                     .unwrap();
                 let before = db::get_primary_versions(&app.db).await.unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(db::get_primary_versions(&app.db).await.unwrap(), before);
@@ -1703,7 +1995,7 @@ mod tests {
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
                 command.description.push_str(" changed");
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1731,7 +2023,7 @@ mod tests {
                     );
                 }
                 assert!(app.finish_slash_resync(changed, Default::default()));
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
@@ -1758,6 +2050,7 @@ mod tests {
                 // A new global command changes every guild's effective payload.
                 let mut global = command.clone();
                 global.name = "shared".into();
+                global.aliases.clear();
                 db::upsert_command(&app.db, 0, &global.name, &global)
                     .await
                     .unwrap();
@@ -1786,7 +2079,7 @@ mod tests {
 
                 // A second save during a PUT must survive completion of the old pass.
                 command.description = "first concurrent edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let first = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1797,7 +2090,7 @@ mod tests {
                     async {
                         received.notified().await;
                         command.description = "second concurrent edit".into();
-                        db::upsert_command(&app.db, 10, "stats", &command)
+                        db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                             .await
                             .unwrap();
                         let second = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1834,7 +2127,7 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .find(|cmd| cmd["name"] == "stats")
+                        .find(|cmd| cmd["name"] == FIXTURE_CMD)
                         .unwrap();
                     assert_eq!(stats["description"], "second concurrent edit");
                 }
@@ -1842,7 +2135,7 @@ mod tests {
 
                 // A transient failure must retry without another configuration write.
                 command.description = "retry this edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1878,13 +2171,13 @@ mod tests {
                 // last successful payload must still send the restored value.
                 let restored = command.clone();
                 command.description = "uncertain edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let uncertain = app.pending_slash_registry_version().await.unwrap().unwrap();
                 response_status.store(503, Ordering::SeqCst);
                 assert!(!sync_slash_commands_versioned_http(&app, &http, guild, uncertain).await);
-                db::upsert_command(&app.db, 10, "stats", &restored)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &restored)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1994,11 +2287,25 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(target, &[10, 20]);
                 assert!(!app.finish_slash_resync(target, [10].into_iter().collect()));
-                let command = db::get_command_row(&app.db, 0, "stats")
+                let command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
                     .await
-                    .unwrap()
                     .unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -2235,6 +2542,188 @@ mod tests {
             rendered.chars().count()
         );
         assert!(rendered.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
+    }
+
+    #[test]
+    fn voice_not_cached_and_not_in_channel_replies_reach_operators() {
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        assert!(
+            command.response.is_empty(),
+            "voice must use outcome.response like warns/banlist"
+        );
+        let vars = BTreeMap::from([
+            ("target".into(), "Alice".into()),
+            ("target_id".into(), "42".into()),
+        ]);
+        let not_cached = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_cached_text = render_outcome(&command, &not_cached);
+        assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
+        assert!(
+            !not_cached_text.contains("{channel_id}"),
+            "{not_cached_text}"
+        );
+        assert_eq!(
+            prefix_response_text(&command, &not_cached).as_deref(),
+            Some(not_cached_text.as_str())
+        );
+
+        let not_in_channel = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_in_text = render_outcome(&command, &not_in_channel);
+        assert!(
+            not_in_text.contains("not in a voice channel"),
+            "{not_in_text}"
+        );
+        assert!(!not_in_text.contains("{channel_id}"), "{not_in_text}");
+        assert_eq!(
+            prefix_response_text(&command, &not_in_channel).as_deref(),
+            Some(not_in_text.as_str())
+        );
+
+        let channel_unavailable = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let unavailable_text = render_outcome(&command, &channel_unavailable);
+        assert!(
+            unavailable_text.contains("cannot be reported"),
+            "{unavailable_text}"
+        );
+        assert!(
+            !unavailable_text.contains("not cached"),
+            "{unavailable_text}"
+        );
+    }
+
+    #[test]
+    fn commands_without_a_response_template_keep_literal_output() {
+        let literal = "kept {user} {actor} {actor_id} {guild} {channel} {source_channel_id} {target} {reason} {mod_reason_dm_clause} {response}";
+        let vars = BTreeMap::from([
+            ("user".into(), "Moderator".into()),
+            ("actor".into(), "Mod (<@1>)".into()),
+            ("actor_id".into(), "1".into()),
+            ("guild".into(), "Server".into()),
+            ("channel".into(), "<#2>".into()),
+            ("source_channel_id".into(), "2".into()),
+            ("target".into(), "Member".into()),
+            ("reason".into(), "spam".into()),
+            ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ("response".into(), "should-not-replace".into()),
+        ]);
+        let mut saw_literal = false;
+        for command in crate::defaults::default_commands() {
+            if !command.response.is_empty() {
+                continue;
+            }
+            saw_literal = true;
+            let outcome = BehaviorOutcome {
+                response: Some(literal.into()),
+                vars: vars.clone(),
+                suppress_response: false,
+            };
+            assert_eq!(
+                render_outcome(&command, &outcome),
+                literal,
+                "{}",
+                command.name
+            );
+            assert_eq!(
+                prefix_response_text(&command, &outcome).as_deref(),
+                Some(literal),
+                "{}",
+                command.name
+            );
+        }
+        assert!(
+            saw_literal,
+            "shipped commands that publish behavior text must exist"
+        );
+    }
+
+    #[test]
+    fn dynamic_list_reasons_are_not_template_expanded() {
+        for name in ["warns", "banlist", "testregex"] {
+            let command = crate::defaults::default_commands()
+                .into_iter()
+                .find(|cmd| cmd.name == name)
+                .unwrap_or_else(|| panic!("{name} command"));
+            assert!(
+                command.response.is_empty(),
+                "{name} publishes behavior text, not a response template"
+            );
+            let outcome = BehaviorOutcome {
+                response: Some(format!("stored reason `{{user}}` for {name}")),
+                vars: BTreeMap::from([
+                    ("user".into(), "Moderator".into()),
+                    ("reason".into(), "Moderator".into()),
+                    ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+                ]),
+                suppress_response: false,
+            };
+            let text = render_outcome(&command, &outcome);
+            assert_eq!(text, format!("stored reason `{{user}}` for {name}"));
+            assert_eq!(
+                prefix_response_text(&command, &outcome).as_deref(),
+                Some(text.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn substituted_reason_keeps_tokens_inside_the_value() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "kick")
+            .unwrap();
+        let outcome = BehaviorOutcome {
+            response: Some("unused {user}".into()),
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam {user}".into()),
+                ("user".into(), "Moderator".into()),
+                ("response".into(), "should not replace the template".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&kick, &outcome),
+            "Kicked Member | spam {user}"
+        );
+    }
+
+    #[test]
+    fn response_slot_does_not_expand_dynamic_text() {
+        let command = say_cmd("{response}");
+        let outcome = BehaviorOutcome {
+            response: Some("hello {user}".into()),
+            vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            suppress_response: false,
+        };
+        assert_eq!(render_outcome(&command, &outcome), "hello {user}");
+        assert_eq!(
+            prefix_response_text(&command, &outcome).as_deref(),
+            Some("hello {user}")
+        );
     }
 
     #[test]
@@ -2534,6 +3023,312 @@ mod tests {
             super::MentionPermission::Unknown,
             "missing everyone role is not a cached deny"
         );
+    }
+
+    #[test]
+    fn member_cannot_view_channel_when_member_overwrite_denies_view() {
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::guild::{Guild, Member, Role};
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+
+        const GUILD: u64 = 100;
+        const ACTOR: u64 = 1;
+        const VOICE: u64 = 7;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.permissions = perms;
+            role
+        }
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(999);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Role(RoleId::new(GUILD)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+        let mut actor = Member::default();
+        actor.user.id = UserId::new(ACTOR);
+        actor.guild_id = guild.id;
+        assert!(
+            !super::member_can_view_channel(
+                &guild,
+                UserId::new(ACTOR),
+                &actor.roles,
+                ChannelId::new(VOICE),
+            ),
+            "member-specific deny must hide the channel"
+        );
+    }
+
+    fn test_guild_member(user_id: u64, role_ids: &[u64]) -> serenity::model::guild::Member {
+        use serenity::model::guild::Member;
+        use serenity::model::id::UserId;
+        let mut member = Member::default();
+        member.user.id = UserId::new(user_id);
+        member.roles = role_ids.iter().map(|id| RoleId::new(*id)).collect();
+        member
+    }
+
+    #[test]
+    fn enforcement_member_prefers_invocation_roles_over_stale_cache() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let resolved =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("invocation or cache member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Everyone,
+            "stale cached moderator roles must not override invocation payload"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn enforcement_member_falls_back_to_cache_without_invocation_payload() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let resolved = super::resolve_actor_member_for_enforcement(actor, None, Some(cached))
+            .expect("cached member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Mod,
+            "cache remains the fallback when invocation member data is absent"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn check_enforcement_uses_invocation_roles_when_cache_still_moderator() {
+        use crate::state::CachedGuildConfig;
+        use crate::types::{CommandDef, GuildSettings};
+        use serenity::model::guild::Role;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let member =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("member");
+
+        let (app, path) = temp_command_test_db();
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: std::collections::BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let ban_behavior = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban")
+            .behavior;
+        let cmd = CommandDef {
+            name: "ban".into(),
+            aliases: vec![],
+            category: "Moderation".into(),
+            description: String::new(),
+            usage: String::new(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: ban_behavior,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        let denied =
+            super::check_enforcement(&app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))
+                .expect_err("demoted caller must not pass mod-gated enforcement");
+        assert!(
+            denied.contains("permission"),
+            "expected permission denial, got {denied}"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn prefix_voice_partial_member_with_member_deny_returns_channel_unavailable() {
+        use super::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::event::GuildCreateEvent;
+        use serenity::model::guild::{Guild, Member, PartialMember, Role};
+        use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+        use serenity::model::voice::VoiceState;
+        use std::sync::Arc;
+
+        const GUILD: u64 = 10;
+        const AUTHOR: u64 = 7;
+        const TARGET: u64 = 42;
+        const VOICE: u64 = 100;
+        const ROLE: u64 = 50;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.guild_id = GuildId::new(GUILD);
+            role.permissions = perms;
+            role
+        }
+
+        fn gateway_partial() -> PartialMember {
+            serde_json::from_value(serde_json::json!({
+                "deaf": false,
+                "joined_at": null,
+                "mute": false,
+                "nick": null,
+                "roles": [ROLE.to_string()],
+                "pending": false,
+                "premium_since": null,
+                "guild_id": GUILD.to_string(),
+                "user": null,
+                "permissions": null,
+                "unusual_dm_activity_until": null,
+                "avatar": null,
+                "banner": null,
+                "avatar_decoration_data": null,
+            }))
+            .unwrap()
+        }
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        guild
+            .roles
+            .insert(RoleId::new(ROLE), role(ROLE, Permissions::VIEW_CHANNEL));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.name = "Secret".into();
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(UserId::new(AUTHOR)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+
+        let voice_state = serde_json::from_value::<VoiceState>(serde_json::json!({
+            "channel_id": VOICE.to_string(),
+            "deaf": false,
+            "guild_id": GUILD.to_string(),
+            "mute": false,
+            "self_deaf": false,
+            "self_mute": false,
+            "self_stream": null,
+            "self_video": false,
+            "session_id": "fixture",
+            "suppress": false,
+            "user_id": TARGET.to_string(),
+        }))
+        .unwrap();
+        guild.voice_states.insert(UserId::new(TARGET), voice_state);
+
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let partial = gateway_partial();
+        assert!(partial.user.is_none());
+        let from_gateway = Member::from(partial);
+        assert_ne!(from_gateway.user.id, UserId::new(AUTHOR));
+
+        let actor = UserId::new(AUTHOR);
+        assert!(
+            cache
+                .guild(GuildId::new(GUILD))
+                .is_none_or(|g| !g.members.contains_key(&actor)),
+            "fixture must exercise the gateway partial path, not a cached author row"
+        );
+        assert_eq!(
+            snapshot_cached_voice(
+                &cache,
+                GuildId::new(GUILD),
+                from_gateway.user.id,
+                &from_gateway.roles,
+                UserId::new(TARGET),
+            ),
+            VoiceLookupSnapshot::InChannel {
+                channel_id: VOICE,
+                channel_name: "Secret".into(),
+            },
+            "default partial user id must not drive member-specific view denies"
+        );
+        let actor_member = super::actor_member_for_command(actor, from_gateway);
+        assert_eq!(actor_member.user.id, actor);
+
+        let snapshot = snapshot_cached_voice(
+            &cache,
+            GuildId::new(GUILD),
+            actor,
+            &actor_member.roles,
+            UserId::new(TARGET),
+        );
+        assert_eq!(snapshot, VoiceLookupSnapshot::ChannelUnavailable);
     }
 
     fn everyone_attempt(can_mention: bool, unknown: bool) -> Option<crate::automod::PendingAction> {
@@ -2847,6 +3642,7 @@ mod tests {
                 "token",
                 "error: writer lease is not held",
                 true,
+                false,
             )
             .await,
             RacedWrite::Cutoff
@@ -2880,7 +3676,7 @@ mod tests {
             .ratelimiter_disabled(true)
             .build();
         assert_eq!(
-            raced_slash_edit(&activation, &http, "token", "pong").await,
+            raced_slash_edit(&activation, &http, "token", "pong", false).await,
             RacedWrite::Cutoff,
             "deferred slash success edits must be cancellable at cutoff"
         );

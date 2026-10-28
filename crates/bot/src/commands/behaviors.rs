@@ -84,11 +84,19 @@ fn apply_mod_reason_dm_clause(
 use crate::types::Behavior;
 use crate::{db, logging};
 
+fn skips_case_enrollment(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Voice)
+}
+
 /// Runs a command behavior. Returns an optional extra response plus vars
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
-    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
+    let enrollment = if skips_case_enrollment(&env.cmd.behavior) {
+        None
+    } else {
+        crate::cases::capture(env.app, env.guild_id.get()).await
+    };
 
     match &env.cmd.behavior {
         Behavior::Ban {
@@ -683,6 +691,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
         Behavior::WarnClear => {
             let mut args = env.args.clone();
             let target =
@@ -706,6 +715,76 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await;
             Ok(BehaviorOutcome {
                 response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
+                vars,
+                suppress_response: false,
+            })
+        }
+        Behavior::Voice => {
+            let mut args = env.args.clone();
+            let token = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+            // Ids and mentions parse before the member search. A name or nick
+            // can only be searched when the guild is cached; otherwise the
+            // reply is the same not-cached line as a cold id lookup.
+            let guild_cached = env.ctx.cache.guild(env.guild_id).is_some();
+            let target = match super::resolve_user_name(env.ctx, env.guild_id, &token) {
+                super::UserNameMatch::Unique(id) => id,
+                super::UserNameMatch::NotFound if !guild_cached => {
+                    vars.insert("target".into(), token);
+                    return Ok(BehaviorOutcome {
+                        response: Some(crate::templates::render(
+                            super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                            &vars,
+                        )),
+                        vars,
+                        suppress_response: false,
+                    });
+                }
+                super::UserNameMatch::NotFound => {
+                    return Err(anyhow!("could not resolve user `{token}`"));
+                }
+                super::UserNameMatch::Ambiguous => {
+                    return Err(anyhow!(
+                        "ambiguous user `{token}`; use a mention or numeric user id"
+                    ));
+                }
+            };
+            let target_user = user_lookup(env, target).await?;
+            let snapshot = super::voice_lookup::snapshot_cached_voice(
+                &env.ctx.cache,
+                env.guild_id,
+                env.actor,
+                &env.actor_member.roles,
+                target,
+            );
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            let response = match snapshot {
+                super::voice_lookup::VoiceLookupSnapshot::InChannel {
+                    channel_id,
+                    channel_name,
+                } => {
+                    vars.insert("channel".into(), channel_name);
+                    vars.insert("channel_id".into(), channel_id.to_string());
+                    Some(crate::templates::render(
+                        super::voice_lookup::IN_CHANNEL_TEMPLATE,
+                        &vars,
+                    ))
+                }
+                super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
+                    crate::templates::render(super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE, &vars),
+                ),
+                super::voice_lookup::VoiceLookupSnapshot::GuildNotCached => Some(
+                    crate::templates::render(super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE, &vars),
+                ),
+                super::voice_lookup::VoiceLookupSnapshot::ChannelUnavailable => {
+                    Some(crate::templates::render(
+                        super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                        &vars,
+                    ))
+                }
+            };
+            Ok(BehaviorOutcome {
+                response,
                 vars,
                 suppress_response: false,
             })
@@ -1208,8 +1287,7 @@ fn parse_channel_mention(token: &str) -> Option<ChannelId> {
     token
         .strip_prefix("<#")
         .and_then(|t| t.strip_suffix('>'))
-        .and_then(|t| t.parse::<u64>().ok())
-        .map(Into::into)
+        .and_then(|t| t.parse().ok())
 }
 
 /// Resolves `!say` arguments into the target channel and the text to post.
@@ -1509,7 +1587,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             }
             let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
             let channel = parse_channel_mention(&token)
-                .or_else(|| token.parse::<u64>().ok().map(Into::into))
+                .or_else(|| token.parse::<ChannelId>().ok())
                 .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
             crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
                 .await?;
@@ -1602,6 +1680,8 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("reason", Str, true, "Warning reason"),
         ],
         Behavior::Warns | Behavior::WarnClear => vec![opt("user", User, true, "User")],
+        Behavior::UserInfo => vec![opt("user", User, false, "User to inspect")],
+        Behavior::Voice => vec![opt("user", User, true, "User")],
         Behavior::Purge { .. } => {
             vec![opt("count", Integer, false, "Number of messages (max 100)")]
         }
@@ -1650,6 +1730,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn voice_skips_case_enrollment_capture() {
+        assert!(skips_case_enrollment(&Behavior::Voice));
+        assert!(!skips_case_enrollment(&Behavior::Help));
+    }
 
     #[tokio::test]
     async fn stats_counts_cases_and_reports_unavailable_stores() {
@@ -2065,6 +2151,23 @@ mod tests {
         let (target, text) = say_target_and_text(&Args::new("<#7> hi"), ChannelId::new(7)).unwrap();
         assert_eq!(target, ChannelId::new(7));
         assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn say_rejects_zero_and_overflow_channel_tokens_without_panicking() {
+        let (target, text) =
+            say_target_and_text(&Args::new("<#0> hello"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#0> hello");
+        let (target, text) = say_target_and_text(
+            &Args::new("<#18446744073709551616> hello"),
+            ChannelId::new(7),
+        )
+        .unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#18446744073709551616> hello");
+        assert!(parse_channel_mention("0").is_none());
+        assert!("0".parse::<ChannelId>().is_err());
     }
 
     #[test]
