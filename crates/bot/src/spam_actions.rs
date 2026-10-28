@@ -1494,8 +1494,7 @@ pub(crate) mod tests {
                             return;
                         };
                         lines.lock().push(format!("{method} {path}"));
-                        let status_override =
-                            before_response.lock()(&method, &path, &request_body);
+                        let status_override = before_response.lock()(&method, &path, &request_body);
                         let body = if method == "GET" && path.contains("/members/") {
                             MEMBER_JSON
                         } else if method == "POST" && path.ends_with("/messages") {
