@@ -2589,6 +2589,53 @@ async fn individual_configuration_reads_keep_global_context_owner_only() {
 }
 
 #[tokio::test]
+async fn builtin_command_effective_read_applies_shipped_definition_and_stored_access_controls() {
+    use jmodguard::db::SqlExecutor;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let shipped = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    let mut stored = shipped.clone();
+    stored.enabled = false;
+    stored.permission = "owner".into();
+    stored.roles = vec![555];
+    stored.channels = vec![777];
+    stored.description = "legacy dashboard row".into();
+    stored.aliases = vec!["legacy-alias".into()];
+    let stored_json = serde_json::to_string(&stored).unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (10,'ban',?1)",
+                jmodguard::db::params![stored_json],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["effective"]["description"], shipped.description);
+    assert_eq!(
+        body["effective"]["aliases"],
+        serde_json::json!(shipped.aliases)
+    );
+    assert_eq!(body["effective"]["enabled"], false);
+    assert_eq!(body["effective"]["permission"], "owner");
+    assert_eq!(body["effective"]["roles"], serde_json::json!(["555"]));
+    assert_eq!(body["effective"]["channels"], serde_json::json!(["777"]));
+    assert_eq!(
+        body["guild_override"]["description"],
+        "legacy dashboard row"
+    );
+}
+
+#[tokio::test]
 async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wire_shapes() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;

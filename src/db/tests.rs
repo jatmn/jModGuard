@@ -3143,11 +3143,54 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
         parts.commands["voice"].description,
         shipped_voice.description
     );
-    assert_eq!(parts.commands["voice"].enabled, shipped_voice.enabled);
+    assert!(!parts.commands["voice"].enabled);
     assert!(matches!(
         parts.commands["voice"].behavior,
         crate::types::Behavior::Voice
     ));
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_access_controls_preserved_on_load_and_slash_registry() {
+    let tmp = tmp_db_path("builtin_access_controls");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    let mut stored = shipped_ban.clone();
+    stored.enabled = false;
+    stored.permission = "owner".into();
+    stored.roles = vec![555];
+    stored.channels = vec![777];
+    stored.description = "legacy description".into();
+    stored.aliases = vec!["legacy-alias".into()];
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
+            params![10_i64, serde_json::to_string(&stored)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    let ban = &parts.commands["ban"];
+    assert_eq!(ban.description, shipped_ban.description);
+    assert_eq!(ban.aliases, shipped_ban.aliases);
+    assert!(matches!(ban.behavior, crate::types::Behavior::Ban { .. }));
+    assert!(!ban.enabled);
+    assert_eq!(ban.permission, "owner");
+    assert_eq!(ban.roles, vec![555]);
+    assert_eq!(ban.channels, vec![777]);
+    let (_, _, slash_commands) =
+        tokio_test_block_on(load_slash_commands_with_version(&db, 10)).unwrap();
+    let slash_ban = slash_commands.get("ban").expect("slash ban");
+    assert!(!slash_ban.enabled);
+    assert_eq!(slash_ban.permission, "owner");
+    assert_eq!(slash_ban.roles, vec![555]);
+    assert_eq!(slash_ban.channels, vec![777]);
     cleanup_db(&tmp);
 }
 
@@ -3759,7 +3802,11 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                     assert_eq!(parts.templates[event], new);
                 }
             }
-            assert_eq!(parts.commands["stats"].permission, "admin");
+            if guild == 456 {
+                assert_eq!(parts.commands["stats"].permission, "everyone");
+            } else {
+                assert_eq!(parts.commands["stats"].permission, "admin");
+            }
             assert!(parts.commands["stats"].matches("status"));
         }
         // Even a deliberate reversion to old wording is retained after the one-time upgrade.
@@ -3885,10 +3932,7 @@ fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
         .into_iter()
         .find(|cmd| cmd.name == "stats")
         .expect("stats");
-    assert_eq!(
-        custom.commands["stats"].permission,
-        shipped_stats.permission
-    );
+    assert_eq!(custom.commands["stats"].permission, "everyone");
     assert_eq!(
         custom.commands["stats"].description,
         shipped_stats.description
@@ -3953,7 +3997,10 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
         parts.commands["stats"].matches("status"),
         "shipped built-in stats must keep its aliases regardless of stored rows"
     );
-    assert!(parts.commands["custom"].matches("status"));
+    assert!(
+        !parts.commands["custom"].matches("status"),
+        "reserved aliases must be stripped from custom commands"
+    );
     // A missing global row must still resolve to the shipped built-in definition.
     tokio_test_block_on(db.with_conn(|conn| {
         conn.execute_bounded(
@@ -3968,7 +4015,7 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     let db = Db::open(&tmp, 2).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
     assert!(parts.commands["stats"].matches("status"));
-    assert!(parts.commands["custom"].matches("status"));
+    assert!(!parts.commands["custom"].matches("status"));
     drop(db);
     cleanup_db(&tmp);
 }

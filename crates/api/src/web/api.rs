@@ -597,10 +597,17 @@ pub async fn get_command(
     let name = name.to_lowercase();
     let layers = db::get_enrolled_command(&app.db, scope, &name).await?;
     let (guild_override, global) = (layers.guild, layers.global);
-    let def = crate::defaults::default_commands()
-        .into_iter()
-        .find(|c| c.name == name);
-    let effective = guild_override.clone().or_else(|| global.clone()).or(def);
+    let effective = if crate::defaults::is_builtin_primary_command_name(&name) {
+        crate::defaults::effective_builtin_command(
+            &name,
+            guild_override.as_ref().or(global.as_ref()),
+        )
+    } else {
+        let def = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == name);
+        guild_override.clone().or_else(|| global.clone()).or(def)
+    };
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
