@@ -3037,6 +3037,19 @@ fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
             .contains("cannot be written to the database"),
         "{ban_error:#}"
     );
+    ban.enabled = false;
+    ban.permission = "owner".into();
+    ban.roles = vec![555];
+    ban.channels = vec![777];
+    let access_error =
+        tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
+            .expect_err("dashboard writer must reject built-in access-control edits");
+    assert!(
+        access_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{access_error:#}"
+    );
     ban.aliases = vec!["extra-ban-alias".into()];
     let alias_error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "ban", &ban))
         .expect_err("dashboard writer must reject built-in ban alias edits");
