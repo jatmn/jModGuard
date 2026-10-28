@@ -2,7 +2,7 @@
 
 The old general SQL message archive remains retired. A separate, rolling guild-store
 snapshot keeps the latest observed text and attachment metadata for eligible human
-messages in guilds with an edit, delete or bulk-delete log destination. It expires
+messages in guilds with an edit, delete, bulk-delete, or automod_delete log destination. It expires
 at most 24 hours after the original message creation; edits never extend that time.
 Capacity pressure can evict it earlier. It stores no attachment bytes. The bounded [member directory](MEMBERS.md) retains current
 member identity and known join dates, plus people with confirmed ban history. It does

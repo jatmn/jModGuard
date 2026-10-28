@@ -117,8 +117,18 @@ pub(crate) struct AutomodDeleteMarks {
     gateway: HashMap<MessageTarget, MessageGatewayState>,
     /// Pending ids kept in a bulk transcript, keyed until delivery settles.
     bulk_logs: HashMap<MessageTarget, BulkLogState>,
+    /// Deadlines for delivered bulk rows, earliest at the front. In-flight,
+    /// deferred, and ambiguous rows are not indexed. Prune only pops entries
+    /// that are already due.
+    bulk_expiry: VecDeque<(Instant, MessageTarget)>,
     mark_expiry_heap: BinaryHeap<Reverse<(Instant, MarkKey)>>,
     gateway_retained_expiry_heap: BinaryHeap<Reverse<(i64, MessageTarget)>>,
+    #[cfg(test)]
+    bulk_expiry_pops: u64,
+    /// Front peeks inside `expire_bulk_logs`, including the peek that stops
+    /// because the next deadline is still in the future.
+    #[cfg(test)]
+    bulk_expiry_visits: u64,
 }
 
 fn snapshot_still_valid(row: &MessageSnapshot, now_ms: i64) -> bool {
@@ -308,17 +318,6 @@ impl AutomodDeleteMarks {
         }
     }
 
-    fn can_evict_for_capacity(
-        entry: &AutomodDeleteMark,
-        gateway: &MessageGatewayState,
-        now: Instant,
-    ) -> bool {
-        if entry.expires > now {
-            return false;
-        }
-        !(gateway.observed && !gateway.settled && !entry.confirmed)
-    }
-
     fn prune(&mut self, now: Instant) {
         self.expire_bulk_logs(now);
         let wall = now_ms();
@@ -355,26 +354,6 @@ impl AutomodDeleteMarks {
         }
     }
 
-    fn evict_one(&mut self, now: Instant) -> bool {
-        let len = self.order.len();
-        for _ in 0..len {
-            let Some(key) = self.order.pop_front() else {
-                break;
-            };
-            let Some(entry) = self.entries.get(&key) else {
-                continue;
-            };
-            let target = Self::message_target(key.0, key.1, key.2);
-            let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
-            if Self::can_evict_for_capacity(entry, &gateway, now) {
-                self.remove_key(key);
-                return true;
-            }
-            self.order.push_back(key);
-        }
-        false
-    }
-
     pub(crate) fn insert(
         &mut self,
         guild: u64,
@@ -388,11 +367,8 @@ impl AutomodDeleteMarks {
         let attempt = AutomodDeleteAttempt(self.next_attempt);
         self.next_attempt += 1;
         let key = Self::mark_key(guild, channel, message, attempt);
-        while self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
-            if !self.evict_one(now) {
-                return attempt;
-            }
-        }
+        // Prune already removed every expired mark that capacity eviction could
+        // take, and renewed protected pending marks. A full cache means reject.
         if self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
             return attempt;
         }
@@ -554,18 +530,60 @@ impl AutomodDeleteMarks {
         }
     }
 
+    fn bulk_log_deadline(state: &BulkLogState) -> Option<Instant> {
+        if state.ambiguous || state.inflight || state.deferred {
+            return None;
+        }
+        state.started.checked_add(AUTOMOD_DELETE_MARK_TTL)
+    }
+
+    fn schedule_bulk_expiry(&mut self, target: MessageTarget) {
+        let Some(deadline) = self
+            .bulk_logs
+            .get(&target)
+            .and_then(Self::bulk_log_deadline)
+        else {
+            return;
+        };
+        if self
+            .bulk_expiry
+            .back()
+            .is_none_or(|(at, _)| *at <= deadline)
+        {
+            self.bulk_expiry.push_back((deadline, target));
+            return;
+        }
+        let index = self.bulk_expiry.partition_point(|(at, _)| *at <= deadline);
+        self.bulk_expiry.insert(index, (deadline, target));
+    }
+
     fn expire_bulk_logs(&mut self, now: Instant) {
-        self.bulk_logs.retain(|_, state| {
-            // These rows are the only record that a later REST failure must not
-            // emit again. The 4096 cap refuses new keys, and Failed settlement
-            // removes a row that is not covered or ambiguous. Covered rows still
-            // expire so a delivered bulk does not pin a map slot forever.
-            if state.ambiguous || state.inflight || state.deferred {
-                return true;
+        // Pop only the due prefix. Fresh delivered rows sit behind that prefix
+        // and are not visited. Suppression rows are not indexed.
+        while let Some((deadline, target)) = self.bulk_expiry.front().copied() {
+            #[cfg(test)]
+            {
+                self.bulk_expiry_visits = self.bulk_expiry_visits.saturating_add(1);
             }
-            now.checked_duration_since(state.started)
-                .is_none_or(|age| age < AUTOMOD_DELETE_MARK_TTL)
-        });
+            if deadline > now {
+                break;
+            }
+            self.bulk_expiry.pop_front();
+            #[cfg(test)]
+            {
+                self.bulk_expiry_pops = self.bulk_expiry_pops.saturating_add(1);
+            }
+            let Some(state) = self.bulk_logs.get(&target) else {
+                continue;
+            };
+            let Some(current) = Self::bulk_log_deadline(state) else {
+                continue;
+            };
+            if current > now {
+                continue;
+            }
+            self.bulk_logs.remove(&target);
+        }
     }
 
     fn bulk_coverage(&self, target: MessageTarget) -> (bool, bool) {
@@ -644,6 +662,7 @@ impl AutomodDeleteMarks {
                         state.deferred = false;
                         state.deferred_retained = None;
                     }
+                    self.schedule_bulk_expiry(target);
                 }
                 BulkDeliveryOutcome::Ambiguous => {
                     // Keep the entry so a later REST failure cannot emit a second report.
@@ -1829,6 +1848,158 @@ mod tests {
         assert_eq!(
             marks.claim_or_defer_plain_replay(1, 2, 1, None),
             BulkPlainReplay::Covered
+        );
+    }
+
+    fn deliver_covered_bulk(marks: &mut AutomodDeleteMarks, message: u64, now: Instant) {
+        marks.insert(1, 2, message, "badword", "Bad word", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, message, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        assert!(marks.reserve_bulk_delivery(1, 2, message, now));
+        marks.finish_bulk_delivery(1, 2, &[message], BulkDeliveryOutcome::Delivered);
+    }
+
+    fn hold_bulk_row(
+        marks: &mut AutomodDeleteMarks,
+        message: u64,
+        now: Instant,
+        outcome: Option<BulkDeliveryOutcome>,
+    ) {
+        marks.insert(1, 2, message, "badword", "Bad word", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, message, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        assert!(marks.reserve_bulk_delivery(1, 2, message, now));
+        if let Some(outcome) = outcome {
+            marks.finish_bulk_delivery(1, 2, &[message], outcome);
+        }
+    }
+
+    #[test]
+    fn bulk_expiry_pops_only_due_entries() {
+        let mut marks = AutomodDeleteMarks::default();
+        let early = Instant::now();
+        let later = early + Duration::from_secs(30);
+        // A fresher deadline is indexed first. The older delivered row has to
+        // land at the front without a scan of the live map.
+        deliver_covered_bulk(&mut marks, 1, later);
+        hold_bulk_row(&mut marks, 2, early, None);
+        hold_bulk_row(&mut marks, 3, early, None);
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 3, None),
+            BulkPlainReplay::Deferred
+        );
+        hold_bulk_row(&mut marks, 4, early, Some(BulkDeliveryOutcome::Ambiguous));
+        deliver_covered_bulk(&mut marks, 0, early);
+        for message in 5..37 {
+            deliver_covered_bulk(&mut marks, message, later);
+        }
+        let pops = marks.bulk_expiry_pops;
+        let visits = marks.bulk_expiry_visits;
+        let due = early + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        assert!(due < later + AUTOMOD_DELETE_MARK_TTL);
+        marks.prune(due);
+        assert_eq!(marks.bulk_expiry_pops, pops + 1);
+        assert_eq!(
+            marks.bulk_expiry_visits,
+            visits + 2,
+            "prune walked past the first deadline that was not due"
+        );
+        assert!(!marks.bulk_logs.contains_key(&(1, 2, 0)));
+        assert!(marks.bulk_logs.contains_key(&(1, 2, 1)));
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 2)),
+            "in-flight bulk row expired"
+        );
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 3)),
+            "deferred bulk row expired"
+        );
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 4)),
+            "ambiguous suppression expired"
+        );
+        assert_eq!(marks.bulk_logs.len(), 1 + 3 + 32);
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 2, None),
+            BulkPlainReplay::Deferred
+        );
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 4, None),
+            BulkPlainReplay::Covered
+        );
+    }
+
+    #[test]
+    fn fresh_bulk_coverage_does_not_slow_unrelated_observations() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            deliver_covered_bulk(&mut marks, message, now);
+        }
+        assert_eq!(marks.bulk_logs.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
+        let pops = marks.bulk_expiry_pops;
+        let visits = marks.bulk_expiry_visits;
+        let started = Instant::now();
+        for message in 0..10_000u64 {
+            assert_eq!(
+                marks.observe_gateway_delete(9, 9, message, None, now),
+                GatewayDeleteObservation::Plain
+            );
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(
+            marks.bulk_expiry_pops, pops,
+            "prune popped bulk rows when nothing was due"
+        );
+        assert_eq!(
+            marks.bulk_expiry_visits,
+            visits + 10_000,
+            "each observation should peek one undued deadline, not the live rows"
+        );
+        assert_eq!(marks.bulk_logs.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "10k observations took {elapsed:?}; scanning every delivered bulk row was about 421ms"
+        );
+    }
+
+    #[test]
+    fn capacity_rejection_does_not_walk_live_marks() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            marks.insert(1, 2, message, "badword", "Bad word", now);
+        }
+        let started = Instant::now();
+        for offset in 0..10_000u64 {
+            marks.insert(
+                1,
+                2,
+                MAX_AUTOMOD_DELETE_MARKS as u64 + offset,
+                "badword",
+                "Bad word",
+                now,
+            );
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert_eq!(marks.order.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert!(marks.contains(1, 2, 0));
+        assert!(!marks.contains(1, 2, MAX_AUTOMOD_DELETE_MARKS as u64));
+        assert!(!marks.contains(1, 2, MAX_AUTOMOD_DELETE_MARKS as u64 + 9_999));
+        assert_eq!(
+            marks.bulk_expiry_visits, 0,
+            "capacity rejection walked bulk expiry"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "10k rejected inserts took {elapsed:?}; walking every live mark was about 2.81s"
         );
     }
 }
