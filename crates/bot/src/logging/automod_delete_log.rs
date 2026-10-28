@@ -1602,3 +1602,120 @@ async fn deferred_plain_replay_drops_text_that_expires_while_inflight() {
         "expired snapshot text was published: {bodies:?}"
     );
 }
+
+#[tokio::test]
+async fn ambiguous_bulk_log_survives_ttl_without_a_second_report() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let (_, reserved) = f
+        .app
+        .automod_delete_marks
+        .observe_and_reserve_bulk_delete(789, 456, 123, None, true);
+    assert!(reserved);
+    assert!(
+        f.app
+            .automod_delete_marks
+            .finish_bulk_delivery(789, 456, &[123], BulkDeliveryOutcome::Ambiguous)
+            .is_empty()
+    );
+    f.app
+        .automod_delete_marks
+        .prune_at(std::time::Instant::now() + std::time::Duration::from_secs(10 * 60 + 5));
+    assert!(f.app.automod_delete_marks.bulk_log_contains(789, 456, 123));
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert_eq!(
+        removal.action,
+        crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    assert!(removal.covered_by_bulk);
+    let sink = Sink::default();
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(
+        sink.messages.lock().unwrap().is_empty(),
+        "TTL dropped the ambiguous bulk row and a second report was emitted"
+    );
+    assert!(f.app.automod_delete_marks.bulk_log_contains(789, 456, 123));
+}
+
+#[tokio::test]
+async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let held: Vec<_> = (0..4)
+        .map(|_| {
+            std::sync::Arc::clone(&f.app.log_delivery_slots)
+                .try_acquire_owned()
+                .unwrap()
+        })
+        .collect();
+    let before_refs = Arc::strong_count(&f.app);
+    let before_failures = f.app.log_delivery_failures.load(Ordering::Relaxed);
+    for message in 0..32u64 {
+        spawn_reconciled_automod_delete(
+            Arc::clone(&f.app),
+            Arc::new(Sink::default()),
+            789,
+            456,
+            message,
+            "badword".into(),
+            "Bad words".into(),
+            Some(sample_retained("queued-snapshot-secret")),
+        );
+    }
+    assert_eq!(
+        Arc::strong_count(&f.app),
+        before_refs,
+        "delivery admission spawned reconciled tasks while every slot was held"
+    );
+    assert_eq!(
+        f.app.log_delivery_failures.load(Ordering::Relaxed),
+        before_failures + 32
+    );
+    drop(held);
+    let sink = Arc::new(Sink::default());
+    spawn_reconciled_automod_delete(
+        Arc::clone(&f.app),
+        Arc::clone(&sink),
+        789,
+        456,
+        99,
+        "badword".into(),
+        "Bad words".into(),
+        Some(sample_retained("admitted-snapshot")),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while sink.messages.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an admitted reconciled delete did not log after a delivery slot freed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let sent = sink.messages.lock().unwrap();
+    assert_eq!(sent[0].0, ChannelId::new(901));
+    let body = sent[0].1.to_string();
+    assert!(body.contains("Bad words"), "{body}");
+    assert!(body.contains("admitted-snapshot"), "{body}");
+}

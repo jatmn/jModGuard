@@ -54,7 +54,9 @@ Joining, leaving and talking still do not maintain a general activity archive.
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
   ambiguous timeout or cancellation is never resent, and it does not release a
-  deferred replay of the same deletion. A pending automod delete replayed through
+  deferred replay of the same deletion. That in-flight, deferred, or ambiguous
+  bulk record stays until settlement or the bulk-log cap; the ten-minute mark
+  expiry does not drop it. A delivered bulk row still expires on that timer. A pending automod delete replayed through
   `message_bulk_delete` because no `message_delete` channel is configured uses
   that same attachment fallback. The transcript is not archived.
 - Join reports use the delivered user and the join timestamp in the Gateway member

@@ -1122,6 +1122,26 @@ pub async fn emit(
     emit_to(app, ctx.http.as_ref(), guild_id, event, vars).await;
 }
 
+/// Send on a delivery permit the caller already holds.
+pub(crate) async fn emit_held(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    guild_id: GuildId,
+    event: &str,
+    vars: BTreeMap<String, String>,
+) -> Delivery {
+    emit_to_observed(
+        app,
+        ctx.http.as_ref(),
+        guild_id,
+        event,
+        vars,
+        None,
+        Admission::Held,
+    )
+    .await
+}
+
 /// Sends a lifecycle notice through the configured system log channel.
 pub async fn emit_system_notice(
     app: &Arc<BotState>,
@@ -1298,6 +1318,9 @@ pub(crate) enum Delivery {
 enum Admission {
     Immediate,
     WaitForShutdown,
+    /// Caller acquired `log_delivery_slots` before spawning and holds that
+    /// permit until this send finishes. Do not take a second one.
+    Held,
 }
 
 pub(crate) async fn emit_to(
@@ -1470,7 +1493,7 @@ async fn emit_to_observed_with_audit(
                 record_delivery_failure(app);
                 return (Delivery::Dropped, None);
             };
-            permit
+            Some(permit)
         }
         Admission::WaitForShutdown => {
             // A stop notice gets the same total deadline for admission and
@@ -1481,8 +1504,9 @@ async fn emit_to_observed_with_audit(
                 record_delivery_failure(app);
                 return (Delivery::Failed, None);
             };
-            permit
+            Some(permit)
         }
+        Admission::Held => None,
     };
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
@@ -3182,8 +3206,9 @@ pub(crate) async fn emit_reconciled_automod_delete(
 }
 
 /// Reconciled automod delete logging without blocking the enforcement caller.
-/// Uses the same delivery path as [`emit_reconciled_automod_delete`]. Report-slot
-/// pressure must not drop this log while the direct emit still sends it.
+/// Delivery admission is taken before the spawn, and that permit is held for
+/// the send. Report-slot pressure does not apply. A full delivery budget does
+/// not queue the retained snapshot on a task.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reconciled_automod_delete(
     app: std::sync::Arc<BotState>,
@@ -3195,16 +3220,30 @@ pub(crate) fn spawn_reconciled_automod_delete(
     rule_name: String,
     retained: Option<db::guild_data::MessageSnapshot>,
 ) {
+    let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
+        record_delivery_failure(&app);
+        return;
+    };
     tokio::spawn(async move {
-        emit_reconciled_automod_delete(
+        let _permit = permit;
+        let retained = settle_automod_retained(&app, guild_id, channel, message, retained.as_ref());
+        let report = automod_delete_report(
             &app,
-            sink.as_ref(),
-            guild_id,
-            channel,
-            message,
+            GuildId::new(guild_id),
+            ChannelId::new(channel),
+            MessageId::new(message),
             &rule_id,
             &rule_name,
             retained.as_ref(),
+        );
+        emit_to_observed(
+            &app,
+            sink.as_ref(),
+            report.guild_id,
+            report.event,
+            report.vars,
+            None,
+            Admission::Held,
         )
         .await;
     });

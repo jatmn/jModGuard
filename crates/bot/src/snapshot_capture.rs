@@ -326,9 +326,9 @@ impl SnapshotIngress {
                         true,
                     );
                     if !queued {
-                        // No collector queue. Admit a report when a slot is free.
-                        // When it is not, still observe and settle so a pending
-                        // automod id is not lost before REST finishes.
+                        // No collector queue. Admit one report task when a slot
+                        // is free. When it is not, observe inline: do not spawn
+                        // a task that waits on configuration.
                         schedule_unqueued_bulk_delete(app, context, guild, event.channel_id, ids);
                     }
                 }
@@ -1463,6 +1463,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
                 let now = chrono::Utc::now().timestamp_millis();
                 let mut transcript = logging::BulkTranscript::new(ids.len());
+                let mut peeled_reports = Vec::new();
                 let ignored_authors: HashSet<i64> = config
                     .as_ref()
                     .and_then(|cfg| cfg.log_filters.get("message_bulk_delete"))
@@ -1506,9 +1507,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         .as_ref()
                                         .and_then(|row| row.fields.author_id)
                                         .is_some_and(|author| ignored_authors.contains(&author));
-                                    record_observed_bulk_member(
-                                        &app,
-                                        &work.context,
+                                    if let Some(report) = record_observed_bulk_member(
                                         &mut transcript,
                                         *id,
                                         row.as_ref(),
@@ -1516,7 +1515,9 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                         automod_individual,
                                         author_filtered,
                                         false,
-                                    );
+                                    ) {
+                                        peeled_reports.push(report);
+                                    }
                                 } else {
                                     single = row;
                                 }
@@ -1526,15 +1527,14 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             tracing::warn!("message snapshot delete unavailable: {error:#}");
                             app.snapshots.gap_scope(&work.scope);
                             if *bulk {
-                                peel_automod_bulk_chunk(
+                                peeled_reports.extend(peel_automod_bulk_chunk(
                                     &app,
-                                    &work.context,
                                     *guild,
                                     *channel,
                                     chunk,
                                     &mut transcript,
                                     automod_individual,
-                                );
+                                ));
                             } else {
                                 single_unknown = true;
                             }
@@ -1542,10 +1542,13 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     }
                 }
                 app.snapshots.mark_deleted(*guild, *channel, ids);
+                for report in peeled_reports {
+                    dispatch_observed_report(&app, &work.context, report);
+                }
                 if *bulk {
                     let pending = transcript.pending_automod.clone();
                     if transcript.worth_sending() {
-                        submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
+                        submit_bulk_report(&app, &work.context, *guild, *channel, transcript).await;
                     } else if !pending.is_empty() {
                         logging::settle_bulk_delivery(
                             &app,
@@ -1666,17 +1669,62 @@ fn schedule_unqueued_bulk_delete(
             submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
         });
     } else {
-        let app = Arc::clone(app);
-        tokio::spawn(async move {
-            abandon_unsent_bulk_deletes(&app, &context, guild, channel, &ids).await;
-        });
+        observe_unadmitted_bulk_delete(app, &context, guild, channel, &ids);
     }
+}
+
+/// Report slots are full. Observe on this caller. A confirmed automod report
+/// is spawned only after a delivery permit is already held.
+fn observe_unadmitted_bulk_delete(
+    app: &Arc<BotState>,
+    context: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+) {
+    for id in ids {
+        let placement = logging::place_bulk_delete(app, guild, channel, *id, None, false);
+        if let Some(report) = placement
+            .report
+            .filter(|report| report.event == "automod_delete")
+        {
+            dispatch_delivery_admitted_report(app, context, report);
+        }
+    }
+}
+
+fn dispatch_observed_report(app: &Arc<BotState>, context: &Context, report: MessageReport) {
+    if let Ok(permit) = Arc::clone(&app.snapshots.report_slots).try_acquire_owned() {
+        let app = Arc::clone(app);
+        let context = context.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            logging::emit(&app, &context, report.guild_id, report.event, report.vars).await;
+        });
+        return;
+    }
+    dispatch_delivery_admitted_report(app, context, report);
+}
+
+fn dispatch_delivery_admitted_report(
+    app: &Arc<BotState>,
+    context: &Context,
+    report: MessageReport,
+) {
+    let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
+        logging::record_delivery_failure(app);
+        return;
+    };
+    let app = Arc::clone(app);
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        logging::emit_held(&app, &context, report.guild_id, report.event, report.vars).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_observed_bulk_member(
-    app: &Arc<BotState>,
-    context: &Context,
     transcript: &mut logging::BulkTranscript,
     id: MessageId,
     row: Option<&crate::db::guild_data::MessageSnapshot>,
@@ -1684,20 +1732,17 @@ fn record_observed_bulk_member(
     automod_individual: bool,
     author_filtered: bool,
     storage_unknown: bool,
-) {
+) -> Option<MessageReport> {
     let report = placement.report;
     if logging::peel_automod_from_bulk(&report, automod_individual) {
         transcript.peel_automod_delete();
-        if let Some(report) = report {
-            submit_report(app, context, report);
-        }
-        return;
+        return report;
     }
     // Cap miss or a concurrent REST replay: the id has no bulk row, so it must
     // not stay in a transcript that can still be sent.
     if report.is_none() && !placement.reserved_pending {
         transcript.drop_unreserved();
-        return;
+        return None;
     }
     if placement.reserved_pending {
         transcript.keep_pending_automod(id);
@@ -1709,23 +1754,22 @@ fn record_observed_bulk_member(
     } else {
         transcript.push(id, row);
     }
+    None
 }
 
 pub(crate) fn peel_automod_bulk_chunk(
     app: &Arc<BotState>,
-    context: &Context,
     guild: GuildId,
     channel: ChannelId,
     ids: &[MessageId],
     transcript: &mut logging::BulkTranscript,
     automod_individual: bool,
-) {
+) -> Vec<MessageReport> {
+    let mut peeled = Vec::new();
     for id in ids {
         let placement =
             logging::place_bulk_delete(app, guild, channel, *id, None, !automod_individual);
-        record_observed_bulk_member(
-            app,
-            context,
+        if let Some(report) = record_observed_bulk_member(
             transcript,
             *id,
             None,
@@ -1733,8 +1777,11 @@ pub(crate) fn peel_automod_bulk_chunk(
             automod_individual,
             false,
             true,
-        );
+        ) {
+            peeled.push(report);
+        }
     }
+    peeled
 }
 
 async fn submit_peeled_bulk_deletes(
@@ -1745,9 +1792,9 @@ async fn submit_peeled_bulk_deletes(
     ids: Vec<MessageId>,
 ) {
     let Some(permit) = acquire_report_slot(app) else {
-        // The transcript cannot be sent. Still observe pending ids so a later
-        // REST failure can fall back instead of finding no bulk delivery.
-        abandon_unsent_bulk_deletes(app, context, guild, channel, &ids).await;
+        // The transcript cannot be sent. Observe pending ids on this worker
+        // instead of spawning a task that waits on configuration.
+        observe_unadmitted_bulk_delete(app, context, guild, channel, &ids);
         return;
     };
     let app = Arc::clone(app);
@@ -1756,41 +1803,6 @@ async fn submit_peeled_bulk_deletes(
         let _permit = permit;
         submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
     });
-}
-
-async fn abandon_unsent_bulk_deletes(
-    app: &Arc<BotState>,
-    context: &Context,
-    guild: GuildId,
-    channel: ChannelId,
-    ids: &[MessageId],
-) {
-    let cfg = app.configs.get(&app.db, guild.get()).await.ok();
-    let automod_individual = cfg
-        .as_ref()
-        .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
-    let mut transcript = logging::BulkTranscript::new(ids.len());
-    peel_automod_bulk_chunk(
-        app,
-        context,
-        guild,
-        channel,
-        ids,
-        &mut transcript,
-        automod_individual,
-    );
-    let pending = transcript.pending_automod;
-    if !pending.is_empty() {
-        logging::settle_bulk_delivery(
-            app,
-            context.http.as_ref(),
-            guild,
-            channel,
-            &pending,
-            logging::BulkDeliveryOutcome::Failed,
-        )
-        .await;
-    }
 }
 
 async fn submit_peeled_bulk_deletes_admitted(
@@ -1805,15 +1817,19 @@ async fn submit_peeled_bulk_deletes_admitted(
         .as_ref()
         .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
     let mut transcript = logging::BulkTranscript::new(ids.len());
-    peel_automod_bulk_chunk(
+    let peeled = peel_automod_bulk_chunk(
         app,
-        context,
         guild,
         channel,
         &ids,
         &mut transcript,
         automod_individual,
     );
+    // This task already holds the report permit. Emit peeled automod reports
+    // here instead of acquiring a second report slot.
+    for report in peeled {
+        logging::emit(app, context, report.guild_id, report.event, report.vars).await;
+    }
     let pending = transcript.pending_automod.clone();
     if !transcript.worth_sending() {
         if !pending.is_empty() {
@@ -1846,7 +1862,7 @@ async fn submit_peeled_bulk_deletes_admitted(
     }
 }
 
-fn submit_bulk_report(
+async fn submit_bulk_report(
     app: &Arc<BotState>,
     context: &Context,
     guild: GuildId,
@@ -1859,19 +1875,15 @@ fn submit_bulk_report(
     }
     let Some(permit) = acquire_report_slot(app) else {
         if !pending.is_empty() {
-            let app = Arc::clone(app);
-            let context = context.clone();
-            tokio::spawn(async move {
-                logging::settle_bulk_delivery(
-                    &app,
-                    context.http.as_ref(),
-                    guild,
-                    channel,
-                    &pending,
-                    logging::BulkDeliveryOutcome::Failed,
-                )
-                .await;
-            });
+            logging::settle_bulk_delivery(
+                app,
+                context.http.as_ref(),
+                guild,
+                channel,
+                &pending,
+                logging::BulkDeliveryOutcome::Failed,
+            )
+            .await;
         }
         return;
     };
@@ -1895,15 +1907,9 @@ fn submit_bulk_report(
 }
 
 fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) {
-    let Some(permit) = acquire_report_slot(app) else {
-        return;
-    };
-    let app = Arc::clone(app);
-    let context = context.clone();
-    tokio::spawn(async move {
-        let _permit = permit;
-        logging::emit(&app, &context, report.guild_id, report.event, report.vars).await;
-    });
+    // Report slot first. If those are saturated, a free delivery slot still
+    // admits the send. Neither branch spawns before its permit is held.
+    dispatch_observed_report(app, context, report);
 }
 
 #[cfg(test)]
@@ -2331,17 +2337,17 @@ mod tests {
                 .is_err(),
             "closed membership must fail snapshot reads for the delete worker Err path"
         );
-        let ctx = test_delete_context().await;
         let mut transcript = logging::BulkTranscript::new(2);
-        peel_automod_bulk_chunk(
+        let peeled = peel_automod_bulk_chunk(
             &app,
-            &ctx,
             GuildId::new(789),
             ChannelId::new(456),
             &[MessageId::new(10), MessageId::new(11)],
             &mut transcript,
             true,
         );
+        assert_eq!(peeled.len(), 1);
+        assert_eq!(peeled[0].event, "automod_delete");
         assert_eq!(transcript.unknown, 1);
         assert!(
             !app.automod_delete_marks.inner.lock().contains(789, 456, 10),
@@ -2362,13 +2368,16 @@ mod tests {
     }
 
     async fn test_delete_context() -> Context {
+        test_delete_context_with(Arc::new(serenity::http::Http::new("fixture"))).await
+    }
+
+    async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
         use serenity::gateway::{
             Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
             ShardRunnerOptions,
         };
         use serenity::model::gateway::{GatewayIntents, ShardInfo};
         use serenity::model::id::ShardId;
-        let http = Arc::new(serenity::http::Http::new("fixture"));
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -2784,6 +2793,202 @@ mod tests {
         remove_db(&path);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_report_slots_do_not_spawn_unqueued_bulk_tasks() {
+        let (app, path) = temp_app("snapshot_saturated_spawn");
+        let attempt = app
+            .automod_delete_marks
+            .insert(789, 456, 1_000, "badword", "Bad words");
+        let held: Vec<_> = (0..32)
+            .map(|_| acquire_report_slot(&app).unwrap())
+            .collect();
+        let ctx = test_delete_context().await;
+        let before = Arc::strong_count(&app);
+        for offset in 0..128u64 {
+            let id = 1_000 + offset;
+            let bulk: serenity::model::event::MessageDeleteBulkEvent =
+                serde_json::from_value(serde_json::json!({
+                    "guild_id": "789",
+                    "channel_id": "456",
+                    "ids": [id.to_string()]
+                }))
+                .unwrap();
+            app.snapshots
+                .on_gateway_event(&app, ctx.clone(), &Event::MessageDeleteBulk(bulk));
+        }
+        assert_eq!(
+            Arc::strong_count(&app),
+            before,
+            "report slots saturated, but unqueued bulk deletes still spawned tasks"
+        );
+        assert!(
+            app.automod_delete_marks
+                .gateway_observed_unsettled(789, 456, 1_000),
+            "pending automod delete was not observed inline"
+        );
+        assert!(!app.automod_delete_marks.bulk_log_contains(789, 456, 1_000));
+        let removal = app
+            .automod_delete_marks
+            .remove_unconfirmed(789, 456, 1_000, attempt);
+        assert_eq!(
+            removal.action,
+            crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+        );
+        drop(held);
+        drop(ctx);
+        drop(app);
+        remove_db(&path);
+    }
+
+    async fn recording_delete_proxy() -> (
+        Arc<serenity::http::Http>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut header_end = None;
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        break;
+                    }
+                }
+                let Some(header_end) = header_end else {
+                    break;
+                };
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if !name.eq_ignore_ascii_case("content-length") {
+                            return None;
+                        }
+                        value.trim().parse::<usize>().ok()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let body = r#"{"id":"1","channel_id":"901","author":{"id":"1","username":"bot","discriminator":"0","avatar":null},"content":"ok","timestamp":"2020-01-01T00:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .application_id(serenity::model::id::ApplicationId::new(1))
+            .ratelimiter_disabled(true)
+            .build();
+        (Arc::new(http), bodies, server)
+    }
+
+    async fn peeled_automod_under_held_report_slots(held_slots: usize) {
+        let (app, path) = temp_app("snapshot_peeled_saturated");
+        crate::db::upsert_log_channel(&app.db, 789, "automod_delete", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let confirmed = app
+            .automod_delete_marks
+            .insert(789, 456, 123, "badword", "Bad words");
+        assert!(
+            app.automod_delete_marks
+                .confirm(789, 456, 123, confirmed)
+                .is_none()
+        );
+        let pending = app
+            .automod_delete_marks
+            .insert(789, 456, 124, "badword", "Bad words");
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let held: Vec<_> = (0..held_slots)
+            .map(|_| acquire_report_slot(&app).unwrap())
+            .collect();
+        let before = Arc::strong_count(&app);
+        let bulk: serenity::model::event::MessageDeleteBulkEvent =
+            serde_json::from_value(serde_json::json!({
+                "guild_id": "789",
+                "channel_id": "456",
+                "ids": ["123", "124"]
+            }))
+            .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageDeleteBulk(bulk));
+        assert_eq!(
+            Arc::strong_count(&app),
+            before + 1,
+            "peeled automod delete took more than one admitted task"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let sent = bodies.lock().unwrap().clone();
+            if sent.iter().any(|body| {
+                body.contains("Bad words") && body.contains("123") && body.contains("901")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peeled automod report was dropped under {held_slots} held report slots: {sent:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            app.automod_delete_marks
+                .gateway_observed_unsettled(789, 456, 124),
+            "pending automod delete inside the bulk was not kept"
+        );
+        assert!(!app.automod_delete_marks.bulk_log_contains(789, 456, 124));
+        let removal = app
+            .automod_delete_marks
+            .remove_unconfirmed(789, 456, 124, pending);
+        assert_eq!(
+            removal.action,
+            crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+        );
+        drop(held);
+        server.abort();
+        drop(ctx);
+        drop(app);
+        remove_db(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_slots_deliver_peeled_automod_with_pending_member() {
+        peeled_automod_under_held_report_slots(32).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn last_report_slot_hands_off_to_the_peeled_automod_report() {
+        peeled_automod_under_held_report_slots(31).await;
+    }
+
     #[tokio::test]
     async fn bulk_cap_omits_an_unreserved_id_so_rest_failure_logs_once() {
         use crate::automod_delete_marks::MAX_AUTOMOD_DELETE_MARKS;
@@ -2816,17 +3021,16 @@ mod tests {
         let attempt = app
             .automod_delete_marks
             .insert(789, 456, overflow, "badword", "Bad words");
-        let ctx = test_delete_context().await;
         let mut transcript = logging::BulkTranscript::new(1);
-        peel_automod_bulk_chunk(
+        let peeled = peel_automod_bulk_chunk(
             &app,
-            &ctx,
             GuildId::new(789),
             ChannelId::new(456),
             &[MessageId::new(overflow)],
             &mut transcript,
             false,
         );
+        assert!(peeled.is_empty());
         assert!(
             transcript.pending_automod.is_empty(),
             "an id that missed the bulk cap stayed in the transcript"

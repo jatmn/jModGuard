@@ -1482,15 +1482,17 @@ impl EventHandler for Handler {
                 .as_ref()
                 .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
             let mut transcript = logging::BulkTranscript::new(ids.len());
-            crate::snapshot_capture::peel_automod_bulk_chunk(
+            let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
                 &self.app,
-                &ctx,
                 guild_id,
                 channel_id,
                 &ids,
                 &mut transcript,
                 automod_individual,
             );
+            for report in peeled {
+                logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
+            }
             let pending = transcript.pending_automod.clone();
             if transcript.worth_sending() {
                 if !pending.is_empty() {

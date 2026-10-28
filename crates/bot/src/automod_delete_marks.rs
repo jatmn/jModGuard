@@ -556,6 +556,13 @@ impl AutomodDeleteMarks {
 
     fn expire_bulk_logs(&mut self, now: Instant) {
         self.bulk_logs.retain(|_, state| {
+            // These rows are the only record that a later REST failure must not
+            // emit again. The 4096 cap refuses new keys, and Failed settlement
+            // removes a row that is not covered or ambiguous. Covered rows still
+            // expire so a delivered bulk does not pin a map slot forever.
+            if state.ambiguous || state.inflight || state.deferred {
+                return true;
+            }
             now.checked_duration_since(state.started)
                 .is_none_or(|age| age < AUTOMOD_DELETE_MARK_TTL)
         });
@@ -1029,6 +1036,11 @@ impl AutomodDeleteMarkAccess {
             .lock()
             .bulk_logs
             .contains_key(&(guild, channel, message))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prune_at(&self, now: Instant) {
+        self.inner.lock().prune(now);
     }
 }
 
@@ -1760,5 +1772,63 @@ mod tests {
             .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
             .unwrap();
         assert!(settlement.retained.is_none());
+    }
+
+    #[test]
+    fn bulk_log_ttl_keeps_ambiguous_inflight_and_deferred_rows() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 1..=4 {
+            marks.insert(1, 2, message, "badword", "Bad words", now);
+            assert_eq!(
+                marks.observe_gateway_delete(1, 2, message, None, now),
+                GatewayDeleteObservation::PendingAutomod
+            );
+            assert!(marks.reserve_bulk_delivery(1, 2, message, now));
+        }
+        marks.finish_bulk_delivery(1, 2, &[1], BulkDeliveryOutcome::Ambiguous);
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 3, None),
+            BulkPlainReplay::Deferred
+        );
+        marks.finish_bulk_delivery(1, 2, &[4], BulkDeliveryOutcome::Delivered);
+
+        let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(expired);
+
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 1)),
+            "ambiguous suppression expired"
+        );
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 1, None),
+            BulkPlainReplay::Covered
+        );
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 2)),
+            "in-flight bulk row expired"
+        );
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 2, None),
+            BulkPlainReplay::Deferred
+        );
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 3)),
+            "deferred bulk row expired"
+        );
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 3, None),
+            BulkPlainReplay::Deferred
+        );
+        assert!(
+            !marks.bulk_logs.contains_key(&(1, 2, 4)),
+            "a delivered row should expire so the cap stays usable"
+        );
+        let replay = marks.finish_bulk_delivery(1, 2, &[2, 3], BulkDeliveryOutcome::Failed);
+        assert_eq!(replay.len(), 2, "TTL dropped a deferred replay");
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 1, None),
+            BulkPlainReplay::Covered
+        );
     }
 }

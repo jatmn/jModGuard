@@ -730,7 +730,7 @@ pub struct BotState {
     pub rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries,
     pub member_audits: crate::logging::MemberAuditClaims,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
-    pub log_delivery_slots: tokio::sync::Semaphore,
+    pub log_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub log_delivery_failures: AtomicU64,
     pub start: Instant,
     pub slash_synced: AtomicBool,
@@ -810,7 +810,8 @@ impl BotState {
         let attachment_burst = crate::attachment_burst::Tracker::new(cfg.attachment_burst.clone());
         let tenant =
             crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
-        let log_delivery_slots = tokio::sync::Semaphore::new(cfg.log.discord_concurrency);
+        let log_delivery_slots =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.log.discord_concurrency));
         // Prime from DB at construction — never leave an "unobserved" sentinel.
         // Cache population is independent of the poll task; skipping the first
         // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
