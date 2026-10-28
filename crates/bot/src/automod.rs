@@ -446,9 +446,10 @@ async fn automod_try_delete_message(
     {
         return;
     }
-    let delete_attempt = app
+    let prepared = app
         .automod_delete_marks
-        .insert(guild_id, channel, message, rule_id, rule_name);
+        .prepare_delete(guild_id, channel, message, rule_id, rule_name);
+    let delete_attempt = prepared.attempt;
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
@@ -479,22 +480,10 @@ async fn automod_try_delete_message(
     };
     match raced {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
-            if let Some(settlement) =
-                app.automod_delete_marks
-                    .confirm(guild_id, channel, message, delete_attempt)
-            {
-                logging::emit_reconciled_automod_delete(
-                    app,
-                    http,
-                    guild_id,
-                    channel,
-                    message,
-                    &settlement.rule_id,
-                    &settlement.rule_name,
-                    settlement.retained.as_ref(),
-                )
-                .await;
-            }
+            logging::complete_prepared_automod_delete(
+                app, http, guild_id, channel, message, &prepared, rule_id, rule_name,
+            )
+            .await;
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
             let removal = app.automod_delete_marks.remove_unconfirmed(
@@ -513,6 +502,7 @@ async fn automod_try_delete_message(
                     &settlement.rule_id,
                     &settlement.rule_name,
                     settlement.retained.as_ref(),
+                    settlement.fallback_to_bulk,
                 )
                 .await;
             }
@@ -563,6 +553,7 @@ async fn automod_try_delete_message(
                     &settlement.rule_id,
                     &settlement.rule_name,
                     settlement.retained.as_ref(),
+                    settlement.fallback_to_bulk,
                 )
                 .await;
             } else {
@@ -582,6 +573,7 @@ async fn automod_try_delete_message(
                         &settlement.rule_id,
                         &settlement.rule_name,
                         settlement.retained.as_ref(),
+                        settlement.fallback_to_bulk,
                     )
                     .await;
                 }

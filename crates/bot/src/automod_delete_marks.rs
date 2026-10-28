@@ -26,6 +26,8 @@ pub(crate) enum GatewayDeleteObservation {
     /// Gateway arrived before REST confirmation; suppress interim plain logging.
     PendingAutomod,
     Plain,
+    /// This delete was already reported, or a bulk transcript still owns it.
+    Suppressed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,9 @@ pub(crate) struct AutomodSettlement {
     pub rule_id: String,
     pub rule_name: String,
     pub retained: Option<MessageSnapshot>,
+    /// Placement peeled this delete for an individual report. If that route is
+    /// gone at send time and `message_bulk_delete` remains, send one bulk report.
+    pub fallback_to_bulk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,49 @@ pub(crate) struct UnconfirmedRemoval {
 pub(crate) struct DeferredBulkReplay {
     pub message: u64,
     pub retained: Option<MessageSnapshot>,
+    /// REST succeeded while the bulk send was still in flight. Emit this instead
+    /// of a plain replay when that send fails.
+    pub automod: Option<AutomodSettlement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkHold {
+    /// The transcript was delivered or its send was ambiguous.
+    Retained,
+    /// The transcript send has not finished.
+    Inflight,
+}
+
+/// Where bulk placement assigned a pending automod delete.
+/// Later config reloads must not move that assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportOwner {
+    /// The id stayed in the bulk transcript.
+    BulkTranscript,
+    /// The id was peeled because an individual route existed.
+    Individual,
+}
+
+/// How [`AutomodDeleteMarkAccess::prepare_delete`] recorded one REST attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteDisposition {
+    /// A live mark holds the rule until REST settles.
+    Stored,
+    /// The live-mark cap rejected this attempt and a bounded suppression row
+    /// remembers it so the gateway path cannot relabel the delete.
+    Unmarked,
+    /// The cap rejected another attempt for a message that already has a mark.
+    /// That mark still owns correlation.
+    Shadowed,
+    /// Both the mark cache and the suppression map were full. The delete still
+    /// runs. A later gateway echo may also log as `message_delete`.
+    Untracked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedAutomodDelete {
+    pub attempt: AutomodDeleteAttempt,
+    pub disposition: DeleteDisposition,
 }
 
 /// What a failed REST delete should do with a pending id that stayed in a bulk.
@@ -94,6 +142,8 @@ struct MessageGatewayState {
     retained: Option<MessageSnapshot>,
     /// Gateway delete already produced or reserved a report class for this message.
     settled: bool,
+    /// First bulk-placement decision for this message. Not replaced by a reload.
+    report_owner: Option<ReportOwner>,
 }
 
 /// Delivery of one message that stayed in a bulk transcript.
@@ -107,8 +157,24 @@ struct BulkLogState {
     ambiguous: bool,
     deferred: bool,
     deferred_retained: Option<MessageSnapshot>,
+    /// Success report held back while this transcript send is still in flight.
+    deferred_automod: Option<AutomodSettlement>,
     started: Instant,
     terminal_at: Option<Instant>,
+}
+
+/// One automod delete that could not take a live mark. Keyed by message, not
+/// walked at prune time: expiry only pops the due prefix of `unmarked_expiry`.
+struct UnmarkedDelete {
+    attempt: u64,
+    rule_id: String,
+    rule_name: String,
+    expires: Instant,
+    gateway_observed: bool,
+    emitted: bool,
+    /// REST already succeeded and no individual route existed yet. The next
+    /// gateway observation classifies as `automod_delete` instead of a plain delete.
+    rest_succeeded: bool,
 }
 
 #[derive(Default)]
@@ -124,6 +190,11 @@ pub(crate) struct AutomodDeleteMarks {
     /// have settled, earliest at the front. In-flight, deferred, and unsettled
     /// ambiguous rows are not indexed. Prune only pops entries that are already due.
     bulk_expiry: VecDeque<(Instant, MessageTarget)>,
+    /// Cap misses that still need an `automod_delete` report. Own cap, own
+    /// expiry index. Not scanned when the live mark map is full.
+    unmarked: HashMap<MessageTarget, UnmarkedDelete>,
+    unmarked_expiry: VecDeque<(Instant, MessageTarget)>,
+    unmarked_overflow_warned: bool,
     mark_expiry_heap: BinaryHeap<Reverse<(Instant, MarkKey)>>,
     gateway_retained_expiry_heap: BinaryHeap<Reverse<(i64, MessageTarget)>>,
     #[cfg(test)]
@@ -257,6 +328,11 @@ impl AutomodDeleteMarks {
         let rule_id = entry.rule_id.clone();
         let rule_name = entry.rule_name.clone();
         let retained = Self::settlement_retained_for(gateway, entry.retained.clone());
+        let fallback_to_bulk = self
+            .gateway
+            .get(&target)
+            .and_then(|state| state.report_owner)
+            == Some(ReportOwner::Individual);
         self.remove_key(key, now);
         if let Some(state) = self.gateway.get_mut(&target) {
             state.settled = true;
@@ -265,7 +341,355 @@ impl AutomodDeleteMarks {
             rule_id,
             rule_name,
             retained,
+            fallback_to_bulk,
         }
+    }
+
+    fn bulk_hold(&self, target: MessageTarget) -> Option<BulkHold> {
+        if self
+            .gateway
+            .get(&target)
+            .and_then(|state| state.report_owner)
+            != Some(ReportOwner::BulkTranscript)
+        {
+            return None;
+        }
+        let state = self.bulk_logs.get(&target)?;
+        if state.covered || state.ambiguous {
+            Some(BulkHold::Retained)
+        } else if state.inflight {
+            Some(BulkHold::Inflight)
+        } else {
+            None
+        }
+    }
+
+    /// The bulk transcript already owns this delete. Consume the mark so the
+    /// caller does not emit a second success report. An in-flight send keeps
+    /// the settlement and releases it only if that send fails.
+    fn consume_if_bulk_owns(
+        &mut self,
+        target: MessageTarget,
+        key: MarkKey,
+        gateway: &MessageGatewayState,
+        now: Instant,
+    ) -> bool {
+        let Some(hold) = self.bulk_hold(target) else {
+            return false;
+        };
+        let settlement = self.finalize_automod_settlement(target, key, gateway, now);
+        if matches!(hold, BulkHold::Inflight)
+            && let Some(state) = self.bulk_logs.get_mut(&target)
+        {
+            state.deferred_automod = Some(AutomodSettlement {
+                fallback_to_bulk: false,
+                ..settlement
+            });
+        }
+        true
+    }
+
+    fn note_report_owner(&mut self, guild: u64, channel: u64, message: u64, owner: ReportOwner) {
+        let state = self
+            .gateway
+            .entry(Self::message_target(guild, channel, message))
+            .or_default();
+        if state.report_owner.is_none() {
+            state.report_owner = Some(owner);
+        }
+    }
+
+    fn remember_unmarked(
+        &mut self,
+        target: MessageTarget,
+        attempt: u64,
+        rule_id: &str,
+        rule_name: &str,
+        now: Instant,
+    ) {
+        self.expire_unmarked(now);
+        if self.unmarked.contains_key(&target) {
+            return;
+        }
+        if self.unmarked.len() >= MAX_AUTOMOD_DELETE_MARKS {
+            if !self.unmarked_overflow_warned {
+                self.unmarked_overflow_warned = true;
+                tracing::warn!(
+                    cap = MAX_AUTOMOD_DELETE_MARKS,
+                    "automod delete marks and overflow suppression are full; the delete still runs, and a gateway echo may also log as message_delete"
+                );
+            }
+            return;
+        }
+        let expires = now + AUTOMOD_DELETE_MARK_TTL;
+        self.unmarked.insert(
+            target,
+            UnmarkedDelete {
+                attempt,
+                rule_id: rule_id.to_owned(),
+                rule_name: rule_name.to_owned(),
+                expires,
+                gateway_observed: false,
+                emitted: false,
+                rest_succeeded: false,
+            },
+        );
+        if self
+            .unmarked_expiry
+            .back()
+            .is_none_or(|(at, _)| *at <= expires)
+        {
+            self.unmarked_expiry.push_back((expires, target));
+        } else {
+            let index = self
+                .unmarked_expiry
+                .partition_point(|(at, _)| *at <= expires);
+            self.unmarked_expiry.insert(index, (expires, target));
+        }
+    }
+
+    fn expire_unmarked(&mut self, now: Instant) {
+        while let Some((deadline, target)) = self.unmarked_expiry.front().copied() {
+            if deadline > now {
+                break;
+            }
+            self.unmarked_expiry.pop_front();
+            let Some(row) = self.unmarked.get(&target) else {
+                continue;
+            };
+            if row.expires > now {
+                continue;
+            }
+            self.unmarked.remove(&target);
+        }
+        if self.unmarked.len() < MAX_AUTOMOD_DELETE_MARKS {
+            self.unmarked_overflow_warned = false;
+        }
+    }
+
+    fn bulk_row_owns(&self, target: MessageTarget) -> bool {
+        self.bulk_logs
+            .get(&target)
+            .is_some_and(|state| state.inflight || state.covered || state.ambiguous)
+    }
+
+    fn observe_unmarked(
+        &mut self,
+        target: MessageTarget,
+        retained: Option<MessageSnapshot>,
+    ) -> Option<GatewayDeleteObservation> {
+        let row = self.unmarked.get(&target)?;
+        if row.emitted {
+            return Some(GatewayDeleteObservation::Suppressed);
+        }
+        if row.rest_succeeded {
+            let rule_id = row.rule_id.clone();
+            let rule_name = row.rule_name.clone();
+            if let Some(row) = self.unmarked.get_mut(&target) {
+                row.emitted = true;
+            }
+            if let Some(state) = self.gateway.get_mut(&target) {
+                state.settled = true;
+            }
+            return Some(GatewayDeleteObservation::Automod { rule_id, rule_name });
+        }
+        if let Some(row) = self.unmarked.get_mut(&target) {
+            row.gateway_observed = true;
+        }
+        let gateway = self.gateway.entry(target).or_default();
+        if !gateway.observed {
+            gateway.observed = true;
+        }
+        if let Some(row) = retained {
+            self.store_gateway_retained(target, row, now_ms());
+        }
+        Some(GatewayDeleteObservation::PendingAutomod)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_unmarked(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        attempt: AutomodDeleteAttempt,
+        individual_route: bool,
+        bulk_route: bool,
+        now: Instant,
+    ) -> Option<AutomodSettlement> {
+        self.prune(now);
+        let target = Self::message_target(guild, channel, message);
+        let row = self.unmarked.get(&target)?;
+        if row.attempt != attempt.0 || row.emitted {
+            return None;
+        }
+        let rule_id = row.rule_id.clone();
+        let rule_name = row.rule_name.clone();
+        let retained = self
+            .gateway
+            .get(&target)
+            .and_then(|state| settlement_retained(state.retained.clone()));
+        let owner = self
+            .gateway
+            .get(&target)
+            .and_then(|state| state.report_owner);
+        let hold = self.bulk_hold(target);
+        let settlement = AutomodSettlement {
+            rule_id,
+            rule_name,
+            retained,
+            fallback_to_bulk: bulk_route
+                && !matches!(hold, Some(BulkHold::Retained | BulkHold::Inflight)),
+        };
+        match hold {
+            Some(BulkHold::Retained) => {
+                self.mark_unmarked_emitted(target);
+                None
+            }
+            Some(BulkHold::Inflight) => {
+                if (individual_route || owner == Some(ReportOwner::Individual))
+                    && let Some(state) = self.bulk_logs.get_mut(&target)
+                {
+                    state.deferred_automod = Some(AutomodSettlement {
+                        fallback_to_bulk: false,
+                        ..settlement
+                    });
+                }
+                self.mark_unmarked_emitted(target);
+                None
+            }
+            None => match owner {
+                Some(ReportOwner::BulkTranscript) => {
+                    if individual_route {
+                        self.mark_unmarked_emitted(target);
+                        Some(settlement)
+                    } else {
+                        self.mark_unmarked_emitted(target);
+                        None
+                    }
+                }
+                Some(ReportOwner::Individual) | None => {
+                    if individual_route || (owner == Some(ReportOwner::Individual) && bulk_route) {
+                        self.mark_unmarked_emitted(target);
+                        Some(settlement)
+                    } else if owner.is_none() {
+                        if let Some(row) = self.unmarked.get_mut(&target) {
+                            row.rest_succeeded = true;
+                        }
+                        None
+                    } else {
+                        self.mark_unmarked_emitted(target);
+                        None
+                    }
+                }
+            },
+        }
+    }
+
+    fn mark_unmarked_emitted(&mut self, target: MessageTarget) {
+        if let Some(row) = self.unmarked.get_mut(&target) {
+            row.emitted = true;
+        }
+        let state = self.gateway.entry(target).or_default();
+        state.settled = true;
+    }
+
+    fn remove_unmarked(
+        &mut self,
+        target: MessageTarget,
+        attempt: AutomodDeleteAttempt,
+    ) -> Option<UnconfirmedRemoval> {
+        let row = self.unmarked.get(&target)?;
+        if row.attempt != attempt.0 {
+            return None;
+        }
+        if row.emitted {
+            return Some(UnconfirmedRemoval {
+                action: UnconfirmedMarkRemoval::Removed,
+                retained: None,
+                released_settlement: None,
+                covered_by_bulk: false,
+                bulk_inflight: false,
+            });
+        }
+        let observed = row.gateway_observed;
+        let retained = self
+            .gateway
+            .get(&target)
+            .and_then(|state| settlement_retained(state.retained.clone()));
+        self.unmarked.remove(&target);
+        if !observed {
+            return Some(UnconfirmedRemoval {
+                action: UnconfirmedMarkRemoval::Removed,
+                retained: None,
+                released_settlement: None,
+                covered_by_bulk: false,
+                bulk_inflight: false,
+            });
+        }
+        let (covered_by_bulk, bulk_inflight) = self.bulk_coverage(target);
+        if covered_by_bulk {
+            return Some(UnconfirmedRemoval {
+                action: UnconfirmedMarkRemoval::Removed,
+                retained,
+                released_settlement: None,
+                covered_by_bulk: true,
+                bulk_inflight,
+            });
+        }
+        if let Some(state) = self.gateway.get_mut(&target) {
+            state.settled = true;
+        }
+        Some(UnconfirmedRemoval {
+            action: UnconfirmedMarkRemoval::ReplayPlainDelete,
+            retained,
+            released_settlement: None,
+            covered_by_bulk: false,
+            bulk_inflight,
+        })
+    }
+
+    fn take_unmarked_uncertain(
+        &mut self,
+        target: MessageTarget,
+        attempt: AutomodDeleteAttempt,
+    ) -> Option<AutomodSettlement> {
+        let row = self.unmarked.get(&target)?;
+        if row.attempt != attempt.0 || row.emitted || !row.gateway_observed {
+            return None;
+        }
+        let rule_id = row.rule_id.clone();
+        let rule_name = row.rule_name.clone();
+        let retained = self
+            .gateway
+            .get(&target)
+            .and_then(|state| settlement_retained(state.retained.clone()));
+        let owner = self
+            .gateway
+            .get(&target)
+            .and_then(|state| state.report_owner);
+        let hold = self.bulk_hold(target);
+        if hold.is_some() {
+            if matches!(hold, Some(BulkHold::Inflight))
+                && let Some(state) = self.bulk_logs.get_mut(&target)
+            {
+                state.deferred_automod = Some(AutomodSettlement {
+                    rule_id,
+                    rule_name,
+                    retained,
+                    fallback_to_bulk: false,
+                });
+            }
+            self.mark_unmarked_emitted(target);
+            return None;
+        }
+        self.mark_unmarked_emitted(target);
+        Some(AutomodSettlement {
+            rule_id,
+            rule_name,
+            retained,
+            fallback_to_bulk: owner == Some(ReportOwner::Individual),
+        })
     }
 
     fn try_release_deferred_settlement(
@@ -284,6 +708,9 @@ impl AutomodDeleteMarks {
             }
             if self.has_older_unconfirmed(target, key) {
                 continue;
+            }
+            if self.consume_if_bulk_owns(target, key, &gateway, now) {
+                return None;
             }
             return Some(self.finalize_automod_settlement(target, key, &gateway, now));
         }
@@ -326,6 +753,7 @@ impl AutomodDeleteMarks {
 
     fn prune(&mut self, now: Instant) {
         self.expire_bulk_logs(now);
+        self.expire_unmarked(now);
         let wall = now_ms();
         self.clear_expired_retained(wall);
         while let Some(Reverse((heap_expires, key))) = self.mark_expiry_heap.peek().copied() {
@@ -373,9 +801,15 @@ impl AutomodDeleteMarks {
         let attempt = AutomodDeleteAttempt(self.next_attempt);
         self.next_attempt += 1;
         let key = Self::mark_key(guild, channel, message, attempt);
+        let target = Self::message_target(guild, channel, message);
         // Prune already removed every expired mark that capacity eviction could
         // take, and renewed protected pending marks. A full cache means reject.
+        // The delete still runs. A suppression row keeps the gateway path from
+        // relabeling it as a plain message_delete when this message has no mark.
         if self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
+            if !self.live_marks(target) {
+                self.remember_unmarked(target, attempt.0, rule_id, rule_name, now);
+            }
             return attempt;
         }
         let expires = now + AUTOMOD_DELETE_MARK_TTL;
@@ -397,7 +831,7 @@ impl AutomodDeleteMarks {
             .or_default()
             .push(key);
         self.push_mark_expiry(key, expires);
-        let target = Self::message_target(guild, channel, message);
+        self.unmarked.remove(&target);
         if let Some(state) = self.bulk_logs.get_mut(&target) {
             // A new attempt can still fail and needs the ambiguous row.
             if state.ambiguous {
@@ -421,6 +855,14 @@ impl AutomodDeleteMarks {
         let target = Self::message_target(guild, channel, message);
         let keys = self.mark_keys_for_message(guild, channel, message);
         if keys.is_empty() {
+            if let Some(observation) = self.observe_unmarked(target, retained) {
+                return observation;
+            }
+            if self.bulk_row_owns(target)
+                || self.gateway.get(&target).is_some_and(|state| state.settled)
+            {
+                return GatewayDeleteObservation::Suppressed;
+            }
             return GatewayDeleteObservation::Plain;
         }
         let already_settled = self.gateway.get(&target).is_some_and(|state| state.settled);
@@ -481,6 +923,9 @@ impl AutomodDeleteMarks {
         if !gateway.observed || gateway.settled || defer_settlement {
             return None;
         }
+        if self.consume_if_bulk_owns(target, key, &gateway, now) {
+            return None;
+        }
         Some(self.finalize_automod_settlement(target, key, &gateway, now))
     }
 
@@ -496,6 +941,9 @@ impl AutomodDeleteMarks {
         let key = Self::mark_key(guild, channel, message, attempt);
         let target = Self::message_target(guild, channel, message);
         let Some(entry) = self.entries.get(&key) else {
+            if let Some(removal) = self.remove_unmarked(target, attempt) {
+                return removal;
+            }
             return UnconfirmedRemoval {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
@@ -662,6 +1110,7 @@ impl AutomodDeleteMarks {
             ambiguous: false,
             deferred: false,
             deferred_retained: None,
+            deferred_automod: None,
             started: now,
             terminal_at: None,
         });
@@ -704,6 +1153,7 @@ impl AutomodDeleteMarks {
                         state.ambiguous = false;
                         state.deferred = false;
                         state.deferred_retained = None;
+                        state.deferred_automod = None;
                     }
                     self.schedule_bulk_expiry(target);
                 }
@@ -718,6 +1168,7 @@ impl AutomodDeleteMarks {
                         state.ambiguous = true;
                         state.deferred = false;
                         state.deferred_retained = None;
+                        state.deferred_automod = None;
                     }
                     self.note_ambiguous_settled(target, Instant::now());
                 }
@@ -732,10 +1183,17 @@ impl AutomodDeleteMarks {
                     let Some(state) = self.bulk_logs.remove(&target) else {
                         continue;
                     };
-                    if state.deferred {
+                    if let Some(automod) = state.deferred_automod {
+                        replay.push(DeferredBulkReplay {
+                            message: *message,
+                            retained: automod.retained.clone(),
+                            automod: Some(automod),
+                        });
+                    } else if state.deferred {
                         replay.push(DeferredBulkReplay {
                             message: *message,
                             retained: settlement_retained(state.deferred_retained),
+                            automod: None,
                         });
                     }
                 }
@@ -783,7 +1241,9 @@ impl AutomodDeleteMarks {
         let key = Self::mark_key(guild, channel, message, attempt);
         let target = Self::message_target(guild, channel, message);
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
-        let entry = self.entries.get(&key)?;
+        let Some(entry) = self.entries.get(&key) else {
+            return self.take_unmarked_uncertain(target, attempt);
+        };
         if entry.confirmed || !gateway.observed || gateway.settled {
             return None;
         }
@@ -798,6 +1258,9 @@ impl AutomodDeleteMarks {
         }) {
             self.remove_key(key, now);
             return self.try_release_deferred_settlement(target, now);
+        }
+        if self.consume_if_bulk_owns(target, key, &gateway, now) {
+            return None;
         }
         Some(self.finalize_automod_settlement(target, key, &gateway, now))
     }
@@ -946,6 +1409,8 @@ pub(crate) struct AutomodDeleteMarkAccess {
 }
 
 impl AutomodDeleteMarkAccess {
+    /// Test and direct callers. Enforcement uses [`Self::prepare_delete`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn insert(
         &self,
         guild: u64,
@@ -1001,7 +1466,92 @@ impl AutomodDeleteMarkAccess {
             run_bulk_reserve_gap_hook();
             reserved = marks.reserve_bulk_delivery(guild, channel, message, now);
         }
+        if matches!(observation, GatewayDeleteObservation::PendingAutomod) {
+            if reserved {
+                marks.note_report_owner(guild, channel, message, ReportOwner::BulkTranscript);
+            } else if !reserve {
+                marks.note_report_owner(guild, channel, message, ReportOwner::Individual);
+            }
+        }
         (observation, reserved)
+    }
+
+    /// Record the attempt before the Discord delete. A full mark cache still
+    /// returns an attempt so the caller deletes the message.
+    pub(crate) fn prepare_delete(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        rule_id: &str,
+        rule_name: &str,
+    ) -> PreparedAutomodDelete {
+        let mut marks = self.inner.lock();
+        let attempt = marks.insert(guild, channel, message, rule_id, rule_name, Instant::now());
+        let key = AutomodDeleteMarks::mark_key(guild, channel, message, attempt);
+        let target = AutomodDeleteMarks::message_target(guild, channel, message);
+        let disposition = if marks.entries.contains_key(&key) {
+            DeleteDisposition::Stored
+        } else if marks
+            .unmarked
+            .get(&target)
+            .is_some_and(|row| row.attempt == attempt.0)
+        {
+            DeleteDisposition::Unmarked
+        } else if marks.live_marks(target) {
+            DeleteDisposition::Shadowed
+        } else {
+            DeleteDisposition::Untracked
+        };
+        PreparedAutomodDelete {
+            attempt,
+            disposition,
+        }
+    }
+
+    /// Settle a prepared delete after REST success.
+    #[allow(clippy::too_many_arguments)]
+    /// `individual_route` is `automod_delete` or its `message_delete` fallback.
+    /// `bulk_route` is `message_bulk_delete`. Stored marks ignore those flags
+    /// and use the placement owner recorded earlier.
+    pub(crate) fn confirm_prepared(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        prepared: &PreparedAutomodDelete,
+        individual_route: bool,
+        bulk_route: bool,
+        rule_id: &str,
+        rule_name: &str,
+    ) -> Option<AutomodSettlement> {
+        let mut marks = self.inner.lock();
+        let now = Instant::now();
+        match prepared.disposition {
+            DeleteDisposition::Stored | DeleteDisposition::Shadowed => {
+                marks.confirm(guild, channel, message, prepared.attempt, now)
+            }
+            DeleteDisposition::Unmarked => marks.settle_unmarked(
+                guild,
+                channel,
+                message,
+                prepared.attempt,
+                individual_route,
+                bulk_route,
+                now,
+            ),
+            DeleteDisposition::Untracked => {
+                if !individual_route {
+                    return None;
+                }
+                Some(AutomodSettlement {
+                    rule_id: rule_id.to_owned(),
+                    rule_name: rule_name.to_owned(),
+                    retained: None,
+                    fallback_to_bulk: bulk_route,
+                })
+            }
+        }
     }
 
     pub(crate) fn finish_bulk_delivery(
@@ -1028,6 +1578,8 @@ impl AutomodDeleteMarkAccess {
             .claim_or_defer_plain_replay(guild, channel, message, retained)
     }
 
+    /// Test and direct callers. Enforcement success uses [`Self::confirm_prepared`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn confirm(
         &self,
         guild: u64,
@@ -2127,5 +2679,67 @@ mod tests {
         assert!(removal.covered_by_bulk);
         marks.prune(later + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
         assert!(!marks.bulk_logs.contains_key(&(1, 2, 5)));
+    }
+
+    #[test]
+    fn bulk_placement_owner_suppresses_a_second_success_report() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let attempt = marks.insert(1, 2, 3, "badword", "Bad words", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        assert!(marks.reserve_bulk_delivery(1, 2, 3, now));
+        marks.note_report_owner(1, 2, 3, ReportOwner::BulkTranscript);
+        assert!(marks.confirm(1, 2, 3, attempt, now).is_none());
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::Suppressed
+        );
+        let replay = marks.finish_bulk_delivery(1, 2, &[3], BulkDeliveryOutcome::Failed);
+        assert_eq!(replay.len(), 1);
+        assert!(replay[0].automod.is_some());
+    }
+
+    #[test]
+    fn peeled_placement_keeps_bulk_fallback_on_the_settlement() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let attempt = marks.insert(1, 2, 3, "badword", "Bad words", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        marks.note_report_owner(1, 2, 3, ReportOwner::Individual);
+        let settlement = marks.confirm(1, 2, 3, attempt, now).unwrap();
+        assert!(settlement.fallback_to_bulk);
+        assert_eq!(settlement.rule_id, "badword");
+    }
+
+    #[test]
+    fn saturated_insert_stays_automod_until_the_action_path_emits() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            marks.insert(1, 2, message, "filler", "Filler", now);
+        }
+        let message = MAX_AUTOMOD_DELETE_MARKS as u64;
+        let attempt = marks.insert(1, 2, message, "badword", "Bad words", now);
+        assert!(!marks.contains(1, 2, message));
+        assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, message, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        let settlement = marks
+            .settle_unmarked(1, 2, message, attempt, true, true, now)
+            .expect("saturated success still carries the rule");
+        assert_eq!(settlement.rule_id, "badword");
+        assert_eq!(settlement.rule_name, "Bad words");
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, message, None, now),
+            GatewayDeleteObservation::Suppressed
+        );
     }
 }

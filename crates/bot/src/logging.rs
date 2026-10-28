@@ -2563,16 +2563,31 @@ pub(crate) async fn settle_bulk_delivery(
         app.automod_delete_marks
             .finish_bulk_delivery(guild.get(), channel.get(), &raw, outcome);
     for item in deferred {
-        emit_replayed_plain_delete(
-            app,
-            sink,
-            guild,
-            channel,
-            MessageId::new(item.message),
-            item.retained.as_ref(),
-            false,
-        )
-        .await;
+        if let Some(settlement) = item.automod {
+            emit_reconciled_automod_delete(
+                app,
+                sink,
+                guild.get(),
+                channel.get(),
+                item.message,
+                &settlement.rule_id,
+                &settlement.rule_name,
+                settlement.retained.as_ref(),
+                settlement.fallback_to_bulk,
+            )
+            .await;
+        } else {
+            emit_replayed_plain_delete(
+                app,
+                sink,
+                guild,
+                channel,
+                MessageId::new(item.message),
+                item.retained.as_ref(),
+                false,
+            )
+            .await;
+        }
     }
 }
 
@@ -3009,9 +3024,20 @@ pub(crate) async fn emit_replayed_plain_delete(
     if channel_for(&cfg, "message_bulk_delete").is_none() {
         return;
     }
-    emit_failure_bulk(app, sink, &cfg, guild_id, channel, id, retained).await;
+    emit_failure_bulk(
+        app,
+        sink,
+        &cfg,
+        guild_id,
+        channel,
+        id,
+        retained,
+        Admission::Immediate,
+    )
+    .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_failure_bulk(
     app: &std::sync::Arc<BotState>,
     sink: &impl LogDelivery,
@@ -3020,15 +3046,22 @@ async fn emit_failure_bulk(
     channel: ChannelId,
     id: MessageId,
     retained: Option<&MessageSnapshot>,
+    admission: Admission,
 ) {
     // Channel exclusion and a remembered-unavailable destination suppress the
     // report. A user filter still sends a count without that author's text.
     if bulk_log_suppressed(app, cfg, guild_id.get(), channel) {
         return;
     }
-    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
-        record_delivery_failure(app);
-        return;
+    let _permit = match admission {
+        Admission::Held => None,
+        Admission::Immediate | Admission::WaitForShutdown => {
+            let Ok(permit) = app.log_delivery_slots.try_acquire() else {
+                record_delivery_failure(app);
+                return;
+            };
+            Some(permit)
+        }
     };
     let Some(destination) = channel_for(cfg, "message_bulk_delete") else {
         return;
@@ -3164,6 +3197,12 @@ pub(crate) fn place_bulk_delete(
                 reserved_pending,
             };
         }
+        GatewayDeleteObservation::Suppressed => {
+            return BulkDeletePlacement {
+                report: None,
+                reserved_pending: false,
+            };
+        }
         GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
     };
     if let Some(row) = retained {
@@ -3194,7 +3233,9 @@ fn classify_observed_delete(
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
             automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
         }
-        GatewayDeleteObservation::PendingAutomod => return None,
+        GatewayDeleteObservation::PendingAutomod | GatewayDeleteObservation::Suppressed => {
+            return None;
+        }
         GatewayDeleteObservation::Plain => message_delete_report(app, guild_id, channel, id),
     };
     if let Some(row) = retained {
@@ -3215,8 +3256,56 @@ pub(crate) async fn emit_reconciled_automod_delete(
     rule_id: &str,
     rule_name: &str,
     retained: Option<&MessageSnapshot>,
+    fallback_to_bulk: bool,
+) {
+    emit_reconciled_automod_delete_with(
+        app,
+        sink,
+        guild_id,
+        channel,
+        message,
+        rule_id,
+        rule_name,
+        retained,
+        fallback_to_bulk,
+        Admission::Immediate,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_reconciled_automod_delete_with(
+    app: &std::sync::Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+    rule_id: &str,
+    rule_name: &str,
+    retained: Option<&MessageSnapshot>,
+    fallback_to_bulk: bool,
+    admission: Admission,
 ) {
     let retained = settle_automod_retained(app, guild_id, channel, message, retained);
+    if fallback_to_bulk
+        && let Ok(cfg) = app.configs.get(&app.db, guild_id).await
+        && channel_for(&cfg, "automod_delete").is_none()
+    {
+        if channel_for(&cfg, "message_bulk_delete").is_some() {
+            emit_failure_bulk(
+                app,
+                sink,
+                &cfg,
+                GuildId::new(guild_id),
+                ChannelId::new(channel),
+                MessageId::new(message),
+                retained.as_ref(),
+                admission,
+            )
+            .await;
+        }
+        return;
+    }
     let report = automod_delete_report(
         app,
         GuildId::new(guild_id),
@@ -3226,7 +3315,23 @@ pub(crate) async fn emit_reconciled_automod_delete(
         rule_name,
         retained.as_ref(),
     );
-    emit_to(app, sink, report.guild_id, report.event, report.vars).await;
+    match admission {
+        Admission::Held => {
+            emit_to_observed(
+                app,
+                sink,
+                report.guild_id,
+                report.event,
+                report.vars,
+                None,
+                Admission::Held,
+            )
+            .await;
+        }
+        Admission::Immediate | Admission::WaitForShutdown => {
+            emit_to(app, sink, report.guild_id, report.event, report.vars).await;
+        }
+    }
 }
 
 /// Reconciled automod delete logging without blocking the enforcement caller.
@@ -3243,6 +3348,7 @@ pub(crate) fn spawn_reconciled_automod_delete(
     rule_id: String,
     rule_name: String,
     retained: Option<db::guild_data::MessageSnapshot>,
+    fallback_to_bulk: bool,
 ) {
     let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
         record_delivery_failure(&app);
@@ -3250,27 +3356,130 @@ pub(crate) fn spawn_reconciled_automod_delete(
     };
     tokio::spawn(async move {
         let _permit = permit;
-        let retained = settle_automod_retained(&app, guild_id, channel, message, retained.as_ref());
-        let report = automod_delete_report(
+        emit_reconciled_automod_delete_with(
             &app,
-            GuildId::new(guild_id),
-            ChannelId::new(channel),
-            MessageId::new(message),
+            sink.as_ref(),
+            guild_id,
+            channel,
+            message,
             &rule_id,
             &rule_name,
             retained.as_ref(),
-        );
-        emit_to_observed(
-            &app,
-            sink.as_ref(),
-            report.guild_id,
-            report.event,
-            report.vars,
-            None,
+            fallback_to_bulk,
             Admission::Held,
         )
         .await;
     });
+}
+
+/// REST succeeded. Stored marks reconcile through the placement owner. A delete
+/// that could not take a mark emits `automod_delete` itself when an individual
+/// route exists, and leaves a bulk-only delete for the gateway transcript.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_prepared_automod_delete(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+    prepared: &crate::automod_delete_marks::PreparedAutomodDelete,
+    rule_id: &str,
+    rule_name: &str,
+) {
+    let needs_route = matches!(
+        prepared.disposition,
+        crate::automod_delete_marks::DeleteDisposition::Unmarked
+            | crate::automod_delete_marks::DeleteDisposition::Untracked
+    );
+    let (individual_route, bulk_route) = if needs_route {
+        let cfg = app.configs.get(&app.db, guild_id).await.ok();
+        (
+            cfg.as_ref()
+                .is_some_and(|cfg| channel_for(cfg, "automod_delete").is_some()),
+            cfg.as_ref()
+                .is_some_and(|cfg| channel_for(cfg, "message_bulk_delete").is_some()),
+        )
+    } else {
+        (false, false)
+    };
+    let Some(settlement) = app.automod_delete_marks.confirm_prepared(
+        guild_id,
+        channel,
+        message,
+        prepared,
+        individual_route,
+        bulk_route,
+        rule_id,
+        rule_name,
+    ) else {
+        return;
+    };
+    emit_reconciled_automod_delete(
+        app,
+        sink,
+        guild_id,
+        channel,
+        message,
+        &settlement.rule_id,
+        &settlement.rule_name,
+        settlement.retained.as_ref(),
+        settlement.fallback_to_bulk,
+    )
+    .await;
+}
+
+/// Same settlement as [`complete_prepared_automod_delete`], but the Discord send
+/// is spawned so enforcement does not wait on it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_prepared_automod_delete(
+    app: Arc<BotState>,
+    sink: Arc<impl LogDelivery + Send + 'static>,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+    prepared: crate::automod_delete_marks::PreparedAutomodDelete,
+    rule_id: String,
+    rule_name: String,
+) {
+    let needs_route = matches!(
+        prepared.disposition,
+        crate::automod_delete_marks::DeleteDisposition::Unmarked
+            | crate::automod_delete_marks::DeleteDisposition::Untracked
+    );
+    let (individual_route, bulk_route) = if needs_route {
+        let cfg = app.configs.get(&app.db, guild_id).await.ok();
+        (
+            cfg.as_ref()
+                .is_some_and(|cfg| channel_for(cfg, "automod_delete").is_some()),
+            cfg.as_ref()
+                .is_some_and(|cfg| channel_for(cfg, "message_bulk_delete").is_some()),
+        )
+    } else {
+        (false, false)
+    };
+    let Some(settlement) = app.automod_delete_marks.confirm_prepared(
+        guild_id,
+        channel,
+        message,
+        &prepared,
+        individual_route,
+        bulk_route,
+        &rule_id,
+        &rule_name,
+    ) else {
+        return;
+    };
+    spawn_reconciled_automod_delete(
+        app,
+        sink,
+        guild_id,
+        channel,
+        message,
+        settlement.rule_id,
+        settlement.rule_name,
+        settlement.retained,
+        settlement.fallback_to_bulk,
+    );
 }
 
 /// Emits a mod-action event with actor context (used by command behaviors).

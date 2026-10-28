@@ -3098,8 +3098,8 @@ mod tests {
             assert!(
                 app.automod_delete_marks
                     .confirm(789, 456, message, attempt)
-                    .is_some(),
-                "successful REST did not settle {message}"
+                    .is_none(),
+                "ambiguous bulk already owns the report for {message}"
             );
         }
         let blocked = MAX_AUTOMOD_DELETE_MARKS as u64 + 1;
@@ -3135,6 +3135,7 @@ mod tests {
                 &settlement.rule_id,
                 &settlement.rule_name,
                 settlement.retained.as_ref(),
+                settlement.fallback_to_bulk,
             )
             .await;
         }

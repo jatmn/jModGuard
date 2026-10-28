@@ -530,9 +530,10 @@ async fn punish_proven_match(
         } else {
             None
         };
-        let delete_attempt =
+        let prepared =
             app.automod_delete_marks
-                .insert(found.guild, *channel, *message, rule, name);
+                .prepare_delete(found.guild, *channel, *message, rule, name);
+        let delete_attempt = prepared.attempt;
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
@@ -556,23 +557,17 @@ async fn punish_proven_match(
         }
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
-                if let Some(settlement) = app.automod_delete_marks.confirm(
+                crate::logging::spawn_prepared_automod_delete(
+                    std::sync::Arc::clone(app),
+                    Arc::clone(&http),
                     found.guild,
                     *channel,
                     *message,
-                    delete_attempt,
-                ) {
-                    crate::logging::spawn_reconciled_automod_delete(
-                        std::sync::Arc::clone(app),
-                        Arc::clone(&http),
-                        found.guild,
-                        *channel,
-                        *message,
-                        settlement.rule_id,
-                        settlement.rule_name,
-                        settlement.retained,
-                    );
-                }
+                    prepared,
+                    rule.to_owned(),
+                    name.to_owned(),
+                )
+                .await;
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
@@ -592,6 +587,7 @@ async fn punish_proven_match(
                         settlement.rule_id,
                         settlement.rule_name,
                         settlement.retained,
+                        settlement.fallback_to_bulk,
                     );
                 }
                 if removal.action
@@ -627,6 +623,7 @@ async fn punish_proven_match(
                         settlement.rule_id,
                         settlement.rule_name,
                         settlement.retained,
+                        settlement.fallback_to_bulk,
                     );
                 } else {
                     let removal = app.automod_delete_marks.remove_unconfirmed(
@@ -645,6 +642,7 @@ async fn punish_proven_match(
                             settlement.rule_id,
                             settlement.rule_name,
                             settlement.retained,
+                            settlement.fallback_to_bulk,
                         );
                     }
                     if removal.action

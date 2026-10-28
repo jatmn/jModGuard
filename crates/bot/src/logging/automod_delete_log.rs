@@ -269,6 +269,7 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
         &reconcile.rule_id,
         &reconcile.rule_name,
         reconcile.retained.as_ref(),
+        false,
     )
     .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
@@ -316,6 +317,7 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
         &reconcile.rule_id,
         &reconcile.rule_name,
         reconcile.retained.as_ref(),
+        false,
     )
     .await;
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
@@ -438,6 +440,7 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
         &reconcile.rule_id,
         &reconcile.rule_name,
         reconcile.retained.as_ref(),
+        false,
     )
     .await;
     assert!(sink.messages.lock().unwrap().is_empty());
@@ -634,6 +637,7 @@ async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
         &reconcile.rule_id,
         &reconcile.rule_name,
         reconcile.retained.as_ref(),
+        false,
     )
     .await;
     let body = sink.messages.lock().unwrap()[0].1.to_string();
@@ -721,6 +725,7 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
         &settlement.rule_id,
         &settlement.rule_name,
         settlement.retained.as_ref(),
+        false,
     )
     .await;
     let body = sink.messages.lock().unwrap()[0].1.to_string();
@@ -787,6 +792,7 @@ async fn saturated_report_slots_still_log_reconciled_automod_delete() {
         "badword",
         "Bad words",
         None,
+        false,
     )
     .await;
     spawn_reconciled_automod_delete(
@@ -798,6 +804,7 @@ async fn saturated_report_slots_still_log_reconciled_automod_delete() {
         "badword".into(),
         "Bad words".into(),
         None,
+        false,
     );
     let deadline = Instant::now() + Duration::from_secs(2);
     while sink.messages.lock().unwrap().len() < 2 {
@@ -950,6 +957,7 @@ async fn account_pending_bulk(
                 &settlement.rule_id,
                 &settlement.rule_name,
                 settlement.retained.as_ref(),
+                false,
             )
             .await;
         }
@@ -990,6 +998,7 @@ async fn account_pending_bulk(
                     &settlement.rule_id,
                     &settlement.rule_name,
                     settlement.retained.as_ref(),
+                    false,
                 )
                 .await;
             } else {
@@ -1682,6 +1691,7 @@ async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
             "badword".into(),
             "Bad words".into(),
             Some(sample_retained("queued-snapshot-secret")),
+            false,
         );
     }
     assert_eq!(
@@ -1704,6 +1714,7 @@ async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
         "badword".into(),
         "Bad words".into(),
         Some(sample_retained("admitted-snapshot")),
+        false,
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while sink.messages.lock().unwrap().is_empty() {
@@ -1718,4 +1729,287 @@ async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
     let body = sent[0].1.to_string();
     assert!(body.contains("Bad words"), "{body}");
     assert!(body.contains("admitted-snapshot"), "{body}");
+}
+
+#[tokio::test]
+async fn saturated_delete_emits_automod_delete_on_the_dedicated_channel() {
+    use crate::automod_delete_marks::{DeleteDisposition, MAX_AUTOMOD_DELETE_MARKS};
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+        f.app
+            .automod_delete_marks
+            .insert(789, 456, message, "filler", "Filler");
+    }
+    let gateway_first = 50_000;
+    let prepared =
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, gateway_first, "badword", "Bad words");
+    assert_eq!(prepared.disposition, DeleteDisposition::Unmarked);
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(gateway_first),
+            None,
+        )
+        .is_none(),
+        "a saturated gateway delete must not log as message_delete"
+    );
+    let sink = Sink::default();
+    complete_prepared_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        gateway_first,
+        &prepared,
+        "badword",
+        "Bad words",
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].starts_with("901 "),
+        "dedicated automod channel: {bodies:?}"
+    );
+    assert!(bodies[0].contains("Bad words"), "{bodies:?}");
+    assert!(bodies[0].contains("`badword`"), "{bodies:?}");
+    assert!(
+        !bodies[0].contains("902"),
+        "plain delete channel was used: {bodies:?}"
+    );
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(gateway_first),
+            None,
+        )
+        .is_none()
+    );
+    assert_eq!(sink_bodies(&sink).len(), 1);
+
+    let rest_first = 50_001;
+    let prepared = f.app.automod_delete_marks.prepare_delete(
+        789,
+        456,
+        rest_first,
+        "repeat_text",
+        "Repeated text",
+    );
+    assert_eq!(prepared.disposition, DeleteDisposition::Unmarked);
+    let sink = Sink::default();
+    complete_prepared_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        rest_first,
+        &prepared,
+        "repeat_text",
+        "Repeated text",
+    )
+    .await;
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(rest_first),
+            None,
+        )
+        .is_none()
+    );
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].starts_with("901 "), "{bodies:?}");
+    assert!(bodies[0].contains("Repeated text"), "{bodies:?}");
+    assert!(bodies[0].contains("`repeat_text`"), "{bodies:?}");
+}
+
+#[tokio::test]
+async fn bulk_owner_does_not_emit_again_when_an_individual_route_appears() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut transcript = BulkTranscript::new(1);
+    let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        &mut transcript,
+        false,
+    );
+    assert!(peeled.is_empty());
+    assert_eq!(transcript.pending_automod, vec![MessageId::new(123)]);
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    begin_bulk_delivery(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &transcript.pending_automod,
+    );
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        transcript,
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Delivered);
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        BulkDeliveryOutcome::Delivered,
+    )
+    .await;
+    assert!(
+        f.app
+            .automod_delete_marks
+            .confirm(789, 456, 123, attempt)
+            .is_none(),
+        "a delivered bulk transcript must keep the only report"
+    );
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].starts_with("903 "), "{bodies:?}");
+    assert!(!bodies[0].contains("Automod deleted"), "{bodies:?}");
+}
+
+#[tokio::test]
+async fn inflight_bulk_releases_one_automod_report_only_if_the_send_fails() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut transcript = BulkTranscript::new(1);
+    let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        &mut transcript,
+        false,
+    );
+    assert!(peeled.is_empty());
+    assert_eq!(transcript.pending_automod, vec![MessageId::new(123)]);
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    assert!(
+        f.app
+            .automod_delete_marks
+            .confirm(789, 456, 123, attempt)
+            .is_none()
+    );
+    let sink = Sink::default();
+    assert!(sink_bodies(&sink).is_empty());
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        BulkDeliveryOutcome::Failed,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].starts_with("901 "), "{bodies:?}");
+    assert!(bodies[0].contains("Bad words"), "{bodies:?}");
+    assert!(bodies[0].contains("`badword`"), "{bodies:?}");
+}
+
+#[tokio::test]
+async fn peeled_delete_uses_bulk_when_the_individual_route_disappears() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut transcript = BulkTranscript::new(1);
+    let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        &mut transcript,
+        true,
+    );
+    assert!(peeled.is_empty());
+    assert!(transcript.pending_automod.is_empty());
+    assert_eq!(transcript.total, 0);
+    db::delete_log_channel(&f.app.db, 789, "automod_delete")
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let settlement = f
+        .app
+        .automod_delete_marks
+        .confirm(789, 456, 123, attempt)
+        .expect("peeled delete still settles");
+    assert!(settlement.fallback_to_bulk);
+    let sink = Sink::default();
+    emit_reconciled_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &settlement.rule_id,
+        &settlement.rule_name,
+        settlement.retained.as_ref(),
+        settlement.fallback_to_bulk,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].starts_with("903 "),
+        "bulk destination remains: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().all(|body| !body.starts_with("901 ")),
+        "{bodies:?}"
+    );
 }
