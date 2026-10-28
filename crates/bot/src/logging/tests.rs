@@ -240,6 +240,50 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
     assert!(rendered.encode_utf16().count() <= 2000);
 }
 
+#[test]
+fn shipped_automod_delete_template_renders_gap_coverage() {
+    let row = MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some("after uncertain REST".into()),
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_001,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: true,
+        attachments_supplied: false,
+    };
+    let mut report = MessageReport {
+        guild_id: GuildId::new(789),
+        event: "automod_delete",
+        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
+    };
+    report.vars.insert("rule".into(), "Bad words".into());
+    report.vars.insert("rule_id".into(), "badword".into());
+    report
+        .vars
+        .insert("time".into(), "2026-10-27T00:00:00Z".into());
+    apply_retained_delete(&mut report, Some(&row));
+    let template = default_template("automod_delete");
+    bound_default_message_vars("automod_delete", &mut report.vars);
+    let rendered = templates::render_bounded(template, &report.vars, 2000);
+    assert!(rendered.contains("**Last observed text:**"));
+    assert!(rendered.contains("after uncertain REST"));
+    assert!(rendered.contains("**Coverage:** last observed; observation gap or restart"));
+    assert!(!rendered.contains("{coverage}"));
+    assert!(!rendered.contains("**Text:**"));
+    assert!(rendered.encode_utf16().count() <= 2000);
+}
+
 #[tokio::test]
 async fn committed_snapshot_transition_reaches_edit_and_delete_delivery() {
     use crate::db::guild_data::{SnapshotFields, SnapshotObservation, SnapshotOutcome};

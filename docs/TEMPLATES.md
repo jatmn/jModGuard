@@ -25,7 +25,7 @@ preview) or via `!template`.
 | `{before}` / `{after}` | last retained text before an observed edit, when available; accepted after text or supplied update text if retention fails. Missing and empty are distinct |
 | `{message_id}` / `{message_url}` | single-message ID and Discord reference (edit/delete reports) |
 | `{attachments}` | retained attachment metadata when available, or supplied update details / an explicitly unavailable value |
-| `{coverage}` | last-observed continuity or a gap / unavailable reason for edit and single-delete reports |
+| `{coverage}` | last-observed continuity or a gap / unavailable reason for edit and single-delete reports. `automod_delete` uses the same wording as `message_delete`: continuous last observation, an observation gap or restart, or an unavailable snapshot |
 | `{retained}` / `{unavailable}` / `{filtered}` / `{details}` | bulk-delete counts, excluded authors and transcript availability |
 | `{count}` | bulk delete count / purge count / warn count |
 | `{duration}` | compact timeout length / slowmode interval / time in server |
@@ -38,7 +38,7 @@ preview) or via `!template`.
 
 Unknown variables are left untouched so template mistakes are visible.
 
-Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{role_name}`, `{detail}`, `{before_global}`, `{after_global}`, `{thread}`, `{thread_id}`, `{thread_name}`, `{notice}`, `{archived}`, `{locked}`, `{auto_archive}`, and `{invitable}` when that event has them. They do not supply message text.
+Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{role_name}`, `{detail}`, `{before_global}`, `{after_global}`, `{thread}`, `{thread_id}`, `{thread_name}`, `{notice}`, `{archived}`, `{locked}`, `{auto_archive}`, and `{invitable}` when that event has them. They do not supply message text, except `automod_delete`, which supplies last observed text, attachments, and `{coverage}` with the same wording as `message_delete`.
 
 ## Default templates (all editable)
 
@@ -47,10 +47,10 @@ Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{ro
 - **member_ban** / **member_unban** — hammer/unlock with recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
 - **member_kick** — boot with actor + reason
 - **message_edit** — one Discord-identified edit (`edited_timestamp`), last observed before and updated text with coverage label. Embed/GIF unfurls, chat replies and the bot's own log posts do not create edit reports.
-- **message_delete** — message ID and last observed author, text and attachment metadata when available
+- **message_delete** — message ID and last observed author, text and attachment metadata when available, plus `{coverage}` for continuous observation, a gap or restart, or an unavailable snapshot
 - **message_bulk_delete** — unique count, retained/known-missing/storage-unknown/filtered counts, omitted transcript entries, and a transient bounded transcript attachment; a definite attachment-permission failure uses plain-message chunks with an exact omitted count
 - **automod** — shield: rule, action, reason, evidence, channel
-- **automod_delete** — automod rule that removed a message (distinct from a plain human delete). Uses the `automod_delete` log channel when set, otherwise the `message_delete` channel. After a bot restart, a gateway delete that arrives before the mark was recorded still logs as **message_delete**
+- **automod_delete** — automod rule that removed a message (distinct from a plain human delete). Last observed text, attachments, and `{coverage}` use the same semantics as `message_delete`. Uses the `automod_delete` log channel when set, otherwise the `message_delete` channel. After a bot restart, a gateway delete that arrives before the mark was recorded still logs as **message_delete**
 - **mod_action** — judge: action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
 - **plan_executed** — custom command runs
@@ -88,8 +88,8 @@ be shared as global defaults.
 ```
 member_join   →  📥 {user} joined! Say hi in #welcome ({mention})
 automod       →  ⛔ {rule} fired on {mention} → {action} | {reason} | {content}
-automod_delete→  ⛔ {rule} deleted `{message_id}` in {channel}; text: {content}; attachments: {attachments}
-message_delete→  🗑 Message `{message_id}` deleted in {channel}; text: {content}; attachments: {attachments}.
+automod_delete→  ⛔ {rule} deleted `{message_id}` in {channel}; text: {content}; attachments: {attachments}; coverage: {coverage}
+message_delete→  🗑 Message `{message_id}` deleted in {channel}; text: {content}; attachments: {attachments}; coverage: {coverage}.
 ```
 
 Discord reports are bounded to 2000 UTF-16 units, including truncation markers.

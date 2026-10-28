@@ -69,11 +69,18 @@ fn automod_delete_template_fits_discord_limit() {
         ("rule_id".into(), "badword".into()),
         ("content".into(), "x".repeat(900)),
         ("attachments".into(), "a".repeat(400)),
+        (
+            "coverage".into(),
+            "last observed; observation gap or restart".into(),
+        ),
         ("time".into(), chrono::Utc::now().to_rfc3339()),
     ]);
     let rendered = render_log_template("automod_delete", template, &mut vars);
     assert!(rendered.encode_utf16().count() <= 2000);
     assert!(rendered.contains("Bad words"));
+    assert!(rendered.contains("**Last observed text:**"));
+    assert!(rendered.contains("**Coverage:** last observed; observation gap or restart"));
+    assert!(!rendered.contains("{coverage}"));
 }
 
 #[test]
@@ -683,7 +690,8 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
         .await
         .unwrap();
     f.app.invalidate_configs();
-    let retained = sample_retained("after uncertain REST");
+    let mut retained = sample_retained("after uncertain REST");
+    retained.continuous = false;
     let delete_attempt = f
         .app
         .automod_delete_marks
@@ -717,6 +725,8 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
     .await;
     let body = sink.messages.lock().unwrap()[0].1.to_string();
     assert!(body.contains("after uncertain REST"));
+    assert!(body.contains("**Last observed text:**"));
+    assert!(body.contains("**Coverage:** last observed; observation gap or restart"));
 }
 
 #[test]

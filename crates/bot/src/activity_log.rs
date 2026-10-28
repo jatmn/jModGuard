@@ -872,6 +872,10 @@ mod tests {
                     ("time".into(), chrono::Utc::now().to_rfc3339()),
                     ("content".into(), "(redacted)".into()),
                     ("attachments".into(), "none".into()),
+                    (
+                        "coverage".into(),
+                        "last observed; observation gap or restart".into(),
+                    ),
                 ]),
             },
             other => panic!("unexpected event {other}"),
@@ -891,6 +895,14 @@ mod tests {
             assert!(rendered.encode_utf16().count() <= 2000, "{event}");
             assert!(!rendered.contains("{user}"), "{event}: {rendered}");
             assert!(!rendered.contains("message body"), "{event}");
+            if event == "automod_delete" {
+                assert!(rendered.contains("**Last observed text:**"), "{rendered}");
+                assert!(
+                    rendered.contains("**Coverage:** last observed; observation gap or restart"),
+                    "{rendered}"
+                );
+                assert!(!rendered.contains("{coverage}"), "{rendered}");
+            }
             if event != "automod_delete" {
                 assert!(
                     !report.vars.contains_key("content"),
