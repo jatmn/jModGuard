@@ -530,6 +530,10 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
             "thread_delete",
             "**:thread: Thread deleted**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Time:** `{time}`",
         ),
+        (
+            "member_rejoin",
+            "**:arrows_counterclockwise: {user} rejoined with prior moderation**\n\n**User:** {mention} (`{user_id}`)\n{cases}\n{notice}",
+        ),
     ]
 }
 
