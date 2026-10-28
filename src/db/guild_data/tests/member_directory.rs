@@ -1732,6 +1732,70 @@ async fn retry_accepts_expired_running_lease_and_fences_old_worker() {
 }
 
 #[tokio::test]
+async fn foreign_audit_recovery_commit_survives_modest_capacity_headroom() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 6_000)
+        .await
+        .unwrap();
+    store
+        .db
+        .with_conn(|conn| {
+            let allocated = crate::capacity::sample(conn)?.allocated_bytes;
+            conn.set_test_capacity_limits(
+                allocated + 72 * 1024 * 1024,
+                allocated + 96 * 1024 * 1024,
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), 6_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let audit = MemberAuditSnapshot {
+        entry_id: 8_001,
+        user_id: 55,
+        executor_id: Some(99),
+        action: MemberAuditAction::Ban,
+        occurred_at_ms: 5_500,
+        reason: Some("foreign moderator".into()),
+    };
+    store
+        .commit_member_audit_recovery_page(
+            scope.clone(),
+            claim,
+            vec![audit],
+            (None, true),
+            6_001,
+            15_000,
+        )
+        .await
+        .unwrap();
+    let case = store
+        .case_for_source(scope.clone(), CaseSource::DiscordAudit { entry_id: 8_001 })
+        .await
+        .unwrap()
+        .expect("foreign audit must materialize a guild case");
+    assert!(!case.removed);
+    let indexed: i64 = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM guild_member_case_index WHERE guild_id=10 AND user_id=55",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(indexed, 1, "trigger must index the recovered case");
+}
+
+#[tokio::test]
 async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion() {
     let (_f, store, scope) = ready().await;
     store
