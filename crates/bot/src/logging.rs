@@ -240,16 +240,23 @@ pub struct MemberJoinContext {
 }
 
 type RejoinStayKey = (u64, u64, String);
+type RejoinOrderToken = (RejoinStayKey, u64);
+
+#[derive(Clone, Copy)]
+struct RejoinCacheEntry {
+    updated_at: Instant,
+    order_stamp: u64,
+}
 
 /// Suppresses duplicate member-rejoin notes for the current stay while still
 /// allowing redelivery after a failed first attempt within a bounded window.
 #[derive(Default)]
 struct RejoinNoteDeliveryState {
-    delivered: HashMap<RejoinStayKey, Instant>,
-    undelivered: HashMap<RejoinStayKey, Instant>,
+    delivered: HashMap<RejoinStayKey, RejoinCacheEntry>,
+    undelivered: HashMap<RejoinStayKey, RejoinCacheEntry>,
     in_flight: HashSet<RejoinStayKey>,
-    delivered_order: VecDeque<RejoinStayKey>,
-    undelivered_order: VecDeque<RejoinStayKey>,
+    delivered_order: VecDeque<RejoinOrderToken>,
+    undelivered_order: VecDeque<RejoinOrderToken>,
     stays_by_member: HashMap<(u64, u64), HashSet<String>>,
 }
 
@@ -299,6 +306,24 @@ impl Drop for RejoinNoteInFlight<'_> {
 }
 
 impl RejoinNoteDeliveryState {
+    fn compact_stale_tokens(
+        order: &mut VecDeque<RejoinOrderToken>,
+        live: &HashMap<RejoinStayKey, RejoinCacheEntry>,
+        max_ops: usize,
+    ) {
+        for _ in 0..max_ops {
+            let Some((key, stamp)) = order.front().cloned() else {
+                break;
+            };
+            match live.get(&key) {
+                Some(entry) if entry.order_stamp == stamp => break,
+                _ => {
+                    order.pop_front();
+                }
+            }
+        }
+    }
+
     fn track_stay(&mut self, guild: u64, user: u64, stay_id: &str) {
         self.stays_by_member
             .entry((guild, user))
@@ -329,13 +354,17 @@ impl RejoinNoteDeliveryState {
     }
 
     fn prune_delivered_front(&mut self) -> bool {
-        while let Some(key) = self.delivered_order.front().cloned() {
+        while let Some((key, stamp)) = self.delivered_order.front().cloned() {
             match self.delivered.get(&key) {
                 None => {
                     self.delivered_order.pop_front();
                     continue;
                 }
-                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
+                Some(entry) if entry.order_stamp != stamp => {
+                    self.delivered_order.pop_front();
+                    continue;
+                }
+                Some(entry) if entry.updated_at.elapsed() < MEMBER_JOINS_KEEP => return false,
                 Some(_) => {
                     self.delivered_order.pop_front();
                     if !self.in_flight.contains(&key) {
@@ -350,13 +379,17 @@ impl RejoinNoteDeliveryState {
     }
 
     fn prune_undelivered_front(&mut self) -> bool {
-        while let Some(key) = self.undelivered_order.front().cloned() {
+        while let Some((key, stamp)) = self.undelivered_order.front().cloned() {
             match self.undelivered.get(&key) {
                 None => {
                     self.undelivered_order.pop_front();
                     continue;
                 }
-                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
+                Some(entry) if entry.order_stamp != stamp => {
+                    self.undelivered_order.pop_front();
+                    continue;
+                }
+                Some(entry) if entry.updated_at.elapsed() < MEMBER_JOINS_KEEP => return false,
                 Some(_) => {
                     self.undelivered_order.pop_front();
                     if !self.in_flight.contains(&key) {
@@ -371,15 +404,19 @@ impl RejoinNoteDeliveryState {
     }
 
     fn evict_oldest_delivered(&mut self) -> bool {
-        while let Some(key) = self.delivered_order.front().cloned() {
+        let scanned = self.delivered_order.len();
+        for _ in 0..scanned {
+            let Some((key, stamp)) = self.delivered_order.pop_front() else {
+                return false;
+            };
             match self.delivered.get(&key) {
-                None => {
-                    self.delivered_order.pop_front();
+                None => continue,
+                Some(entry) if entry.order_stamp != stamp => continue,
+                Some(_) if self.in_flight.contains(&key) => {
+                    self.delivered_order.push_back((key, stamp));
                     continue;
                 }
-                Some(_) if self.in_flight.contains(&key) => return false,
                 Some(_) => {
-                    self.delivered_order.pop_front();
                     self.delivered.remove(&key);
                     self.untrack_stay(key.0, key.1, &key.2);
                     return true;
@@ -389,17 +426,20 @@ impl RejoinNoteDeliveryState {
         false
     }
 
-    fn evict_oldest_expired_undelivered(&mut self) -> bool {
-        while let Some(key) = self.undelivered_order.front().cloned() {
+    fn evict_oldest_undelivered(&mut self) -> bool {
+        let scanned = self.undelivered_order.len();
+        for _ in 0..scanned {
+            let Some((key, stamp)) = self.undelivered_order.pop_front() else {
+                return false;
+            };
             match self.undelivered.get(&key) {
-                None => {
-                    self.undelivered_order.pop_front();
+                None => continue,
+                Some(entry) if entry.order_stamp != stamp => continue,
+                Some(_) if self.in_flight.contains(&key) => {
+                    self.undelivered_order.push_back((key, stamp));
                     continue;
                 }
-                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
-                Some(_) if self.in_flight.contains(&key) => return false,
                 Some(_) => {
-                    self.undelivered_order.pop_front();
                     self.undelivered.remove(&key);
                     self.untrack_stay(key.0, key.1, &key.2);
                     return true;
@@ -410,6 +450,16 @@ impl RejoinNoteDeliveryState {
     }
 
     fn prune_incremental(&mut self) {
+        Self::compact_stale_tokens(
+            &mut self.delivered_order,
+            &self.delivered,
+            REJOIN_NOTE_PRUNE_BATCH,
+        );
+        Self::compact_stale_tokens(
+            &mut self.undelivered_order,
+            &self.undelivered,
+            REJOIN_NOTE_PRUNE_BATCH,
+        );
         for _ in 0..REJOIN_NOTE_PRUNE_BATCH {
             if !self.prune_delivered_front() && !self.prune_undelivered_front() {
                 break;
@@ -423,25 +473,70 @@ impl RejoinNoteDeliveryState {
             if self.evict_oldest_delivered() {
                 continue;
             }
-            if self.evict_oldest_expired_undelivered() {
+            if self.evict_oldest_undelivered() {
                 continue;
             }
             break;
         }
+        Self::compact_stale_tokens(
+            &mut self.delivered_order,
+            &self.delivered,
+            REJOIN_NOTE_PRUNE_BATCH,
+        );
+        Self::compact_stale_tokens(
+            &mut self.undelivered_order,
+            &self.undelivered,
+            REJOIN_NOTE_PRUNE_BATCH,
+        );
+    }
+
+    fn drop_superseded_tokens(order: &mut VecDeque<RejoinOrderToken>, key: &RejoinStayKey, stamp: u64) {
+        order.retain(|(queued_key, queued_stamp)| {
+            queued_key != key || *queued_stamp == stamp
+        });
     }
 
     fn record_delivered(&mut self, key: RejoinStayKey) {
         self.undelivered.remove(&key);
-        self.delivered.insert(key.clone(), Instant::now());
-        self.delivered_order.push_back(key.clone());
+        let order_stamp = self
+            .delivered
+            .remove(&key)
+            .map(|entry| entry.order_stamp + 1)
+            .unwrap_or(1);
+        Self::drop_superseded_tokens(&mut self.delivered_order, &key, order_stamp);
+        self.delivered.insert(
+            key.clone(),
+            RejoinCacheEntry {
+                updated_at: Instant::now(),
+                order_stamp,
+            },
+        );
+        self.delivered_order.push_back((key.clone(), order_stamp));
         self.track_stay(key.0, key.1, &key.2);
     }
 
     fn record_undelivered(&mut self, key: RejoinStayKey) {
         self.delivered.remove(&key);
-        self.undelivered.insert(key.clone(), Instant::now());
-        self.undelivered_order.push_back(key.clone());
+        let order_stamp = self
+            .undelivered
+            .remove(&key)
+            .map(|entry| entry.order_stamp + 1)
+            .unwrap_or(1);
+        Self::drop_superseded_tokens(&mut self.undelivered_order, &key, order_stamp);
+        self.undelivered.insert(
+            key.clone(),
+            RejoinCacheEntry {
+                updated_at: Instant::now(),
+                order_stamp,
+            },
+        );
+        self.undelivered_order.push_back((key.clone(), order_stamp));
         self.track_stay(key.0, key.1, &key.2);
+        Self::compact_stale_tokens(
+            &mut self.undelivered_order,
+            &self.undelivered,
+            REJOIN_NOTE_PRUNE_BATCH,
+        );
     }
 }
 
@@ -519,7 +614,7 @@ impl RejoinNoteDeliveries {
         if state
             .delivered
             .get(&key)
-            .is_some_and(|delivered| delivered.elapsed() < MEMBER_JOINS_KEEP)
+            .is_some_and(|entry| entry.updated_at.elapsed() < MEMBER_JOINS_KEEP)
         {
             return false;
         }
@@ -550,10 +645,15 @@ impl RejoinNoteDeliveries {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_undelivered_queue_len(&self) -> usize {
+        self.inner.lock().undelivered_order.len()
+    }
+
+    #[cfg(test)]
     pub fn test_age_undelivered(&self, guild: u64, user: u64, stay_id: &str, ago: Duration) {
         let key = rejoin_stay_key(guild, user, stay_id);
-        if let Some(marked) = self.inner.lock().undelivered.get_mut(&key) {
-            *marked = Instant::now() - ago;
+        if let Some(entry) = self.inner.lock().undelivered.get_mut(&key) {
+            entry.updated_at = Instant::now() - ago;
         }
     }
 }

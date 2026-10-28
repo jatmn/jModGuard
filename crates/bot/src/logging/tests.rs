@@ -4073,6 +4073,36 @@ fn rejoin_delivery_burst_respects_settled_entry_cap() {
 }
 
 #[test]
+fn rejoin_failed_delivery_burst_respects_cap_and_queue() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let overflow = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..overflow {
+        let stay = format!("stay-{index}");
+        deliveries.finish_attempt(1, index as u64, &stay, false);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "failed stays must stay within the hard cap"
+    );
+    for _ in 0..512 {
+        deliveries.finish_attempt(1, 99_999, "stay-hot", false);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "repeated retries must not grow settled entries past the cap"
+    );
+    assert!(
+        deliveries.test_undelivered_queue_len()
+            <= REJOIN_NOTE_DELIVERY_LIMIT + REJOIN_NOTE_PRUNE_BATCH,
+        "stale retry tokens must not grow the undelivered queue without bound"
+    );
+    assert!(
+        deliveries.pending_redelivery(1, 99_999, "stay-hot"),
+        "the newest failed stay must remain retryable in memory"
+    );
+}
+
+#[test]
 fn rejoin_note_leave_clears_member_state() {
     let deliveries = RejoinNoteDeliveries::default();
     deliveries.finish_attempt(9, 8, "stay-leave", false);
