@@ -64,6 +64,12 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Drop retained snapshot text when the fixed expiry has passed at settlement time.
+pub(crate) fn settlement_retained(row: Option<MessageSnapshot>) -> Option<MessageSnapshot> {
+    let wall = now_ms();
+    row.filter(|snapshot| snapshot_still_valid(snapshot, wall))
+}
+
 impl AutomodDeleteMarks {
     fn prune(&mut self, now: Instant) {
         let wall = now_ms();
@@ -196,7 +202,7 @@ impl AutomodDeleteMarks {
         Some(AutomodSettlement {
             rule_id: entry.rule_id,
             rule_name: entry.rule_name,
-            retained: entry.retained,
+            retained: settlement_retained(entry.retained),
         })
     }
 
@@ -222,7 +228,7 @@ impl AutomodDeleteMarks {
             };
         }
         let replay = entry.gateway_pending;
-        let retained = entry.retained.clone();
+        let retained = settlement_retained(entry.retained.clone());
         self.order.retain(|candidate| *candidate != key);
         self.entries.remove(&key);
         UnconfirmedRemoval {
@@ -254,7 +260,7 @@ impl AutomodDeleteMarks {
         Some(AutomodSettlement {
             rule_id: entry.rule_id,
             rule_name: entry.rule_name,
-            retained: entry.retained,
+            retained: settlement_retained(entry.retained),
         })
     }
 
@@ -268,7 +274,7 @@ impl AutomodDeleteMarks {
         self.prune(now);
         let key = (guild, channel, message);
         let entry = self.entries.get_mut(&key)?;
-        entry.retained.take()
+        settlement_retained(entry.retained.take())
     }
 
     #[cfg(test)]
@@ -563,6 +569,39 @@ mod tests {
                 .map(|r| r.fields.content.clone()),
             Some(Some("atomic body".into()))
         );
+    }
+
+    #[test]
+    fn settlement_drops_expired_retained_snapshot() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 3, "badword", "Bad word", now);
+        marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "stale body")), now);
+        marks
+            .entries
+            .get_mut(&(1, 2, 3))
+            .unwrap()
+            .retained
+            .as_mut()
+            .unwrap()
+            .expires_at_ms = 1;
+        let settlement = marks.confirm(1, 2, 3, now).unwrap();
+        assert!(settlement.retained.is_none());
+        let mut marks = AutomodDeleteMarks::default();
+        marks.insert(1, 2, 4, "badword", "Bad word", now);
+        marks.observe_gateway_delete(1, 2, 4, Some(sample_retained(4, "stale uncertain")), now);
+        marks
+            .entries
+            .get_mut(&(1, 2, 4))
+            .unwrap()
+            .retained
+            .as_mut()
+            .unwrap()
+            .expires_at_ms = 1;
+        let settlement = marks
+            .take_uncertain_gateway_settlement(1, 2, 4, now)
+            .unwrap();
+        assert!(settlement.retained.is_none());
     }
 
     #[test]

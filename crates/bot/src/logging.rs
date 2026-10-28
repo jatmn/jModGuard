@@ -2257,7 +2257,8 @@ fn settle_automod_retained(
     message: u64,
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageSnapshot> {
-    retained.cloned().or_else(|| {
+    use crate::automod_delete_marks::settlement_retained;
+    settlement_retained(retained.cloned()).or_else(|| {
         app.automod_delete_marks
             .take_stored_retained(guild, channel, message)
     })
