@@ -99,6 +99,8 @@ struct MessageGatewayState {
 /// Delivery of one message that stayed in a bulk transcript.
 /// `covered` is set only after that transcript is actually delivered.
 /// `ambiguous` means a timeout or partial send may already have reached Discord.
+/// `terminal_at` starts the suppression window once every REST attempt for the
+/// message has settled. Until then the row is not eligible for expiry.
 struct BulkLogState {
     inflight: bool,
     covered: bool,
@@ -106,6 +108,7 @@ struct BulkLogState {
     deferred: bool,
     deferred_retained: Option<MessageSnapshot>,
     started: Instant,
+    terminal_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -117,9 +120,9 @@ pub(crate) struct AutomodDeleteMarks {
     gateway: HashMap<MessageTarget, MessageGatewayState>,
     /// Pending ids kept in a bulk transcript, keyed until delivery settles.
     bulk_logs: HashMap<MessageTarget, BulkLogState>,
-    /// Deadlines for delivered bulk rows, earliest at the front. In-flight,
-    /// deferred, and ambiguous rows are not indexed. Prune only pops entries
-    /// that are already due.
+    /// Deadlines for delivered rows and for ambiguous rows whose REST attempts
+    /// have settled, earliest at the front. In-flight, deferred, and unsettled
+    /// ambiguous rows are not indexed. Prune only pops entries that are already due.
     bulk_expiry: VecDeque<(Instant, MessageTarget)>,
     mark_expiry_heap: BinaryHeap<Reverse<(Instant, MarkKey)>>,
     gateway_retained_expiry_heap: BinaryHeap<Reverse<(i64, MessageTarget)>>,
@@ -228,7 +231,7 @@ impl AutomodDeleteMarks {
         self.order = live;
     }
 
-    fn remove_key(&mut self, key: MarkKey) {
+    fn remove_key(&mut self, key: MarkKey, now: Instant) {
         self.entries.remove(&key);
         self.compact_order_if_needed();
         let target = Self::message_target(key.0, key.1, key.2);
@@ -240,6 +243,7 @@ impl AutomodDeleteMarks {
             }
         }
         self.compact_heaps_if_needed();
+        self.note_ambiguous_settled(target, now);
     }
 
     fn finalize_automod_settlement(
@@ -247,12 +251,13 @@ impl AutomodDeleteMarks {
         target: MessageTarget,
         key: MarkKey,
         gateway: &MessageGatewayState,
+        now: Instant,
     ) -> AutomodSettlement {
         let entry = self.entries.get(&key).expect("settling mark");
         let rule_id = entry.rule_id.clone();
         let rule_name = entry.rule_name.clone();
         let retained = Self::settlement_retained_for(gateway, entry.retained.clone());
-        self.remove_key(key);
+        self.remove_key(key, now);
         if let Some(state) = self.gateway.get_mut(&target) {
             state.settled = true;
         }
@@ -266,6 +271,7 @@ impl AutomodDeleteMarks {
     fn try_release_deferred_settlement(
         &mut self,
         target: MessageTarget,
+        now: Instant,
     ) -> Option<AutomodSettlement> {
         let gateway = self.gateway.get(&target)?.clone();
         if !gateway.observed || gateway.settled {
@@ -279,7 +285,7 @@ impl AutomodDeleteMarks {
             if self.has_older_unconfirmed(target, key) {
                 continue;
             }
-            return Some(self.finalize_automod_settlement(target, key, &gateway));
+            return Some(self.finalize_automod_settlement(target, key, &gateway, now));
         }
         None
     }
@@ -349,7 +355,7 @@ impl AutomodDeleteMarks {
                     }
                     self.push_mark_expiry(key, new_expires);
                 }
-                Some(Some(false)) => self.remove_key(key),
+                Some(Some(false)) => self.remove_key(key, now),
             }
         }
     }
@@ -391,6 +397,13 @@ impl AutomodDeleteMarks {
             .or_default()
             .push(key);
         self.push_mark_expiry(key, expires);
+        let target = Self::message_target(guild, channel, message);
+        if let Some(state) = self.bulk_logs.get_mut(&target) {
+            // A new attempt can still fail and needs the ambiguous row.
+            if state.ambiguous {
+                state.terminal_at = None;
+            }
+        }
         attempt
     }
 
@@ -423,7 +436,7 @@ impl AutomodDeleteMarks {
                         .by_message
                         .get(&target)
                         .is_some_and(|keys| keys.iter().any(|candidate| candidate != key));
-                    self.remove_key(*key);
+                    self.remove_key(*key, now);
                     if siblings_remain {
                         let state = self.gateway.entry(target).or_default();
                         state.observed = true;
@@ -468,7 +481,7 @@ impl AutomodDeleteMarks {
         if !gateway.observed || gateway.settled || defer_settlement {
             return None;
         }
-        Some(self.finalize_automod_settlement(target, key, &gateway))
+        Some(self.finalize_automod_settlement(target, key, &gateway, now))
     }
 
     pub(crate) fn remove_unconfirmed(
@@ -508,8 +521,8 @@ impl AutomodDeleteMarks {
             .into_iter()
             .filter(|candidate| *candidate != key && self.entries.contains_key(candidate))
             .count();
-        self.remove_key(key);
-        let released_settlement = self.try_release_deferred_settlement(target);
+        self.remove_key(key, now);
+        let released_settlement = self.try_release_deferred_settlement(target, now);
         let replay = gateway.observed
             && !gateway.settled
             && remaining_attempts == 0
@@ -531,10 +544,39 @@ impl AutomodDeleteMarks {
     }
 
     fn bulk_log_deadline(state: &BulkLogState) -> Option<Instant> {
-        if state.ambiguous || state.inflight || state.deferred {
+        if state.inflight || state.deferred {
             return None;
         }
+        if state.ambiguous {
+            return state
+                .terminal_at
+                .and_then(|at| at.checked_add(AUTOMOD_DELETE_MARK_TTL));
+        }
         state.started.checked_add(AUTOMOD_DELETE_MARK_TTL)
+    }
+
+    fn live_marks(&self, target: MessageTarget) -> bool {
+        self.by_message
+            .get(&target)
+            .is_some_and(|keys| keys.iter().any(|key| self.entries.contains_key(key)))
+    }
+
+    /// Start the bounded suppression window once an ambiguous row can no longer
+    /// be needed by an in-flight send or an unsettled REST attempt.
+    fn note_ambiguous_settled(&mut self, target: MessageTarget, now: Instant) {
+        if self.live_marks(target) {
+            return;
+        }
+        let ready = self.bulk_logs.get(&target).is_some_and(|state| {
+            state.ambiguous && !state.inflight && !state.deferred && state.terminal_at.is_none()
+        });
+        if !ready {
+            return;
+        }
+        if let Some(state) = self.bulk_logs.get_mut(&target) {
+            state.terminal_at = Some(now);
+        }
+        self.schedule_bulk_expiry(target);
     }
 
     fn schedule_bulk_expiry(&mut self, target: MessageTarget) {
@@ -558,8 +600,8 @@ impl AutomodDeleteMarks {
     }
 
     fn expire_bulk_logs(&mut self, now: Instant) {
-        // Pop only the due prefix. Fresh delivered rows sit behind that prefix
-        // and are not visited. Suppression rows are not indexed.
+        // Pop only the due prefix. Fresh rows and unsettled ambiguous rows sit
+        // behind that prefix or are absent from the index.
         while let Some((deadline, target)) = self.bulk_expiry.front().copied() {
             #[cfg(test)]
             {
@@ -621,6 +663,7 @@ impl AutomodDeleteMarks {
             deferred: false,
             deferred_retained: None,
             started: now,
+            terminal_at: None,
         });
         if state.covered || state.ambiguous {
             return false;
@@ -676,6 +719,7 @@ impl AutomodDeleteMarks {
                         state.deferred = false;
                         state.deferred_retained = None;
                     }
+                    self.note_ambiguous_settled(target, Instant::now());
                 }
                 BulkDeliveryOutcome::Failed => {
                     if self
@@ -752,10 +796,10 @@ impl AutomodDeleteMarks {
                         .is_some_and(|sibling| sibling.confirmed)
             })
         }) {
-            self.remove_key(key);
-            return self.try_release_deferred_settlement(target);
+            self.remove_key(key, now);
+            return self.try_release_deferred_settlement(target, now);
         }
-        Some(self.finalize_automod_settlement(target, key, &gateway))
+        Some(self.finalize_automod_settlement(target, key, &gateway, now))
     }
 
     pub(crate) fn take_stored_retained(
@@ -872,7 +916,7 @@ impl AutomodDeleteMarks {
             }
             let rule_id = entry.rule_id.clone();
             let rule_name = entry.rule_name.clone();
-            self.remove_key(key);
+            self.remove_key(key, now);
             self.assert_indexes_consistent();
             return Some((rule_id, rule_name));
         }
@@ -2001,5 +2045,87 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "10k rejected inserts took {elapsed:?}; walking every live mark was about 2.81s"
         );
+    }
+
+    #[test]
+    fn settled_ambiguous_coverage_expires_after_its_suppression_window() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        hold_bulk_row(&mut marks, 1, now, Some(BulkDeliveryOutcome::Ambiguous));
+        hold_bulk_row(&mut marks, 2, now, None);
+        let past_ttl = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(past_ttl);
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 1)),
+            "unsettled ambiguous coverage expired"
+        );
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 2)),
+            "in-flight bulk row expired"
+        );
+        let attempt = attempt_for_message(&marks, 1);
+        assert!(marks.confirm(1, 2, 1, attempt, now).is_some());
+        marks.prune(now + AUTOMOD_DELETE_MARK_TTL - Duration::from_secs(1));
+        assert!(marks.bulk_logs.contains_key(&(1, 2, 1)));
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 1, None),
+            BulkPlainReplay::Covered
+        );
+        let pops = marks.bulk_expiry_pops;
+        marks.prune(past_ttl);
+        assert_eq!(marks.bulk_expiry_pops, pops + 1);
+        assert!(
+            !marks.bulk_logs.contains_key(&(1, 2, 1)),
+            "settled ambiguous coverage stayed after its window"
+        );
+        assert!(marks.bulk_logs.contains_key(&(1, 2, 2)));
+        marks.insert(1, 2, 9, "badword", "Bad word", past_ttl);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 9, None, past_ttl),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        assert!(marks.reserve_bulk_delivery(1, 2, 9, past_ttl));
+    }
+
+    #[test]
+    fn failed_rest_settlement_also_starts_the_ambiguous_window() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        hold_bulk_row(&mut marks, 4, now, Some(BulkDeliveryOutcome::Ambiguous));
+        let past_ttl = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(past_ttl);
+        assert!(marks.bulk_logs.contains_key(&(1, 2, 4)));
+        let attempt = attempt_for_message(&marks, 4);
+        let removal = marks.remove_unconfirmed(1, 2, 4, attempt, now);
+        assert!(removal.covered_by_bulk);
+        assert_eq!(
+            marks.claim_or_defer_plain_replay(1, 2, 4, None),
+            BulkPlainReplay::Covered
+        );
+        assert!(marks.bulk_logs.contains_key(&(1, 2, 4)));
+        marks.prune(past_ttl);
+        assert!(!marks.bulk_logs.contains_key(&(1, 2, 4)));
+    }
+
+    #[test]
+    fn a_new_attempt_keeps_ambiguous_coverage_until_it_settles() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        hold_bulk_row(&mut marks, 5, now, Some(BulkDeliveryOutcome::Ambiguous));
+        let first = attempt_for_message(&marks, 5);
+        assert!(marks.confirm(1, 2, 5, first, now).is_some());
+        let later = now + Duration::from_secs(30);
+        marks.insert(1, 2, 5, "badword", "Bad word", later);
+        marks.prune(now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
+        assert!(
+            marks.bulk_logs.contains_key(&(1, 2, 5)),
+            "a new attempt lost ambiguous suppression"
+        );
+        assert!(marks.contains(1, 2, 5));
+        let second = attempt_for_message(&marks, 5);
+        let removal = marks.remove_unconfirmed(1, 2, 5, second, later);
+        assert!(removal.covered_by_bulk);
+        marks.prune(later + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
+        assert!(!marks.bulk_logs.contains_key(&(1, 2, 5)));
     }
 }

@@ -3068,6 +3068,116 @@ mod tests {
         remove_db(&path);
     }
 
+    #[tokio::test]
+    async fn settled_ambiguous_rows_release_capacity_for_the_next_bulk_delete() {
+        use crate::automod_delete_marks::MAX_AUTOMOD_DELETE_MARKS;
+        use std::time::{Duration, Instant};
+        let (app, path) = temp_app("snapshot_ambiguous_cap");
+        crate::db::upsert_log_channel(&app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        for message in 1..=MAX_AUTOMOD_DELETE_MARKS as u64 {
+            let attempt =
+                app.automod_delete_marks
+                    .insert(789, 456, message, "badword", "Bad words");
+            let (_, reserved) = app
+                .automod_delete_marks
+                .observe_and_reserve_bulk_delete(789, 456, message, None, true);
+            assert!(reserved, "setup reservation failed at {message}");
+            assert!(
+                app.automod_delete_marks
+                    .finish_bulk_delivery(
+                        789,
+                        456,
+                        &[message],
+                        logging::BulkDeliveryOutcome::Ambiguous,
+                    )
+                    .is_empty()
+            );
+            assert!(
+                app.automod_delete_marks
+                    .confirm(789, 456, message, attempt)
+                    .is_some(),
+                "successful REST did not settle {message}"
+            );
+        }
+        let blocked = MAX_AUTOMOD_DELETE_MARKS as u64 + 1;
+        let blocked_attempt =
+            app.automod_delete_marks
+                .insert(789, 456, blocked, "badword", "Bad words");
+        let mut transcript = logging::BulkTranscript::new(1);
+        let peeled = peel_automod_bulk_chunk(
+            &app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            &[MessageId::new(blocked)],
+            &mut transcript,
+            false,
+        );
+        assert!(peeled.is_empty());
+        assert!(
+            transcript.pending_automod.is_empty(),
+            "a full ambiguous cache kept an id it could not reserve"
+        );
+        assert!(!transcript.worth_sending());
+        let sink = RecordingSink::default();
+        if let Some(settlement) =
+            app.automod_delete_marks
+                .confirm(789, 456, blocked, blocked_attempt)
+        {
+            logging::emit_reconciled_automod_delete(
+                &app,
+                &sink,
+                789,
+                456,
+                blocked,
+                &settlement.rule_id,
+                &settlement.rule_name,
+                settlement.retained.as_ref(),
+            )
+            .await;
+        }
+        assert!(
+            sink.messages.lock().unwrap().is_empty(),
+            "bulk-only success has no individual destination: {:?}",
+            sink.messages.lock().unwrap()
+        );
+        let still = blocked + 1;
+        app.automod_delete_marks
+            .insert(789, 456, still, "badword", "Bad words");
+        let (_, reserved) = app
+            .automod_delete_marks
+            .observe_and_reserve_bulk_delete(789, 456, still, None, true);
+        assert!(
+            !reserved,
+            "the suppression window released capacity immediately"
+        );
+        app.automod_delete_marks
+            .prune_at(Instant::now() + Duration::from_secs(10 * 60 + 5));
+        let recovered = still + 1;
+        app.automod_delete_marks
+            .insert(789, 456, recovered, "badword", "Bad words");
+        let mut transcript = logging::BulkTranscript::new(1);
+        let peeled = peel_automod_bulk_chunk(
+            &app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            &[MessageId::new(recovered)],
+            &mut transcript,
+            false,
+        );
+        assert!(peeled.is_empty());
+        assert_eq!(transcript.pending_automod, vec![MessageId::new(recovered)]);
+        assert!(transcript.worth_sending());
+        assert!(
+            app.automod_delete_marks
+                .bulk_log_contains(789, 456, recovered)
+        );
+        drop(app);
+        remove_db(&path);
+    }
+
     #[test]
     fn author_provenance_is_bounded_and_eviction_marks_a_gap() {
         let ingress = SnapshotIngress::default();

@@ -3290,6 +3290,283 @@ async fn ambiguous_bulk_timeout_does_not_release_a_deferred_replay() {
     server.abort();
 }
 
+enum SequencedProxyReply {
+    Status {
+        status: u16,
+        body: &'static str,
+    },
+    /// HTTP 200 with a declared length the body does not satisfy.
+    TruncatedSuccess,
+}
+
+async fn sequenced_bulk_proxy(
+    replies: Vec<SequencedProxyReply>,
+) -> (
+    serenity::http::Http,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let saved = Arc::clone(&requests);
+    let replies = Arc::new(Mutex::new(replies));
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let replies = Arc::clone(&replies);
+            let counter = Arc::clone(&counter);
+            let saved = Arc::clone(&saved);
+            tokio::spawn(async move {
+                let Some(request) = read_proxied_request(&mut stream).await else {
+                    return;
+                };
+                saved.lock().unwrap().push(request);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = {
+                    let mut pending = replies.lock().unwrap();
+                    if pending.is_empty() {
+                        SequencedProxyReply::Status {
+                            status: 500,
+                            body: r#"{"code":0,"message":"unexpected"}"#,
+                        }
+                    } else {
+                        pending.remove(0)
+                    }
+                };
+                let bytes = match reply {
+                    SequencedProxyReply::Status { status, body } => format!(
+                        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes(),
+                    SequencedProxyReply::TruncatedSuccess => {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{"
+                            .to_vec()
+                    }
+                };
+                let _ = stream.write_all(&bytes).await;
+            });
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, requests, calls, server)
+}
+
+async fn defer_inflight_bulk_only(f: &Fixture) -> Sink {
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let retained = replay_snapshot("bulk fallback body");
+    let placement = place_bulk_delete(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        Some(&retained),
+        true,
+    );
+    assert!(placement.reserved_pending);
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert!(removal.bulk_inflight);
+    let sink = Sink::default();
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(sink.messages.lock().unwrap().is_empty());
+    sink
+}
+
+fn pending_bulk_transcript(messages: u64) -> BulkTranscript {
+    let mut transcript = BulkTranscript::new(messages as usize);
+    let retained = replay_snapshot("bulk fallback body");
+    transcript.keep_pending_automod(MessageId::new(123));
+    transcript.push(MessageId::new(123), Some(&retained));
+    for id in 2..=messages {
+        transcript.push(MessageId::new(id), None);
+    }
+    transcript
+}
+
+async fn settle_pending_bulk(f: &Fixture, sink: &Sink, outcome: BulkDeliveryOutcome) {
+    settle_bulk_delivery(
+        &f.app,
+        sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        outcome,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn truncated_success_body_stays_ambiguous_for_attachment_fallback_and_count() {
+    let rejection = anyhow::Error::from(serenity::Error::Json(
+        serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+    ));
+    assert!(!bulk_send_definitely_rejected(&rejection));
+    assert!(!bulk_send_definitely_rejected(&anyhow::anyhow!(
+        "transport"
+    )));
+    let http_error = fixture_discord_http_error(500, 0).await;
+    assert!(bulk_send_definitely_rejected(&anyhow::Error::from(
+        http_error
+    )));
+
+    let f = Fixture::with_timeout(30);
+    let sink = defer_inflight_bulk_only(&f).await;
+    let (http, requests, calls, server) =
+        sequenced_bulk_proxy(vec![SequencedProxyReply::TruncatedSuccess]).await;
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        pending_bulk_transcript(1),
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Ambiguous);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(request_names_transcript(&requests.lock().unwrap()[0]));
+    settle_pending_bulk(&f, &sink, outcome).await;
+    assert!(
+        sink.messages.lock().unwrap().is_empty(),
+        "a truncated success released the deferred replay: {:?}",
+        sink.messages.lock().unwrap()
+    );
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    let sink = defer_inflight_bulk_only(&f).await;
+    let parts = fallback_bulk_parts(
+        "{details}",
+        &BTreeMap::from([
+            ("channel".into(), "<#456>".into()),
+            ("details".into(), "transcript attached".into()),
+        ]),
+        &pending_bulk_transcript(200),
+    );
+    assert!(parts.len() > 1, "the fixture must have a second text part");
+    let (http, _requests, calls, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 403,
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        SequencedProxyReply::TruncatedSuccess,
+    ])
+    .await;
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        pending_bulk_transcript(200),
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Ambiguous);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the first text part's read error must not send another part"
+    );
+    settle_pending_bulk(&f, &sink, outcome).await;
+    assert!(sink.messages.lock().unwrap().is_empty());
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    let data = r#"{"users":["42"],"channels":[]}"#.to_string();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_bulk_delete',?1)",
+                db::params![data],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let sink = defer_inflight_bulk_only(&f).await;
+    let (http, requests, calls, server) =
+        sequenced_bulk_proxy(vec![SequencedProxyReply::TruncatedSuccess]).await;
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        pending_bulk_transcript(1),
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Ambiguous);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        !request_names_transcript(&requests.lock().unwrap()[0]),
+        "the filtered send attached the transcript"
+    );
+    settle_pending_bulk(&f, &sink, outcome).await;
+    assert!(sink.messages.lock().unwrap().is_empty());
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    let sink = defer_inflight_bulk_only(&f).await;
+    let (http, _requests, calls, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 403,
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        SequencedProxyReply::Status {
+            status: 500,
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        pending_bulk_transcript(200),
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Failed);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    settle_pending_bulk(&f, &sink, outcome).await;
+    let bodies: Vec<String> = sink
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(channel, body)| format!("{channel} {body}"))
+        .collect();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].contains("last observed: bulk fallback body"));
+    server.abort();
+}
+
 struct ScriptedHttpReply {
     status: u16,
     headers: &'static str,

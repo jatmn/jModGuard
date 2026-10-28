@@ -2344,6 +2344,20 @@ fn attachment_permission_denied(error: &anyhow::Error) -> bool {
         })
 }
 
+/// Discord answered with a non-success status, so the transcript was rejected.
+/// A transport error, a truncated body, or a decode failure does not: Serenity
+/// reports those after `request` has already accepted HTTP 200.
+fn bulk_send_definitely_rejected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<serenity::Error>()
+        .is_some_and(|discord_err| {
+            matches!(
+                discord_err,
+                serenity::Error::Http(http_error) if http_error.status_code().is_some()
+            )
+        })
+}
+
 struct TextFallbackDelivery {
     outcome: crate::automod_delete_marks::BulkDeliveryOutcome,
     terminal_error: Option<serenity::Error>,
@@ -2392,8 +2406,11 @@ async fn deliver_bulk_text_fallback_parts(
                 parts_sent += 1;
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                let definite = bulk_send_definitely_rejected(&error);
                 terminal_error = error.downcast::<serenity::Error>().ok();
-                ambiguous = parts_sent > 0;
+                // A later part's rejection still follows bytes Discord already accepted.
+                // The first part's body-read or transport error does not prove rejection.
+                ambiguous = parts_sent > 0 || !definite;
                 break;
             }
             // Timeout or cancellation is ambiguous: do not send another part.
@@ -2468,9 +2485,12 @@ async fn deliver_attached_bulk(
                 failure_recovery = fallback.recovery;
                 terminal_error = fallback.terminal_error;
                 fallback.outcome
-            } else {
+            } else if bulk_send_definitely_rejected(&discord_err) {
                 terminal_error = discord_err.downcast::<serenity::Error>().ok();
                 BulkDeliveryOutcome::Failed
+            } else {
+                terminal_error = discord_err.downcast::<serenity::Error>().ok();
+                BulkDeliveryOutcome::Ambiguous
             }
         }
         // Timeout or cancellation is ambiguous: do not send the plain-text fallback.
@@ -2692,9 +2712,13 @@ pub(crate) async fn emit_retained_bulk_to(
         .await
         {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => BulkDeliveryOutcome::Delivered,
-            Ok(crate::discord::DiscordCall::Finished(Err(_))) => {
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
                 record_delivery_failure(app);
-                BulkDeliveryOutcome::Failed
+                if bulk_send_definitely_rejected(&error) {
+                    BulkDeliveryOutcome::Failed
+                } else {
+                    BulkDeliveryOutcome::Ambiguous
+                }
             }
             // Timeout or cancellation may already have reached Discord.
             _ => {
