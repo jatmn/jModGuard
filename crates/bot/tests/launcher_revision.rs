@@ -1,6 +1,6 @@
 //! Children of unsupported launchers idle with health up and never
-//! take the writer lease. Revision 7 and a standalone start are not gated.
-use jmodguard::db::SqlExecutor;
+//! take the writer lease. The current launcher revision and a standalone start are not gated.
+use jmodguard::db::{LAUNCHER_REVISION, REQUIRED_LAUNCHER_REVISION, SqlExecutor};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -169,6 +169,8 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
         Some("4"),
         Some("5"),
         Some("6"),
+        Some("7"),
+        Some("17"),
     ] {
         let root = temp_root("rev2");
         let db_path = root.join("core.db");
@@ -190,7 +192,10 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
             vec![]
         };
         let mut running = spawn(&envs, &remove);
-        wait_log(&running, "this release requires launcher revision 7");
+        wait_log(
+            &running,
+            &format!("this release requires launcher revision {REQUIRED_LAUNCHER_REVISION}"),
+        );
         let log = wait_log(&running, "health listener");
         let addr = health_addr(&log);
         let health = get(&addr, "/health");
@@ -232,9 +237,10 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
 }
 
 #[test]
-fn revision_seven_launcher_child_starts_and_claims_the_lease() {
-    let root = temp_root("rev7");
+fn current_launcher_revision_child_starts_and_claims_the_lease() {
+    let root = temp_root("current");
     let db_path = root.join("core.db");
+    let revision = LAUNCHER_REVISION.to_string();
     let running = spawn(
         &[
             ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
@@ -242,7 +248,7 @@ fn revision_seven_launcher_child_starts_and_claims_the_lease() {
             ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
             ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
             ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "7"),
+            ("JMODGUARD_LAUNCHER_REVISION", revision.as_str()),
         ],
         &[],
     );
@@ -252,7 +258,7 @@ fn revision_seven_launcher_child_starts_and_claims_the_lease() {
     while !lease_present(&db_path) {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "revision 7 child did not claim the writer lease\n{log}"
+            "current launcher child did not claim the writer lease\n{log}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

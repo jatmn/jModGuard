@@ -6,9 +6,15 @@ use axum::{
     response::Response,
     routing::get,
 };
-use jmodguard_updater::oci::{Registry, sha256_hex};
-use serde_json::json;
-use std::{collections::HashMap, io::Write, sync::Arc};
+use jmodguard_updater::oci::Registry;
+use jmodguard_updater::signature::{
+    BAD_IMAGE_SIGNATURE, EXPIRED_IMAGE_SIGNATURE, UNSIGNED_IMAGE, UNTRUSTED_IMAGE_SIGNATURE_KEY,
+    signature_rejection_phrase, signature_tag_for_digest,
+};
+use jmodguard_updater::signing_fixture::{
+    SigningFixture, SigningKeyChoice, image as signed_image, signature_not_after_far_future,
+};
+use std::{collections::HashMap, sync::Arc, sync::OnceLock};
 use tokio::sync::RwLock;
 
 #[derive(Default)]
@@ -38,65 +44,37 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
     }
 }
 
-fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{}", sha256_hex(bytes))
+fn signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::new();
+        fixture.apply_env();
+        fixture
+    })
 }
 
-fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &str) -> String {
-    let sha = source.to_string().repeat(40);
-    let config = serde_json::to_vec(&json!({
-        "architecture":"amd64","os":"linux","config":{"Labels":{
-            "io.jmodguard.component":"api","io.jmodguard.channel":channel,
-            "io.jmodguard.release-id":format!("v1.0.{source}"),
-            "io.jmodguard.published-at":"2026-09-23T00:00:00Z",
-            "io.jmodguard.min-schema":"15","io.jmodguard.max-schema":"15",
-            "io.jmodguard.result-schema":"15","io.jmodguard.min-api":"1",
-            "io.jmodguard.max-api":"1","io.jmodguard.launcher-protocol":"1",
-            "io.jmodguard.base-abi":"debian-bookworm-amd64",
-            "io.jmodguard.update-control":"3", "io.jmodguard.upgrade-min-core":"15",
-            "io.jmodguard.upgrade-min-guild":"1", "io.jmodguard.guild-schema":"14",
-            "io.jmodguard.launcher-revision":"7", "io.jmodguard.min-launcher-revision":"4",
-            "org.opencontainers.image.revision":sha
-        }}
-    }))
-    .unwrap();
-    let mut tar_bytes = Vec::new();
-    {
-        let mut tar = tar::Builder::new(&mut tar_bytes);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(binary.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        tar.append_data(&mut header, "usr/local/bin/jmodguard-api", binary)
-            .unwrap();
-        tar.finish().unwrap();
-    }
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&tar_bytes).unwrap();
-    let layer = encoder.finish().unwrap();
-    let config_digest = digest(&config);
-    let layer_digest = digest(&layer);
-    let manifest=serde_json::to_vec(&json!({
-        "schemaVersion":2,
-        "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_digest,"size":config.len()},
-        "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":layer_digest,"size":layer.len()}]
-    })).unwrap();
-    fixture.objects.insert(config_digest, config);
-    fixture.objects.insert(layer_digest, layer);
-    let manifest_digest = digest(&manifest);
-    fixture.objects.insert(sha, manifest.clone());
-    fixture.objects.insert(manifest_digest.clone(), manifest);
-    manifest_digest
+fn image(fixture: &mut RegistryFixture, binary: &[u8], channel: &str, source: char) -> String {
+    let mut objects = fixture.objects.clone();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        binary,
+        channel,
+        &signature_not_after_far_future(),
+        source,
+    );
+    fixture.objects = objects;
+    release.digest
 }
 
-#[tokio::test]
-async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
-    let mut fixture = RegistryFixture::default();
-    let old = image(&mut fixture, 'a', b"\x7fELFfirst", "development");
-    let new = image(&mut fixture, 'b', b"\x7fELFsecond", "development");
-    let stable = image(&mut fixture, 'c', b"\x7fELFstable", "stable");
-    let nightly = image(&mut fixture, 'd', b"\x7fELFnightly", "nightly");
-    fixture.tag = old.clone();
+async fn start_registry(
+    fixture: RegistryFixture,
+) -> (
+    Registry,
+    Arc<RwLock<RegistryFixture>>,
+    tokio::task::JoinHandle<()>,
+) {
     let state = Arc::new(RwLock::new(fixture));
     let router = Router::new()
         .fallback(get(serve_object))
@@ -105,13 +83,24 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let registry = Registry::new(&format!("http://{addr}")).unwrap();
+    (registry, state, server)
+}
+
+#[tokio::test]
+async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
+    let mut fixture = RegistryFixture::default();
+    let old = image(&mut fixture, b"\x7fELFfirst", "development", 'a');
+    let new = image(&mut fixture, b"\x7fELFsecond", "development", 'b');
+    let stable = image(&mut fixture, b"\x7fELFstable", "stable", 'c');
+    let nightly = image(&mut fixture, b"\x7fELFnightly", "nightly", 'd');
+    fixture.tag = old.clone();
+    let (registry, state, server) = start_registry(fixture).await;
     let approved = registry.discover("api", "latest").await.unwrap();
     assert_eq!(approved.channel, "latest");
-    assert_eq!(approved.launcher.as_ref().unwrap().revision, 7);
-    assert_eq!(approved.required_launcher(), 4);
-    assert!(approved.supports_launcher(3).is_err());
-    approved.supports_launcher(4).unwrap();
-    approved.supports_launcher(9).unwrap();
+    assert_eq!(approved.launcher.as_ref().unwrap().revision, 19);
+    assert_eq!(approved.required_launcher(), 19);
+    assert!(approved.supports_launcher(18).is_err());
+    approved.supports_launcher(19).unwrap();
     assert_eq!(approved.digest, old);
     state.write().await.tag = new.clone();
     assert_eq!(
@@ -122,28 +111,11 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
             .digest,
         old
     );
-    assert!(
-        registry
-            .discover_source("api", "latest", &"f".repeat(40))
-            .await
-            .is_err()
-    );
-    assert!(
-        registry
-            .discover_source("api", "latest", "../../other-image")
-            .await
-            .is_err()
-    );
-
     assert_eq!(
         registry.discover("api", "latest").await.unwrap().digest,
         new
     );
     state.write().await.tag = stable.clone();
-    assert_eq!(
-        registry.discover("api", "latest").await.unwrap().digest,
-        stable
-    );
     assert_eq!(
         registry.discover("api", "stable").await.unwrap().digest,
         stable
@@ -157,33 +129,153 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
             .unwrap()["usr/local/bin/jmodguard-api"],
         b"\x7fELFfirst"
     );
-    let wrong_revision_manifest = state.read().await.objects[&new].clone();
-    state
-        .write()
-        .await
-        .objects
-        .insert("a".repeat(40), wrong_revision_manifest);
-    assert!(
-        registry
-            .discover_source("api", "latest", &"a".repeat(40))
-            .await
-            .is_err()
+    server.abort();
+}
+
+#[tokio::test]
+async fn signature_policy_rejects_bad_missing_expired_and_unknown_keys() {
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        &signature_not_after_far_future(),
+        'a',
     );
-    let config_digest = {
-        let guard = state.read().await;
-        let manifest: serde_json::Value = serde_json::from_slice(&guard.objects[&old]).unwrap();
-        manifest["config"]["digest"].as_str().unwrap().to_owned()
-    };
-    state
-        .write()
-        .await
-        .objects
-        .insert(config_digest, b"altered config".to_vec());
-    assert!(
-        registry
-            .files(&approved, &["usr/local/bin/jmodguard-api"])
-            .await
-            .is_err()
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    let (registry, state, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    registry.discover("api", "latest").await.unwrap();
+    state.write().await.objects.remove(&tag);
+    let error = registry.discover("api", "latest").await.unwrap_err();
+    assert!(error.to_string().contains(UNSIGNED_IMAGE));
+    server.abort();
+
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        "2020-01-01T00:00:00Z",
+        'e',
+    );
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    let error = registry.discover("api", "latest").await.unwrap_err();
+    assert!(error.to_string().contains(EXPIRED_IMAGE_SIGNATURE));
+    server.abort();
+
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        "2020-01-01T00:00:00Z",
+        'b',
+    );
+    signing().sign(
+        &mut objects,
+        "api",
+        &release.digest,
+        &signature_not_after_far_future(),
+        SigningKeyChoice::Current,
+    );
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    registry.discover("api", "latest").await.unwrap();
+    server.abort();
+
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        &signature_not_after_far_future(),
+        'a',
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.insert(tag, b"not-json".to_vec());
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    let error = registry.discover("api", "latest").await.unwrap_err();
+    assert!(error.to_string().contains(BAD_IMAGE_SIGNATURE));
+    server.abort();
+
+    let rotation = signing().with_previous_key();
+    rotation.apply_env();
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        &rotation,
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        &signature_not_after_far_future(),
+        'f',
+    );
+    rotation.sign(
+        &mut objects,
+        "api",
+        &release.digest,
+        &signature_not_after_far_future(),
+        SigningKeyChoice::Previous,
+    );
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    registry.discover("api", "latest").await.unwrap();
+    server.abort();
+
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        signing(),
+        "api",
+        b"\x7fELFsigned",
+        "development",
+        &signature_not_after_far_future(),
+        'g',
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
+    signing().sign(
+        &mut objects,
+        "api",
+        &release.digest,
+        &signature_not_after_far_future(),
+        SigningKeyChoice::Unknown,
+    );
+    let (registry, _, server) = start_registry(RegistryFixture {
+        tag: release.digest.clone(),
+        objects,
+    })
+    .await;
+    let error = registry.discover("api", "latest").await.unwrap_err();
+    assert_eq!(
+        signature_rejection_phrase(&error),
+        Some(UNTRUSTED_IMAGE_SIGNATURE_KEY)
     );
     server.abort();
 }

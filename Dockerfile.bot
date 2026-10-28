@@ -16,6 +16,7 @@ RUN rustup show
 COPY Cargo.toml Cargo.lock LICENSE.md ./
 COPY src ./src
 COPY crates ./crates
+COPY deploy ./deploy
 COPY migrations ./migrations
 COPY vendor ./vendor
 COPY scripts/bootstrap-container.sh ./scripts/bootstrap-container.sh
@@ -61,6 +62,7 @@ ENV JMODGUARD_REQUIRE_REMOTE_DB=1
 ENV JMODGUARD_HEALTH_BIND=0.0.0.0:8081
 ENV JMODGUARD_BASE_SHA=${SOURCE_SHA}
 ENV JMODGUARD_BASE_ABI=debian-bookworm-amd64
+ENV JMODGUARD_REPO_ROOT=/usr/local/share/jmodguard
 ENV JMODGUARD_ROLE=bot
 ENV JMODGUARD_SELF_UPDATE=0
 EXPOSE 8081

@@ -7,6 +7,10 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
 use jmodguard_updater::oci::{Registry, sha256_hex};
+use jmodguard_updater::signature::{
+    SCHEMA_MISMATCH, boot_repair_reason, registry_transient, signature_rejection_phrase,
+};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -551,6 +555,19 @@ async fn watch_child_health_from(
     }
 }
 
+async fn discard_stale_staging_files(dir: &Path) {
+    let Ok(entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut entries = entries;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".stage-") {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 async fn stage(
     registry: &Registry,
     release: &ComponentRelease,
@@ -582,16 +599,24 @@ async fn stage(
     );
     // PID 1 reads only this fixed directory; TMPDIR is allowed to differ.
     tokio::fs::create_dir_all(&dir).await?;
+    discard_stale_staging_files(dir).await;
     let target = dir.join(format!("{}-{hash}", release.component));
     let temp = dir.join(format!(".stage-{:032x}", rand::random::<u128>()));
-    tokio::fs::write(&temp, binary).await?;
-    tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).await?;
-    tokio::fs::rename(&temp, &target).await?;
-    ensure!(
-        sha256_hex(&tokio::fs::read(&target).await?) == hash,
-        "staged binary hash mismatch"
-    );
-    Ok(target)
+    let staged: Result<PathBuf> = async {
+        tokio::fs::write(&temp, binary).await?;
+        tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).await?;
+        ensure!(
+            sha256_hex(&tokio::fs::read(&temp).await?) == hash,
+            "staged binary hash mismatch"
+        );
+        tokio::fs::rename(&temp, &target).await?;
+        Ok(target)
+    }
+    .await;
+    if staged.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    staged
 }
 
 fn observation(
@@ -650,6 +675,15 @@ enum ControlStep {
 struct PendingFailure {
     component: Option<(ComponentRelease, String)>,
     launcher: Option<(String, String)>,
+}
+
+#[derive(Clone)]
+enum PendingBootMismatch {
+    Record {
+        release: Box<ComponentRelease>,
+        reason: String,
+    },
+    Clear,
 }
 
 /// Startup receipts the API cannot store until the bot is the writer.
@@ -739,6 +773,9 @@ struct Supervisor {
     // Failed independent selection awaiting verified prior-service readiness.
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
+    pending_boot_mismatch: VecDeque<PendingBootMismatch>,
+    /// Installed release retained while the baked executable is running temporarily.
+    baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
     receipt_attempt: u32,
     receipt_not_before: Option<Instant>,
@@ -747,6 +784,116 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn baked_child_running(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|child| child.path == self.baked)
+    }
+
+    fn pending_record_blocks_clear(&self) -> bool {
+        self.pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Record { .. }))
+            && !self.baked_child_running()
+    }
+
+    fn keep_record_ahead_of_clear(&mut self) {
+        if !self
+            .pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Record { .. }))
+        {
+            return;
+        }
+        let mut records = VecDeque::new();
+        let mut rest = VecDeque::new();
+        for pending in self.pending_boot_mismatch.drain(..) {
+            match pending {
+                record @ PendingBootMismatch::Record { .. } => records.push_back(record),
+                other => rest.push_back(other),
+            }
+        }
+        records.append(&mut rest);
+        self.pending_boot_mismatch = records;
+    }
+
+    /// The baked process is not release A. When that process is the rollback
+    /// target, the durable installed selection is the retained fallback.
+    fn durable_baked_selection(
+        &self,
+        path_is_baked: bool,
+        process_release: &Option<ComponentRelease>,
+    ) -> Option<ComponentRelease> {
+        if process_release.is_some() || !path_is_baked {
+            return process_release.clone();
+        }
+        self.baked_fallback_installed.clone()
+    }
+
+    fn queue_pending_boot_record(&mut self, release: ComponentRelease, reason: String) {
+        for pending in &mut self.pending_boot_mismatch {
+            if let PendingBootMismatch::Record {
+                release: existing,
+                reason: existing_reason,
+            } = pending
+            {
+                **existing = release;
+                *existing_reason = reason;
+                self.keep_record_ahead_of_clear();
+                return;
+            }
+        }
+        let record = PendingBootMismatch::Record {
+            release: Box::new(release),
+            reason,
+        };
+        if let Some(index) = self
+            .pending_boot_mismatch
+            .iter()
+            .position(|pending| matches!(pending, PendingBootMismatch::Clear))
+        {
+            self.pending_boot_mismatch.insert(index, record);
+        } else {
+            self.pending_boot_mismatch.push_back(record);
+        }
+        self.keep_record_ahead_of_clear();
+    }
+
+    fn queue_pending_boot_clear_retry(&mut self) {
+        if self
+            .pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Clear))
+        {
+            self.keep_record_ahead_of_clear();
+            return;
+        }
+        self.pending_boot_mismatch
+            .push_back(PendingBootMismatch::Clear);
+        self.keep_record_ahead_of_clear();
+    }
+
+    fn queue_pending_boot_clear_after_recovery(&mut self) {
+        self.pending_boot_mismatch
+            .retain(|pending| !matches!(pending, PendingBootMismatch::Record { .. }));
+        self.queue_pending_boot_clear_retry();
+    }
+
+    fn clear_pending_boot_mismatch(&mut self) {
+        self.pending_boot_mismatch.clear();
+    }
+
+    #[cfg(test)]
+    fn pending_boot_mismatch_labels(&self) -> Vec<&'static str> {
+        self.pending_boot_mismatch
+            .iter()
+            .map(|pending| match pending {
+                PendingBootMismatch::Record { .. } => "record",
+                PendingBootMismatch::Clear => "clear",
+            })
+            .collect()
+    }
+
     async fn hold_rejected_token(&mut self) -> Result<bool> {
         // Copy the fields the child borrow must not hold. A saved digest keeps
         // the candidate when this process no longer has a standby path.
@@ -1028,6 +1175,67 @@ impl Supervisor {
                     return Ok(());
                 }
                 Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_pending_boot_mismatch(&mut self) -> Result<()> {
+        if self.pending_boot_mismatch.is_empty() || !self.receipt_wait_elapsed() {
+            return Ok(());
+        }
+        self.keep_record_ahead_of_clear();
+        let record_blocked = self.pending_record_blocks_clear();
+        let index = self
+            .pending_boot_mismatch
+            .iter()
+            .position(|pending| match pending {
+                PendingBootMismatch::Clear => !record_blocked,
+                PendingBootMismatch::Record { .. } => self.baked_child_running(),
+            });
+        let Some(index) = index else {
+            return Ok(());
+        };
+        let pending = self.pending_boot_mismatch.remove(index).unwrap();
+        match pending {
+            PendingBootMismatch::Record { release, reason } => {
+                match self
+                    .control
+                    .record_boot_mismatch(db::BootMismatchRecord {
+                        component: self.role.clone(),
+                        running: self.base_sha.clone(),
+                        expected: db::BootMismatchExpected {
+                            release_id: release.release_id.clone(),
+                            source_sha: release.source_sha.clone(),
+                        },
+                        reason: reason.clone(),
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        self.reset_receipt_backoff();
+                    }
+                    Err(error) if Self::receipt_not_saved(&error) => {
+                        tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                        self.queue_pending_boot_record((*release).clone(), reason);
+                        self.note_receipt_delay();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            PendingBootMismatch::Clear => {
+                match self.control.clear_boot_mismatch(&self.role).await {
+                    Ok(()) => {
+                        self.clear_pending_boot_mismatch();
+                        self.reset_receipt_backoff();
+                    }
+                    Err(error) if Self::receipt_not_saved(&error) => {
+                        tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                        self.queue_pending_boot_clear_retry();
+                        self.note_receipt_delay();
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -1354,7 +1562,7 @@ impl Supervisor {
         if self.hold_rejected_token().await? {
             return Ok(false);
         }
-        let (release, seen) = {
+        let (release, seen, running_from_baked) = {
             let Some(child) = self.running.as_mut() else {
                 return Ok(false);
             };
@@ -1383,9 +1591,11 @@ impl Supervisor {
                 self.restart.recovered();
             }
             if tokio::fs::metadata(&child.ready_file).await.is_err() {
+                let baked_child = child.path == self.baked;
                 ensure!(
                     self.rollback.is_some()
                         || child.release.is_none()
+                        || baked_child
                         || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
                     "replacement child readiness timed out"
                 );
@@ -1400,6 +1610,7 @@ impl Supervisor {
                     self.enabled,
                     &self.baked_compatibility,
                 ),
+                child.path == self.baked,
             )
         };
         self.restart.recovered();
@@ -1422,9 +1633,10 @@ impl Supervisor {
             return Ok(false);
         }
         if let Some((failed, error)) = self.rollback.clone() {
+            let previous = self.durable_baked_selection(running_from_baked, &release);
             match self
                 .control
-                .rolled_back(&self.role, &failed, release.clone(), seen, &error, now())
+                .rolled_back(&self.role, &failed, previous, seen, &error, now())
                 .await
             {
                 Ok(()) => {
@@ -1443,18 +1655,51 @@ impl Supervisor {
                 Err(error) => return Err(error),
             }
         } else {
+            let installed_digest = release.as_ref().map(|release| release.digest.clone());
             let saved = if release.is_none() {
-                self.control.baked_running(&self.role, seen, now()).await
+                if running_from_baked {
+                    if let Some(installed) = self.baked_fallback_installed.clone() {
+                        self.control
+                            .running(&self.role, Some(installed), seen, now())
+                            .await
+                    } else {
+                        self.control.baked_running(&self.role, seen, now()).await
+                    }
+                } else {
+                    self.control.baked_running(&self.role, seen, now()).await
+                }
             } else {
                 self.control.running(&self.role, release, seen, now()).await
             };
             match saved {
                 Ok(()) => {
+                    if installed_digest.is_some() && !running_from_baked {
+                        self.baked_fallback_installed = None;
+                    }
                     self.standby = None;
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
                     self.clear_rejected_marker().await;
+                    if let Some(digest) = installed_digest.as_ref() {
+                        let state = self.control.component(&self.role).await?;
+                        if !running_from_baked
+                            && state
+                                .installed
+                                .as_ref()
+                                .is_some_and(|installed| &installed.digest == digest)
+                        {
+                            match self.clear_boot_mismatch_when_saved().await {
+                                Ok(()) => {}
+                                Err(error) if Self::receipt_not_saved(&error) => {
+                                    tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                                    self.queue_pending_boot_clear_after_recovery();
+                                    self.note_receipt_delay();
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
                     tracing::warn!("activation receipt was not saved: {error:#}");
@@ -1566,6 +1811,132 @@ impl Supervisor {
         Ok(false)
     }
 
+    fn baked_supports_schema(&self, schema: i64) -> bool {
+        if self.role == "bot" {
+            (15..=self.baked_compatibility.core).contains(&schema)
+        } else {
+            schema == self.baked_compatibility.core
+        }
+    }
+
+    async fn required_guild_schema_for_fallback(
+        &self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+    ) -> Result<i64> {
+        let mut required = release
+            .upgrade
+            .as_ref()
+            .context("installed release lacks guild schema metadata")?
+            .guild_schema;
+        if let Some(observed) = state.observed.as_ref().and_then(|seen| seen.guild_schema) {
+            required = required.max(observed);
+        }
+        let counterpart = if self.role == "bot" { "api" } else { "bot" };
+        let other = self.control.component(counterpart).await?;
+        if let Some(observed) = other.observed.as_ref().and_then(|seen| seen.guild_schema) {
+            required = required.max(observed);
+        }
+        if let Some(installed) = other
+            .installed
+            .as_ref()
+            .and_then(|candidate| candidate.upgrade.as_ref())
+        {
+            required = required.max(installed.guild_schema);
+        }
+        Ok(required)
+    }
+
+    async fn baked_supports_guild_for_fallback(
+        &self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+    ) -> Result<bool> {
+        let required = self
+            .required_guild_schema_for_fallback(state, release)
+            .await?;
+        Ok(self.baked_compatibility.guild >= required)
+    }
+
+    async fn record_boot_mismatch_for_installed(
+        &mut self,
+        release: &ComponentRelease,
+        reason: &str,
+    ) -> Result<()> {
+        match self
+            .control
+            .record_boot_mismatch(db::BootMismatchRecord {
+                component: self.role.clone(),
+                running: self.base_sha.clone(),
+                expected: db::BootMismatchExpected {
+                    release_id: release.release_id.clone(),
+                    source_sha: release.source_sha.clone(),
+                },
+                reason: reason.to_owned(),
+            })
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if Self::receipt_not_saved(&error) => {
+                tracing::warn!("boot mismatch receipt was not saved: {error:#}");
+                self.queue_pending_boot_record(release.clone(), reason.to_owned());
+                self.note_receipt_delay();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
+        match self.control.clear_boot_mismatch(&self.role).await {
+            Ok(()) => {
+                self.clear_pending_boot_mismatch();
+                Ok(())
+            }
+            Err(error) if Self::receipt_not_saved(&error) => {
+                tracing::warn!("boot mismatch clear was not saved: {error:#}");
+                self.queue_pending_boot_clear_retry();
+                self.note_receipt_delay();
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn boot_fallback_from_installed(
+        &mut self,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+        reason: &str,
+    ) -> Result<()> {
+        let schema = self.control.schema_version().await?;
+        if !self.baked_supports_schema(schema) {
+            bail!("baked application cannot open database; use owner recovery");
+        }
+        if !self
+            .baked_supports_guild_for_fallback(state, release)
+            .await?
+        {
+            self.record_boot_mismatch_for_installed(release, SCHEMA_MISMATCH)
+                .await?;
+            bail!("baked application cannot open database; use owner recovery");
+        }
+        tracing::error!(
+            component = %self.role,
+            digest = %release.digest,
+            baked_sha = %self.base_sha,
+            reason = reason,
+            "installed release could not be restored from the registry; starting baked application"
+        );
+        self.record_boot_mismatch_for_installed(release, reason)
+            .await?;
+        self.baked_fallback_installed = Some(release.clone());
+        let baked = self.baked.clone();
+        let base_sha = self.base_sha.clone();
+        self.start(&baked, &base_sha, None).await?;
+        Ok(())
+    }
+
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some((failed, error)) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
@@ -1601,15 +1972,35 @@ impl Supervisor {
                 release.base_abi == self.base_abi,
                 "installed application requires a different base ABI"
             );
-            let path = stage(
+            match stage(
                 &self.registry,
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
             )
-            .await?;
-            self.start(&path, &release.source_sha, Some(release.clone()))
-                .await?;
+            .await
+            {
+                Ok(path) => {
+                    self.start(&path, &release.source_sha, Some(release.clone()))
+                        .await?;
+                }
+                Err(error) => {
+                    if registry_transient(&error) {
+                        tracing::warn!(
+                            component = %self.role,
+                            digest = %release.digest,
+                            "registry download stalled on transient error: {error:#}"
+                        );
+                        return Err(error);
+                    }
+                    if let Some(reason) = boot_repair_reason(&error) {
+                        return self
+                            .boot_fallback_from_installed(state, release, reason)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             // A baked bot owns migrations. A protocol-aware observation alone
             // does not make an uninstalled, queued release a managed baseline.
@@ -1862,14 +2253,17 @@ impl Supervisor {
                 Ok(ControlStep::Defer) => return Ok(false),
                 Ok(ControlStep::Proceed) => {}
                 Err(error) => {
-                    if let Some(op) = self.control.upgrade().await?.filter(|op| {
-                        self.rollback.is_none()
-                            && op.phase == Phase::Complete
-                            && state.installed.as_ref().is_some_and(|release| {
-                                op.service(&self.role)
-                                    .is_ok_and(|service| release.digest == service.release.digest)
-                            })
-                    }) {
+                    if !registry_transient(&error)
+                        && let Some(op) = self.control.upgrade().await?.filter(|op| {
+                            self.rollback.is_none()
+                                && op.phase == Phase::Complete
+                                && state.installed.as_ref().is_some_and(|release| {
+                                    op.service(&self.role).is_ok_and(|service| {
+                                        release.digest == service.release.digest
+                                    })
+                                })
+                        })
+                    {
                         self.control
                             .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
                             .await?;
@@ -1915,6 +2309,7 @@ impl Supervisor {
                 return Ok(false);
             }
             if let Some((path, sha, previous)) = self.standby.take() {
+                let durable = self.durable_baked_selection(path == self.baked, &previous);
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
                 let schema = self.control.schema_version().await?;
@@ -1943,7 +2338,7 @@ impl Supervisor {
                     .and_then(|r| r.release.clone())
                     .context("failed replacement missing")?;
                 self.stop_application().await?;
-                self.start(&path, &sha, previous.clone()).await?;
+                self.start(&path, &sha, previous).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
                 let message = format!("{error:#}");
                 match self
@@ -1951,7 +2346,7 @@ impl Supervisor {
                     .rolled_back(
                         &self.role,
                         &failed,
-                        previous,
+                        durable,
                         deployment_observation(
                             child,
                             &self.base_sha,
@@ -2060,8 +2455,18 @@ impl Supervisor {
         {
             Ok(path) => path,
             Err(error) => {
-                self.record_component_failure(candidate, format!("download: {error:#}"))
-                    .await?;
+                if registry_transient(&error) {
+                    tracing::warn!(
+                        component = %self.role,
+                        digest = %candidate.digest,
+                        "registry download stalled on transient error: {error:#}"
+                    );
+                    return Ok(false);
+                }
+                let message = signature_rejection_phrase(&error)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("download: {error:#}"));
+                self.record_component_failure(candidate, message).await?;
                 return Ok(false);
             }
         };
@@ -2222,6 +2627,7 @@ impl Supervisor {
     async fn tick_control(&mut self) -> Result<bool> {
         self.flush_startup_receipts().await?;
         self.flush_pending_failure().await?;
+        self.flush_pending_boot_mismatch().await?;
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
@@ -2639,6 +3045,8 @@ async fn main() -> Result<()> {
         }
         Vec::new()
     };
+    let staging = PathBuf::from("/tmp/jmodguard-updates");
+    discard_stale_staging_files(&staging).await;
     let mut supervisor = Supervisor {
         role,
         base_sha,
@@ -2667,7 +3075,7 @@ async fn main() -> Result<()> {
         before_idle_gate: None,
         #[cfg(test)]
         after_idle_gate: None,
-        staging: PathBuf::from("/tmp/jmodguard-updates"),
+        staging,
         prepared: None,
         standby: None,
         rejected_candidate: None,
@@ -2679,6 +3087,8 @@ async fn main() -> Result<()> {
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
+        pending_boot_mismatch: VecDeque::new(),
+        baked_fallback_installed: None,
         pending_startup,
         receipt_attempt: 0,
         receipt_not_before: None,

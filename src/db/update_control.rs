@@ -10,9 +10,9 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 18;
+pub const LAUNCHER_REVISION: u32 = 19;
 // Selected bots need the auth-exit hold before the readiness deadline check.
-pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 19;
 pub const LAUNCHER_FENCE_TTL_MS: i64 = 20_000;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
@@ -961,6 +961,26 @@ impl UpdateControl {
                 .await;
         }
         record_component_failure(&self.db, role, release, error).await
+    }
+
+    pub async fn record_boot_mismatch(&self, record: BootMismatchRecord) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::RecordBootMismatch { record })
+                .await;
+        }
+        record_boot_mismatch(&self.db, record).await
+    }
+
+    pub async fn clear_boot_mismatch(&self, component: &str) -> Result<()> {
+        if !self.writes_locally() {
+            return self
+                .forward_process(ControlOp::ClearBootMismatch {
+                    component: component.to_owned(),
+                })
+                .await;
+        }
+        clear_boot_mismatch(&self.db, component).await
     }
 
     pub async fn rolled_back(

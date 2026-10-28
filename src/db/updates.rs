@@ -882,6 +882,79 @@ pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Re
     }).await
 }
 
+pub const UPDATE_BOOT_MISMATCH_META: &str = "update_boot_mismatch_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootMismatchExpected {
+    pub release_id: String,
+    pub source_sha: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootMismatchRecord {
+    pub component: String,
+    pub running: String,
+    pub expected: BootMismatchExpected,
+    pub reason: String,
+}
+
+pub type BootMismatchMap = std::collections::BTreeMap<String, BootMismatchRecord>;
+
+pub fn read_boot_mismatch_map_conn(conn: &impl SqlExecutor) -> Result<BootMismatchMap> {
+    let raw = meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?;
+    match raw {
+        None => Ok(BootMismatchMap::new()),
+        Some(value) => Ok(serde_json::from_str(&value)?),
+    }
+}
+
+pub async fn read_boot_mismatch_map(db: &Db) -> Result<BootMismatchMap> {
+    db.with_conn(|conn| read_boot_mismatch_map_conn(conn)).await
+}
+
+pub fn write_boot_mismatch_map_conn(conn: &impl SqlExecutor, map: &BootMismatchMap) -> Result<()> {
+    if map.is_empty() {
+        conn.execute_rows(
+            "DELETE FROM meta WHERE key=?1",
+            params![UPDATE_BOOT_MISMATCH_META],
+            1,
+        )?;
+        return Ok(());
+    }
+    write_meta_string_conn(
+        conn,
+        UPDATE_BOOT_MISMATCH_META,
+        &serde_json::to_string(map)?,
+    )?;
+    Ok(())
+}
+
+pub async fn record_boot_mismatch(db: &Db, record: BootMismatchRecord) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let mut map = read_boot_mismatch_map_conn(&tx)?;
+        map.insert(record.component.clone(), record);
+        write_boot_mismatch_map_conn(&tx, &map)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn clear_boot_mismatch(db: &Db, component: &str) -> Result<()> {
+    let component = component.to_owned();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let mut map = read_boot_mismatch_map_conn(&tx)?;
+        if map.remove(&component).is_some() {
+            write_boot_mismatch_map_conn(&tx, &map)?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1895,6 +1968,98 @@ mod tests {
         request_component_install(&db, "webui", &webui.digest, 7401)
             .await
             .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_boot_mismatch_updates_keep_both_components() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_boot_mismatch_race_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        for round in 0..50 {
+            let bot = BootMismatchRecord {
+                component: "bot".into(),
+                running: format!("sha256:{:064x}", round),
+                expected: BootMismatchExpected {
+                    release_id: format!("bot-{round}"),
+                    source_sha: "b".repeat(40),
+                },
+                reason: "unsigned image".into(),
+            };
+            let api = BootMismatchRecord {
+                component: "api".into(),
+                running: format!("sha256:{:064x}", round + 1),
+                expected: BootMismatchExpected {
+                    release_id: format!("api-{round}"),
+                    source_sha: "c".repeat(40),
+                },
+                reason: "bad image signature".into(),
+            };
+            let (bot_write, api_write) = tokio::join!(
+                record_boot_mismatch(&db, bot),
+                record_boot_mismatch(&db, api)
+            );
+            bot_write.unwrap();
+            api_write.unwrap();
+            let map = read_boot_mismatch_map(&db).await.unwrap();
+            assert_eq!(map["bot"].expected.release_id, format!("bot-{round}"));
+            assert_eq!(map["api"].expected.release_id, format!("api-{round}"));
+            let (clear_bot, clear_api) = tokio::join!(
+                clear_boot_mismatch(&db, "bot"),
+                clear_boot_mismatch(&db, "api")
+            );
+            clear_bot.unwrap();
+            clear_api.unwrap();
+        }
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_last_boot_mismatch_deletes_meta_key() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_boot_mismatch_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let record = BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: "bad image signature".into(),
+        };
+        record_boot_mismatch(&db, record).await.unwrap();
+        assert!(
+            read_boot_mismatch_map(&db)
+                .await
+                .unwrap()
+                .contains_key("api")
+        );
+        db.with_conn(|conn| {
+            assert!(meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?.is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        clear_boot_mismatch(&db, "api").await.unwrap();
+        assert!(read_boot_mismatch_map(&db).await.unwrap().is_empty());
+        db.with_conn(|conn| {
+            assert!(meta_string_conn(conn, UPDATE_BOOT_MISMATCH_META)?.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

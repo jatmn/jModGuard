@@ -4,9 +4,20 @@
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
+use jmodguard_updater::signature::{UNSIGNED_IMAGE, signature_tag_for_digest};
+use jmodguard_updater::signing_fixture::{SigningFixture, SigningKeyChoice};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
+
+fn test_signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::new();
+        fixture.apply_env();
+        fixture
+    })
+}
 
 async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) -> Response {
     match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
@@ -54,6 +65,13 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     objects.insert(config_hash, config);
     objects.insert(layer_hash, layer);
     objects.insert(manifest_hash.clone(), manifest);
+    test_signing().sign(
+        objects,
+        role,
+        &manifest_hash,
+        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
+        SigningKeyChoice::Current,
+    );
     ComponentRelease {
         component: role.into(),
         channel: "latest".into(),
@@ -263,6 +281,8 @@ fn controller(
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
+        pending_boot_mismatch: VecDeque::new(),
+        baked_fallback_installed: None,
         pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,
@@ -8071,5 +8091,716 @@ async fn baked_auth_rejection_after_ready_is_held() {
     assert_eq!(independent_exit_starts(&root).await, ["baked-bot.start"]);
     bot.end_idle().await.unwrap();
     drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn registry_with_objects(
+    objects: HashMap<String, Vec<u8>>,
+) -> (Registry, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    (registry, server)
+}
+
+#[tokio::test]
+async fn bad_signature_leaves_running_child_without_rollback() {
+    let root = std::env::temp_dir().join(format!("sig-rollback-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let running = executable(&root, "running-bot").await;
+    let candidate_bin = executable(&root, "candidate-bot").await;
+    let mut objects = HashMap::new();
+    let mut running_release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(running).await.unwrap(),
+    );
+    let mut release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(candidate_bin).await.unwrap(),
+    );
+    for item in [&mut running_release, &mut release] {
+        item.min_schema = db::CORE_SCHEMA_VERSION;
+        item.max_schema = db::CORE_SCHEMA_VERSION;
+        item.result_schema = db::CORE_SCHEMA_VERSION;
+        item.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    }
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.insert(tag, b"broken-signature".to_vec());
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    control
+        .checked("bot", "latest", Some(running_release.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &running_release.digest, now())
+        .await
+        .unwrap();
+    bot.tick().await.unwrap();
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(running_release.digest.as_str()),
+        "installed release must be active before the bad signature attempt"
+    );
+    control
+        .checked("bot", "latest", Some(release.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("events"), "").await.unwrap();
+    for _ in 0..10 {
+        bot.tick().await.unwrap();
+    }
+    assert!(bot.running.is_some());
+    assert!(bot.rollback.is_none());
+    let state = control.component("bot").await.unwrap();
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("signature")),
+        "expected signature rejection during staging to be recorded: {:?}",
+        state.last_error
+    );
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(running_release.digest.as_str()),
+        "signature rejection must leave the running installed release in place"
+    );
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_ignores_leftover_stage_file() {
+    let root = std::env::temp_dir().join(format!("sig-stage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let mut objects = HashMap::new();
+    let mut release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let release_json = serde_json::to_string(&release).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, state='running' WHERE component='bot'",
+            params![release_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let staging = root.join("staged-bot");
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    tokio::fs::write(staging.join(".stage-deadbeef"), b"short")
+        .await
+        .unwrap();
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
+    let stage_marker = staging.join(".stage-deadbeef");
+    bot.staging = staging;
+    bot.running = None;
+    for _ in 0..20 {
+        if bot.tick().await.unwrap() {
+            break;
+        }
+    }
+    assert!(bot.running.is_some());
+    assert!(!tokio::fs::try_exists(stage_marker).await.unwrap());
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn boot_repair_starts_baked_when_signature_missing_and_schema_fits() {
+    let root = std::env::temp_dir().join(format!("sig-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let mut objects = HashMap::new();
+    let release = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release;
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let installed_digest = release.digest.clone();
+    let release_json = serde_json::to_string(&release).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: "b".repeat(40),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "b".repeat(40),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=100, state='running' WHERE component='bot'",
+            params![release_json, observed_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
+    bot.running = None;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+    }
+    assert!(bot.running.is_some());
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    let mismatches = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatches["bot"].reason, UNSIGNED_IMAGE);
+    let state = control.component("bot").await.unwrap();
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "baked boot repair must not clear the installed selection"
+    );
+    server.abort();
+    drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn cosign_publisher_signature_verifies_during_staging() {
+    use jmodguard_updater::signing_fixture::image as signed_image;
+    let root = std::env::temp_dir().join(format!("cosign-stage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = tokio::fs::read(executable(&root, "baked-bot").await)
+        .await
+        .unwrap();
+    let mut objects = HashMap::new();
+    let release = signed_image(
+        &mut objects,
+        test_signing(),
+        "bot",
+        &baked,
+        "latest",
+        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
+        'c',
+    );
+    let (registry, server) = registry_with_objects(objects).await;
+    let staging = root.join("staged");
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    stage(&registry, &release, "jmodguard-bot", &staging)
+        .await
+        .expect("cosign publisher artifact must verify during staging");
+    server.abort();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn api_boot_restore_starts_compatible_baked_child_when_installed_staging_fails() {
+    let root = std::env::temp_dir().join(format!("api-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let mut objects = HashMap::new();
+    let release = image(
+        &mut objects,
+        "api",
+        &tokio::fs::read(baked.clone()).await.unwrap(),
+    );
+    let tag = signature_tag_for_digest(&release.digest).unwrap();
+    objects.remove(&tag);
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release;
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let installed_digest = release.digest.clone();
+    let release_json = serde_json::to_string(&release).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: release.source_sha.clone(),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: release.source_sha.clone(),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=100, state='running' WHERE component='api'",
+            params![release_json, observed_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut api = controller("api", baked.clone(), registry, control.clone(), &root);
+    api.running = None;
+    api.restore(&control.component("api").await.unwrap())
+        .await
+        .unwrap();
+    assert!(
+        api.running.is_some(),
+        "compatible API must start baked fallback even when installed staging fails"
+    );
+    assert_eq!(api.running.as_ref().unwrap().path, baked);
+    let state = control.component("api").await.unwrap();
+    assert_eq!(
+        state
+            .installed
+            .as_ref()
+            .map(|installed| installed.digest.as_str()),
+        Some(installed_digest.as_str())
+    );
+    server.abort();
+    drop((api, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_boot_mismatch_clear_retry_keeps_record_and_successful_clear_drops_it() {
+    let root = std::env::temp_dir().join(format!(
+        "boot-mismatch-pending-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    db::record_boot_mismatch(
+        &db,
+        db::BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: db::BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: UNSIGNED_IMAGE.into(),
+        },
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let read_only = DbOpenOptions {
+        read_only: true,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let mut api = controller(
+        "api",
+        root.join("baked-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        UpdateControl::open(&read_only).unwrap().unwrap(),
+        &root,
+    );
+    let release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    api.queue_pending_boot_record(release.clone(), UNSIGNED_IMAGE.into());
+    api.queue_pending_boot_clear_retry();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "clear retry must not replace a pending record"
+    );
+    let writable = DbOpenOptions {
+        read_only: false,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    api.control = UpdateControl::open(&writable).unwrap().unwrap();
+    api.clear_boot_mismatch_when_saved().await.unwrap();
+    assert!(
+        api.pending_boot_mismatch_labels().is_empty(),
+        "successful clear must drop any stale pending record"
+    );
+    api.queue_pending_boot_record(release.clone(), UNSIGNED_IMAGE.into());
+    api.clear_boot_mismatch_when_saved().await.unwrap();
+    api.receipt_attempt = 0;
+    api.receipt_not_before = None;
+    api.flush_pending_boot_mismatch().await.unwrap();
+    let db = Db::open(&path, 2).unwrap();
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    drop(db);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn blocked_boot_record_is_not_cleared_while_running_is_absent_or_not_baked() {
+    let root = std::env::temp_dir().join(format!(
+        "boot-mismatch-order-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    db::record_boot_mismatch(
+        &db,
+        db::BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: db::BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: UNSIGNED_IMAGE.into(),
+        },
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let writable = DbOpenOptions {
+        read_only: false,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let mut api = controller(
+        "api",
+        root.join("baked-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        UpdateControl::open(&writable).unwrap().unwrap(),
+        &root,
+    );
+    let release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    api.queue_pending_boot_clear_retry();
+    api.queue_pending_boot_record(release, UNSIGNED_IMAGE.into());
+    assert_eq!(api.pending_boot_mismatch_labels(), ["record", "clear"]);
+    api.flush_pending_boot_mismatch().await.unwrap();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "an absent child must not flush a clear ahead of a blocked record"
+    );
+    let other = root.join("not-baked");
+    tokio::fs::write(&other, b"#!/bin/sh\nexec sleep 30\n")
+        .await
+        .unwrap();
+    std::fs::set_permissions(&other, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    api.start(&other, &"b".repeat(40), None).await.unwrap();
+    api.flush_pending_boot_mismatch().await.unwrap();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "a non-baked child must not flush a clear ahead of a blocked record"
+    );
+    let db = Db::open(&path, 2).unwrap();
+    assert!(
+        !db::read_boot_mismatch_map(&db).await.unwrap().is_empty(),
+        "the durable mismatch row must stay until the record can be saved"
+    );
+    drop(db);
+    // API idle relaunches the baked binary. The stand-in only has to exist
+    // so stopping the non-baked child can release the process.
+    let baked = root.join("baked-api");
+    tokio::fs::write(&baked, b"#!/bin/sh\nexec sleep 30\n")
+        .await
+        .unwrap();
+    std::fs::set_permissions(&baked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    api.stop_application().await.unwrap();
+    api.end_idle().await.unwrap();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn transient_restore_does_not_boot_repair_or_record_mismatch() {
+    let root = std::env::temp_dir().join(format!("sig-transient-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let release_json = serde_json::to_string(&release).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, state='running' WHERE component='api'",
+            params![release_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control.clone(),
+        &root,
+    );
+    let error = api
+        .restore(&control.component("api").await.unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        registry_transient(&error),
+        "restore must surface the registry outage for retry: {error:#}"
+    );
+    assert!(api.running.is_none());
+    assert!(api.baked_fallback_installed.is_none());
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    drop((api, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn baked_fallback_keeps_installed_selection_through_failed_candidate_and_cold_start() {
+    let root = std::env::temp_dir().join(format!("fallback-keep-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let candidate_bin = executable(&root, "candidate-bot").await;
+    let mut objects = HashMap::new();
+    let mut installed = image(&mut objects, "bot", &tokio::fs::read(&baked).await.unwrap());
+    let mut candidate = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(&candidate_bin).await.unwrap(),
+    );
+    for release in [&mut installed, &mut candidate] {
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    }
+    let available = objects.clone();
+    objects.remove(&signature_tag_for_digest(&installed.digest).unwrap());
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let installed_digest = installed.digest.clone();
+    let release_json = serde_json::to_string(&installed).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: "b".repeat(40),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "b".repeat(40),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=?3, state='running' WHERE component='bot'",
+            params![release_json, observed_json, now()],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
+    bot.running = None;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+    }
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert_eq!(
+        bot.baked_fallback_installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str())
+    );
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+
+    let counterpart = db::ComponentObservation {
+        started_at: now(),
+        ..observed
+    };
+    control
+        .running("api", None, counterpart, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("hold-candidate-bot-ready"), "hold")
+        .await
+        .unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    let mut started_candidate = false;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+        if bot
+            .running
+            .as_ref()
+            .and_then(|child| child.release.as_ref())
+            .is_some_and(|release| release.digest == candidate.digest)
+        {
+            started_candidate = true;
+            break;
+        }
+    }
+    assert!(started_candidate, "candidate did not start");
+    assert_eq!(
+        bot.baked_fallback_installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "starting the candidate must keep the installed fallback identity"
+    );
+    assert!(
+        bot.standby
+            .as_ref()
+            .is_some_and(|(_, _, process_release)| process_release.is_none()),
+        "standby must keep the baked executable identity"
+    );
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    bot.tick().await.unwrap();
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest,
+        "rollback must not clear the installed selection"
+    );
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(
+        bot.running.as_ref().unwrap().release.is_none(),
+        "baked rollback must not claim the installed release is running"
+    );
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    let (registry, cold_server) = registry_with_objects(available).await;
+    let mut cold = controller("bot", baked.clone(), registry, control.clone(), &root);
+    cold.restore(&control.component("bot").await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        cold.running
+            .as_ref()
+            .and_then(|child| child.release.as_ref())
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "a later boot must restore the retained installed release"
+    );
+    assert_ne!(cold.running.as_ref().unwrap().path, baked);
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+    cold.stop_application().await.unwrap();
+    cold.end_idle().await.unwrap();
+    server.abort();
+    cold_server.abort();
+    drop((bot, cold, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

@@ -30,9 +30,10 @@ bot's active lease and exits with code 78
 (`DISCORD_TOKEN_REJECTED_EXIT_CODE`, shared by bot and launcher). The launcher
 holds that bot without immediate restart or rollback and logs once per hold entry:
 `discord token rejected; bot held, fix token and restart container`.
-This release requires launcher revision 7 or newer, which handles exit 78 before
-checking the selected child's readiness deadline. Older launchers must install the
-required launcher before starting either a pending selection or a restored install;
+This release requires launcher revision 19 or newer (`REQUIRED_LAUNCHER_REVISION`),
+which handles exit 78 before checking the selected child's readiness deadline.
+Older launchers must install the required launcher before starting either a pending
+selection or a restored install;
 in-process idling cannot protect an unready selected child from their timeout.
 The bot never writes the Discord-ready marker for a rejected token.
 Fix the token and restart the container to resume immediately. As a fallback,
@@ -107,6 +108,22 @@ artifact using the cosign simple-signing envelope. Signatures carry an
 that publication timestamp for signing, not updater compatibility labels. The matching
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
+
+The launcher verifies every digest before it downloads image layers or stages an
+executable. Unsigned, cryptographically invalid, expired, and untrusted-key
+signatures are refused with a permanent error. Registry outages and other
+transient fetch failures are retried and are not recorded as signature rejections.
+The same verification runs during boot repair when ephemeral staging files are
+missing. If the installed release cannot be re-downloaded or verified, the
+launcher starts the baked application only when the database core and observed
+guild schemas still fit that binary; otherwise moderation stays stopped until
+owner recovery. Boot repair ignores `JMODGUARD_UNATTENDED_UPDATES`. When the
+running digest again matches the installed release, the durable
+`update_boot_mismatch_v1` record for that component is cleared.
+
+After a manual in-app install, select that same published image as the Bunny
+container image so a pod replacement already contains the verified binary. The bot
+does not publish images.
 
 ## Schema upgrades and recovery
 
