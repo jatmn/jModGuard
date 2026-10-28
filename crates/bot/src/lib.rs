@@ -9,6 +9,7 @@ pub mod activation;
 pub mod activity_log;
 pub mod attachment_burst;
 pub mod automod;
+pub(crate) mod automod_delete_marks;
 pub mod cases;
 pub mod commands;
 pub mod control_server;

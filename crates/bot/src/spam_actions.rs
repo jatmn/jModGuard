@@ -251,7 +251,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
     }
     enforce(
         app,
-        ctx.http.as_ref(),
+        std::sync::Arc::clone(&ctx.http),
         ctx.cache.as_ref(),
         found,
         rule,
@@ -262,7 +262,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
 
 pub(crate) async fn enforce(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     found: Match,
     rule: &str,
@@ -322,7 +322,14 @@ pub(crate) async fn enforce(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
@@ -353,7 +360,7 @@ async fn image_match_still_current(
 #[allow(clippy::too_many_arguments)]
 async fn punish_proven_match(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     found: Match,
     rule: &str,
@@ -363,7 +370,8 @@ async fn punish_proven_match(
 ) -> ReportDisposition {
     let member = tokio::time::timeout(
         Duration::from_secs(10),
-        http.get_member(GuildId::new(found.guild), UserId::new(found.author)),
+        http.as_ref()
+            .get_member(GuildId::new(found.guild), UserId::new(found.author)),
     )
     .await
     .ok()
@@ -382,7 +390,14 @@ async fn punish_proven_match(
             ("reason".into(), found.reason),
             ("content".into(), "member lookup failed or timed out".into()),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     if !found
@@ -406,7 +421,14 @@ async fn punish_proven_match(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
@@ -454,7 +476,14 @@ async fn punish_proven_match(
                 "matched channel/user/role is whitelisted".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     let now = Instant::now();
@@ -501,11 +530,15 @@ async fn punish_proven_match(
         } else {
             None
         };
+        let prepared =
+            app.automod_delete_marks
+                .prepare_delete(found.guild, *channel, *message, rule, name);
+        let delete_attempt = prepared.attempt;
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
                 &app.activation,
-                http.delete_message(
+                http.as_ref().delete_message(
                     ChannelId::new(*channel),
                     MessageId::new(*message),
                     Some("spam match"),
@@ -523,9 +556,111 @@ async fn punish_proven_match(
             own_deletes.push(deleted);
         }
         let outcome = match result {
-            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
-            Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
-            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+                crate::logging::spawn_prepared_automod_delete(
+                    std::sync::Arc::clone(app),
+                    Arc::clone(&http),
+                    found.guild,
+                    *channel,
+                    *message,
+                    prepared,
+                    rule.to_owned(),
+                    name.to_owned(),
+                )
+                .await;
+                CaseOutcome::Succeeded
+            }
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                let removal = app.automod_delete_marks.remove_unconfirmed(
+                    found.guild,
+                    *channel,
+                    *message,
+                    delete_attempt,
+                );
+                if let Some(settlement) = removal.released_settlement.clone() {
+                    crate::logging::spawn_reconciled_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
+                        found.guild,
+                        *channel,
+                        *message,
+                        settlement.rule_id,
+                        settlement.rule_name,
+                        settlement.retained,
+                        settlement.fallback_to_bulk,
+                    );
+                }
+                if removal.action
+                    == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                {
+                    crate::logging::replay_unconfirmed_plain_delete(
+                        app,
+                        http.as_ref(),
+                        GuildId::new(found.guild),
+                        ChannelId::new(*channel),
+                        MessageId::new(*message),
+                        &removal,
+                    )
+                    .await;
+                }
+                delete_outcome(&error)
+            }
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+                if let Some(settlement) =
+                    app.automod_delete_marks.take_uncertain_gateway_settlement(
+                        found.guild,
+                        *channel,
+                        *message,
+                        delete_attempt,
+                    )
+                {
+                    crate::logging::spawn_reconciled_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
+                        found.guild,
+                        *channel,
+                        *message,
+                        settlement.rule_id,
+                        settlement.rule_name,
+                        settlement.retained,
+                        settlement.fallback_to_bulk,
+                    );
+                } else {
+                    let removal = app.automod_delete_marks.remove_unconfirmed(
+                        found.guild,
+                        *channel,
+                        *message,
+                        delete_attempt,
+                    );
+                    if let Some(settlement) = removal.released_settlement.clone() {
+                        crate::logging::spawn_reconciled_automod_delete(
+                            std::sync::Arc::clone(app),
+                            Arc::clone(&http),
+                            found.guild,
+                            *channel,
+                            *message,
+                            settlement.rule_id,
+                            settlement.rule_name,
+                            settlement.retained,
+                            settlement.fallback_to_bulk,
+                        );
+                    }
+                    if removal.action
+                        == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                    {
+                        crate::logging::replay_unconfirmed_plain_delete(
+                            app,
+                            http.as_ref(),
+                            GuildId::new(found.guild),
+                            ChannelId::new(*channel),
+                            MessageId::new(*message),
+                            &removal,
+                        )
+                        .await;
+                    }
+                }
+                CaseOutcome::Uncertain
+            }
         };
         app.spam_gate.finish_delete(
             found.guild,
@@ -564,7 +699,7 @@ async fn punish_proven_match(
     } else if !proof_stale && app.spam_gate.claim_ban(found.guild, found.author, now) {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
-            http,
+            http.as_ref(),
             found.guild,
             found.author,
             crate::member_directory::MarkerSave::Missing,
@@ -641,7 +776,7 @@ async fn punish_proven_match(
                                 pending_ban,
                                 attempted,
                                 GuildId::new(found.guild).ban_with_reason(
-                                    http,
+                                    http.as_ref(),
                                     UserId::new(found.author),
                                     0,
                                     &discord_reason,
@@ -693,7 +828,14 @@ async fn punish_proven_match(
         ("reason".into(), found.reason),
         ("content".into(), content),
     ]);
-    crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+    crate::logging::emit_to(
+        app,
+        http.as_ref(),
+        GuildId::new(found.guild),
+        "automod",
+        vars,
+    )
+    .await;
     ReportDisposition::Consumed
 }
 
@@ -1351,46 +1493,54 @@ pub(crate) mod tests {
         Some((method, path, body))
     }
 
-    pub(crate) fn serve_discord_stub(
+    pub(crate) fn serve_discord_stub<F>(
         listener: std::net::TcpListener,
         lines: Arc<Mutex<Vec<String>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
-        mut before_response: impl FnMut(&str, &str, &str) -> Option<&'static str>,
-    ) {
+        before_response: F,
+    ) where
+        F: FnMut(&str, &str, &str) -> Option<&'static str> + Send + 'static,
+    {
         use std::io::Write;
+        let before_response = Arc::new(Mutex::new(before_response));
         listener.set_nonblocking(true).unwrap();
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    let Some((method, path, request_body)) = read_http_request(&mut stream) else {
-                        continue;
-                    };
-                    lines.lock().push(format!("{method} {path}"));
-                    let status_override = before_response(&method, &path, &request_body);
-                    let body = if method == "GET" && path.contains("/members/") {
-                        MEMBER_JSON
-                    } else if method == "POST" && path.ends_with("/messages") {
-                        r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0001","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#
-                    } else {
-                        ""
-                    };
-                    let status = if let Some(status) = status_override {
-                        status
-                    } else if method == "GET" && path.contains("/bans/") {
-                        "404 Not Found"
-                    } else if body.is_empty() {
-                        "204 No Content"
-                    } else {
-                        "200 OK"
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    let lines = Arc::clone(&lines);
+                    let before_response = Arc::clone(&before_response);
+                    std::thread::spawn(move || {
+                        let Some((method, path, request_body)) = read_http_request(&mut stream)
+                        else {
+                            return;
+                        };
+                        lines.lock().push(format!("{method} {path}"));
+                        let status_override = before_response.lock()(&method, &path, &request_body);
+                        let body = if method == "GET" && path.contains("/members/") {
+                            MEMBER_JSON
+                        } else if method == "POST" && path.ends_with("/messages") {
+                            r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0001","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#
+                        } else {
+                            ""
+                        };
+                        let status = if let Some(status) = status_override {
+                            status
+                        } else if method == "GET" && path.contains("/bans/") {
+                            "404 Not Found"
+                        } else if body.is_empty() {
+                            "204 No Content"
+                        } else {
+                            "200 OK"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -1508,7 +1658,7 @@ pub(crate) mod tests {
         );
         let disposition = punish_proven_match(
             &app,
-            &http,
+            Arc::new(http),
             &cache,
             found,
             "repeat_text",
@@ -1542,6 +1692,16 @@ pub(crate) mod tests {
                 && output.contains(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING),
             "{output}"
         );
+        let report = crate::logging::observed_delete_report(
+            &app,
+            GuildId::new(10),
+            ChannelId::new(11),
+            MessageId::new(42),
+            None,
+        )
+        .expect("automod delete");
+        assert_eq!(report.event, "automod_delete");
+        assert_eq!(report.vars["rule"], "Repeated text");
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);
