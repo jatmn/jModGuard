@@ -2752,6 +2752,135 @@ pub(crate) async fn emit_plain_message_delete(
     emit_to(app, sink, report.guild_id, report.event, report.vars).await;
 }
 
+/// REST failed or was cancelled after a gateway delete was held back.
+/// A pending id already written into a delivered bulk transcript is not logged again.
+/// Otherwise the delete goes to `message_delete` when that channel exists, and to
+/// `message_bulk_delete` when that is the only configured fallback.
+pub(crate) async fn emit_replayed_plain_delete(
+    app: &std::sync::Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+    covered_by_bulk: bool,
+) {
+    if covered_by_bulk {
+        return;
+    }
+    let Ok(cfg) = app.configs.get(&app.db, guild_id.get()).await else {
+        return;
+    };
+    if channel_for(&cfg, "message_delete").is_some() {
+        drop(cfg);
+        emit_plain_message_delete(app, sink, guild_id, channel, id, retained).await;
+        return;
+    }
+    if channel_for(&cfg, "message_bulk_delete").is_none() {
+        return;
+    }
+    emit_failure_bulk(app, sink, &cfg, guild_id, channel, id, retained).await;
+}
+
+async fn emit_failure_bulk(
+    app: &std::sync::Arc<BotState>,
+    sink: &impl LogDelivery,
+    cfg: &crate::state::CachedGuildConfig,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+) {
+    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
+        record_delivery_failure(app);
+        return;
+    };
+    let Some(destination) = channel_for(cfg, "message_bulk_delete") else {
+        return;
+    };
+    let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+        guild: guild_id.get(),
+        channel: destination.get(),
+    };
+    if app
+        .remembered_discord_targets
+        .blocked(rest_target, Instant::now())
+    {
+        return;
+    }
+    let filter = cfg.log_filters.get("message_bulk_delete");
+    if filter.is_some_and(|filter| {
+        filter
+            .channels
+            .iter()
+            .any(|ignored| ignored == &channel.to_string())
+    }) {
+        return;
+    }
+    let author = retained.and_then(|row| row.fields.author_id);
+    let author_ignored = author.is_some_and(|author| {
+        filter.is_some_and(|filter| {
+            filter
+                .users
+                .iter()
+                .any(|ignored| ignored == &author.to_string())
+        })
+    });
+    let mut transcript = BulkTranscript::new(1);
+    let details = if author_ignored {
+        transcript.push_filtered();
+        "excluded by user filter".to_string()
+    } else if let Some(row) = retained {
+        transcript.push(id, Some(row));
+        let text = retained_content_with_limit(row, 500);
+        format!("last observed: {text}")
+    } else {
+        transcript.push_unknown(id);
+        "retained snapshot unavailable".to_string()
+    };
+    if !transcript.worth_sending() {
+        return;
+    }
+    let mut vars = BTreeMap::from([
+        ("channel".into(), format!("<#{channel}>")),
+        ("channel_id".into(), channel.to_string()),
+        ("count".into(), transcript.total.to_string()),
+        ("retained".into(), transcript.retained.to_string()),
+        ("unavailable".into(), transcript.unavailable.to_string()),
+        ("unknown".into(), transcript.unknown.to_string()),
+        ("filtered".into(), transcript.filtered.to_string()),
+        ("omitted".into(), transcript.omitted.to_string()),
+        ("details".into(), details),
+        ("time".into(), chrono::Utc::now().to_rfc3339()),
+    ]);
+    let template = cfg
+        .templates
+        .get("message_bulk_delete")
+        .map(String::as_str)
+        .unwrap_or_else(|| default_template("message_bulk_delete"));
+    templates::format_log_timestamps(&mut vars);
+    let rendered = templates::render_bounded(template, &vars, 2000);
+    if !app.activation.may_record() {
+        return;
+    }
+    let message = log_message(&rendered).add_file(CreateAttachment::bytes(
+        transcript.finish(),
+        "deleted-messages.txt",
+    ));
+    let recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
+    let delivered = matches!(
+        tokio::time::timeout(
+            Duration::from_secs(app.cfg.log.discord_timeout_secs),
+            crate::discord::race_discord_call(&app.activation, sink.send(destination, message)),
+        )
+        .await,
+        Ok(crate::discord::DiscordCall::Finished(Ok(())))
+    );
+    finish_bulk_channel_delivery(app, recovery, rest_target, delivered, None);
+}
+
 /// Gateway delete logging. Returns `None` when an automod delete is pending REST
 /// confirmation so callers do not emit a premature plain `message_delete`.
 pub(crate) fn observed_delete_report(
@@ -2761,14 +2890,58 @@ pub(crate) fn observed_delete_report(
     id: MessageId,
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
+    classify_observed_delete(app, guild_id, channel, id, retained, false)
+}
+
+/// Bulk-delete observation. A pending automod id is marked covered only when this
+/// bulk transcript will actually be delivered and no individual automod route will
+/// take the id back out.
+pub(crate) fn observed_bulk_delete_report(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+    automod_individual: bool,
+    bulk_configured: bool,
+) -> Option<MessageReport> {
+    classify_observed_delete(
+        app,
+        guild_id,
+        channel,
+        id,
+        retained,
+        bulk_configured && !automod_individual,
+    )
+}
+
+fn classify_observed_delete(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    retained: Option<&MessageSnapshot>,
+    include_pending_in_bulk: bool,
+) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
     let retained_for_mark = retained.cloned();
-    let mut report = match app.automod_delete_marks.observe_gateway_delete(
-        guild_id.get(),
-        channel.get(),
-        id.get(),
-        retained_for_mark,
-    ) {
+    let observation = if include_pending_in_bulk {
+        app.automod_delete_marks.observe_bulk_gateway_delete(
+            guild_id.get(),
+            channel.get(),
+            id.get(),
+            retained_for_mark,
+            true,
+        )
+    } else {
+        app.automod_delete_marks.observe_gateway_delete(
+            guild_id.get(),
+            channel.get(),
+            id.get(),
+            retained_for_mark,
+        )
+    };
+    let mut report = match observation {
         GatewayDeleteObservation::Automod { rule_id, rule_name } => {
             automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
         }

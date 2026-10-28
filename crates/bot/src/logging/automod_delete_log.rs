@@ -788,3 +788,305 @@ async fn saturated_report_slots_skip_reconciled_automod_spawn() {
     );
     drop(held);
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BulkOutcome {
+    Success,
+    Failure,
+    Cancel,
+    Uncertain,
+    Race,
+}
+
+#[tokio::test]
+async fn pending_bulk_automod_keeps_a_destination_for_every_route_and_outcome() {
+    let routes = [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ];
+    for (automod, message, bulk) in routes {
+        for outcome in [
+            BulkOutcome::Success,
+            BulkOutcome::Failure,
+            BulkOutcome::Cancel,
+            BulkOutcome::Uncertain,
+            BulkOutcome::Race,
+        ] {
+            account_pending_bulk(automod, message, bulk, outcome, false, false).await;
+        }
+    }
+    account_pending_bulk(true, false, true, BulkOutcome::Failure, true, false).await;
+    account_pending_bulk(true, false, true, BulkOutcome::Failure, false, true).await;
+}
+
+async fn account_pending_bulk(
+    automod: bool,
+    message: bool,
+    bulk: bool,
+    outcome: BulkOutcome,
+    filter_author: bool,
+    filter_channel: bool,
+) {
+    let f = Fixture::new();
+    if automod {
+        db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+            .await
+            .unwrap();
+    }
+    if message {
+        db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+            .await
+            .unwrap();
+    }
+    if bulk {
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+    }
+    if filter_author {
+        set_log_filter(
+            &f.app,
+            "message_bulk_delete",
+            Some(r#"{"users":["42"],"channels":[]}"#),
+        )
+        .await;
+    }
+    if filter_channel {
+        set_log_filter(
+            &f.app,
+            "message_bulk_delete",
+            Some(r#"{"users":[],"channels":["456"]}"#),
+        )
+        .await;
+    }
+    f.app.invalidate_configs();
+    let cfg = f.app.configs.get(&f.app.db, 789).await.unwrap();
+    let automod_individual = channel_for(&cfg, "automod_delete").is_some();
+    let bulk_configured = channel_for(&cfg, "message_bulk_delete").is_some();
+    let message_configured = channel_for(&cfg, "message_delete").is_some();
+    assert_eq!(automod_individual, automod || message, "{outcome:?}");
+    assert_eq!(bulk_configured, bulk);
+    assert_eq!(message_configured, message);
+
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut retained = sample_retained("bulk fallback body");
+    retained.continuous = false;
+    let mut transcript = BulkTranscript::new(2);
+    for id in [123_u64, 124] {
+        let row = (id == 123).then_some(&retained);
+        let report = observed_bulk_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(id),
+            row,
+            automod_individual,
+            bulk_configured,
+        );
+        if peel_automod_from_bulk(&report, automod_individual) {
+            transcript.peel_automod_delete();
+        } else if id == 123 {
+            transcript.push(MessageId::new(id), row);
+        } else {
+            transcript.push_unknown(MessageId::new(id));
+        }
+    }
+    let kept_pending = bulk_configured && transcript.total == 2;
+    let sink = Sink::default();
+    match outcome {
+        BulkOutcome::Success => {
+            let settlement = f
+                .app
+                .automod_delete_marks
+                .confirm(789, 456, 123, attempt)
+                .expect("gateway observation settles on success");
+            emit_reconciled_automod_delete(
+                &f.app,
+                &sink,
+                789,
+                456,
+                123,
+                &settlement.rule_id,
+                &settlement.rule_name,
+                settlement.retained.as_ref(),
+            )
+            .await;
+        }
+        BulkOutcome::Failure | BulkOutcome::Race => {
+            let removal = f
+                .app
+                .automod_delete_marks
+                .remove_unconfirmed(789, 456, 123, attempt);
+            assert_eq!(
+                removal.action,
+                crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete,
+                "{automod} {message} {bulk} {outcome:?}"
+            );
+            assert_eq!(removal.covered_by_bulk, kept_pending);
+            emit_replayed_plain_delete(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(123),
+                removal.retained.as_ref(),
+                removal.covered_by_bulk,
+            )
+            .await;
+        }
+        BulkOutcome::Uncertain | BulkOutcome::Cancel => {
+            if let Some(settlement) = f
+                .app
+                .automod_delete_marks
+                .take_uncertain_gateway_settlement(789, 456, 123, attempt)
+            {
+                emit_reconciled_automod_delete(
+                    &f.app,
+                    &sink,
+                    789,
+                    456,
+                    123,
+                    &settlement.rule_id,
+                    &settlement.rule_name,
+                    settlement.retained.as_ref(),
+                )
+                .await;
+            } else {
+                let removal = f
+                    .app
+                    .automod_delete_marks
+                    .remove_unconfirmed(789, 456, 123, attempt);
+                if removal.action
+                    == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                {
+                    emit_replayed_plain_delete(
+                        &f.app,
+                        &sink,
+                        GuildId::new(789),
+                        ChannelId::new(456),
+                        MessageId::new(123),
+                        removal.retained.as_ref(),
+                        removal.covered_by_bulk,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    if outcome == BulkOutcome::Race {
+        let before = sink.messages.lock().unwrap().len();
+        f.app.snapshots.mark_deleted(
+            GuildId::new(789),
+            ChannelId::new(456),
+            &[MessageId::new(123), MessageId::new(124)],
+        );
+        let mut later = vec![MessageId::new(123), MessageId::new(124)];
+        later.retain(|id| {
+            !f.app
+                .snapshots
+                .deletion_recorded(GuildId::new(789), ChannelId::new(456), *id)
+        });
+        assert!(
+            later.is_empty(),
+            "a later bulk must not log the same ids again"
+        );
+        assert_eq!(sink.messages.lock().unwrap().len(), before);
+    }
+
+    let messages = sink.messages.lock().unwrap();
+    let bodies: Vec<String> = messages
+        .iter()
+        .map(|(channel, body)| format!("{} {}", channel, body))
+        .collect();
+    let label = format!(
+        "{automod} {message} {bulk} {outcome:?} author={filter_author} channel={filter_channel} {bodies:?}"
+    );
+    let automod_logged = bodies.iter().any(|body| {
+        body.contains("901") && body.contains("Automod deleted") && body.contains("Bad words")
+    }) || bodies.iter().any(|body| {
+        !automod && message && body.contains("902") && body.contains("Automod deleted")
+    });
+    let plain_logged = bodies
+        .iter()
+        .any(|body| body.contains("902") && body.contains("Message deleted"));
+    let bulk_logged = bodies.iter().any(|body| body.contains("903"));
+    match outcome {
+        BulkOutcome::Success | BulkOutcome::Uncertain | BulkOutcome::Cancel => {
+            if automod || message {
+                assert!(automod_logged, "automod report missing: {label}");
+                assert!(
+                    !kept_pending,
+                    "successful automod also stayed in bulk: {label}"
+                );
+                assert!(
+                    !bulk_logged,
+                    "successful automod duplicated into bulk: {label}"
+                );
+            } else if bulk {
+                assert!(
+                    kept_pending,
+                    "bulk transcript dropped the pending id: {label}"
+                );
+                assert!(
+                    messages.is_empty(),
+                    "no individual route should send: {label}"
+                );
+            } else {
+                assert!(messages.is_empty(), "{label}");
+            }
+        }
+        BulkOutcome::Failure | BulkOutcome::Race => {
+            if filter_channel {
+                assert!(
+                    messages.is_empty(),
+                    "channel filter still delivered the fallback: {label}"
+                );
+                assert!(!kept_pending, "{label}");
+            } else if filter_author {
+                assert!(bulk_logged, "{label}");
+                assert!(
+                    bodies
+                        .iter()
+                        .all(|body| !body.contains("bulk fallback body")),
+                    "filtered bulk exposed retained text: {label}"
+                );
+                assert!(!kept_pending, "{label}");
+            } else if message {
+                assert!(plain_logged, "plain delete missing: {label}");
+                assert!(!kept_pending, "{label}");
+                assert!(!bulk_logged, "plain delete also emitted bulk: {label}");
+            } else if automod && bulk {
+                assert!(
+                    bulk_logged,
+                    "failed automod was not replayed to bulk: {label}"
+                );
+                assert!(
+                    bodies
+                        .iter()
+                        .any(|body| body.contains("last observed: bulk fallback body")),
+                    "{label}"
+                );
+                assert!(!kept_pending, "{label}");
+                assert!(!automod_logged, "{label}");
+            } else if bulk {
+                assert!(kept_pending, "bulk-only pending id was peeled: {label}");
+                assert!(
+                    messages.is_empty(),
+                    "bulk transcript would be duplicated: {label}"
+                );
+            } else {
+                assert!(messages.is_empty(), "{label}");
+            }
+        }
+    }
+    assert!(messages.len() <= 1, "duplicate report: {label}");
+}

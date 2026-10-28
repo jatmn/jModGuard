@@ -41,6 +41,8 @@ pub(crate) struct UnconfirmedRemoval {
     pub retained: Option<MessageSnapshot>,
     /// Automod settlement for a younger confirmed sibling deferred until this removal.
     pub released_settlement: Option<AutomodSettlement>,
+    /// The gateway bulk transcript already includes this pending delete.
+    pub covered_by_bulk: bool,
 }
 
 /// Per-REST-delete attempt identity for one message target.
@@ -65,6 +67,8 @@ struct MessageGatewayState {
     retained: Option<MessageSnapshot>,
     /// Gateway delete already produced or reserved a report class for this message.
     settled: bool,
+    /// Pending id stayed in a bulk transcript that will be delivered.
+    covered_by_bulk: bool,
 }
 
 #[derive(Default)]
@@ -467,6 +471,7 @@ impl AutomodDeleteMarks {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
                 released_settlement: None,
+                covered_by_bulk: false,
             };
         };
         if entry.confirmed {
@@ -474,6 +479,7 @@ impl AutomodDeleteMarks {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
                 released_settlement: None,
+                covered_by_bulk: false,
             };
         }
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
@@ -500,6 +506,7 @@ impl AutomodDeleteMarks {
             },
             retained,
             released_settlement,
+            covered_by_bulk: gateway.covered_by_bulk,
         }
     }
 
@@ -699,9 +706,32 @@ impl AutomodDeleteMarkAccess {
         message: u64,
         retained: Option<MessageSnapshot>,
     ) -> GatewayDeleteObservation {
-        self.inner
-            .lock()
-            .observe_gateway_delete(guild, channel, message, retained, Instant::now())
+        self.observe_bulk_gateway_delete(guild, channel, message, retained, false)
+    }
+
+    /// Like [`Self::observe_gateway_delete`]. When `include_pending_in_bulk` is set,
+    /// a still-pending observation is marked as already represented by the bulk
+    /// transcript so a later REST failure does not log it a second time.
+    pub(crate) fn observe_bulk_gateway_delete(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        retained: Option<MessageSnapshot>,
+        include_pending_in_bulk: bool,
+    ) -> GatewayDeleteObservation {
+        let mut marks = self.inner.lock();
+        let observation =
+            marks.observe_gateway_delete(guild, channel, message, retained, Instant::now());
+        if include_pending_in_bulk
+            && matches!(observation, GatewayDeleteObservation::PendingAutomod)
+            && let Some(state) = marks.gateway.get_mut(&(guild, channel, message))
+            && state.observed
+            && !state.settled
+        {
+            state.covered_by_bulk = true;
+        }
+        observation
     }
 
     pub(crate) fn confirm(

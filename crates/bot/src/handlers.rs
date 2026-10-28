@@ -1472,13 +1472,18 @@ impl EventHandler for Handler {
         }
         if !hooked {
             let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
-            let automod_individual = self
+            let cfg = self
                 .app
                 .configs
                 .get(&self.app.db, guild_id.get())
                 .await
-                .ok()
-                .is_some_and(|cfg| logging::channel_for(&cfg, "automod_delete").is_some());
+                .ok();
+            let automod_individual = cfg
+                .as_ref()
+                .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+            let bulk_configured = cfg
+                .as_ref()
+                .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
             let mut transcript = logging::BulkTranscript::new(ids.len());
             crate::snapshot_capture::peel_automod_bulk_chunk(
                 &self.app,
@@ -1488,6 +1493,7 @@ impl EventHandler for Handler {
                 &ids,
                 &mut transcript,
                 automod_individual,
+                bulk_configured,
             );
             if transcript.worth_sending() {
                 logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)

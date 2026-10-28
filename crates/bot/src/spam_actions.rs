@@ -597,13 +597,14 @@ async fn punish_proven_match(
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
-                    crate::logging::emit_plain_message_delete(
+                    crate::logging::emit_replayed_plain_delete(
                         app,
                         http.as_ref(),
                         GuildId::new(found.guild),
                         ChannelId::new(*channel),
                         MessageId::new(*message),
                         removal.retained.as_ref(),
+                        removal.covered_by_bulk,
                     )
                     .await;
                 }
@@ -650,13 +651,14 @@ async fn punish_proven_match(
                     if removal.action
                         == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                     {
-                        crate::logging::emit_plain_message_delete(
+                        crate::logging::emit_replayed_plain_delete(
                             app,
                             http.as_ref(),
                             GuildId::new(found.guild),
                             ChannelId::new(*channel),
                             MessageId::new(*message),
                             removal.retained.as_ref(),
+                            removal.covered_by_bulk,
                         )
                         .await;
                     }

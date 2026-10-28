@@ -519,13 +519,14 @@ async fn automod_try_delete_message(
             if removal.action
                 == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
             {
-                logging::emit_plain_message_delete(
+                logging::emit_replayed_plain_delete(
                     app,
                     http,
                     GuildId::new(guild_id),
                     ChannelId::new(channel),
                     MessageId::new(message),
                     removal.retained.as_ref(),
+                    removal.covered_by_bulk,
                 )
                 .await;
             }
@@ -588,13 +589,14 @@ async fn automod_try_delete_message(
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
-                    logging::emit_plain_message_delete(
+                    logging::emit_replayed_plain_delete(
                         app,
                         http,
                         GuildId::new(guild_id),
                         ChannelId::new(channel),
                         MessageId::new(message),
                         removal.retained.as_ref(),
+                        removal.covered_by_bulk,
                     )
                     .await;
                 }

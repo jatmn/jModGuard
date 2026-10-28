@@ -655,7 +655,16 @@ impl SnapshotIngress {
         deleted.exact.contains_key(&key) || deleted.bloom.contains(key)
     }
 
-    fn mark_deleted(&self, guild: GuildId, channel: ChannelId, ids: &[MessageId]) {
+    pub(crate) fn deletion_recorded(
+        &self,
+        guild: GuildId,
+        channel: ChannelId,
+        id: MessageId,
+    ) -> bool {
+        self.deleted((guild.get(), channel.get(), id.get()))
+    }
+
+    pub(crate) fn mark_deleted(&self, guild: GuildId, channel: ChannelId, ids: &[MessageId]) {
         let mut deleted = self.deleted.lock();
         for id in ids {
             let key = (guild.get(), channel.get(), id.get());
@@ -1446,19 +1455,15 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 bulk,
             } => {
                 if *bulk {
-                    ids.retain(|id| {
-                        !app.snapshots
-                            .deleted((guild.get(), channel.get(), id.get()))
-                    });
+                    ids.retain(|id| !app.snapshots.deletion_recorded(*guild, *channel, *id));
                     if ids.is_empty() {
                         continue;
                     }
                 }
                 if !*bulk
-                    && ids.first().is_some_and(|id| {
-                        app.snapshots
-                            .deleted((guild.get(), channel.get(), id.get()))
-                    })
+                    && ids
+                        .first()
+                        .is_some_and(|id| app.snapshots.deletion_recorded(*guild, *channel, *id))
                 {
                     continue;
                 }
@@ -1478,6 +1483,9 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 let automod_individual = config
                     .as_ref()
                     .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+                let bulk_configured = config
+                    .as_ref()
+                    .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
                 let mut single = None;
                 let mut single_unknown = false;
                 for chunk in ids.chunks(100) {
@@ -1495,12 +1503,14 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         Ok(rows) => {
                             for (id, row) in chunk.iter().zip(rows) {
                                 if *bulk {
-                                    let report = logging::observed_delete_report(
+                                    let report = logging::observed_bulk_delete_report(
                                         &app,
                                         *guild,
                                         *channel,
                                         *id,
                                         row.as_ref(),
+                                        automod_individual,
+                                        bulk_configured,
                                     );
                                     if logging::peel_automod_from_bulk(&report, automod_individual)
                                     {
@@ -1534,6 +1544,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                     chunk,
                                     &mut transcript,
                                     automod_individual,
+                                    bulk_configured,
                                 );
                             } else {
                                 single_unknown = true;
@@ -1640,6 +1651,7 @@ pub(crate) fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn peel_automod_bulk_chunk(
     app: &Arc<BotState>,
     context: &Context,
@@ -1648,9 +1660,18 @@ pub(crate) fn peel_automod_bulk_chunk(
     ids: &[MessageId],
     transcript: &mut logging::BulkTranscript,
     automod_individual: bool,
+    bulk_configured: bool,
 ) {
     for id in ids {
-        let report = logging::observed_delete_report(app, guild, channel, *id, None);
+        let report = logging::observed_bulk_delete_report(
+            app,
+            guild,
+            channel,
+            *id,
+            None,
+            automod_individual,
+            bulk_configured,
+        );
         if logging::peel_automod_from_bulk(&report, automod_individual) {
             transcript.peel_automod_delete();
             if let Some(report) = report {
@@ -1687,12 +1708,13 @@ async fn submit_peeled_bulk_deletes_admitted(
     channel: ChannelId,
     ids: Vec<MessageId>,
 ) {
-    let automod_individual = app
-        .configs
-        .get(&app.db, guild.get())
-        .await
-        .ok()
-        .is_some_and(|cfg| logging::channel_for(&cfg, "automod_delete").is_some());
+    let cfg = app.configs.get(&app.db, guild.get()).await.ok();
+    let automod_individual = cfg
+        .as_ref()
+        .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+    let bulk_configured = cfg
+        .as_ref()
+        .is_some_and(|cfg| logging::channel_for(cfg, "message_bulk_delete").is_some());
     let mut transcript = logging::BulkTranscript::new(ids.len());
     peel_automod_bulk_chunk(
         app,
@@ -1702,6 +1724,7 @@ async fn submit_peeled_bulk_deletes_admitted(
         &ids,
         &mut transcript,
         automod_individual,
+        bulk_configured,
     );
     if !transcript.worth_sending() {
         return;
@@ -2173,6 +2196,7 @@ mod tests {
             ChannelId::new(456),
             &[MessageId::new(10), MessageId::new(11)],
             &mut transcript,
+            true,
             true,
         );
         assert_eq!(transcript.unknown, 1);
