@@ -509,7 +509,7 @@ pub async fn pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64) ->
     }
 }
 
-pub async fn clear_pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64) {
+pub async fn clear_pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64, stay_id: &str) {
     let Some((store, scope)) = live_observation(
         app,
         guild_id,
@@ -521,7 +521,7 @@ pub async fn clear_pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u
         return;
     };
     if let Err(error) = store
-        .clear_pending_rejoin_note(scope.clone(), user_id as i64)
+        .clear_pending_rejoin_note(scope.clone(), user_id as i64, stay_id)
         .await
     {
         tracing::warn!(

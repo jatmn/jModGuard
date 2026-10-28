@@ -318,10 +318,10 @@ impl RejoinNoteDeliveries {
 
     pub fn retain_current_stay(&self, guild: u64, user: u64, stay_id: &str) {
         let mut state = self.inner.lock();
-        let keep = |key: &RejoinStayKey| key.0 == guild && key.1 == user && key.2 == stay_id;
-        state.delivered.retain(|key, _| keep(key));
-        state.undelivered.retain(|key, _| keep(key));
-        state.in_flight.retain(|key| keep(key));
+        let superseded = |key: &RejoinStayKey| key.0 == guild && key.1 == user && key.2 != stay_id;
+        state.delivered.retain(|key, _| !superseded(key));
+        state.undelivered.retain(|key, _| !superseded(key));
+        state.in_flight.retain(|key| !superseded(key));
     }
 
     pub fn begin_in_flight(
@@ -1222,14 +1222,25 @@ async fn emit_to_observed_with_audit(
             }
         }
         if event == "member_rejoin" {
-            if let Some(user) = rejoin_enrich_user {
-                if !crate::member_rejoin::enrich_member_rejoin_vars(app, guild_id, user, &mut vars)
+            let needs_enrich = !vars.contains_key("cases") && !vars.contains_key("notice");
+            if needs_enrich {
+                if let Some(user) = rejoin_enrich_user {
+                    match crate::member_rejoin::enrich_member_rejoin_vars(
+                        app, guild_id, user, &mut vars,
+                    )
                     .await
-                {
+                    {
+                        crate::member_rejoin::MemberRejoinEnrich::Ready => {}
+                        crate::member_rejoin::MemberRejoinEnrich::NoNote => {
+                            return Ok(Delivery::Unconfigured);
+                        }
+                        crate::member_rejoin::MemberRejoinEnrich::Retry => {
+                            return Ok(Delivery::Failed);
+                        }
+                    }
+                } else {
                     return Ok(Delivery::Unconfigured);
                 }
-            } else if !vars.contains_key("cases") && !vars.contains_key("notice") {
-                return Ok(Delivery::Unconfigured);
             }
             if cfg
                 .log_filters

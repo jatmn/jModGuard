@@ -737,6 +737,71 @@ async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
     );
 }
 
+#[tokio::test]
+async fn member_rejoin_emit_retries_without_clearing_durable_pending() {
+    const GUILD: i64 = 10;
+    const USER: i64 = 42;
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = ready_directory(&f.app, &enrollment).await;
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(1_000),
+                observed_at_ms: 1_000,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .depart_member(scope.clone(), USER, 2_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(3_000),
+                observed_at_ms: 3_000,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .has_pending_rejoin_note(scope.clone(), USER)
+            .await
+            .unwrap()
+    );
+    let mut vars = BTreeMap::new();
+    assert_eq!(
+        enrich_member_rejoin_vars(&f.app, GuildId::new(999_999), &user(USER as u64), &mut vars)
+            .await,
+        MemberRejoinEnrich::Retry
+    );
+    assert!(
+        store
+            .has_pending_rejoin_note(scope.clone(), USER)
+            .await
+            .unwrap()
+    );
+}
+
 #[test]
 fn superseded_stay_does_not_inherit_undelivered_retry() {
     let deliveries = crate::logging::RejoinNoteDeliveries::default();
@@ -855,7 +920,10 @@ async fn removed_last_case_after_backfill_uses_ban_history_notice() {
     );
     let user = user(SUBJECT);
     let mut vars = BTreeMap::new();
-    assert!(enrich_member_rejoin_vars(&f.app, GuildId::new(GUILD as u64), &user, &mut vars).await);
+    assert_eq!(
+        enrich_member_rejoin_vars(&f.app, GuildId::new(GUILD as u64), &user, &mut vars).await,
+        MemberRejoinEnrich::Ready
+    );
     assert!(vars["notice"].contains("no case details"));
     assert!(!vars["notice"].contains("not ready"));
     assert!(vars["cases"].is_empty());

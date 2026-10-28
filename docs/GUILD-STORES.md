@@ -81,7 +81,8 @@ action without creating a duplicate case. Version14 lets case-retention updates
 preserve in-flight member import pages. Version 15 is the local write fence checked before guild-store mutations, plus one `guild_writer_epoch` row. A leased guild commit reads that row in the same transaction and rolls back unless it equals the holder's generation. There are no core
 configuration/default/enrollment tables or general event archives. Version16 adds an
 optional immutable ban-attempt tag to case JSON, without table changes or rewriting
-legacy cases. Core bootstrap
+legacy cases. Version17 adds `guild_member_pending_rejoin_notes` for durable
+member-rejoin log receipts keyed to the current stay. Core bootstrap
 never applies this schema; the existing core version is 17.
 
 | Operation | Contract |

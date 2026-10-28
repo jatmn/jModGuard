@@ -4040,6 +4040,20 @@ fn rejoin_note_undelivered_retry_expires() {
 }
 
 #[test]
+fn retain_current_stay_preserves_other_members_delivery_state() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let guard = deliveries
+        .begin_in_flight(10, 77, "stay-a")
+        .expect("first member reserves delivery");
+    deliveries.retain_current_stay(10, 88, "stay-b");
+    assert!(
+        !deliveries.begin_attempt(10, 77, "stay-a"),
+        "another member's refresh must not release an in-flight stay"
+    );
+    drop(guard);
+}
+
+#[test]
 fn rejoin_note_leave_clears_member_state() {
     let deliveries = RejoinNoteDeliveries::default();
     deliveries.finish_attempt(9, 8, "stay-leave", false);

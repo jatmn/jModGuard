@@ -78,23 +78,31 @@ pub(crate) async fn collect_prior_cases(
     })
 }
 
+/// Whether rejoin enrichment produced a deliverable note, found nothing to say, or must retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberRejoinEnrich {
+    Ready,
+    NoNote,
+    Retry,
+}
+
 /// Loads case lines for a member rejoin report after log delivery admission.
 pub(crate) async fn enrich_member_rejoin_vars(
     app: &Arc<BotState>,
     guild_id: GuildId,
     user: &User,
     vars: &mut BTreeMap<String, String>,
-) -> bool {
+) -> MemberRejoinEnrich {
     let guild = i64::try_from(guild_id.get()).unwrap_or(0);
     let enrollment = match crate::db::guild_enrollment(&app.db, guild).await {
         Ok(Some(enrollment)) => enrollment,
-        Ok(None) => return false,
+        Ok(None) => return MemberRejoinEnrich::Retry,
         Err(error) => {
             tracing::warn!(
                 guild_id = guild_id.get(),
                 "member rejoin enrollment lookup failed: {error:#}"
             );
-            return false;
+            return MemberRejoinEnrich::Retry;
         }
     };
     let (store, scope) = match app.tenant.live(enrollment).await {
@@ -104,7 +112,7 @@ pub(crate) async fn enrich_member_rejoin_vars(
                 guild_id = guild_id.get(),
                 "member rejoin guild store unavailable: {error:#}"
             );
-            return false;
+            return MemberRejoinEnrich::Retry;
         }
     };
     let user_id = user.id.get() as i64;
@@ -117,26 +125,28 @@ pub(crate) async fn enrich_member_rejoin_vars(
                 user_id,
                 "member rejoin profile unavailable: {error:#}"
             );
-            None
+            return MemberRejoinEnrich::Retry;
         }
     };
-    let collected = collect_prior_cases(&store, scope, user_id).await;
-    let note = match collected {
-        Ok(cases) => build_rejoin_note(cases, ever_banned),
+    let collected = match collect_prior_cases(&store, scope, user_id).await {
+        Ok(cases) => cases,
         Err(error) => {
             tracing::warn!(
                 guild_id = guild_id.get(),
                 user_id,
                 "member rejoin case history unavailable: {error:#}"
             );
-            None
+            return MemberRejoinEnrich::Retry;
         }
     };
-    let Some(note) = note else {
-        return false;
-    };
-    vars.extend(rejoin_note_vars(&note));
-    true
+    let note = build_rejoin_note(collected, ever_banned);
+    match note {
+        None => MemberRejoinEnrich::NoNote,
+        Some(note) => {
+            vars.extend(rejoin_note_vars(&note));
+            MemberRejoinEnrich::Ready
+        }
+    }
 }
 
 pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
@@ -287,23 +297,35 @@ fn clip_units(text: &str, units: usize) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberRejoinEmitOutcome {
+    Sent,
+    NoNote,
+    Retry,
+}
+
 pub(crate) async fn maybe_emit_member_rejoin(
     app: &Arc<BotState>,
     ctx: &serenity::client::Context,
     guild_id: GuildId,
     user: &User,
-) -> logging::Delivery {
-    logging::emit_member_event(
-        app,
-        ctx,
-        guild_id,
-        "member_rejoin",
-        user,
-        BTreeMap::new(),
-        None,
-    )
-    .await
-    .0
+) -> MemberRejoinEmitOutcome {
+    let mut vars = BTreeMap::new();
+    match enrich_member_rejoin_vars(app, guild_id, user, &mut vars).await {
+        MemberRejoinEnrich::Retry => return MemberRejoinEmitOutcome::Retry,
+        MemberRejoinEnrich::NoNote => return MemberRejoinEmitOutcome::NoNote,
+        MemberRejoinEnrich::Ready => {}
+    }
+    match logging::emit_member_event(app, ctx, guild_id, "member_rejoin", user, vars, None)
+        .await
+        .0
+    {
+        logging::Delivery::Sent => MemberRejoinEmitOutcome::Sent,
+        logging::Delivery::Unconfigured
+        | logging::Delivery::Failed
+        | logging::Delivery::Dropped
+        | logging::Delivery::Blocked => MemberRejoinEmitOutcome::Retry,
+    }
 }
 
 #[cfg(test)]

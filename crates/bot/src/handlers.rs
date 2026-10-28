@@ -766,7 +766,7 @@ impl EventHandler for Handler {
                 app.rejoin_note_deliveries
                     .begin_in_flight(guild_id.get(), uid, stay_id)
         {
-            let delivery = crate::member_rejoin::maybe_emit_member_rejoin(
+            let outcome = crate::member_rejoin::maybe_emit_member_rejoin(
                 &app,
                 &ctx,
                 guild_id,
@@ -774,12 +774,19 @@ impl EventHandler for Handler {
             )
             .await;
             let settled = matches!(
-                delivery,
-                logging::Delivery::Sent | logging::Delivery::Unconfigured
+                outcome,
+                crate::member_rejoin::MemberRejoinEmitOutcome::Sent
+                    | crate::member_rejoin::MemberRejoinEmitOutcome::NoNote
             );
             in_flight.complete(settled);
             if settled {
-                crate::member_directory::clear_pending_rejoin_note(&app, guild_id.get(), uid).await;
+                crate::member_directory::clear_pending_rejoin_note(
+                    &app,
+                    guild_id.get(),
+                    uid,
+                    stay_id,
+                )
+                .await;
             }
         }
     }

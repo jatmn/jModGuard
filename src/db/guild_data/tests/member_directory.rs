@@ -678,6 +678,44 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
 }
 
 #[tokio::test]
+async fn closed_scope_erasure_removes_pending_rejoin_notes() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(scope.clone(), observed(12, Some(500), 1_000))
+        .await
+        .unwrap();
+    store.depart_member(scope.clone(), 12, 2_000).await.unwrap();
+    store
+        .observe_member(scope.clone(), observed(12, Some(2_500), 3_000))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .has_pending_rejoin_note(scope.clone(), 12)
+            .await
+            .unwrap()
+    );
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(store.erase_closed_scope(scope.clone()).await.unwrap());
+    let pending: i64 = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM guild_member_pending_rejoin_notes WHERE guild_id=10",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
 async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
     let (_f, store, scope) = ready().await;
     store
@@ -739,8 +777,13 @@ async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
             .unwrap(),
         "durable receipt must survive a stale gateway observation"
     );
+    let stay = store
+        .current_member_stay_id(scope.clone(), 10)
+        .await
+        .unwrap()
+        .expect("rejoin must capture a current stay");
     store
-        .clear_pending_rejoin_note(scope.clone(), 10)
+        .clear_pending_rejoin_note(scope.clone(), 10, &stay)
         .await
         .unwrap();
     assert!(

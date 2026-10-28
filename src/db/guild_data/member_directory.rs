@@ -1565,19 +1565,26 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         &self,
         scope: GuildDataScope,
         user_id: i64,
+        stay_id: &str,
     ) -> Result<()> {
         checked_scope(self, &scope)?;
-        anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
+        anyhow::ensure!(user_id > 0 && !stay_id.is_empty(), MemberSyncError::Invalid);
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
+        let stay_id = stay_id.to_owned();
         self.db
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_read()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 tx.ensure_mutation_receipt()?;
                 tx.member_execute(
-                    "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
-                    params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+                    "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND stay_id=?4",
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        user_id,
+                        stay_id.as_str()
+                    ],
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -1691,10 +1698,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             }
             tx.ensure_mutation_receipt()?;
             if let Some(stay)=stay { tx.member_execute("UPDATE guild_member_stays SET departed_at_ms=?4,ended_unknown=0 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,departed_at_ms])?; }
-            tx.member_execute(
-                "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
-                params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
-            )?;
+            clear_pending_rejoin_note_tx(&tx, &scope, user_id)?;
             tx.member_execute("UPDATE guild_member_directory SET is_current=0,departed_at_ms=?4,current_stay_id=NULL,cleanup_after_ms=?5,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,departed_at_ms,if retained {None} else {Some(departed_at_ms.saturating_add(300_000))}])?;
             bump_revision(&tx,&scope)?; tx.commit()?;
             Ok(MemberDepartureDecision::Applied(Some(MemberDeparture{user_id,joined_at_ms:joined,departed_at_ms,completed_stay_ms:joined.filter(|j|*j<=departed_at_ms).map(|j|departed_at_ms-j)})))
@@ -2792,6 +2796,7 @@ impl GuildDataStore {
                 let row=tx.query_row("SELECT is_current,joined_at_ms,current_stay_id,ever_banned FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id],|r|Ok((r.get::<bool>(0)?,r.get::<Option<i64>>(1)?,r.get::<Option<String>>(2)?,r.get::<bool>(3)?))).optional()?;
                 if let Some((current,joined,Some(stay),retained))=row && (current || retained) && Some(stay.as_str())==check.expected_stay_id.as_deref() && joined.is_none_or(|v|v<=departure_observed_at_ms) {
                     tx.member_execute("UPDATE guild_member_stays SET departed_at_ms=?4,ended_unknown=0 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,departure_observed_at_ms])?;
+                    clear_pending_rejoin_note_tx(&tx, &scope, check.user_id)?;
                     tx.member_execute("UPDATE guild_member_directory SET is_current=0,current_stay_id=NULL,departed_at_ms=?4,cleanup_after_ms=?5,cleanup_member_checked_at_ms=?6,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,departure_observed_at_ms,if retained{None}else{Some(departure_observed_at_ms.saturating_add(300_000))},now_ms])?;
                     bump_revision(&tx,&scope)?;
                     departure=Some(MemberDeparture{user_id:check.user_id,joined_at_ms:joined,departed_at_ms:departure_observed_at_ms,completed_stay_ms:joined.map(|v|departure_observed_at_ms-v)});
@@ -2873,7 +2878,7 @@ impl GuildDataStore {
             let target:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3)",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id],|r|Ok(r.get(0)?))?;
             anyhow::ensure!(!target,MemberSyncError::Stale);
             if banned {record_undated_ban_present(&tx,&scope,candidate.user_id,now_ms)?;tx.member_execute("UPDATE guild_member_directory SET is_banned=1,ever_banned=1,cleanup_after_ms=NULL,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;}
-            else {tx.member_execute("DELETE FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;tx.member_execute("DELETE FROM guild_member_state_observations WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;tx.member_execute("DELETE FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;}
+            else {clear_pending_rejoin_note_tx(&tx,&scope,candidate.user_id)?;tx.member_execute("DELETE FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;tx.member_execute("DELETE FROM guild_member_state_observations WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;tx.member_execute("DELETE FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;}
             bump_revision(&tx,&scope)?;tx.commit()
         }).await
     }
