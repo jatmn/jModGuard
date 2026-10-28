@@ -203,12 +203,19 @@ fn mention_header(tail: &str) -> Option<(MentionKind, usize)> {
 }
 
 /// `false` for zero, for a value that does not fit in a snowflake, and for a
-/// channel the caller cannot view. Parsing is fallible and never builds a zero id.
+/// channel the caller cannot view. A private thread also needs Manage Threads
+/// or known membership; uncached membership stays hidden. Parsing is fallible
+/// and never builds a zero id.
 fn mention_is_reportable(kind: MentionKind, digits: &str, viewer: Option<ChannelView<'_>>) -> bool {
     match kind {
         MentionKind::Channel => digits.parse::<ChannelId>().ok().is_some_and(|channel_id| {
             viewer.is_some_and(|view| {
                 super::member_can_view_channel(
+                    view.guild,
+                    view.actor_id,
+                    view.actor_roles,
+                    channel_id,
+                ) && super::private_thread_visible_to(
                     view.guild,
                     view.actor_id,
                     view.actor_roles,

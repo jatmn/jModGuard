@@ -1721,6 +1721,354 @@ async fn userinfo_prefix_and_slash_reject_invalid_mention_ids() {
     let _ = std::fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
+    use crate::state::CachedGuildConfig;
+    use serenity::model::channel::{
+        ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+    };
+    use serenity::model::permissions::Permissions;
+    const GUILD: u64 = 10;
+    const ACTOR: u64 = 7;
+    const TARGET: u64 = 91;
+    const ROLE: u64 = 50;
+    const VOICE: u64 = 700;
+    const PARENT: u64 = 800;
+    const PRIVATE: u64 = 802;
+    const PUBLIC_ARCHIVED: u64 = 803;
+    const PRIVATE_ARCHIVED: u64 = 804;
+    let reason = format!("see <#{PARENT}> <#{PRIVATE}> <#{PUBLIC_ARCHIVED}> <#{PRIVATE_ARCHIVED}>");
+
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_private_thread_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    app.activation.mark_lock_held(true);
+    let enrollment = crate::db::enroll_guild(&app.db, GUILD as i64, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    crate::cases::record(
+        &app,
+        Some(enrollment),
+        CaseAction::Warning,
+        CaseOutcome::Succeeded,
+        TARGET,
+        Some(ACTOR),
+        Some(reason),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    let cache = Arc::new(Cache::new());
+    let (http, captured, server) = capturing_proxy().await;
+    let http = Arc::new(http);
+    let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
+    let commands = jmodguard::defaults::default_commands()
+        .into_iter()
+        .map(|mut cmd| {
+            if matches!(cmd.behavior, jmodguard::types::Behavior::UserInfo) {
+                cmd.log_event.clear();
+            }
+            (cmd.name.clone(), cmd)
+        })
+        .collect();
+    let cfg = Arc::new(CachedGuildConfig {
+        version: 1,
+        durable_version: 1,
+        loaded_at: std::time::Instant::now(),
+        settings: crate::types::GuildSettings {
+            prefix: "!".into(),
+            ..Default::default()
+        },
+        rules: Default::default(),
+        commands,
+        templates: Default::default(),
+        log_channels: Default::default(),
+        known_bad_hashes: Default::default(),
+        log_filters: Default::default(),
+        regexes: Vec::new(),
+        custom_patterns: Default::default(),
+    });
+
+    let thread = |id: u64, kind: ChannelType, name: &str, archived: bool| {
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(id);
+        channel.guild_id = GuildId::new(GUILD);
+        channel.parent_id = Some(ChannelId::new(PARENT));
+        channel.kind = kind;
+        channel.name = name.into();
+        channel.thread_metadata = Some(
+            serde_json::from_value(serde_json::json!({
+                "archived": archived,
+                "auto_archive_duration": 60,
+                "locked": false
+            }))
+            .unwrap(),
+        );
+        channel.member = Some(
+            serde_json::from_value(serde_json::json!({
+                "join_timestamp": "2024-01-01T00:00:00.000000+00:00",
+                "flags": 0
+            }))
+            .unwrap(),
+        );
+        channel
+    };
+    let install = |manage_threads: bool, deny_manage_threads: bool| {
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild.name = "fixture".into();
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(GUILD);
+        everyone.guild_id = guild.id;
+        everyone.permissions = Permissions::empty();
+        guild.roles.insert(everyone.id, everyone);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(ROLE);
+        mod_role.guild_id = guild.id;
+        mod_role.name = "Mod".into();
+        mod_role.permissions = Permissions::MANAGE_MESSAGES | Permissions::VIEW_CHANNEL;
+        if manage_threads {
+            mod_role.permissions |= Permissions::MANAGE_THREADS;
+        }
+        guild.roles.insert(mod_role.id, mod_role);
+        let mut parent = GuildChannel::default();
+        parent.id = ChannelId::new(PARENT);
+        parent.guild_id = guild.id;
+        parent.kind = ChannelType::Text;
+        parent.name = "notes".into();
+        if deny_manage_threads {
+            parent.permission_overwrites = vec![PermissionOverwrite {
+                kind: PermissionOverwriteType::Role(RoleId::new(ROLE)),
+                allow: Permissions::empty(),
+                deny: Permissions::MANAGE_THREADS,
+            }];
+        }
+        guild.channels.insert(parent.id, parent);
+        let mut voice = GuildChannel::default();
+        voice.id = ChannelId::new(VOICE);
+        voice.guild_id = guild.id;
+        voice.kind = ChannelType::Voice;
+        voice.name = "Lobby".into();
+        guild.channels.insert(voice.id, voice);
+        guild.threads.push(thread(
+            PRIVATE,
+            ChannelType::PrivateThread,
+            "secret-thread",
+            false,
+        ));
+        guild.threads.push(thread(
+            PUBLIC_ARCHIVED,
+            ChannelType::PublicThread,
+            "open-archive",
+            true,
+        ));
+        guild.threads.push(thread(
+            PRIVATE_ARCHIVED,
+            ChannelType::PrivateThread,
+            "old-secret",
+            true,
+        ));
+        guild.members.insert(
+            UserId::new(TARGET),
+            target_member(GUILD, TARGET, Some("Nick")),
+        );
+        let mut caller = target_member(GUILD, ACTOR, None);
+        caller.user.name = "mod".into();
+        caller.roles = vec![RoleId::new(ROLE)];
+        guild.members.insert(caller.user.id, caller);
+        guild.voice_states.insert(
+            UserId::new(TARGET),
+            serde_json::from_value(serde_json::json!({
+                "channel_id": VOICE.to_string(),
+                "user_id": TARGET.to_string(),
+                "guild_id": GUILD.to_string(),
+                "session_id": "sess",
+                "deaf": false,
+                "mute": false,
+                "self_deaf": false,
+                "self_mute": false,
+                "self_video": false,
+                "suppress": false
+            }))
+            .unwrap(),
+        );
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+    };
+
+    let mut author = User::default();
+    author.id = UserId::new(ACTOR);
+    author.name = "mod".into();
+    let partial: serenity::model::guild::PartialMember =
+        serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [ROLE.to_string()],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": GUILD.to_string(),
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap();
+    let mut message = serenity::model::channel::Message::default();
+    message.id = serenity::model::id::MessageId::new(9);
+    message.content = format!("!userinfo {TARGET}");
+    message.guild_id = Some(GuildId::new(GUILD));
+    message.channel_id = ChannelId::new(2);
+    message.author = author.clone();
+    message.member = Some(Box::new(partial));
+    let mut slash_member = Member::default();
+    slash_member.user = author.clone();
+    slash_member.guild_id = GuildId::new(GUILD);
+    slash_member.roles = vec![RoleId::new(ROLE)];
+    let interaction: serenity::model::application::Interaction =
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "application_id": "1",
+            "type": 2,
+            "token": "token",
+            "version": 1,
+            "guild_id": GUILD.to_string(),
+            "channel_id": "2",
+            "locale": "en-US",
+            "app_permissions": "0",
+            "entitlements": [],
+            "authorizing_integration_owners": {},
+            "attachment_size_limit": 10000000,
+            "user": author,
+            "member": slash_member,
+            "data": {
+                "id": "3",
+                "name": "userinfo",
+                "type": 1,
+                "options": [{"name": "user", "type": 6, "value": TARGET.to_string()}]
+            }
+        }))
+        .unwrap();
+
+    let run = |label: &str| {
+        captured.lock().unwrap().clear();
+        let prefix_label = format!("{label} prefix");
+        let slash_label = format!("{label} slash");
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        let cache = Arc::clone(&cache);
+        let cfg = Arc::clone(&cfg);
+        let message = message.clone();
+        let ctx = ctx.clone();
+        let interaction = interaction.clone();
+        let captured = Arc::clone(&captured);
+        async move {
+            crate::commands::handle_prefix(&app, http.as_ref(), &cache, cfg, &message, Some(&ctx))
+                .await
+                .unwrap();
+            let prefix = report_content(&prefix_label, &captured);
+            crate::commands::handle_interaction(&app, &ctx, interaction).await;
+            let slash = report_content(&slash_label, &captured);
+            (prefix, slash)
+        }
+    };
+
+    install(false, false);
+    {
+        let guild = cache.guild(GuildId::new(GUILD)).unwrap();
+        let roles = [RoleId::new(ROLE)];
+        assert_eq!(
+            crate::commands::permission_level(0, &guild.roles, ACTOR, [ROLE]),
+            crate::commands::PermLevel::Mod
+        );
+        assert!(
+            guild
+                .threads
+                .iter()
+                .any(|thread| thread.id == ChannelId::new(PRIVATE)
+                    && thread.kind == ChannelType::PrivateThread
+                    && thread.member.is_some()),
+            "the private thread must be cached with the bot's membership"
+        );
+        assert!(crate::commands::member_can_view_channel(
+            &guild,
+            UserId::new(ACTOR),
+            &roles,
+            ChannelId::new(PRIVATE),
+        ));
+        assert!(!crate::commands::private_thread_visible_to(
+            &guild,
+            UserId::new(ACTOR),
+            &roles,
+            ChannelId::new(PRIVATE),
+        ));
+        assert!(crate::commands::private_thread_visible_to(
+            &guild,
+            UserId::new(ACTOR),
+            &roles,
+            ChannelId::new(PUBLIC_ARCHIVED),
+        ));
+    }
+    let (prefix, slash) = run("hidden").await;
+    for content in [&prefix, &slash] {
+        assert!(content.contains("800"), "{content}");
+        assert!(content.contains("803"), "{content}");
+        assert!(!content.contains("802"), "{content}");
+        assert!(!content.contains("804"), "{content}");
+        assert!(!content.contains("secret-thread"), "{content}");
+        assert!(!content.contains("old-secret"), "{content}");
+        assert!(content.contains("unavailable"), "{content}");
+        let voice = voice_line_from_content(content);
+        assert!(voice.contains("Lobby"), "{voice}");
+        assert!(voice.contains("700"), "{voice}");
+    }
+
+    install(true, false);
+    let (prefix, slash) = run("manage threads").await;
+    for content in [&prefix, &slash] {
+        assert!(content.contains("802"), "{content}");
+        assert!(content.contains("804"), "{content}");
+        assert!(content.contains("800"), "{content}");
+        assert!(content.contains("803"), "{content}");
+    }
+
+    install(true, true);
+    let (prefix, slash) = run("manage threads denied").await;
+    for content in [&prefix, &slash] {
+        assert!(content.contains("800"), "{content}");
+        assert!(content.contains("803"), "{content}");
+        assert!(!content.contains("802"), "{content}");
+        assert!(!content.contains("804"), "{content}");
+        assert!(!content.contains("secret-thread"), "{content}");
+        assert!(!content.contains("old-secret"), "{content}");
+    }
+
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+fn voice_line_from_content(content: &str) -> String {
+    content
+        .lines()
+        .find(|line| line.contains("**Voice:**"))
+        .unwrap_or_else(|| panic!("no voice line in {content}"))
+        .to_string()
+}
+
 fn report_content(label: &str, captured: &Arc<std::sync::Mutex<Vec<String>>>) -> String {
     let requests = captured.lock().unwrap().clone();
     captured.lock().unwrap().clear();

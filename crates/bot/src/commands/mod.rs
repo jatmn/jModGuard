@@ -301,6 +301,46 @@ pub(crate) fn member_can_view_channel(
     role_ids: &[RoleId],
     channel_id: ChannelId,
 ) -> bool {
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::VIEW_CHANNEL,
+    )
+}
+
+/// Parent `VIEW_CHANNEL` does not grant access to a private thread. Effective
+/// `MANAGE_THREADS` does. The gateway cache does not store other users' thread
+/// membership, so an uncached membership does not grant access.
+pub(crate) fn private_thread_visible_to(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    let Some(channel) = cached_channel(guild, channel_id) else {
+        return true;
+    };
+    if channel.kind != serenity::model::channel::ChannelType::PrivateThread {
+        return true;
+    }
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::MANAGE_THREADS,
+    ) || cached_caller_is_thread_member(channel, user_id)
+}
+
+fn member_has_channel_permission(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+    permission: Permissions,
+) -> bool {
     let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
         return false;
     };
@@ -314,7 +354,16 @@ pub(crate) fn member_can_view_channel(
     };
     guild
         .partial_member_permissions_in(channel, user_id, &partial)
-        .contains(Permissions::VIEW_CHANNEL)
+        .contains(permission)
+}
+
+/// `GuildChannel.member` is the current gateway user and has no user id.
+/// It must not be treated as this caller's membership.
+fn cached_caller_is_thread_member(
+    _thread: &serenity::model::channel::GuildChannel,
+    _actor: UserId,
+) -> bool {
+    false
 }
 
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
@@ -349,6 +398,16 @@ fn is_thread(kind: serenity::model::channel::ChannelType) -> bool {
             | serenity::model::channel::ChannelType::PrivateThread
             | serenity::model::channel::ChannelType::NewsThread
     )
+}
+
+fn cached_channel(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+) -> Option<&serenity::model::channel::GuildChannel> {
+    guild
+        .channels
+        .get(&channel_id)
+        .or_else(|| guild.threads.iter().find(|thread| thread.id == channel_id))
 }
 
 fn channel_for_member_permissions(
