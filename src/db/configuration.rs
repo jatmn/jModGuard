@@ -319,6 +319,9 @@ pub async fn get_command_row(db: &Db, guild_id: i64, name: &str) -> Result<Optio
 }
 
 pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef) -> Result<()> {
+    if crate::defaults::rejects_binary_overlay_command_persist(name, cmd) {
+        anyhow::bail!(crate::defaults::command_persist_rejected_message(name));
+    }
     upsert_row(
         db,
         "commands",
@@ -1315,6 +1318,7 @@ impl ConfigurationSnapshotRows {
         for (name, def) in self.guild_commands {
             commands.insert(name, def);
         }
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         let mut templates = std::collections::HashMap::new();
         for (event, def) in crate::defaults::default_templates() {
             let resolved = resolve(
@@ -1465,6 +1469,7 @@ pub async fn load_slash_commands_with_version(
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })
@@ -1483,6 +1488,7 @@ pub async fn load_slash_commands_with_version_primary(
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
+        crate::defaults::apply_shipped_builtin_commands(&mut commands);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })
@@ -1610,6 +1616,9 @@ pub async fn upsert_enrolled_command(
     name: &str,
     command: &CommandDef,
 ) -> Result<()> {
+    if crate::defaults::rejects_binary_overlay_command_persist(name, command) {
+        anyhow::bail!(crate::defaults::command_persist_rejected_message(name));
+    }
     upsert_row(
         db,
         "commands",

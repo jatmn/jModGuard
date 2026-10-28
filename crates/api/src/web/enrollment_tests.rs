@@ -1233,8 +1233,7 @@ async fn configuration_crud_routes_use_scoped_writes_for_current_guild_and_globa
     let f = Fixture::new(true).await;
     f.enroll(10).await;
     let rule = crate::defaults::default_rules().remove(0);
-    let mut command = crate::defaults::default_commands().remove(0);
-    command.name = "fixture".into();
+    let command = crate::defaults::custom_command_fixture("fixture");
     for (guild, scope) in [(10, "guild"), (10, "global"), (0, "global")] {
         let base = format!("/api/guilds/{guild}");
         let rule_path = format!("{base}/rules/{}", crate::types::RULE_IDS[0]);
@@ -1335,7 +1334,7 @@ async fn configuration_edits_reject_missing_and_replaced_page_memberships() {
     let old = loaded["enrollment_id"].as_str().unwrap();
     db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
     let rule = crate::defaults::default_rules().remove(0);
-    let command = crate::defaults::default_commands().remove(0);
+    let command = crate::defaults::custom_command_fixture("fixture");
     let version = db::get_config_version(&f.app.db).await.unwrap();
     for scope in ["guild", "global"] {
         let scope_body = serde_json::json!({"scope":scope}).to_string();
@@ -2590,6 +2589,158 @@ async fn individual_configuration_reads_keep_global_context_owner_only() {
 }
 
 #[tokio::test]
+async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
+    use jmodguard::db::SqlExecutor;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let shipped_commands = crate::defaults::default_commands();
+    let shipped = shipped_commands
+        .iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban")
+        .clone();
+    let shipped_voice = shipped_commands
+        .iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice")
+        .clone();
+    let mut stored = shipped.clone();
+    stored.enabled = false;
+    stored.permission = "owner".into();
+    stored.roles = vec![555];
+    stored.channels = vec![777];
+    stored.description = "legacy dashboard row".into();
+    stored.aliases = vec!["legacy-alias".into()];
+    let mut stored_voice = shipped_voice.clone();
+    stored_voice.enabled = false;
+    stored_voice.description = "legacy voice row".into();
+    stored_voice.behavior = crate::types::Behavior::Say;
+    let stored_json = serde_json::to_string(&stored).unwrap();
+    let voice_json = serde_json::to_string(&stored_voice).unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (10,'ban',?1)",
+                jmodguard::db::params![stored_json],
+                64 * 1024 * 1024,
+            )?;
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (10,'voice',?1)",
+                jmodguard::db::params![voice_json],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["effective"]["description"], shipped.description);
+    assert_eq!(
+        body["effective"]["aliases"],
+        serde_json::json!(shipped.aliases)
+    );
+    assert_eq!(body["effective"]["enabled"], shipped.enabled);
+    assert_eq!(body["effective"]["permission"], shipped.permission.as_str());
+    assert_eq!(body["effective"]["roles"], serde_json::json!([]));
+    assert_eq!(body["effective"]["channels"], serde_json::json!([]));
+    assert_eq!(
+        body["effective"]["cooldown_secs"],
+        serde_json::json!(shipped.cooldown_secs)
+    );
+    assert_eq!(
+        body["guild_override"]["description"],
+        "legacy dashboard row"
+    );
+    for method in ["GET", "POST"] {
+        let (status, bundle) = f.request(method, "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::OK, "{method} {bundle}");
+        let commands = bundle["commands"].as_array().expect("commands");
+        let ban = commands
+            .iter()
+            .find(|row| row["name"] == "ban")
+            .expect("bundle ban");
+        assert_eq!(ban["effective"]["description"], shipped.description);
+        assert_eq!(
+            ban["effective"]["aliases"],
+            serde_json::json!(shipped.aliases)
+        );
+        assert_eq!(ban["effective"]["enabled"], shipped.enabled);
+        assert_eq!(ban["effective"]["permission"], shipped.permission.as_str());
+        assert_eq!(ban["effective"]["roles"], serde_json::json!([]));
+        assert_eq!(ban["effective"]["channels"], serde_json::json!([]));
+        assert_eq!(
+            ban["effective"]["cooldown_secs"],
+            serde_json::json!(shipped.cooldown_secs)
+        );
+        assert_eq!(ban["guild_override"]["description"], "legacy dashboard row");
+        let voice = commands
+            .iter()
+            .find(|row| row["name"] == "voice")
+            .expect("bundle voice");
+        assert_eq!(voice["effective"]["description"], shipped_voice.description);
+        assert_eq!(voice["effective"]["behavior"]["kind"], "voice");
+        assert_eq!(voice["effective"]["enabled"], shipped_voice.enabled);
+        assert_eq!(
+            voice["effective"]["permission"],
+            shipped_voice.permission.as_str()
+        );
+        assert_eq!(
+            voice["effective"]["cooldown_secs"],
+            serde_json::json!(shipped_voice.cooldown_secs)
+        );
+        assert_eq!(voice["guild_override"]["description"], "legacy voice row");
+    }
+    let (status, listed) = f.request("GET", "/api/guilds/10/commands", "").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed_ban = listed["commands"]
+        .as_array()
+        .expect("list commands")
+        .iter()
+        .find(|row| row["name"] == "ban")
+        .expect("listed ban");
+    assert_eq!(listed_ban["effective"]["description"], shipped.description);
+    assert_eq!(listed_ban["effective"]["enabled"], shipped.enabled);
+    assert_eq!(
+        listed_ban["effective"]["permission"],
+        shipped.permission.as_str()
+    );
+    assert_eq!(listed_ban["effective"]["roles"], serde_json::json!([]));
+    assert_eq!(listed_ban["effective"]["channels"], serde_json::json!([]));
+    assert_eq!(
+        listed_ban["effective"]["cooldown_secs"],
+        serde_json::json!(shipped.cooldown_secs)
+    );
+    let (status, voice_body) = f.request("GET", "/api/guilds/10/commands/voice", "").await;
+    assert_eq!(status, StatusCode::OK, "{voice_body}");
+    assert_eq!(
+        voice_body["effective"]["description"],
+        shipped_voice.description
+    );
+    assert_eq!(voice_body["effective"]["behavior"]["kind"], "voice");
+    assert_eq!(voice_body["effective"]["enabled"], shipped_voice.enabled);
+    assert_eq!(
+        voice_body["effective"]["permission"],
+        shipped_voice.permission.as_str()
+    );
+    assert_eq!(
+        voice_body["effective"]["cooldown_secs"],
+        serde_json::json!(shipped_voice.cooldown_secs)
+    );
+    assert_eq!(
+        listed["guild"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[0] == "ban")
+            .expect("raw ban row")[1]["description"],
+        "legacy dashboard row"
+    );
+}
+
+#[tokio::test]
 async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wire_shapes() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
@@ -2597,8 +2748,7 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
         db::upsert_template(&f.app.db, guild, "fixture", label)
             .await
             .unwrap();
-        let mut command = crate::defaults::default_commands()[0].clone();
-        command.name = "fixture".into();
+        let mut command = crate::defaults::custom_command_fixture("fixture");
         command.description = label.into();
         db::upsert_command(&f.app.db, guild, "fixture", &command)
             .await

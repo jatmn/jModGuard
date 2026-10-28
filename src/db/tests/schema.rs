@@ -305,3 +305,144 @@ fn one_active_ban_migration_collapses_existing_duplicates() {
     drop(conn);
     cleanup_db(&path);
 }
+
+#[test]
+fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
+    let path = tmp_db_path("builtin_command_access_migration");
+    let mut conn = Connection::open(&path).unwrap();
+    let prior = 20; // 0021 deletes built-in and reserved-alias command rows.
+    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
+        let tx = conn.transaction_primary_read().unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .unwrap();
+    let voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .unwrap();
+    let mut legacy_ban = ban.clone();
+    legacy_ban.enabled = false;
+    legacy_ban.permission = "owner".into();
+    legacy_ban.roles = vec![555];
+    legacy_ban.channels = vec![777];
+    legacy_ban.cooldown_secs = 42;
+    legacy_ban.description = "legacy ban".into();
+    let mut legacy_voice = voice;
+    legacy_voice.enabled = false;
+    legacy_voice.permission = "owner".into();
+    legacy_voice.cooldown_secs = 9;
+    legacy_voice.description = "legacy voice".into();
+    legacy_voice.behavior = crate::types::Behavior::Say;
+    let mut alias_row = ban;
+    alias_row.name = "yeet".into();
+    alias_row.enabled = false;
+    alias_row.permission = "owner".into();
+    let mut custom = crate::defaults::custom_command_fixture("greet");
+    custom.aliases = vec!["status".into(), "mine".into()];
+    let inserts = [
+        (0_i64, "ban", serde_json::to_string(&legacy_ban).unwrap()),
+        (10_i64, "Ban", serde_json::to_string(&legacy_ban).unwrap()),
+        (
+            10_i64,
+            "voice",
+            serde_json::to_string(&legacy_voice).unwrap(),
+        ),
+        (10_i64, "yeet", serde_json::to_string(&alias_row).unwrap()),
+        (10_i64, "greet", serde_json::to_string(&custom).unwrap()),
+    ];
+    for (guild_id, name, data) in inserts {
+        conn.execute_bounded(
+            "INSERT INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
+            params![guild_id, name, data],
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+    }
+    migrate_conn(&mut conn).unwrap();
+    let count = |conn: &Connection, sql: &str| -> i64 {
+        conn.query_row(sql, (), |row| Ok(row.get(0)?)).unwrap()
+    };
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet')"
+        ),
+        0,
+        "built-in and reserved-alias rows are removed"
+    );
+    let greet: String = conn
+        .query_row(
+            "SELECT data FROM commands WHERE guild_id=10 AND name='greet'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+        .unwrap();
+    assert!(greet.contains("status"), "{greet}");
+    assert!(greet.contains("mine"), "{greet}");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))
+        .unwrap();
+    assert_eq!(version, MIGRATIONS.len() as i64);
+    let changes_before: i64 = count(&conn, "SELECT total_changes()");
+    conn.execute_batch_bounded(MIGRATIONS[prior], 64 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        count(&conn, "SELECT total_changes()"),
+        changes_before,
+        "replaying the migration SQL changes nothing"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM commands WHERE name='greet'"),
+        1
+    );
+    migrate_conn(&mut conn).unwrap();
+    let version_after: i64 = conn
+        .query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))
+        .unwrap();
+    assert_eq!(version_after, version);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM commands WHERE name='greet'"),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet')"
+        ),
+        0
+    );
+    drop(conn);
+    for _ in 0..2 {
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn_sync(|conn| {
+            let global_ban: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM commands WHERE guild_id=0 AND name='ban'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            assert_eq!(global_ban, 1, "seed restores the shipped global ban row");
+            let guild_legacy: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM commands WHERE guild_id=10 AND lower(name) IN ('ban','voice','yeet')",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            assert_eq!(guild_legacy, 0);
+            let greet: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM commands WHERE name='greet'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            assert_eq!(greet, 1);
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+    }
+    cleanup_db(&path);
+}
