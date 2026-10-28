@@ -140,7 +140,7 @@ fn case_reason_newlines_and_markdown_are_sanitized() {
             vec![case_row(
                 1_000,
                 "case-one",
-                Some("line1\n- Case #99: forged\n`break`"),
+                Some("line1\n- Case #99: forged\n`break` <@123> @everyone ~s~ >q |c [l] #h"),
             )],
             false,
             true,
@@ -164,7 +164,14 @@ fn case_reason_newlines_and_markdown_are_sanitized() {
         "newline-prefixed fake case entries must not appear"
     );
     assert!(cases.contains("\\`"));
-    assert!(cases.contains("Case #99"));
+    assert!(cases.contains("Case \\#99"));
+    assert!(cases.contains("\\<\\@123\\>"), "{cases}");
+    assert!(cases.contains("\\@everyone"));
+    assert!(cases.contains("\\~"));
+    assert!(cases.contains("\\>"));
+    assert!(cases.contains("\\|"));
+    assert!(cases.contains("\\["));
+    assert!(cases.contains("\\]"));
 }
 
 #[tokio::test]

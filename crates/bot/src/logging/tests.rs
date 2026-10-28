@@ -4092,13 +4092,78 @@ fn rejoin_failed_delivery_burst_respects_cap_and_queue() {
         "repeated retries must not grow settled entries past the cap"
     );
     assert!(
-        deliveries.test_undelivered_queue_len()
-            <= REJOIN_NOTE_DELIVERY_LIMIT + REJOIN_NOTE_PRUNE_BATCH,
-        "stale retry tokens must not grow the undelivered queue without bound"
+        deliveries.test_undelivered_queue_len() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "undelivered ordering index must stay within the same cap as live entries"
+    );
+    assert!(
+        deliveries.test_delivered_queue_len() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "delivered ordering index must stay within the same cap as live entries"
     );
     assert!(
         deliveries.pending_redelivery(1, 99_999, "stay-hot"),
         "the newest failed stay must remain retryable in memory"
+    );
+}
+
+#[test]
+fn rejoin_departure_churn_drops_ordering_tokens() {
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(1, 1, "anchor", false);
+    let churn = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..churn {
+        let stay = format!("stay-{index}");
+        let user = 10_000 + index as u64;
+        deliveries.finish_attempt(2, user, &stay, false);
+        deliveries.clear_member(2, user);
+    }
+    assert_eq!(
+        deliveries.test_settled_entry_count(),
+        1,
+        "only the anchor stay should remain"
+    );
+    assert!(
+        deliveries.test_undelivered_queue_len() <= 1,
+        "departures must remove ordering tokens, not leave them behind a live front"
+    );
+    assert!(deliveries.pending_redelivery(1, 1, "anchor"));
+    assert_eq!(deliveries.test_delivered_queue_len(), 0);
+    for index in 0..churn {
+        let stay = format!("sent-{index}");
+        let user = 30_000 + index as u64;
+        deliveries.finish_attempt(3, user, &stay, true);
+        deliveries.clear_member(3, user);
+    }
+    assert_eq!(
+        deliveries.test_delivered_queue_len(),
+        0,
+        "departures must remove delivered ordering tokens too"
+    );
+    assert_eq!(deliveries.test_undelivered_queue_len(), 1);
+}
+
+#[test]
+fn rejoin_stay_replacement_bounds_both_order_indexes() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let churn = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..churn {
+        let failed = format!("failed-{index}");
+        deliveries.finish_attempt(7, 7, &failed, false);
+        deliveries.retain_current_stay(7, 7, "current-failed");
+        let sent = format!("sent-{index}");
+        deliveries.finish_attempt(8, 8, &sent, true);
+        deliveries.retain_current_stay(8, 8, "current-sent");
+    }
+    deliveries.finish_attempt(7, 7, "current-failed", false);
+    deliveries.finish_attempt(8, 8, "current-sent", true);
+    deliveries.retain_current_stay(7, 7, "current-failed");
+    deliveries.retain_current_stay(8, 8, "current-sent");
+    assert_eq!(deliveries.test_settled_entry_count(), 2);
+    assert_eq!(deliveries.test_undelivered_queue_len(), 1);
+    assert_eq!(deliveries.test_delivered_queue_len(), 1);
+    assert!(deliveries.pending_redelivery(7, 7, "current-failed"));
+    assert!(
+        !deliveries.begin_attempt(8, 8, "current-sent"),
+        "the retained successful stay must still be deduped"
     );
 }
 

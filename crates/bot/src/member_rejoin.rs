@@ -230,11 +230,17 @@ fn sanitize_reason_for_report(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    single_line
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('*', "\\*")
-        .replace('_', "\\_")
+    let mut escaped = String::with_capacity(single_line.len());
+    for ch in single_line.chars() {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '~' | '>' | '|' | '[' | ']' | '#' | '<' | '@'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn format_case_time(ms: Option<i64>) -> String {
