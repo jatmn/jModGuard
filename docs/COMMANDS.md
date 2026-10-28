@@ -22,7 +22,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
 | `!slowmode <seconds>` | Moderation | mod | Set slowmode on this channel |
 | `!banlist [limit]` | Moderation | mod | Recent bans tracked by the bot (`!bans`) |
-| `!voice <user>` | Moderation | mod | Report a user's cached voice channel (`not cached` when the guild is absent from cache; hidden or uncached channels are reported without naming them) |
+| `!voice <user>` | Moderation | mod | Report a user's cached voice channel (`not cached` when the guild is absent from cache, for an id, mention, name, or nickname; hidden or uncached channels are reported without naming them) |
 | `!setname <name>` | Admin | admin | Queue the bot's nickname for application in this server |
 | `!prefix <prefix>` | Admin | admin | Change this server's command prefix |
 | `!template <list\|get\|set\|reset> [event] [text]` | Admin | admin | Edit log event templates |

@@ -629,4 +629,129 @@ mod tests {
         drop(app);
         let _ = std::fs::remove_file(path);
     }
+
+    #[tokio::test]
+    async fn empty_cache_voice_name_uses_not_cached_reply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("fixture")
+                .proxy(format!("http://{address}"))
+                .application_id(serenity::model::id::ApplicationId::new(1))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let ctx = fixture_context(http, Arc::clone(&cache)).await;
+
+        let path = std::env::temp_dir().join(format!(
+            "voice_lookup_name_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = crate::state::BotState::new(Default::default(), db).unwrap();
+        app.activation.mark_lock_held(true);
+
+        let cmd = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "voice")
+            .unwrap();
+        let mut actor = serenity::model::guild::Member::default();
+        actor.user.id = UserId::new(1);
+        actor.user.name = "mod".into();
+        actor.guild_id = GuildId::new(GUILD);
+
+        let token = "alice";
+        let env = crate::commands::CmdEnv {
+            app: &app,
+            ctx: &ctx,
+            cmd: &cmd,
+            guild_id: GuildId::new(GUILD),
+            channel_id: ChannelId::new(1),
+            actor: actor.user.id,
+            actor_member: actor,
+            args: crate::commands::Args::new(token),
+            source_message: None,
+        };
+        let outcome = crate::commands::behaviors::run(&env).await.unwrap();
+        let text = outcome.response.expect("voice name reply");
+        let expected = crate::templates::render(
+            GUILD_NOT_CACHED_TEMPLATE,
+            &std::collections::BTreeMap::from([("target".into(), token.into())]),
+        );
+        assert_eq!(text, expected);
+        assert!(text.contains("not cached"), "{text}");
+        assert!(!text.contains("could not resolve"), "{text}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "voice must not call Discord"
+        );
+
+        let cached = cache_with_guild(HashMap::new(), Vec::new());
+        let cached_ctx = fixture_context(
+            Arc::new(
+                serenity::http::HttpBuilder::new("fixture")
+                    .proxy(format!("http://{address}"))
+                    .application_id(serenity::model::id::ApplicationId::new(1))
+                    .ratelimiter_disabled(true)
+                    .build(),
+            ),
+            cached,
+        )
+        .await;
+        let mut known_actor = serenity::model::guild::Member::default();
+        known_actor.user.id = UserId::new(1);
+        known_actor.user.name = "mod".into();
+        known_actor.guild_id = GuildId::new(GUILD);
+        let missing = crate::commands::CmdEnv {
+            app: &app,
+            ctx: &cached_ctx,
+            cmd: &cmd,
+            guild_id: GuildId::new(GUILD),
+            channel_id: ChannelId::new(1),
+            actor: known_actor.user.id,
+            actor_member: known_actor,
+            args: crate::commands::Args::new(token),
+            source_message: None,
+        };
+        let result = crate::commands::behaviors::run(&missing).await;
+        let Err(error) = result else {
+            panic!("a cached guild with no matching member is not a cold cache");
+        };
+        assert!(
+            error.to_string().contains("could not resolve user `alice`"),
+            "{error:#}"
+        );
+
+        server.abort();
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
 }

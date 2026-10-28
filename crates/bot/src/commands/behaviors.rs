@@ -592,8 +592,23 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Voice => {
             let mut args = env.args.clone();
             let token = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+            // Ids and mentions parse before the member search. A name or nick
+            // can only be searched when the guild is cached; otherwise the
+            // reply is the same not-cached line as a cold id lookup.
+            let guild_cached = env.ctx.cache.guild(env.guild_id).is_some();
             let target = match super::resolve_user_name(env.ctx, env.guild_id, &token) {
                 super::UserNameMatch::Unique(id) => id,
+                super::UserNameMatch::NotFound if !guild_cached => {
+                    vars.insert("target".into(), token);
+                    return Ok(BehaviorOutcome {
+                        response: Some(crate::templates::render(
+                            super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                            &vars,
+                        )),
+                        vars,
+                        suppress_response: false,
+                    });
+                }
                 super::UserNameMatch::NotFound => {
                     return Err(anyhow!("could not resolve user `{token}`"));
                 }
