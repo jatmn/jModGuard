@@ -144,7 +144,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "ban",
         "Moderation",
         "Ban a user from the server.",
-        "!ban <user> [reason]",
+        "!ban <user> [--dm] [reason]",
         "mod",
         Behavior::Ban {
             default_reason: "Banned by a moderator".into(),
@@ -171,7 +171,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "kick",
         "Moderation",
         "Kick a user from the server.",
-        "!kick <user> [reason]",
+        "!kick <user> [--dm] [reason]",
         "mod",
         Behavior::Kick {
             default_reason: "Kicked by a moderator".into(),
@@ -720,6 +720,29 @@ pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
 pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
 pub const ATTACHMENT_BURST_BANNED: &str = "banned";
 pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
+
+/// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
+pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// DM when Discord already shows the user removed but a moderator requested `--dm`.
+pub const MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE: &str =
+    "You are already removed from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// Slash option label for the optional kick/ban `dm` flag.
+pub const SLASH_MOD_REASON_DM_OPTION_TEMPLATE: &str = "DM the reason before applying the action";
+
+/// Follow-up when the preliminary reason DM was sent but kick/ban failed.
+pub const MOD_REASON_DM_MODERATION_FAILED_TEMPLATE: &str =
+    "Update: your removal from **{guild}** did not complete; you may still be in the server.";
+
+/// Shipped kick/ban confirmation clause when a reason DM was requested.
+pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";
+pub const MOD_REASON_DM_STATUS_SENT: &str = "Reason DM sent.";
+pub const MOD_REASON_DM_STATUS_NOT_SENT: &str = "Reason DM not sent.";
+pub const MOD_REASON_DM_STATUS_UNCERTAIN: &str = "Reason DM delivery uncertain.";
+
+/// User-facing error when kick/ban targets the bot itself.
+pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{command}`.";
 
 /// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
 ///

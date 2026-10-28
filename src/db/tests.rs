@@ -712,6 +712,46 @@ fn seeded_database_skips_another_globals_write() {
 }
 
 #[test]
+fn legacy_kick_ban_usage_upgraded_when_seed_already_satisfied() {
+    let tmp = tmp_db_path("kick_ban_usage_satisfied_seed");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "kick")
+        .expect("kick command");
+    let legacy =
+        super::bootstrap::legacy_kick_ban_usage_payload(&shipped, "!kick <user> [reason]").unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands (guild_id, name, data) VALUES (42, 'kick', ?1)",
+            params![legacy],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let usage: String = tokio_test_block_on(db.with_conn(|conn| {
+        let usage: String = conn.query_row(
+            "SELECT json_extract(data, '$.usage') FROM commands WHERE guild_id = 42 AND name = 'kick'",
+            (),
+            |row| Ok(row.get(0)?),
+        )?;
+        Ok(usage)
+    }))
+    .unwrap();
+    assert_eq!(usage, "!kick <user> [--dm] [reason]");
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1,
+        "legacy kick/ban usage upgrade must bump slash_registry_version when command rows change"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn missing_shipped_global_is_restored_when_a_custom_row_keeps_the_count() {
     let tmp = tmp_db_path("seed_missing_key_hidden_by_custom");
     let db = Db::open(&tmp, 2).unwrap();
