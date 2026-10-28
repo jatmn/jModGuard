@@ -1,6 +1,6 @@
 //! Optional prior-case note when a member joins and the guild store already has cases.
 
-use crate::db::guild_data::{GuildDataScope, GuildDataStore, MemberHistoryEntry};
+use crate::db::guild_data::{CaseLimits, GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use crate::logging;
 use crate::state::BotState;
 #[cfg(test)]
@@ -24,6 +24,11 @@ pub(crate) enum RejoinNote {
     },
     IndexNotReady,
     BanHistoryOnly,
+    /// The case read refused to return rows. The rejoin note still goes out.
+    CasesUnavailable {
+        budget: bool,
+        index_not_ready: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +69,12 @@ pub(crate) async fn collect_prior_cases(
     let index_complete = store.member_case_index_complete(scope.clone()).await?;
     let (entries, truncated) = if index_complete {
         store
-            .member_case_entries(scope.clone(), user_id, PRIOR_CASE_LIMIT)
+            .member_case_entries(
+                scope.clone(),
+                user_id,
+                PRIOR_CASE_LIMIT,
+                CaseLimits::default(),
+            )
             .await?
     } else {
         store
@@ -130,6 +140,16 @@ pub(crate) async fn enrich_member_rejoin_vars(
     };
     let collected = match collect_prior_cases(&store, scope, user_id).await {
         Ok(cases) => cases,
+        Err(error) if fail_closed_case_read(&error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id,
+                "member rejoin case history unavailable: {error:#}"
+            );
+            let note = rejoin_note_for_failed_case_read(&error);
+            vars.extend(rejoin_note_vars(&note));
+            return MemberRejoinEnrich::Ready;
+        }
         Err(error) => {
             tracing::warn!(
                 guild_id = guild_id.get(),
@@ -165,6 +185,20 @@ pub(crate) fn rejoin_note_vars(note: &RejoinNote) -> BTreeMap<String, String> {
                 "notice".into(),
                 "Recorded ban history exists; no case details are available to list.".into(),
             );
+        }
+        RejoinNote::CasesUnavailable {
+            budget,
+            index_not_ready,
+        } => {
+            vars.insert("cases".into(), String::new());
+            let notice = if *budget {
+                "Case lines are unavailable because a stored case exceeds the read budget."
+            } else if *index_not_ready {
+                "Indexed case lines are not ready yet."
+            } else {
+                "Case lines are unavailable."
+            };
+            vars.insert("notice".into(), notice.into());
         }
         RejoinNote::Cases {
             lines,
@@ -209,6 +243,30 @@ pub(crate) fn member_rejoin_vars(user: &User, note: &RejoinNote) -> BTreeMap<Str
     vars
 }
 
+/// Store refusals userinfo also turns into an unavailable case list.
+/// A locked database or other infrastructure error stays retryable.
+fn fail_closed_case_read(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::db::guild_data::CaseError>()
+        .is_some()
+        || error
+            .downcast_ref::<crate::db::guild_data::MemberSyncError>()
+            .is_some()
+}
+
+fn rejoin_note_for_failed_case_read(error: &anyhow::Error) -> RejoinNote {
+    let budget = error
+        .downcast_ref::<crate::db::guild_data::CaseError>()
+        .is_some_and(|err| matches!(err, crate::db::guild_data::CaseError::Limit));
+    let index_not_ready = error
+        .downcast_ref::<crate::db::guild_data::MemberSyncError>()
+        .is_some_and(|err| matches!(err, crate::db::guild_data::MemberSyncError::Stale));
+    RejoinNote::CasesUnavailable {
+        budget,
+        index_not_ready,
+    }
+}
+
 fn format_case_line(entry: &MemberHistoryEntry) -> String {
     let action = &entry.kind;
     let outcome = entry.outcome.as_deref().unwrap_or("unknown");
@@ -224,7 +282,7 @@ fn format_case_line(entry: &MemberHistoryEntry) -> String {
     line
 }
 
-fn sanitize_reason_for_report(text: &str) -> String {
+pub(crate) fn sanitize_reason_for_report(text: &str) -> String {
     let single_line = text
         .replace(['\r', '\n'], " ")
         .split_whitespace()

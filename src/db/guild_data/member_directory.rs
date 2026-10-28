@@ -1188,6 +1188,20 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,bot_id)?;
             let (after,done):(Option<String>,bool)=tx.query_row("SELECT case_backfill_after,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if done {tx.finish_read()?;return Ok(true)}
+            let legacy_cases: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 LIMIT 1)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
+            if !legacy_cases {
+                tx.ensure_mutation_receipt()?;
+                tx.member_execute("UPDATE guild_member_seed SET case_backfill_after=NULL,case_backfill_done=1 WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
+                let pending=tx.query_row("SELECT run_kind,phase,status FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<String>(2)?))).optional()?;
+                if let Some((kind,phase,state))=pending && phase=="complete" && state=="waiting" {
+                    tx.member_execute("UPDATE guild_member_sync SET status='complete',status_reason=NULL,completed_at_ms=coalesce(completed_at_ms,unixepoch()*1000),last_success_at_ms=coalesce(completed_at_ms,unixepoch()*1000),last_success_processed=processed,last_success_inserted=inserted,last_success_updated=updated,last_success_unchanged=unchanged,progress_revision=progress_revision+1 WHERE guild_id=?1",params![scope.guild_id()])?;
+                    if kind=="reconcile" {tx.member_execute("UPDATE guild_member_seed SET reconciliation_needed=0,reconciliation_reason=NULL,gap_at_ms=NULL WHERE guild_id=?1 AND gap_generation=(SELECT reconcile_gap_generation FROM guild_member_sync WHERE guild_id=?1)",params![scope.guild_id()])?;}
+                    if kind=="initial"{tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=coalesce(initial_completed_at_ms,unixepoch()*1000) WHERE guild_id=?1",params![scope.guild_id()])?;}
+                    if kind=="initial"{tx.member_execute("INSERT OR IGNORE INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=?1 AND reconciliation_needed=1 AND initial_completed_at_ms IS NOT NULL",params![scope.guild_id()])?;}
+                }
+                tx.commit()?;
+                return Ok(true);
+            }
             let mut stmt=tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
             let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_deref().unwrap_or(""),limit as i64],|r|Ok(r.get::<String>(0)?))?;
             let mut last=None;let mut count=0;for row in rows{last=Some(row?);count+=1;}drop(stmt);
@@ -2059,6 +2073,17 @@ fn ingest_member_audits(
                     case_id.as_str(),
                     key,
                     payload.as_str()
+                ],
+            )?;
+            conn.member_execute(
+                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    audit.user_id,
+                    case_id.as_str(),
+                    action,
+                    audit.occurred_at_ms
                 ],
             )?;
         }
@@ -3006,41 +3031,15 @@ impl GuildDataStore {
         }).await
     }
 
-    fn member_case_row(row: &Row) -> Result<MemberHistoryEntry> {
-        Ok(MemberHistoryEntry {
-            kind: row.get(0)?,
-            occurred_at_ms: row.get(1)?,
-            observed_at_ms: None,
-            stay_id: None,
-            observation_id: None,
-            case_id: Some(row.get::<String>(2)?),
-            joined_at_ms: None,
-            departed_at_ms: None,
-            moderator_id: row.get(3)?,
-            reason: row.get(4)?,
-            outcome: row.get(5)?,
-            source_kind: row.get(6)?,
-        })
-    }
-
-    /// Index-ordered case lookup: bound live cases before joining payloads.
+    /// Index-ordered case lookup: bound the index walk before joining payloads.
     pub(crate) fn member_case_entries_lookup_sql() -> &'static str {
-        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,json_extract(c.payload,'$.actor_id'),json_extract(c.payload,'$.reason'),json_extract(c.payload,'$.outcome'),CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END FROM (SELECT i.guild_id,i.enrollment_id,i.user_id,i.case_id,i.action_kind,i.occurred_at_ms FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(CAST(c.payload AS BLOB))<=65536 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) AS i JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 AND length(CAST(c.payload AS BLOB))<=65536 ORDER BY i.occurred_at_ms DESC,i.case_id DESC"
+        "SELECT i.action_kind,i.occurred_at_ms,i.case_id,length(CAST(c.payload AS BLOB)),CASE WHEN length(CAST(c.payload AS BLOB))<=?5 THEN json_extract(c.payload,'$.actor_id') END,CASE WHEN length(CAST(c.payload AS BLOB))<=?5 THEN json_extract(c.payload,'$.reason') END,CASE WHEN length(CAST(c.payload AS BLOB))<=?5 THEN json_extract(c.payload,'$.outcome') END,CASE WHEN length(CAST(c.payload AS BLOB))<=?5 THEN CASE WHEN c.source_key LIKE 'discord:%' THEN 'discord_audit' WHEN EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=c.guild_id AND s.enrollment_id=c.enrollment_id AND s.case_id=c.case_id AND s.source_kind=1) THEN 'application_audit_linked' WHEN json_type(c.payload,'$.source.gateway_observation') IS NOT NULL THEN 'gateway_observation_unlinked' ELSE 'application' END END FROM guild_member_case_index i INDEXED BY guild_member_cases_user INNER JOIN guild_cases c ON c.guild_id=i.guild_id AND c.enrollment_id=i.enrollment_id AND c.case_id=i.case_id AND c.deleted=0 WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4"
     }
 
-    fn member_case_entries_oversized_sql() -> &'static str {
-        "SELECT EXISTS(SELECT 1 FROM (SELECT i.case_id FROM guild_member_case_index i INDEXED BY guild_member_cases_user WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) recent JOIN guild_cases c ON c.guild_id=?1 AND c.enrollment_id=?2 AND c.case_id=recent.case_id AND c.deleted=0 WHERE length(CAST(c.payload AS BLOB))>65536)"
-    }
-
-    /// Bounded member-case lookup while `case_backfill_done` is false. Uses the
-    /// partial `guild_member_case_index` window (same plan as `member_case_entries`)
-    /// instead of scanning `guild_cases` by subject JSON.
-    pub(crate) fn member_subject_cases_lookup_sql() -> &'static str {
-        Self::member_case_entries_lookup_sql()
-    }
-
-    fn member_subject_cases_oversized_sql() -> &'static str {
-        Self::member_case_entries_oversized_sql()
+    /// True when one of the recent index rows has no live case. The `LIMIT`
+    /// is the same window the lookup reads, so the probe stays on that window.
+    pub(crate) fn member_case_entries_index_gap_sql() -> &'static str {
+        "SELECT EXISTS(SELECT 1 FROM (SELECT i.case_id FROM guild_member_case_index i INDEXED BY guild_member_cases_user WHERE i.guild_id=?1 AND i.enrollment_id=?2 AND i.user_id=?3 ORDER BY i.occurred_at_ms DESC,i.case_id DESC LIMIT ?4) recent WHERE NOT EXISTS(SELECT 1 FROM guild_cases c WHERE c.guild_id=?1 AND c.enrollment_id=?2 AND c.case_id=recent.case_id AND c.deleted=0))"
     }
 
     /// Recent moderation cases for one member, newest first. Fetches at most
@@ -3050,51 +3049,57 @@ impl GuildDataStore {
         scope: GuildDataScope,
         user_id: i64,
         limit: u32,
+        limits: CaseLimits,
     ) -> Result<(Vec<MemberHistoryEntry>, bool)> {
         checked_scope(self, &scope)?;
+        limits.validate()?;
         anyhow::ensure!(
             user_id > 0 && limit > 0 && limit <= 8,
             MemberSyncError::Invalid
         );
-        let fetch = limit + 1;
+        let fetch = i64::from(limit) + 1;
+        let max_record_bytes = i64::from(limits.max_record_bytes);
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let oversize: bool = tx.query_row(
-                    GuildDataStore::member_case_entries_oversized_sql(),
+                let backfill_done: bool = tx
+                    .query_row(
+                        "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !backfill_done {
+                    tx.finish_read()?;
+                    return Err(MemberSyncError::Stale.into());
+                }
+                let index_gap: bool = tx.query_row(
+                    GuildDataStore::member_case_entries_index_gap_sql(),
                     params![
                         scope.guild_id(),
                         scope.enrollment.id.as_str(),
                         user_id,
-                        fetch as i64
+                        fetch
                     ],
                     |r| Ok(r.get(0)?),
                 )?;
-                anyhow::ensure!(!oversize, MemberSyncError::Invalid);
-                let sql = GuildDataStore::member_case_entries_lookup_sql();
-                let mut stmt = tx.prepare(sql)?;
-                let rows = stmt.query_map(
-                    params![
-                        scope.guild_id(),
-                        scope.enrollment.id.as_str(),
-                        user_id,
-                        fetch as i64
-                    ],
-                    Self::member_case_row,
+                if index_gap {
+                    tx.finish_read()?;
+                    return Err(MemberSyncError::Stale.into());
+                }
+                let page = Self::collect_member_case_page(
+                    &tx,
+                    &scope,
+                    user_id,
+                    fetch,
+                    limit,
+                    max_record_bytes,
                 )?;
-                let mut entries = Vec::new();
-                for row in rows {
-                    entries.push(row?);
-                }
-                drop(stmt);
-                let truncated = entries.len() > limit as usize;
-                if truncated {
-                    entries.pop();
-                }
                 tx.finish_read()?;
-                Ok((entries, truncated))
+                Ok(page)
             })
             .await
     }
@@ -3111,47 +3116,77 @@ impl GuildDataStore {
             user_id > 0 && limit > 0 && limit <= 8,
             MemberSyncError::Invalid
         );
-        let fetch = limit + 1;
+        let fetch = i64::from(limit) + 1;
+        let max_record_bytes = i64::from(CaseLimits::default().max_record_bytes);
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let oversize: bool = tx.query_row(
-                    GuildDataStore::member_subject_cases_oversized_sql(),
-                    params![
-                        scope.guild_id(),
-                        scope.enrollment.id.as_str(),
-                        user_id,
-                        fetch as i64
-                    ],
-                    |r| Ok(r.get(0)?),
+                let page = Self::collect_member_case_page(
+                    &tx,
+                    &scope,
+                    user_id,
+                    fetch,
+                    limit,
+                    max_record_bytes,
                 )?;
-                anyhow::ensure!(!oversize, MemberSyncError::Invalid);
-                let sql = GuildDataStore::member_subject_cases_lookup_sql();
-                let mut stmt = tx.prepare(sql)?;
-                let rows = stmt.query_map(
-                    params![
-                        scope.guild_id(),
-                        scope.enrollment.id.as_str(),
-                        user_id,
-                        fetch as i64
-                    ],
-                    Self::member_case_row,
-                )?;
-                let mut entries = Vec::new();
-                for row in rows {
-                    entries.push(row?);
-                }
-                drop(stmt);
-                let truncated = entries.len() > limit as usize;
-                if truncated {
-                    entries.pop();
-                }
                 tx.finish_read()?;
-                Ok((entries, truncated))
+                Ok(page)
             })
             .await
+    }
+
+    fn collect_member_case_page(
+        tx: &impl crate::db::SqlExecutor,
+        scope: &GuildDataScope,
+        user_id: i64,
+        fetch: i64,
+        limit: u32,
+        max_record_bytes: i64,
+    ) -> Result<(Vec<MemberHistoryEntry>, bool)> {
+        let mut stmt = tx.prepare(Self::member_case_entries_lookup_sql())?;
+        let rows = stmt.query_map(
+            params![
+                scope.guild_id(),
+                scope.enrollment.id.as_str(),
+                user_id,
+                fetch,
+                max_record_bytes
+            ],
+            |row| Self::map_limited_member_case(row, max_record_bytes),
+        )?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        drop(stmt);
+        let truncated = entries.len() > limit as usize;
+        if truncated {
+            entries.pop();
+        }
+        Ok((entries, truncated))
+    }
+
+    fn map_limited_member_case(row: &Row, max_record_bytes: i64) -> Result<MemberHistoryEntry> {
+        let payload_len: i64 = row.get(3)?;
+        if payload_len > max_record_bytes {
+            return Err(CaseError::Limit.into());
+        }
+        Ok(MemberHistoryEntry {
+            kind: row.get(0)?,
+            occurred_at_ms: row.get(1)?,
+            observed_at_ms: None,
+            stay_id: None,
+            observation_id: None,
+            case_id: Some(row.get::<String>(2)?),
+            joined_at_ms: None,
+            departed_at_ms: None,
+            moderator_id: row.get(4)?,
+            reason: row.get(5)?,
+            outcome: row.get(6)?,
+            source_kind: row.get(7)?,
+        })
     }
 
     pub async fn claim_member_sync(

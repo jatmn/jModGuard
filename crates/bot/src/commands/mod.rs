@@ -4,10 +4,14 @@
 
 pub mod behaviors;
 pub mod plans;
+pub mod userinfo;
 pub mod voice_lookup;
 
 use anyhow::Result;
-use serenity::builder::{Builder, CreateCommand, CreateCommandOption, EditInteractionResponse};
+use serenity::builder::{
+    Builder, CreateAllowedMentions, CreateCommand, CreateCommandOption, CreateMessage,
+    EditInteractionResponse,
+};
 use serenity::client::Context;
 use serenity::model::application::{CommandDataOptionValue, CommandOptionType, Interaction};
 use serenity::model::prelude::{ChannelId, GuildId, Permissions, Role, RoleId, UserId};
@@ -297,6 +301,46 @@ pub(crate) fn member_can_view_channel(
     role_ids: &[RoleId],
     channel_id: ChannelId,
 ) -> bool {
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::VIEW_CHANNEL,
+    )
+}
+
+/// Parent `VIEW_CHANNEL` does not grant access to a private thread. Effective
+/// `MANAGE_THREADS` does. The gateway cache does not store other users' thread
+/// membership, so an uncached membership does not grant access.
+pub(crate) fn private_thread_visible_to(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    let Some(channel) = cached_channel(guild, channel_id) else {
+        return true;
+    };
+    if channel.kind != serenity::model::channel::ChannelType::PrivateThread {
+        return true;
+    }
+    member_has_channel_permission(
+        guild,
+        user_id,
+        role_ids,
+        channel_id,
+        Permissions::MANAGE_THREADS,
+    ) || cached_caller_is_thread_member(channel, user_id)
+}
+
+fn member_has_channel_permission(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+    permission: Permissions,
+) -> bool {
     let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
         return false;
     };
@@ -310,7 +354,16 @@ pub(crate) fn member_can_view_channel(
     };
     guild
         .partial_member_permissions_in(channel, user_id, &partial)
-        .contains(Permissions::VIEW_CHANNEL)
+        .contains(permission)
+}
+
+/// `GuildChannel.member` is the current gateway user and has no user id.
+/// It must not be treated as this caller's membership.
+fn cached_caller_is_thread_member(
+    _thread: &serenity::model::channel::GuildChannel,
+    _actor: UserId,
+) -> bool {
+    false
 }
 
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
@@ -345,6 +398,16 @@ fn is_thread(kind: serenity::model::channel::ChannelType) -> bool {
             | serenity::model::channel::ChannelType::PrivateThread
             | serenity::model::channel::ChannelType::NewsThread
     )
+}
+
+fn cached_channel(
+    guild: &serenity::model::guild::Guild,
+    channel_id: ChannelId,
+) -> Option<&serenity::model::channel::GuildChannel> {
+    guild
+        .channels
+        .get(&channel_id)
+        .or_else(|| guild.threads.iter().find(|thread| thread.id == channel_id))
 }
 
 fn channel_for_member_permissions(
@@ -681,8 +744,16 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            send_prefix_command_error(app, msg.channel_id, http, guild_id.get(), &cmd.name, &e)
-                .await;
+            send_prefix_command_error(
+                app,
+                msg.channel_id,
+                http,
+                guild_id.get(),
+                &cmd.name,
+                &e,
+                suppress_untrusted_mentions(&cmd.behavior),
+            )
+            .await;
             return Ok(true);
         }
     };
@@ -999,7 +1070,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("interaction: config load failed: {e:#}");
-            respond(&app.activation, &slash, ctx, deferred, "internal error").await;
+            respond(
+                &app.activation,
+                &slash,
+                ctx,
+                deferred,
+                "internal error",
+                false,
+            )
+            .await;
             return;
         }
     };
@@ -1009,7 +1088,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             "no slash command matched `{}` in guild {guild_id}",
             slash.name
         );
-        respond(&app.activation, &slash, ctx, deferred, "unknown command").await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            "unknown command",
+            false,
+        )
+        .await;
         return;
     };
     let cmd = cmd.clone();
@@ -1032,6 +1119,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             ctx,
             deferred,
             "guild not cached / member data unavailable",
+            false,
         )
         .await;
         return;
@@ -1039,7 +1127,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
 
     if let Err(reason) = check_enforcement(app, &cfg, &cmd, &guild_roles, &member, slash.channel_id)
     {
-        respond(&app.activation, &slash, ctx, deferred, &reason.to_string()).await;
+        respond(
+            &app.activation,
+            &slash,
+            ctx,
+            deferred,
+            &reason.to_string(),
+            false,
+        )
+        .await;
         return;
     }
     if !cooldown_check(app, guild_id, actor_id, &cmd) {
@@ -1049,6 +1145,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             ctx,
             deferred,
             "that command is on cooldown",
+            false,
         )
         .await;
         return;
@@ -1087,7 +1184,15 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         }
         Err(e) => {
             let text = format!("error: {e:#}");
-            respond(&app.activation, &slash, ctx, deferred, &text).await;
+            respond(
+                &app.activation,
+                &slash,
+                ctx,
+                deferred,
+                &text,
+                suppress_untrusted_mentions(&cmd.behavior),
+            )
+            .await;
         }
     }
 }
@@ -1099,9 +1204,12 @@ async fn send_prefix_command_error(
     guild_id: u64,
     command_name: &str,
     error: &anyhow::Error,
+    suppress_mentions: bool,
 ) {
     let reply = format!("error: {error:#}");
-    if raced_channel_say(app, channel_id, http, guild_id, reply).await == RacedWrite::Cutoff {
+    if raced_channel_text(app, channel_id, http, guild_id, reply, suppress_mentions).await
+        == RacedWrite::Cutoff
+    {
         tracing::warn!(
             "command `{command_name}` error reply suppressed after writer cutoff: {error:#}"
         );
@@ -1142,9 +1250,17 @@ async fn respond(
     ctx: &Context,
     deferred: bool,
     text: &str,
+    suppress_mentions: bool,
 ) {
     let delivered = if deferred {
-        raced_slash_edit(activation, &ctx.http, slash.token.as_str(), text).await
+        raced_slash_edit(
+            activation,
+            &ctx.http,
+            slash.token.as_str(),
+            text,
+            suppress_mentions,
+        )
+        .await
     } else {
         raced_slash_create_message(
             activation,
@@ -1153,6 +1269,7 @@ async fn respond(
             slash.token.as_str(),
             text,
             true,
+            suppress_mentions,
         )
         .await
     };
@@ -1181,12 +1298,35 @@ fn raced_write_chain(first: RacedWrite, second: RacedWrite) -> RacedWrite {
     }
 }
 
+fn suppress_untrusted_mentions(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::UserInfo)
+}
+
+fn no_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new()
+        .all_users(false)
+        .all_roles(false)
+        .everyone(false)
+        .replied_user(false)
+}
+
 async fn raced_channel_say(
     app: &Arc<BotState>,
     channel_id: ChannelId,
     http: &serenity::http::Http,
     guild_id: u64,
     text: String,
+) -> RacedWrite {
+    raced_channel_text(app, channel_id, http, guild_id, text, false).await
+}
+
+async fn raced_channel_text(
+    app: &Arc<BotState>,
+    channel_id: ChannelId,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    text: String,
+    suppress_mentions: bool,
 ) -> RacedWrite {
     let target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild_id,
@@ -1201,7 +1341,21 @@ async fn raced_channel_say(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    match crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await {
+    let call = if suppress_mentions {
+        crate::discord::race_discord_call(
+            &app.activation,
+            channel_id.send_message(
+                http,
+                CreateMessage::new()
+                    .content(text)
+                    .allowed_mentions(no_mentions()),
+            ),
+        )
+        .await
+    } else {
+        crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await
+    };
+    match call {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             app.remembered_discord_targets.forget(target);
             RacedWrite::Finished
@@ -1225,15 +1379,13 @@ async fn raced_slash_edit(
     http: &serenity::http::Http,
     token: &str,
     content: &str,
+    suppress_mentions: bool,
 ) -> RacedWrite {
-    match crate::discord::race_discord_call(
-        activation,
-        EditInteractionResponse::new()
-            .content(content)
-            .execute(http, token),
-    )
-    .await
-    {
+    let mut edit = EditInteractionResponse::new().content(content);
+    if suppress_mentions {
+        edit = edit.allowed_mentions(no_mentions());
+    }
+    match crate::discord::race_discord_call(activation, edit.execute(http, token)).await {
         crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
         crate::discord::DiscordCall::Finished(Err(error)) => {
             tracing::warn!("failed to edit slash response: {error}");
@@ -1250,15 +1402,17 @@ async fn raced_slash_create_message(
     token: &str,
     content: &str,
     ephemeral: bool,
+    suppress_mentions: bool,
 ) -> RacedWrite {
+    let mut message = serenity::builder::CreateInteractionResponseMessage::new()
+        .content(content)
+        .ephemeral(ephemeral);
+    if suppress_mentions {
+        message = message.allowed_mentions(no_mentions());
+    }
     match crate::discord::race_discord_call(
         activation,
-        serenity::builder::CreateInteractionResponse::Message(
-            serenity::builder::CreateInteractionResponseMessage::new()
-                .content(content)
-                .ephemeral(ephemeral),
-        )
-        .execute(http, (id, token)),
+        serenity::builder::CreateInteractionResponse::Message(message).execute(http, (id, token)),
     )
     .await
     {
@@ -1281,6 +1435,7 @@ async fn deliver_slash_success(
 ) -> RacedWrite {
     let answer = slash_answer(cmd, outcome);
     let text = render_outcome(cmd, outcome);
+    let suppress_mentions = suppress_untrusted_mentions(&cmd.behavior);
     match answer {
         SlashAnswer::Withdraw => {
             if deferred {
@@ -1294,13 +1449,21 @@ async fn deliver_slash_success(
                     slash.token.as_str(),
                     &text,
                     true,
+                    suppress_mentions,
                 )
                 .await
             }
         }
         SlashAnswer::Public | SlashAnswer::Ephemeral => {
             if deferred {
-                raced_slash_edit(activation, http, slash.token.as_str(), &text).await
+                raced_slash_edit(
+                    activation,
+                    http,
+                    slash.token.as_str(),
+                    &text,
+                    suppress_mentions,
+                )
+                .await
             } else {
                 raced_slash_create_message(
                     activation,
@@ -1309,6 +1472,7 @@ async fn deliver_slash_success(
                     slash.token.as_str(),
                     &text,
                     answer != SlashAnswer::Public,
+                    suppress_mentions,
                 )
                 .await
             }
@@ -1420,7 +1584,14 @@ async fn withdraw_deferred_slash_answer(
     };
     raced_write_chain(
         delete,
-        raced_slash_edit(activation, http, token, WITHDRAW_DEFERRED_FALLBACK_CONTENT).await,
+        raced_slash_edit(
+            activation,
+            http,
+            token,
+            WITHDRAW_DEFERRED_FALLBACK_CONTENT,
+            false,
+        )
+        .await,
     )
 }
 
@@ -1436,7 +1607,15 @@ async fn send_outcome(
     outcome: BehaviorOutcome,
 ) {
     if let Some(text) = prefix_response_text(cmd, &outcome)
-        && raced_channel_say(app, channel_id, http, guild_id.get(), text).await
+        && raced_channel_text(
+            app,
+            channel_id,
+            http,
+            guild_id.get(),
+            text,
+            suppress_untrusted_mentions(&cmd.behavior),
+        )
+        .await
             == RacedWrite::Cutoff
     {
         return;
@@ -1500,6 +1679,22 @@ pub enum UserNameMatch {
     Ambiguous,
 }
 
+/// A mention or raw id token. Zero and values that do not fit in a snowflake
+/// are `None`; this does not call [`UserId::new`].
+fn user_id_from_token(trimmed: &str) -> Option<UserId> {
+    if let Some(inner) = trimmed
+        .strip_prefix("<@")
+        .and_then(|token| token.strip_suffix('>'))
+        .map(|token| token.trim_start_matches('!'))
+    {
+        return inner.parse().ok();
+    }
+    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return trimmed.parse().ok();
+    }
+    None
+}
+
 fn member_matches_name_token(member: &serenity::model::guild::Member, lower: &str) -> bool {
     member.user.name.to_lowercase() == lower
         || member
@@ -1518,16 +1713,8 @@ pub fn resolve_user_name_in_guild(
     token: &str,
 ) -> UserNameMatch {
     let trimmed = token.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("<@")
-        .and_then(|t| t.strip_suffix('>'))
-        .map(|t| t.trim_start_matches('!'))
-        && let Ok(id) = inner.parse::<u64>()
-    {
-        return UserNameMatch::Unique(id.into());
-    }
-    if let Ok(id) = trimmed.parse::<u64>() {
-        return UserNameMatch::Unique(id.into());
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
     }
     let lower = trimmed.to_lowercase();
     let matches = guild
@@ -1546,16 +1733,8 @@ pub fn resolve_user_name_in_guild(
 /// Resolves a user from a mention, raw ID, or cached member name/nick search.
 pub fn resolve_user_name(ctx: &Context, guild_id: GuildId, token: &str) -> UserNameMatch {
     let trimmed = token.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("<@")
-        .and_then(|t| t.strip_suffix('>'))
-        .map(|t| t.trim_start_matches('!'))
-        && let Ok(id) = inner.parse::<u64>()
-    {
-        return UserNameMatch::Unique(id.into());
-    }
-    if let Ok(id) = trimmed.parse::<u64>() {
-        return UserNameMatch::Unique(id.into());
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
     }
     let Some(guild) = ctx.cache.guild(guild_id) else {
         return UserNameMatch::NotFound;
@@ -3112,6 +3291,7 @@ mod tests {
                 "token",
                 "error: writer lease is not held",
                 true,
+                false,
             )
             .await,
             RacedWrite::Cutoff
@@ -3145,7 +3325,7 @@ mod tests {
             .ratelimiter_disabled(true)
             .build();
         assert_eq!(
-            raced_slash_edit(&activation, &http, "token", "pong").await,
+            raced_slash_edit(&activation, &http, "token", "pong", false).await,
             RacedWrite::Cutoff,
             "deferred slash success edits must be cancellable at cutoff"
         );

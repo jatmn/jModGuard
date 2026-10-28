@@ -507,7 +507,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves built dist/frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless bundled at build time, not git)
-migrations/             0001_init through 0021_clear_builtin_command_access
+migrations/             0001_init through 0022_clear_userinfo_command_rows
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```

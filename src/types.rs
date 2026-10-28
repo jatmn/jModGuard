@@ -324,6 +324,7 @@ pub enum Behavior {
     },
     Warns,
     WarnClear,
+    UserInfo,
     Banlist,
     Voice,
     Purge {

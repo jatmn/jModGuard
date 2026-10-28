@@ -63,7 +63,9 @@ fn snapshot_voice_state(
     if !channel_belongs_to_guild(cache, guild_id, guild, channel_id) {
         return VoiceLookupSnapshot::ChannelUnavailable;
     }
-    if !actor_can_view_channel(guild, actor_id, actor_roles, channel_id) {
+    if !actor_can_view_channel(guild, actor_id, actor_roles, channel_id)
+        || !super::private_thread_visible_to(guild, actor_id, actor_roles, channel_id)
+    {
         return VoiceLookupSnapshot::ChannelUnavailable;
     }
     let channel_name = guild
@@ -223,6 +225,31 @@ mod tests {
                 channel_id: VOICE_CHANNEL,
                 channel_name: "Lounge".into(),
             }
+        );
+    }
+
+    #[test]
+    fn private_thread_channel_is_not_named_without_manage_threads() {
+        let mut states = HashMap::new();
+        states.insert(
+            UserId::new(TARGET),
+            voice_state(TARGET, Some(VOICE_CHANNEL)),
+        );
+        let mut parent = GuildChannel::default();
+        parent.id = ChannelId::new(800);
+        parent.guild_id = GuildId::new(GUILD);
+        parent.kind = ChannelType::Text;
+        parent.name = "notes".into();
+        let mut thread = GuildChannel::default();
+        thread.id = ChannelId::new(VOICE_CHANNEL);
+        thread.guild_id = GuildId::new(GUILD);
+        thread.parent_id = Some(parent.id);
+        thread.kind = ChannelType::PrivateThread;
+        thread.name = "secret-thread".into();
+        let cache = cache_with_guild(states, vec![parent, thread]);
+        assert_eq!(
+            snapshot_for_mod(&cache, UserId::new(TARGET)),
+            VoiceLookupSnapshot::ChannelUnavailable
         );
     }
 
