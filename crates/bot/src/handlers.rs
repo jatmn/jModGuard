@@ -1496,7 +1496,7 @@ impl EventHandler for Handler {
                 if !pending.is_empty() {
                     logging::begin_bulk_delivery(&self.app, guild_id, channel_id, &pending);
                 }
-                let delivered =
+                let outcome =
                     logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)
                         .await;
                 if !pending.is_empty() {
@@ -1506,7 +1506,7 @@ impl EventHandler for Handler {
                         guild_id,
                         channel_id,
                         &pending,
-                        delivered,
+                        outcome,
                     )
                     .await;
                 }
@@ -1517,7 +1517,7 @@ impl EventHandler for Handler {
                     guild_id,
                     channel_id,
                     &pending,
-                    false,
+                    logging::BulkDeliveryOutcome::Failed,
                 )
                 .await;
             }

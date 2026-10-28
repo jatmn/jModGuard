@@ -764,27 +764,61 @@ fn unhooked_bulk_chunk_keeps_gateway_pending_in_transcript_without_individual_ro
 }
 
 #[tokio::test]
-async fn saturated_report_slots_skip_reconciled_automod_spawn() {
+async fn saturated_report_slots_still_log_reconciled_automod_delete() {
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
     let held: Vec<_> = (0..32)
         .map(|_| crate::snapshot_capture::acquire_report_slot(&f.app).unwrap())
         .collect();
     let before = f.app.log_delivery_failures.load(Ordering::Relaxed);
-    spawn_reconciled_automod_delete(
-        Arc::clone(&f.app),
-        Arc::new(serenity::http::Http::new("reconciled-slot-test")),
+    let sink = Arc::new(Sink::default());
+    emit_reconciled_automod_delete(
+        &f.app,
+        sink.as_ref(),
         789,
         456,
         123,
+        "badword",
+        "Bad words",
+        None,
+    )
+    .await;
+    spawn_reconciled_automod_delete(
+        Arc::clone(&f.app),
+        Arc::clone(&sink),
+        789,
+        456,
+        124,
         "badword".into(),
         "Bad words".into(),
         None,
     );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sink.messages.lock().unwrap().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "spawned reconcile did not log under report-slot saturation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let bodies = sink_bodies(sink.as_ref());
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.contains("901") && body.contains("Bad words")),
+        "{bodies:?}"
+    );
     assert_eq!(
         f.app.log_delivery_failures.load(Ordering::Relaxed),
-        before + 1
+        before,
+        "report-slot pressure must not drop a reconcile the direct emit still sends"
     );
     drop(held);
 }
@@ -1044,18 +1078,9 @@ async fn account_pending_bulk(
         }
         BulkOutcome::Failure | BulkOutcome::Race => {
             if filter_channel {
-                assert_eq!(messages.len(), 1, "{label}");
                 assert!(
-                    bodies
-                        .iter()
-                        .any(|body| body.contains("excluded by channel filter")),
-                    "{label}"
-                );
-                assert!(
-                    bodies
-                        .iter()
-                        .all(|body| !body.contains("bulk fallback body")),
-                    "channel filter exposed retained text: {label}"
+                    messages.is_empty(),
+                    "channel exclusion must suppress the bulk fallback: {label}"
                 );
                 assert!(!kept_pending, "{label}");
             } else if filter_author {
@@ -1189,7 +1214,7 @@ async fn bulk_only_slot_saturation_replays_one_log_when_rest_fails() {
                 GuildId::new(789),
                 ChannelId::new(456),
                 &pending,
-                false,
+                BulkDeliveryOutcome::Failed,
             )
             .await;
         } else {
@@ -1199,7 +1224,7 @@ async fn bulk_only_slot_saturation_replays_one_log_when_rest_fails() {
                 GuildId::new(789),
                 ChannelId::new(456),
                 &pending,
-                false,
+                BulkDeliveryOutcome::Failed,
             )
             .await;
             let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
@@ -1221,7 +1246,7 @@ async fn bulk_only_slot_saturation_replays_one_log_when_rest_fails() {
 }
 
 #[tokio::test]
-async fn bulk_only_filtered_or_blocked_bulk_replays_one_log_when_rest_fails() {
+async fn bulk_only_channel_or_blocked_bulk_suppresses_replay_when_rest_fails() {
     for blocked in [false, true] {
         let f = Fixture::new();
         db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
@@ -1255,31 +1280,67 @@ async fn bulk_only_filtered_or_blocked_bulk_replays_one_log_when_rest_fails() {
         let pending = [MessageId::new(123)];
         begin_bulk_delivery(&f.app, GuildId::new(789), ChannelId::new(456), &pending);
         let sink = Sink::default();
+        let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+        assert!(removal.bulk_inflight, "blocked={blocked}");
+        assert!(sink.messages.lock().unwrap().is_empty());
         settle_bulk_delivery(
             &f.app,
             &sink,
             GuildId::new(789),
             ChannelId::new(456),
             &pending,
-            false,
+            BulkDeliveryOutcome::Failed,
         )
         .await;
-        let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
-        assert!(!removal.covered_by_bulk);
-        let bodies = sink_bodies(&sink);
-        assert_eq!(bodies.len(), 1, "blocked={blocked} {bodies:?}");
-        assert!(bodies[0].contains("903"), "{bodies:?}");
         assert!(
-            !bodies[0].contains("bulk fallback body"),
-            "filtered bulk exposed retained text: {bodies:?}"
+            sink.messages.lock().unwrap().is_empty(),
+            "suppressed bulk fallback must not send: blocked={blocked} {:?}",
+            sink_bodies(&sink)
         );
-        let expected = if blocked {
-            "bulk destination unavailable"
-        } else {
-            "excluded by channel filter"
-        };
-        assert!(bodies[0].contains(expected), "{bodies:?}");
     }
+}
+
+#[tokio::test]
+async fn bulk_only_author_filter_still_redacts_replay_when_rest_fails() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    set_log_filter(
+        &f.app,
+        "message_bulk_delete",
+        Some(r#"{"users":["42"],"channels":[]}"#),
+    )
+    .await;
+    let cfg = f.app.configs.get(&f.app.db, 789).await.unwrap();
+    assert!(
+        !bulk_log_suppressed(&f.app, &cfg, 789, ChannelId::new(456)),
+        "a user filter must not suppress the bulk summary"
+    );
+    let attempt = observe_bulk_only_pending(&f);
+    let pending = [MessageId::new(123)];
+    begin_bulk_delivery(&f.app, GuildId::new(789), ChannelId::new(456), &pending);
+    let sink = Sink::default();
+    let removal = replay_bulk_only_rest_failure(&f, attempt, &sink).await;
+    assert!(removal.bulk_inflight);
+    assert!(sink.messages.lock().unwrap().is_empty());
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &pending,
+        BulkDeliveryOutcome::Failed,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].contains("903"), "{bodies:?}");
+    assert!(bodies[0].contains("excluded by user filter"), "{bodies:?}");
+    assert!(
+        !bodies[0].contains("bulk fallback body"),
+        "user filter exposed retained text: {bodies:?}"
+    );
 }
 
 #[tokio::test]
@@ -1306,7 +1367,7 @@ async fn delivered_bulk_suppresses_the_rest_failure_replay() {
             GuildId::new(789),
             ChannelId::new(456),
             &pending,
-            true,
+            BulkDeliveryOutcome::Delivered,
         )
         .await;
         if !rest_during_inflight {
@@ -1319,4 +1380,225 @@ async fn delivered_bulk_suppresses_the_rest_failure_replay() {
             "a delivered bulk must not be logged again"
         );
     }
+}
+
+#[tokio::test]
+async fn bulk_reservation_stays_atomic_with_the_pending_observation() {
+    use crate::automod_delete_marks::{UnconfirmedMarkRemoval, set_bulk_reserve_gap_hook};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let go = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let app = Arc::clone(&f.app);
+    let go_thread = Arc::clone(&go);
+    let entered_thread = Arc::clone(&entered);
+    let racer = std::thread::spawn(move || {
+        let start = Instant::now();
+        while !go_thread.load(Ordering::Acquire) {
+            if start.elapsed() > Duration::from_secs(2) {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+        entered_thread.store(true, Ordering::Release);
+        Some(
+            app.automod_delete_marks
+                .remove_unconfirmed(789, 456, 123, attempt),
+        )
+    });
+    set_bulk_reserve_gap_hook(Some(Box::new(move || {
+        go.store(true, Ordering::Release);
+        let start = Instant::now();
+        while !entered.load(Ordering::Acquire) {
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("concurrent REST replay did not reach the reservation lock");
+            }
+            std::thread::yield_now();
+        }
+        // Hold the observation lock so a split lock lets REST replay first.
+        std::thread::sleep(Duration::from_millis(150));
+    })));
+    let mut retained = sample_retained("bulk fallback body");
+    retained.continuous = false;
+    let placement = place_bulk_delete(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        Some(&retained),
+        true,
+    );
+    let removal = racer
+        .join()
+        .expect("racer thread")
+        .expect("reservation hook ran");
+    assert!(
+        placement.reserved_pending,
+        "pending observation must reserve coverage before the lock is released"
+    );
+    assert!(placement.report.is_none());
+    assert_eq!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
+    assert!(
+        removal.bulk_inflight,
+        "REST must see the reservation; a gap between observe and reserve emits twice"
+    );
+    let mut transcript = BulkTranscript::new(1);
+    transcript.keep_pending_automod(MessageId::new(123));
+    transcript.push(MessageId::new(123), Some(&retained));
+    assert!(transcript.worth_sending());
+    let sink = Sink::default();
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(
+        sink.messages.lock().unwrap().is_empty(),
+        "in-flight bulk defers the fallback: {:?}",
+        sink_bodies(&sink)
+    );
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &transcript.pending_automod,
+        BulkDeliveryOutcome::Failed,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].contains("last observed: bulk fallback body"),
+        "{bodies:?}"
+    );
+}
+
+async fn defer_then_expire(
+    f: &Fixture,
+    channel_event: &str,
+    channel_id: i64,
+) -> (Sink, crate::automod_delete_marks::UnconfirmedRemoval) {
+    db::upsert_log_channel(&f.app.db, 789, channel_event, channel_id)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let mut retained = sample_retained("expired-snapshot-secret");
+    retained.continuous = false;
+    retained.expires_at_ms = chrono::Utc::now().timestamp_millis() + 1_500;
+    let placement = place_bulk_delete(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        Some(&retained),
+        true,
+    );
+    assert!(
+        placement.reserved_pending,
+        "{channel_event} pending id was not reserved"
+    );
+    let sink = Sink::default();
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert_eq!(
+        removal.action,
+        crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    assert!(removal.bulk_inflight, "{channel_event}");
+    assert_eq!(
+        removal
+            .retained
+            .as_ref()
+            .and_then(|row| row.fields.content.as_deref()),
+        Some("expired-snapshot-secret"),
+        "snapshot must still be valid when the replay is deferred"
+    );
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(
+        sink.messages.lock().unwrap().is_empty(),
+        "{channel_event} deferred replay sent early: {:?}",
+        sink_bodies(&sink)
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    (sink, removal)
+}
+
+#[tokio::test]
+async fn deferred_bulk_replay_drops_text_that_expires_while_inflight() {
+    let f = Fixture::new();
+    let (sink, _) = defer_then_expire(&f, "message_bulk_delete", 903).await;
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        BulkDeliveryOutcome::Failed,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].contains("retained snapshot unavailable"),
+        "{bodies:?}"
+    );
+    assert!(
+        !bodies[0].contains("expired-snapshot-secret"),
+        "expired snapshot text was published: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn deferred_plain_replay_drops_text_that_expires_while_inflight() {
+    let f = Fixture::new();
+    let (sink, _) = defer_then_expire(&f, "message_delete", 902).await;
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        BulkDeliveryOutcome::Failed,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].contains("902"), "{bodies:?}");
+    assert!(
+        bodies[0].contains("unavailable (not captured)"),
+        "{bodies:?}"
+    );
+    assert!(
+        !bodies[0].contains("expired-snapshot-secret"),
+        "expired snapshot text was published: {bodies:?}"
+    );
 }

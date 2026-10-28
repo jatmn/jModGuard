@@ -46,10 +46,15 @@ Joining, leaving and talking still do not maintain a general activity archive.
   distinguish retained, known missing, storage unknown and filtered entries,
   and attach a transient
   UTF-8 transcript capped at 256 KiB. The summary keeps the total and filtered
-  counts without including ignored authors' content. A definite
+  counts without including ignored authors' content. A source-channel exclusion
+  or a bulk destination already known to be unavailable suppresses that report,
+  including when a pending automod delete falls back through `message_bulk_delete`.
+  A user filter still sends the summary and filtered count without that author's
+  content. A definite
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
-  ambiguous timeout is never resent. A pending automod delete replayed through
+  ambiguous timeout or cancellation is never resent, and it does not release a
+  deferred replay of the same deletion. A pending automod delete replayed through
   `message_bulk_delete` because no `message_delete` channel is configured uses
   that same attachment fallback. The transcript is not archived.
 - Join reports use the delivered user and the join timestamp in the Gateway member

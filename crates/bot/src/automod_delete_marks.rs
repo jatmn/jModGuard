@@ -55,12 +55,21 @@ pub(crate) struct DeferredBulkReplay {
 /// What a failed REST delete should do with a pending id that stayed in a bulk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkPlainReplay {
-    /// The transcript that kept this delete was delivered.
+    /// The transcript that kept this delete was delivered, or its delivery is ambiguous.
     Covered,
     /// Delivery has not settled; emit only if it fails.
     Deferred,
     /// No delivered or in-flight bulk covers this delete.
     Emit,
+}
+
+/// Result of one bulk-transcript attempt.
+/// Ambiguous means Discord may already have the body, so a deferred replay stays unsent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkDeliveryOutcome {
+    Delivered,
+    Failed,
+    Ambiguous,
 }
 
 /// Per-REST-delete attempt identity for one message target.
@@ -89,9 +98,11 @@ struct MessageGatewayState {
 
 /// Delivery of one message that stayed in a bulk transcript.
 /// `covered` is set only after that transcript is actually delivered.
+/// `ambiguous` means a timeout or partial send may already have reached Discord.
 struct BulkLogState {
     inflight: bool,
     covered: bool,
+    ambiguous: bool,
     deferred: bool,
     deferred_retained: Option<MessageSnapshot>,
     started: Instant,
@@ -552,9 +563,46 @@ impl AutomodDeleteMarks {
 
     fn bulk_coverage(&self, target: MessageTarget) -> (bool, bool) {
         match self.bulk_logs.get(&target) {
-            Some(state) => (state.covered, state.inflight),
+            Some(state) => (state.covered || state.ambiguous, state.inflight),
             None => (false, false),
         }
+    }
+
+    /// Mark one pending gateway delete as in a bulk transcript.
+    /// Returns false when the gateway state is already gone, covered, ambiguous, or at cap.
+    fn reserve_bulk_delivery(
+        &mut self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        now: Instant,
+    ) -> bool {
+        let target = Self::message_target(guild, channel, message);
+        let pending = self
+            .gateway
+            .get(&target)
+            .is_some_and(|state| state.observed && !state.settled);
+        if !pending {
+            return false;
+        }
+        if self.bulk_logs.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.bulk_logs.contains_key(&target)
+        {
+            return false;
+        }
+        let state = self.bulk_logs.entry(target).or_insert(BulkLogState {
+            inflight: false,
+            covered: false,
+            ambiguous: false,
+            deferred: false,
+            deferred_retained: None,
+            started: now,
+        });
+        if state.covered || state.ambiguous {
+            return false;
+        }
+        state.inflight = true;
+        state.started = now;
+        true
     }
 
     pub(crate) fn begin_bulk_delivery(
@@ -566,31 +614,7 @@ impl AutomodDeleteMarks {
     ) {
         self.expire_bulk_logs(now);
         for message in ids {
-            let target = Self::message_target(guild, channel, *message);
-            let pending = self
-                .gateway
-                .get(&target)
-                .is_some_and(|state| state.observed && !state.settled);
-            if !pending {
-                continue;
-            }
-            if self.bulk_logs.len() >= MAX_AUTOMOD_DELETE_MARKS
-                && !self.bulk_logs.contains_key(&target)
-            {
-                continue;
-            }
-            let state = self.bulk_logs.entry(target).or_insert(BulkLogState {
-                inflight: false,
-                covered: false,
-                deferred: false,
-                deferred_retained: None,
-                started: now,
-            });
-            if state.covered {
-                continue;
-            }
-            state.inflight = true;
-            state.started = now;
+            let _ = self.reserve_bulk_delivery(guild, channel, *message, now);
         }
     }
 
@@ -599,35 +623,52 @@ impl AutomodDeleteMarks {
         guild: u64,
         channel: u64,
         ids: &[u64],
-        delivered: bool,
+        outcome: BulkDeliveryOutcome,
     ) -> Vec<DeferredBulkReplay> {
         let mut replay = Vec::new();
         for message in ids {
             let target = Self::message_target(guild, channel, *message);
-            if delivered {
-                if let Some(state) = self.bulk_logs.get_mut(&target) {
-                    state.inflight = false;
-                    state.covered = true;
-                    state.deferred = false;
-                    state.deferred_retained = None;
+            match outcome {
+                BulkDeliveryOutcome::Delivered => {
+                    if let Some(state) = self.bulk_logs.get_mut(&target) {
+                        state.inflight = false;
+                        state.covered = true;
+                        state.ambiguous = false;
+                        state.deferred = false;
+                        state.deferred_retained = None;
+                    }
                 }
-                continue;
-            }
-            if self
-                .bulk_logs
-                .get(&target)
-                .is_some_and(|state| state.covered)
-            {
-                continue;
-            }
-            let Some(state) = self.bulk_logs.remove(&target) else {
-                continue;
-            };
-            if state.deferred {
-                replay.push(DeferredBulkReplay {
-                    message: *message,
-                    retained: state.deferred_retained,
-                });
+                BulkDeliveryOutcome::Ambiguous => {
+                    // Keep the entry so a later REST failure cannot emit a second report.
+                    // Drop any deferred replay: Discord may already have the transcript.
+                    if let Some(state) = self.bulk_logs.get_mut(&target) {
+                        if state.covered {
+                            continue;
+                        }
+                        state.inflight = false;
+                        state.ambiguous = true;
+                        state.deferred = false;
+                        state.deferred_retained = None;
+                    }
+                }
+                BulkDeliveryOutcome::Failed => {
+                    if self
+                        .bulk_logs
+                        .get(&target)
+                        .is_some_and(|state| state.covered || state.ambiguous)
+                    {
+                        continue;
+                    }
+                    let Some(state) = self.bulk_logs.remove(&target) else {
+                        continue;
+                    };
+                    if state.deferred {
+                        replay.push(DeferredBulkReplay {
+                            message: *message,
+                            retained: settlement_retained(state.deferred_retained),
+                        });
+                    }
+                }
             }
         }
         replay
@@ -648,12 +689,12 @@ impl AutomodDeleteMarks {
         else {
             return BulkPlainReplay::Emit;
         };
-        if state.covered {
+        if state.covered || state.ambiguous {
             return BulkPlainReplay::Covered;
         }
         if state.inflight {
             state.deferred = true;
-            state.deferred_retained = retained;
+            state.deferred_retained = settlement_retained(retained);
             return BulkPlainReplay::Deferred;
         }
         BulkPlainReplay::Emit
@@ -868,16 +909,41 @@ impl AutomodDeleteMarkAccess {
             .begin_bulk_delivery(guild, channel, ids, Instant::now());
     }
 
+    /// Observe a gateway delete and, when `reserve` is set, mark a pending automod
+    /// id in-flight before releasing the lock. A concurrent REST failure then defers
+    /// instead of emitting while the caller also keeps the id in the transcript.
+    pub(crate) fn observe_and_reserve_bulk_delete(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+        retained: Option<MessageSnapshot>,
+        reserve: bool,
+    ) -> (GatewayDeleteObservation, bool) {
+        let mut marks = self.inner.lock();
+        let now = Instant::now();
+        let observation = marks.observe_gateway_delete(guild, channel, message, retained, now);
+        let mut reserved = false;
+        if reserve && matches!(observation, GatewayDeleteObservation::PendingAutomod) {
+            // The regression test injects a REST failure here. It must run
+            // before reserve and while this lock is still held.
+            #[cfg(test)]
+            run_bulk_reserve_gap_hook();
+            reserved = marks.reserve_bulk_delivery(guild, channel, message, now);
+        }
+        (observation, reserved)
+    }
+
     pub(crate) fn finish_bulk_delivery(
         &self,
         guild: u64,
         channel: u64,
         ids: &[u64],
-        delivered: bool,
+        outcome: BulkDeliveryOutcome,
     ) -> Vec<DeferredBulkReplay> {
         self.inner
             .lock()
-            .finish_bulk_delivery(guild, channel, ids, delivered)
+            .finish_bulk_delivery(guild, channel, ids, outcome)
     }
 
     pub(crate) fn claim_or_defer_plain_replay(
@@ -941,6 +1007,53 @@ impl AutomodDeleteMarkAccess {
         self.inner
             .lock()
             .take_stored_retained(guild, channel, message, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gateway_observed_unsettled(
+        &self,
+        guild: u64,
+        channel: u64,
+        message: u64,
+    ) -> bool {
+        self.inner
+            .lock()
+            .gateway
+            .get(&(guild, channel, message))
+            .is_some_and(|state| state.observed && !state.settled)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bulk_log_contains(&self, guild: u64, channel: u64, message: u64) -> bool {
+        self.inner
+            .lock()
+            .bulk_logs
+            .contains_key(&(guild, channel, message))
+    }
+}
+
+#[cfg(test)]
+type BulkReserveGapHook = Box<dyn Fn() + Send>;
+
+#[cfg(test)]
+fn bulk_reserve_gap_slot() -> &'static parking_lot::Mutex<Option<BulkReserveGapHook>> {
+    use std::sync::OnceLock;
+    static HOOK: OnceLock<parking_lot::Mutex<Option<BulkReserveGapHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Test hook invoked after observation and before bulk reservation, while the
+/// marks mutex is still held. The closure runs outside this hook mutex.
+#[cfg(test)]
+pub(crate) fn set_bulk_reserve_gap_hook(hook: Option<BulkReserveGapHook>) {
+    *bulk_reserve_gap_slot().lock() = hook;
+}
+
+#[cfg(test)]
+fn run_bulk_reserve_gap_hook() {
+    let hook = bulk_reserve_gap_slot().lock().take();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

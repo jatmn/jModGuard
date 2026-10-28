@@ -2799,7 +2799,7 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
         .remembered_discord_targets
         .capture_recovery_epoch(rest_target);
     let started = Instant::now();
-    let (delivered, error, _) = deliver_bulk_text_fallback_parts(
+    let fallback = deliver_bulk_text_fallback_parts(
         &f.app,
         &http,
         destination,
@@ -2812,8 +2812,16 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
         recovery,
     )
     .await;
-    assert!(error.is_none(), "unexpected discord error: {:?}", error);
-    assert!(delivered, "expected every fallback part to succeed");
+    assert!(
+        fallback.terminal_error.is_none(),
+        "unexpected discord error: {:?}",
+        fallback.terminal_error
+    );
+    assert_eq!(
+        fallback.outcome,
+        BulkDeliveryOutcome::Delivered,
+        "expected every fallback part to succeed"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         parts.len(),
@@ -3145,6 +3153,140 @@ async fn replayed_bulk_attachment_timeout_or_cancel_or_server_error_is_not_resen
         replay_attachment_proxy(ReplayAttachmentProxy::ServerError).await;
     replay_failed_automod_bulk(&f, &http).await;
     assert_eq!(requests.lock().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn ambiguous_bulk_timeout_does_not_release_a_deferred_replay() {
+    async fn prepare_bulk_only(f: &Fixture) -> crate::automod_delete_marks::AutomodDeleteAttempt {
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        let attempt = f
+            .app
+            .automod_delete_marks
+            .insert(789, 456, 123, "badword", "Bad words");
+        let retained = replay_snapshot("bulk fallback body");
+        let placement = place_bulk_delete(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+            true,
+        );
+        assert!(placement.reserved_pending);
+        attempt
+    }
+
+    let f = Fixture::with_timeout(1);
+    let attempt = prepare_bulk_only(&f).await;
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Hang).await;
+    let sink = Sink::default();
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert!(removal.bulk_inflight);
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(sink.messages.lock().unwrap().is_empty());
+    let retained = replay_snapshot("bulk fallback body");
+    let mut transcript = BulkTranscript::new(1);
+    transcript.keep_pending_automod(MessageId::new(123));
+    transcript.push(MessageId::new(123), Some(&retained));
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        transcript,
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Ambiguous);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the timed-out attempt still handed the transcript to Discord"
+    );
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        outcome,
+    )
+    .await;
+    assert!(
+        sink.messages.lock().unwrap().is_empty(),
+        "ambiguous timeout must not resend the deferred replay: {:?}",
+        sink.messages.lock().unwrap()
+    );
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    let attempt = prepare_bulk_only(&f).await;
+    let (http, requests, server) =
+        replay_attachment_proxy(ReplayAttachmentProxy::ServerError).await;
+    let sink = Sink::default();
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+    assert!(sink.messages.lock().unwrap().is_empty());
+    let retained = replay_snapshot("bulk fallback body");
+    let mut transcript = BulkTranscript::new(1);
+    transcript.keep_pending_automod(MessageId::new(123));
+    transcript.push(MessageId::new(123), Some(&retained));
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        transcript,
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Failed);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        outcome,
+    )
+    .await;
+    let bodies: Vec<String> = sink
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(channel, body)| format!("{channel} {body}"))
+        .collect();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].contains("last observed: bulk fallback body"),
+        "a definite bulk failure still releases one replay: {bodies:?}"
+    );
     server.abort();
 }
 
