@@ -8494,3 +8494,313 @@ async fn pending_boot_mismatch_clear_retry_keeps_record_and_successful_clear_dro
     drop(db);
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
+
+#[tokio::test]
+async fn blocked_boot_record_is_not_cleared_while_running_is_absent_or_not_baked() {
+    let root = std::env::temp_dir().join(format!(
+        "boot-mismatch-order-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    db::record_boot_mismatch(
+        &db,
+        db::BootMismatchRecord {
+            component: "api".into(),
+            running: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            expected: db::BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "b".repeat(40),
+            },
+            reason: UNSIGNED_IMAGE.into(),
+        },
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let writable = DbOpenOptions {
+        read_only: false,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let mut api = controller(
+        "api",
+        root.join("baked-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        UpdateControl::open(&writable).unwrap().unwrap(),
+        &root,
+    );
+    let release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    api.queue_pending_boot_clear_retry();
+    api.queue_pending_boot_record(release, UNSIGNED_IMAGE.into());
+    assert_eq!(api.pending_boot_mismatch_labels(), ["record", "clear"]);
+    api.flush_pending_boot_mismatch().await.unwrap();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "an absent child must not flush a clear ahead of a blocked record"
+    );
+    let other = root.join("not-baked");
+    tokio::fs::write(&other, b"#!/bin/sh\nexec sleep 30\n")
+        .await
+        .unwrap();
+    std::fs::set_permissions(&other, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    api.start(&other, &"b".repeat(40), None).await.unwrap();
+    api.flush_pending_boot_mismatch().await.unwrap();
+    assert_eq!(
+        api.pending_boot_mismatch_labels(),
+        ["record", "clear"],
+        "a non-baked child must not flush a clear ahead of a blocked record"
+    );
+    let db = Db::open(&path, 2).unwrap();
+    assert!(
+        !db::read_boot_mismatch_map(&db).await.unwrap().is_empty(),
+        "the durable mismatch row must stay until the record can be saved"
+    );
+    drop(db);
+    // API idle relaunches the baked binary. The stand-in only has to exist
+    // so stopping the non-baked child can release the process.
+    let baked = root.join("baked-api");
+    tokio::fs::write(&baked, b"#!/bin/sh\nexec sleep 30\n")
+        .await
+        .unwrap();
+    std::fs::set_permissions(&baked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    api.stop_application().await.unwrap();
+    api.end_idle().await.unwrap();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn transient_restore_does_not_boot_repair_or_record_mismatch() {
+    let root = std::env::temp_dir().join(format!("sig-transient-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let mut release = release_at("api", 'a', db::CORE_SCHEMA_VERSION);
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let release_json = serde_json::to_string(&release).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, state='running' WHERE component='api'",
+            params![release_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control.clone(),
+        &root,
+    );
+    let error = api
+        .restore(&control.component("api").await.unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        registry_transient(&error),
+        "restore must surface the registry outage for retry: {error:#}"
+    );
+    assert!(api.running.is_none());
+    assert!(api.baked_fallback_installed.is_none());
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    drop((api, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn baked_fallback_keeps_installed_selection_through_failed_candidate_and_cold_start() {
+    let root = std::env::temp_dir().join(format!("fallback-keep-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let candidate_bin = executable(&root, "candidate-bot").await;
+    let mut objects = HashMap::new();
+    let mut installed = image(&mut objects, "bot", &tokio::fs::read(&baked).await.unwrap());
+    let mut candidate = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(&candidate_bin).await.unwrap(),
+    );
+    for release in [&mut installed, &mut candidate] {
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    }
+    let available = objects.clone();
+    objects.remove(&signature_tag_for_digest(&installed.digest).unwrap());
+    let (registry, server) = registry_with_objects(objects).await;
+    let (db, control) = open_launcher_db(&root).await;
+    let installed_digest = installed.digest.clone();
+    let release_json = serde_json::to_string(&installed).unwrap();
+    let observed = db::ComponentObservation {
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+        source_sha: "b".repeat(40),
+        executable_sha256: "a".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "b".repeat(40),
+        started_at: 100,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+    };
+    let observed_json = serde_json::to_string(&observed).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1, observed=?2, observed_at=?3, state='running' WHERE component='bot'",
+            params![release_json, observed_json, now()],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut bot = controller("bot", baked.clone(), registry, control.clone(), &root);
+    bot.running = None;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+    }
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert_eq!(
+        bot.baked_fallback_installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str())
+    );
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+
+    let counterpart = db::ComponentObservation {
+        started_at: now(),
+        ..observed
+    };
+    control
+        .running("api", None, counterpart, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("hold-candidate-bot-ready"), "hold")
+        .await
+        .unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    let mut started_candidate = false;
+    for _ in 0..20 {
+        bot.tick().await.unwrap();
+        if bot
+            .running
+            .as_ref()
+            .and_then(|child| child.release.as_ref())
+            .is_some_and(|release| release.digest == candidate.digest)
+        {
+            started_candidate = true;
+            break;
+        }
+    }
+    assert!(started_candidate, "candidate did not start");
+    assert_eq!(
+        bot.baked_fallback_installed
+            .as_ref()
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "starting the candidate must keep the installed fallback identity"
+    );
+    assert!(
+        bot.standby
+            .as_ref()
+            .is_some_and(|(_, _, process_release)| process_release.is_none()),
+        "standby must keep the baked executable identity"
+    );
+    bot.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+    bot.tick().await.unwrap();
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(bot.running.as_ref().unwrap().release.is_none());
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest,
+        "rollback must not clear the installed selection"
+    );
+    wait_for_bot_ready(&mut bot).await;
+    assert_eq!(bot.running.as_ref().unwrap().path, baked);
+    assert!(
+        bot.running.as_ref().unwrap().release.is_none(),
+        "baked rollback must not claim the installed release is running"
+    );
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    let (registry, cold_server) = registry_with_objects(available).await;
+    let mut cold = controller("bot", baked.clone(), registry, control.clone(), &root);
+    cold.restore(&control.component("bot").await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        cold.running
+            .as_ref()
+            .and_then(|child| child.release.as_ref())
+            .map(|release| release.digest.as_str()),
+        Some(installed_digest.as_str()),
+        "a later boot must restore the retained installed release"
+    );
+    assert_ne!(cold.running.as_ref().unwrap().path, baked);
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed_digest
+    );
+    cold.stop_application().await.unwrap();
+    cold.end_idle().await.unwrap();
+    server.abort();
+    cold_server.abort();
+    drop((bot, cold, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}

@@ -784,6 +784,52 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn baked_child_running(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|child| child.path == self.baked)
+    }
+
+    fn pending_record_blocks_clear(&self) -> bool {
+        self.pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Record { .. }))
+            && !self.baked_child_running()
+    }
+
+    fn keep_record_ahead_of_clear(&mut self) {
+        if !self
+            .pending_boot_mismatch
+            .iter()
+            .any(|pending| matches!(pending, PendingBootMismatch::Record { .. }))
+        {
+            return;
+        }
+        let mut records = VecDeque::new();
+        let mut rest = VecDeque::new();
+        for pending in self.pending_boot_mismatch.drain(..) {
+            match pending {
+                record @ PendingBootMismatch::Record { .. } => records.push_back(record),
+                other => rest.push_back(other),
+            }
+        }
+        records.append(&mut rest);
+        self.pending_boot_mismatch = records;
+    }
+
+    /// The baked process is not release A. When that process is the rollback
+    /// target, the durable installed selection is the retained fallback.
+    fn durable_baked_selection(
+        &self,
+        path_is_baked: bool,
+        process_release: &Option<ComponentRelease>,
+    ) -> Option<ComponentRelease> {
+        if process_release.is_some() || !path_is_baked {
+            return process_release.clone();
+        }
+        self.baked_fallback_installed.clone()
+    }
+
     fn queue_pending_boot_record(&mut self, release: ComponentRelease, reason: String) {
         for pending in &mut self.pending_boot_mismatch {
             if let PendingBootMismatch::Record {
@@ -793,14 +839,24 @@ impl Supervisor {
             {
                 **existing = release;
                 *existing_reason = reason;
+                self.keep_record_ahead_of_clear();
                 return;
             }
         }
-        self.pending_boot_mismatch
-            .push_back(PendingBootMismatch::Record {
-                release: Box::new(release),
-                reason,
-            });
+        let record = PendingBootMismatch::Record {
+            release: Box::new(release),
+            reason,
+        };
+        if let Some(index) = self
+            .pending_boot_mismatch
+            .iter()
+            .position(|pending| matches!(pending, PendingBootMismatch::Clear))
+        {
+            self.pending_boot_mismatch.insert(index, record);
+        } else {
+            self.pending_boot_mismatch.push_back(record);
+        }
+        self.keep_record_ahead_of_clear();
     }
 
     fn queue_pending_boot_clear_retry(&mut self) {
@@ -809,10 +865,12 @@ impl Supervisor {
             .iter()
             .any(|pending| matches!(pending, PendingBootMismatch::Clear))
         {
+            self.keep_record_ahead_of_clear();
             return;
         }
         self.pending_boot_mismatch
             .push_back(PendingBootMismatch::Clear);
+        self.keep_record_ahead_of_clear();
     }
 
     fn queue_pending_boot_clear_after_recovery(&mut self) {
@@ -1126,15 +1184,14 @@ impl Supervisor {
         if self.pending_boot_mismatch.is_empty() || !self.receipt_wait_elapsed() {
             return Ok(());
         }
+        self.keep_record_ahead_of_clear();
+        let record_blocked = self.pending_record_blocks_clear();
         let index = self
             .pending_boot_mismatch
             .iter()
             .position(|pending| match pending {
-                PendingBootMismatch::Clear => true,
-                PendingBootMismatch::Record { .. } => self
-                    .running
-                    .as_ref()
-                    .is_some_and(|child| child.path == self.baked),
+                PendingBootMismatch::Clear => !record_blocked,
+                PendingBootMismatch::Record { .. } => self.baked_child_running(),
             });
         let Some(index) = index else {
             return Ok(());
@@ -1467,9 +1524,6 @@ impl Supervisor {
         if self.running.is_some() {
             anyhow::bail!("application process is already running");
         }
-        if path != self.baked {
-            self.baked_fallback_installed = None;
-        }
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
         }
@@ -1579,9 +1633,10 @@ impl Supervisor {
             return Ok(false);
         }
         if let Some((failed, error)) = self.rollback.clone() {
+            let previous = self.durable_baked_selection(running_from_baked, &release);
             match self
                 .control
-                .rolled_back(&self.role, &failed, release.clone(), seen, &error, now())
+                .rolled_back(&self.role, &failed, previous, seen, &error, now())
                 .await
             {
                 Ok(()) => {
@@ -1618,6 +1673,9 @@ impl Supervisor {
             };
             match saved {
                 Ok(()) => {
+                    if installed_digest.is_some() && !running_from_baked {
+                        self.baked_fallback_installed = None;
+                    }
                     self.standby = None;
                     self.reported = true;
                     self.last_observed = Some(Instant::now());
@@ -1927,6 +1985,14 @@ impl Supervisor {
                         .await?;
                 }
                 Err(error) => {
+                    if registry_transient(&error) {
+                        tracing::warn!(
+                            component = %self.role,
+                            digest = %release.digest,
+                            "registry download stalled on transient error: {error:#}"
+                        );
+                        return Err(error);
+                    }
                     if let Some(reason) = boot_repair_reason(&error) {
                         return self
                             .boot_fallback_from_installed(state, release, reason)
@@ -2187,14 +2253,17 @@ impl Supervisor {
                 Ok(ControlStep::Defer) => return Ok(false),
                 Ok(ControlStep::Proceed) => {}
                 Err(error) => {
-                    if let Some(op) = self.control.upgrade().await?.filter(|op| {
-                        self.rollback.is_none()
-                            && op.phase == Phase::Complete
-                            && state.installed.as_ref().is_some_and(|release| {
-                                op.service(&self.role)
-                                    .is_ok_and(|service| release.digest == service.release.digest)
-                            })
-                    }) {
+                    if !registry_transient(&error)
+                        && let Some(op) = self.control.upgrade().await?.filter(|op| {
+                            self.rollback.is_none()
+                                && op.phase == Phase::Complete
+                                && state.installed.as_ref().is_some_and(|release| {
+                                    op.service(&self.role).is_ok_and(|service| {
+                                        release.digest == service.release.digest
+                                    })
+                                })
+                        })
+                    {
                         self.control
                             .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
                             .await?;
@@ -2240,6 +2309,7 @@ impl Supervisor {
                 return Ok(false);
             }
             if let Some((path, sha, previous)) = self.standby.take() {
+                let durable = self.durable_baked_selection(path == self.baked, &previous);
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
                 let schema = self.control.schema_version().await?;
@@ -2268,7 +2338,7 @@ impl Supervisor {
                     .and_then(|r| r.release.clone())
                     .context("failed replacement missing")?;
                 self.stop_application().await?;
-                self.start(&path, &sha, previous.clone()).await?;
+                self.start(&path, &sha, previous).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
                 let message = format!("{error:#}");
                 match self
@@ -2276,7 +2346,7 @@ impl Supervisor {
                     .rolled_back(
                         &self.role,
                         &failed,
-                        previous,
+                        durable,
                         deployment_observation(
                             child,
                             &self.base_sha,

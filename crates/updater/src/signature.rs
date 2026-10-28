@@ -305,17 +305,24 @@ pub fn signature_rejection_phrase(error: &anyhow::Error) -> Option<&'static str>
         .map(|rejection| rejection.phrase)
 }
 
+fn transport_is_transient(req: &reqwest::Error) -> bool {
+    if req.is_timeout() || req.is_connect() || req.is_request() {
+        return true;
+    }
+    req.status()
+        .is_some_and(|status| matches!(status.as_u16(), 408 | 429) || status.is_server_error())
+}
+
 pub fn registry_transient(error: &anyhow::Error) -> bool {
     if signature_rejection_phrase(error).is_some() {
         return false;
     }
-    if let Some(req) = error.downcast_ref::<reqwest::Error>() {
-        if req.is_timeout() || req.is_connect() || req.is_request() {
-            return true;
-        }
-        if let Some(status) = req.status() {
-            return matches!(status.as_u16(), 408 | 429) || status.is_server_error();
-        }
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(transport_is_transient)
+    }) {
+        return true;
     }
     let message = error.to_string();
     message.contains("incomplete registry body")
@@ -327,23 +334,16 @@ pub fn registry_transient(error: &anyhow::Error) -> bool {
 }
 
 pub fn registry_unreachable_reason(error: &anyhow::Error) -> Option<&'static str> {
-    if signature_rejection_phrase(error).is_some() {
-        return None;
-    }
-    if registry_transient(error) {
-        return Some(REGISTRY_UNREACHABLE);
-    }
-    if error.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|req| req.is_connect() || req.is_timeout())
-    }) {
-        return Some(REGISTRY_UNREACHABLE);
-    }
+    // Outages are retried. They are not a signature rejection and do not
+    // authorize a durable boot-mismatch row.
+    let _ = registry_transient(error) || signature_rejection_phrase(error).is_some();
     None
 }
 
 pub fn boot_repair_reason(error: &anyhow::Error) -> Option<&'static str> {
+    if registry_transient(error) {
+        return None;
+    }
     if let Some(phrase) = signature_rejection_phrase(error) {
         return Some(phrase);
     }
@@ -353,7 +353,7 @@ pub fn boot_repair_reason(error: &anyhow::Error) -> Option<&'static str> {
     {
         return Some(BAD_IMAGE_SIGNATURE);
     }
-    registry_unreachable_reason(error)
+    None
 }
 
 pub mod test_support {
@@ -475,5 +475,28 @@ pub mod test_support {
             }]
         });
         serde_json::to_vec(&envelope).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_registry_failures_are_retried_not_boot_repaired() {
+        let outage = anyhow::Error::msg("registry returned HTTP 503");
+        assert!(registry_transient(&outage));
+        assert!(registry_unreachable_reason(&outage).is_none());
+        assert!(boot_repair_reason(&outage).is_none());
+        assert_ne!(boot_repair_reason(&outage), Some(REGISTRY_UNREACHABLE));
+
+        let unsigned = anyhow::Error::new(ImageSignatureRejection {
+            phrase: UNSIGNED_IMAGE,
+        });
+        assert!(!registry_transient(&unsigned));
+        assert_eq!(boot_repair_reason(&unsigned), Some(UNSIGNED_IMAGE));
+
+        let bad = anyhow::Error::msg(BAD_IMAGE_SIGNATURE);
+        assert_eq!(boot_repair_reason(&bad), Some(BAD_IMAGE_SIGNATURE));
     }
 }
