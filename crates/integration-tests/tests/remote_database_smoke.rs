@@ -819,8 +819,7 @@ async fn exercise_configuration_reads(bot: &Db, api: &Db) {
         upsert_template(bot, guild, "read-scope", text)
             .await
             .unwrap();
-        let mut cmd = jmodguard::defaults::default_commands()[0].clone();
-        cmd.name = "read-scope".into();
+        let mut cmd = jmodguard::defaults::custom_command_fixture("read-scope");
         cmd.description = text.into();
         upsert_command(bot, guild, "read-scope", &cmd)
             .await

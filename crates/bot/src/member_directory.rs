@@ -454,7 +454,93 @@ async fn member_records_ban(
         .is_some_and(|member| member.is_banned)
 }
 
-pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) {
+pub async fn current_member_stay_id(app: &BotState, guild_id: u64, user_id: u64) -> Option<String> {
+    match live_observation(
+        app,
+        guild_id,
+        Some(user_id as i64),
+        "member stay lookup unavailable",
+    )
+    .await
+    {
+        Some((store, scope)) => match store.current_member_stay_id(scope, user_id as i64).await {
+            Ok(stay) => stay,
+            Err(error) => {
+                tracing::warn!(guild_id, user_id, "member stay lookup failed: {error:#}");
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+pub async fn pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64) -> bool {
+    let Some((store, scope)) = live_observation(
+        app,
+        guild_id,
+        Some(user_id as i64),
+        "member rejoin receipt unavailable",
+    )
+    .await
+    else {
+        return false;
+    };
+    match store
+        .has_pending_rejoin_note(scope.clone(), user_id as i64)
+        .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(
+                guild_id,
+                user_id,
+                "member rejoin receipt lookup failed: {error:#}"
+            );
+            mark_gap(
+                app,
+                &store,
+                scope,
+                Some(user_id as i64),
+                "member rejoin receipt unavailable",
+            )
+            .await;
+            false
+        }
+    }
+}
+
+pub async fn clear_pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64, stay_id: &str) {
+    let Some((store, scope)) = live_observation(
+        app,
+        guild_id,
+        Some(user_id as i64),
+        "member rejoin receipt unavailable",
+    )
+    .await
+    else {
+        return;
+    };
+    if let Err(error) = store
+        .clear_pending_rejoin_note(scope.clone(), user_id as i64, stay_id)
+        .await
+    {
+        tracing::warn!(
+            guild_id,
+            user_id,
+            "member rejoin receipt clear failed: {error:#}"
+        );
+        mark_gap(
+            app,
+            &store,
+            scope,
+            Some(user_id as i64),
+            "member rejoin receipt unavailable",
+        )
+        .await;
+    }
+}
+
+pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) -> bool {
     let Some((store, scope)) = live_observation(
         app,
         member.guild_id.get(),
@@ -463,25 +549,29 @@ pub async fn observe_join(app: &BotState, member: &Member, observed_at_ms: i64) 
     )
     .await
     else {
-        return;
+        return false;
     };
-    if let Err(error) = store
+    match store
         .observe_member(scope.clone(), from_member(member, observed_at_ms, true))
         .await
     {
-        tracing::warn!(
-            guild_id = member.guild_id.get(),
-            user_id = member.user.id.get(),
-            "member join observation failed: {error:#}"
-        );
-        mark_gap(
-            app,
-            &store,
-            scope,
-            Some(member.user.id.get() as i64),
-            "member join persistence unavailable",
-        )
-        .await;
+        Ok(outcome) => outcome.membership_refresh,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = member.guild_id.get(),
+                user_id = member.user.id.get(),
+                "member join observation failed: {error:#}"
+            );
+            mark_gap(
+                app,
+                &store,
+                scope,
+                Some(member.user.id.get() as i64),
+                "member join persistence unavailable",
+            )
+            .await;
+            false
+        }
     }
 }
 
@@ -597,8 +687,7 @@ pub async fn observe_ban(
     #[cfg(test)]
     app.record_gateway_ban_path_test_phase("observe");
     let user_id = user.id.get();
-    let contested = app.begin_ban_observation(guild_id, user_id);
-    let _end = BanObservation::new(app, guild_id, user_id);
+    let (contested, _end) = BanObservation::acquire(app, guild_id, user_id);
     let (store, scope) = live_observation(
         app,
         guild_id,
@@ -652,22 +741,106 @@ struct BanObservation<'a> {
     app: &'a BotState,
     guild_id: u64,
     user_id: u64,
+    owns: bool,
 }
 
 impl<'a> BanObservation<'a> {
-    fn new(app: &'a BotState, guild_id: u64, user_id: u64) -> Self {
-        Self {
+    /// The guard exists before this returns, including when registration panics.
+    fn acquire(app: &'a BotState, guild_id: u64, user_id: u64) -> (bool, Self) {
+        let mut guard = Self {
             app,
             guild_id,
             user_id,
-        }
+            owns: false,
+        };
+        let contested = app.begin_ban_observation(guild_id, user_id);
+        guard.owns = true;
+        (contested, guard)
+    }
+
+    /// A rejected overlap leaves the guard unowned so dropping it cannot release
+    /// another caller. The successful path owns the count before it returns.
+    fn try_command(app: &'a BotState, guild_id: u64, user_id: u64) -> Self {
+        let mut guard = Self {
+            app,
+            guild_id,
+            user_id,
+            owns: false,
+        };
+        guard.owns = app.try_begin_command_ban_observation(guild_id, user_id);
+        guard
     }
 }
 
 impl Drop for BanObservation<'_> {
     fn drop(&mut self) {
-        self.app.end_ban_observation(self.guild_id, self.user_id);
+        if self.owns {
+            self.app.end_ban_observation(self.guild_id, self.user_id);
+        }
     }
+}
+
+/// Serializes overlapping moderator-initiated bans for one guild member.
+pub(crate) struct CommandBanInProgress<'a> {
+    _observation: BanObservation<'a>,
+}
+
+#[cfg(test)]
+mod command_ban_in_progress_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_overlapping_command_ban_does_not_block_later_bans() {
+        let path = std::env::temp_dir().join(format!(
+            "ban_in_progress_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(crate::config::BotProcessConfig::default(), db).unwrap();
+        let first = begin_command_ban_in_progress(&app, 10, 20).expect("first ban");
+        assert!(
+            begin_command_ban_in_progress(&app, 10, 20).is_err(),
+            "overlapping ban must be rejected"
+        );
+        assert!(
+            begin_command_ban_in_progress(&app, 10, 20).is_err(),
+            "a second rejection must not consume the only free slot"
+        );
+        drop(first);
+        let again = begin_command_ban_in_progress(&app, 10, 20).expect("ban after release");
+        drop(again);
+
+        assert!(!app.begin_ban_observation(10, 21));
+        assert!(
+            begin_command_ban_in_progress(&app, 10, 21).is_err(),
+            "an active observation must still reject a command ban"
+        );
+        assert!(
+            begin_command_ban_in_progress(&app, 10, 21).is_err(),
+            "rejecting a command ban must not release the observation"
+        );
+        app.end_ban_observation(10, 21);
+        begin_command_ban_in_progress(&app, 10, 21).expect("command ban after observation ends");
+        drop(app);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        crate::tenant::remove_sidecars(&path);
+    }
+}
+
+pub(crate) fn begin_command_ban_in_progress(
+    app: &BotState,
+    guild_id: u64,
+    user_id: u64,
+) -> Result<CommandBanInProgress<'_>> {
+    let observation = BanObservation::try_command(app, guild_id, user_id);
+    if !observation.owns {
+        anyhow::bail!("another ban for this user is already in progress");
+    }
+    Ok(CommandBanInProgress {
+        _observation: observation,
+    })
 }
 
 pub async fn observe_unban(
@@ -677,8 +850,7 @@ pub async fn observe_unban(
     observed_at_ms: i64,
 ) -> Option<bool> {
     let user_id = user.id.get();
-    let contested = app.begin_ban_observation(guild_id, user_id);
-    let _end = BanObservation::new(app, guild_id, user_id);
+    let (contested, _end) = BanObservation::acquire(app, guild_id, user_id);
     let (store, scope) = live_observation(
         app,
         guild_id,

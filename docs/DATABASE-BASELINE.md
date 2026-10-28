@@ -111,10 +111,12 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version16,
-using `migrations/guild/0001_identity.sql` through `0015_local_write_fence.sql`. Version 16
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version17,
+using `migrations/guild/0001_identity.sql` through `0016_member_pending_rejoin_notes.sql`. Version 16
 adds optional immutable ban attempt tags to case payloads without changing tables or
-rewriting legacy cases. Earlier binaries must not read these payloads. This separate
+rewriting legacy cases. Version 17 adds durable `guild_member_pending_rejoin_notes` so
+member-rejoin log delivery can survive restarts and member-sync ahead of gateway joins.
+Earlier binaries must not read version16+ case tags or version17 pending receipts. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
@@ -150,4 +152,4 @@ rows for the same guild and user, keeping the row that already has an actor or
 a real reason, otherwise the earliest id. Inactive history stays. A unique index
 then rejects a second active row. Upgrade the bot and API together through the
 existing paired schema protocol; their exact core runtime schema is now 20. Migration 0020 adds the gateway ban delivery inbox: full received ban/unban/audit facts and stable retry results, scoped to the captured guild membership.
-The guild schema is 15. Migration 0015 adds `guild_local_write_fence` so a member-sync status read can see a fence inside the guild transaction, and `guild_writer_epoch` so a leased guild commit must match the holder's generation before it lands. Core fences remain in the other database. A newer holder raises that epoch in the guild store before it acts. The core writer lock is not held across the guild commit.
+Migration 0015 adds `guild_local_write_fence` so a member-sync status read can see a fence inside the guild transaction, and `guild_writer_epoch` so a leased guild commit must match the holder's generation before it lands. Core fences remain in the other database. A newer holder raises that epoch in the guild store before it acts. The core writer lock is not held across the guild commit.

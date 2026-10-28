@@ -11,17 +11,19 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 
 | Command | Category | Permission | Description |
 |---|---|---|---|
-| `!ban <user> [reason]` | Moderation | mod | Ban a user (aliases: `!yeet`, `!b`) |
+| `!ban <user> [--dm] [reason]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
-| `!kick <user> [reason]` | Moderation | mod | Kick a user (`!k`) |
+| `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
 | `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
 | `!warnclear <user>` | Moderation | mod | Clear a user's warnings |
+| `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you). A cached voice channel is named only when the caller can view it; otherwise the voice field is `unavailable` and omits the name and id. Channel mentions in case reasons use that rule. A private thread, including an archived one, also needs Manage Threads on the parent or known thread membership; uncached membership is `unavailable` and omits the id. An archived public thread stays with parent visibility. A user, role, or channel mention whose id is zero or does not fit is `unavailable` |
 | `!purge [count]` | Moderation | mod | Delete recent messages (max 100; `!clear`, `!p`) |
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
 | `!slowmode <seconds>` | Moderation | mod | Set slowmode on this channel |
 | `!banlist [limit]` | Moderation | mod | Recent bans tracked by the bot (`!bans`) |
+| `!voice <user>` | Moderation | mod | Report a user's cached voice channel (`not cached` when the guild is absent from cache, for an id, mention, name, or nickname; hidden or uncached channels are reported without naming them) |
 | `!setname <name>` | Admin | admin | Queue the bot's nickname for application in this server |
 | `!prefix <prefix>` | Admin | admin | Change this server's command prefix |
 | `!template <list\|get\|set\|reset> [event] [text]` | Admin | admin | Edit log event templates |
@@ -32,8 +34,11 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!about` | Utility | everyone | Bot info |
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
 
+`/kick` and `/ban` accept an optional boolean `dm` to DM the reason to the target.
+
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
-`/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,
+`/warn`, `/warns`, `/warnclear`, `/userinfo`, `/purge`, `/say`, `/slowmode`, `/voice`,
+`/unban`,
 `/setname`, `/prefix`, `/template`, `/rule`, `/testregex`, `/help`, `/about`,
 `/stats`).
 

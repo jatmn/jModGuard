@@ -947,6 +947,92 @@ fn legacy_setname_payload(shipped: &crate::types::CommandDef) -> Result<String> 
     Ok(serde_json::to_string(&legacy)?)
 }
 
+pub(crate) fn legacy_kick_ban_usage_payload(
+    shipped: &crate::types::CommandDef,
+    usage: &str,
+) -> Result<String> {
+    let mut legacy = shipped.clone();
+    legacy.usage = usage.into();
+    Ok(serde_json::to_string(&legacy)?)
+}
+
+const KICK_BAN_DM_USAGE_MARKER: &str = "kick_ban_dm_usage_v1";
+
+fn kick_ban_dm_usage_needs_upgrade(conn: &impl SqlExecutor) -> Result<bool> {
+    for cmd in crate::defaults::default_commands() {
+        let (name, legacy_usage) = match cmd.name.as_str() {
+            "kick" => ("kick", "!kick <user> [reason]"),
+            "ban" => ("ban", "!ban <user> [reason]"),
+            _ => continue,
+        };
+        let legacy = legacy_kick_ban_usage_payload(&cmd, legacy_usage)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE name = ?1 AND data = ?2",
+            params![name, legacy],
+            |row| Ok(row.get(0)?),
+        )?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn kick_ban_dm_usage_upgrade_sql() -> Result<String> {
+    let mut sql = String::new();
+    for cmd in crate::defaults::default_commands() {
+        if cmd.name == "kick" {
+            sql.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'kick' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!kick <user> [reason]"
+                )?)
+            ));
+        }
+        if cmd.name == "ban" {
+            sql.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'ban' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!ban <user> [reason]"
+                )?)
+            ));
+        }
+    }
+    Ok(sql)
+}
+
+/// Rewrites legacy kick/ban usage strings on every guild row, including when
+/// global seeding is already satisfied. Idempotent: runs whenever migrate-open
+/// sees a satisfied seed so guild-scoped rows are not skipped after the marker
+/// is first written.
+pub(super) fn upgrade_legacy_kick_ban_usage_conn(conn: &mut Connection) -> Result<()> {
+    let marker_missing = meta_string_conn(conn, KICK_BAN_DM_USAGE_MARKER)?.is_none();
+    if !kick_ban_dm_usage_needs_upgrade(conn)? {
+        if marker_missing {
+            write_meta_string_conn(conn, KICK_BAN_DM_USAGE_MARKER, "1")?;
+        }
+        return Ok(());
+    }
+    let body = kick_ban_dm_usage_upgrade_sql()?;
+    let tx = conn.transaction_immediate()?;
+    let before = total_changes(&tx)?;
+    tx.execute_batch_bounded(&body, seed_batch_growth(&body))?;
+    let changed = total_changes(&tx)? > before;
+    if changed {
+        bump_config_version_conn(&tx)?;
+        bump_slash_registry_version_conn(&tx)?;
+    }
+    if changed || meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER)?.is_none() {
+        write_meta_string_conn(&tx, KICK_BAN_DM_USAGE_MARKER, "1")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// True when a migrate-open has nothing left to write. The check is one short
 /// primary read. The previous seed held BEGIN IMMEDIATE across every default
 /// row, and each statement was its own Hrana round trip.
@@ -1009,7 +1095,7 @@ fn shipped_global_keys_present(conn: &impl SqlExecutor) -> Result<bool> {
     if rules != crate::types::RULE_IDS.len() as i64 {
         return Ok(false);
     }
-    let commands = crate::defaults::default_commands();
+    let commands = crate::defaults::default_global_seed_commands();
     let command_names: Vec<String> = commands.iter().map(|cmd| cmd.name.to_lowercase()).collect();
     let command_refs: Vec<&str> = command_names.iter().map(String::as_str).collect();
     if count_global_keys(conn, "commands", "name", &command_refs)? != command_refs.len() as i64 {
@@ -1055,6 +1141,7 @@ pub(super) fn seed_globals_conn(
     terminal: &GuildSettings,
 ) -> Result<()> {
     if globals_seed_satisfied(conn)? {
+        upgrade_legacy_kick_ban_usage_conn(conn)?;
         return Ok(());
     }
     let tx = conn.transaction_immediate()?;
@@ -1093,6 +1180,7 @@ pub(super) fn seed_globals_conn(
         write_meta_string_conn(&tx, key, "1")?;
     }
     tx.commit()?;
+    upgrade_legacy_kick_ban_usage_conn(conn)?;
     Ok(())
 }
 
@@ -1204,7 +1292,7 @@ fn seed_globals_sql(
         ));
         markers.push("retained_bulk_status_template_v1");
     }
-    for mut cmd in crate::defaults::default_commands() {
+    for mut cmd in crate::defaults::default_global_seed_commands() {
         if cmd.name == "stats" && status_taken {
             cmd.aliases.clear();
         }
@@ -1229,6 +1317,26 @@ fn seed_globals_sql(
                 "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'setname' AND data = {};\n",
                 sql_text(&serde_json::to_string(&cmd)?),
                 sql_text(&legacy_setname_payload(&cmd)?)
+            ));
+        }
+        if cmd.name == "kick" {
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'kick' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!kick <user> [reason]"
+                )?)
+            ));
+        }
+        if cmd.name == "ban" {
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'ban' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_kick_ban_usage_payload(
+                    &cmd,
+                    "!ban <user> [reason]"
+                )?)
             ));
         }
         commands.push_str(&format!(

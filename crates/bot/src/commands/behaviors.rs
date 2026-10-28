@@ -6,7 +6,7 @@ use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
-use super::{Args, BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
+use super::{Args, BehaviorOutcome, CmdEnv, mod_reason_dm, refuse_fenced_discord_mutation};
 
 fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
     if env.app.activation.may_record() {
@@ -15,14 +15,88 @@ fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
         Err(anyhow!("writer lease is not held"))
     }
 }
+
+pub(crate) fn refuse_bot_target(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+) -> Result<()> {
+    if target == env.ctx.cache.current_user().id {
+        let message = jmodguard::templates::render_bounded(
+            jmodguard::defaults::CANNOT_MODERATE_BOT_TEMPLATE,
+            &std::collections::BTreeMap::from([("command".into(), env.cmd.name.clone())]),
+            2000,
+        );
+        return Err(anyhow!(message));
+    }
+    Ok(())
+}
+
+/// Sends the optional reason DM while the target can still receive guild DMs.
+async fn mod_reason_dm_if_requested(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+    action: &str,
+    reason: &str,
+) -> Option<mod_reason_dm::ModReasonDmOutcome> {
+    if !env.dm {
+        return None;
+    }
+    if !env.app.activation.may_record() {
+        return Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
+    }
+    Some(mod_reason_dm::send_mod_reason_dm(env, target, action, reason).await)
+}
+
+async fn mod_reason_dm_if_requested_already_removed(
+    env: &CmdEnv<'_>,
+    target: serenity::model::id::UserId,
+    action: &str,
+    reason: &str,
+) -> Option<mod_reason_dm::ModReasonDmOutcome> {
+    if !env.dm {
+        return None;
+    }
+    if !env.app.activation.may_record() {
+        return Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
+    }
+    Some(mod_reason_dm::send_mod_reason_dm_already_removed(env, target, action, reason).await)
+}
+
+fn abort_if_mod_reason_dm_cancelled(dm: Option<mod_reason_dm::ModReasonDmOutcome>) -> Result<()> {
+    if dm == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+        Err(anyhow!("writer lease is not held"))
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_mod_reason_dm_clause(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    dm: Option<mod_reason_dm::ModReasonDmOutcome>,
+) {
+    if let Some(outcome) = dm {
+        vars.insert(
+            "mod_reason_dm_clause".into(),
+            mod_reason_dm::render_mod_reason_dm_clause(outcome),
+        );
+    }
+}
 use crate::types::Behavior;
 use crate::{db, logging};
+
+fn skips_case_enrollment(behavior: &Behavior) -> bool {
+    matches!(behavior, Behavior::Voice)
+}
 
 /// Runs a command behavior. Returns an optional extra response plus vars
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
-    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
+    let enrollment = if skips_case_enrollment(&env.cmd.behavior) {
+        None
+    } else {
+        crate::cases::capture(env.app, env.guild_id.get()).await
+    };
 
     match &env.cmd.behavior {
         Behavior::Ban {
@@ -37,7 +111,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
+            refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
+            let _ban_in_progress = crate::member_directory::begin_command_ban_in_progress(
+                env.app,
+                env.guild_id.get(),
+                target.get(),
+            )?;
+            #[allow(unused_assignments)]
+            let mut dm_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -50,18 +132,32 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::member_directory::BanContinuation::Stop => {
                     return Err(anyhow!("writer lease is not held"));
                 }
-                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                crate::member_directory::BanContinuation::AlreadyFinished {
+                    reason: _finished_reason,
+                } => {
                     crate::cases::settle_present_application_ban(
                         env.app,
                         enrollment.clone(),
                         target.get(),
-                        reason.as_deref(),
+                        _finished_reason.as_deref(),
                     )
                     .await;
+                    let dm_reason = _finished_reason.as_deref().unwrap_or(reason.as_str());
+                    dm_outcome = mod_reason_dm_if_requested_already_removed(
+                        env, target, "banned", dm_reason,
+                    )
+                    .await;
+                    abort_if_mod_reason_dm_cancelled(dm_outcome)?;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
                 } => {
+                    let dm_reason = discord_reason.as_deref().unwrap_or(reason.as_str());
+                    dm_outcome = mod_reason_dm_if_requested_already_removed(
+                        env, target, "banned", dm_reason,
+                    )
+                    .await;
+                    abort_if_mod_reason_dm_cancelled(dm_outcome)?;
                     if continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -82,6 +178,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                             target,
                             &target_user.name,
                             &reason,
+                            dm_outcome,
                         )
                         .await;
                     }
@@ -120,6 +217,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     let discord_reason =
                         crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
+                    dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
+                    if abort_if_mod_reason_dm_cancelled(dm_outcome).is_err() {
+                        if let Some(attempt) = attempted {
+                            attempt
+                                .finish(env.app, crate::db::guild_data::CaseOutcome::Failed)
+                                .await;
+                        }
+                        pending_ban
+                            .finish(env.app, crate::db::guild_data::CaseOutcome::Failed)
+                            .await;
+                        return Err(anyhow!("writer lease is not held"));
+                    }
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -182,15 +291,23 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                     target,
                                     &target_user.name,
                                     &reason,
+                                    dm_outcome,
                                 )
                                 .await;
                             }
                         }
                         crate::db::guild_data::CaseOutcome::Failed => {
-                            return Err(discord
+                            mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
+                                env, target, dm_outcome,
+                            )
+                            .await;
+                            let message = discord
                                 .err()
-                                .map(|error| anyhow!("{error}"))
-                                .unwrap_or_else(|| anyhow!("ban failed")));
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "ban failed".to_string());
+                            return Err(mod_reason_dm::moderation_failure_error(
+                                message, dm_outcome,
+                            ));
                         }
                         _ => {
                             return Err(anyhow!("ban outcome is uncertain; verify it in Discord"));
@@ -201,6 +318,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -286,6 +404,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -306,8 +425,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
+            refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
+            let dm_outcome = mod_reason_dm_if_requested(env, target, "kicked", &reason).await;
+            if dm_outcome == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+                return Err(anyhow!("writer lease is not held"));
+            }
             let discord = match crate::discord::race_discord_call(
                 &env.app.activation,
                 member.kick_with_reason(&env.ctx.http, &reason),
@@ -324,7 +448,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
-                outcome,
+                outcome.clone(),
                 target.get(),
                 Some(env.actor.get()),
                 Some(reason.clone()),
@@ -332,7 +456,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             lease_held(env)?;
-            discord?;
+            if let Err(error) = discord {
+                if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                    mod_reason_dm::send_mod_reason_dm_moderation_failed_followup(
+                        env, target, dm_outcome,
+                    )
+                    .await;
+                }
+                return Err(mod_reason_dm::moderation_failure_error(error, dm_outcome));
+            }
             log_mod(
                 env,
                 enrollment.clone(),
@@ -340,11 +472,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                dm_outcome,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -444,6 +578,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -508,6 +643,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &reason,
+                None,
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
@@ -555,6 +691,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
         Behavior::WarnClear => {
             let mut args = env.args.clone();
             let target =
@@ -573,10 +710,81 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 target,
                 &target_user.name,
                 &n.to_string(),
+                None,
             )
             .await;
             Ok(BehaviorOutcome {
                 response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
+                vars,
+                suppress_response: false,
+            })
+        }
+        Behavior::Voice => {
+            let mut args = env.args.clone();
+            let token = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+            // Ids and mentions parse before the member search. A name or nick
+            // can only be searched when the guild is cached; otherwise the
+            // reply is the same not-cached line as a cold id lookup.
+            let guild_cached = env.ctx.cache.guild(env.guild_id).is_some();
+            let target = match super::resolve_user_name(env.ctx, env.guild_id, &token) {
+                super::UserNameMatch::Unique(id) => id,
+                super::UserNameMatch::NotFound if !guild_cached => {
+                    vars.insert("target".into(), token);
+                    return Ok(BehaviorOutcome {
+                        response: Some(crate::templates::render(
+                            super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                            &vars,
+                        )),
+                        vars,
+                        suppress_response: false,
+                    });
+                }
+                super::UserNameMatch::NotFound => {
+                    return Err(anyhow!("could not resolve user `{token}`"));
+                }
+                super::UserNameMatch::Ambiguous => {
+                    return Err(anyhow!(
+                        "ambiguous user `{token}`; use a mention or numeric user id"
+                    ));
+                }
+            };
+            let target_user = user_lookup(env, target).await?;
+            let snapshot = super::voice_lookup::snapshot_cached_voice(
+                &env.ctx.cache,
+                env.guild_id,
+                env.actor,
+                &env.actor_member.roles,
+                target,
+            );
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            let response = match snapshot {
+                super::voice_lookup::VoiceLookupSnapshot::InChannel {
+                    channel_id,
+                    channel_name,
+                } => {
+                    vars.insert("channel".into(), channel_name);
+                    vars.insert("channel_id".into(), channel_id.to_string());
+                    Some(crate::templates::render(
+                        super::voice_lookup::IN_CHANNEL_TEMPLATE,
+                        &vars,
+                    ))
+                }
+                super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
+                    crate::templates::render(super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE, &vars),
+                ),
+                super::voice_lookup::VoiceLookupSnapshot::GuildNotCached => Some(
+                    crate::templates::render(super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE, &vars),
+                ),
+                super::voice_lookup::VoiceLookupSnapshot::ChannelUnavailable => {
+                    Some(crate::templates::render(
+                        super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                        &vars,
+                    ))
+                }
+            };
+            Ok(BehaviorOutcome {
+                response,
                 vars,
                 suppress_response: false,
             })
@@ -649,6 +857,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.actor,
                 "messages",
                 &format!("{n} deleted"),
+                None,
             )
             .await;
             vars.insert("count".into(), n.to_string());
@@ -717,6 +926,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.actor,
                 "channel",
                 &duration,
+                None,
             )
             .await;
             Ok(BehaviorOutcome {
@@ -1077,8 +1287,7 @@ fn parse_channel_mention(token: &str) -> Option<ChannelId> {
     token
         .strip_prefix("<#")
         .and_then(|t| t.strip_suffix('>'))
-        .and_then(|t| t.parse::<u64>().ok())
-        .map(Into::into)
+        .and_then(|t| t.parse().ok())
 }
 
 /// Resolves `!say` arguments into the target channel and the text to post.
@@ -1110,7 +1319,16 @@ async fn log_mod(
     target: serenity::model::id::UserId,
     target_name: &str,
     reason: &str,
+    dm: Option<mod_reason_dm::ModReasonDmOutcome>,
 ) {
+    let reason = match dm {
+        Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) | None => reason.to_string(),
+        Some(outcome) => format!(
+            "{}{}",
+            reason,
+            mod_reason_dm::render_mod_reason_dm_clause(outcome)
+        ),
+    };
     logging::emit_mod_action(
         env.app,
         enrollment,
@@ -1123,7 +1341,7 @@ async fn log_mod(
         env.actor.get(),
         env.actor_member.display_name(),
         env.channel_id.get(),
-        reason,
+        &reason,
     )
     .await;
 }
@@ -1369,7 +1587,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             }
             let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
             let channel = parse_channel_mention(&token)
-                .or_else(|| token.parse::<u64>().ok().map(Into::into))
+                .or_else(|| token.parse::<ChannelId>().ok())
                 .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
             crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
                 .await?;
@@ -1421,11 +1639,17 @@ fn opt(
 }
 
 pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
-    use CommandOptionType::{Channel, Integer, String as Str, User};
+    use CommandOptionType::{Boolean, Channel, Integer, String as Str, User};
     match behavior {
         Behavior::Ban { .. } => vec![
             opt("user", User, true, "User to ban"),
             opt("reason", Str, false, "Ban reason"),
+            opt(
+                "dm",
+                Boolean,
+                false,
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+            ),
         ],
         Behavior::Unban { .. } => vec![
             opt("user", User, true, "User to unban"),
@@ -1434,6 +1658,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Kick { .. } => vec![
             opt("user", User, true, "User to kick"),
             opt("reason", Str, false, "Kick reason"),
+            opt(
+                "dm",
+                Boolean,
+                false,
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+            ),
         ],
         Behavior::Timeout { .. } => vec![
             opt("user", User, true, "User to timeout"),
@@ -1450,6 +1680,8 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("reason", Str, true, "Warning reason"),
         ],
         Behavior::Warns | Behavior::WarnClear => vec![opt("user", User, true, "User")],
+        Behavior::UserInfo => vec![opt("user", User, false, "User to inspect")],
+        Behavior::Voice => vec![opt("user", User, true, "User")],
         Behavior::Purge { .. } => {
             vec![opt("count", Integer, false, "Number of messages (max 100)")]
         }
@@ -1495,7 +1727,15 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    #[test]
+    fn voice_skips_case_enrollment_capture() {
+        assert!(skips_case_enrollment(&Behavior::Voice));
+        assert!(!skips_case_enrollment(&Behavior::Help));
+    }
 
     #[tokio::test]
     async fn stats_counts_cases_and_reports_unavailable_stores() {
@@ -1777,7 +2017,8 @@ mod tests {
             ("action".into(), "dryrun".into()),
             ("value".into(), "off".into()),
         ];
-        let mut slash = Args::from_parts(super::super::options_to_args(&command, &options));
+        let mut slash =
+            Args::from_parts(super::super::options_to_args_with_dm(&command, &options).0);
         assert_eq!(
             rule_action_and_id(&mut slash, "list"),
             ("dryrun".into(), "repeat_text".into())
@@ -1821,6 +2062,41 @@ mod tests {
         assert!(rule.params.get("mode").is_none());
     }
     use crate::types::Behavior;
+
+    #[test]
+    fn kick_ban_slash_specs_include_optional_dm_flag() {
+        use serenity::model::application::CommandOptionType;
+        let kick_specs = slash_spec(&Behavior::Kick {
+            default_reason: "Kicked by a moderator".into(),
+        });
+        let kick_dm = kick_specs
+            .iter()
+            .find(|o| o.name == "dm")
+            .expect("kick dm option");
+        assert_eq!(kick_dm.kind, CommandOptionType::Boolean);
+        assert!(!kick_dm.required);
+        let ban_specs = slash_spec(&Behavior::Ban {
+            default_reason: "Banned by a moderator".into(),
+            delete_days: 0,
+        });
+        let ban_dm = ban_specs
+            .iter()
+            .find(|o| o.name == "dm")
+            .expect("ban dm option");
+        assert_eq!(ban_dm.kind, CommandOptionType::Boolean);
+        assert!(!ban_dm.required);
+        assert_eq!(
+            kick_dm.description,
+            jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE
+        );
+        assert_eq!(
+            jmodguard::templates::render(kick_dm.description, &BTreeMap::new()),
+            jmodguard::templates::render(
+                jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
+                &BTreeMap::new(),
+            )
+        );
+    }
 
     #[test]
     fn setname_slash_name_option_is_optional() {
@@ -1878,6 +2154,23 @@ mod tests {
     }
 
     #[test]
+    fn say_rejects_zero_and_overflow_channel_tokens_without_panicking() {
+        let (target, text) =
+            say_target_and_text(&Args::new("<#0> hello"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#0> hello");
+        let (target, text) = say_target_and_text(
+            &Args::new("<#18446744073709551616> hello"),
+            ChannelId::new(7),
+        )
+        .unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#18446744073709551616> hello");
+        assert!(parse_channel_mention("0").is_none());
+        assert!("0".parse::<ChannelId>().is_err());
+    }
+
+    #[test]
     fn say_without_text_errors() {
         assert!(say_target_and_text(&Args::new(""), ChannelId::new(7)).is_err());
         assert!(say_target_and_text(&Args::new("<#42>"), ChannelId::new(7)).is_err());
@@ -1889,5 +2182,55 @@ mod tests {
         let (_, text) =
             say_target_and_text(&Args::new("<#42>   padded  "), ChannelId::new(7)).unwrap();
         assert_eq!(text, "padded");
+    }
+
+    #[test]
+    fn cancelled_mod_reason_dm_aborts_present_ban_followup() {
+        let err =
+            abort_if_mod_reason_dm_cancelled(Some(mod_reason_dm::ModReasonDmOutcome::Cancelled))
+                .expect_err("cancelled DM must abort");
+        assert_eq!(err.to_string(), "writer lease is not held");
+        assert!(
+            abort_if_mod_reason_dm_cancelled(Some(mod_reason_dm::ModReasonDmOutcome::Sent)).is_ok()
+        );
+        assert!(abort_if_mod_reason_dm_cancelled(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn record_only_skips_local_ban_row_when_reason_dm_cancelled() {
+        let path = std::env::temp_dir().join(format!(
+            "record_only_dm_cancel_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let app =
+            crate::state::BotState::new(crate::config::BotProcessConfig::default(), db).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let dm = Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
+        if abort_if_mod_reason_dm_cancelled(dm).is_ok() {
+            continue_present_command_ban(
+                &app,
+                Some(enrollment.clone()),
+                99,
+                Some("target"),
+                None,
+                42,
+                "mod",
+                "raid",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let rows = db::list_enrolled_bans(&app.db, enrollment, 10)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "cancelled DM must not record a ban row");
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
