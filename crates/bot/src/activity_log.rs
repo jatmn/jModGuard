@@ -858,6 +858,18 @@ mod tests {
             "thread_create" => thread_created(&thread("topic title", false)).unwrap(),
             "thread_update" => thread_updated(None, &thread("topic title", false)).unwrap(),
             "thread_delete" => thread_deleted(&thread("topic title", false)).unwrap(),
+            "member_rejoin" => ActivityReport {
+                event: "member_rejoin",
+                vars: {
+                    let mut vars = member_vars(&new);
+                    vars.insert(
+                        "cases".into(),
+                        "- `ban` · succeeded · `2020-01-01T00:00:00+00:00`".into(),
+                    );
+                    vars.insert("notice".into(), String::new());
+                    vars
+                },
+            },
             other => panic!("unexpected event {other}"),
         }
     }
@@ -962,6 +974,9 @@ mod tests {
         for event in ACTIVITY_LOG_EVENTS {
             let report = sample(event);
             db::delete_log_channel(&f.app.db, 789, event).await.unwrap();
+            db::delete_log_channel(&f.app.db, 789, "member_join")
+                .await
+                .unwrap();
             set_filter(&f.app, event, None).await;
             assert_eq!(
                 emit_to(&f.app, &sink, guild, report.event, report.vars.clone()).await,
@@ -969,6 +984,24 @@ mod tests {
                 "{event} is opt-in"
             );
             assert!(sink.messages.lock().unwrap().is_empty(), "{event}");
+
+            if event == "member_rejoin" {
+                db::upsert_log_channel(&f.app.db, 789, "member_join", 457)
+                    .await
+                    .unwrap();
+                f.app.invalidate_configs();
+                assert_eq!(
+                    emit_to(&f.app, &sink, guild, report.event, report.vars.clone()).await,
+                    Delivery::Sent,
+                    "{event} falls back to member_join"
+                );
+                assert_eq!(sink.messages.lock().unwrap()[0].0, ChannelId::new(457));
+                sink.messages.lock().unwrap().clear();
+                db::delete_log_channel(&f.app.db, 789, "member_join")
+                    .await
+                    .unwrap();
+                f.app.invalidate_configs();
+            }
 
             db::upsert_log_channel(&f.app.db, 789, event, 456)
                 .await

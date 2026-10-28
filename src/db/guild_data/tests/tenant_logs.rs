@@ -24,6 +24,29 @@ pub(super) async fn scope(
 }
 
 #[tokio::test]
+async fn activity_log_events_are_not_guild_store_log_channels() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let scope = scope(&f, &store, &reg, 10).await;
+    let revision = store
+        .log_channels(scope.clone())
+        .await
+        .unwrap()
+        .revision()
+        .to_owned();
+    for event in crate::types::ACTIVITY_LOG_EVENTS {
+        assert!(
+            store
+                .set_log_channel(scope.clone(), &revision, event, Some(12))
+                .await
+                .is_err(),
+            "{event} must stay out of guild_log_channels"
+        );
+    }
+}
+
+#[tokio::test]
 async fn log_mappings_are_membership_scoped_persistent_and_bounded_by_event_types() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;

@@ -7,14 +7,13 @@ use serenity::model::channel::MessageFlags;
 use serenity::model::event::MessageUpdateEvent;
 use serenity::model::guild::audit_log::{Action, AuditLogs, MemberAction};
 use serenity::model::id::{ChannelId, GuildId, MessageId};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::db::guild_data::MessageSnapshot;
 use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -23,7 +22,9 @@ const SNIPPETS_PER_GUILD: usize = 64;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
-const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
+pub(crate) const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
+pub(crate) const REJOIN_NOTE_DELIVERY_LIMIT: usize = 4096;
+const REJOIN_NOTE_PRUNE_BATCH: usize = 64;
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
@@ -235,6 +236,419 @@ impl MemberAuditClaims {
 #[derive(Default)]
 pub struct MemberJoinContext {
     inner: Mutex<HashMap<(u64, u64), (serenity::model::Timestamp, Instant)>>,
+}
+
+type RejoinStayKey = (u64, u64, String);
+
+#[derive(Clone, Copy)]
+struct RejoinCacheEntry {
+    updated_at: Instant,
+    seq: u64,
+}
+
+/// Suppresses duplicate member-rejoin notes for the current stay while still
+/// allowing redelivery after a failed first attempt within a bounded window.
+#[derive(Default)]
+struct RejoinNoteDeliveryState {
+    delivered: HashMap<RejoinStayKey, RejoinCacheEntry>,
+    undelivered: HashMap<RejoinStayKey, RejoinCacheEntry>,
+    in_flight: HashSet<RejoinStayKey>,
+    delivered_order: BTreeMap<u64, RejoinStayKey>,
+    undelivered_order: BTreeMap<u64, RejoinStayKey>,
+    stays_by_member: HashMap<(u64, u64), HashSet<String>>,
+    next_seq: u64,
+}
+
+fn rejoin_stay_key(guild: u64, user: u64, stay_id: &str) -> RejoinStayKey {
+    (guild, user, stay_id.to_owned())
+}
+
+#[derive(Default)]
+pub struct RejoinNoteDeliveries {
+    inner: Mutex<RejoinNoteDeliveryState>,
+}
+
+/// Clears an in-flight rejoin attempt when the handler future is canceled.
+pub struct RejoinNoteInFlight<'a> {
+    deliveries: &'a RejoinNoteDeliveries,
+    guild: u64,
+    user: u64,
+    stay_id: String,
+    finished: bool,
+}
+
+impl<'a> RejoinNoteInFlight<'a> {
+    fn new(deliveries: &'a RejoinNoteDeliveries, guild: u64, user: u64, stay_id: String) -> Self {
+        Self {
+            deliveries,
+            guild,
+            user,
+            stay_id,
+            finished: false,
+        }
+    }
+
+    pub fn complete(mut self, sent: bool) {
+        self.finished = true;
+        self.deliveries
+            .finish_attempt(self.guild, self.user, &self.stay_id, sent);
+    }
+}
+
+impl Drop for RejoinNoteInFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.deliveries
+                .finish_attempt(self.guild, self.user, &self.stay_id, false);
+        }
+    }
+}
+
+impl RejoinNoteDeliveryState {
+    fn alloc_seq(&mut self) -> u64 {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1;
+        }
+        self.next_seq
+    }
+
+    fn track_stay(&mut self, guild: u64, user: u64, stay_id: &str) {
+        self.stays_by_member
+            .entry((guild, user))
+            .or_default()
+            .insert(stay_id.to_owned());
+    }
+
+    fn untrack_stay(&mut self, guild: u64, user: u64, stay_id: &str) {
+        let member = (guild, user);
+        if let Some(stays) = self.stays_by_member.get_mut(&member) {
+            stays.remove(stay_id);
+            if stays.is_empty() {
+                self.stays_by_member.remove(&member);
+            }
+        }
+    }
+
+    fn forget_delivered(&mut self, key: &RejoinStayKey) -> bool {
+        let Some(entry) = self.delivered.remove(key) else {
+            return false;
+        };
+        self.delivered_order.remove(&entry.seq);
+        true
+    }
+
+    fn forget_undelivered(&mut self, key: &RejoinStayKey) -> bool {
+        let Some(entry) = self.undelivered.remove(key) else {
+            return false;
+        };
+        self.undelivered_order.remove(&entry.seq);
+        true
+    }
+
+    fn detach_settled(&mut self, key: &RejoinStayKey) {
+        let removed_delivered = self.forget_delivered(key);
+        let removed_undelivered = self.forget_undelivered(key);
+        if removed_delivered || removed_undelivered {
+            self.untrack_stay(key.0, key.1, &key.2);
+        }
+    }
+
+    fn remove_key(&mut self, key: &RejoinStayKey) {
+        if self.in_flight.contains(key) {
+            return;
+        }
+        self.detach_settled(key);
+    }
+
+    fn rotate_in_flight(
+        order: &mut BTreeMap<u64, RejoinStayKey>,
+        seq: u64,
+        key: RejoinStayKey,
+        next: u64,
+    ) {
+        order.remove(&seq);
+        order.insert(next, key);
+    }
+
+    fn prune_delivered_front(&mut self) -> bool {
+        let Some((&seq, key)) = self
+            .delivered_order
+            .iter()
+            .next()
+            .map(|(seq, key)| (seq, key.clone()))
+        else {
+            return false;
+        };
+        if self.in_flight.contains(&key) {
+            let next = self.alloc_seq();
+            if let Some(entry) = self.delivered.get_mut(&key) {
+                entry.seq = next;
+            }
+            Self::rotate_in_flight(&mut self.delivered_order, seq, key, next);
+            return true;
+        }
+        let Some(entry) = self.delivered.get(&key).copied() else {
+            self.delivered_order.remove(&seq);
+            return true;
+        };
+        if entry.updated_at.elapsed() < MEMBER_JOINS_KEEP {
+            return false;
+        }
+        self.delivered_order.remove(&seq);
+        self.delivered.remove(&key);
+        self.untrack_stay(key.0, key.1, &key.2);
+        true
+    }
+
+    fn prune_undelivered_front(&mut self) -> bool {
+        let Some((&seq, key)) = self
+            .undelivered_order
+            .iter()
+            .next()
+            .map(|(seq, key)| (seq, key.clone()))
+        else {
+            return false;
+        };
+        if self.in_flight.contains(&key) {
+            let next = self.alloc_seq();
+            if let Some(entry) = self.undelivered.get_mut(&key) {
+                entry.seq = next;
+            }
+            Self::rotate_in_flight(&mut self.undelivered_order, seq, key, next);
+            return true;
+        }
+        let Some(entry) = self.undelivered.get(&key).copied() else {
+            self.undelivered_order.remove(&seq);
+            return true;
+        };
+        if entry.updated_at.elapsed() < MEMBER_JOINS_KEEP {
+            return false;
+        }
+        self.undelivered_order.remove(&seq);
+        self.undelivered.remove(&key);
+        self.untrack_stay(key.0, key.1, &key.2);
+        true
+    }
+
+    fn evict_oldest(
+        order: &mut BTreeMap<u64, RejoinStayKey>,
+        live: &mut HashMap<RejoinStayKey, RejoinCacheEntry>,
+        in_flight: &HashSet<RejoinStayKey>,
+        stays_by_member: &mut HashMap<(u64, u64), HashSet<String>>,
+        next_seq: &mut u64,
+    ) -> bool {
+        let len = order.len();
+        for _ in 0..len {
+            let Some((&seq, key)) = order.iter().next().map(|(seq, key)| (seq, key.clone())) else {
+                return false;
+            };
+            if in_flight.contains(&key) {
+                *next_seq = next_seq.wrapping_add(1).max(1);
+                let next = *next_seq;
+                order.remove(&seq);
+                if let Some(entry) = live.get_mut(&key) {
+                    entry.seq = next;
+                }
+                order.insert(next, key);
+                continue;
+            }
+            order.remove(&seq);
+            live.remove(&key);
+            let member = (key.0, key.1);
+            if let Some(stays) = stays_by_member.get_mut(&member) {
+                stays.remove(&key.2);
+                if stays.is_empty() {
+                    stays_by_member.remove(&member);
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn prune_incremental(&mut self) {
+        for _ in 0..REJOIN_NOTE_PRUNE_BATCH {
+            if !self.prune_delivered_front() && !self.prune_undelivered_front() {
+                break;
+            }
+        }
+        self.enforce_limit();
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.delivered.len() + self.undelivered.len() > REJOIN_NOTE_DELIVERY_LIMIT {
+            if Self::evict_oldest(
+                &mut self.delivered_order,
+                &mut self.delivered,
+                &self.in_flight,
+                &mut self.stays_by_member,
+                &mut self.next_seq,
+            ) {
+                continue;
+            }
+            if Self::evict_oldest(
+                &mut self.undelivered_order,
+                &mut self.undelivered,
+                &self.in_flight,
+                &mut self.stays_by_member,
+                &mut self.next_seq,
+            ) {
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn record_delivered(&mut self, key: RejoinStayKey) {
+        self.detach_settled(&key);
+        let seq = self.alloc_seq();
+        self.delivered.insert(
+            key.clone(),
+            RejoinCacheEntry {
+                updated_at: Instant::now(),
+                seq,
+            },
+        );
+        self.delivered_order.insert(seq, key.clone());
+        self.track_stay(key.0, key.1, &key.2);
+    }
+
+    fn record_undelivered(&mut self, key: RejoinStayKey) {
+        self.detach_settled(&key);
+        let seq = self.alloc_seq();
+        self.undelivered.insert(
+            key.clone(),
+            RejoinCacheEntry {
+                updated_at: Instant::now(),
+                seq,
+            },
+        );
+        self.undelivered_order.insert(seq, key.clone());
+        self.track_stay(key.0, key.1, &key.2);
+    }
+}
+
+impl RejoinNoteDeliveries {
+    pub fn clear_member(&self, guild: u64, user: u64) {
+        let mut state = self.inner.lock();
+        let stays = state
+            .stays_by_member
+            .remove(&(guild, user))
+            .unwrap_or_default();
+        for stay_id in stays {
+            let key = rejoin_stay_key(guild, user, &stay_id);
+            state.in_flight.remove(&key);
+            state.detach_settled(&key);
+        }
+    }
+
+    pub fn retain_current_stay(&self, guild: u64, user: u64, stay_id: &str) {
+        let mut state = self.inner.lock();
+        let stays = state
+            .stays_by_member
+            .get(&(guild, user))
+            .cloned()
+            .unwrap_or_default();
+        for other in stays {
+            if other == stay_id {
+                continue;
+            }
+            let key = rejoin_stay_key(guild, user, &other);
+            if state.in_flight.contains(&key) {
+                continue;
+            }
+            state.remove_key(&key);
+        }
+    }
+
+    pub fn begin_in_flight(
+        &self,
+        guild: u64,
+        user: u64,
+        stay_id: &str,
+    ) -> Option<RejoinNoteInFlight<'_>> {
+        if stay_id.is_empty() || !self.begin_attempt(guild, user, stay_id) {
+            return None;
+        }
+        Some(RejoinNoteInFlight::new(
+            self,
+            guild,
+            user,
+            stay_id.to_owned(),
+        ))
+    }
+
+    pub fn pending_redelivery(&self, guild: u64, user: u64, stay_id: &str) -> bool {
+        if stay_id.is_empty() {
+            return false;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
+        let mut state = self.inner.lock();
+        state.prune_incremental();
+        state.undelivered.contains_key(&key)
+    }
+
+    pub fn begin_attempt(&self, guild: u64, user: u64, stay_id: &str) -> bool {
+        if stay_id.is_empty() {
+            return false;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
+        let mut state = self.inner.lock();
+        state.prune_incremental();
+        if state.in_flight.contains(&key) {
+            return false;
+        }
+        if state
+            .delivered
+            .get(&key)
+            .is_some_and(|entry| entry.updated_at.elapsed() < MEMBER_JOINS_KEEP)
+        {
+            return false;
+        }
+        state.in_flight.insert(key.clone());
+        state.track_stay(guild, user, stay_id);
+        true
+    }
+
+    pub fn finish_attempt(&self, guild: u64, user: u64, stay_id: &str, sent: bool) {
+        if stay_id.is_empty() {
+            return;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
+        let mut state = self.inner.lock();
+        state.in_flight.remove(&key);
+        if sent {
+            state.record_delivered(key);
+        } else {
+            state.record_undelivered(key);
+        }
+        state.enforce_limit();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_settled_entry_count(&self) -> usize {
+        let state = self.inner.lock();
+        state.delivered.len() + state.undelivered.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_undelivered_queue_len(&self) -> usize {
+        self.inner.lock().undelivered_order.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delivered_queue_len(&self) -> usize {
+        self.inner.lock().delivered_order.len()
+    }
+
+    #[cfg(test)]
+    pub fn test_age_undelivered(&self, guild: u64, user: u64, stay_id: &str, ago: Duration) {
+        let key = rejoin_stay_key(guild, user, stay_id);
+        if let Some(entry) = self.inner.lock().undelivered.get_mut(&key) {
+            entry.updated_at = Instant::now() - ago;
+        }
+    }
 }
 
 impl MemberJoinContext {
@@ -635,7 +1049,13 @@ fn channel_for(
     cfg: &crate::state::CachedGuildConfig,
     event: &str,
 ) -> Option<serenity::model::id::ChannelId> {
-    cfg.log_channels.get(event).copied()
+    if let Some(channel) = cfg.log_channels.get(event).copied() {
+        return Some(channel);
+    }
+    if event == "member_rejoin" {
+        return cfg.log_channels.get("member_join").copied();
+    }
+    None
 }
 
 /// Resolve one observed ban/unban against Discord's bounded recent audit window.
@@ -825,6 +1245,8 @@ pub(crate) enum Delivery {
     Failed,
     /// Skipped because this guild/channel was recently rejected with a permanent error.
     Blocked,
+    /// Admitted rejoin enrichment found nothing to report; do not retry delivery.
+    NothingToSend,
 }
 
 #[derive(Clone, Copy)]
@@ -862,6 +1284,7 @@ pub(crate) async fn emit_to_if(
         commit,
         false,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -887,6 +1310,7 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         commit,
         true,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -912,6 +1336,7 @@ async fn emit_to_observed(
         || true,
         false,
         Vec::new(),
+        None,
     )
     .await
     .0
@@ -937,6 +1362,7 @@ pub(crate) async fn emit_with_components(
         commit,
         true,
         components,
+        None,
     )
     .await
     .0
@@ -976,6 +1402,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     components: Vec<CreateActionRow>,
+    rejoin_enrich_user: Option<&serenity::model::user::User>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1043,6 +1470,35 @@ async fn emit_to_observed_with_audit(
                 vars.extend(context);
             }
             // Moderator-ID exclusions can only be evaluated after attribution.
+            if cfg
+                .log_filters
+                .get(event)
+                .is_some_and(|filter| excluded(filter, &vars))
+            {
+                return Ok(Delivery::Unconfigured);
+            }
+        }
+        if event == "member_rejoin" {
+            let needs_enrich = !vars.contains_key("cases") && !vars.contains_key("notice");
+            if needs_enrich {
+                if let Some(user) = rejoin_enrich_user {
+                    match crate::member_rejoin::enrich_member_rejoin_vars(
+                        app, guild_id, user, &mut vars,
+                    )
+                    .await
+                    {
+                        crate::member_rejoin::MemberRejoinEnrich::Ready => {}
+                        crate::member_rejoin::MemberRejoinEnrich::NoNote => {
+                            return Ok(Delivery::NothingToSend);
+                        }
+                        crate::member_rejoin::MemberRejoinEnrich::Retry => {
+                            return Ok(Delivery::Failed);
+                        }
+                    }
+                } else {
+                    return Ok(Delivery::Unconfigured);
+                }
+            }
             if cfg
                 .log_filters
                 .get(event)
@@ -2198,7 +2654,7 @@ pub(crate) async fn emit_member_event(
     user: &serenity::model::user::User,
     extra: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
-) -> Option<BTreeMap<String, String>> {
+) -> (Delivery, Option<BTreeMap<String, String>>) {
     let account_created = user.created_at();
     let account_age_seconds =
         (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
@@ -2225,9 +2681,13 @@ pub(crate) async fn emit_member_event(
         || true,
         false,
         Vec::new(),
+        if event == "member_rejoin" {
+            Some(user)
+        } else {
+            None
+        },
     )
     .await
-    .1
 }
 
 /// Emits a departure after the paced member check proved the captured stay is
@@ -2254,6 +2714,7 @@ pub(crate) async fn emit_verified_member_departure(
         || true,
         false,
         Vec::new(),
+        None,
     )
     .await;
 }

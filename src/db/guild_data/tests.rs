@@ -86,7 +86,7 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
         assert_eq!(
             count,
-            26,
+            27,
             "store contains tenant tables, transient snapshots, member-directory tables, the local write fence, and the writer epoch"
         );
         Ok(())
