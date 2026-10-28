@@ -531,6 +531,8 @@ pub fn default_global_seed_commands() -> Vec<CommandDef> {
         .collect()
 }
 
+/// Inserts shipped binary-overlay commands, replacing any legacy stored row (including
+/// guild-persisted `voice` rows from older builds).
 pub fn merge_binary_overlay_commands(commands: &mut std::collections::HashMap<String, CommandDef>) {
     for cmd in default_commands() {
         if BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str()) {
@@ -870,22 +872,28 @@ mod rolling_upgrade_tests {
             "voice".into(),
             CommandDef {
                 name: "voice".into(),
-                description: "stale".into(),
-                behavior: Behavior::Help,
-                aliases: vec![],
-                category: String::new(),
-                usage: String::new(),
-                enabled: true,
-                permission: "everyone".into(),
+                description: "legacy guild row".into(),
+                behavior: Behavior::Say,
+                enabled: false,
+                aliases: vec!["vc".into()],
+                category: "Custom".into(),
+                usage: "!voice".into(),
+                permission: "owner".into(),
                 roles: vec![],
                 channels: vec![],
-                cooldown_secs: 0,
-                response: String::new(),
-                log_event: String::new(),
+                cooldown_secs: 99,
+                response: "stale".into(),
+                log_event: "stale".into(),
             },
         )]);
+        assert!(
+            commands.contains_key("voice"),
+            "legacy row must exist before merge"
+        );
         merge_binary_overlay_commands(&mut commands);
         assert_eq!(commands["voice"].description, voice.description);
+        assert_eq!(commands["voice"].enabled, voice.enabled);
+        assert_eq!(commands["voice"].aliases, voice.aliases);
         assert!(matches!(commands["voice"].behavior, Behavior::Voice));
     }
 
