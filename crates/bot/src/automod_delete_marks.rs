@@ -2,7 +2,8 @@
 
 use crate::db::guild_data::MessageSnapshot;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const AUTOMOD_DELETE_MARK_TTL: Duration = Duration::from_secs(10 * 60);
@@ -45,6 +46,7 @@ pub(crate) struct UnconfirmedRemoval {
 pub(crate) struct AutomodDeleteAttempt(pub(crate) u64);
 
 type MarkKey = (u64, u64, u64, u64);
+type MessageTarget = (u64, u64, u64);
 
 #[derive(Clone)]
 struct AutomodDeleteMark {
@@ -61,6 +63,10 @@ pub(crate) struct AutomodDeleteMarks {
     next_attempt: u64,
     order: VecDeque<MarkKey>,
     entries: HashMap<MarkKey, AutomodDeleteMark>,
+    by_message: HashMap<MessageTarget, Vec<MarkKey>>,
+    /// REST attempt id (`MarkKey` field 3) that owns the single gateway observation.
+    gateway_owner: HashMap<MessageTarget, u64>,
+    expiry_heap: BinaryHeap<Reverse<(Instant, MarkKey)>>,
 }
 
 fn snapshot_still_valid(row: &MessageSnapshot, now_ms: i64) -> bool {
@@ -82,17 +88,56 @@ impl AutomodDeleteMarks {
         (guild, channel, message, attempt.0)
     }
 
+    fn message_target(guild: u64, channel: u64, message: u64) -> MessageTarget {
+        (guild, channel, message)
+    }
+
     fn mark_keys_for_message(&self, guild: u64, channel: u64, message: u64) -> Vec<MarkKey> {
-        self.order
-            .iter()
-            .filter(|key| key.0 == guild && key.1 == channel && key.2 == message)
-            .copied()
-            .collect()
+        self.by_message
+            .get(&Self::message_target(guild, channel, message))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn push_expiry(&mut self, key: MarkKey, expires: Instant) {
+        self.expiry_heap.push(Reverse((expires, key)));
     }
 
     fn remove_key(&mut self, key: MarkKey) {
         self.entries.remove(&key);
         self.order.retain(|candidate| *candidate != key);
+        let target = Self::message_target(key.0, key.1, key.2);
+        if let Some(keys) = self.by_message.get_mut(&target) {
+            keys.retain(|candidate| *candidate != key);
+            if keys.is_empty() {
+                self.by_message.remove(&target);
+                self.gateway_owner.remove(&target);
+            }
+        }
+    }
+
+    fn first_unconfirmed_key(&self, target: MessageTarget) -> Option<MarkKey> {
+        self.by_message
+            .get(&target)
+            .and_then(|keys| {
+                keys.iter()
+                    .find(|key| self.entries.get(key).is_some_and(|entry| !entry.confirmed))
+            })
+            .copied()
+    }
+
+    fn transfer_gateway_owner(&mut self, target: MessageTarget, now: Instant) -> bool {
+        if let Some(next_key) = self.first_unconfirmed_key(target) {
+            let new_expires = now + AUTOMOD_DELETE_MARK_TTL;
+            if let Some(entry) = self.entries.get_mut(&next_key) {
+                entry.gateway_pending = true;
+                entry.expires = new_expires;
+            }
+            self.push_expiry(next_key, new_expires);
+            self.gateway_owner.insert(target, next_key.3);
+            return true;
+        }
+        false
     }
 
     fn clear_expired_retained(&mut self, wall: i64) {
@@ -117,25 +162,32 @@ impl AutomodDeleteMarks {
     fn prune(&mut self, now: Instant) {
         let wall = now_ms();
         self.clear_expired_retained(wall);
-        let stale: Vec<MarkKey> = self
-            .entries
-            .iter()
-            .filter_map(|(key, entry)| {
+        while let Some(Reverse((heap_expires, key))) = self.expiry_heap.peek().copied() {
+            if heap_expires > now {
+                break;
+            }
+            self.expiry_heap.pop();
+            let action = self.entries.get(&key).map(|entry| {
                 if entry.expires > now {
                     return None;
                 }
                 if entry.gateway_pending && !entry.confirmed {
-                    return None;
+                    Some(true)
+                } else {
+                    Some(false)
                 }
-                Some(*key)
-            })
-            .collect();
-        for key in stale {
-            self.remove_key(key);
-        }
-        for entry in self.entries.values_mut() {
-            if entry.expires <= now && entry.gateway_pending && !entry.confirmed {
-                entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
+            });
+            match action {
+                None => {}
+                Some(None) => {}
+                Some(Some(true)) => {
+                    let new_expires = now + AUTOMOD_DELETE_MARK_TTL;
+                    if let Some(entry) = self.entries.get_mut(&key) {
+                        entry.expires = new_expires;
+                    }
+                    self.push_expiry(key, new_expires);
+                }
+                Some(Some(false)) => self.remove_key(key),
             }
         }
     }
@@ -186,6 +238,12 @@ impl AutomodDeleteMarks {
             return attempt;
         }
         self.order.push_back(key);
+        let expires = now + AUTOMOD_DELETE_MARK_TTL;
+        self.by_message
+            .entry(Self::message_target(guild, channel, message))
+            .or_default()
+            .push(key);
+        self.push_expiry(key, expires);
         self.entries.insert(
             key,
             AutomodDeleteMark {
@@ -193,7 +251,7 @@ impl AutomodDeleteMarks {
                 rule_name: rule_name.to_owned(),
                 confirmed: false,
                 gateway_pending: false,
-                expires: now + AUTOMOD_DELETE_MARK_TTL,
+                expires,
                 retained: None,
             },
         );
@@ -238,26 +296,27 @@ impl AutomodDeleteMarks {
                 };
             }
         }
-        let mut pending = false;
-        for key in keys {
-            let Some(entry) = self.entries.get_mut(&key) else {
-                continue;
-            };
-            if entry.confirmed {
-                continue;
-            }
+        let target = Self::message_target(guild, channel, message);
+        if self.gateway_owner.contains_key(&target) {
+            return GatewayDeleteObservation::PendingAutomod;
+        }
+        let owner_key = self.first_unconfirmed_key(target);
+        if owner_key.is_none() {
+            return GatewayDeleteObservation::Plain;
+        }
+        let owner_key = owner_key.expect("checked");
+        let new_expires = now + AUTOMOD_DELETE_MARK_TTL;
+        {
+            let entry = self.entries.get_mut(&owner_key).expect("present");
             entry.gateway_pending = true;
-            entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
-            pending = true;
-            if let Some(row) = retained.clone() {
-                self.store_retained(key, row);
-            }
+            entry.expires = new_expires;
         }
-        if pending {
-            GatewayDeleteObservation::PendingAutomod
-        } else {
-            GatewayDeleteObservation::Plain
+        self.push_expiry(owner_key, new_expires);
+        self.gateway_owner.insert(target, owner_key.3);
+        if let Some(row) = retained {
+            self.store_retained(owner_key, row);
         }
+        GatewayDeleteObservation::PendingAutomod
     }
 
     /// Marks REST success. When the gateway delete already logged as plain
@@ -278,12 +337,16 @@ impl AutomodDeleteMarks {
         if !entry.gateway_pending {
             return None;
         }
-        let entry = self.entries.remove(&key)?;
-        self.order.retain(|candidate| *candidate != key);
+        self.gateway_owner
+            .remove(&Self::message_target(guild, channel, message));
+        let rule_id = entry.rule_id.clone();
+        let rule_name = entry.rule_name.clone();
+        let retained = settlement_retained(entry.retained.clone());
+        self.remove_key(key);
         Some(AutomodSettlement {
-            rule_id: entry.rule_id,
-            rule_name: entry.rule_name,
-            retained: settlement_retained(entry.retained),
+            rule_id,
+            rule_name,
+            retained,
         })
     }
 
@@ -309,10 +372,16 @@ impl AutomodDeleteMarks {
                 retained: None,
             };
         }
-        let replay = entry.gateway_pending;
+        let was_gateway_owner = entry.gateway_pending;
         let retained = settlement_retained(entry.retained.clone());
-        self.order.retain(|candidate| *candidate != key);
-        self.entries.remove(&key);
+        self.remove_key(key);
+        let target = Self::message_target(guild, channel, message);
+        let replay = if was_gateway_owner {
+            self.gateway_owner.remove(&target);
+            !self.transfer_gateway_owner(target, now)
+        } else {
+            false
+        };
         UnconfirmedRemoval {
             action: if replay {
                 UnconfirmedMarkRemoval::ReplayPlainDelete
@@ -338,12 +407,16 @@ impl AutomodDeleteMarks {
         if entry.confirmed || !entry.gateway_pending {
             return None;
         }
-        let entry = self.entries.remove(&key)?;
-        self.order.retain(|candidate| *candidate != key);
+        self.gateway_owner
+            .remove(&Self::message_target(guild, channel, message));
+        let rule_id = entry.rule_id.clone();
+        let rule_name = entry.rule_name.clone();
+        let retained = settlement_retained(entry.retained.clone());
+        self.remove_key(key);
         Some(AutomodSettlement {
-            rule_id: entry.rule_id,
-            rule_name: entry.rule_name,
-            retained: settlement_retained(entry.retained),
+            rule_id,
+            rule_name,
+            retained,
         })
     }
 
@@ -391,9 +464,10 @@ impl AutomodDeleteMarks {
             if !entry.confirmed {
                 continue;
             }
-            let entry = self.entries.remove(&key)?;
-            self.order.retain(|candidate| *candidate != key);
-            return Some((entry.rule_id, entry.rule_name));
+            let rule_id = entry.rule_id.clone();
+            let rule_name = entry.rule_name.clone();
+            self.remove_key(key);
+            return Some((rule_id, rule_name));
         }
         None
     }
@@ -887,7 +961,54 @@ mod tests {
         let settlement = marks.confirm(1, 2, 3, first, now).unwrap();
         assert_eq!(settlement.rule_id, "badword");
         assert!(marks.contains(1, 2, 3));
-        marks.remove_unconfirmed(1, 2, 3, second, now);
+        let removal = marks.remove_unconfirmed(1, 2, 3, second, now);
+        assert_eq!(removal.action, UnconfirmedMarkRemoval::Removed);
+    }
+
+    #[test]
+    fn overlapping_gateway_success_then_sibling_failure_emits_one_report_class() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        marks.confirm(1, 2, 3, first, now).unwrap();
+        let removal = marks.remove_unconfirmed(1, 2, 3, second, now);
+        assert_eq!(removal.action, UnconfirmedMarkRemoval::Removed);
+    }
+
+    #[test]
+    fn overlapping_gateway_owner_failure_transfers_to_sibling_before_plain_replay() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        marks.observe_gateway_delete(1, 2, 3, None, now);
+        let first_removal = marks.remove_unconfirmed(1, 2, 3, first, now);
+        assert_eq!(first_removal.action, UnconfirmedMarkRemoval::Removed);
+        let settlement = marks.confirm(1, 2, 3, second, now).unwrap();
+        assert_eq!(settlement.rule_id, "repeat_text");
+        assert!(!marks.contains(1, 2, 3));
+    }
+
+    #[test]
+    fn overlapping_gateway_all_fail_replays_plain_once() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        marks.observe_gateway_delete(1, 2, 3, None, now);
+        assert_eq!(
+            marks.remove_unconfirmed(1, 2, 3, first, now).action,
+            UnconfirmedMarkRemoval::Removed
+        );
+        assert_eq!(
+            marks.remove_unconfirmed(1, 2, 3, second, now).action,
+            UnconfirmedMarkRemoval::ReplayPlainDelete
+        );
     }
 
     #[test]

@@ -1630,7 +1630,7 @@ async fn update_health(
     }
 }
 
-fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+pub(crate) fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePermit> {
     match Arc::clone(&app.snapshots.report_slots).try_acquire_owned() {
         Ok(permit) => Some(permit),
         Err(_) => {

@@ -752,3 +752,29 @@ fn unhooked_bulk_chunk_keeps_gateway_pending_in_transcript_without_individual_ro
     assert_eq!(transcript.total, 2);
     assert!(transcript.worth_sending());
 }
+
+#[tokio::test]
+async fn saturated_report_slots_skip_reconciled_automod_spawn() {
+    use std::sync::atomic::Ordering;
+
+    let f = Fixture::new();
+    let held: Vec<_> = (0..32)
+        .map(|_| crate::snapshot_capture::acquire_report_slot(&f.app).unwrap())
+        .collect();
+    let before = f.app.log_delivery_failures.load(Ordering::Relaxed);
+    spawn_reconciled_automod_delete(
+        Arc::clone(&f.app),
+        Arc::new(serenity::http::Http::new("reconciled-slot-test")),
+        789,
+        456,
+        123,
+        "badword".into(),
+        "Bad words".into(),
+        None,
+    );
+    assert_eq!(
+        f.app.log_delivery_failures.load(Ordering::Relaxed),
+        before + 1
+    );
+    drop(held);
+}

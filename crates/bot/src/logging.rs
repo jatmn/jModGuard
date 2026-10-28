@@ -2367,7 +2367,11 @@ pub(crate) fn spawn_reconciled_automod_delete(
     rule_name: String,
     retained: Option<db::guild_data::MessageSnapshot>,
 ) {
+    let Some(permit) = crate::snapshot_capture::acquire_report_slot(&app) else {
+        return;
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         emit_reconciled_automod_delete(
             &app,
             http.as_ref(),
