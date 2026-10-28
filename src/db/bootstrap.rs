@@ -1009,7 +1009,7 @@ fn shipped_global_keys_present(conn: &impl SqlExecutor) -> Result<bool> {
     if rules != crate::types::RULE_IDS.len() as i64 {
         return Ok(false);
     }
-    let commands = crate::defaults::default_commands();
+    let commands = crate::defaults::default_global_seed_commands();
     let command_names: Vec<String> = commands.iter().map(|cmd| cmd.name.to_lowercase()).collect();
     let command_refs: Vec<&str> = command_names.iter().map(String::as_str).collect();
     if count_global_keys(conn, "commands", "name", &command_refs)? != command_refs.len() as i64 {
@@ -1204,7 +1204,7 @@ fn seed_globals_sql(
         ));
         markers.push("retained_bulk_status_template_v1");
     }
-    for mut cmd in crate::defaults::default_commands() {
+    for mut cmd in crate::defaults::default_global_seed_commands() {
         if cmd.name == "stats" && status_taken {
             cmd.aliases.clear();
         }

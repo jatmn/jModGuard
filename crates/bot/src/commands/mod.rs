@@ -4,6 +4,7 @@
 
 pub mod behaviors;
 pub mod plans;
+pub mod voice_lookup;
 
 use anyhow::Result;
 use serenity::builder::{Builder, CreateCommand, CreateCommandOption, EditInteractionResponse};
@@ -287,6 +288,31 @@ pub(crate) fn mention_permission_in(
     }
 }
 
+/// Whether `user_id` with `role_ids` may see `channel_id`, including overwrites
+/// and thread parents. Prefer the gateway author id over `Member::user.id` when
+/// the member payload omitted `user` (prefix commands).
+pub(crate) fn member_can_view_channel(
+    guild: &serenity::model::guild::Guild,
+    user_id: UserId,
+    role_ids: &[RoleId],
+    channel_id: ChannelId,
+) -> bool {
+    let Some(channel) = channel_for_member_permissions(guild, channel_id) else {
+        return false;
+    };
+    if !guild.roles.contains_key(&RoleId::new(guild.id.get()))
+        || role_ids.iter().any(|id| !guild.roles.contains_key(id))
+    {
+        return false;
+    }
+    let Some(partial) = partial_member(guild.id, role_ids) else {
+        return false;
+    };
+    guild
+        .partial_member_permissions_in(channel, user_id, &partial)
+        .contains(Permissions::VIEW_CHANNEL)
+}
+
 /// `PartialMember` is `non_exhaustive`, so tests and this helper share a decode.
 fn partial_member(
     guild_id: GuildId,
@@ -360,9 +386,35 @@ pub fn guild_permissions(
     Permissions::from_bits_truncate(bits)
 }
 
+/// Gateway `Member` payloads must use the message/interaction author id for
+/// permission checks. `PartialMember::user` is often null and `Member::from`
+/// then fills a default user id that must not win over the cached member row.
+fn actor_member_for_command(
+    actor: UserId,
+    member: serenity::model::guild::Member,
+) -> serenity::model::guild::Member {
+    let mut member = member;
+    member.user.id = actor;
+    member
+}
+
+/// Discord supplies the caller's current roles on each message/interaction; the
+/// guild member cache can lag behind role removals. Prefer invocation data when
+/// present and use the cache only as a fallback.
+fn resolve_actor_member_for_enforcement(
+    actor: UserId,
+    member_from_invocation: Option<serenity::model::guild::Member>,
+    cached_member: Option<serenity::model::guild::Member>,
+) -> Option<serenity::model::guild::Member> {
+    member_from_invocation
+        .or(cached_member)
+        .map(|member| actor_member_for_command(actor, member))
+}
+
 /// Resolves (guild roles, caller member) for command enforcement, preferring
-/// the cache and falling back to an HTTP guild fetch. Never holds a cache
-/// reference across `.await`.
+/// invocation-supplied member data when present and falling back to the guild
+/// member cache, then an HTTP guild fetch. Never holds a cache reference across
+/// `.await`.
 async fn guild_snapshot(
     ctx: &Context,
     guild_id: GuildId,
@@ -370,14 +422,18 @@ async fn guild_snapshot(
     actor: UserId,
 ) -> Option<(StdHashMap<RoleId, Role>, serenity::model::guild::Member)> {
     if let Some(guild) = ctx.cache.guild(guild_id) {
-        let member = member_from_msg.or_else(|| guild.members.get(&actor).cloned());
+        let member = resolve_actor_member_for_enforcement(
+            actor,
+            member_from_msg,
+            guild.members.get(&actor).cloned(),
+        );
         return member.map(|m| (guild.roles.clone(), m));
     }
     tracing::warn!("guild {guild_id} not in cache; falling back to HTTP fetch");
     match ctx.http.get_guild(guild_id).await {
         Ok(guild) => {
             // REST guild payload carries roles but no member map.
-            let member = member_from_msg;
+            let member = resolve_actor_member_for_enforcement(actor, member_from_msg, None);
             member.map(|m| (guild.roles.clone(), m))
         }
         Err(e) => {
@@ -1437,13 +1493,30 @@ fn cooldown_check(
     true
 }
 
-/// Resolves a user from a mention (`<@123>` / `<@!123>`), raw ID, or member
-/// name/nick search.
-pub async fn resolve_user(
-    ctx: &Context,
-    guild_id: GuildId,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserNameMatch {
+    Unique(serenity::model::id::UserId),
+    NotFound,
+    Ambiguous,
+}
+
+fn member_matches_name_token(member: &serenity::model::guild::Member, lower: &str) -> bool {
+    member.user.name.to_lowercase() == lower
+        || member
+            .nick
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase() == lower)
+        || member
+            .user
+            .global_name
+            .as_deref()
+            .is_some_and(|g| g.to_lowercase() == lower)
+}
+
+pub fn resolve_user_name_in_guild(
+    guild: &serenity::model::guild::Guild,
     token: &str,
-) -> Option<serenity::model::id::UserId> {
+) -> UserNameMatch {
     let trimmed = token.trim();
     if let Some(inner) = trimmed
         .strip_prefix("<@")
@@ -1451,40 +1524,67 @@ pub async fn resolve_user(
         .map(|t| t.trim_start_matches('!'))
         && let Ok(id) = inner.parse::<u64>()
     {
-        return Some(id.into());
+        return UserNameMatch::Unique(id.into());
     }
     if let Ok(id) = trimmed.parse::<u64>() {
-        return Some(id.into());
+        return UserNameMatch::Unique(id.into());
     }
-    let guild = ctx.cache.guild(guild_id)?;
     let lower = trimmed.to_lowercase();
-    guild
+    let matches = guild
         .members
-        .iter()
-        .find(|(_, m)| {
-            m.user.name.to_lowercase() == lower
-                || m.nick
-                    .as_deref()
-                    .map(|n| n.to_lowercase() == lower)
-                    .unwrap_or(false)
-                || m.user
-                    .global_name
-                    .as_deref()
-                    .map(|g| g.to_lowercase() == lower)
-                    .unwrap_or(false)
-        })
-        .map(|(_, m)| m.user.id)
+        .values()
+        .filter(|member| member_matches_name_token(member, &lower))
+        .map(|member| member.user.id)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => UserNameMatch::NotFound,
+        1 => UserNameMatch::Unique(matches[0]),
+        _ => UserNameMatch::Ambiguous,
+    }
+}
+
+/// Resolves a user from a mention, raw ID, or cached member name/nick search.
+pub fn resolve_user_name(ctx: &Context, guild_id: GuildId, token: &str) -> UserNameMatch {
+    let trimmed = token.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("<@")
+        .and_then(|t| t.strip_suffix('>'))
+        .map(|t| t.trim_start_matches('!'))
+        && let Ok(id) = inner.parse::<u64>()
+    {
+        return UserNameMatch::Unique(id.into());
+    }
+    if let Ok(id) = trimmed.parse::<u64>() {
+        return UserNameMatch::Unique(id.into());
+    }
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return UserNameMatch::NotFound;
+    };
+    resolve_user_name_in_guild(&guild, token)
+}
+
+/// Resolves a user from a mention (`<@123>` / `<@!123>`), raw ID, or member
+/// name/nick search.
+pub async fn resolve_user(
+    ctx: &Context,
+    guild_id: GuildId,
+    token: &str,
+) -> Option<serenity::model::id::UserId> {
+    match resolve_user_name(ctx, guild_id, token) {
+        UserNameMatch::Unique(id) => Some(id),
+        UserNameMatch::NotFound | UserNameMatch::Ambiguous => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Behavior;
-
     #[tokio::test]
     async fn slash_http_saves_registration_and_failure_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const FIXTURE_CMD: &str = "slashfixture";
         for (status, code) in [
             (200, 0),
             (403, 50013),
@@ -1582,12 +1682,26 @@ mod tests {
             if status == 200 {
                 assert!(sync_slash_commands_versioned_http(&app, &http, guild, target).await);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
-                let mut command = db::get_command_row(&app.db, 0, "stats")
+                let mut command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
                     .await
-                    .unwrap()
                     .unwrap();
                 let before = db::get_primary_versions(&app.db).await.unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(db::get_primary_versions(&app.db).await.unwrap(), before);
@@ -1600,7 +1714,7 @@ mod tests {
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
                 command.description.push_str(" changed");
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1628,7 +1742,7 @@ mod tests {
                     );
                 }
                 assert!(app.finish_slash_resync(changed, Default::default()));
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(app.pending_slash_registry_version().await.unwrap(), None);
@@ -1655,6 +1769,7 @@ mod tests {
                 // A new global command changes every guild's effective payload.
                 let mut global = command.clone();
                 global.name = "shared".into();
+                global.aliases.clear();
                 db::upsert_command(&app.db, 0, &global.name, &global)
                     .await
                     .unwrap();
@@ -1683,7 +1798,7 @@ mod tests {
 
                 // A second save during a PUT must survive completion of the old pass.
                 command.description = "first concurrent edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let first = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1694,7 +1809,7 @@ mod tests {
                     async {
                         received.notified().await;
                         command.description = "second concurrent edit".into();
-                        db::upsert_command(&app.db, 10, "stats", &command)
+                        db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                             .await
                             .unwrap();
                         let second = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1731,7 +1846,7 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .find(|cmd| cmd["name"] == "stats")
+                        .find(|cmd| cmd["name"] == FIXTURE_CMD)
                         .unwrap();
                     assert_eq!(stats["description"], "second concurrent edit");
                 }
@@ -1739,7 +1854,7 @@ mod tests {
 
                 // A transient failure must retry without another configuration write.
                 command.description = "retry this edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1775,13 +1890,13 @@ mod tests {
                 // last successful payload must still send the restored value.
                 let restored = command.clone();
                 command.description = "uncertain edit".into();
-                db::upsert_command(&app.db, 10, "stats", &command)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 let uncertain = app.pending_slash_registry_version().await.unwrap().unwrap();
                 response_status.store(503, Ordering::SeqCst);
                 assert!(!sync_slash_commands_versioned_http(&app, &http, guild, uncertain).await);
-                db::upsert_command(&app.db, 10, "stats", &restored)
+                db::upsert_command(&app.db, 10, FIXTURE_CMD, &restored)
                     .await
                     .unwrap();
                 let changed = app.pending_slash_registry_version().await.unwrap().unwrap();
@@ -1891,11 +2006,25 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(target, &[10, 20]);
                 assert!(!app.finish_slash_resync(target, [10].into_iter().collect()));
-                let command = db::get_command_row(&app.db, 0, "stats")
+                let command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
+                use crate::db::SqlExecutor;
+                let fixture_seed = command.clone();
+                app.db
+                    .with_conn(move |conn| {
+                        conn.execute_bounded(
+                            "INSERT INTO commands(guild_id,name,data) VALUES (0, ?1, ?2)",
+                            crate::db::params![
+                                FIXTURE_CMD,
+                                serde_json::to_string(&fixture_seed)
+                                    .map_err(|e| anyhow::anyhow!(e))?
+                            ],
+                            64 * 1024 * 1024,
+                        )?;
+                        Ok(())
+                    })
                     .await
-                    .unwrap()
                     .unwrap();
-                db::upsert_command(&app.db, 0, "stats", &command)
+                db::upsert_command(&app.db, 0, FIXTURE_CMD, &command)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1994,6 +2123,77 @@ mod tests {
             vars: BTreeMap::new(),
             suppress_response,
         }
+    }
+
+    #[test]
+    fn voice_not_cached_and_not_in_channel_replies_reach_operators() {
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        assert!(
+            command.response.is_empty(),
+            "voice must use outcome.response like warns/banlist"
+        );
+        let vars = BTreeMap::from([
+            ("target".into(), "Alice".into()),
+            ("target_id".into(), "42".into()),
+        ]);
+        let not_cached = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_cached_text = render_outcome(&command, &not_cached);
+        assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
+        assert!(
+            !not_cached_text.contains("{channel_id}"),
+            "{not_cached_text}"
+        );
+        assert_eq!(
+            prefix_response_text(&command, &not_cached).as_deref(),
+            Some(not_cached_text.as_str())
+        );
+
+        let not_in_channel = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let not_in_text = render_outcome(&command, &not_in_channel);
+        assert!(
+            not_in_text.contains("not in a voice channel"),
+            "{not_in_text}"
+        );
+        assert!(!not_in_text.contains("{channel_id}"), "{not_in_text}");
+        assert_eq!(
+            prefix_response_text(&command, &not_in_channel).as_deref(),
+            Some(not_in_text.as_str())
+        );
+
+        let channel_unavailable = BehaviorOutcome {
+            response: Some(templates::render(
+                super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
+                &vars,
+            )),
+            vars: vars.clone(),
+            suppress_response: false,
+        };
+        let unavailable_text = render_outcome(&command, &channel_unavailable);
+        assert!(
+            unavailable_text.contains("cannot be reported"),
+            "{unavailable_text}"
+        );
+        assert!(
+            !unavailable_text.contains("not cached"),
+            "{unavailable_text}"
+        );
     }
 
     #[test]
@@ -2293,6 +2493,312 @@ mod tests {
             super::MentionPermission::Unknown,
             "missing everyone role is not a cached deny"
         );
+    }
+
+    #[test]
+    fn member_cannot_view_channel_when_member_overwrite_denies_view() {
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::guild::{Guild, Member, Role};
+        use serenity::model::id::{ChannelId, GuildId, UserId};
+
+        const GUILD: u64 = 100;
+        const ACTOR: u64 = 1;
+        const VOICE: u64 = 7;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.permissions = perms;
+            role
+        }
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(999);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Role(RoleId::new(GUILD)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+        let mut actor = Member::default();
+        actor.user.id = UserId::new(ACTOR);
+        actor.guild_id = guild.id;
+        assert!(
+            !super::member_can_view_channel(
+                &guild,
+                UserId::new(ACTOR),
+                &actor.roles,
+                ChannelId::new(VOICE),
+            ),
+            "member-specific deny must hide the channel"
+        );
+    }
+
+    fn test_guild_member(user_id: u64, role_ids: &[u64]) -> serenity::model::guild::Member {
+        use serenity::model::guild::Member;
+        use serenity::model::id::UserId;
+        let mut member = Member::default();
+        member.user.id = UserId::new(user_id);
+        member.roles = role_ids.iter().map(|id| RoleId::new(*id)).collect();
+        member
+    }
+
+    #[test]
+    fn enforcement_member_prefers_invocation_roles_over_stale_cache() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let resolved =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("invocation or cache member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Everyone,
+            "stale cached moderator roles must not override invocation payload"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn enforcement_member_falls_back_to_cache_without_invocation_payload() {
+        use serenity::model::guild::Role;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let resolved = super::resolve_actor_member_for_enforcement(actor, None, Some(cached))
+            .expect("cached member");
+
+        let (app, path) = temp_command_test_db();
+        assert_eq!(
+            super::perm_level(&app, &guild_roles, &resolved),
+            PermLevel::Mod,
+            "cache remains the fallback when invocation member data is absent"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn check_enforcement_uses_invocation_roles_when_cache_still_moderator() {
+        use crate::state::CachedGuildConfig;
+        use crate::types::{CommandDef, GuildSettings};
+        use serenity::model::guild::Role;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        const ACTOR: u64 = 7;
+        const MOD_ROLE: u64 = 50;
+        let actor = UserId::new(ACTOR);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(MOD_ROLE);
+        mod_role.permissions = Permissions::BAN_MEMBERS;
+        let guild_roles = StdHashMap::from([(RoleId::new(MOD_ROLE), mod_role)]);
+
+        let cached = test_guild_member(ACTOR, &[MOD_ROLE]);
+        let invocation = test_guild_member(ACTOR, &[]);
+        let member =
+            super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
+                .expect("member");
+
+        let (app, path) = temp_command_test_db();
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules: HashMap::new(),
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            known_bad_hashes: std::collections::BTreeSet::new(),
+            regexes: Vec::new(),
+            custom_patterns: HashMap::new(),
+        };
+        let ban_behavior = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban")
+            .behavior;
+        let cmd = CommandDef {
+            name: "ban".into(),
+            aliases: vec![],
+            category: "Moderation".into(),
+            description: String::new(),
+            usage: String::new(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: ban_behavior,
+            response: String::new(),
+            log_event: String::new(),
+        };
+        let denied =
+            super::check_enforcement(&app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))
+                .expect_err("demoted caller must not pass mod-gated enforcement");
+        assert!(
+            denied.contains("permission"),
+            "expected permission denial, got {denied}"
+        );
+        drop(app);
+        remove_command_test_db(&path);
+    }
+
+    #[test]
+    fn prefix_voice_partial_member_with_member_deny_returns_channel_unavailable() {
+        use super::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
+        use serenity::model::channel::{
+            ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+        };
+        use serenity::model::event::GuildCreateEvent;
+        use serenity::model::guild::{Guild, Member, PartialMember, Role};
+        use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+        use serenity::model::voice::VoiceState;
+        use std::sync::Arc;
+
+        const GUILD: u64 = 10;
+        const AUTHOR: u64 = 7;
+        const TARGET: u64 = 42;
+        const VOICE: u64 = 100;
+        const ROLE: u64 = 50;
+
+        fn role(id: u64, perms: Permissions) -> Role {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            role.guild_id = GuildId::new(GUILD);
+            role.permissions = perms;
+            role
+        }
+
+        fn gateway_partial() -> PartialMember {
+            serde_json::from_value(serde_json::json!({
+                "deaf": false,
+                "joined_at": null,
+                "mute": false,
+                "nick": null,
+                "roles": [ROLE.to_string()],
+                "pending": false,
+                "premium_since": null,
+                "guild_id": GUILD.to_string(),
+                "user": null,
+                "permissions": null,
+                "unusual_dm_activity_until": null,
+                "avatar": null,
+                "banner": null,
+                "avatar_decoration_data": null,
+            }))
+            .unwrap()
+        }
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild
+            .roles
+            .insert(RoleId::new(GUILD), role(GUILD, Permissions::empty()));
+        guild
+            .roles
+            .insert(RoleId::new(ROLE), role(ROLE, Permissions::VIEW_CHANNEL));
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(VOICE);
+        channel.guild_id = guild.id;
+        channel.kind = ChannelType::Voice;
+        channel.name = "Secret".into();
+        channel.permission_overwrites = vec![PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(UserId::new(AUTHOR)),
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+        }];
+        guild.channels.insert(channel.id, channel);
+
+        let voice_state = serde_json::from_value::<VoiceState>(serde_json::json!({
+            "channel_id": VOICE.to_string(),
+            "deaf": false,
+            "guild_id": GUILD.to_string(),
+            "mute": false,
+            "self_deaf": false,
+            "self_mute": false,
+            "self_stream": null,
+            "self_video": false,
+            "session_id": "fixture",
+            "suppress": false,
+            "user_id": TARGET.to_string(),
+        }))
+        .unwrap();
+        guild.voice_states.insert(UserId::new(TARGET), voice_state);
+
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+
+        let partial = gateway_partial();
+        assert!(partial.user.is_none());
+        let from_gateway = Member::from(partial);
+        assert_ne!(from_gateway.user.id, UserId::new(AUTHOR));
+
+        let actor = UserId::new(AUTHOR);
+        assert!(
+            cache
+                .guild(GuildId::new(GUILD))
+                .is_none_or(|g| !g.members.contains_key(&actor)),
+            "fixture must exercise the gateway partial path, not a cached author row"
+        );
+        assert_eq!(
+            snapshot_cached_voice(
+                &cache,
+                GuildId::new(GUILD),
+                from_gateway.user.id,
+                &from_gateway.roles,
+                UserId::new(TARGET),
+            ),
+            VoiceLookupSnapshot::InChannel {
+                channel_id: VOICE,
+                channel_name: "Secret".into(),
+            },
+            "default partial user id must not drive member-specific view denies"
+        );
+        let actor_member = super::actor_member_for_command(actor, from_gateway);
+        assert_eq!(actor_member.user.id, actor);
+
+        let snapshot = snapshot_cached_voice(
+            &cache,
+            GuildId::new(GUILD),
+            actor,
+            &actor_member.roles,
+            UserId::new(TARGET),
+        );
+        assert_eq!(snapshot, VoiceLookupSnapshot::ChannelUnavailable);
     }
 
     fn everyone_attempt(can_mention: bool, unknown: bool) -> Option<crate::automod::PendingAction> {

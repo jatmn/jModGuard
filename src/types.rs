@@ -325,6 +325,7 @@ pub enum Behavior {
     Warns,
     WarnClear,
     Banlist,
+    Voice,
     Purge {
         default_count: u32,
     },
