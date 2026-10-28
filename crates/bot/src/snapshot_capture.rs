@@ -1673,6 +1673,7 @@ fn schedule_unqueued_bulk_delete(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_observed_bulk_member(
     app: &Arc<BotState>,
     context: &Context,

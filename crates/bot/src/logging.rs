@@ -3187,7 +3187,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reconciled_automod_delete(
     app: std::sync::Arc<BotState>,
-    sink: std::sync::Arc<impl LogDelivery + Send + Sync + 'static>,
+    sink: std::sync::Arc<impl LogDelivery + Send + 'static>,
     guild_id: u64,
     channel: u64,
     message: u64,
