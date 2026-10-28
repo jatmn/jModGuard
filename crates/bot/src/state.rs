@@ -2144,8 +2144,8 @@ impl CachedGuildConfig {
     /// Looks up a command by name or alias (case-insensitive).
     pub fn find_command(&self, name: &str) -> Option<&CommandDef> {
         let lower = name.to_lowercase();
-        if jmodguard::defaults::is_binary_overlay_command_name(&lower) {
-            return self.commands.get("voice");
+        if let Some(primary) = jmodguard::defaults::builtin_command_for_label(&lower) {
+            return self.commands.get(&primary);
         }
         self.commands.values().find(|c| c.matches(&lower))
     }

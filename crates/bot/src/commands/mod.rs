@@ -1682,12 +1682,7 @@ mod tests {
             if status == 200 {
                 assert!(sync_slash_commands_versioned_http(&app, &http, guild, target).await);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
-                let mut command = db::get_command_row(&app.db, 0, "stats")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                command.name = FIXTURE_CMD.into();
-                command.aliases.clear();
+                let mut command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
                 use crate::db::SqlExecutor;
                 let fixture_seed = command.clone();
                 app.db
@@ -2011,12 +2006,7 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(target, &[10, 20]);
                 assert!(!app.finish_slash_resync(target, [10].into_iter().collect()));
-                let mut command = db::get_command_row(&app.db, 0, "stats")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                command.name = FIXTURE_CMD.into();
-                command.aliases.clear();
+                let command = crate::defaults::custom_command_fixture(FIXTURE_CMD);
                 use crate::db::SqlExecutor;
                 let fixture_seed = command.clone();
                 app.db

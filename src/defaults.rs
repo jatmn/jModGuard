@@ -462,12 +462,33 @@ pub fn is_builtin_primary_command_name(name: &str) -> bool {
         .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
 }
 
-/// Overwrites any stored built-in rows with the running binary's shipped definitions.
+/// Shipped metadata wins; stored rows may only contribute behavior parameters
+/// (for example `delete_days` on `Behavior::Ban`) from before write lockdown.
+fn merge_shipped_builtin(stored: &CommandDef, shipped: CommandDef) -> CommandDef {
+    let behavior =
+        if std::mem::discriminant(&stored.behavior) == std::mem::discriminant(&shipped.behavior) {
+            stored.behavior.clone()
+        } else {
+            shipped.behavior
+        };
+    CommandDef {
+        behavior,
+        ..shipped
+    }
+}
+
+/// Applies shipped built-in commands, preserving stored behavior parameters when
+/// the behavior variant still matches.
 pub fn apply_shipped_builtin_commands(
     commands: &mut std::collections::HashMap<String, CommandDef>,
 ) {
-    for cmd in default_global_seed_commands() {
-        commands.insert(cmd.name.clone(), cmd);
+    for shipped in default_global_seed_commands() {
+        let primary = shipped.name.clone();
+        let merged = commands
+            .get(&primary)
+            .map(|stored| merge_shipped_builtin(stored, shipped.clone()))
+            .unwrap_or(shipped);
+        commands.insert(primary, merged);
     }
     merge_binary_overlay_commands(commands);
 }
@@ -813,6 +834,31 @@ pub fn sample_plan_command() -> CommandDef {
 #[cfg(test)]
 mod rolling_upgrade_tests {
     use super::*;
+
+    #[test]
+    fn merge_shipped_builtin_preserves_matching_behavior_parameters() {
+        let shipped = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban");
+        let stored = CommandDef {
+            behavior: Behavior::Ban {
+                default_reason: "legacy reason".into(),
+                delete_days: 7,
+            },
+            ..shipped.clone()
+        };
+        let merged = merge_shipped_builtin(&stored, shipped.clone());
+        assert_eq!(merged.description, shipped.description);
+        assert_eq!(merged.aliases, shipped.aliases);
+        assert!(matches!(
+            merged.behavior,
+            Behavior::Ban {
+                default_reason,
+                delete_days: 7
+            } if default_reason == "legacy reason"
+        ));
+    }
 
     #[test]
     fn merge_binary_overlay_commands_replaces_stale_voice_rows() {
