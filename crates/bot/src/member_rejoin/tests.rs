@@ -628,49 +628,62 @@ async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh()
     f.app.tenant.activate(enrollment.clone()).await.unwrap();
     let (store, scope) = ready_directory(&f.app, &enrollment).await;
     store
-        .observe_member(scope.clone(), MemberObservation {
-            user_id: USER,
-            username: Some(Some("member".into())),
-            global_name: None,
-            nickname: None,
-            joined_at_ms: Some(1_000),
-            observed_at_ms: 1_000,
-            is_join: true,
-        })
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(1_000),
+                observed_at_ms: 1_000,
+                is_join: true,
+            },
+        )
         .await
         .unwrap();
-    store.depart_member(scope.clone(), USER, 2_000).await.unwrap();
     store
-        .observe_member(scope.clone(), MemberObservation {
-            user_id: USER,
-            username: Some(Some("member".into())),
-            global_name: None,
-            nickname: None,
-            joined_at_ms: Some(3_000),
-            observed_at_ms: 3_000,
-            is_join: true,
-        })
+        .depart_member(scope.clone(), USER, 2_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(3_000),
+                observed_at_ms: 3_000,
+                is_join: true,
+            },
+        )
         .await
         .unwrap();
     assert!(
-        store.has_pending_rejoin_note(scope.clone(), USER).await.unwrap()
+        store
+            .has_pending_rejoin_note(scope.clone(), USER)
+            .await
+            .unwrap()
     );
     let stale = store
-        .observe_member(scope.clone(), MemberObservation {
-            user_id: USER,
-            username: Some(Some("member".into())),
-            global_name: None,
-            nickname: None,
-            joined_at_ms: Some(3_000),
-            observed_at_ms: 3_500,
-            is_join: true,
-        })
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(3_000),
+                observed_at_ms: 3_500,
+                is_join: true,
+            },
+        )
         .await
         .unwrap();
     assert!(!stale.membership_refresh);
-    assert!(
-        crate::member_directory::pending_rejoin_note(&f.app, GUILD as u64, USER as u64).await
-    );
+    assert!(crate::member_directory::pending_rejoin_note(&f.app, GUILD as u64, USER as u64).await);
 }
 
 #[tokio::test]
@@ -700,10 +713,10 @@ async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
         "failed delivery must remain retryable"
     );
     let membership_refresh = false;
-    let retry_undelivered =
-        f.app
-            .rejoin_note_deliveries
-            .pending_redelivery(GUILD, USER, STAY);
+    let retry_undelivered = f
+        .app
+        .rejoin_note_deliveries
+        .pending_redelivery(GUILD, USER, STAY);
     assert!(retry_undelivered);
     assert!(!membership_refresh);
     let stale_retry = f

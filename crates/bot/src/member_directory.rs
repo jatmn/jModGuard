@@ -454,11 +454,7 @@ async fn member_records_ban(
         .is_some_and(|member| member.is_banned)
 }
 
-pub async fn current_member_stay_id(
-    app: &BotState,
-    guild_id: u64,
-    user_id: u64,
-) -> Option<String> {
+pub async fn current_member_stay_id(app: &BotState, guild_id: u64, user_id: u64) -> Option<String> {
     match live_observation(
         app,
         guild_id,
@@ -470,11 +466,7 @@ pub async fn current_member_stay_id(
         Some((store, scope)) => match store.current_member_stay_id(scope, user_id as i64).await {
             Ok(stay) => stay,
             Err(error) => {
-                tracing::warn!(
-                    guild_id,
-                    user_id,
-                    "member stay lookup failed: {error:#}"
-                );
+                tracing::warn!(guild_id, user_id, "member stay lookup failed: {error:#}");
                 None
             }
         },

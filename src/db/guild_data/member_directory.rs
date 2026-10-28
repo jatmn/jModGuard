@@ -2065,6 +2065,18 @@ fn ingest_member_audits(
     Ok((inserted, unchanged))
 }
 
+fn clear_pending_rejoin_note_tx(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    user_id: i64,
+) -> Result<()> {
+    conn.member_execute(
+        "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+    )?;
+    Ok(())
+}
+
 fn set_pending_rejoin_note_tx(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
@@ -2215,6 +2227,7 @@ fn upsert_member(
     if rotate {
         let retained:bool=conn.query_row("SELECT ever_banned FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),obs.user_id],|r|Ok(r.get(0)?))?;
         if !retained {
+            clear_pending_rejoin_note_tx(conn, scope, obs.user_id)?;
             conn.member_execute("DELETE FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),obs.user_id])?;
             conn.member_execute("DELETE FROM guild_member_state_observations WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),obs.user_id])?;
         } else if changed_instance {
@@ -2451,6 +2464,8 @@ fn upsert_member_batch(
     let data = serde_json::to_string(&changed)?;
     let row_bound = u64::try_from(changed.len()).map_err(|_| MemberSyncError::Invalid)?;
     let guild_id = scope.guild_id();
+    note_member_sync_statement(guild_id);
+    conn.member_execute("DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id IN (SELECT CAST(json_extract(value,'$.id') AS INTEGER) FROM json_each(?3) WHERE json_extract(value,'$.purge_prior')=1)",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()])?;
     note_member_sync_statement(guild_id);
     conn.member_execute("DELETE FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id IN (SELECT CAST(json_extract(value,'$.id') AS INTEGER) FROM json_each(?3) WHERE json_extract(value,'$.purge_prior')=1)",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()])?;
     note_member_sync_statement(guild_id);

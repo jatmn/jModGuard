@@ -779,8 +779,7 @@ impl EventHandler for Handler {
             );
             in_flight.complete(settled);
             if settled {
-                crate::member_directory::clear_pending_rejoin_note(&app, guild_id.get(), uid)
-                    .await;
+                crate::member_directory::clear_pending_rejoin_note(&app, guild_id.get(), uid).await;
             }
         }
     }

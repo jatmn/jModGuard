@@ -733,12 +733,21 @@ async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
         "stale gateway add must not rotate the stay again"
     );
     assert!(
-        store.has_pending_rejoin_note(scope.clone(), 10).await.unwrap(),
+        store
+            .has_pending_rejoin_note(scope.clone(), 10)
+            .await
+            .unwrap(),
         "durable receipt must survive a stale gateway observation"
     );
-    store.clear_pending_rejoin_note(scope.clone(), 10).await.unwrap();
+    store
+        .clear_pending_rejoin_note(scope.clone(), 10)
+        .await
+        .unwrap();
     assert!(
-        !store.has_pending_rejoin_note(scope.clone(), 10).await.unwrap()
+        !store
+            .has_pending_rejoin_note(scope.clone(), 10)
+            .await
+            .unwrap()
     );
     assert_eq!(
         store

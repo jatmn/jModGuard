@@ -311,14 +311,14 @@ impl RejoinNoteDeliveries {
         state
             .undelivered
             .retain(|(g, u, _), _| *g != guild || *u != user);
-        state.in_flight.retain(|(g, u, _)| *g != guild || *u != user);
+        state
+            .in_flight
+            .retain(|(g, u, _)| *g != guild || *u != user);
     }
 
     pub fn retain_current_stay(&self, guild: u64, user: u64, stay_id: &str) {
         let mut state = self.inner.lock();
-        let keep = |key: &RejoinStayKey| {
-            key.0 == guild && key.1 == user && key.2 == stay_id
-        };
+        let keep = |key: &RejoinStayKey| key.0 == guild && key.1 == user && key.2 == stay_id;
         state.delivered.retain(|key, _| keep(key));
         state.undelivered.retain(|key, _| keep(key));
         state.in_flight.retain(|key| keep(key));
