@@ -71,13 +71,13 @@ pub(crate) fn settlement_retained(row: Option<MessageSnapshot>) -> Option<Messag
 }
 
 impl AutomodDeleteMarks {
-    fn prune(&mut self, now: Instant) {
-        let wall = now_ms();
-        while let Some(key) = self.order.front().copied() {
-            let Some(entry) = self.entries.get_mut(&key) else {
-                self.order.pop_front();
-                continue;
-            };
+    fn remove_key(&mut self, key: (u64, u64, u64)) {
+        self.entries.remove(&key);
+        self.order.retain(|candidate| *candidate != key);
+    }
+
+    fn clear_expired_retained(&mut self, wall: i64) {
+        for entry in self.entries.values_mut() {
             if entry
                 .retained
                 .as_ref()
@@ -85,28 +85,64 @@ impl AutomodDeleteMarks {
             {
                 entry.retained = None;
             }
-            if entry.expires > now {
-                break;
-            }
-            if entry.gateway_pending && !entry.confirmed {
-                entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
-                break;
-            }
-            self.order.pop_front();
-            self.entries.remove(&key);
         }
     }
 
-    fn evict_one(&mut self) {
-        if let Some(key) = self.order.front().copied().or_else(|| {
-            self.entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires)
-                .map(|(key, _)| *key)
-        }) {
-            self.order.retain(|candidate| *candidate != key);
-            self.entries.remove(&key);
+    fn can_evict_for_capacity(entry: &AutomodDeleteMark, now: Instant) -> bool {
+        if entry.expires > now {
+            return false;
         }
+        !entry.gateway_pending || entry.confirmed
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let wall = now_ms();
+        self.clear_expired_retained(wall);
+        let stale: Vec<(u64, u64, u64)> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                if entry.expires > now {
+                    return None;
+                }
+                if entry.gateway_pending && !entry.confirmed {
+                    return None;
+                }
+                Some(*key)
+            })
+            .collect();
+        for key in stale {
+            self.remove_key(key);
+        }
+        for entry in self.entries.values_mut() {
+            if entry.expires <= now && entry.gateway_pending && !entry.confirmed {
+                entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
+            }
+        }
+    }
+
+    fn evict_one(&mut self, now: Instant) -> bool {
+        let key = self
+            .order
+            .iter()
+            .find(|key| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|entry| Self::can_evict_for_capacity(entry, now))
+            })
+            .copied()
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .filter(|(_, entry)| Self::can_evict_for_capacity(entry, now))
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| *key)
+            });
+        if let Some(key) = key {
+            self.remove_key(key);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn insert(
@@ -120,8 +156,13 @@ impl AutomodDeleteMarks {
     ) {
         self.prune(now);
         let key = (guild, channel, message);
+        while self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
+            if !self.evict_one(now) {
+                break;
+            }
+        }
         if self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
-            self.evict_one();
+            return;
         }
         if !self.entries.contains_key(&key) {
             self.order.push_back(key);
@@ -436,8 +477,16 @@ mod tests {
     fn cap_evicts_oldest_without_unbounded_growth() {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
-        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
+        }
+        let later = now + Duration::from_secs(30);
+        for message in 0..8 {
+            marks.entries.get_mut(&(1, 2, message)).unwrap().expires =
+                later - Duration::from_millis(1);
+        }
+        for message in MAX_AUTOMOD_DELETE_MARKS as u64..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
+            marks.insert(1, 2, message, "badword", "Bad word", later);
         }
         assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert!(!marks.contains(1, 2, 0));
@@ -445,17 +494,112 @@ mod tests {
     }
 
     #[test]
+    fn cap_does_not_evict_unsettled_in_flight_marks() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            marks.insert(1, 2, message, "badword", "Bad word", now);
+        }
+        marks.insert(1, 2, 9_999, "badword", "Bad word", now);
+        assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
+        assert!(marks.contains(1, 2, 0));
+        assert!(!marks.contains(1, 2, 9_999));
+    }
+
+    #[test]
+    fn expired_confirmed_mark_pruned_behind_refreshed_pending_does_not_relabel() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 1, "stale", "Stale rule", now);
+        assert!(marks.confirm(1, 2, 1, now).is_none());
+        marks.insert(1, 2, 2, "front", "Front rule", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 2, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(expired);
+        assert!(!marks.contains(1, 2, 1));
+        assert!(marks.contains(1, 2, 2));
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 1, None, expired),
+            GatewayDeleteObservation::Plain
+        );
+    }
+
+    #[test]
+    fn cap_does_not_evict_gateway_pending_mark() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            marks.insert(1, 2, message, "badword", "Bad word", now);
+        }
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 0, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        marks.insert(1, 2, 9_999, "badword", "Bad word", now);
+        assert!(marks.contains(1, 2, 0));
+        assert!(!marks.contains(1, 2, 9_999));
+    }
+
+    #[test]
+    fn prune_drops_expired_mark_behind_extended_front_pending() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 1, "front", "Front", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 1, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        marks.insert(1, 2, 2, "stale", "Stale", now);
+        let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(expired);
+        assert!(marks.contains(1, 2, 1));
+        assert!(!marks.contains(1, 2, 2));
+    }
+
+    #[test]
+    fn prune_clears_expired_retained_behind_extended_front_mark() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        marks.insert(1, 2, 1, "front", "Front", now);
+        marks.observe_gateway_delete(1, 2, 1, None, now);
+        marks.insert(1, 2, 2, "later", "Later", now);
+        marks.observe_gateway_delete(1, 2, 2, Some(sample_retained(2, "stale")), now);
+        marks
+            .entries
+            .get_mut(&(1, 2, 2))
+            .unwrap()
+            .retained
+            .as_mut()
+            .unwrap()
+            .expires_at_ms = 1;
+        marks.prune(now);
+        let settlement = marks.confirm(1, 2, 2, now).unwrap();
+        assert!(settlement.retained.is_none());
+    }
+
+    #[test]
     fn retained_payload_count_tracks_mark_capacity() {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
-        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
+        }
+        let later = now + Duration::from_secs(30);
+        for message in 0..8 {
+            marks.entries.get_mut(&(1, 2, message)).unwrap().expires =
+                later - Duration::from_millis(1);
+        }
+        for message in MAX_AUTOMOD_DELETE_MARKS as u64..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
+            marks.insert(1, 2, message, "badword", "Bad word", later);
             marks.observe_gateway_delete(
                 1,
                 2,
                 message,
                 Some(sample_retained(message, "body")),
-                now,
+                later,
             );
         }
         assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);

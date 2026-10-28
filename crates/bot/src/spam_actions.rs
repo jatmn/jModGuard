@@ -251,7 +251,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
     }
     enforce(
         app,
-        ctx.http.as_ref(),
+        std::sync::Arc::clone(&ctx.http),
         ctx.cache.as_ref(),
         found,
         rule,
@@ -262,7 +262,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
 
 pub(crate) async fn enforce(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     found: Match,
     rule: &str,
@@ -322,7 +322,14 @@ pub(crate) async fn enforce(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
@@ -353,7 +360,7 @@ async fn image_match_still_current(
 #[allow(clippy::too_many_arguments)]
 async fn punish_proven_match(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     found: Match,
     rule: &str,
@@ -363,7 +370,8 @@ async fn punish_proven_match(
 ) -> ReportDisposition {
     let member = tokio::time::timeout(
         Duration::from_secs(10),
-        http.get_member(GuildId::new(found.guild), UserId::new(found.author)),
+        http.as_ref()
+            .get_member(GuildId::new(found.guild), UserId::new(found.author)),
     )
     .await
     .ok()
@@ -382,7 +390,14 @@ async fn punish_proven_match(
             ("reason".into(), found.reason),
             ("content".into(), "member lookup failed or timed out".into()),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     if !found
@@ -406,7 +421,14 @@ async fn punish_proven_match(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
@@ -454,7 +476,14 @@ async fn punish_proven_match(
                 "matched channel/user/role is whitelisted".into(),
             ),
         ]);
-        crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+        crate::logging::emit_to(
+            app,
+            http.as_ref(),
+            GuildId::new(found.guild),
+            "automod",
+            vars,
+        )
+        .await;
         return ReportDisposition::Consumed;
     }
     let now = Instant::now();
@@ -507,7 +536,7 @@ async fn punish_proven_match(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
                 &app.activation,
-                http.delete_message(
+                http.as_ref().delete_message(
                     ChannelId::new(*channel),
                     MessageId::new(*message),
                     Some("spam match"),
@@ -530,17 +559,16 @@ async fn punish_proven_match(
                     app.automod_delete_marks
                         .confirm(found.guild, *channel, *message)
                 {
-                    crate::logging::emit_reconciled_automod_delete(
-                        app,
-                        http,
+                    crate::logging::spawn_reconciled_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
                         found.guild,
                         *channel,
                         *message,
-                        &settlement.rule_id,
-                        &settlement.rule_name,
-                        settlement.retained.as_ref(),
-                    )
-                    .await;
+                        settlement.rule_id,
+                        settlement.rule_name,
+                        settlement.retained,
+                    );
                 }
                 CaseOutcome::Succeeded
             }
@@ -553,7 +581,7 @@ async fn punish_proven_match(
                 {
                     crate::logging::emit_plain_message_delete(
                         app,
-                        http,
+                        http.as_ref(),
                         GuildId::new(found.guild),
                         ChannelId::new(*channel),
                         MessageId::new(*message),
@@ -568,17 +596,16 @@ async fn punish_proven_match(
                     .automod_delete_marks
                     .take_uncertain_gateway_settlement(found.guild, *channel, *message)
                 {
-                    crate::logging::emit_reconciled_automod_delete(
-                        app,
-                        http,
+                    crate::logging::spawn_reconciled_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
                         found.guild,
                         *channel,
                         *message,
-                        &settlement.rule_id,
-                        &settlement.rule_name,
-                        settlement.retained.as_ref(),
-                    )
-                    .await;
+                        settlement.rule_id,
+                        settlement.rule_name,
+                        settlement.retained,
+                    );
                 } else {
                     let removal = app.automod_delete_marks.remove_unconfirmed(
                         found.guild,
@@ -590,7 +617,7 @@ async fn punish_proven_match(
                     {
                         crate::logging::emit_plain_message_delete(
                             app,
-                            http,
+                            http.as_ref(),
                             GuildId::new(found.guild),
                             ChannelId::new(*channel),
                             MessageId::new(*message),
@@ -639,7 +666,7 @@ async fn punish_proven_match(
     } else if !proof_stale && app.spam_gate.claim_ban(found.guild, found.author, now) {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
-            http,
+            http.as_ref(),
             found.guild,
             found.author,
             crate::member_directory::MarkerSave::Missing,
@@ -716,7 +743,7 @@ async fn punish_proven_match(
                                 pending_ban,
                                 attempted,
                                 GuildId::new(found.guild).ban_with_reason(
-                                    http,
+                                    http.as_ref(),
                                     UserId::new(found.author),
                                     0,
                                     &discord_reason,
@@ -768,7 +795,14 @@ async fn punish_proven_match(
         ("reason".into(), found.reason),
         ("content".into(), content),
     ]);
-    crate::logging::emit_to(app, http, GuildId::new(found.guild), "automod", vars).await;
+    crate::logging::emit_to(
+        app,
+        http.as_ref(),
+        GuildId::new(found.guild),
+        "automod",
+        vars,
+    )
+    .await;
     ReportDisposition::Consumed
 }
 
@@ -1583,7 +1617,7 @@ pub(crate) mod tests {
         );
         let disposition = punish_proven_match(
             &app,
-            &http,
+            Arc::new(http),
             &cache,
             found,
             "repeat_text",

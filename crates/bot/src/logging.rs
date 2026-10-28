@@ -845,6 +845,26 @@ impl LogDelivery for serenity::http::Http {
         .await
     }
 }
+#[serenity::async_trait]
+impl LogDelivery for std::sync::Arc<serenity::http::Http> {
+    async fn member_audit(&self, guild: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+        self.as_ref().member_audit(guild, action).await
+    }
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        self.as_ref().send(channel, message).await
+    }
+    async fn send_after_rate_limit(
+        &self,
+        channel: ChannelId,
+        message: CreateMessage,
+        still_current: &(dyn Fn() -> bool + Sync),
+        on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+    ) -> anyhow::Result<bool> {
+        self.as_ref()
+            .send_after_rate_limit(channel, message, still_current, on_global_rate_limit)
+            .await
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
@@ -2333,6 +2353,33 @@ pub(crate) async fn emit_reconciled_automod_delete(
         retained.as_ref(),
     );
     emit_to(app, sink, report.guild_id, report.event, report.vars).await;
+}
+
+/// Reconciled automod delete logging without blocking the enforcement caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_reconciled_automod_delete(
+    app: std::sync::Arc<BotState>,
+    http: std::sync::Arc<serenity::http::Http>,
+    guild_id: u64,
+    channel: u64,
+    message: u64,
+    rule_id: String,
+    rule_name: String,
+    retained: Option<db::guild_data::MessageSnapshot>,
+) {
+    tokio::spawn(async move {
+        emit_reconciled_automod_delete(
+            &app,
+            http.as_ref(),
+            guild_id,
+            channel,
+            message,
+            &rule_id,
+            &rule_name,
+            retained.as_ref(),
+        )
+        .await;
+    });
 }
 
 /// Emits a mod-action event with actor context (used by command behaviors).
