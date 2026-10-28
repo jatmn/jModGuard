@@ -470,6 +470,19 @@ async fn automod_try_delete_message(
                 message,
                 delete_attempt,
             );
+            if let Some(settlement) = removal.released_settlement {
+                logging::emit_reconciled_automod_delete(
+                    app,
+                    http,
+                    guild_id,
+                    channel,
+                    message,
+                    &settlement.rule_id,
+                    &settlement.rule_name,
+                    settlement.retained.as_ref(),
+                )
+                .await;
+            }
             if removal.action
                 == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
             {
@@ -509,12 +522,25 @@ async fn automod_try_delete_message(
                 )
                 .await;
             } else {
-                app.automod_delete_marks.remove_unconfirmed(
+                let removal = app.automod_delete_marks.remove_unconfirmed(
                     guild_id,
                     channel,
                     message,
                     delete_attempt,
                 );
+                if let Some(settlement) = removal.released_settlement {
+                    logging::emit_reconciled_automod_delete(
+                        app,
+                        http,
+                        guild_id,
+                        channel,
+                        message,
+                        &settlement.rule_id,
+                        &settlement.rule_name,
+                        settlement.retained.as_ref(),
+                    )
+                    .await;
+                }
             }
         }
     }

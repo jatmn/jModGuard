@@ -582,6 +582,18 @@ async fn punish_proven_match(
                     *message,
                     delete_attempt,
                 );
+                if let Some(settlement) = removal.released_settlement {
+                    crate::logging::spawn_reconciled_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
+                        found.guild,
+                        *channel,
+                        *message,
+                        settlement.rule_id,
+                        settlement.rule_name,
+                        settlement.retained,
+                    );
+                }
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
@@ -623,6 +635,18 @@ async fn punish_proven_match(
                         *message,
                         delete_attempt,
                     );
+                    if let Some(settlement) = removal.released_settlement {
+                        crate::logging::spawn_reconciled_automod_delete(
+                            std::sync::Arc::clone(app),
+                            Arc::clone(&http),
+                            found.guild,
+                            *channel,
+                            *message,
+                            settlement.rule_id,
+                            settlement.rule_name,
+                            settlement.retained,
+                        );
+                    }
                     if removal.action
                         == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                     {

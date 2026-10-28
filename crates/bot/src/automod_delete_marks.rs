@@ -39,6 +39,8 @@ pub(crate) struct AutomodSettlement {
 pub(crate) struct UnconfirmedRemoval {
     pub action: UnconfirmedMarkRemoval,
     pub retained: Option<MessageSnapshot>,
+    /// Automod settlement for a younger confirmed sibling deferred until this removal.
+    pub released_settlement: Option<AutomodSettlement>,
 }
 
 /// Per-REST-delete attempt identity for one message target.
@@ -108,6 +110,36 @@ impl AutomodDeleteMarks {
 
     fn push_mark_expiry(&mut self, key: MarkKey, expires: Instant) {
         self.mark_expiry_heap.push(Reverse((expires, key)));
+        self.compact_heaps_if_needed();
+    }
+
+    fn compact_mark_expiry_heap(&mut self) {
+        let mut fresh = BinaryHeap::new();
+        for (key, entry) in &self.entries {
+            fresh.push(Reverse((entry.expires, *key)));
+        }
+        self.mark_expiry_heap = fresh;
+    }
+
+    fn compact_gateway_retained_expiry_heap(&mut self) {
+        let mut fresh = BinaryHeap::new();
+        for (target, state) in &self.gateway {
+            if let Some(row) = &state.retained {
+                fresh.push(Reverse((row.expires_at_ms, *target)));
+            }
+        }
+        self.gateway_retained_expiry_heap = fresh;
+    }
+
+    fn compact_heaps_if_needed(&mut self) {
+        let entry_bound = self.entries.len().saturating_mul(2).max(1);
+        if self.mark_expiry_heap.len() > entry_bound {
+            self.compact_mark_expiry_heap();
+        }
+        let gateway_bound = self.gateway.len().saturating_mul(2).max(1);
+        if self.gateway_retained_expiry_heap.len() > gateway_bound {
+            self.compact_gateway_retained_expiry_heap();
+        }
     }
 
     fn store_gateway_retained(&mut self, target: MessageTarget, row: MessageSnapshot, wall: i64) {
@@ -120,6 +152,7 @@ impl AutomodDeleteMarks {
         }
         self.gateway_retained_expiry_heap
             .push(Reverse((expires_at_ms, target)));
+        self.compact_heaps_if_needed();
     }
 
     fn settlement_retained_for(
@@ -140,12 +173,49 @@ impl AutomodDeleteMarks {
                 self.gateway.remove(&target);
             }
         }
+        self.compact_heaps_if_needed();
     }
 
-    fn message_has_open_attempts(&self, target: MessageTarget) -> bool {
-        self.by_message
-            .get(&target)
-            .is_some_and(|keys| keys.iter().any(|key| self.entries.contains_key(key)))
+    fn finalize_automod_settlement(
+        &mut self,
+        target: MessageTarget,
+        key: MarkKey,
+        gateway: &MessageGatewayState,
+    ) -> AutomodSettlement {
+        let entry = self.entries.get(&key).expect("settling mark");
+        let rule_id = entry.rule_id.clone();
+        let rule_name = entry.rule_name.clone();
+        let retained = Self::settlement_retained_for(gateway, entry.retained.clone());
+        self.remove_key(key);
+        if let Some(state) = self.gateway.get_mut(&target) {
+            state.settled = true;
+        }
+        AutomodSettlement {
+            rule_id,
+            rule_name,
+            retained,
+        }
+    }
+
+    fn try_release_deferred_settlement(
+        &mut self,
+        target: MessageTarget,
+    ) -> Option<AutomodSettlement> {
+        let gateway = self.gateway.get(&target)?.clone();
+        if !gateway.observed || gateway.settled {
+            return None;
+        }
+        let keys = self.by_message.get(&target)?.clone();
+        for key in keys {
+            if !self.entries.get(&key).is_some_and(|entry| entry.confirmed) {
+                continue;
+            }
+            if self.has_older_unconfirmed(target, key) {
+                continue;
+            }
+            return Some(self.finalize_automod_settlement(target, key, &gateway));
+        }
+        None
     }
 
     fn has_older_unconfirmed(&self, target: MessageTarget, key: MarkKey) -> bool {
@@ -350,18 +420,7 @@ impl AutomodDeleteMarks {
         if !gateway.observed || gateway.settled || defer_settlement {
             return None;
         }
-        let rule_id = entry.rule_id.clone();
-        let rule_name = entry.rule_name.clone();
-        let retained = Self::settlement_retained_for(&gateway, entry.retained.clone());
-        self.remove_key(key);
-        if let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
-        }
-        Some(AutomodSettlement {
-            rule_id,
-            rule_name,
-            retained,
-        })
+        Some(self.finalize_automod_settlement(target, key, &gateway))
     }
 
     pub(crate) fn remove_unconfirmed(
@@ -379,19 +438,29 @@ impl AutomodDeleteMarks {
             return UnconfirmedRemoval {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
+                released_settlement: None,
             };
         };
         if entry.confirmed {
             return UnconfirmedRemoval {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
+                released_settlement: None,
             };
         }
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
         let retained = Self::settlement_retained_for(&gateway, entry.retained.clone());
+        let remaining_attempts = self
+            .mark_keys_for_message(guild, channel, message)
+            .into_iter()
+            .filter(|candidate| *candidate != key && self.entries.contains_key(candidate))
+            .count();
         self.remove_key(key);
-        let replay =
-            gateway.observed && !gateway.settled && !self.message_has_open_attempts(target);
+        let released_settlement = self.try_release_deferred_settlement(target);
+        let replay = gateway.observed
+            && !gateway.settled
+            && remaining_attempts == 0
+            && released_settlement.is_none();
         if replay && let Some(state) = self.gateway.get_mut(&target) {
             state.settled = true;
         }
@@ -402,6 +471,7 @@ impl AutomodDeleteMarks {
                 UnconfirmedMarkRemoval::Removed
             },
             retained,
+            released_settlement,
         }
     }
 
@@ -422,18 +492,7 @@ impl AutomodDeleteMarks {
         if entry.confirmed || !gateway.observed || gateway.settled {
             return None;
         }
-        let rule_id = entry.rule_id.clone();
-        let rule_name = entry.rule_name.clone();
-        let retained = Self::settlement_retained_for(&gateway, entry.retained.clone());
-        self.remove_key(key);
-        if let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
-        }
-        Some(AutomodSettlement {
-            rule_id,
-            rule_name,
-            retained,
-        })
+        Some(self.finalize_automod_settlement(target, key, &gateway))
     }
 
     pub(crate) fn take_stored_retained(
@@ -460,6 +519,34 @@ impl AutomodDeleteMarks {
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_expiry_heap_len(&self) -> usize {
+        self.mark_expiry_heap.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gateway_retained_expiry_heap_len(&self) -> usize {
+        self.gateway_retained_expiry_heap.len()
+    }
+
+    #[cfg(test)]
+    fn assert_heaps_bounded(&self) {
+        let entry_bound = self.entries.len().saturating_mul(2).max(1);
+        assert!(
+            self.mark_expiry_heap_len() <= entry_bound,
+            "mark expiry heap {} exceeds bound {}",
+            self.mark_expiry_heap_len(),
+            entry_bound
+        );
+        let gateway_bound = self.gateway.len().saturating_mul(2).max(1);
+        assert!(
+            self.gateway_retained_expiry_heap_len() <= gateway_bound,
+            "gateway retained heap {} exceeds bound {}",
+            self.gateway_retained_expiry_heap_len(),
+            gateway_bound
+        );
     }
 
     #[cfg(test)]
@@ -1175,7 +1262,25 @@ mod tests {
             marks.assert_indexes_consistent();
             assert_eq!(marks.by_message_index_len(), 0);
             assert!(marks.gateway.is_empty());
+            marks.assert_heaps_bounded();
         }
+    }
+
+    #[test]
+    fn expiry_heaps_stay_bounded_across_many_completed_marks() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        for message in 0..5_000u64 {
+            let attempt = marks.insert(1, 2, message, "badword", "Bad words", now);
+            assert!(marks.confirm(1, 2, message, attempt, now).is_none());
+            assert!(matches!(
+                marks.observe_gateway_delete(1, 2, message, None, now),
+                GatewayDeleteObservation::Automod { .. }
+            ));
+            marks.assert_heaps_bounded();
+        }
+        assert_eq!(marks.len(), 0);
+        marks.assert_heaps_bounded();
     }
 
     #[test]
@@ -1191,7 +1296,9 @@ mod tests {
         assert!(marks.confirm(1, 2, 3, second, now).is_none());
         let removal = marks.remove_unconfirmed(1, 2, 3, first, now);
         assert_ne!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
-        let settlement = marks.confirm(1, 2, 3, second, now).unwrap();
+        let settlement = removal
+            .released_settlement
+            .expect("deferred younger success released on older failure");
         assert_eq!(settlement.rule_id, "repeat_text");
     }
 
