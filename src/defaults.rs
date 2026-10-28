@@ -510,6 +510,20 @@ pub fn resolve_legacy_builtin_command_collisions(
     }
 }
 
+/// Effective command map for one guild: guild rows overlay global rows, then the
+/// same shipped-builtin merge used by the bot (`apply_shipped_builtin_commands`).
+pub fn effective_command_registry(
+    global_commands: &std::collections::HashMap<String, CommandDef>,
+    guild_commands: &std::collections::HashMap<String, CommandDef>,
+) -> std::collections::HashMap<String, CommandDef> {
+    let mut commands = global_commands.clone();
+    for (name, def) in guild_commands {
+        commands.insert(name.clone(), def.clone());
+    }
+    apply_shipped_builtin_commands(&mut commands);
+    commands
+}
+
 /// Applies shipped built-in commands, preserving stored access controls per guild row.
 pub fn apply_shipped_builtin_commands(
     commands: &mut std::collections::HashMap<String, CommandDef>,
