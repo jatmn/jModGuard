@@ -1657,6 +1657,20 @@ impl BotState {
         contested
     }
 
+    /// Reserves a command-ban serialization slot without incrementing when one
+    /// is already held (rejected overlapping bans must not leak a marker).
+    pub(crate) fn try_begin_command_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
+        let mut observations = self.ban_observations.lock();
+        let owners = observations.entry((guild_id, user_id)).or_default();
+        if *owners > 0 {
+            return false;
+        }
+        *owners = owners
+            .checked_add(1)
+            .expect("ban observation owners overflow");
+        true
+    }
+
     pub(crate) fn end_ban_observation(&self, guild_id: u64, user_id: u64) {
         let mut observations = self.ban_observations.lock();
         if let std::collections::hash_map::Entry::Occupied(mut entry) =

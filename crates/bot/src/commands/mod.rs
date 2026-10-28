@@ -3,6 +3,7 @@
 //! cooldown, behavior execution), and mirror to Discord slash commands.
 
 pub mod behaviors;
+pub mod mod_reason_dm;
 pub mod plans;
 pub mod userinfo;
 pub mod voice_lookup;
@@ -68,6 +69,10 @@ impl Args {
 
     pub fn is_empty(&self) -> bool {
         self.pos >= self.parts.len()
+    }
+
+    pub(crate) fn strip_dm_flag(&mut self) -> bool {
+        mod_reason_dm::take_prefix_dm_flag(&mut self.parts)
     }
 }
 
@@ -545,8 +550,39 @@ pub struct CmdEnv<'a> {
     pub actor: serenity::model::id::UserId,
     pub actor_member: serenity::model::guild::Member,
     pub args: Args,
+    /// When true, DM the moderation reason to the target before kick/ban.
+    pub dm: bool,
     /// Source message (prefix commands) — None for slash commands.
     pub source_message: Option<serenity::model::id::MessageId>,
+}
+
+impl<'a> CmdEnv<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        app: &'a Arc<BotState>,
+        ctx: &'a Context,
+        cmd: &'a CommandDef,
+        guild_id: GuildId,
+        channel_id: serenity::model::id::ChannelId,
+        actor: serenity::model::id::UserId,
+        actor_member: serenity::model::guild::Member,
+        args: Args,
+        dm: bool,
+        source_message: Option<serenity::model::id::MessageId>,
+    ) -> Self {
+        Self {
+            app,
+            ctx,
+            cmd,
+            guild_id,
+            channel_id,
+            actor,
+            actor_member,
+            args,
+            dm,
+            source_message,
+        }
+    }
 }
 
 pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<()> {
@@ -722,17 +758,24 @@ pub async fn handle_prefix(
         return Ok(true);
     }
 
-    let env = CmdEnv {
+    let mut args = Args::new(raw_args);
+    let dm = if mod_reason_dm::command_supports_reason_dm(&cmd.behavior) {
+        args.strip_dm_flag()
+    } else {
+        false
+    };
+    let env = CmdEnv::new(
         app,
         ctx,
-        cmd: &cmd,
+        &cmd,
         guild_id,
-        channel_id: msg.channel_id,
-        actor: msg.author.id,
-        actor_member: member,
-        args: Args::new(raw_args),
-        source_message: Some(msg.id),
-    };
+        msg.channel_id,
+        msg.author.id,
+        member,
+        args,
+        dm,
+        Some(msg.id),
+    );
     tracing::info!(
         "command `{}` invoked by {} in guild {} (channel {})",
         cmd.name,
@@ -903,8 +946,9 @@ async fn set_slash_commands(
         let description = slash_description(&cmd.description);
         let mut builder = CreateCommand::new(name).description(description);
         for opt in behaviors::slash_spec(&cmd.behavior) {
-            let mut o = CreateCommandOption::new(opt.kind, opt.name, opt.description)
-                .required(opt.required);
+            let description = templates::render(opt.description, &BTreeMap::new());
+            let mut o =
+                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
             if opt.kind == CommandOptionType::Integer {
                 o = o.min_int_value(0);
             }
@@ -1151,18 +1195,19 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         return;
     }
 
-    let args = Args::from_parts(options_to_args(&cmd, &slash.options));
-    let env = CmdEnv {
+    let (arg_parts, dm) = options_to_args_with_dm(&cmd, &slash.options);
+    let env = CmdEnv::new(
         app,
         ctx,
-        cmd: &cmd,
+        &cmd,
         guild_id,
-        channel_id: slash.channel_id,
-        actor: actor_id,
-        actor_member: member,
-        args,
-        source_message: None,
-    };
+        slash.channel_id,
+        actor_id,
+        member,
+        Args::from_parts(arg_parts),
+        dm,
+        None,
+    );
     match run_command(env).await {
         Ok(outcome) => {
             if deliver_slash_success(&app.activation, &ctx.http, &slash, deferred, &cmd, &outcome)
@@ -1229,9 +1274,20 @@ fn option_value_string(value: Option<CommandDataOptionValue>) -> String {
     }
 }
 
-fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String> {
+pub(crate) fn options_to_args_with_dm(
+    cmd: &CommandDef,
+    options: &[(String, String)],
+) -> (Vec<String>, bool) {
+    let dm = if mod_reason_dm::command_supports_reason_dm(&cmd.behavior) {
+        mod_reason_dm::slash_dm_flag(options)
+    } else {
+        false
+    };
     let mut out = Vec::new();
     for spec in behaviors::slash_spec(&cmd.behavior) {
+        if mod_reason_dm::slash_option_excluded_from_args(spec.name) {
+            continue;
+        }
         let s = options
             .iter()
             .find(|(n, _)| n == spec.name)
@@ -1241,7 +1297,7 @@ fn options_to_args(cmd: &CommandDef, options: &[(String, String)]) -> Vec<String
             out.push(s);
         }
     }
-    out
+    (out, dm)
 }
 
 async fn respond(
@@ -1488,31 +1544,77 @@ async fn run_command(env: CmdEnv<'_>) -> Result<BehaviorOutcome> {
     behaviors::run(&env).await
 }
 
-fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
-    if !cmd.response.is_empty() {
-        let mut vars = outcome.vars.clone();
-        vars.insert(
-            "response".into(),
-            outcome.response.clone().unwrap_or_default(),
-        );
-        // Keep stored defaults readable by older bots during a rollout or
-        // rollback. Only the current process substitutes compact presentation;
-        // other custom response text and raw numeric variables stay unchanged.
-        let response = match (&cmd.behavior, cmd.response.as_str()) {
-            (Behavior::Timeout { .. }, "Timed out {target} for {minutes} minutes | {reason}") => {
-                "Timed out {target} for {duration} | {reason}"
-            }
-            (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => {
-                "Slowmode set to {duration}"
-            }
-            _ => &cmd.response,
-        };
-        templates::render(response, &vars)
-    } else if let Some(r) = &outcome.response {
-        r.clone()
-    } else {
-        "done".to_string()
+fn truncate_to_char_limit(text: &str, max_units: usize) -> String {
+    if text.chars().count() <= max_units {
+        return text.to_string();
     }
+    text.chars().take(max_units).collect()
+}
+
+fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
+    const DISCORD_MESSAGE_LIMIT: usize = 2000;
+    // Commands that publish behavior text leave `response` empty. That text is
+    // already produced (warnings, ban reasons, regex samples, help, voice).
+    // It is never a template, and kick/ban variables must not be applied to it.
+    if cmd.response.is_empty() {
+        return match outcome.response.as_deref() {
+            Some(text) => truncate_to_char_limit(text, DISCORD_MESSAGE_LIMIT),
+            None => "done".to_string(),
+        };
+    }
+    let clause = outcome
+        .vars
+        .get("mod_reason_dm_clause")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let clause_units = clause.chars().count();
+    let body_limit = DISCORD_MESSAGE_LIMIT.saturating_sub(clause_units);
+    let mut vars = outcome.vars.clone();
+    vars.insert(
+        "response".into(),
+        outcome.response.clone().unwrap_or_default(),
+    );
+    // Keep stored defaults readable by older bots during a rollout or
+    // rollback. Only the current process substitutes compact presentation;
+    // other custom response text and raw numeric variables stay unchanged.
+    let response = match (&cmd.behavior, cmd.response.as_str()) {
+        (Behavior::Timeout { .. }, "Timed out {target} for {minutes} minutes | {reason}") => {
+            "Timed out {target} for {duration} | {reason}"
+        }
+        (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => "Slowmode set to {duration}",
+        (Behavior::Kick { .. }, "Kicked {target} | {reason}")
+            if vars.contains_key("mod_reason_dm_clause") =>
+        {
+            "Kicked {target} | {reason}{mod_reason_dm_clause}"
+        }
+        (Behavior::Ban { .. }, "Banned {target} | {reason}")
+            if vars.contains_key("mod_reason_dm_clause") =>
+        {
+            "Banned {target} | {reason}{mod_reason_dm_clause}"
+        }
+        _ => &cmd.response,
+    };
+    if response.contains("{mod_reason_dm_clause}") {
+        return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
+    }
+    let mut render_vars = vars.clone();
+    render_vars.remove("mod_reason_dm_clause");
+    let rendered = templates::render_bounded(response, &render_vars, body_limit);
+    if !clause.is_empty()
+        && matches!(
+            (&cmd.behavior, response),
+            (
+                Behavior::Kick { .. },
+                "Kicked {target} | {reason}" | "Kicked {target} | {reason}{mod_reason_dm_clause}"
+            ) | (
+                Behavior::Ban { .. },
+                "Banned {target} | {reason}" | "Banned {target} | {reason}{mod_reason_dm_clause}"
+            )
+        )
+    {
+        return format!("{rendered}{clause}");
+    }
+    rendered
 }
 
 /// Text to post in the invocation channel after a prefix command, or None
@@ -2305,6 +2407,144 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_commands_keep_literal_dm_tokens_in_args() {
+        let say = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "say")
+            .unwrap();
+        let mut args = Args::new("use --dm");
+        let dm = if mod_reason_dm::command_supports_reason_dm(&say.behavior) {
+            args.strip_dm_flag()
+        } else {
+            false
+        };
+        assert!(!dm);
+        assert_eq!(args.rest(), "use --dm");
+    }
+
+    #[test]
+    fn slash_dm_option_sets_flag_without_polluting_reason_args() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let (args, dm) = options_to_args_with_dm(
+            &kick,
+            &[("user".into(), "42".into()), ("dm".into(), "true".into())],
+        );
+        assert!(dm);
+        assert_eq!(args, vec!["42"]);
+        assert!(!args.iter().any(|part| part == "true"));
+
+        let ban = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap();
+        let (args, dm) = options_to_args_with_dm(
+            &ban,
+            &[("user".into(), "7".into()), ("dm".into(), "false".into())],
+        );
+        assert!(!dm);
+        assert_eq!(args, vec!["7"]);
+
+        let (args, dm) = options_to_args_with_dm(
+            &ban,
+            &[("user".into(), "7".into()), ("dm".into(), "true".into())],
+        );
+        assert!(dm);
+        assert_eq!(args, vec!["7"]);
+    }
+
+    #[test]
+    fn behavior_dynamic_response_preserves_literal_template_tokens() {
+        let testregex = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "testregex")
+            .unwrap();
+        let outcome = BehaviorOutcome {
+            response: Some("Normalized sample: `{user}`".into()),
+            vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&testregex, &outcome),
+            "Normalized sample: `{user}`"
+        );
+    }
+
+    #[test]
+    fn custom_command_response_does_not_append_dm_clause_or_substitute_foreign_vars() {
+        let custom = say_cmd("See {target} for details");
+        let outcome = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(render_outcome(&custom, &outcome), "See Member for details");
+    }
+
+    #[test]
+    fn shipped_kick_ban_response_adds_dm_clause_only_for_defaults() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let mut with_dm = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam".into()),
+                ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&kick, &with_dm),
+            "Kicked Member | spam | Reason DM sent."
+        );
+
+        let mut custom = kick.clone();
+        custom.response = "Custom kick {target}".into();
+        assert_eq!(render_outcome(&custom, &with_dm), "Custom kick Member");
+
+        with_dm.vars.remove("mod_reason_dm_clause");
+        assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");
+    }
+
+    #[test]
+    fn near_limit_kick_confirmation_stays_deliverable_with_dm_clause() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "kick")
+            .unwrap();
+        let mut custom = kick.clone();
+        let clause =
+            mod_reason_dm::render_mod_reason_dm_clause(mod_reason_dm::ModReasonDmOutcome::Sent);
+        let clause_chars = clause.chars().count();
+        let body = "x".repeat(2000usize.saturating_sub(clause_chars));
+        custom.response = format!("{body}{{mod_reason_dm_clause}}");
+        let outcome = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam".into()),
+                ("mod_reason_dm_clause".into(), clause),
+            ]),
+            suppress_response: false,
+        };
+        let rendered = render_outcome(&custom, &outcome);
+        assert!(
+            rendered.chars().count() <= 2000,
+            "DM status made a valid custom confirmation undeliverable: {} characters",
+            rendered.chars().count()
+        );
+        assert!(rendered.contains(jmodguard::defaults::MOD_REASON_DM_STATUS_SENT));
+    }
+
+    #[test]
     fn voice_not_cached_and_not_in_channel_replies_reach_operators() {
         let command = crate::defaults::default_commands()
             .into_iter()
@@ -2372,6 +2612,117 @@ mod tests {
         assert!(
             !unavailable_text.contains("not cached"),
             "{unavailable_text}"
+        );
+    }
+
+    #[test]
+    fn commands_without_a_response_template_keep_literal_output() {
+        let literal = "kept {user} {actor} {actor_id} {guild} {channel} {source_channel_id} {target} {reason} {mod_reason_dm_clause} {response}";
+        let vars = BTreeMap::from([
+            ("user".into(), "Moderator".into()),
+            ("actor".into(), "Mod (<@1>)".into()),
+            ("actor_id".into(), "1".into()),
+            ("guild".into(), "Server".into()),
+            ("channel".into(), "<#2>".into()),
+            ("source_channel_id".into(), "2".into()),
+            ("target".into(), "Member".into()),
+            ("reason".into(), "spam".into()),
+            ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ("response".into(), "should-not-replace".into()),
+        ]);
+        let mut saw_literal = false;
+        for command in crate::defaults::default_commands() {
+            if !command.response.is_empty() {
+                continue;
+            }
+            saw_literal = true;
+            let outcome = BehaviorOutcome {
+                response: Some(literal.into()),
+                vars: vars.clone(),
+                suppress_response: false,
+            };
+            assert_eq!(
+                render_outcome(&command, &outcome),
+                literal,
+                "{}",
+                command.name
+            );
+            assert_eq!(
+                prefix_response_text(&command, &outcome).as_deref(),
+                Some(literal),
+                "{}",
+                command.name
+            );
+        }
+        assert!(
+            saw_literal,
+            "shipped commands that publish behavior text must exist"
+        );
+    }
+
+    #[test]
+    fn dynamic_list_reasons_are_not_template_expanded() {
+        for name in ["warns", "banlist", "testregex"] {
+            let command = crate::defaults::default_commands()
+                .into_iter()
+                .find(|cmd| cmd.name == name)
+                .unwrap_or_else(|| panic!("{name} command"));
+            assert!(
+                command.response.is_empty(),
+                "{name} publishes behavior text, not a response template"
+            );
+            let outcome = BehaviorOutcome {
+                response: Some(format!("stored reason `{{user}}` for {name}")),
+                vars: BTreeMap::from([
+                    ("user".into(), "Moderator".into()),
+                    ("reason".into(), "Moderator".into()),
+                    ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+                ]),
+                suppress_response: false,
+            };
+            let text = render_outcome(&command, &outcome);
+            assert_eq!(text, format!("stored reason `{{user}}` for {name}"));
+            assert_eq!(
+                prefix_response_text(&command, &outcome).as_deref(),
+                Some(text.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn substituted_reason_keeps_tokens_inside_the_value() {
+        let kick = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "kick")
+            .unwrap();
+        let outcome = BehaviorOutcome {
+            response: Some("unused {user}".into()),
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "spam {user}".into()),
+                ("user".into(), "Moderator".into()),
+                ("response".into(), "should not replace the template".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&kick, &outcome),
+            "Kicked Member | spam {user}"
+        );
+    }
+
+    #[test]
+    fn response_slot_does_not_expand_dynamic_text() {
+        let command = say_cmd("{response}");
+        let outcome = BehaviorOutcome {
+            response: Some("hello {user}".into()),
+            vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            suppress_response: false,
+        };
+        assert_eq!(render_outcome(&command, &outcome), "hello {user}");
+        assert_eq!(
+            prefix_response_text(&command, &outcome).as_deref(),
+            Some("hello {user}")
         );
     }
 

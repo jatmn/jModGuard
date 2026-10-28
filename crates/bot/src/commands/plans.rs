@@ -301,6 +301,7 @@ async fn run_step(
         }
         PlanStep::Kick => {
             let target = target.expect("target-required plan steps are validated before execution");
+            super::behaviors::refuse_bot_target(env, target)?;
             let member = target_member(env, target).await?;
             refuse_fenced_discord_mutation(env).await?;
             run_guarded_case_step(
@@ -315,6 +316,7 @@ async fn run_step(
         }
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
+            super::behaviors::refuse_bot_target(env, target)?;
             refuse_fenced_discord_mutation(env).await?;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,

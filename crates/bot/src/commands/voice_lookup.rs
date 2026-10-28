@@ -635,6 +635,7 @@ mod tests {
             actor: actor.user.id,
             actor_member: actor,
             args: crate::commands::Args::new(&TARGET.to_string()),
+            dm: false,
             source_message: None,
         };
         let outcome = crate::commands::behaviors::run(&env).await.unwrap();
@@ -724,6 +725,7 @@ mod tests {
             actor: actor.user.id,
             actor_member: actor,
             args: crate::commands::Args::new(token),
+            dm: false,
             source_message: None,
         };
         let outcome = crate::commands::behaviors::run(&env).await.unwrap();
@@ -766,6 +768,7 @@ mod tests {
             actor: known_actor.user.id,
             actor_member: known_actor,
             args: crate::commands::Args::new(token),
+            dm: false,
             source_message: None,
         };
         let result = crate::commands::behaviors::run(&missing).await;

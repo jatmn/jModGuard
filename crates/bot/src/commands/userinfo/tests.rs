@@ -734,6 +734,7 @@ async fn rest_lookup_failure_still_renders_warns_and_cases() {
         actor: UserId::new(7),
         actor_member: actor,
         args: Args::new("91"),
+        dm: false,
         source_message: None,
     };
     let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
@@ -882,6 +883,7 @@ async fn omitted_user_argument_defaults_to_actor() {
         actor: UserId::new(7),
         actor_member: actor,
         args: Args::new(""),
+        dm: false,
         source_message: None,
     };
     let target = super::resolve_userinfo_target(&env, &mut env.args.clone())
@@ -987,6 +989,7 @@ async fn integration_warn_and_case_rows() {
         actor: UserId::new(91),
         actor_member: actor,
         args: Args::new(""),
+        dm: false,
         source_message: None,
     };
     let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
