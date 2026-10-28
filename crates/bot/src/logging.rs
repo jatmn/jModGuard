@@ -2599,6 +2599,9 @@ pub(crate) async fn replay_unconfirmed_plain_delete(
     id: MessageId,
     removal: &crate::automod_delete_marks::UnconfirmedRemoval,
 ) {
+    if removal.action != crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete {
+        return;
+    }
     if matches!(
         app.automod_delete_marks.claim_or_defer_plain_replay(
             guild_id.get(),

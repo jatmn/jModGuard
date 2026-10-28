@@ -1954,6 +1954,292 @@ async fn inflight_bulk_releases_one_automod_report_only_if_the_send_fails() {
 }
 
 #[tokio::test]
+async fn deferred_bulk_only_success_reports_when_the_send_fails() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let prepared = f
+        .app
+        .automod_delete_marks
+        .prepare_delete(789, 456, 123, "badword", "Bad words");
+    assert_eq!(
+        prepared.disposition,
+        crate::automod_delete_marks::DeleteDisposition::Stored
+    );
+    let mut transcript = BulkTranscript::new(1);
+    let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        &mut transcript,
+        false,
+    );
+    assert!(peeled.is_empty());
+    assert_eq!(transcript.pending_automod, vec![MessageId::new(123)]);
+    begin_bulk_delivery(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &transcript.pending_automod,
+    );
+    let sink = Sink::default();
+    complete_prepared_automod_delete(
+        &f.app,
+        &sink,
+        789,
+        456,
+        123,
+        &prepared,
+        "badword",
+        "Bad words",
+    )
+    .await;
+    assert!(
+        sink_bodies(&sink).is_empty(),
+        "success stays deferred while the bulk send is in flight"
+    );
+    let held = f
+        .app
+        .log_delivery_slots
+        .try_acquire_many(4)
+        .expect("the fixture has four delivery permits");
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        transcript,
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Failed);
+    assert!(
+        sink_bodies(&sink).is_empty(),
+        "a full delivery budget must fail before sending"
+    );
+    drop(held);
+    settle_bulk_delivery(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123)],
+        outcome,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].starts_with("903 "),
+        "bulk-only guild keeps its one destination: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_saturated_attempts_share_one_report() {
+    use crate::automod_delete_marks::{
+        DeleteDisposition, MAX_AUTOMOD_DELETE_MARKS, UnconfirmedMarkRemoval,
+    };
+
+    for success_then_failure in [true, false] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+            .await
+            .unwrap();
+        db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+            f.app
+                .automod_delete_marks
+                .insert(789, 456, message, "filler", "Filler");
+        }
+        let message = 50_000;
+        let first =
+            f.app
+                .automod_delete_marks
+                .prepare_delete(789, 456, message, "badword", "Bad words");
+        let second =
+            f.app
+                .automod_delete_marks
+                .prepare_delete(789, 456, message, "badword", "Bad words");
+        assert_eq!(first.disposition, DeleteDisposition::Unmarked);
+        assert_eq!(second.disposition, DeleteDisposition::Unmarked);
+        assert!(
+            observed_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                None,
+            )
+            .is_none(),
+            "one gateway delete stays pending until an attempt settles"
+        );
+        let sink = Sink::default();
+        if success_then_failure {
+            complete_prepared_automod_delete(
+                &f.app,
+                &sink,
+                789,
+                456,
+                message,
+                &second,
+                "badword",
+                "Bad words",
+            )
+            .await;
+            let removal =
+                f.app
+                    .automod_delete_marks
+                    .remove_unconfirmed(789, 456, message, first.attempt);
+            assert_eq!(removal.action, UnconfirmedMarkRemoval::Removed);
+            replay_unconfirmed_plain_delete(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                &removal,
+            )
+            .await;
+        } else {
+            let removal =
+                f.app
+                    .automod_delete_marks
+                    .remove_unconfirmed(789, 456, message, first.attempt);
+            assert_eq!(removal.action, UnconfirmedMarkRemoval::Removed);
+            replay_unconfirmed_plain_delete(
+                &f.app,
+                &sink,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                &removal,
+            )
+            .await;
+            complete_prepared_automod_delete(
+                &f.app,
+                &sink,
+                789,
+                456,
+                message,
+                &second,
+                "badword",
+                "Bad words",
+            )
+            .await;
+        }
+        let bodies = sink_bodies(&sink);
+        assert_eq!(bodies.len(), 1, "order {success_then_failure}: {bodies:?}");
+        assert!(
+            bodies[0].starts_with("901 "),
+            "order {success_then_failure}: {bodies:?}"
+        );
+        assert!(bodies[0].contains("Bad words"), "{bodies:?}");
+        assert!(bodies[0].contains("`badword`"), "{bodies:?}");
+        assert!(
+            bodies.iter().all(|body| !body.starts_with("902 ")),
+            "plain replay duplicated the delete: {bodies:?}"
+        );
+        assert!(
+            observed_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                None,
+            )
+            .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn overlapping_saturated_failures_replay_one_plain_delete() {
+    use crate::automod_delete_marks::{
+        DeleteDisposition, MAX_AUTOMOD_DELETE_MARKS, UnconfirmedMarkRemoval,
+    };
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+        f.app
+            .automod_delete_marks
+            .insert(789, 456, message, "filler", "Filler");
+    }
+    let message = 50_000;
+    let first =
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, message, "badword", "Bad words");
+    let second =
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, message, "badword", "Bad words");
+    assert_eq!(first.disposition, DeleteDisposition::Unmarked);
+    assert_eq!(second.disposition, DeleteDisposition::Unmarked);
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(message),
+            None,
+        )
+        .is_none()
+    );
+    let sink = Sink::default();
+    let first_removal =
+        f.app
+            .automod_delete_marks
+            .remove_unconfirmed(789, 456, message, first.attempt);
+    assert_eq!(first_removal.action, UnconfirmedMarkRemoval::Removed);
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(message),
+        &first_removal,
+    )
+    .await;
+    let second_removal =
+        f.app
+            .automod_delete_marks
+            .remove_unconfirmed(789, 456, message, second.attempt);
+    assert_eq!(
+        second_removal.action,
+        UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(message),
+        &second_removal,
+    )
+    .await;
+    let bodies = sink_bodies(&sink);
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(bodies[0].starts_with("902 "), "{bodies:?}");
+    assert!(
+        bodies.iter().all(|body| !body.starts_with("901 ")),
+        "{bodies:?}"
+    );
+}
+
+#[tokio::test]
 async fn peeled_delete_uses_bulk_when_the_individual_route_disappears() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
