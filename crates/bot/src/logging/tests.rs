@@ -1084,6 +1084,104 @@ impl LogDelivery for Sink {
 }
 
 #[tokio::test]
+async fn member_rejoin_delivers_when_indexed_case_exceeds_read_budget() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseError, CaseEvidence, CaseId, CaseLimits, CaseOutcome, CaseSource,
+    };
+    const GUILD: i64 = 10;
+    const SUBJECT: i64 = 91;
+    assert_eq!(CaseLimits::default().max_record_bytes, 65_536);
+
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 100, 1_000)
+        .await
+        .unwrap();
+    while !store
+        .backfill_member_case_index(scope.clone(), 100, 100)
+        .await
+        .unwrap()
+    {}
+    let write_limits = CaseLimits {
+        max_record_bytes: 1_048_576,
+        ..CaseLimits::default()
+    };
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: SUBJECT,
+                actor_id: Some(7),
+                occurred_at_ms: 3_000,
+                reason: Some("z".repeat(262_144)),
+                evidence: CaseEvidence::Unavailable,
+            },
+            write_limits,
+        )
+        .await
+        .unwrap();
+    let read_error = store
+        .member_case_entries(scope, SUBJECT, 8, CaseLimits::default())
+        .await
+        .unwrap_err();
+    assert!(
+        read_error
+            .downcast_ref::<CaseError>()
+            .is_some_and(|error| matches!(error, CaseError::Limit)),
+        "default read budget must still refuse the oversize case: {read_error:#}"
+    );
+
+    db::upsert_log_channel(&f.app.db, GUILD, "member_rejoin", 456)
+        .await
+        .unwrap();
+    let mut user = serenity::model::user::User::default();
+    user.id = serenity::model::id::UserId::new(SUBJECT as u64);
+    user.name = "member".into();
+    let vars = crate::templates::user_vars(user.id.get(), &user.name, &user.name);
+    let sink = Sink::default();
+    let (delivery, _) = super::emit_to_observed_with_audit(
+        &f.app,
+        &sink,
+        GuildId::new(GUILD as u64),
+        "member_rejoin",
+        vars,
+        None,
+        Admission::Immediate,
+        || true,
+        false,
+        Vec::new(),
+        Some(&user),
+    )
+    .await;
+    assert_eq!(delivery, Delivery::Sent);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    let content = messages[0].1["content"].as_str().unwrap();
+    assert!(
+        content.contains("read budget"),
+        "rejoin note omitted the budget notice: {content}"
+    );
+    assert!(
+        !content.contains(&"z".repeat(32)),
+        "rejoin note included the oversize reason"
+    );
+    assert!(content.contains("91"), "{content}");
+}
+
+#[tokio::test]
 async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "system", 456)

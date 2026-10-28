@@ -345,6 +345,15 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     alias_row.permission = "owner".into();
     let mut custom = crate::defaults::custom_command_fixture("greet");
     custom.aliases = vec!["status".into(), "mine".into()];
+    let userinfo = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "userinfo")
+        .unwrap();
+    let mut legacy_userinfo = userinfo;
+    legacy_userinfo.enabled = false;
+    legacy_userinfo.permission = "owner".into();
+    legacy_userinfo.cooldown_secs = 15;
+    legacy_userinfo.description = "legacy userinfo".into();
     let inserts = [
         (0_i64, "ban", serde_json::to_string(&legacy_ban).unwrap()),
         (10_i64, "Ban", serde_json::to_string(&legacy_ban).unwrap()),
@@ -354,6 +363,16 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
             serde_json::to_string(&legacy_voice).unwrap(),
         ),
         (10_i64, "yeet", serde_json::to_string(&alias_row).unwrap()),
+        (
+            0_i64,
+            "userinfo",
+            serde_json::to_string(&legacy_userinfo).unwrap(),
+        ),
+        (
+            10_i64,
+            "UserInfo",
+            serde_json::to_string(&legacy_userinfo).unwrap(),
+        ),
         (10_i64, "greet", serde_json::to_string(&custom).unwrap()),
     ];
     for (guild_id, name, data) in inserts {
@@ -371,7 +390,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     assert_eq!(
         count(
             &conn,
-            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet')"
+            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet','userinfo')"
         ),
         0,
         "built-in and reserved-alias rows are removed"
@@ -391,6 +410,8 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     assert_eq!(version, MIGRATIONS.len() as i64);
     let changes_before: i64 = count(&conn, "SELECT total_changes()");
     conn.execute_batch_bounded(MIGRATIONS[prior], 64 * 1024 * 1024)
+        .unwrap();
+    conn.execute_batch_bounded(MIGRATIONS[MIGRATIONS.len() - 1], 64 * 1024 * 1024)
         .unwrap();
     assert_eq!(
         count(&conn, "SELECT total_changes()"),
@@ -413,7 +434,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     assert_eq!(
         count(
             &conn,
-            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet')"
+            "SELECT COUNT(*) FROM commands WHERE lower(name) IN ('ban','voice','yeet','userinfo')"
         ),
         0
     );
@@ -427,8 +448,17 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
                 |row| Ok(row.get(0)?),
             )?;
             assert_eq!(global_ban, 1, "seed restores the shipped global ban row");
+            let global_userinfo: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM commands WHERE guild_id=0 AND name='userinfo'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            assert_eq!(
+                global_userinfo, 1,
+                "seed restores the shipped global userinfo row"
+            );
             let guild_legacy: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM commands WHERE guild_id=10 AND lower(name) IN ('ban','voice','yeet')",
+                "SELECT COUNT(*) FROM commands WHERE guild_id=10 AND lower(name) IN ('ban','voice','yeet','userinfo')",
                 (),
                 |row| Ok(row.get(0)?),
             )?;

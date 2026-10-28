@@ -4,7 +4,8 @@ use crate::config::BotProcessConfig;
 use crate::db;
 use crate::db::Db;
 use crate::db::guild_data::{
-    CaseAction, CaseEvidence, CaseId, CaseOutcome, MemberHistoryEntry, MemberObservation,
+    CaseAction, CaseEvidence, CaseId, CaseLimits, CaseOutcome, MemberHistoryEntry,
+    MemberObservation,
 };
 use crate::logging::{Delivery, LogDelivery, emit_to};
 use crate::state::BotState;
@@ -968,7 +969,7 @@ async fn removed_last_case_after_backfill_uses_ban_history_notice() {
     )
     .await;
     let recorded = store
-        .member_case_entries(scope.clone(), SUBJECT as i64, 8)
+        .member_case_entries(scope.clone(), SUBJECT as i64, 8, CaseLimits::default())
         .await
         .unwrap()
         .0;
@@ -977,7 +978,7 @@ async fn removed_last_case_after_backfill_uses_ban_history_notice() {
     store.remove_case(scope.clone(), removed).await.unwrap();
     assert!(
         store
-            .member_case_entries(scope.clone(), SUBJECT as i64, 8)
+            .member_case_entries(scope.clone(), SUBJECT as i64, 8, CaseLimits::default())
             .await
             .unwrap()
             .0
