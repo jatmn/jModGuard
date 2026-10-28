@@ -417,6 +417,19 @@ fn automod_member_target(
     })
 }
 
+#[cfg(test)]
+struct AutomodDeleteCancelProbe {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    /// When set, uncertain settlement declines so the removal arm runs.
+    skip_uncertain: bool,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUTOMOD_DELETE_CANCEL_PROBE: std::sync::Arc<AutomodDeleteCancelProbe>;
+}
+
 async fn automod_try_delete_message(
     app: &std::sync::Arc<BotState>,
     http: &serenity::http::Http,
@@ -439,12 +452,32 @@ async fn automod_try_delete_message(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    match crate::discord::race_discord_call(
-        &app.activation,
-        http.delete_message(channel.into(), message.into(), None),
-    )
-    .await
-    {
+    let forced_cancel = {
+        #[cfg(test)]
+        {
+            if let Ok(probe) = AUTOMOD_DELETE_CANCEL_PROBE.try_with(std::sync::Arc::clone) {
+                probe.entered.notify_one();
+                probe.release.notified().await;
+                true
+            } else {
+                false
+            }
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
+    let raced = if forced_cancel {
+        crate::discord::DiscordCall::Cancelled
+    } else {
+        crate::discord::race_discord_call(
+            &app.activation,
+            http.delete_message(channel.into(), message.into(), None),
+        )
+        .await
+    };
+    match raced {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             if let Some(settlement) =
                 app.automod_delete_marks
@@ -504,12 +537,23 @@ async fn automod_try_delete_message(
             );
         }
         crate::discord::DiscordCall::Cancelled => {
-            if let Some(settlement) = app.automod_delete_marks.take_uncertain_gateway_settlement(
-                guild_id,
-                channel,
-                message,
-                delete_attempt,
-            ) {
+            let skip_uncertain = {
+                #[cfg(test)]
+                {
+                    AUTOMOD_DELETE_CANCEL_PROBE
+                        .try_with(|probe| probe.skip_uncertain)
+                        .unwrap_or(false)
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            };
+            if !skip_uncertain
+                && let Some(settlement) = app
+                    .automod_delete_marks
+                    .take_uncertain_gateway_settlement(guild_id, channel, message, delete_attempt)
+            {
                 logging::emit_reconciled_automod_delete(
                     app,
                     http,
@@ -538,6 +582,19 @@ async fn automod_try_delete_message(
                         &settlement.rule_id,
                         &settlement.rule_name,
                         settlement.retained.as_ref(),
+                    )
+                    .await;
+                }
+                if removal.action
+                    == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+                {
+                    logging::emit_plain_message_delete(
+                        app,
+                        http,
+                        GuildId::new(guild_id),
+                        ChannelId::new(channel),
+                        MessageId::new(message),
+                        removal.retained.as_ref(),
                     )
                     .await;
                 }
@@ -3806,6 +3863,155 @@ mod tests {
         )
         .expect("plain delete");
         assert_eq!(report.event, "message_delete");
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn cancelled_automod_delete_replays_plain_message_delete() {
+        use super::{
+            AUTOMOD_DELETE_CANCEL_PROBE, AutomodDeleteCancelProbe, automod_try_delete_message,
+        };
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path =
+            std::env::temp_dir().join(format!("cancel_replay_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        crate::db::upsert_log_channel(&app.db, 10, "message_delete", 900)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        app.invalidate_configs();
+
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server_bodies = Arc::clone(&bodies);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 2048];
+                        loop {
+                            match stream.read(&mut tmp) {
+                                Ok(0) => break,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::WouldBlock
+                                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                            if buf.len() > 65_536 {
+                                break;
+                            }
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let header = String::from_utf8_lossy(&buf[..header_end]);
+                                let length = header.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        value.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(length) = length {
+                                    if buf.len() >= header_end + 4 + length {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        server_bodies
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf).into_owned());
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let probe = Arc::new(AutomodDeleteCancelProbe {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            skip_uncertain: true,
+        });
+        let task_app = Arc::clone(&app);
+        let task_probe = Arc::clone(&probe);
+        let task = tokio::spawn(async move {
+            AUTOMOD_DELETE_CANCEL_PROBE
+                .scope(task_probe, async move {
+                    automod_try_delete_message(
+                        &task_app,
+                        &http,
+                        10,
+                        70,
+                        42,
+                        "badword",
+                        "Bad words",
+                    )
+                    .await;
+                })
+                .await;
+        });
+        probe.entered.notified().await;
+        assert!(
+            crate::logging::observed_delete_report(
+                &app,
+                serenity::model::id::GuildId::new(10),
+                serenity::model::id::ChannelId::new(70),
+                serenity::model::id::MessageId::new(42),
+                None,
+            )
+            .is_none(),
+            "gateway delete stays pending until REST settles"
+        );
+        probe.release.notify_one();
+        task.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        let logged = bodies.lock().unwrap().clone();
+        assert!(
+            logged.iter().any(|body| body.contains("Message deleted")),
+            "cancelled delete must replay plain message_delete, got {logged:?}"
+        );
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);

@@ -352,13 +352,9 @@ impl AutomodDeleteMarks {
         if self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
             return attempt;
         }
-        self.order.push_back(key);
         let expires = now + AUTOMOD_DELETE_MARK_TTL;
-        self.by_message
-            .entry(Self::message_target(guild, channel, message))
-            .or_default()
-            .push(key);
-        self.push_mark_expiry(key, expires);
+        // Insert before indexing expiry. Compaction rebuilds the heap from
+        // `entries`, so a push beforehand drops this mark's deadline.
         self.entries.insert(
             key,
             AutomodDeleteMark {
@@ -369,6 +365,12 @@ impl AutomodDeleteMarks {
                 retained: None,
             },
         );
+        self.order.push_back(key);
+        self.by_message
+            .entry(Self::message_target(guild, channel, message))
+            .or_default()
+            .push(key);
+        self.push_mark_expiry(key, expires);
         attempt
     }
 
@@ -807,6 +809,26 @@ mod tests {
             content_supplied: true,
             attachments_supplied: false,
         }
+    }
+
+    #[test]
+    fn insert_after_consume_prunes_at_ttl() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let mut attempts = Vec::new();
+        for message in 0..4u64 {
+            attempts.push(marks.insert(1, 2, message, "badword", "Bad word", now));
+        }
+        marks.remove_unconfirmed(1, 2, 0, attempts[0], now);
+        marks.remove_unconfirmed(1, 2, 1, attempts[1], now);
+        let fresh = marks.insert(1, 2, 99, "badword", "Bad word", now);
+        assert!(marks.confirm(1, 2, 99, fresh, now).is_none());
+        let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 99, None, expired),
+            GatewayDeleteObservation::Plain
+        );
+        assert!(!marks.contains(1, 2, 99));
     }
 
     #[test]
