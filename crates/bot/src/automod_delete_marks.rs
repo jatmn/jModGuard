@@ -40,6 +40,12 @@ pub(crate) struct UnconfirmedRemoval {
     pub retained: Option<MessageSnapshot>,
 }
 
+/// Per-REST-delete attempt identity for one message target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AutomodDeleteAttempt(pub(crate) u64);
+
+type MarkKey = (u64, u64, u64, u64);
+
 #[derive(Clone)]
 struct AutomodDeleteMark {
     rule_id: String,
@@ -52,8 +58,9 @@ struct AutomodDeleteMark {
 
 #[derive(Default)]
 pub(crate) struct AutomodDeleteMarks {
-    order: VecDeque<(u64, u64, u64)>,
-    entries: HashMap<(u64, u64, u64), AutomodDeleteMark>,
+    next_attempt: u64,
+    order: VecDeque<MarkKey>,
+    entries: HashMap<MarkKey, AutomodDeleteMark>,
 }
 
 fn snapshot_still_valid(row: &MessageSnapshot, now_ms: i64) -> bool {
@@ -71,7 +78,19 @@ pub(crate) fn settlement_retained(row: Option<MessageSnapshot>) -> Option<Messag
 }
 
 impl AutomodDeleteMarks {
-    fn remove_key(&mut self, key: (u64, u64, u64)) {
+    fn mark_key(guild: u64, channel: u64, message: u64, attempt: AutomodDeleteAttempt) -> MarkKey {
+        (guild, channel, message, attempt.0)
+    }
+
+    fn mark_keys_for_message(&self, guild: u64, channel: u64, message: u64) -> Vec<MarkKey> {
+        self.order
+            .iter()
+            .filter(|key| key.0 == guild && key.1 == channel && key.2 == message)
+            .copied()
+            .collect()
+    }
+
+    fn remove_key(&mut self, key: MarkKey) {
         self.entries.remove(&key);
         self.order.retain(|candidate| *candidate != key);
     }
@@ -98,7 +117,7 @@ impl AutomodDeleteMarks {
     fn prune(&mut self, now: Instant) {
         let wall = now_ms();
         self.clear_expired_retained(wall);
-        let stale: Vec<(u64, u64, u64)> = self
+        let stale: Vec<MarkKey> = self
             .entries
             .iter()
             .filter_map(|(key, entry)| {
@@ -153,20 +172,20 @@ impl AutomodDeleteMarks {
         rule_id: &str,
         rule_name: &str,
         now: Instant,
-    ) {
+    ) -> AutomodDeleteAttempt {
         self.prune(now);
-        let key = (guild, channel, message);
+        let attempt = AutomodDeleteAttempt(self.next_attempt);
+        self.next_attempt += 1;
+        let key = Self::mark_key(guild, channel, message, attempt);
         while self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
             if !self.evict_one(now) {
-                break;
+                return attempt;
             }
         }
         if self.entries.len() >= MAX_AUTOMOD_DELETE_MARKS && !self.entries.contains_key(&key) {
-            return;
+            return attempt;
         }
-        if !self.entries.contains_key(&key) {
-            self.order.push_back(key);
-        }
+        self.order.push_back(key);
         self.entries.insert(
             key,
             AutomodDeleteMark {
@@ -178,9 +197,10 @@ impl AutomodDeleteMarks {
                 retained: None,
             },
         );
+        attempt
     }
 
-    fn store_retained(&mut self, key: (u64, u64, u64), row: MessageSnapshot) {
+    fn store_retained(&mut self, key: MarkKey, row: MessageSnapshot) {
         let wall = now_ms();
         if !snapshot_still_valid(&row, wall) {
             return;
@@ -201,24 +221,43 @@ impl AutomodDeleteMarks {
         now: Instant,
     ) -> GatewayDeleteObservation {
         self.prune(now);
-        let key = (guild, channel, message);
-        let Some(entry) = self.entries.get_mut(&key) else {
+        let keys = self.mark_keys_for_message(guild, channel, message);
+        if keys.is_empty() {
             return GatewayDeleteObservation::Plain;
-        };
-        if entry.confirmed {
-            let entry = self.entries.remove(&key).expect("entry present");
-            self.order.retain(|candidate| *candidate != key);
-            return GatewayDeleteObservation::Automod {
-                rule_id: entry.rule_id,
-                rule_name: entry.rule_name,
+        }
+        for key in &keys {
+            let Some(entry) = self.entries.get(key) else {
+                continue;
             };
+            if entry.confirmed && !entry.gateway_pending {
+                let entry = self.entries.remove(key).expect("entry present");
+                self.order.retain(|candidate| candidate != key);
+                return GatewayDeleteObservation::Automod {
+                    rule_id: entry.rule_id,
+                    rule_name: entry.rule_name,
+                };
+            }
         }
-        entry.gateway_pending = true;
-        entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
-        if let Some(row) = retained {
-            self.store_retained(key, row);
+        let mut pending = false;
+        for key in keys {
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.confirmed {
+                continue;
+            }
+            entry.gateway_pending = true;
+            entry.expires = now + AUTOMOD_DELETE_MARK_TTL;
+            pending = true;
+            if let Some(row) = retained.clone() {
+                self.store_retained(key, row);
+            }
         }
-        GatewayDeleteObservation::PendingAutomod
+        if pending {
+            GatewayDeleteObservation::PendingAutomod
+        } else {
+            GatewayDeleteObservation::Plain
+        }
     }
 
     /// Marks REST success. When the gateway delete already logged as plain
@@ -229,10 +268,11 @@ impl AutomodDeleteMarks {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
         now: Instant,
     ) -> Option<AutomodSettlement> {
         self.prune(now);
-        let key = (guild, channel, message);
+        let key = Self::mark_key(guild, channel, message, attempt);
         let entry = self.entries.get_mut(&key)?;
         entry.confirmed = true;
         if !entry.gateway_pending {
@@ -252,10 +292,11 @@ impl AutomodDeleteMarks {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
         now: Instant,
     ) -> UnconfirmedRemoval {
         self.prune(now);
-        let key = (guild, channel, message);
+        let key = Self::mark_key(guild, channel, message, attempt);
         let Some(entry) = self.entries.get(&key) else {
             return UnconfirmedRemoval {
                 action: UnconfirmedMarkRemoval::Removed,
@@ -288,10 +329,11 @@ impl AutomodDeleteMarks {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
         now: Instant,
     ) -> Option<AutomodSettlement> {
         self.prune(now);
-        let key = (guild, channel, message);
+        let key = Self::mark_key(guild, channel, message, attempt);
         let entry = self.entries.get(&key)?;
         if entry.confirmed || !entry.gateway_pending {
             return None;
@@ -313,9 +355,14 @@ impl AutomodDeleteMarks {
         now: Instant,
     ) -> Option<MessageSnapshot> {
         self.prune(now);
-        let key = (guild, channel, message);
-        let entry = self.entries.get_mut(&key)?;
-        settlement_retained(entry.retained.take())
+        for key in self.mark_keys_for_message(guild, channel, message) {
+            if let Some(entry) = self.entries.get_mut(&key)
+                && let Some(row) = settlement_retained(entry.retained.take())
+            {
+                return Some(row);
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -337,19 +384,25 @@ impl AutomodDeleteMarks {
         now: Instant,
     ) -> Option<(String, String)> {
         self.prune(now);
-        let key = (guild, channel, message);
-        let entry = self.entries.get(&key)?;
-        if !entry.confirmed {
-            return None;
+        for key in self.mark_keys_for_message(guild, channel, message) {
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if !entry.confirmed {
+                continue;
+            }
+            let entry = self.entries.remove(&key)?;
+            self.order.retain(|candidate| *candidate != key);
+            return Some((entry.rule_id, entry.rule_name));
         }
-        let entry = self.entries.remove(&key)?;
-        self.order.retain(|candidate| *candidate != key);
-        Some((entry.rule_id, entry.rule_name))
+        None
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, guild: u64, channel: u64, message: u64) -> bool {
-        self.entries.contains_key(&(guild, channel, message))
+        self.mark_keys_for_message(guild, channel, message)
+            .iter()
+            .any(|key| self.entries.contains_key(key))
     }
 
     #[cfg(test)]
@@ -370,10 +423,10 @@ impl AutomodDeleteMarkAccess {
         message: u64,
         rule_id: &str,
         rule_name: &str,
-    ) {
+    ) -> AutomodDeleteAttempt {
         self.inner
             .lock()
-            .insert(guild, channel, message, rule_id, rule_name, Instant::now());
+            .insert(guild, channel, message, rule_id, rule_name, Instant::now())
     }
 
     pub(crate) fn observe_gateway_delete(
@@ -393,10 +446,11 @@ impl AutomodDeleteMarkAccess {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
     ) -> Option<AutomodSettlement> {
         self.inner
             .lock()
-            .confirm(guild, channel, message, Instant::now())
+            .confirm(guild, channel, message, attempt, Instant::now())
     }
 
     pub(crate) fn remove_unconfirmed(
@@ -404,10 +458,11 @@ impl AutomodDeleteMarkAccess {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
     ) -> UnconfirmedRemoval {
         self.inner
             .lock()
-            .remove_unconfirmed(guild, channel, message, Instant::now())
+            .remove_unconfirmed(guild, channel, message, attempt, Instant::now())
     }
 
     pub(crate) fn take_uncertain_gateway_settlement(
@@ -415,10 +470,15 @@ impl AutomodDeleteMarkAccess {
         guild: u64,
         channel: u64,
         message: u64,
+        attempt: AutomodDeleteAttempt,
     ) -> Option<AutomodSettlement> {
-        self.inner
-            .lock()
-            .take_uncertain_gateway_settlement(guild, channel, message, Instant::now())
+        self.inner.lock().take_uncertain_gateway_settlement(
+            guild,
+            channel,
+            message,
+            attempt,
+            Instant::now(),
+        )
     }
 
     pub(crate) fn take_stored_retained(
@@ -436,6 +496,36 @@ impl AutomodDeleteMarkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt_for_message(marks: &AutomodDeleteMarks, message: u64) -> AutomodDeleteAttempt {
+        AutomodDeleteAttempt(
+            marks
+                .entries
+                .keys()
+                .find(|key| key.2 == message)
+                .expect("mark")
+                .3,
+        )
+    }
+
+    fn set_mark_expires(marks: &mut AutomodDeleteMarks, message: u64, expires: Instant) {
+        for (key, entry) in marks.entries.iter_mut() {
+            if key.2 == message {
+                entry.expires = expires;
+            }
+        }
+    }
+
+    fn set_retained_expires(marks: &mut AutomodDeleteMarks, message: u64, expires_at_ms: i64) {
+        for (key, entry) in marks.entries.iter_mut() {
+            if key.2 == message
+                && let Some(row) = entry.retained.as_mut()
+            {
+                row.expires_at_ms = expires_at_ms;
+            }
+        }
+    }
+
     use crate::db::guild_data::{MessageSnapshot, SnapshotFields};
 
     fn sample_retained(message: u64, content: &str) -> MessageSnapshot {
@@ -466,7 +556,11 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        assert!(marks.confirm(1, 2, 3, now).is_none());
+        assert!(
+            marks
+                .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+                .is_none()
+        );
         let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
         marks.prune(expired);
         assert!(marks.take(1, 2, 3, expired).is_none());
@@ -482,8 +576,7 @@ mod tests {
         }
         let later = now + Duration::from_secs(30);
         for message in 0..8 {
-            marks.entries.get_mut(&(1, 2, message)).unwrap().expires =
-                later - Duration::from_millis(1);
+            set_mark_expires(&mut marks, message, later - Duration::from_millis(1));
         }
         for message in MAX_AUTOMOD_DELETE_MARKS as u64..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
             marks.insert(1, 2, message, "badword", "Bad word", later);
@@ -511,7 +604,11 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 1, "stale", "Stale rule", now);
-        assert!(marks.confirm(1, 2, 1, now).is_none());
+        assert!(
+            marks
+                .confirm(1, 2, 1, attempt_for_message(&marks, 1), now)
+                .is_none()
+        );
         marks.insert(1, 2, 2, "front", "Front rule", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 2, None, now),
@@ -567,16 +664,11 @@ mod tests {
         marks.observe_gateway_delete(1, 2, 1, None, now);
         marks.insert(1, 2, 2, "later", "Later", now);
         marks.observe_gateway_delete(1, 2, 2, Some(sample_retained(2, "stale")), now);
-        marks
-            .entries
-            .get_mut(&(1, 2, 2))
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
+        set_retained_expires(&mut marks, 2, 1);
         marks.prune(now);
-        let settlement = marks.confirm(1, 2, 2, now).unwrap();
+        let settlement = marks
+            .confirm(1, 2, 2, attempt_for_message(&marks, 2), now)
+            .unwrap();
         assert!(settlement.retained.is_none());
     }
 
@@ -589,8 +681,7 @@ mod tests {
         }
         let later = now + Duration::from_secs(30);
         for message in 0..8 {
-            marks.entries.get_mut(&(1, 2, message)).unwrap().expires =
-                later - Duration::from_millis(1);
+            set_mark_expires(&mut marks, message, later - Duration::from_millis(1));
         }
         for message in MAX_AUTOMOD_DELETE_MARKS as u64..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
             marks.insert(1, 2, message, "badword", "Bad word", later);
@@ -611,7 +702,11 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "invite", "Invites", now);
-        assert!(marks.confirm(1, 2, 3, now).is_none());
+        assert!(
+            marks
+                .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+                .is_none()
+        );
         assert_eq!(
             marks.take(1, 2, 3, now),
             Some(("invite".into(), "Invites".into()))
@@ -624,7 +719,7 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        marks.remove_unconfirmed(1, 2, 3, now);
+        marks.remove_unconfirmed(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert!(!marks.contains(1, 2, 3));
     }
 
@@ -634,7 +729,7 @@ mod tests {
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.take(1, 2, 3, now).is_none());
-        marks.remove_unconfirmed(1, 2, 3, now);
+        marks.remove_unconfirmed(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert!(!marks.contains(1, 2, 3));
     }
 
@@ -645,7 +740,11 @@ mod tests {
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.contains(1, 2, 3));
         assert!(marks.take(1, 2, 3, now).is_none());
-        assert!(marks.confirm(1, 2, 3, now).is_none());
+        assert!(
+            marks
+                .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+                .is_none()
+        );
         assert_eq!(
             marks.take(1, 2, 3, now),
             Some(("badword".into(), "Bad word".into()))
@@ -674,7 +773,9 @@ mod tests {
             marks.observe_gateway_delete(1, 2, 3, None, now),
             GatewayDeleteObservation::PendingAutomod
         );
-        let settlement = marks.confirm(1, 2, 3, now).unwrap();
+        let settlement = marks
+            .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+            .unwrap();
         assert_eq!(settlement.rule_id, "badword");
         assert!(!marks.contains(1, 2, 3));
     }
@@ -684,7 +785,7 @@ mod tests {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
-        marks.confirm(1, 2, 3, now);
+        marks.confirm(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
             GatewayDeleteObservation::Automod {
@@ -705,7 +806,9 @@ mod tests {
             marks.observe_gateway_delete(1, 2, 3, Some(row.clone()), now),
             GatewayDeleteObservation::PendingAutomod
         );
-        let settlement = marks.confirm(1, 2, 3, now).unwrap();
+        let settlement = marks
+            .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+            .unwrap();
         assert_eq!(
             settlement
                 .retained
@@ -721,29 +824,17 @@ mod tests {
         let now = Instant::now();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "stale body")), now);
-        marks
-            .entries
-            .get_mut(&(1, 2, 3))
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
-        let settlement = marks.confirm(1, 2, 3, now).unwrap();
+        set_retained_expires(&mut marks, 3, 1);
+        let settlement = marks
+            .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
+            .unwrap();
         assert!(settlement.retained.is_none());
         let mut marks = AutomodDeleteMarks::default();
         marks.insert(1, 2, 4, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 4, Some(sample_retained(4, "stale uncertain")), now);
-        marks
-            .entries
-            .get_mut(&(1, 2, 4))
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
+        set_retained_expires(&mut marks, 4, 1);
         let settlement = marks
-            .take_uncertain_gateway_settlement(1, 2, 4, now)
+            .take_uncertain_gateway_settlement(1, 2, 4, attempt_for_message(&marks, 4), now)
             .unwrap();
         assert!(settlement.retained.is_none());
     }
@@ -756,10 +847,10 @@ mod tests {
         assert!(marks.contains(1, 2, 3));
         assert!(
             marks
-                .take_uncertain_gateway_settlement(1, 2, 3, now)
+                .take_uncertain_gateway_settlement(1, 2, 3, attempt_for_message(&marks, 3), now)
                 .is_none()
         );
-        marks.remove_unconfirmed(1, 2, 3, now);
+        marks.remove_unconfirmed(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert!(!marks.contains(1, 2, 3));
     }
 
@@ -770,7 +861,7 @@ mod tests {
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "uncertain")), now);
         let settlement = marks
-            .take_uncertain_gateway_settlement(1, 2, 3, now)
+            .take_uncertain_gateway_settlement(1, 2, 3, attempt_for_message(&marks, 3), now)
             .unwrap();
         assert_eq!(settlement.rule_id, "badword");
         assert!(
@@ -781,5 +872,34 @@ mod tests {
                 .is_some_and(|c| c.contains("uncertain"))
         );
         assert!(!marks.contains(1, 2, 3));
+    }
+
+    #[test]
+    fn overlapping_delete_attempts_settle_with_own_rule_identity() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        let settlement = marks.confirm(1, 2, 3, first, now).unwrap();
+        assert_eq!(settlement.rule_id, "badword");
+        assert!(marks.contains(1, 2, 3));
+        marks.remove_unconfirmed(1, 2, 3, second, now);
+    }
+
+    #[test]
+    fn later_insert_does_not_erase_gateway_pending_on_earlier_attempt() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        let _second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        assert!(marks.confirm(1, 2, 3, first, now).is_some());
     }
 }

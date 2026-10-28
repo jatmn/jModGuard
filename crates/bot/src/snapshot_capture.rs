@@ -2149,9 +2149,11 @@ mod tests {
         app.invalidate_configs();
         app.snapshots.scopes.lock().insert(789, scope.clone());
         app.snapshots.content_access.lock().insert(789);
-        app.automod_delete_marks
+        let delete_attempt = app
+            .automod_delete_marks
             .insert(789, 456, 10, "badword", "Bad words");
-        app.automod_delete_marks.confirm(789, 456, 10);
+        app.automod_delete_marks
+            .confirm(789, 456, 10, delete_attempt);
         store.close_membership(scope.clone()).await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         let epoch = app.snapshots.epoch.load(Ordering::Acquire);

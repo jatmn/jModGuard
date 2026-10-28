@@ -433,7 +433,8 @@ async fn automod_try_delete_message(
     {
         return;
     }
-    app.automod_delete_marks
+    let delete_attempt = app
+        .automod_delete_marks
         .insert(guild_id, channel, message, rule_id, rule_name);
     let recovery = app
         .remembered_discord_targets
@@ -445,7 +446,10 @@ async fn automod_try_delete_message(
     .await
     {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
-            if let Some(settlement) = app.automod_delete_marks.confirm(guild_id, channel, message) {
+            if let Some(settlement) =
+                app.automod_delete_marks
+                    .confirm(guild_id, channel, message, delete_attempt)
+            {
                 logging::emit_reconciled_automod_delete(
                     app,
                     http,
@@ -460,9 +464,12 @@ async fn automod_try_delete_message(
             }
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
-            let removal = app
-                .automod_delete_marks
-                .remove_unconfirmed(guild_id, channel, message);
+            let removal = app.automod_delete_marks.remove_unconfirmed(
+                guild_id,
+                channel,
+                message,
+                delete_attempt,
+            );
             if removal.action
                 == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
             {
@@ -484,10 +491,12 @@ async fn automod_try_delete_message(
             );
         }
         crate::discord::DiscordCall::Cancelled => {
-            if let Some(settlement) = app
-                .automod_delete_marks
-                .take_uncertain_gateway_settlement(guild_id, channel, message)
-            {
+            if let Some(settlement) = app.automod_delete_marks.take_uncertain_gateway_settlement(
+                guild_id,
+                channel,
+                message,
+                delete_attempt,
+            ) {
                 logging::emit_reconciled_automod_delete(
                     app,
                     http,
@@ -500,8 +509,12 @@ async fn automod_try_delete_message(
                 )
                 .await;
             } else {
-                app.automod_delete_marks
-                    .remove_unconfirmed(guild_id, channel, message);
+                app.automod_delete_marks.remove_unconfirmed(
+                    guild_id,
+                    channel,
+                    message,
+                    delete_attempt,
+                );
             }
         }
     }

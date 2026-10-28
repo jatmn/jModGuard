@@ -4144,9 +4144,11 @@ mod tests {
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
-        crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
-            .await
-            .unwrap();
+        if !log_post_delay.is_zero() {
+            crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
+                .await
+                .unwrap();
+        }
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
@@ -4211,6 +4213,8 @@ mod tests {
         let server_stop = Arc::clone(&stop);
         let trigger = (trigger_method.to_owned(), trigger_path.to_owned());
         let runtime = tokio::runtime::Handle::current();
+        let scope = scope.clone();
+        let ctx = ctx.clone();
         let server = Server(
             stop,
             Some(std::thread::spawn(move || {
@@ -4218,7 +4222,7 @@ mod tests {
                     listener,
                     server_lines,
                     server_stop,
-                    |method, path, body| {
+                    move |method, path, body| {
                         if method == "POST" && path.ends_with("/messages") {
                             if path.ends_with("/channels/998/messages") && !log_post_delay.is_zero()
                             {

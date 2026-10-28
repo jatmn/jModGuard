@@ -530,8 +530,9 @@ async fn punish_proven_match(
         } else {
             None
         };
-        app.automod_delete_marks
-            .insert(found.guild, *channel, *message, rule, name);
+        let delete_attempt =
+            app.automod_delete_marks
+                .insert(found.guild, *channel, *message, rule, name);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             crate::discord::race_discord_call(
@@ -555,10 +556,12 @@ async fn punish_proven_match(
         }
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
-                if let Some(settlement) =
-                    app.automod_delete_marks
-                        .confirm(found.guild, *channel, *message)
-                {
+                if let Some(settlement) = app.automod_delete_marks.confirm(
+                    found.guild,
+                    *channel,
+                    *message,
+                    delete_attempt,
+                ) {
                     crate::logging::spawn_reconciled_automod_delete(
                         std::sync::Arc::clone(app),
                         Arc::clone(&http),
@@ -573,9 +576,12 @@ async fn punish_proven_match(
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                let removal =
-                    app.automod_delete_marks
-                        .remove_unconfirmed(found.guild, *channel, *message);
+                let removal = app.automod_delete_marks.remove_unconfirmed(
+                    found.guild,
+                    *channel,
+                    *message,
+                    delete_attempt,
+                );
                 if removal.action
                     == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
                 {
@@ -592,9 +598,13 @@ async fn punish_proven_match(
                 delete_outcome(&error)
             }
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
-                if let Some(settlement) = app
-                    .automod_delete_marks
-                    .take_uncertain_gateway_settlement(found.guild, *channel, *message)
+                if let Some(settlement) =
+                    app.automod_delete_marks.take_uncertain_gateway_settlement(
+                        found.guild,
+                        *channel,
+                        *message,
+                        delete_attempt,
+                    )
                 {
                     crate::logging::spawn_reconciled_automod_delete(
                         std::sync::Arc::clone(app),
@@ -611,6 +621,7 @@ async fn punish_proven_match(
                         found.guild,
                         *channel,
                         *message,
+                        delete_attempt,
                     );
                     if removal.action
                         == crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
@@ -1460,46 +1471,55 @@ pub(crate) mod tests {
         Some((method, path, body))
     }
 
-    pub(crate) fn serve_discord_stub(
+    pub(crate) fn serve_discord_stub<F>(
         listener: std::net::TcpListener,
         lines: Arc<Mutex<Vec<String>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
-        mut before_response: impl FnMut(&str, &str, &str) -> Option<&'static str>,
-    ) {
+        before_response: F,
+    ) where
+        F: FnMut(&str, &str, &str) -> Option<&'static str> + Send + 'static,
+    {
         use std::io::Write;
+        let before_response = Arc::new(Mutex::new(before_response));
         listener.set_nonblocking(true).unwrap();
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    let Some((method, path, request_body)) = read_http_request(&mut stream) else {
-                        continue;
-                    };
-                    lines.lock().push(format!("{method} {path}"));
-                    let status_override = before_response(&method, &path, &request_body);
-                    let body = if method == "GET" && path.contains("/members/") {
-                        MEMBER_JSON
-                    } else if method == "POST" && path.ends_with("/messages") {
-                        r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0001","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#
-                    } else {
-                        ""
-                    };
-                    let status = if let Some(status) = status_override {
-                        status
-                    } else if method == "GET" && path.contains("/bans/") {
-                        "404 Not Found"
-                    } else if body.is_empty() {
-                        "204 No Content"
-                    } else {
-                        "200 OK"
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    let lines = Arc::clone(&lines);
+                    let before_response = Arc::clone(&before_response);
+                    std::thread::spawn(move || {
+                        let Some((method, path, request_body)) = read_http_request(&mut stream)
+                        else {
+                            return;
+                        };
+                        lines.lock().push(format!("{method} {path}"));
+                        let status_override =
+                            before_response.lock()(&method, &path, &request_body);
+                        let body = if method == "GET" && path.contains("/members/") {
+                            MEMBER_JSON
+                        } else if method == "POST" && path.ends_with("/messages") {
+                            r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0001","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#
+                        } else {
+                            ""
+                        };
+                        let status = if let Some(status) = status_override {
+                            status
+                        } else if method == "GET" && path.contains("/bans/") {
+                            "404 Not Found"
+                        } else if body.is_empty() {
+                            "204 No Content"
+                        } else {
+                            "200 OK"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));

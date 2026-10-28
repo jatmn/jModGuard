@@ -96,10 +96,13 @@ async fn confirmed_mark_emits_automod_delete_not_plain_delete() {
     db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
         .await
         .unwrap();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
-    f.app.automod_delete_marks.confirm(789, 456, 123);
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt);
     let report = observed_delete_report(
         &f.app,
         GuildId::new(789),
@@ -134,10 +137,13 @@ async fn automod_delete_channel_falls_back_to_message_delete() {
     db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
         .await
         .unwrap();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "invite", "Invites");
-    f.app.automod_delete_marks.confirm(789, 456, 123);
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt);
     let report = observed_delete_report(
         &f.app,
         GuildId::new(789),
@@ -183,10 +189,13 @@ async fn restart_substitute_has_no_mark() {
 #[tokio::test]
 async fn double_emit_path_consumes_mark_once() {
     let f = Fixture::new();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
-    f.app.automod_delete_marks.confirm(789, 456, 123);
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt);
     let first = observed_delete_report(
         &f.app,
         GuildId::new(789),
@@ -213,7 +222,8 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
     db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
         .await
         .unwrap();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -233,7 +243,10 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
             .lock()
             .contains(789, 456, 123)
     );
-    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123);
+    let reconcile = f
+        .app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt);
     assert_eq!(
         reconcile.as_ref().map(|s| s.rule_id.as_str()),
         Some("badword")
@@ -267,9 +280,10 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
     db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
         .await
         .unwrap();
-    f.app
-        .automod_delete_marks
-        .insert(789, 456, 123, "repeated_text", "Repeated text");
+    let delete_attempt =
+        f.app
+            .automod_delete_marks
+            .insert(789, 456, 123, "repeated_text", "Repeated text");
     assert!(
         observed_delete_report(
             &f.app,
@@ -283,7 +297,7 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
     let reconcile = f
         .app
         .automod_delete_marks
-        .confirm(789, 456, 123)
+        .confirm(789, 456, 123, delete_attempt)
         .expect("spam reconcile");
     let sink = Sink::default();
     emit_reconciled_automod_delete(
@@ -342,10 +356,13 @@ async fn automod_delete_fallback_inherits_message_delete_ignore_filter() {
         Some(r#"{"users":["42"],"channels":[]}"#),
     )
     .await;
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
-    f.app.automod_delete_marks.confirm(789, 456, 123);
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt);
     let mut report = observed_delete_report(
         &f.app,
         GuildId::new(789),
@@ -374,7 +391,8 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
     )
     .await;
     remember_message(&f.app, 789, 456, 123, Some(42), None, None);
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -399,7 +417,11 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
         emit_to(&f.app, &sink, peek.guild_id, peek.event, peek.vars).await,
         Delivery::Unconfigured
     );
-    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123).unwrap();
+    let reconcile = f
+        .app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt)
+        .unwrap();
     emit_reconciled_automod_delete(
         &f.app,
         &sink,
@@ -431,10 +453,13 @@ fn bulk_transcript_peel_automod_suppresses_empty_bulk() {
 #[tokio::test]
 async fn bulk_mix_splits_automod_from_plain_ids() {
     let f = Fixture::new();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 10, "badword", "Bad words");
-    f.app.automod_delete_marks.confirm(789, 456, 10);
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 10, delete_attempt);
     let automod = observed_delete_report(
         &f.app,
         GuildId::new(789),
@@ -464,7 +489,8 @@ async fn rest_failure_replays_plain_delete_after_gateway_pending() {
         .await
         .unwrap();
     f.app.invalidate_configs();
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -477,7 +503,10 @@ async fn rest_failure_replays_plain_delete_after_gateway_pending() {
         )
         .is_none()
     );
-    let removal = f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, delete_attempt);
     assert_eq!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
     let sink = Sink::default();
     emit_plain_message_delete(
@@ -569,7 +598,8 @@ async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
         .unwrap();
     f.app.invalidate_configs();
     let retained = sample_retained("kept through settlement");
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -582,7 +612,11 @@ async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
         )
         .is_none()
     );
-    let reconcile = f.app.automod_delete_marks.confirm(789, 456, 123).unwrap();
+    let reconcile = f
+        .app
+        .automod_delete_marks
+        .confirm(789, 456, 123, delete_attempt)
+        .unwrap();
     let sink = Sink::default();
     emit_reconciled_automod_delete(
         &f.app,
@@ -609,7 +643,8 @@ async fn rest_failure_replay_uses_stashed_retained_snapshot() {
         .unwrap();
     f.app.invalidate_configs();
     let retained = sample_retained("plain replay body");
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -622,7 +657,10 @@ async fn rest_failure_replay_uses_stashed_retained_snapshot() {
         )
         .is_none()
     );
-    let removal = f.app.automod_delete_marks.remove_unconfirmed(789, 456, 123);
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, delete_attempt);
     assert_eq!(removal.action, UnconfirmedMarkRemoval::ReplayPlainDelete);
     let sink = Sink::default();
     emit_plain_message_delete(
@@ -646,7 +684,8 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
         .unwrap();
     f.app.invalidate_configs();
     let retained = sample_retained("after uncertain REST");
-    f.app
+    let delete_attempt = f
+        .app
         .automod_delete_marks
         .insert(789, 456, 123, "badword", "Bad words");
     assert!(
@@ -662,7 +701,7 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
     let settlement = f
         .app
         .automod_delete_marks
-        .take_uncertain_gateway_settlement(789, 456, 123)
+        .take_uncertain_gateway_settlement(789, 456, 123, delete_attempt)
         .expect("gateway pending settlement");
     let sink = Sink::default();
     emit_reconciled_automod_delete(
