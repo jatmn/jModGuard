@@ -678,6 +678,26 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
 }
 
 #[tokio::test]
+async fn first_profile_insert_creates_pending_rejoin_receipt() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(scope.clone(), observed(77, Some(900), 1_500))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .has_pending_rejoin_note(scope.clone(), 77)
+            .await
+            .unwrap(),
+        "first directory row must persist durable rejoin-note eligibility"
+    );
+}
+
+#[tokio::test]
 async fn closed_scope_erasure_removes_pending_rejoin_notes() {
     let (_f, store, scope) = ready().await;
     store
@@ -5821,7 +5841,7 @@ async fn configured_large_roster_and_ban_pages_commit_with_one_cursor_each() {
 const QUERY_COUNT_GUILD: i64 = 424_242;
 const MEMBER_PAGE_CAP: usize = 500;
 /// Lookup, set-based writes, revision bump, and the last-seen update.
-const STATEMENTS_PER_MEMBER_BATCH: u64 = 14;
+const STATEMENTS_PER_MEMBER_BATCH: u64 = 16;
 /// Claim seed read plus status() after the page, with a small fixed margin.
 const STATEMENTS_PER_MEMBER_PAGE: u64 = 8;
 

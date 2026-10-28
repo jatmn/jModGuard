@@ -579,6 +579,40 @@ async fn ignored_user_skips_member_rejoin_note() {
 }
 
 #[test]
+fn maybe_emit_defers_rejoin_enrichment_to_log_admission() {
+    let src = include_str!("../member_rejoin.rs");
+    let start = src
+        .find("pub(crate) async fn maybe_emit_member_rejoin")
+        .expect("maybe_emit_member_rejoin");
+    let body = &src[start..start + 700];
+    assert!(
+        !body.contains("enrich_member_rejoin_vars("),
+        "rejoin enrichment must run only after log delivery admission"
+    );
+    assert!(body.contains("emit_member_event"));
+}
+
+#[test]
+fn rejected_departure_keeps_rejoin_delivery_guard() {
+    let src = include_str!("../handlers.rs");
+    let start = src
+        .find("let departed = crate::member_directory::observe_departure")
+        .expect("departure observation");
+    let body = &src[start..start + 900];
+    let verify = body
+        .find("NeedsVerification")
+        .expect("stale removal must be rejected");
+    let clear = body
+        .find("rejoin_note_deliveries")
+        .expect("applied departures clear delivery state");
+    assert!(
+        verify < clear,
+        "rejected departures must not release in-flight rejoin delivery"
+    );
+    assert!(body.contains("MemberDepartureDecision::Applied(_))"));
+}
+
+#[test]
 fn guild_member_addition_retries_rejoin_without_double_posting() {
     let source = include_str!("../handlers.rs");
     let start = source

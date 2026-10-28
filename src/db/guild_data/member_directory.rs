@@ -2132,7 +2132,8 @@ fn upsert_member(
         let stay = random_id();
         let search_text = normalized_name(&username, &global, &nickname);
         conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,username,global_name,nickname,search_text,is_current,joined_at_ms,current_stay_id,observed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10)",params![scope.guild_id(),scope.enrollment.id.as_str(),obs.user_id,username,global,nickname,search_text,obs.joined_at_ms,stay.as_str(),obs.observed_at_ms])?;
-        conn.member_execute("INSERT INTO guild_member_stays(guild_id,enrollment_id,stay_id,user_id,joined_at_ms,provenance) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,obs.user_id,obs.joined_at_ms,provenance])?;
+        conn.member_execute("INSERT INTO guild_member_stays(guild_id,enrollment_id,stay_id,user_id,joined_at_ms,provenance) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),stay.clone(),obs.user_id,obs.joined_at_ms,provenance])?;
+        set_pending_rejoin_note_tx(conn, scope, obs.user_id, stay.as_str(), obs.joined_at_ms)?;
         bump_revision(conn, scope)?;
         return Ok(MemberUpsertOutcome {
             membership_refresh: true,
@@ -2450,7 +2451,7 @@ fn upsert_member_batch(
             let global = bounded_name(obs.global_name.clone().flatten())?;
             let nickname = bounded_name(obs.nickname.clone().flatten())?;
             let stay = random_id();
-            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":true,"joined_at_ms":obs.joined_at_ms,"current_stay_id":stay,"observed_at_ms":obs.observed_at_ms,"revision":0,"clear_ban":false,"new_stay_id":stay,"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":"imported","pending_rejoin":false,"purge_prior":false,"old_stay_id":null,"unknown_observation_id":null,"fill_stay_id":null,"fill_joined_at_ms":null}));
+            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":true,"joined_at_ms":obs.joined_at_ms,"current_stay_id":stay,"observed_at_ms":obs.observed_at_ms,"revision":0,"clear_ban":false,"new_stay_id":stay,"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":"imported","pending_rejoin":true,"purge_prior":false,"old_stay_id":null,"unknown_observation_id":null,"fill_stay_id":null,"fill_joined_at_ms":null}));
             inserted += 1;
         }
     }

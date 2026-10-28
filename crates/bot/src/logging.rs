@@ -990,6 +990,8 @@ pub(crate) enum Delivery {
     Failed,
     /// Skipped because this guild/channel was recently rejected with a permanent error.
     Blocked,
+    /// Admitted rejoin enrichment found nothing to report; do not retry delivery.
+    NothingToSend,
 }
 
 #[derive(Clone, Copy)]
@@ -1232,7 +1234,7 @@ async fn emit_to_observed_with_audit(
                     {
                         crate::member_rejoin::MemberRejoinEnrich::Ready => {}
                         crate::member_rejoin::MemberRejoinEnrich::NoNote => {
-                            return Ok(Delivery::Unconfigured);
+                            return Ok(Delivery::NothingToSend);
                         }
                         crate::member_rejoin::MemberRejoinEnrich::Retry => {
                             return Ok(Delivery::Failed);

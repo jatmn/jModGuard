@@ -310,17 +310,20 @@ pub(crate) async fn maybe_emit_member_rejoin(
     guild_id: GuildId,
     user: &User,
 ) -> MemberRejoinEmitOutcome {
-    let mut vars = BTreeMap::new();
-    match enrich_member_rejoin_vars(app, guild_id, user, &mut vars).await {
-        MemberRejoinEnrich::Retry => return MemberRejoinEmitOutcome::Retry,
-        MemberRejoinEnrich::NoNote => return MemberRejoinEmitOutcome::NoNote,
-        MemberRejoinEnrich::Ready => {}
-    }
-    match logging::emit_member_event(app, ctx, guild_id, "member_rejoin", user, vars, None)
-        .await
-        .0
+    match logging::emit_member_event(
+        app,
+        ctx,
+        guild_id,
+        "member_rejoin",
+        user,
+        BTreeMap::new(),
+        None,
+    )
+    .await
+    .0
     {
         logging::Delivery::Sent => MemberRejoinEmitOutcome::Sent,
+        logging::Delivery::NothingToSend => MemberRejoinEmitOutcome::NoNote,
         logging::Delivery::Unconfigured
         | logging::Delivery::Failed
         | logging::Delivery::Dropped
