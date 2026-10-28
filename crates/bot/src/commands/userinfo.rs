@@ -180,7 +180,7 @@ pub(crate) fn format_voice(voice: &VoiceSnapshot) -> String {
     match voice {
         VoiceSnapshot::NotCached => VOICE_NOT_CACHED.to_string(),
         VoiceSnapshot::NotInChannel => VOICE_NOT_IN.to_string(),
-        VoiceSnapshot::Channel { name, id } => format!("{name} (`{id}`)"),
+        VoiceSnapshot::Channel { name, id } => format!("{} (`{id}`)", report_text(name)),
     }
 }
 
@@ -229,7 +229,7 @@ pub(crate) fn format_case_line(
     if let Some(reason) = reason {
         let stripped = jmodguard::ban_reason::without_tag(reason);
         if !stripped.is_empty() {
-            let clipped = clip_reason(stripped, 120);
+            let clipped = clip_reason(&report_text(stripped), 120);
             line.push_str(&format!(" — {clipped}"));
         }
     }
@@ -265,24 +265,30 @@ pub(crate) fn userinfo_template_vars(
         .unwrap_or(&fallback_id);
     let mut vars = BTreeMap::new();
     vars.insert("user_id".into(), snapshot.user_id.to_string());
-    vars.insert("display".into(), display.to_string());
+    vars.insert("display".into(), report_text(display));
     vars.insert(
         "username".into(),
         snapshot
             .username
-            .clone()
+            .as_deref()
+            .map(report_text)
             .unwrap_or_else(|| MISSING.to_string()),
     );
     vars.insert(
         "global_name".into(),
         snapshot
             .global_name
-            .clone()
+            .as_deref()
+            .map(report_text)
             .unwrap_or_else(|| MISSING.to_string()),
     );
     vars.insert(
         "nick".into(),
-        snapshot.nick.clone().unwrap_or_else(|| MISSING.to_string()),
+        snapshot
+            .nick
+            .as_deref()
+            .map(report_text)
+            .unwrap_or_else(|| MISSING.to_string()),
     );
     vars.insert("account_created".into(), account_created.to_string());
     vars.insert(
@@ -300,9 +306,10 @@ pub(crate) fn userinfo_template_vars(
             MISSING.to_string()
         },
     );
+    let safe_roles: Vec<String> = roles.iter().map(|role| report_text(role)).collect();
     vars.insert(
         "roles".into(),
-        format_roles(roles, snapshot.roles_cached, snapshot.member_cached),
+        format_roles(&safe_roles, snapshot.roles_cached, snapshot.member_cached),
     );
     vars.insert("voice".into(), format_voice(&snapshot.voice));
     vars.insert("warns".into(), format_warns(warns));
@@ -438,6 +445,12 @@ fn render_pass(
 
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
+}
+
+/// Member-fed and case-fed report text. Same escaping as a rejoin case reason:
+/// one line, with mention and markdown characters treated as data.
+fn report_text(text: &str) -> String {
+    crate::member_rejoin::sanitize_reason_for_report(text)
 }
 
 pub(crate) async fn resolve_userinfo_target(env: &CmdEnv<'_>, args: &mut Args) -> Result<UserId> {

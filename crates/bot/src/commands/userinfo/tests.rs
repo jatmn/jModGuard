@@ -121,6 +121,311 @@ fn case_reason_strips_ban_tag() {
 }
 
 #[test]
+fn profile_and_case_text_is_sanitized_like_rejoin_reports() {
+    let snapshot = MemberSnapshot {
+        user_id: 91,
+        username: Some("ada <@123>".into()),
+        global_name: Some("Ada @everyone".into()),
+        nick: Some("nick\n<@123> @everyone".into()),
+        joined_at: None,
+        roles: vec!["crew <@&55> @here".into()],
+        roles_cached: true,
+        voice: VoiceSnapshot::Channel {
+            name: "room <@8> @here".into(),
+            id: 7,
+        },
+        member_cached: true,
+        guild_cached: true,
+    };
+    let line = format_case_line(
+        "ban",
+        Some("succeeded"),
+        Some(1_700_000_000_000),
+        Some("line1\n- Case #99: <@123> @everyone `break`"),
+    );
+    let body = render_userinfo_message(
+        jmodguard::defaults::USER_INFO_TEMPLATE,
+        &snapshot,
+        &WarnsField::Count(0),
+        vec![line],
+    );
+    let nick = body
+        .lines()
+        .find(|line| line.contains("**Nick:**"))
+        .expect("nick line");
+    assert!(nick.contains("\\<\\@123\\>"), "{nick}");
+    assert!(nick.contains("\\@everyone"), "{nick}");
+    assert!(
+        !contains_unescaped(nick, "<@123>"),
+        "nickname must not keep a live mention: {nick}"
+    );
+    assert!(!contains_unescaped(nick, "@everyone"), "{nick}");
+    assert!(
+        nick.contains("nick \\<\\@123\\>"),
+        "a newline in the nickname must collapse onto the nick line: {nick}"
+    );
+    assert!(body.contains("\\@everyone"));
+    assert!(body.contains("crew \\<\\@&55\\> \\@here"), "{body}");
+    assert!(body.contains("room \\<\\@8\\> \\@here"), "{body}");
+    assert!(body.contains("Case \\#99"), "{body}");
+    assert!(body.contains("\\`break\\`"), "{body}");
+    assert!(!contains_unescaped(&body, "<@123>"), "{body}");
+    assert!(!contains_unescaped(&body, "@everyone"), "{body}");
+    assert!(!contains_unescaped(&body, "@here"), "{body}");
+    let vars = userinfo_template_vars(
+        &snapshot,
+        &WarnsField::Count(0),
+        &CasesField::None,
+        &snapshot.roles,
+        &[],
+        "",
+    );
+    assert_eq!(vars["username"], "ada \\<\\@123\\>");
+    assert_eq!(vars["global_name"], "Ada \\@everyone");
+    assert_eq!(vars["nick"], "nick \\<\\@123\\> \\@everyone");
+    assert_eq!(vars["display"], vars["nick"]);
+    assert_eq!(vars["roles"], "crew \\<\\@&55\\> \\@here");
+}
+
+fn contains_unescaped(text: &str, needle: &str) -> bool {
+    text.match_indices(needle)
+        .any(|(index, _)| !text[..index].ends_with('\\'))
+}
+
+#[tokio::test]
+async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
+    const USER_MENTION: &str = "<@123456789012345678>";
+    const ROLE_MENTION: &str = "<@&50>";
+    let snapshot = MemberSnapshot {
+        user_id: 91,
+        username: Some("ada".into()),
+        global_name: Some("Ada".into()),
+        nick: Some(format!("{USER_MENTION} @everyone")),
+        joined_at: None,
+        roles: vec![format!("{ROLE_MENTION} @here")],
+        roles_cached: true,
+        voice: VoiceSnapshot::Channel {
+            name: format!("room {USER_MENTION} @here"),
+            id: 7,
+        },
+        member_cached: true,
+        guild_cached: true,
+    };
+    let line = format_case_line(
+        "ban",
+        Some("succeeded"),
+        Some(1_700_000_000_000),
+        Some(&format!("{USER_MENTION} {ROLE_MENTION} @everyone @here")),
+    );
+    let body = render_userinfo_message(
+        jmodguard::defaults::USER_INFO_TEMPLATE,
+        &snapshot,
+        &WarnsField::Count(1),
+        vec![line],
+    );
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_mentions_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    app.activation.mark_lock_held(true);
+    let (http, captured, server) = capturing_proxy().await;
+    let http = Arc::new(http);
+    let cache = Cache::new();
+    let mut userinfo = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| matches!(cmd.behavior, jmodguard::types::Behavior::UserInfo))
+        .unwrap();
+    userinfo.log_event.clear();
+    let outcome = super::super::BehaviorOutcome {
+        response: Some(body),
+        vars: std::collections::BTreeMap::new(),
+        suppress_response: false,
+    };
+    let slash = super::super::SlashCtx {
+        id: serenity::model::id::InteractionId::new(1),
+        token: "token".into(),
+        channel_id: ChannelId::new(2),
+        guild_id: GuildId::new(10),
+        actor: UserId::new(7),
+        member: None,
+        name: "userinfo".into(),
+        options: Vec::new(),
+    };
+    super::super::deliver_slash_success(
+        &app.activation,
+        http.as_ref(),
+        &slash,
+        true,
+        &userinfo,
+        &outcome,
+    )
+    .await;
+    super::super::deliver_slash_success(
+        &app.activation,
+        http.as_ref(),
+        &slash,
+        false,
+        &userinfo,
+        &outcome,
+    )
+    .await;
+    super::super::send_outcome(
+        &app,
+        http.as_ref(),
+        &cache,
+        &userinfo,
+        GuildId::new(10),
+        ChannelId::new(2),
+        UserId::new(7),
+        outcome,
+    )
+    .await;
+    let mut say = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| matches!(cmd.behavior, jmodguard::types::Behavior::Say))
+        .unwrap();
+    say.response.clear();
+    say.log_event.clear();
+    super::super::send_outcome(
+        &app,
+        http.as_ref(),
+        &cache,
+        &say,
+        GuildId::new(10),
+        ChannelId::new(2),
+        UserId::new(7),
+        super::super::BehaviorOutcome {
+            response: Some(format!("{USER_MENTION} @everyone")),
+            vars: std::collections::BTreeMap::new(),
+            suppress_response: false,
+        },
+    )
+    .await;
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        4,
+        "deferred slash, initial slash, prefix, and say: {requests:?}"
+    );
+    for request in &requests[..3] {
+        let payload = message_fields(request);
+        assert_eq!(
+            payload["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "{payload}"
+        );
+        assert_eq!(payload["allowed_mentions"]["replied_user"], false);
+        let content = payload["content"].as_str().unwrap();
+        for raw in [USER_MENTION, ROLE_MENTION, "@everyone", "@here"] {
+            assert!(
+                !contains_unescaped(content, raw),
+                "{raw} remained mentionable in {content}"
+            );
+        }
+    }
+    let say_payload = message_fields(&requests[3]);
+    assert!(
+        say_payload.get("allowed_mentions").is_none(),
+        "say must keep Discord's normal mention parsing: {say_payload}"
+    );
+    let say_content = say_payload["content"].as_str().unwrap();
+    assert!(
+        contains_unescaped(say_content, USER_MENTION),
+        "{say_content}"
+    );
+    assert!(
+        contains_unescaped(say_content, "@everyone"),
+        "{say_content}"
+    );
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+fn request_json(raw: &str) -> serde_json::Value {
+    let (_, body) = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("request had no body: {raw}"));
+    serde_json::from_str(body).unwrap_or_else(|error| panic!("{error} in {body}"))
+}
+
+/// Channel posts and deferred edits put the message at the top level. The
+/// initial interaction callback wraps that same object in `data`.
+fn message_fields(raw: &str) -> serde_json::Value {
+    let payload = request_json(raw);
+    payload
+        .get("data")
+        .filter(|data| data.is_object())
+        .cloned()
+        .unwrap_or(payload)
+}
+
+async fn capturing_proxy() -> (
+    serenity::http::Http,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slot = Arc::clone(&captured);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut header_end = None;
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if header_end.is_none() {
+                    header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4);
+                }
+                if let Some(end) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + length {
+                        break;
+                    }
+                }
+            }
+            slot.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request).into_owned());
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, captured, server)
+}
+
+#[test]
 fn history_unavailable_does_not_say_none() {
     let snapshot = MemberSnapshot {
         user_id: 91,
