@@ -109,7 +109,7 @@ entire configuration bundle. Complete tenant isolation and replica coordination 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 16. Ban recovery uses immutable opaque attempt tags,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 17. Ban recovery uses immutable opaque attempt tags,
 never reason-text equality. Keep tags out of case API JSON and human reasons. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write.
@@ -507,7 +507,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves built dist/frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless bundled at build time, not git)
-migrations/             0001_init through 0020_gateway_ban_deliveries
+migrations/             0001_init through 0022_clear_userinfo_command_rows
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```

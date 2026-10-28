@@ -728,7 +728,7 @@ impl EventHandler for Handler {
         let uid = new_member.user.id.get();
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
-        crate::member_directory::observe_join(
+        let membership_refresh = crate::member_directory::observe_join(
             &app,
             &new_member,
             chrono::Utc::now().timestamp_millis(),
@@ -744,6 +744,51 @@ impl EventHandler for Handler {
             None,
         )
         .await;
+        let current_stay =
+            crate::member_directory::current_member_stay_id(&app, guild_id.get(), uid).await;
+        if membership_refresh {
+            if let Some(stay_id) = current_stay.as_deref() {
+                app.rejoin_note_deliveries
+                    .retain_current_stay(guild_id.get(), uid, stay_id);
+            } else {
+                app.rejoin_note_deliveries.clear_member(guild_id.get(), uid);
+            }
+        }
+        let retry_undelivered = current_stay.as_deref().is_some_and(|stay_id| {
+            app.rejoin_note_deliveries
+                .pending_redelivery(guild_id.get(), uid, stay_id)
+        });
+        let durable_pending =
+            crate::member_directory::pending_rejoin_note(&app, guild_id.get(), uid).await;
+        if (membership_refresh || retry_undelivered || durable_pending)
+            && let Some(stay_id) = current_stay.as_deref()
+            && let Some(in_flight) =
+                app.rejoin_note_deliveries
+                    .begin_in_flight(guild_id.get(), uid, stay_id)
+        {
+            let outcome = crate::member_rejoin::maybe_emit_member_rejoin(
+                &app,
+                &ctx,
+                guild_id,
+                &new_member.user,
+            )
+            .await;
+            let settled = matches!(
+                outcome,
+                crate::member_rejoin::MemberRejoinEmitOutcome::Sent
+                    | crate::member_rejoin::MemberRejoinEmitOutcome::NoNote
+            );
+            in_flight.complete(settled);
+            if settled {
+                crate::member_directory::clear_pending_rejoin_note(
+                    &app,
+                    guild_id.get(),
+                    uid,
+                    stay_id,
+                )
+                .await;
+            }
+        }
     }
 
     async fn guild_member_removal(
@@ -788,6 +833,13 @@ impl EventHandler for Handler {
             // A paced target check will either discard this stale remove or
             // emit the leave with the saved duration once absence is proven.
             return;
+        }
+        if matches!(
+            departed,
+            Some(crate::db::guild_data::MemberDepartureDecision::Applied(_))
+        ) {
+            app.rejoin_note_deliveries
+                .clear_member(guild_id.get(), user.id.get());
         }
         let joined_at_ms = departure_joined_at_ms(
             departed.as_ref(),
@@ -882,7 +934,7 @@ impl EventHandler for Handler {
         }
         let mut extra = audit.unwrap_or_default();
         extra.insert("time".into(), observed_at);
-        let late_audit = logging::emit_member_event(
+        let (_, late_audit) = logging::emit_member_event(
             &app,
             &ctx,
             guild_id,

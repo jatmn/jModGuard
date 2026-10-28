@@ -727,6 +727,7 @@ pub struct BotState {
     pub snapshots: crate::snapshot_capture::SnapshotIngress,
     pub edit_reports: crate::logging::EditReportDedup,
     pub member_joins: crate::logging::MemberJoinContext,
+    pub rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries,
     pub member_audits: crate::logging::MemberAuditClaims,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
     pub log_delivery_slots: tokio::sync::Semaphore,
@@ -841,6 +842,7 @@ impl BotState {
             snapshots: crate::snapshot_capture::SnapshotIngress::default(),
             edit_reports: crate::logging::EditReportDedup::default(),
             member_joins: crate::logging::MemberJoinContext::default(),
+            rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries::default(),
             member_audits: crate::logging::MemberAuditClaims::default(),
             cooldowns: DashMap::new(),
             log_delivery_slots,
@@ -2144,6 +2146,9 @@ impl CachedGuildConfig {
     /// Looks up a command by name or alias (case-insensitive).
     pub fn find_command(&self, name: &str) -> Option<&CommandDef> {
         let lower = name.to_lowercase();
+        if let Some(primary) = jmodguard::defaults::builtin_command_for_label(&lower) {
+            return self.commands.get(&primary);
+        }
         self.commands.values().find(|c| c.matches(&lower))
     }
 }
@@ -3678,11 +3683,8 @@ mod tests {
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
         );
-        let cmd = crate::defaults::default_commands()
-            .into_iter()
-            .next()
-            .expect("defaults");
-        tokio_test_block_on(db::upsert_command(&app.db, 1, &cmd.name, &cmd)).unwrap();
+        let cmd = crate::defaults::custom_command_fixture("slashpending");
+        tokio_test_block_on(db::upsert_command(&app.db, 1, "slashpending", &cmd)).unwrap();
         let pending = tokio_test_block_on(app.pending_slash_registry_version())
             .unwrap()
             .expect("command write must surface pending slash version");

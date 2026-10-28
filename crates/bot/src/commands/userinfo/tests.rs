@@ -401,7 +401,8 @@ async fn rest_lookup_failure_still_renders_warns_and_cases() {
     .await;
     let cache = Arc::new(Cache::new());
     remember_guild(&cache, 10, None, None);
-    let ctx = test_context(cache).await;
+    let (http, requested, server) = rejecting_user_proxy().await;
+    let ctx = test_context(cache, Arc::new(http)).await;
     let cmd = jmodguard::defaults::default_commands()
         .into_iter()
         .find(|c| matches!(c.behavior, jmodguard::types::Behavior::UserInfo))
@@ -425,6 +426,12 @@ async fn rest_lookup_failure_still_renders_warns_and_cases() {
     assert!(body.contains("**Warnings:** 1"));
     assert!(body.contains("`warning`"));
     assert!(!body.contains("Discord API error"));
+    let requested = requested.lock().unwrap().clone();
+    assert!(
+        requested.contains("/users/91"),
+        "user lookup must hit the local proxy, got {requested:?}"
+    );
+    server.abort();
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
@@ -524,7 +531,8 @@ async fn omitted_user_argument_defaults_to_actor() {
     ready_userinfo_case_index(&app, &enrollment).await;
     let cache = Arc::new(Cache::new());
     remember_guild(&cache, 10, Some(target_member(10, 7, None)), None);
-    let ctx = test_context(cache).await;
+    let (http, requested, server) = rejecting_user_proxy().await;
+    let ctx = test_context(cache, Arc::new(http)).await;
     let cmd = jmodguard::defaults::default_commands()
         .into_iter()
         .find(|c| matches!(c.behavior, jmodguard::types::Behavior::UserInfo))
@@ -550,6 +558,11 @@ async fn omitted_user_argument_defaults_to_actor() {
         .await
         .unwrap();
     assert_eq!(other, UserId::new(91));
+    assert!(
+        requested.lock().unwrap().is_empty(),
+        "resolving a cached or numeric user must not call Discord"
+    );
+    server.abort();
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
@@ -623,7 +636,8 @@ async fn integration_warn_and_case_rows() {
     .await;
     let cache = Arc::new(Cache::new());
     remember_guild(&cache, 10, Some(target_member(10, 91, Some("Nick"))), None);
-    let ctx = test_context(cache).await;
+    let (http, requested, server) = rejecting_user_proxy().await;
+    let ctx = test_context(cache, Arc::new(http)).await;
     let cmd = jmodguard::defaults::default_commands()
         .into_iter()
         .find(|c| matches!(c.behavior, jmodguard::types::Behavior::UserInfo))
@@ -646,6 +660,11 @@ async fn integration_warn_and_case_rows() {
     assert!(body.contains("**Warnings:** 1"));
     assert!(body.contains("`ban`"));
     assert!(body.contains("`91`"));
+    assert!(
+        requested.lock().unwrap().is_empty(),
+        "a cached member must not call Discord"
+    );
+    server.abort();
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
@@ -751,14 +770,57 @@ fn guild_create_voice_without_guild_id_is_not_rejected() {
     ));
 }
 
-async fn test_context(cache: Arc<Cache>) -> serenity::client::Context {
+async fn rejecting_user_proxy() -> (
+    serenity::http::Http,
+    Arc<std::sync::Mutex<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(std::sync::Mutex::new(String::new()));
+    let slot = Arc::clone(&captured);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *slot.lock().unwrap() = String::from_utf8_lossy(&request).into_owned();
+            let body = r#"{"code":10013,"message":"fixture"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, captured, server)
+}
+
+async fn test_context(
+    cache: Arc<Cache>,
+    http: Arc<serenity::http::Http>,
+) -> serenity::client::Context {
     use serenity::client::Context;
     use serenity::gateway::{
         Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner, ShardRunnerOptions,
     };
     use serenity::model::gateway::{GatewayIntents, ShardInfo};
     use serenity::model::id::ShardId;
-    let http = Arc::new(serenity::http::Http::new("fixture"));
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();

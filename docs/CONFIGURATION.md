@@ -70,7 +70,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0020_gateway_ban_deliveries.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0022_clear_userinfo_command_rows.sql`) and is applied by
 `jmodguard-bot` on startup. The API opens with `migrate=false` and does not
 migrate. It keeps retrying with a capped delay. `/health` stays 200. `/ready`
 and app routes stay 503 until it is ready. It exits on a newer unsupported

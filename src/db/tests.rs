@@ -1598,11 +1598,8 @@ fn slash_registry_version_bumps_only_on_command_writes() {
         "settings must not bump slash_registry_version"
     );
 
-    let cmd = crate::defaults::default_commands()
-        .into_iter()
-        .next()
-        .expect("defaults include commands");
-    tokio_test_block_on(crate::db::upsert_command(&db, 1, &cmd.name, &cmd)).unwrap();
+    let cmd = crate::defaults::custom_command_fixture("slashpressure");
+    tokio_test_block_on(crate::db::upsert_command(&db, 1, "slashpressure", &cmd)).unwrap();
     assert_eq!(
         tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
         s0 + 1,
@@ -2295,6 +2292,24 @@ fn global_settings_never_persist_a_guild_nickname() {
 }
 
 #[test]
+fn activity_events_accept_member_rejoin_in_core_log_channels() {
+    let tmp = tmp_db_path("member_rejoin_log_channel");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(crate::db::upsert_log_channel(
+        &db,
+        11,
+        "member_rejoin",
+        12_345,
+    ))
+    .unwrap();
+    assert_eq!(
+        tokio_test_block_on(crate::db::list_log_channels(&db, 11)).unwrap(),
+        vec![("member_rejoin".into(), 12_345)]
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn copy_logchannels_skips_cross_guild() {
     let tmp = tmp_db_path("copy_logchannels_skip");
     let db = Db::open(&tmp, 2).unwrap();
@@ -2695,6 +2710,532 @@ fn seeded_commands_publish_a_primary_registry_version() {
 }
 
 #[test]
+fn voice_command_loads_from_binary_overlay_without_global_row() {
+    let tmp = tmp_db_path("voice_binary_overlay");
+    let db = Db::open(&tmp, 2).unwrap();
+    let global_voice: i64 = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE guild_id = 0 AND name = 'voice'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+    }))
+    .unwrap();
+    assert_eq!(
+        global_voice, 0,
+        "voice must not be seeded into shared global commands"
+    );
+    let parts = tokio_test_block_on(load_config_parts(&db, 42)).unwrap();
+    let voice = parts
+        .commands
+        .get("voice")
+        .expect("effective config must include binary overlay voice");
+    assert!(matches!(voice.behavior, crate::types::Behavior::Voice));
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn voice_command_cannot_be_persisted_to_the_database() {
+    let tmp = tmp_db_path("voice_persist_rejected");
+    let db = Db::open(&tmp, 2).unwrap();
+    let voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    let error = tokio_test_block_on(upsert_command(&db, 0, "voice", &voice))
+        .expect_err("binary overlay commands must not be stored");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let renamed = CommandDef {
+        name: "vc_lookup".into(),
+        ..voice.clone()
+    };
+    let renamed_error = tokio_test_block_on(upsert_command(&db, 0, "vc_lookup", &renamed))
+        .expect_err("voice behavior must not be stored under another name");
+    assert!(
+        renamed_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{renamed_error:#}"
+    );
+    let alias2_error = tokio_test_block_on(upsert_command(&db, 0, "voicealias2", &voice))
+        .expect_err("overlay behavior must not be stored under voicealias2");
+    assert!(
+        alias2_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias2_error:#}"
+    );
+    let ban_shell = CommandDef {
+        name: "ban".into(),
+        behavior: crate::types::Behavior::Voice,
+        aliases: vec![],
+        category: "Moderation".into(),
+        description: "x".into(),
+        usage: "!ban".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let ban_row_error = tokio_test_block_on(upsert_command(&db, 0, "ban", &ban_shell))
+        .expect_err("voice behavior must not be stored on the ban row");
+    assert!(
+        ban_row_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_row_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn voice_dashboard_disable_save_cannot_persist_voice_behavior() {
+    let tmp = tmp_db_path("voice_enrolled_persist_rejected");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    voice.enabled = false;
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "voice", &voice))
+        .expect_err("dashboard save of overlay voice must not persist");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let before = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+    let alias_scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let alias_error = tokio_test_block_on(upsert_enrolled_command(
+        &db,
+        alias_scope,
+        "voicealias",
+        &voice,
+    ))
+    .expect_err("overlay behavior must not persist under another command name");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    let after = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn voice_command_alias_cannot_replace_builtin_via_dashboard_writer() {
+    let tmp = tmp_db_path("voice_alias_hijack_dashboard");
+    let db = Db::open(&tmp, 2).unwrap();
+    let hijack = CommandDef {
+        name: "customvc".into(),
+        aliases: vec!["voice".into(), "VOICE".into()],
+        category: "Moderation".into(),
+        description: "steal voice".into(),
+        usage: "!customvc".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: crate::types::Behavior::Help,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "customvc", &hijack))
+        .expect_err("dashboard writer must not persist voice alias hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[tokio::test]
+async fn voice_command_cannot_be_replaced_via_api_control_dispatch() {
+    let tmp = tmp_db_path("voice_api_control_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let wire = ConfigurationScope::Global.to_wire();
+    let mut voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice command");
+    voice.enabled = false;
+    let direct = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire.clone(),
+        name: "voice".into(),
+        command: voice,
+    };
+    let direct_error = apply_control(&db, None, direct, None)
+        .await
+        .expect_err("API upsert must not replace built-in voice");
+    assert!(
+        direct_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{direct_error:#}"
+    );
+    let hijack = CommandDef {
+        name: "customvc".into(),
+        aliases: vec!["voice".into()],
+        category: "Moderation".into(),
+        description: "steal voice".into(),
+        usage: "!customvc".into(),
+        enabled: true,
+        permission: "mod".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: crate::types::Behavior::Help,
+        response: String::new(),
+        log_event: String::new(),
+    };
+    let alias_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire,
+        name: "customvc".into(),
+        command: hijack,
+    };
+    let alias_error = apply_control(&db, None, alias_op, None)
+        .await
+        .expect_err("API upsert must not claim the voice alias");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+fn custom_command_hijack(
+    name: &str,
+    aliases: Vec<String>,
+    behavior: crate::types::Behavior,
+) -> CommandDef {
+    CommandDef {
+        name: name.into(),
+        aliases,
+        category: "Utility".into(),
+        description: "custom".into(),
+        usage: format!("!{name}"),
+        enabled: true,
+        permission: "everyone".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior,
+        response: String::new(),
+        log_event: String::new(),
+    }
+}
+
+#[test]
+fn builtin_command_cannot_be_replaced_via_db_writer() {
+    let tmp = tmp_db_path("builtin_db_writer_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let kick_steal = custom_command_hijack("kick", vec![], crate::types::Behavior::Help);
+    let error = tokio_test_block_on(upsert_command(&db, 0, "mykick", &kick_steal))
+        .expect_err("db writer must reject built-in name hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let alias_steal =
+        custom_command_hijack("mykick", vec!["yeet".into()], crate::types::Behavior::Help);
+    let alias_error = tokio_test_block_on(upsert_command(&db, 0, "mykick", &alias_steal))
+        .expect_err("db writer must reject built-in alias hijack");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "guild-specific ban copy".into();
+    let ban_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
+        .expect_err("db writer must reject built-in ban edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.aliases = vec!["custom-ban-alias".into()];
+    let alias_edit_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
+        .expect_err("db writer must reject built-in alias edits");
+    assert!(
+        alias_edit_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_edit_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
+    let tmp = tmp_db_path("builtin_dashboard_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let scope =
+        ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+            .unwrap();
+    let hijack = custom_command_hijack(
+        "myhelp",
+        vec!["commands".into()],
+        crate::types::Behavior::Say,
+    );
+    let error = tokio_test_block_on(upsert_enrolled_command(
+        &db,
+        scope.clone(),
+        "myhelp",
+        &hijack,
+    ))
+    .expect_err("dashboard writer must reject help alias hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "dashboard ban copy".into();
+    let ban_error = tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
+        .expect_err("dashboard writer must reject built-in ban description edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.enabled = false;
+    ban.permission = "owner".into();
+    ban.roles = vec![555];
+    ban.channels = vec![777];
+    let access_error =
+        tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
+            .expect_err("dashboard writer must reject built-in access-control edits");
+    assert!(
+        access_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{access_error:#}"
+    );
+    ban.aliases = vec!["extra-ban-alias".into()];
+    let alias_error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "ban", &ban))
+        .expect_err("dashboard writer must reject built-in ban alias edits");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[tokio::test]
+async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
+    let tmp = tmp_db_path("builtin_api_control_block");
+    let db = Db::open(&tmp, 2).unwrap();
+    let wire = ConfigurationScope::Global.to_wire();
+    let hijack = custom_command_hijack("stats", vec![], crate::types::Behavior::Help);
+    let op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire.clone(),
+        name: "mystats".into(),
+        command: hijack,
+    };
+    let error = apply_control(&db, None, op, None)
+        .await
+        .expect_err("API upsert must reject built-in stats name hijack");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{error:#}"
+    );
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "api ban copy".into();
+    let ban_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire.clone(),
+        name: "ban".into(),
+        command: ban.clone(),
+    };
+    let ban_error = apply_control(&db, None, ban_op, None)
+        .await
+        .expect_err("API upsert must reject built-in ban description edits");
+    assert!(
+        ban_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{ban_error:#}"
+    );
+    ban.aliases = vec!["api-ban-alias".into()];
+    let alias_op = ControlOp::UpsertCommand {
+        request: wire.clone(),
+        target: wire,
+        name: "ban".into(),
+        command: ban,
+    };
+    let alias_error = apply_control(&db, None, alias_op, None)
+        .await
+        .expect_err("API upsert must reject built-in ban alias edits");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("cannot be written to the database"),
+        "{alias_error:#}"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_command_stored_guild_override_ignored_on_load() {
+    let tmp = tmp_db_path("builtin_guild_override_ignored");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    let mut override_row = shipped_ban.clone();
+    override_row.description = "legacy guild ban override".into();
+    override_row.aliases = vec!["legacy-ban-alias".into()];
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
+            params![10_i64, serde_json::to_string(&override_row)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(parts.commands["ban"].description, shipped_ban.description);
+    assert_eq!(parts.commands["ban"].aliases, shipped_ban.aliases);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_voice_stored_guild_override_ignored_on_load() {
+    let tmp = tmp_db_path("builtin_voice_guild_override_ignored");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice");
+    let mut override_row = shipped_voice.clone();
+    override_row.description = "legacy guild voice override".into();
+    override_row.enabled = false;
+    override_row.behavior = crate::types::Behavior::Say;
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'voice',?2)",
+            params![10_i64, serde_json::to_string(&override_row)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(
+        parts.commands["voice"].description,
+        shipped_voice.description
+    );
+    assert_eq!(parts.commands["voice"].enabled, shipped_voice.enabled);
+    assert_eq!(parts.commands["voice"].permission, shipped_voice.permission);
+    assert_eq!(parts.commands["voice"].roles, shipped_voice.roles);
+    assert_eq!(parts.commands["voice"].channels, shipped_voice.channels);
+    assert_eq!(
+        parts.commands["voice"].cooldown_secs,
+        shipped_voice.cooldown_secs
+    );
+    assert!(matches!(
+        parts.commands["voice"].behavior,
+        crate::types::Behavior::Voice
+    ));
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_access_controls_ignored_on_load_and_slash_registry() {
+    let tmp = tmp_db_path("builtin_access_controls");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    let mut stored = shipped_ban.clone();
+    stored.enabled = false;
+    stored.permission = "owner".into();
+    stored.roles = vec![555];
+    stored.channels = vec![777];
+    stored.description = "legacy description".into();
+    stored.aliases = vec!["legacy-alias".into()];
+    stored.cooldown_secs = 42;
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
+            params![10_i64, serde_json::to_string(&stored)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    let ban = &parts.commands["ban"];
+    assert_eq!(ban.description, shipped_ban.description);
+    assert_eq!(ban.aliases, shipped_ban.aliases);
+    assert!(matches!(ban.behavior, crate::types::Behavior::Ban { .. }));
+    assert_eq!(ban.enabled, shipped_ban.enabled);
+    assert_eq!(ban.permission, shipped_ban.permission);
+    assert_eq!(ban.roles, shipped_ban.roles);
+    assert_eq!(ban.channels, shipped_ban.channels);
+    assert_eq!(ban.cooldown_secs, shipped_ban.cooldown_secs);
+    let (_, _, slash_commands) =
+        tokio_test_block_on(load_slash_commands_with_version(&db, 10)).unwrap();
+    let slash_ban = slash_commands.get("ban").expect("slash ban");
+    assert_eq!(slash_ban.enabled, shipped_ban.enabled);
+    assert_eq!(slash_ban.permission, shipped_ban.permission);
+    assert_eq!(slash_ban.roles, shipped_ban.roles);
+    assert_eq!(slash_ban.channels, shipped_ban.channels);
+    assert_eq!(slash_ban.cooldown_secs, shipped_ban.cooldown_secs);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();
@@ -2954,7 +3495,15 @@ fn bot_bootstrap_upgrades_only_unchanged_legacy_setname_seed() {
     legacy.description =
         "Set the bot's nickname in this server (omit / clear / - to reset).".into();
     legacy.response = "Bot nickname set to {name}".into();
-    tokio_test_block_on(upsert_command(&db, GLOBAL_SCOPE, "setname", &legacy)).unwrap();
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE commands SET data = ?1 WHERE guild_id = ?2 AND name = 'setname'",
+            params![serde_json::to_string(&legacy)?, GLOBAL_SCOPE],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
     drop(db);
 
     let reopened = Db::open(&tmp, 2).unwrap();
@@ -3294,13 +3843,8 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                     assert_eq!(parts.templates[event], new);
                 }
             }
-            if guild == 456 {
-                assert_eq!(parts.commands["stats"].permission, "everyone");
-                assert!(parts.commands["stats"].aliases.is_empty());
-            } else {
-                assert_eq!(parts.commands["stats"].permission, "admin");
-                assert!(parts.commands["stats"].matches("status"));
-            }
+            assert_eq!(parts.commands["stats"].permission, "admin");
+            assert!(parts.commands["stats"].matches("status"));
         }
         // Even a deliberate reversion to old wording is retained after the one-time upgrade.
         db.with_conn(|conn| {
@@ -3421,10 +3965,14 @@ fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
         assert!(parts.commands["stats"].matches("status"));
     }
     let custom = tokio_test_block_on(load_config_parts(&db, 125)).unwrap();
-    assert_eq!(custom.commands["stats"].permission, "everyone");
+    let shipped_stats = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "stats")
+        .expect("stats");
+    assert_eq!(custom.commands["stats"].permission, "admin");
     assert_eq!(
         custom.commands["stats"].description,
-        "Operator customized Stats"
+        shipped_stats.description
     );
     assert_eq!(
         tokio_test_block_on(get_config_version(&db)).unwrap(),
@@ -3482,9 +4030,15 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
-    assert!(!parts.commands["stats"].matches("status"));
-    assert!(parts.commands["custom"].matches("status"));
-    // Restoring a deleted default on a later boot must not steal the alias either.
+    assert!(
+        parts.commands["stats"].matches("status"),
+        "shipped built-in stats must keep its aliases regardless of stored rows"
+    );
+    assert!(
+        !parts.commands["custom"].matches("status"),
+        "reserved aliases must be stripped from custom commands"
+    );
+    // A missing global row must still resolve to the shipped built-in definition.
     tokio_test_block_on(db.with_conn(|conn| {
         conn.execute_bounded(
             "DELETE FROM commands WHERE name='stats'",
@@ -3497,8 +4051,8 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
-    assert!(!parts.commands["stats"].matches("status"));
-    assert!(parts.commands["custom"].matches("status"));
+    assert!(parts.commands["stats"].matches("status"));
+    assert!(!parts.commands["custom"].matches("status"));
     drop(db);
     cleanup_db(&tmp);
 }

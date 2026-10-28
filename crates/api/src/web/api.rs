@@ -101,55 +101,9 @@ pub async fn guild_config(
     // removable through it.
     let badwords: Vec<_> = snapshot.badwords.iter().map(|w| w.with_status()).collect();
 
-    // commands: union of guild + global rows, effective resolution
-    let defaults = crate::defaults::default_commands();
-    let mut commands: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, def) in &snapshot.global_commands {
-        let guild_row = snapshot
-            .guild_commands
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone());
-        commands.push(serde_json::json!({
-            "name": name,
-            "scope": "global",
-            "effective": db::resolve(&guild_row, &Some(def.clone()), def),
-            "guild_override": guild_row,
-            "global": def,
-        }));
-        seen.insert(name.to_lowercase());
-    }
-    for (name, def) in &snapshot.guild_commands {
-        if seen.insert(name.to_lowercase()) {
-            let global_row = snapshot
-                .global_commands
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.clone());
-            commands.push(serde_json::json!({
-                "name": name,
-                "scope": "guild",
-                "effective": def,
-                "guild_override": Some(def),
-                "global": global_row,
-            }));
-        }
-    }
-    // built-in defaults that have no rows at either scope (rare)
-    for def in defaults {
-        let name = def.name.to_lowercase();
-        if seen.contains(&name) {
-            continue;
-        }
-        commands.push(serde_json::json!({
-            "name": name,
-            "scope": "default",
-            "effective": def,
-            "guild_override": null,
-            "global": null,
-        }));
-    }
+    // commands: raw scope rows stay on guild_override/global. `effective` matches
+    // runtime (shipped built-ins and their shipped access, reserved-label collisions).
+    let commands = command_config_rows(&snapshot.global_commands, &snapshot.guild_commands);
 
     let mut templates = Vec::new();
     for (event, def) in crate::defaults::rendered_log_templates() {
@@ -582,7 +536,56 @@ pub async fn list_commands(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::list_enrolled_commands(&app.db, scope).await?;
     let (g, gl) = (layers.guild, layers.global);
-    Ok(Json(serde_json::json!({ "guild": g, "global": gl })))
+    let commands = command_config_rows(&pairs_to_map(&gl), &pairs_to_map(&g));
+    Ok(Json(
+        serde_json::json!({ "guild": g, "global": gl, "commands": commands }),
+    ))
+}
+
+fn pairs_to_map(rows: &[(String, CommandDef)]) -> std::collections::HashMap<String, CommandDef> {
+    rows.iter().cloned().collect()
+}
+
+fn command_row_by_name<'a>(
+    rows: &'a std::collections::HashMap<String, CommandDef>,
+    name: &str,
+) -> Option<&'a CommandDef> {
+    rows.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, command)| command)
+}
+
+/// Config-bundle command entries. Raw stored rows stay on `guild_override` and
+/// `global`. `effective` is the runtime registry for that name.
+fn command_config_rows(
+    global_commands: &std::collections::HashMap<String, CommandDef>,
+    guild_commands: &std::collections::HashMap<String, CommandDef>,
+) -> Vec<serde_json::Value> {
+    let effective = crate::defaults::effective_command_registry(global_commands, guild_commands);
+    let mut names: Vec<String> = effective.keys().cloned().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let def = &effective[&name];
+            let guild_row = command_row_by_name(guild_commands, &name).cloned();
+            let global_row = command_row_by_name(global_commands, &name).cloned();
+            let scope = if global_row.is_some() {
+                "global"
+            } else if guild_row.is_some() {
+                "guild"
+            } else {
+                "default"
+            };
+            serde_json::json!({
+                "name": name,
+                "scope": scope,
+                "effective": def,
+                "guild_override": guild_row,
+                "global": global_row,
+            })
+        })
+        .collect()
 }
 
 pub async fn get_command(
@@ -595,12 +598,19 @@ pub async fn get_command(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
-    let layers = db::get_enrolled_command(&app.db, scope, &name).await?;
+    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
+    let layers = db::get_enrolled_command(&app.db, scope, &canonical).await?;
     let (guild_override, global) = (layers.guild, layers.global);
-    let def = crate::defaults::default_commands()
-        .into_iter()
-        .find(|c| c.name == name);
-    let effective = guild_override.clone().or_else(|| global.clone()).or(def);
+    let mut guild_map = std::collections::HashMap::new();
+    let mut global_map = std::collections::HashMap::new();
+    if let Some(row) = guild_override.clone() {
+        guild_map.insert(canonical.clone(), row);
+    }
+    if let Some(row) = global.clone() {
+        global_map.insert(canonical.clone(), row);
+    }
+    let registry = crate::defaults::effective_command_registry(&global_map, &guild_map);
+    let effective = registry.get(&canonical).cloned();
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
@@ -608,7 +618,7 @@ pub async fn get_command(
     })))
 }
 
-fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
+fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef) -> ApiResult<()> {
     let valid_name = !cmd.name.is_empty()
         && cmd.name.len() <= 32
         && cmd
@@ -624,6 +634,11 @@ fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
     if !(1..=100).contains(&description_len) {
         return Err(ApiError(anyhow::anyhow!(
             "command description must be 1-100 characters"
+        )));
+    }
+    if crate::defaults::rejects_binary_overlay_command_persist(storage_name, cmd) {
+        return Err(ApiError(anyhow::anyhow!(
+            crate::defaults::command_persist_rejected_message(storage_name)
         )));
     }
     Ok(())
@@ -642,7 +657,7 @@ pub async fn put_command(
     let name = name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&data)?;
+    validate_command_descriptor(&name, &data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -679,7 +694,7 @@ pub async fn create_command(
     let name = body.data.name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&data)?;
+    validate_command_descriptor(&name, &data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
