@@ -18,7 +18,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
 | `!warnclear <user>` | Moderation | mod | Clear a user's warnings |
-| `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you) |
+| `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you). A cached voice channel is named only when the caller can view it; otherwise the voice field is `unavailable` and omits the name and id. Channel mentions in case reasons use the same rule |
 | `!purge [count]` | Moderation | mod | Delete recent messages (max 100; `!clear`, `!p`) |
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
 | `!slowmode <seconds>` | Moderation | mod | Set slowmode on this channel |

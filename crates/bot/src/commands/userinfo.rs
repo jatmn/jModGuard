@@ -3,7 +3,6 @@
 use crate::db::guild_data::{CaseLimits, GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
-use serenity::model::voice::VoiceState;
 use std::collections::BTreeMap;
 
 use super::{Args, BehaviorOutcome, CmdEnv};
@@ -13,6 +12,8 @@ pub(crate) const CASE_LINE_LIMIT: u32 = 8;
 pub(crate) const MISSING: &str = "missing";
 pub(crate) const VOICE_NOT_IN: &str = "not in a voice channel";
 pub(crate) const VOICE_NOT_CACHED: &str = "not cached";
+/// Voice channel, or a channel mention, whose view cannot be shown.
+pub(crate) const VOICE_UNAVAILABLE: &str = "unavailable";
 pub(crate) const CASES_UNAVAILABLE: &str = "unavailable";
 pub(crate) const CASES_NONE: &str = "none";
 pub(crate) const CLIPPED_SUFFIX: &str = "\n… clipped";
@@ -35,7 +36,12 @@ pub(crate) struct MemberSnapshot {
 pub(crate) enum VoiceSnapshot {
     NotCached,
     NotInChannel,
-    Channel { name: String, id: u64 },
+    /// The shared voice lookup could not show a channel name or id.
+    Unavailable,
+    Channel {
+        name: String,
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +60,8 @@ pub(crate) enum CasesField {
 pub(crate) fn capture_member_snapshot(
     guild_id: GuildId,
     target: UserId,
+    actor_id: UserId,
+    actor_roles: &[RoleId],
     cache: &serenity::cache::Cache,
 ) -> MemberSnapshot {
     let user_id = target.get();
@@ -91,7 +99,7 @@ pub(crate) fn capture_member_snapshot(
         joined_at,
         roles: role_labels(&guild.roles, member.map(|m| &m.roles)),
         roles_cached: true,
-        voice: voice_from_guild(guild_id, &guild.voice_states, target, &guild.channels),
+        voice: voice_from_lookup(cache, guild_id, target, actor_id, actor_roles),
         member_cached,
         guild_cached: true,
     }
@@ -115,29 +123,65 @@ fn role_labels(
         .collect()
 }
 
-fn voice_from_guild(
+fn voice_from_lookup(
+    cache: &serenity::cache::Cache,
     guild_id: GuildId,
-    voice_states: &std::collections::HashMap<UserId, VoiceState>,
     target: UserId,
-    channels: &std::collections::HashMap<ChannelId, serenity::model::channel::GuildChannel>,
+    actor_id: UserId,
+    actor_roles: &[RoleId],
 ) -> VoiceSnapshot {
-    let Some(state) = voice_states.get(&target) else {
-        return VoiceSnapshot::NotInChannel;
-    };
-    let Some(channel_id) = state.channel_id else {
-        return VoiceSnapshot::NotInChannel;
-    };
-    if state.guild_id.is_some_and(|gid| gid != guild_id) {
-        return VoiceSnapshot::NotCached;
+    use super::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
+    match snapshot_cached_voice(cache, guild_id, actor_id, actor_roles, target) {
+        VoiceLookupSnapshot::InChannel {
+            channel_id,
+            channel_name,
+        } => VoiceSnapshot::Channel {
+            name: channel_name,
+            id: channel_id,
+        },
+        VoiceLookupSnapshot::NotInChannel => VoiceSnapshot::NotInChannel,
+        VoiceLookupSnapshot::GuildNotCached => VoiceSnapshot::NotCached,
+        VoiceLookupSnapshot::ChannelUnavailable => VoiceSnapshot::Unavailable,
     }
-    let name = channels
-        .get(&channel_id)
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| channel_id.get().to_string());
-    VoiceSnapshot::Channel {
-        name,
-        id: channel_id.get(),
+}
+
+/// Channel mentions in a case reason. An id the caller cannot view, or whose
+/// view cannot be decided, is replaced without leaving the id behind.
+fn redact_unviewable_channel_mentions(text: &str, viewer: Option<ChannelView<'_>>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<#") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('>') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let id_text = &after[..end];
+        if id_text.is_empty() || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            out.push_str("<#");
+            rest = after;
+            continue;
+        }
+        let visible = id_text.parse::<u64>().ok().is_some_and(|id| {
+            viewer.is_some_and(|view| {
+                super::member_can_view_channel(
+                    view.guild,
+                    view.actor_id,
+                    view.actor_roles,
+                    ChannelId::new(id),
+                )
+            })
+        });
+        if visible {
+            out.push_str(&rest[start..start + 2 + end + 1]);
+        } else {
+            out.push_str(VOICE_UNAVAILABLE);
+        }
+        rest = &after[end + 1..];
     }
+    out.push_str(rest);
+    out
 }
 
 pub(crate) fn snapshot_has_cached_user(snapshot: &MemberSnapshot) -> bool {
@@ -162,24 +206,40 @@ pub(crate) fn apply_missing_user_identity(snapshot: &mut MemberSnapshot) {
     }
 }
 
-pub(crate) fn case_lines_from_entries(entries: &[MemberHistoryEntry]) -> Vec<String> {
+pub(crate) fn case_lines_from_entries(
+    entries: &[MemberHistoryEntry],
+    viewer: Option<ChannelView<'_>>,
+) -> Vec<String> {
     entries
         .iter()
         .map(|entry| {
+            let reason = entry
+                .reason
+                .as_deref()
+                .map(|reason| redact_unviewable_channel_mentions(reason, viewer));
             format_case_line(
                 &entry.kind,
                 entry.outcome.as_deref(),
                 entry.occurred_at_ms,
-                entry.reason.as_deref(),
+                reason.as_deref(),
             )
         })
         .collect()
+}
+
+/// Caller identity used to decide whether a cached channel may be named.
+#[derive(Clone, Copy)]
+pub(crate) struct ChannelView<'a> {
+    pub guild: &'a serenity::model::guild::Guild,
+    pub actor_id: UserId,
+    pub actor_roles: &'a [RoleId],
 }
 
 pub(crate) fn format_voice(voice: &VoiceSnapshot) -> String {
     match voice {
         VoiceSnapshot::NotCached => VOICE_NOT_CACHED.to_string(),
         VoiceSnapshot::NotInChannel => VOICE_NOT_IN.to_string(),
+        VoiceSnapshot::Unavailable => VOICE_UNAVAILABLE.to_string(),
         VoiceSnapshot::Channel { name, id } => format!("{} (`{id}`)", report_text(name)),
     }
 }
@@ -507,25 +567,16 @@ async fn load_case_lines(
     let Ok((store, scope)) = live else {
         return CasesField::Unavailable;
     };
-    load_case_lines_from_store(&store, scope, target).await
+    load_case_lines_from_store(&store, scope, target, Some(env)).await
 }
 
-async fn load_case_lines_from_store(
-    store: &GuildDataStore,
-    scope: GuildDataScope,
-    target: UserId,
+fn cases_from_loaded(
+    loaded: Result<(Vec<MemberHistoryEntry>, bool)>,
+    viewer: Option<ChannelView<'_>>,
 ) -> CasesField {
-    let loaded = store
-        .member_case_entries(
-            scope,
-            target.get() as i64,
-            CASE_LINE_LIMIT,
-            CaseLimits::default(),
-        )
-        .await;
     match loaded {
         Ok((entries, _truncated)) => {
-            let lines = case_lines_from_entries(&entries);
+            let lines = case_lines_from_entries(&entries, viewer);
             if lines.is_empty() {
                 CasesField::None
             } else {
@@ -536,6 +587,32 @@ async fn load_case_lines_from_store(
     }
 }
 
+async fn load_case_lines_from_store(
+    store: &GuildDataStore,
+    scope: GuildDataScope,
+    target: UserId,
+    env: Option<&CmdEnv<'_>>,
+) -> CasesField {
+    let loaded = store
+        .member_case_entries(
+            scope,
+            target.get() as i64,
+            CASE_LINE_LIMIT,
+            CaseLimits::default(),
+        )
+        .await;
+    let guild = env.and_then(|env| env.ctx.cache.guild(env.guild_id));
+    let viewer = match (env, guild.as_ref()) {
+        (Some(env), Some(guild)) => Some(ChannelView {
+            guild,
+            actor_id: env.actor,
+            actor_roles: &env.actor_member.roles,
+        }),
+        _ => None,
+    };
+    cases_from_loaded(loaded, viewer)
+}
+
 pub(crate) async fn run(
     env: &CmdEnv<'_>,
     enrollment: Option<crate::db::GuildEnrollment>,
@@ -543,7 +620,13 @@ pub(crate) async fn run(
 ) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
     let target = resolve_userinfo_target(env, &mut args).await?;
-    let mut snapshot = capture_member_snapshot(env.guild_id, target, &env.ctx.cache);
+    let mut snapshot = capture_member_snapshot(
+        env.guild_id,
+        target,
+        env.actor,
+        &env.actor_member.roles,
+        &env.ctx.cache,
+    );
 
     if !snapshot_has_cached_user(&snapshot) {
         match rest_user_lookup(env, target).await {

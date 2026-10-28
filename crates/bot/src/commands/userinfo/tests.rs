@@ -17,6 +17,12 @@ fn remember_guild(
 ) {
     let mut guild = Guild::default();
     guild.id = GuildId::new(guild_id);
+    guild.owner_id = UserId::new(99);
+    let mut everyone = Role::default();
+    everyone.id = RoleId::new(guild_id);
+    everyone.guild_id = guild.id;
+    everyone.permissions = serenity::model::permissions::Permissions::VIEW_CHANNEL;
+    guild.roles.insert(everyone.id, everyone);
     let mut role = Role::default();
     role.id = RoleId::new(50);
     role.guild_id = guild.id;
@@ -78,7 +84,13 @@ fn cached_member_renders_profile_warns_and_cases() {
             .unwrap(),
         ),
     );
-    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    let snapshot = capture_member_snapshot(
+        GuildId::new(10),
+        UserId::new(91),
+        UserId::new(8),
+        &[],
+        &cache,
+    );
     assert!(snapshot.member_cached);
     assert_eq!(snapshot.nick.as_deref(), Some("Nick"));
     assert_eq!(snapshot.roles, vec!["Mod".to_string()]);
@@ -562,7 +574,7 @@ async fn load_case_lines_from_store_past_stay_rows_on_first_page() {
             .await
             .unwrap();
     }
-    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91), None).await;
     let lines = match cases {
         CasesField::Lines(lines) => lines,
         other => panic!("expected case lines, got {other:?}"),
@@ -618,7 +630,7 @@ async fn load_case_lines_from_store_rejects_default_budget_oversize_payload() {
         )
         .await
         .unwrap();
-    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91), None).await;
     assert!(
         matches!(cases, CasesField::Unavailable),
         "oversize indexed case must not surface through userinfo: {cases:?}"
@@ -649,7 +661,7 @@ fn paginate_case_lines_past_stay_rows_on_first_page() {
     };
     let entries = collect_case_entries_from_pages(&[page1, page2]);
     assert_eq!(entries.len(), 2);
-    let lines = case_lines_from_entries(&entries);
+    let lines = case_lines_from_entries(&entries, None);
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("`ban`"));
     let snapshot = MemberSnapshot {
@@ -769,7 +781,13 @@ fn empty_history_says_none() {
 #[test]
 fn empty_guild_cache_marks_voice_not_cached() {
     let cache = Cache::new();
-    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    let snapshot = capture_member_snapshot(
+        GuildId::new(10),
+        UserId::new(91),
+        UserId::new(8),
+        &[],
+        &cache,
+    );
     assert!(!snapshot.guild_cached);
     assert_eq!(format_voice(&snapshot.voice), VOICE_NOT_CACHED);
 }
@@ -778,14 +796,26 @@ fn empty_guild_cache_marks_voice_not_cached() {
 fn cached_member_does_not_need_rest_lookup() {
     let cache = Cache::new();
     remember_guild(&cache, 10, Some(target_member(10, 91, None)), None);
-    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    let snapshot = capture_member_snapshot(
+        GuildId::new(10),
+        UserId::new(91),
+        UserId::new(8),
+        &[],
+        &cache,
+    );
     assert!(snapshot_has_cached_user(&snapshot));
 }
 
 #[test]
 fn uncached_user_requires_rest_lookup() {
     let cache = Cache::new();
-    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    let snapshot = capture_member_snapshot(
+        GuildId::new(10),
+        UserId::new(91),
+        UserId::new(8),
+        &[],
+        &cache,
+    );
     assert!(!snapshot_has_cached_user(&snapshot));
 }
 
@@ -1032,7 +1062,7 @@ async fn retained_case_visible_after_join_depart_noise() {
             .await
             .unwrap();
     }
-    let cases = load_case_lines_from_store(&store, scope, UserId::new(91)).await;
+    let cases = load_case_lines_from_store(&store, scope, UserId::new(91), None).await;
     let lines = match cases {
         CasesField::Lines(lines) => lines,
         other => panic!("expected case lines, got {other:?}"),
@@ -1068,7 +1098,13 @@ fn guild_create_voice_without_guild_id_is_not_rejected() {
             .unwrap(),
         ),
     );
-    let snapshot = capture_member_snapshot(GuildId::new(10), UserId::new(91), &cache);
+    let snapshot = capture_member_snapshot(
+        GuildId::new(10),
+        UserId::new(91),
+        UserId::new(8),
+        &[],
+        &cache,
+    );
     assert!(matches!(
         snapshot.voice,
         VoiceSnapshot::Channel { id: 700, .. }
@@ -1185,4 +1221,328 @@ async fn test_context(
     drop(runner);
     drop(socket);
     ctx
+}
+
+#[tokio::test]
+async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
+    use crate::commands::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
+    use crate::state::CachedGuildConfig;
+    use serenity::model::channel::{
+        ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType,
+    };
+    use serenity::model::permissions::Permissions;
+    const GUILD: u64 = 10;
+    const ACTOR: u64 = 7;
+    const TARGET: u64 = 91;
+    const ROLE: u64 = 50;
+    const VOICE: u64 = 700;
+    const VISIBLE_CASE_CHANNEL: u64 = 801;
+    const HIDDEN_CASE_CHANNEL: u64 = 802;
+
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_voice_view_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    app.activation.mark_lock_held(true);
+    let enrollment = crate::db::enroll_guild(&app.db, GUILD as i64, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    crate::cases::record(
+        &app,
+        Some(enrollment),
+        CaseAction::Warning,
+        CaseOutcome::Succeeded,
+        TARGET,
+        Some(ACTOR),
+        Some(format!(
+            "see <#{VISIBLE_CASE_CHANNEL}> and <#{HIDDEN_CASE_CHANNEL}>"
+        )),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    let cache = Arc::new(Cache::new());
+    let (http, captured, server) = capturing_proxy().await;
+    let http = Arc::new(http);
+    let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
+    let commands = jmodguard::defaults::default_commands()
+        .into_iter()
+        .map(|mut cmd| {
+            if matches!(cmd.behavior, jmodguard::types::Behavior::UserInfo) {
+                cmd.log_event.clear();
+            }
+            (cmd.name.clone(), cmd)
+        })
+        .collect();
+    let cfg = Arc::new(CachedGuildConfig {
+        version: 1,
+        durable_version: 1,
+        loaded_at: std::time::Instant::now(),
+        settings: crate::types::GuildSettings {
+            prefix: "!".into(),
+            ..Default::default()
+        },
+        rules: Default::default(),
+        commands,
+        templates: Default::default(),
+        log_channels: Default::default(),
+        known_bad_hashes: Default::default(),
+        log_filters: Default::default(),
+        regexes: Vec::new(),
+        custom_patterns: Default::default(),
+    });
+
+    let install = |name: Option<&str>, hidden: bool| {
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild.name = "fixture".into();
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(GUILD);
+        everyone.guild_id = guild.id;
+        everyone.permissions = Permissions::empty();
+        guild.roles.insert(everyone.id, everyone);
+        let mut mod_role = Role::default();
+        mod_role.id = RoleId::new(ROLE);
+        mod_role.guild_id = guild.id;
+        mod_role.name = "Mod".into();
+        mod_role.permissions = Permissions::MANAGE_MESSAGES | Permissions::VIEW_CHANNEL;
+        guild.roles.insert(mod_role.id, mod_role);
+        let mut notes = GuildChannel::default();
+        notes.id = ChannelId::new(VISIBLE_CASE_CHANNEL);
+        notes.guild_id = guild.id;
+        notes.name = "notes".into();
+        guild.channels.insert(notes.id, notes);
+        if let Some(name) = name {
+            let mut voice = GuildChannel::default();
+            voice.id = ChannelId::new(VOICE);
+            voice.guild_id = guild.id;
+            voice.kind = ChannelType::Voice;
+            voice.name = name.into();
+            if hidden {
+                voice.permission_overwrites = vec![PermissionOverwrite {
+                    kind: PermissionOverwriteType::Member(UserId::new(ACTOR)),
+                    allow: Permissions::empty(),
+                    deny: Permissions::VIEW_CHANNEL,
+                }];
+            }
+            guild.channels.insert(voice.id, voice);
+        }
+        guild.members.insert(
+            UserId::new(TARGET),
+            target_member(GUILD, TARGET, Some("Nick")),
+        );
+        let mut caller = target_member(GUILD, ACTOR, None);
+        caller.user.name = "mod".into();
+        caller.roles = vec![RoleId::new(ROLE)];
+        guild.members.insert(caller.user.id, caller);
+        guild.voice_states.insert(
+            UserId::new(TARGET),
+            serde_json::from_value(serde_json::json!({
+                "channel_id": VOICE.to_string(),
+                "user_id": TARGET.to_string(),
+                "guild_id": GUILD.to_string(),
+                "session_id": "sess",
+                "deaf": false,
+                "mute": false,
+                "self_deaf": false,
+                "self_mute": false,
+                "self_video": false,
+                "suppress": false
+            }))
+            .unwrap(),
+        );
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+    };
+
+    let mut author = User::default();
+    author.id = UserId::new(ACTOR);
+    author.name = "mod".into();
+    let partial: serenity::model::guild::PartialMember =
+        serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [ROLE.to_string()],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": GUILD.to_string(),
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap();
+    let mut message = serenity::model::channel::Message::default();
+    message.id = serenity::model::id::MessageId::new(9);
+    message.content = format!("!userinfo {TARGET}");
+    message.guild_id = Some(GuildId::new(GUILD));
+    message.channel_id = ChannelId::new(2);
+    message.author = author.clone();
+    message.member = Some(Box::new(partial));
+    let mut slash_member = Member::default();
+    slash_member.user = author.clone();
+    slash_member.guild_id = GuildId::new(GUILD);
+    slash_member.roles = vec![RoleId::new(ROLE)];
+    let interaction: serenity::model::application::Interaction =
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "application_id": "1",
+            "type": 2,
+            "token": "token",
+            "version": 1,
+            "guild_id": GUILD.to_string(),
+            "channel_id": "2",
+            "locale": "en-US",
+            "app_permissions": "0",
+            "entitlements": [],
+            "authorizing_integration_owners": {},
+            "attachment_size_limit": 10000000,
+            "user": author,
+            "member": slash_member,
+            "data": {
+                "id": "3",
+                "name": "userinfo",
+                "type": 1,
+                "options": [{"name": "user", "type": 6, "value": TARGET.to_string()}]
+            }
+        }))
+        .unwrap();
+
+    let report_from = |label: &str| {
+        let requests = captured.lock().unwrap().clone();
+        captured.lock().unwrap().clear();
+        let report = requests
+            .iter()
+            .find(|raw| raw.contains("**Voice:**"))
+            .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
+        assert!(
+            report.contains("**User info**"),
+            "{label} did not pass command authorization: {report}"
+        );
+        assert!(
+            report.contains("\\#801") || report.contains("#801"),
+            "{label} dropped a visible case channel: {report}"
+        );
+        assert!(
+            !report.contains("802"),
+            "{label} leaked an uncached case channel: {report}"
+        );
+        report.to_string()
+    };
+
+    install(Some("Lobby"), false);
+    crate::commands::handle_prefix(
+        &app,
+        http.as_ref(),
+        &cache,
+        Arc::clone(&cfg),
+        &message,
+        Some(&ctx),
+    )
+    .await
+    .unwrap();
+    let prefix = report_from("visible prefix");
+    crate::commands::handle_interaction(&app, &ctx, interaction.clone()).await;
+    let slash = report_from("visible slash");
+    for report in [&prefix, &slash] {
+        let voice = voice_line(report);
+        assert!(voice.contains("Lobby"), "{voice}");
+        assert!(voice.contains("`700`") || voice.contains("700"), "{voice}");
+    }
+
+    install(Some("Secret staff room"), true);
+    {
+        let guild = cache.guild(GuildId::new(GUILD)).unwrap();
+        assert_eq!(
+            crate::commands::permission_level(0, &guild.roles, ACTOR, [ROLE]),
+            crate::commands::PermLevel::Mod
+        );
+        assert!(!crate::commands::member_can_view_channel(
+            &guild,
+            UserId::new(ACTOR),
+            &[RoleId::new(ROLE)],
+            ChannelId::new(VOICE),
+        ));
+    }
+    assert_eq!(
+        snapshot_cached_voice(
+            &cache,
+            GuildId::new(GUILD),
+            UserId::new(ACTOR),
+            &[RoleId::new(ROLE)],
+            UserId::new(TARGET),
+        ),
+        VoiceLookupSnapshot::ChannelUnavailable
+    );
+    crate::commands::handle_prefix(
+        &app,
+        http.as_ref(),
+        &cache,
+        Arc::clone(&cfg),
+        &message,
+        Some(&ctx),
+    )
+    .await
+    .unwrap();
+    let prefix = report_from("hidden prefix");
+    crate::commands::handle_interaction(&app, &ctx, interaction.clone()).await;
+    let slash = report_from("hidden slash");
+    for report in [&prefix, &slash] {
+        let voice = voice_line(report);
+        assert!(voice.contains(VOICE_UNAVAILABLE), "{voice}");
+        assert!(!voice.contains("Secret"), "{voice}");
+        assert!(!voice.contains("700"), "{voice}");
+        assert!(!report.contains("Secret staff room"), "{report}");
+    }
+
+    install(None, false);
+    crate::commands::handle_prefix(&app, http.as_ref(), &cache, cfg, &message, Some(&ctx))
+        .await
+        .unwrap();
+    let prefix = report_from("uncached prefix");
+    crate::commands::handle_interaction(&app, &ctx, interaction).await;
+    let slash = report_from("uncached slash");
+    for report in [&prefix, &slash] {
+        let voice = voice_line(report);
+        assert!(voice.contains(VOICE_UNAVAILABLE), "{voice}");
+        assert!(!voice.contains("700"), "{voice}");
+        assert!(!report.contains("Ghost"), "{report}");
+        assert!(!report.contains("700"), "{report}");
+    }
+
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+fn voice_line(report: &str) -> String {
+    let (_, body) = report
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("report had no body: {report}"));
+    let payload: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error} in {body}"));
+    let message = payload
+        .get("data")
+        .filter(|data| data.is_object())
+        .unwrap_or(&payload);
+    message["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no content in {payload}"))
+        .lines()
+        .find(|line| line.contains("**Voice:**"))
+        .unwrap_or_else(|| panic!("no voice line in {payload}"))
+        .to_string()
 }
