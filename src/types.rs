@@ -40,7 +40,7 @@ pub const EVENT_TYPES: [&str; 14] = [
 /// ignore list as [`EVENT_TYPES`], but they are not guild-store event types:
 /// `guild_log_channels` keeps its existing check constraint, and these names
 /// are not inserted as new global template rows on startup.
-pub const ACTIVITY_LOG_EVENTS: [&str; 11] = [
+pub const ACTIVITY_LOG_EVENTS: [&str; 12] = [
     "member_role_update",
     "role_change",
     "voice_join",
@@ -52,6 +52,7 @@ pub const ACTIVITY_LOG_EVENTS: [&str; 11] = [
     "thread_update",
     "thread_delete",
     "automod_delete",
+    "member_rejoin",
 ];
 
 /// True for a log event the core log-channel settings can route.

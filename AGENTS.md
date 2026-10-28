@@ -109,7 +109,7 @@ entire configuration bundle. Complete tenant isolation and replica coordination 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 16. Ban recovery uses immutable opaque attempt tags,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 17. Ban recovery uses immutable opaque attempt tags,
 never reason-text equality. Keep tags out of case API JSON and human reasons. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write.

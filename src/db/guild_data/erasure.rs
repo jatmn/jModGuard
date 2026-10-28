@@ -85,7 +85,7 @@ impl GuildDataStore {
                     "DELETE FROM guild_tenant_settings WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
                 )?;
-                for table in ["guild_member_unresolved_audits","guild_member_case_index","guild_member_state_observations","guild_member_target_checks","guild_member_audit_recovery","guild_member_stays","guild_member_pending_bans","guild_member_directory","guild_member_sync","guild_member_seed","guild_member_feature"] {
+                for table in ["guild_member_unresolved_audits","guild_member_case_index","guild_member_state_observations","guild_member_target_checks","guild_member_audit_recovery","guild_member_pending_rejoin_notes","guild_member_stays","guild_member_pending_bans","guild_member_directory","guild_member_sync","guild_member_seed","guild_member_feature"] {
                     tx.execute_reclaim(&format!("DELETE FROM {table} WHERE guild_id=?1 AND enrollment_id=?2"),params![scope.guild_id(),scope.enrollment.id.as_str()])?;
                 }
                 tx.execute_reclaim(

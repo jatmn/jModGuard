@@ -2295,6 +2295,24 @@ fn global_settings_never_persist_a_guild_nickname() {
 }
 
 #[test]
+fn activity_events_accept_member_rejoin_in_core_log_channels() {
+    let tmp = tmp_db_path("member_rejoin_log_channel");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(crate::db::upsert_log_channel(
+        &db,
+        11,
+        "member_rejoin",
+        12_345,
+    ))
+    .unwrap();
+    assert_eq!(
+        tokio_test_block_on(crate::db::list_log_channels(&db, 11)).unwrap(),
+        vec![("member_rejoin".into(), 12_345)]
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn copy_logchannels_skips_cross_guild() {
     let tmp = tmp_db_path("copy_logchannels_skip");
     let db = Db::open(&tmp, 2).unwrap();
