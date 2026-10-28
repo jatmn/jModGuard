@@ -23,7 +23,7 @@ const SNIPPETS_PER_GUILD: usize = 64;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
-const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
+pub(crate) const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
@@ -237,13 +237,19 @@ pub struct MemberJoinContext {
     inner: Mutex<HashMap<(u64, u64), (serenity::model::Timestamp, Instant)>>,
 }
 
-/// Suppresses duplicate member-rejoin notes for the same join token while still
-/// allowing redelivery after a failed first attempt.
+type RejoinStayKey = (u64, u64, String);
+
+/// Suppresses duplicate member-rejoin notes for the current stay while still
+/// allowing redelivery after a failed first attempt within a bounded window.
 #[derive(Default)]
 struct RejoinNoteDeliveryState {
-    delivered: HashMap<(u64, u64, i64), Instant>,
-    undelivered: std::collections::HashSet<(u64, u64, i64)>,
-    in_flight: std::collections::HashSet<(u64, u64, i64)>,
+    delivered: HashMap<RejoinStayKey, Instant>,
+    undelivered: HashMap<RejoinStayKey, Instant>,
+    in_flight: std::collections::HashSet<RejoinStayKey>,
+}
+
+fn rejoin_stay_key(guild: u64, user: u64, stay_id: &str) -> RejoinStayKey {
+    (guild, user, stay_id.to_owned())
 }
 
 #[derive(Default)]
@@ -256,17 +262,17 @@ pub struct RejoinNoteInFlight<'a> {
     deliveries: &'a RejoinNoteDeliveries,
     guild: u64,
     user: u64,
-    joined_at_ms: i64,
+    stay_id: String,
     finished: bool,
 }
 
 impl<'a> RejoinNoteInFlight<'a> {
-    fn new(deliveries: &'a RejoinNoteDeliveries, guild: u64, user: u64, joined_at_ms: i64) -> Self {
+    fn new(deliveries: &'a RejoinNoteDeliveries, guild: u64, user: u64, stay_id: String) -> Self {
         Self {
             deliveries,
             guild,
             user,
-            joined_at_ms,
+            stay_id,
             finished: false,
         }
     }
@@ -274,7 +280,7 @@ impl<'a> RejoinNoteInFlight<'a> {
     pub fn complete(mut self, sent: bool) {
         self.finished = true;
         self.deliveries
-            .finish_attempt(self.guild, self.user, self.joined_at_ms, sent);
+            .finish_attempt(self.guild, self.user, &self.stay_id, sent);
     }
 }
 
@@ -282,35 +288,76 @@ impl Drop for RejoinNoteInFlight<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.deliveries
-                .finish_attempt(self.guild, self.user, self.joined_at_ms, false);
+                .finish_attempt(self.guild, self.user, &self.stay_id, false);
         }
     }
 }
 
 impl RejoinNoteDeliveries {
+    fn prune_stale(state: &mut RejoinNoteDeliveryState) {
+        state
+            .delivered
+            .retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
+        state
+            .undelivered
+            .retain(|_, marked| marked.elapsed() < MEMBER_JOINS_KEEP);
+    }
+
+    pub fn clear_member(&self, guild: u64, user: u64) {
+        let mut state = self.inner.lock();
+        state
+            .delivered
+            .retain(|(g, u, _), _| *g != guild || *u != user);
+        state
+            .undelivered
+            .retain(|(g, u, _), _| *g != guild || *u != user);
+        state.in_flight.retain(|(g, u, _)| *g != guild || *u != user);
+    }
+
+    pub fn retain_current_stay(&self, guild: u64, user: u64, stay_id: &str) {
+        let mut state = self.inner.lock();
+        let keep = |key: &RejoinStayKey| {
+            key.0 == guild && key.1 == user && key.2 == stay_id
+        };
+        state.delivered.retain(|key, _| keep(key));
+        state.undelivered.retain(|key, _| keep(key));
+        state.in_flight.retain(|key| keep(key));
+    }
+
     pub fn begin_in_flight(
         &self,
         guild: u64,
         user: u64,
-        joined_at_ms: i64,
+        stay_id: &str,
     ) -> Option<RejoinNoteInFlight<'_>> {
-        if !self.begin_attempt(guild, user, joined_at_ms) {
+        if stay_id.is_empty() || !self.begin_attempt(guild, user, stay_id) {
             return None;
         }
-        Some(RejoinNoteInFlight::new(self, guild, user, joined_at_ms))
+        Some(RejoinNoteInFlight::new(
+            self,
+            guild,
+            user,
+            stay_id.to_owned(),
+        ))
     }
 
-    pub fn pending_redelivery(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
-        let key = (guild, user, joined_at_ms);
-        self.inner.lock().undelivered.contains(&key)
-    }
-
-    pub fn begin_attempt(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
-        let key = (guild, user, joined_at_ms);
+    pub fn pending_redelivery(&self, guild: u64, user: u64, stay_id: &str) -> bool {
+        if stay_id.is_empty() {
+            return false;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
-        state
-            .delivered
-            .retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
+        Self::prune_stale(&mut state);
+        state.undelivered.contains_key(&key)
+    }
+
+    pub fn begin_attempt(&self, guild: u64, user: u64, stay_id: &str) -> bool {
+        if stay_id.is_empty() {
+            return false;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
+        let mut state = self.inner.lock();
+        Self::prune_stale(&mut state);
         if state.in_flight.contains(&key) {
             return false;
         }
@@ -325,15 +372,26 @@ impl RejoinNoteDeliveries {
         true
     }
 
-    pub fn finish_attempt(&self, guild: u64, user: u64, joined_at_ms: i64, sent: bool) {
-        let key = (guild, user, joined_at_ms);
+    pub fn finish_attempt(&self, guild: u64, user: u64, stay_id: &str, sent: bool) {
+        if stay_id.is_empty() {
+            return;
+        }
+        let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
         state.in_flight.remove(&key);
         if sent {
             state.undelivered.remove(&key);
             state.delivered.insert(key, Instant::now());
         } else {
-            state.undelivered.insert(key);
+            state.undelivered.insert(key, Instant::now());
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_age_undelivered(&self, guild: u64, user: u64, stay_id: &str, ago: Duration) {
+        let key = rejoin_stay_key(guild, user, stay_id);
+        if let Some(marked) = self.inner.lock().undelivered.get_mut(&key) {
+            *marked = Instant::now() - ago;
         }
     }
 }

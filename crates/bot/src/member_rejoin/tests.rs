@@ -387,7 +387,7 @@ async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
     f.app.activation.mark_lock_held(true);
     const GUILD: u64 = 789;
     const USER: u64 = 42;
-    const JOINED_AT_MS: i64 = 1_700_000_000_000;
+    const STAY: &str = "stay-delivered-a";
     let note = RejoinNote::IndexNotReady;
     let vars = member_rejoin_vars(&user(USER), &note);
     db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
@@ -398,7 +398,7 @@ async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
     assert!(
         f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS)
+            .begin_attempt(GUILD, USER, STAY)
     );
     let sent = emit_to(
         &f.app,
@@ -411,14 +411,14 @@ async fn delivered_rejoin_note_is_deduped_for_same_join_token() {
         == Delivery::Sent;
     f.app
         .rejoin_note_deliveries
-        .finish_attempt(GUILD, USER, JOINED_AT_MS, sent);
+        .finish_attempt(GUILD, USER, STAY, sent);
     assert!(sent);
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
     assert!(
         !f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS),
-        "second join handler pass must not post again for the same join token"
+            .begin_attempt(GUILD, USER, STAY),
+        "second join handler pass must not post again for the same stay"
     );
     assert_eq!(sink.messages.lock().unwrap().len(), 1);
 }
@@ -429,7 +429,7 @@ async fn delivered_rejoin_note_is_deduped_after_membership_refresh() {
     f.app.activation.mark_lock_held(true);
     const GUILD: u64 = 789;
     const USER: u64 = 42;
-    const JOINED_AT_MS: i64 = 1_700_000_000_001;
+    const STAY: &str = "stay-delivered-b";
     let note = RejoinNote::IndexNotReady;
     let vars = member_rejoin_vars(&user(USER), &note);
     db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
@@ -440,7 +440,7 @@ async fn delivered_rejoin_note_is_deduped_after_membership_refresh() {
     assert!(
         f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS)
+            .begin_attempt(GUILD, USER, STAY)
     );
     let sent = emit_to(
         &f.app,
@@ -453,12 +453,12 @@ async fn delivered_rejoin_note_is_deduped_after_membership_refresh() {
         == Delivery::Sent;
     f.app
         .rejoin_note_deliveries
-        .finish_attempt(GUILD, USER, JOINED_AT_MS, sent);
+        .finish_attempt(GUILD, USER, STAY, sent);
     assert!(sent);
     assert!(
         !f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS),
+            .begin_attempt(GUILD, USER, STAY),
         "membership refresh must not bypass a delivered rejoin receipt"
     );
 }
@@ -539,11 +539,11 @@ fn near_full_case_budget_still_shows_omission_marker() {
 fn canceled_rejoin_attempt_allows_redelivery() {
     let deliveries = crate::logging::RejoinNoteDeliveries::default();
     let guard = deliveries
-        .begin_in_flight(1, 2, 3)
+        .begin_in_flight(1, 2, "stay-canceled")
         .expect("first attempt must start");
     drop(guard);
     assert!(
-        deliveries.begin_attempt(1, 2, 3),
+        deliveries.begin_attempt(1, 2, "stay-canceled"),
         "canceled attempt must clear in-flight state"
     );
 }
@@ -603,8 +603,73 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         "stale join events must still retry an undelivered rejoin note"
     );
     assert!(
-        body.contains("membership_refresh || retry_undelivered"),
-        "only fresh stays or failed-delivery retries may emit rejoin notes"
+        body.contains("membership_refresh || retry_undelivered || durable_pending"),
+        "fresh stays, durable receipts, or failed-delivery retries may emit rejoin notes"
+    );
+    assert!(
+        body.contains("clear_pending_rejoin_note"),
+        "settled rejoin delivery must clear the durable receipt"
+    );
+    assert!(
+        body.contains("retain_current_stay") && body.contains("current_member_stay_id"),
+        "in-memory retries must key to the current stay"
+    );
+}
+
+#[tokio::test]
+async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh() {
+    const GUILD: i64 = 10;
+    const USER: i64 = 42;
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = ready_directory(&f.app, &enrollment).await;
+    store
+        .observe_member(scope.clone(), MemberObservation {
+            user_id: USER,
+            username: Some(Some("member".into())),
+            global_name: None,
+            nickname: None,
+            joined_at_ms: Some(1_000),
+            observed_at_ms: 1_000,
+            is_join: true,
+        })
+        .await
+        .unwrap();
+    store.depart_member(scope.clone(), USER, 2_000).await.unwrap();
+    store
+        .observe_member(scope.clone(), MemberObservation {
+            user_id: USER,
+            username: Some(Some("member".into())),
+            global_name: None,
+            nickname: None,
+            joined_at_ms: Some(3_000),
+            observed_at_ms: 3_000,
+            is_join: true,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store.has_pending_rejoin_note(scope.clone(), USER).await.unwrap()
+    );
+    let stale = store
+        .observe_member(scope.clone(), MemberObservation {
+            user_id: USER,
+            username: Some(Some("member".into())),
+            global_name: None,
+            nickname: None,
+            joined_at_ms: Some(3_000),
+            observed_at_ms: 3_500,
+            is_join: true,
+        })
+        .await
+        .unwrap();
+    assert!(!stale.membership_refresh);
+    assert!(
+        crate::member_directory::pending_rejoin_note(&f.app, GUILD as u64, USER as u64).await
     );
 }
 
@@ -614,7 +679,7 @@ async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
     f.app.activation.mark_lock_held(true);
     const GUILD: u64 = 789;
     const USER: u64 = 42;
-    const JOINED_AT_MS: i64 = 1_700_000_000_002;
+    const STAY: &str = "stay-retry";
     let note = RejoinNote::IndexNotReady;
     let vars = member_rejoin_vars(&user(USER), &note);
     db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
@@ -625,27 +690,27 @@ async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
     let refresh_attempt = f
         .app
         .rejoin_note_deliveries
-        .begin_in_flight(GUILD, USER, JOINED_AT_MS)
+        .begin_in_flight(GUILD, USER, STAY)
         .expect("fresh stay reserves delivery");
     refresh_attempt.complete(false);
     assert!(
         f.app
             .rejoin_note_deliveries
-            .pending_redelivery(GUILD, USER, JOINED_AT_MS),
+            .pending_redelivery(GUILD, USER, STAY),
         "failed delivery must remain retryable"
     );
     let membership_refresh = false;
     let retry_undelivered =
         f.app
             .rejoin_note_deliveries
-            .pending_redelivery(GUILD, USER, JOINED_AT_MS);
+            .pending_redelivery(GUILD, USER, STAY);
     assert!(retry_undelivered);
     assert!(!membership_refresh);
     let stale_retry = f
         .app
         .rejoin_note_deliveries
-        .begin_in_flight(GUILD, USER, JOINED_AT_MS)
-        .expect("stale add must retry the undelivered join token");
+        .begin_in_flight(GUILD, USER, STAY)
+        .expect("stale add must retry the undelivered stay");
     let sent =
         emit_to(&f.app, &sink, GuildId::new(GUILD), "member_rejoin", vars).await == Delivery::Sent;
     stale_retry.complete(sent);
@@ -654,9 +719,21 @@ async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
     assert!(
         !f.app
             .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, JOINED_AT_MS),
+            .begin_attempt(GUILD, USER, STAY),
         "successful delivery must not post again"
     );
+}
+
+#[test]
+fn superseded_stay_does_not_inherit_undelivered_retry() {
+    let deliveries = crate::logging::RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(1, 2, "stay-old", false);
+    assert!(deliveries.pending_redelivery(1, 2, "stay-old"));
+    assert!(!deliveries.pending_redelivery(1, 2, "stay-new"));
+    deliveries.retain_current_stay(1, 2, "stay-new");
+    assert!(!deliveries.pending_redelivery(1, 2, "stay-old"));
+    deliveries.finish_attempt(1, 2, "stay-new", false);
+    assert!(deliveries.pending_redelivery(1, 2, "stay-new"));
 }
 
 struct Fixture {

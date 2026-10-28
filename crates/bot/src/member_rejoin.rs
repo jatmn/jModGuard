@@ -292,7 +292,7 @@ pub(crate) async fn maybe_emit_member_rejoin(
     ctx: &serenity::client::Context,
     guild_id: GuildId,
     user: &User,
-) -> bool {
+) -> logging::Delivery {
     logging::emit_member_event(
         app,
         ctx,
@@ -303,7 +303,7 @@ pub(crate) async fn maybe_emit_member_rejoin(
         None,
     )
     .await
-    .0 == logging::Delivery::Sent
+    .0
 }
 
 #[cfg(test)]

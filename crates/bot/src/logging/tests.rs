@@ -3986,12 +3986,12 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
 fn rejoin_note_canceled_in_flight_allows_redelivery() {
     let deliveries = RejoinNoteDeliveries::default();
     let guard = deliveries
-        .begin_in_flight(9, 8, 7)
-        .expect("first delivery attempt must reserve the join token");
+        .begin_in_flight(9, 8, "stay-7")
+        .expect("first delivery attempt must reserve the stay");
     drop(guard);
     assert!(
-        deliveries.begin_attempt(9, 8, 7),
-        "canceled handler must release the in-flight join token"
+        deliveries.begin_attempt(9, 8, "stay-7"),
+        "canceled handler must release the in-flight stay"
     );
 }
 
@@ -3999,12 +3999,12 @@ fn rejoin_note_canceled_in_flight_allows_redelivery() {
 fn rejoin_note_successful_delivery_blocks_redelivery() {
     let deliveries = RejoinNoteDeliveries::default();
     let guard = deliveries
-        .begin_in_flight(9, 8, 7)
+        .begin_in_flight(9, 8, "stay-7")
         .expect("delivery attempt must start");
     guard.complete(true);
     assert!(
-        !deliveries.begin_attempt(9, 8, 7),
-        "delivered join token must be deduped"
+        !deliveries.begin_attempt(9, 8, "stay-7"),
+        "delivered stay must be deduped"
     );
 }
 
@@ -4012,11 +4012,38 @@ fn rejoin_note_successful_delivery_blocks_redelivery() {
 fn rejoin_note_failed_delivery_allows_redelivery() {
     let deliveries = RejoinNoteDeliveries::default();
     let guard = deliveries
-        .begin_in_flight(9, 8, 7)
+        .begin_in_flight(9, 8, "stay-7")
         .expect("delivery attempt must start");
     guard.complete(false);
     assert!(
-        deliveries.begin_attempt(9, 8, 7),
-        "failed delivery must not mark the join token as delivered"
+        deliveries.begin_attempt(9, 8, "stay-7"),
+        "failed delivery must not mark the stay as delivered"
     );
+}
+
+#[test]
+fn rejoin_note_undelivered_retry_expires() {
+    use std::time::Duration;
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(9, 8, "stay-expire", false);
+    assert!(deliveries.pending_redelivery(9, 8, "stay-expire"));
+    deliveries.test_age_undelivered(
+        9,
+        8,
+        "stay-expire",
+        MEMBER_JOINS_KEEP + Duration::from_secs(1),
+    );
+    assert!(
+        !deliveries.pending_redelivery(9, 8, "stay-expire"),
+        "stale undelivered state must not retry forever"
+    );
+}
+
+#[test]
+fn rejoin_note_leave_clears_member_state() {
+    let deliveries = RejoinNoteDeliveries::default();
+    deliveries.finish_attempt(9, 8, "stay-leave", false);
+    deliveries.clear_member(9, 8);
+    assert!(!deliveries.pending_redelivery(9, 8, "stay-leave"));
+    assert!(deliveries.begin_attempt(9, 8, "stay-leave"));
 }

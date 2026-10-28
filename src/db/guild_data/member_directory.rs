@@ -1504,6 +1504,87 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             .await
     }
 
+    pub async fn current_member_stay_id(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+    ) -> Result<Option<String>> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let stay = tx
+                    .query_row(
+                        "SELECT current_stay_id FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND is_current=1",
+                        params![
+                            scope.guild_id(),
+                            scope.enrollment.id.as_str(),
+                            user_id
+                        ],
+                        |r| Ok(r.get::<Option<String>>(0)?),
+                    )
+                    .optional()?
+                    .flatten();
+                tx.finish_read()?;
+                Ok(stay)
+            })
+            .await
+    }
+
+    pub async fn has_pending_rejoin_note(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+    ) -> Result<bool> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM guild_member_pending_rejoin_notes p JOIN guild_member_directory d ON d.guild_id=p.guild_id AND d.enrollment_id=p.enrollment_id AND d.user_id=p.user_id WHERE p.guild_id=?1 AND p.enrollment_id=?2 AND p.user_id=?3 AND d.is_current=1 AND d.current_stay_id=p.stay_id)",
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        user_id
+                    ],
+                    |r| Ok(r.get(0)?),
+                )?;
+                tx.finish_read()?;
+                Ok(pending)
+            })
+            .await
+    }
+
+    pub async fn clear_pending_rejoin_note(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+    ) -> Result<()> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_read()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                tx.ensure_mutation_receipt()?;
+                tx.member_execute(
+                    "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn member_case_index_complete(&self, scope: GuildDataScope) -> Result<bool> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
@@ -1610,6 +1691,10 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             }
             tx.ensure_mutation_receipt()?;
             if let Some(stay)=stay { tx.member_execute("UPDATE guild_member_stays SET departed_at_ms=?4,ended_unknown=0 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,departed_at_ms])?; }
+            tx.member_execute(
+                "DELETE FROM guild_member_pending_rejoin_notes WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+                params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+            )?;
             tx.member_execute("UPDATE guild_member_directory SET is_current=0,departed_at_ms=?4,current_stay_id=NULL,cleanup_after_ms=?5,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,departed_at_ms,if retained {None} else {Some(departed_at_ms.saturating_add(300_000))}])?;
             bump_revision(&tx,&scope)?; tx.commit()?;
             Ok(MemberDepartureDecision::Applied(Some(MemberDeparture{user_id,joined_at_ms:joined,departed_at_ms,completed_stay_ms:joined.filter(|j|*j<=departed_at_ms).map(|j|departed_at_ms-j)})))
@@ -1980,6 +2065,26 @@ fn ingest_member_audits(
     Ok((inserted, unchanged))
 }
 
+fn set_pending_rejoin_note_tx(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    user_id: i64,
+    stay_id: &str,
+    joined_at_ms: Option<i64>,
+) -> Result<()> {
+    conn.member_execute(
+        "INSERT INTO guild_member_pending_rejoin_notes(guild_id,enrollment_id,user_id,stay_id,joined_at_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET stay_id=excluded.stay_id,joined_at_ms=excluded.joined_at_ms",
+        params![
+            scope.guild_id(),
+            scope.enrollment.id.as_str(),
+            user_id,
+            stay_id,
+            joined_at_ms
+        ],
+    )?;
+    Ok(())
+}
+
 fn upsert_member(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
@@ -2119,6 +2224,9 @@ fn upsert_member(
             conn.member_execute("INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(?1,?2,?3,?4,'membership_changed',?5)",params![scope.guild_id(),scope.enrollment.id.as_str(),random_id(),obs.user_id,obs.observed_at_ms])?;
         }
         conn.member_execute("INSERT INTO guild_member_stays(guild_id,enrollment_id,stay_id,user_id,joined_at_ms,provenance) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),stay.as_deref(),obs.user_id,obs.joined_at_ms,format!("{provenance}_rejoin")])?;
+        if let Some(stay_id) = stay.as_deref() {
+            set_pending_rejoin_note_tx(conn, scope, obs.user_id, stay_id, joined)?;
+        }
     } else if current
         && old_join.is_none()
         && joined.is_some()
@@ -2318,14 +2426,14 @@ fn upsert_member_batch(
             } else {
                 old_stay.clone()
             };
-            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":is_current,"joined_at_ms":joined,"current_stay_id":stay_id,"observed_at_ms":obs.observed_at_ms,"revision":revision+1,"clear_ban":clear_ban,"new_stay_id":if rotate{stay_id.clone()}else{None},"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":if rotate{"imported_rejoin"}else{"imported"},"purge_prior":rotate && !*ever_banned,"old_stay_id":if changed_instance && *ever_banned{old_stay.clone()}else{None},"unknown_observation_id":if changed_instance && *ever_banned{Some(random_id())}else{None},"fill_stay_id":if *current && old_join.is_none() && joined.is_some(){old_stay.clone()}else{None},"fill_joined_at_ms":joined}));
+            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":is_current,"joined_at_ms":joined,"current_stay_id":stay_id,"observed_at_ms":obs.observed_at_ms,"revision":revision+1,"clear_ban":clear_ban,"new_stay_id":if rotate{stay_id.clone()}else{None},"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":if rotate{"imported_rejoin"}else{"imported"},"pending_rejoin":rotate,"purge_prior":rotate && !*ever_banned,"old_stay_id":if changed_instance && *ever_banned{old_stay.clone()}else{None},"unknown_observation_id":if changed_instance && *ever_banned{Some(random_id())}else{None},"fill_stay_id":if *current && old_join.is_none() && joined.is_some(){old_stay.clone()}else{None},"fill_joined_at_ms":joined}));
             updated += 1;
         } else {
             let username = bounded_name(obs.username.clone().flatten())?;
             let global = bounded_name(obs.global_name.clone().flatten())?;
             let nickname = bounded_name(obs.nickname.clone().flatten())?;
             let stay = random_id();
-            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":true,"joined_at_ms":obs.joined_at_ms,"current_stay_id":stay,"observed_at_ms":obs.observed_at_ms,"revision":0,"clear_ban":false,"new_stay_id":stay,"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":"imported","purge_prior":false,"old_stay_id":null,"unknown_observation_id":null,"fill_stay_id":null,"fill_joined_at_ms":null}));
+            changed.push(serde_json::json!({"id":obs.user_id,"username":username,"global_name":global,"nickname":nickname,"search_text":normalized_name(&username,&global,&nickname),"is_current":true,"joined_at_ms":obs.joined_at_ms,"current_stay_id":stay,"observed_at_ms":obs.observed_at_ms,"revision":0,"clear_ban":false,"new_stay_id":stay,"new_stay_joined_at_ms":obs.joined_at_ms,"new_stay_provenance":"imported","pending_rejoin":false,"purge_prior":false,"old_stay_id":null,"unknown_observation_id":null,"fill_stay_id":null,"fill_joined_at_ms":null}));
             inserted += 1;
         }
     }
@@ -2353,6 +2461,8 @@ fn upsert_member_batch(
     conn.member_execute_rows("INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) SELECT ?1,?2,json_extract(value,'$.unknown_observation_id'),CAST(json_extract(value,'$.id') AS INTEGER),'membership_changed',CAST(json_extract(value,'$.observed_at_ms') AS INTEGER) FROM json_each(?3) WHERE json_extract(value,'$.unknown_observation_id') IS NOT NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()],row_bound)?;
     note_member_sync_statement(guild_id);
     conn.member_execute_rows("INSERT INTO guild_member_stays(guild_id,enrollment_id,stay_id,user_id,joined_at_ms,provenance) SELECT ?1,?2,json_extract(value,'$.new_stay_id'),CAST(json_extract(value,'$.id') AS INTEGER),CAST(json_extract(value,'$.new_stay_joined_at_ms') AS INTEGER),json_extract(value,'$.new_stay_provenance') FROM json_each(?3) WHERE json_extract(value,'$.new_stay_id') IS NOT NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()],row_bound)?;
+    note_member_sync_statement(guild_id);
+    conn.member_execute_rows("INSERT INTO guild_member_pending_rejoin_notes(guild_id,enrollment_id,user_id,stay_id,joined_at_ms) SELECT ?1,?2,CAST(json_extract(value,'$.id') AS INTEGER),json_extract(value,'$.new_stay_id'),CAST(json_extract(value,'$.joined_at_ms') AS INTEGER) FROM json_each(?3) WHERE json_extract(value,'$.pending_rejoin')=1 ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET stay_id=excluded.stay_id,joined_at_ms=excluded.joined_at_ms",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()],row_bound)?;
     note_member_sync_statement(guild_id);
     conn.member_execute("UPDATE guild_member_stays SET joined_at_ms=(SELECT CAST(json_extract(value,'$.fill_joined_at_ms') AS INTEGER) FROM json_each(?3) WHERE json_extract(value,'$.fill_stay_id')=guild_member_stays.stay_id) WHERE guild_id=?1 AND enrollment_id=?2 AND joined_at_ms IS NULL AND stay_id IN (SELECT json_extract(value,'$.fill_stay_id') FROM json_each(?3) WHERE json_extract(value,'$.fill_stay_id') IS NOT NULL)",params![scope.guild_id(),scope.enrollment.id.as_str(),data.as_str()])?;
     note_member_sync_statement(guild_id);

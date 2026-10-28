@@ -717,6 +717,29 @@ async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
         stays, 1,
         "ordinary prior stay must be purged on live rejoin"
     );
+    assert!(
+        store
+            .has_pending_rejoin_note(scope.clone(), 10)
+            .await
+            .unwrap(),
+        "live rejoin must persist a durable rejoin-note receipt"
+    );
+    let stale = store
+        .observe_member(scope.clone(), observed(10, Some(2_500), 3_500))
+        .await
+        .unwrap();
+    assert!(
+        !stale.membership_refresh,
+        "stale gateway add must not rotate the stay again"
+    );
+    assert!(
+        store.has_pending_rejoin_note(scope.clone(), 10).await.unwrap(),
+        "durable receipt must survive a stale gateway observation"
+    );
+    store.clear_pending_rejoin_note(scope.clone(), 10).await.unwrap();
+    assert!(
+        !store.has_pending_rejoin_note(scope.clone(), 10).await.unwrap()
+    );
     assert_eq!(
         store
             .depart_member(scope.clone(), 10, 4_000)

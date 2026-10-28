@@ -744,26 +744,44 @@ impl EventHandler for Handler {
             None,
         )
         .await;
-        let joined_at_ms = new_member
-            .joined_at
-            .map(|joined| joined.timestamp_millis())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        let retry_undelivered =
+        let current_stay =
+            crate::member_directory::current_member_stay_id(&app, guild_id.get(), uid).await;
+        if membership_refresh {
+            if let Some(stay_id) = current_stay.as_deref() {
+                app.rejoin_note_deliveries
+                    .retain_current_stay(guild_id.get(), uid, stay_id);
+            } else {
+                app.rejoin_note_deliveries.clear_member(guild_id.get(), uid);
+            }
+        }
+        let retry_undelivered = current_stay.as_deref().is_some_and(|stay_id| {
             app.rejoin_note_deliveries
-                .pending_redelivery(guild_id.get(), uid, joined_at_ms);
-        if (membership_refresh || retry_undelivered)
+                .pending_redelivery(guild_id.get(), uid, stay_id)
+        });
+        let durable_pending =
+            crate::member_directory::pending_rejoin_note(&app, guild_id.get(), uid).await;
+        if (membership_refresh || retry_undelivered || durable_pending)
+            && let Some(stay_id) = current_stay.as_deref()
             && let Some(in_flight) =
                 app.rejoin_note_deliveries
-                    .begin_in_flight(guild_id.get(), uid, joined_at_ms)
+                    .begin_in_flight(guild_id.get(), uid, stay_id)
         {
-            let sent = crate::member_rejoin::maybe_emit_member_rejoin(
+            let delivery = crate::member_rejoin::maybe_emit_member_rejoin(
                 &app,
                 &ctx,
                 guild_id,
                 &new_member.user,
             )
             .await;
-            in_flight.complete(sent);
+            let settled = matches!(
+                delivery,
+                logging::Delivery::Sent | logging::Delivery::Unconfigured
+            );
+            in_flight.complete(settled);
+            if settled {
+                crate::member_directory::clear_pending_rejoin_note(&app, guild_id.get(), uid)
+                    .await;
+            }
         }
     }
 
@@ -802,6 +820,8 @@ impl EventHandler for Handler {
             expected_joined_at_ms,
         )
         .await;
+        app.rejoin_note_deliveries
+            .clear_member(guild_id.get(), user.id.get());
         if matches!(
             departed,
             Some(crate::db::guild_data::MemberDepartureDecision::NeedsVerification)
