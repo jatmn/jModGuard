@@ -102,7 +102,7 @@ pub async fn guild_config(
     let badwords: Vec<_> = snapshot.badwords.iter().map(|w| w.with_status()).collect();
 
     // commands: raw scope rows stay on guild_override/global. `effective` matches
-    // runtime (shipped built-ins, stored access controls, reserved-label collisions).
+    // runtime (shipped built-ins and their shipped access, reserved-label collisions).
     let commands = command_config_rows(&snapshot.global_commands, &snapshot.guild_commands);
 
     let mut templates = Vec::new();

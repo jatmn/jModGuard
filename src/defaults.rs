@@ -462,28 +462,30 @@ pub fn is_builtin_primary_command_name(name: &str) -> bool {
         .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
 }
 
-/// Applies guild access controls from a stored row onto the shipped built-in definition.
-fn merge_shipped_builtin(stored: &CommandDef, shipped: CommandDef) -> CommandDef {
-    CommandDef {
-        enabled: stored.enabled,
-        permission: stored.permission.clone(),
-        roles: stored.roles.clone(),
-        channels: stored.channels.clone(),
-        cooldown_secs: stored.cooldown_secs,
-        ..shipped
-    }
+/// Shipped built-in for runtime enforcement and API reads.
+/// Stored rows do not contribute definition or access controls.
+pub fn effective_builtin_command(
+    primary: &str,
+    _stored: Option<&CommandDef>,
+) -> Option<CommandDef> {
+    default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))
 }
 
-/// Effective built-in for runtime enforcement and API reads: shipped identity/behavior
-/// with optional stored access controls from the guild or global row.
-pub fn effective_builtin_command(primary: &str, stored: Option<&CommandDef>) -> Option<CommandDef> {
-    let shipped = default_commands()
-        .into_iter()
-        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))?;
-    Some(match stored {
-        Some(stored) => merge_shipped_builtin(stored, shipped),
-        None => shipped,
-    })
+fn install_shipped_builtin(
+    commands: &mut std::collections::HashMap<String, CommandDef>,
+    shipped: CommandDef,
+) {
+    let stale: Vec<String> = commands
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(&shipped.name))
+        .cloned()
+        .collect();
+    for key in stale {
+        commands.remove(&key);
+    }
+    commands.insert(shipped.name.clone(), shipped);
 }
 
 /// Removes legacy rows and aliases that compete with shipped built-in labels.
@@ -510,8 +512,8 @@ pub fn resolve_legacy_builtin_command_collisions(
     }
 }
 
-/// Effective command map for one guild: guild rows overlay global rows, then the
-/// same shipped-builtin merge used by the bot (`apply_shipped_builtin_commands`).
+/// Effective command map for one guild: guild rows overlay global rows, then
+/// shipped built-ins replace any stored primary (`apply_shipped_builtin_commands`).
 pub fn effective_command_registry(
     global_commands: &std::collections::HashMap<String, CommandDef>,
     guild_commands: &std::collections::HashMap<String, CommandDef>,
@@ -524,17 +526,13 @@ pub fn effective_command_registry(
     commands
 }
 
-/// Applies shipped built-in commands, preserving stored access controls per guild row.
+/// Replaces built-in primaries with the shipped command. Stored rows do not
+/// contribute definition or access controls.
 pub fn apply_shipped_builtin_commands(
     commands: &mut std::collections::HashMap<String, CommandDef>,
 ) {
     for shipped in default_global_seed_commands() {
-        let primary = shipped.name.clone();
-        let merged = commands
-            .get(&primary)
-            .map(|stored| merge_shipped_builtin(stored, shipped.clone()))
-            .unwrap_or(shipped);
-        commands.insert(primary, merged);
+        install_shipped_builtin(commands, shipped);
     }
     merge_binary_overlay_commands(commands);
     resolve_legacy_builtin_command_collisions(commands);
@@ -579,18 +577,13 @@ pub fn default_global_seed_commands() -> Vec<CommandDef> {
 }
 
 /// Inserts shipped binary-overlay commands, replacing any legacy stored row (including
-/// guild-persisted `voice` rows from older builds).
+/// guild-persisted `voice` rows from older builds). Stored access controls are ignored.
 pub fn merge_binary_overlay_commands(commands: &mut std::collections::HashMap<String, CommandDef>) {
     for shipped in default_commands() {
         if !BINARY_OVERLAY_COMMAND_NAMES.contains(&shipped.name.as_str()) {
             continue;
         }
-        let primary = shipped.name.clone();
-        let merged = commands
-            .get(&primary)
-            .map(|stored| merge_shipped_builtin(stored, shipped.clone()))
-            .unwrap_or(shipped);
-        commands.insert(primary, merged);
+        install_shipped_builtin(commands, shipped);
     }
 }
 
@@ -895,7 +888,7 @@ mod rolling_upgrade_tests {
     use super::*;
 
     #[test]
-    fn merge_shipped_builtin_preserves_access_controls_not_definition() {
+    fn shipped_builtin_ignores_stored_access_and_definition() {
         let shipped = default_commands()
             .into_iter()
             .find(|cmd| cmd.name == "ban")
@@ -911,15 +904,21 @@ mod rolling_upgrade_tests {
             behavior: Behavior::Say,
             ..shipped.clone()
         };
-        let merged = merge_shipped_builtin(&stored, shipped.clone());
+        let merged = effective_builtin_command("ban", Some(&stored)).expect("ban");
         assert_eq!(merged.description, shipped.description);
         assert_eq!(merged.aliases, shipped.aliases);
         assert!(matches!(merged.behavior, Behavior::Ban { .. }));
-        assert!(!merged.enabled);
-        assert_eq!(merged.permission, "owner");
-        assert_eq!(merged.roles, vec![555]);
-        assert_eq!(merged.channels, vec![777]);
-        assert_eq!(merged.cooldown_secs, 42);
+        assert_eq!(merged.enabled, shipped.enabled);
+        assert_eq!(merged.permission, shipped.permission);
+        assert_eq!(merged.roles, shipped.roles);
+        assert_eq!(merged.channels, shipped.channels);
+        assert_eq!(merged.cooldown_secs, shipped.cooldown_secs);
+        let mut commands = std::collections::HashMap::from([("Ban".into(), stored)]);
+        apply_shipped_builtin_commands(&mut commands);
+        assert!(!commands.contains_key("Ban"));
+        assert_eq!(commands["ban"].enabled, shipped.enabled);
+        assert_eq!(commands["ban"].permission, shipped.permission);
+        assert_eq!(commands["ban"].cooldown_secs, shipped.cooldown_secs);
     }
 
     #[test]
@@ -998,8 +997,11 @@ mod rolling_upgrade_tests {
         );
         merge_binary_overlay_commands(&mut commands);
         assert_eq!(commands["voice"].description, voice.description);
-        assert!(!commands["voice"].enabled);
-        assert_eq!(commands["voice"].permission, "owner");
+        assert_eq!(commands["voice"].enabled, voice.enabled);
+        assert_eq!(commands["voice"].permission, voice.permission);
+        assert_eq!(commands["voice"].roles, voice.roles);
+        assert_eq!(commands["voice"].channels, voice.channels);
+        assert_eq!(commands["voice"].cooldown_secs, voice.cooldown_secs);
         assert_eq!(commands["voice"].aliases, voice.aliases);
         assert!(matches!(commands["voice"].behavior, Behavior::Voice));
     }

@@ -3174,7 +3174,14 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
         parts.commands["voice"].description,
         shipped_voice.description
     );
-    assert!(!parts.commands["voice"].enabled);
+    assert_eq!(parts.commands["voice"].enabled, shipped_voice.enabled);
+    assert_eq!(parts.commands["voice"].permission, shipped_voice.permission);
+    assert_eq!(parts.commands["voice"].roles, shipped_voice.roles);
+    assert_eq!(parts.commands["voice"].channels, shipped_voice.channels);
+    assert_eq!(
+        parts.commands["voice"].cooldown_secs,
+        shipped_voice.cooldown_secs
+    );
     assert!(matches!(
         parts.commands["voice"].behavior,
         crate::types::Behavior::Voice
@@ -3183,7 +3190,7 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
 }
 
 #[test]
-fn builtin_access_controls_preserved_on_load_and_slash_registry() {
+fn builtin_access_controls_ignored_on_load_and_slash_registry() {
     let tmp = tmp_db_path("builtin_access_controls");
     let db = Db::open(&tmp, 2).unwrap();
     let shipped_ban = crate::defaults::default_commands()
@@ -3197,6 +3204,7 @@ fn builtin_access_controls_preserved_on_load_and_slash_registry() {
     stored.channels = vec![777];
     stored.description = "legacy description".into();
     stored.aliases = vec!["legacy-alias".into()];
+    stored.cooldown_secs = 42;
     tokio_test_block_on(db.with_conn(move |conn| {
         conn.execute_bounded(
             "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
@@ -3211,17 +3219,19 @@ fn builtin_access_controls_preserved_on_load_and_slash_registry() {
     assert_eq!(ban.description, shipped_ban.description);
     assert_eq!(ban.aliases, shipped_ban.aliases);
     assert!(matches!(ban.behavior, crate::types::Behavior::Ban { .. }));
-    assert!(!ban.enabled);
-    assert_eq!(ban.permission, "owner");
-    assert_eq!(ban.roles, vec![555]);
-    assert_eq!(ban.channels, vec![777]);
+    assert_eq!(ban.enabled, shipped_ban.enabled);
+    assert_eq!(ban.permission, shipped_ban.permission);
+    assert_eq!(ban.roles, shipped_ban.roles);
+    assert_eq!(ban.channels, shipped_ban.channels);
+    assert_eq!(ban.cooldown_secs, shipped_ban.cooldown_secs);
     let (_, _, slash_commands) =
         tokio_test_block_on(load_slash_commands_with_version(&db, 10)).unwrap();
     let slash_ban = slash_commands.get("ban").expect("slash ban");
-    assert!(!slash_ban.enabled);
-    assert_eq!(slash_ban.permission, "owner");
-    assert_eq!(slash_ban.roles, vec![555]);
-    assert_eq!(slash_ban.channels, vec![777]);
+    assert_eq!(slash_ban.enabled, shipped_ban.enabled);
+    assert_eq!(slash_ban.permission, shipped_ban.permission);
+    assert_eq!(slash_ban.roles, shipped_ban.roles);
+    assert_eq!(slash_ban.channels, shipped_ban.channels);
+    assert_eq!(slash_ban.cooldown_secs, shipped_ban.cooldown_secs);
     cleanup_db(&tmp);
 }
 
@@ -3833,11 +3843,7 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                     assert_eq!(parts.templates[event], new);
                 }
             }
-            if guild == 456 {
-                assert_eq!(parts.commands["stats"].permission, "everyone");
-            } else {
-                assert_eq!(parts.commands["stats"].permission, "admin");
-            }
+            assert_eq!(parts.commands["stats"].permission, "admin");
             assert!(parts.commands["stats"].matches("status"));
         }
         // Even a deliberate reversion to old wording is retained after the one-time upgrade.
@@ -3963,7 +3969,7 @@ fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
         .into_iter()
         .find(|cmd| cmd.name == "stats")
         .expect("stats");
-    assert_eq!(custom.commands["stats"].permission, "everyone");
+    assert_eq!(custom.commands["stats"].permission, "admin");
     assert_eq!(
         custom.commands["stats"].description,
         shipped_stats.description

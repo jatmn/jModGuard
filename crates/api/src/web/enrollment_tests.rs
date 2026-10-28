@@ -2589,7 +2589,7 @@ async fn individual_configuration_reads_keep_global_context_owner_only() {
 }
 
 #[tokio::test]
-async fn builtin_command_effective_read_applies_shipped_definition_and_stored_access_controls() {
+async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
     use jmodguard::db::SqlExecutor;
 
     let f = Fixture::new(false).await;
@@ -2642,10 +2642,14 @@ async fn builtin_command_effective_read_applies_shipped_definition_and_stored_ac
         body["effective"]["aliases"],
         serde_json::json!(shipped.aliases)
     );
-    assert_eq!(body["effective"]["enabled"], false);
-    assert_eq!(body["effective"]["permission"], "owner");
-    assert_eq!(body["effective"]["roles"], serde_json::json!(["555"]));
-    assert_eq!(body["effective"]["channels"], serde_json::json!(["777"]));
+    assert_eq!(body["effective"]["enabled"], shipped.enabled);
+    assert_eq!(body["effective"]["permission"], shipped.permission.as_str());
+    assert_eq!(body["effective"]["roles"], serde_json::json!([]));
+    assert_eq!(body["effective"]["channels"], serde_json::json!([]));
+    assert_eq!(
+        body["effective"]["cooldown_secs"],
+        serde_json::json!(shipped.cooldown_secs)
+    );
     assert_eq!(
         body["guild_override"]["description"],
         "legacy dashboard row"
@@ -2663,7 +2667,14 @@ async fn builtin_command_effective_read_applies_shipped_definition_and_stored_ac
             ban["effective"]["aliases"],
             serde_json::json!(shipped.aliases)
         );
-        assert_eq!(ban["effective"]["enabled"], false);
+        assert_eq!(ban["effective"]["enabled"], shipped.enabled);
+        assert_eq!(ban["effective"]["permission"], shipped.permission.as_str());
+        assert_eq!(ban["effective"]["roles"], serde_json::json!([]));
+        assert_eq!(ban["effective"]["channels"], serde_json::json!([]));
+        assert_eq!(
+            ban["effective"]["cooldown_secs"],
+            serde_json::json!(shipped.cooldown_secs)
+        );
         assert_eq!(ban["guild_override"]["description"], "legacy dashboard row");
         let voice = commands
             .iter()
@@ -2671,7 +2682,15 @@ async fn builtin_command_effective_read_applies_shipped_definition_and_stored_ac
             .expect("bundle voice");
         assert_eq!(voice["effective"]["description"], shipped_voice.description);
         assert_eq!(voice["effective"]["behavior"]["kind"], "voice");
-        assert_eq!(voice["effective"]["enabled"], false);
+        assert_eq!(voice["effective"]["enabled"], shipped_voice.enabled);
+        assert_eq!(
+            voice["effective"]["permission"],
+            shipped_voice.permission.as_str()
+        );
+        assert_eq!(
+            voice["effective"]["cooldown_secs"],
+            serde_json::json!(shipped_voice.cooldown_secs)
+        );
         assert_eq!(voice["guild_override"]["description"], "legacy voice row");
     }
     let (status, listed) = f.request("GET", "/api/guilds/10/commands", "").await;
@@ -2683,6 +2702,33 @@ async fn builtin_command_effective_read_applies_shipped_definition_and_stored_ac
         .find(|row| row["name"] == "ban")
         .expect("listed ban");
     assert_eq!(listed_ban["effective"]["description"], shipped.description);
+    assert_eq!(listed_ban["effective"]["enabled"], shipped.enabled);
+    assert_eq!(
+        listed_ban["effective"]["permission"],
+        shipped.permission.as_str()
+    );
+    assert_eq!(listed_ban["effective"]["roles"], serde_json::json!([]));
+    assert_eq!(listed_ban["effective"]["channels"], serde_json::json!([]));
+    assert_eq!(
+        listed_ban["effective"]["cooldown_secs"],
+        serde_json::json!(shipped.cooldown_secs)
+    );
+    let (status, voice_body) = f.request("GET", "/api/guilds/10/commands/voice", "").await;
+    assert_eq!(status, StatusCode::OK, "{voice_body}");
+    assert_eq!(
+        voice_body["effective"]["description"],
+        shipped_voice.description
+    );
+    assert_eq!(voice_body["effective"]["behavior"]["kind"], "voice");
+    assert_eq!(voice_body["effective"]["enabled"], shipped_voice.enabled);
+    assert_eq!(
+        voice_body["effective"]["permission"],
+        shipped_voice.permission.as_str()
+    );
+    assert_eq!(
+        voice_body["effective"]["cooldown_secs"],
+        serde_json::json!(shipped_voice.cooldown_secs)
+    );
     assert_eq!(
         listed["guild"]
             .as_array()

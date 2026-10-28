@@ -237,7 +237,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness and /ready readiness (in-memory; bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless bundled at build time, not vendored)
-migrations/                0001_init through 0020_gateway_ban_deliveries
+migrations/                0001_init through 0021_clear_builtin_command_access
 Dockerfile.bot
 Dockerfile.api
 ```
