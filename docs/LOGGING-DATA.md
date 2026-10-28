@@ -49,7 +49,9 @@ Joining, leaving and talking still do not maintain a general activity archive.
   counts without including ignored authors' content. A definite
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
-  ambiguous timeout is never resent. The transcript is not archived.
+  ambiguous timeout is never resent. A pending automod delete replayed through
+  `message_bulk_delete` because no `message_delete` channel is configured uses
+  that same attachment fallback. The transcript is not archived.
 - Join reports use the delivered user and the join timestamp in the Gateway member
   payload; they do not look up a saved directory join date. Leave reports use the
   saved directory stay when an authoritative departure decision is available,

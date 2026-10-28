@@ -2822,6 +2822,332 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
     server.abort();
 }
 
+#[derive(Clone, Copy)]
+enum ReplayAttachmentProxy {
+    /// 403 when the body names the transcript file; 200 for plain text.
+    Forbidden,
+    /// Read each request, then leave the connection open.
+    Hang,
+    /// Definite non-permission failure. No plain-text retry.
+    ServerError,
+}
+
+async fn read_proxied_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        request.extend_from_slice(&buf[..n]);
+        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if request.len() > 64 * 1024 {
+            return None;
+        }
+    };
+    let header = String::from_utf8_lossy(&request[..header_end]);
+    let length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            value.trim().parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + length && request.len() < 2 * 1024 * 1024 {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+    Some(request)
+}
+
+async fn write_proxy_reply(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn request_names_transcript(request: &[u8]) -> bool {
+    request
+        .windows("deleted-messages.txt".len())
+        .any(|window| window == b"deleted-messages.txt")
+}
+
+async fn replay_attachment_proxy(
+    mode: ReplayAttachmentProxy,
+) -> (
+    serenity::http::Http,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let saved = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let saved = Arc::clone(&saved);
+            tokio::spawn(async move {
+                let Some(request) = read_proxied_request(&mut stream).await else {
+                    return;
+                };
+                let attachment = request_names_transcript(&request);
+                saved.lock().unwrap().push(request);
+                match mode {
+                    ReplayAttachmentProxy::Hang => std::future::pending::<()>().await,
+                    ReplayAttachmentProxy::ServerError => {
+                        write_proxy_reply(
+                            &mut stream,
+                            500,
+                            "Error",
+                            r#"{"code":0,"message":"fixture"}"#,
+                        )
+                        .await;
+                    }
+                    ReplayAttachmentProxy::Forbidden if attachment => {
+                        write_proxy_reply(
+                            &mut stream,
+                            403,
+                            "Forbidden",
+                            r#"{"code":50013,"message":"fixture"}"#,
+                        )
+                        .await;
+                    }
+                    ReplayAttachmentProxy::Forbidden => {
+                        write_proxy_reply(&mut stream, 200, "OK", CREATED_MESSAGE_JSON).await;
+                    }
+                }
+            });
+        }
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .application_id(serenity::model::id::ApplicationId::new(1))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, requests, server)
+}
+
+fn replay_snapshot(content: &str) -> MessageSnapshot {
+    MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some(content.into()),
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 1,
+        edit_at_ms: None,
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 86_400_000,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: true,
+        attachments_supplied: false,
+    }
+}
+
+async fn prepare_replayed_automod_bulk(f: &Fixture, filter: Option<&str>) {
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    if let Some(data) = filter {
+        let data = data.to_string();
+        f.app
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_bulk_delete',?1)",
+                    db::params![data],
+                    65_536,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    f.app.invalidate_configs();
+}
+
+async fn replay_failed_automod_bulk(f: &Fixture, sink: &impl LogDelivery) {
+    let attempt = f
+        .app
+        .automod_delete_marks
+        .insert(789, 456, 123, "badword", "Bad words");
+    let retained = replay_snapshot("bulk fallback body");
+    assert!(
+        observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            Some(&retained),
+        )
+        .is_none()
+    );
+    let removal = f
+        .app
+        .automod_delete_marks
+        .remove_unconfirmed(789, 456, 123, attempt);
+    assert_eq!(
+        removal.action,
+        crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
+    replay_unconfirmed_plain_delete(
+        &f.app,
+        sink,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
+    )
+    .await;
+}
+
+fn request_text(requests: &[Vec<u8>]) -> Vec<String> {
+    requests
+        .iter()
+        .map(|request| String::from_utf8_lossy(request).into_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn replayed_bulk_attachment_forbidden_delivers_plain_text() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::with_timeout(30);
+    prepare_replayed_automod_bulk(&f, None).await;
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Forbidden).await;
+    let before = f.app.log_delivery_failures.load(Ordering::Relaxed);
+    replay_failed_automod_bulk(&f, &http).await;
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(
+        seen.len(),
+        2,
+        "attachment attempt plus one text part: {seen:?}"
+    );
+    assert!(
+        request_names_transcript(seen[0].as_bytes()),
+        "first send must attach the transcript: {}",
+        seen[0]
+    );
+    assert!(
+        seen[0].contains("/channels/903/"),
+        "bulk destination: {}",
+        seen[0]
+    );
+    assert!(
+        !request_names_transcript(seen[1].as_bytes()),
+        "text fallback must not attach again: {}",
+        seen[1]
+    );
+    assert!(
+        seen[1].contains("Attachment unavailable") && seen[1].contains("bulk fallback body"),
+        "plain delivery: {}",
+        seen[1]
+    );
+    assert!(
+        seen[1].contains("/channels/903/"),
+        "fallback stays on the bulk channel: {}",
+        seen[1]
+    );
+    assert_eq!(
+        f.app.log_delivery_failures.load(Ordering::Relaxed),
+        before,
+        "a delivered text fallback is not a failed log"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn replayed_filtered_bulk_attachment_fallback_omits_retained_text() {
+    let f = Fixture::with_timeout(30);
+    prepare_replayed_automod_bulk(&f, Some(r#"{"users":["42"],"channels":[]}"#)).await;
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Forbidden).await;
+    replay_failed_automod_bulk(&f, &http).await;
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|request| !request.contains("bulk fallback body")),
+        "filtered fallback exposed retained text: {seen:?}"
+    );
+    assert!(
+        seen[1].contains("excluded by user filter") || seen[1].contains("Attachment unavailable"),
+        "{seen:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn replayed_bulk_attachment_timeout_or_cancel_or_server_error_is_not_resent() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::with_timeout(1);
+    prepare_replayed_automod_bulk(&f, None).await;
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Hang).await;
+    let before = f.app.log_delivery_failures.load(Ordering::Relaxed);
+    replay_failed_automod_bulk(&f, &http).await;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(request_names_transcript(&requests.lock().unwrap()[0]));
+    assert!(f.app.log_delivery_failures.load(Ordering::Relaxed) > before);
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    prepare_replayed_automod_bulk(&f, None).await;
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Hang).await;
+    let app = Arc::clone(&f.app);
+    let watched = Arc::clone(&requests);
+    let watcher = tokio::spawn(async move {
+        loop {
+            if !watched.lock().unwrap().is_empty() {
+                app.activation.cut_off();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    replay_failed_automod_bulk(&f, &http).await;
+    watcher.abort();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "cancellation must not send the plain-text fallback"
+    );
+    server.abort();
+
+    let f = Fixture::with_timeout(30);
+    prepare_replayed_automod_bulk(&f, None).await;
+    let (http, requests, server) =
+        replay_attachment_proxy(ReplayAttachmentProxy::ServerError).await;
+    replay_failed_automod_bulk(&f, &http).await;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    server.abort();
+}
+
 struct ScriptedHttpReply {
     status: u16,
     headers: &'static str,

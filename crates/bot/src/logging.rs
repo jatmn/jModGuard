@@ -2301,9 +2301,24 @@ fn fallback_bulk_parts(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn attachment_permission_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<serenity::Error>()
+        .is_some_and(|discord_err| {
+            matches!(
+                discord_err,
+                serenity::Error::Http(http_error)
+                    if http_error
+                        .status_code()
+                        .is_some_and(|status| status.as_u16() == 403)
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn deliver_bulk_text_fallback_parts(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    sink: &impl LogDelivery,
     destination: ChannelId,
     rest_target: crate::discord::DiscordRestTarget,
     template: &str,
@@ -2329,23 +2344,95 @@ async fn deliver_bulk_text_fallback_parts(
             left,
             crate::discord::race_discord_call(
                 &app.activation,
-                destination.send_message(http, log_message(&details)),
+                sink.send(destination, log_message(&details)),
             ),
         )
         .await
         {
-            Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
                 parts_sent += 1;
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                terminal_error = Some(error);
+                terminal_error = error.downcast::<serenity::Error>().ok();
                 break;
             }
+            // Timeout or cancellation is ambiguous: do not send another part.
             _ => break,
         }
     }
     let delivered = parts_sent == part_count && part_count > 0;
     (delivered, terminal_error, failure_recovery)
+}
+
+/// Send one bulk transcript. A definite attachment 403 uses the bounded
+/// plain-text chunks. A timeout or cancellation is not resent.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_attached_bulk(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    destination: ChannelId,
+    rest_target: crate::discord::DiscordRestTarget,
+    template: &str,
+    display: &BTreeMap<String, String>,
+    transcript: &BulkTranscript,
+    rendered: &str,
+    deadline: Duration,
+    started: Instant,
+) -> bool {
+    let message = log_message(rendered).add_file(CreateAttachment::bytes(
+        transcript.finish(),
+        "deleted-messages.txt",
+    ));
+    let mut delivered = false;
+    let mut terminal_error: Option<serenity::Error> = None;
+    let mut failure_recovery = app
+        .remembered_discord_targets
+        .capture_recovery_epoch(rest_target);
+    match tokio::time::timeout(
+        deadline.saturating_sub(started.elapsed()),
+        crate::discord::race_discord_call(&app.activation, sink.send(destination, message)),
+    )
+    .await
+    {
+        Ok(crate::discord::DiscordCall::Finished(Ok(()))) => delivered = true,
+        Ok(crate::discord::DiscordCall::Finished(Err(discord_err))) => {
+            if attachment_permission_denied(&discord_err) {
+                // Attach Files may be absent while Send Messages still works.
+                let (all_parts_delivered, fallback_error, recovery) =
+                    deliver_bulk_text_fallback_parts(
+                        app,
+                        sink,
+                        destination,
+                        rest_target,
+                        template,
+                        display,
+                        transcript,
+                        deadline,
+                        started,
+                        failure_recovery,
+                    )
+                    .await;
+                failure_recovery = recovery;
+                terminal_error = fallback_error;
+                delivered = all_parts_delivered;
+            } else {
+                terminal_error = discord_err.downcast::<serenity::Error>().ok();
+            }
+        }
+        // Timeout or cancellation is ambiguous: do not send the plain-text fallback.
+        _ => {
+            record_delivery_failure(app);
+            return false;
+        }
+    }
+    finish_bulk_channel_delivery(
+        app,
+        failure_recovery,
+        rest_target,
+        delivered,
+        terminal_error.as_ref(),
+    );
+    delivered
 }
 
 pub(crate) fn bulk_log_suppressed(
@@ -2564,69 +2651,19 @@ pub(crate) async fn emit_retained_bulk(
     let mut display = vars;
     templates::format_log_timestamps(&mut display);
     let rendered = templates::render_bounded(template, &display, 2000);
-    let body = transcript.finish();
-    let message =
-        log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
-    let mut delivered = false;
-    let mut terminal_error: Option<serenity::Error> = None;
-    let mut failure_recovery = app
-        .remembered_discord_targets
-        .capture_recovery_epoch(rest_target);
-    match tokio::time::timeout(
-        deadline.saturating_sub(started.elapsed()),
-        crate::discord::race_discord_call(
-            &app.activation,
-            destination.send_message(&ctx.http, message),
-        ),
+    deliver_attached_bulk(
+        app,
+        ctx.http.as_ref(),
+        destination,
+        rest_target,
+        template,
+        &display,
+        &transcript,
+        &rendered,
+        deadline,
+        started,
     )
     .await
-    {
-        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => delivered = true,
-        Ok(crate::discord::DiscordCall::Finished(Err(discord_err))) => {
-            if matches!(
-                &discord_err,
-                serenity::Error::Http(http_error)
-                    if http_error
-                        .status_code()
-                        .is_some_and(|status| status.as_u16() == 403)
-            ) {
-                // Attach Files may be absent while Send Messages still works.
-                let (all_parts_delivered, fallback_error, recovery) =
-                    deliver_bulk_text_fallback_parts(
-                        app,
-                        &ctx.http,
-                        destination,
-                        rest_target,
-                        template,
-                        &display,
-                        &transcript,
-                        deadline,
-                        started,
-                        failure_recovery,
-                    )
-                    .await;
-                failure_recovery = recovery;
-                if let Some(error) = fallback_error {
-                    terminal_error = Some(error);
-                }
-                delivered = all_parts_delivered;
-            } else {
-                terminal_error = Some(discord_err);
-            }
-        }
-        _ => {
-            record_delivery_failure(app);
-            return false;
-        }
-    }
-    finish_bulk_channel_delivery(
-        app,
-        failure_recovery,
-        rest_target,
-        delivered,
-        terminal_error.as_ref(),
-    );
-    delivered
 }
 
 fn finish_bulk_channel_delivery(
@@ -2974,22 +3011,21 @@ async fn emit_failure_bulk(
     if !app.activation.may_record() {
         return;
     }
-    let message = log_message(&rendered).add_file(CreateAttachment::bytes(
-        transcript.finish(),
-        "deleted-messages.txt",
-    ));
-    let recovery = app
-        .remembered_discord_targets
-        .capture_recovery_epoch(rest_target);
-    let delivered = matches!(
-        tokio::time::timeout(
-            Duration::from_secs(app.cfg.log.discord_timeout_secs),
-            crate::discord::race_discord_call(&app.activation, sink.send(destination, message)),
-        )
-        .await,
-        Ok(crate::discord::DiscordCall::Finished(Ok(())))
-    );
-    finish_bulk_channel_delivery(app, recovery, rest_target, delivered, None);
+    let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
+    let started = Instant::now();
+    deliver_attached_bulk(
+        app,
+        sink,
+        destination,
+        rest_target,
+        template,
+        &vars,
+        &transcript,
+        &rendered,
+        deadline,
+        started,
+    )
+    .await;
 }
 
 /// Gateway delete logging. Returns `None` when an automod delete is pending REST
