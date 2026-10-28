@@ -1620,6 +1620,22 @@ pub enum UserNameMatch {
     Ambiguous,
 }
 
+/// A mention or raw id token. Zero and values that do not fit in a snowflake
+/// are `None`; this does not call [`UserId::new`].
+fn user_id_from_token(trimmed: &str) -> Option<UserId> {
+    if let Some(inner) = trimmed
+        .strip_prefix("<@")
+        .and_then(|token| token.strip_suffix('>'))
+        .map(|token| token.trim_start_matches('!'))
+    {
+        return inner.parse().ok();
+    }
+    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return trimmed.parse().ok();
+    }
+    None
+}
+
 fn member_matches_name_token(member: &serenity::model::guild::Member, lower: &str) -> bool {
     member.user.name.to_lowercase() == lower
         || member
@@ -1638,16 +1654,8 @@ pub fn resolve_user_name_in_guild(
     token: &str,
 ) -> UserNameMatch {
     let trimmed = token.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("<@")
-        .and_then(|t| t.strip_suffix('>'))
-        .map(|t| t.trim_start_matches('!'))
-        && let Ok(id) = inner.parse::<u64>()
-    {
-        return UserNameMatch::Unique(id.into());
-    }
-    if let Ok(id) = trimmed.parse::<u64>() {
-        return UserNameMatch::Unique(id.into());
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
     }
     let lower = trimmed.to_lowercase();
     let matches = guild
@@ -1666,16 +1674,8 @@ pub fn resolve_user_name_in_guild(
 /// Resolves a user from a mention, raw ID, or cached member name/nick search.
 pub fn resolve_user_name(ctx: &Context, guild_id: GuildId, token: &str) -> UserNameMatch {
     let trimmed = token.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("<@")
-        .and_then(|t| t.strip_suffix('>'))
-        .map(|t| t.trim_start_matches('!'))
-        && let Ok(id) = inner.parse::<u64>()
-    {
-        return UserNameMatch::Unique(id.into());
-    }
-    if let Ok(id) = trimmed.parse::<u64>() {
-        return UserNameMatch::Unique(id.into());
+    if let Some(id) = user_id_from_token(trimmed) {
+        return UserNameMatch::Unique(id);
     }
     let Some(guild) = ctx.cache.guild(guild_id) else {
         return UserNameMatch::NotFound;

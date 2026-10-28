@@ -145,43 +145,80 @@ fn voice_from_lookup(
     }
 }
 
-/// Channel mentions in a case reason. An id the caller cannot view, or whose
-/// view cannot be decided, is replaced without leaving the id behind.
+#[derive(Clone, Copy)]
+enum MentionKind {
+    Channel,
+    User,
+    Role,
+}
+
+/// User, role, and channel mentions in a case reason. An id the caller cannot
+/// view, or that is not a snowflake, is replaced without leaving the id behind.
 fn redact_unviewable_channel_mentions(text: &str, viewer: Option<ChannelView<'_>>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find("<#") {
+    while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
+        let tail = &rest[start..];
+        let Some((kind, header_len)) = mention_header(tail) else {
+            out.push('<');
+            rest = &tail[1..];
+            continue;
+        };
+        let after = &tail[header_len..];
         let Some(end) = after.find('>') else {
-            out.push_str(&rest[start..]);
+            out.push_str(tail);
             return out;
         };
         let id_text = &after[..end];
         if id_text.is_empty() || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
-            out.push_str("<#");
-            rest = after;
+            out.push_str(&tail[..header_len]);
+            rest = &tail[header_len..];
             continue;
         }
-        let visible = id_text.parse::<u64>().ok().is_some_and(|id| {
+        let raw_len = header_len + end + 1;
+        if mention_is_reportable(kind, id_text, viewer) {
+            out.push_str(&tail[..raw_len]);
+        } else {
+            out.push_str(VOICE_UNAVAILABLE);
+        }
+        rest = &tail[raw_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mention_header(tail: &str) -> Option<(MentionKind, usize)> {
+    if tail.starts_with("<#") {
+        Some((MentionKind::Channel, 2))
+    } else if tail.starts_with("<@&") {
+        Some((MentionKind::Role, 3))
+    } else if tail.starts_with("<@!") {
+        Some((MentionKind::User, 3))
+    } else if tail.starts_with("<@") {
+        Some((MentionKind::User, 2))
+    } else {
+        None
+    }
+}
+
+/// `false` for zero, for a value that does not fit in a snowflake, and for a
+/// channel the caller cannot view. Parsing is fallible and never builds a zero id.
+fn mention_is_reportable(kind: MentionKind, digits: &str, viewer: Option<ChannelView<'_>>) -> bool {
+    match kind {
+        MentionKind::Channel => digits.parse::<ChannelId>().ok().is_some_and(|channel_id| {
             viewer.is_some_and(|view| {
                 super::member_can_view_channel(
                     view.guild,
                     view.actor_id,
                     view.actor_roles,
-                    ChannelId::new(id),
+                    channel_id,
                 )
             })
-        });
-        if visible {
-            out.push_str(&rest[start..start + 2 + end + 1]);
-        } else {
-            out.push_str(VOICE_UNAVAILABLE);
-        }
-        rest = &after[end + 1..];
+        }),
+        MentionKind::User => digits.parse::<UserId>().is_ok(),
+        MentionKind::Role => digits.parse::<RoleId>().is_ok(),
     }
-    out.push_str(rest);
-    out
 }
 
 pub(crate) fn snapshot_has_cached_user(snapshot: &MemberSnapshot) -> bool {

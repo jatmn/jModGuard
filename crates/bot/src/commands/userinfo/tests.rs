@@ -1528,6 +1528,221 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
     let _ = std::fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn userinfo_prefix_and_slash_reject_invalid_mention_ids() {
+    use crate::state::CachedGuildConfig;
+    use serenity::model::channel::GuildChannel;
+    use serenity::model::permissions::Permissions;
+    const GUILD: u64 = 10;
+    const ACTOR: u64 = 7;
+    const TARGET: u64 = 91;
+    const ROLE: u64 = 50;
+    const VISIBLE: u64 = 700;
+    const OVERFLOW: &str = "18446744073709551616";
+    let reason = format!("<#0> <@0> <@&0> <#{OVERFLOW}> <@{OVERFLOW}> <@&{OVERFLOW}> <#{VISIBLE}>");
+
+    let path = std::env::temp_dir().join(format!(
+        "userinfo_bad_ids_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    app.activation.mark_lock_held(true);
+    let enrollment = crate::db::enroll_guild(&app.db, GUILD as i64, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    ready_userinfo_case_index(&app, &enrollment).await;
+    crate::cases::record(
+        &app,
+        Some(enrollment),
+        CaseAction::Warning,
+        CaseOutcome::Succeeded,
+        TARGET,
+        Some(ACTOR),
+        Some(reason),
+        CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
+    let cache = Arc::new(Cache::new());
+    let mut guild = Guild::default();
+    guild.id = GuildId::new(GUILD);
+    guild.owner_id = UserId::new(99);
+    guild.name = "fixture".into();
+    let mut everyone = Role::default();
+    everyone.id = RoleId::new(GUILD);
+    everyone.guild_id = guild.id;
+    everyone.permissions = Permissions::VIEW_CHANNEL;
+    guild.roles.insert(everyone.id, everyone);
+    let mut mod_role = Role::default();
+    mod_role.id = RoleId::new(ROLE);
+    mod_role.guild_id = guild.id;
+    mod_role.name = "Mod".into();
+    mod_role.permissions = Permissions::MANAGE_MESSAGES;
+    guild.roles.insert(mod_role.id, mod_role);
+    let mut visible = GuildChannel::default();
+    visible.id = ChannelId::new(VISIBLE);
+    visible.guild_id = guild.id;
+    visible.name = "notes".into();
+    guild.channels.insert(visible.id, visible);
+    guild.members.insert(
+        UserId::new(TARGET),
+        target_member(GUILD, TARGET, Some("Nick")),
+    );
+    let mut event: GuildCreateEvent =
+        serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+    cache.update(&mut event);
+    let (http, captured, server) = capturing_proxy().await;
+    let http = Arc::new(http);
+    let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
+    for token in ["0", "<@0>", OVERFLOW, &format!("<@{OVERFLOW}>")] {
+        assert_eq!(
+            crate::commands::resolve_user_name(&ctx, GuildId::new(GUILD), token),
+            crate::commands::UserNameMatch::NotFound,
+            "{token}"
+        );
+    }
+    let commands = jmodguard::defaults::default_commands()
+        .into_iter()
+        .map(|mut cmd| {
+            if matches!(cmd.behavior, jmodguard::types::Behavior::UserInfo) {
+                cmd.log_event.clear();
+            }
+            (cmd.name.clone(), cmd)
+        })
+        .collect();
+    let cfg = Arc::new(CachedGuildConfig {
+        version: 1,
+        durable_version: 1,
+        loaded_at: std::time::Instant::now(),
+        settings: crate::types::GuildSettings {
+            prefix: "!".into(),
+            ..Default::default()
+        },
+        rules: Default::default(),
+        commands,
+        templates: Default::default(),
+        log_channels: Default::default(),
+        known_bad_hashes: Default::default(),
+        log_filters: Default::default(),
+        regexes: Vec::new(),
+        custom_patterns: Default::default(),
+    });
+    let mut author = User::default();
+    author.id = UserId::new(ACTOR);
+    author.name = "mod".into();
+    let partial: serenity::model::guild::PartialMember =
+        serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [ROLE.to_string()],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": GUILD.to_string(),
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap();
+    let mut message = serenity::model::channel::Message::default();
+    message.id = serenity::model::id::MessageId::new(9);
+    message.content = format!("!userinfo {TARGET}");
+    message.guild_id = Some(GuildId::new(GUILD));
+    message.channel_id = ChannelId::new(2);
+    message.author = author.clone();
+    message.member = Some(Box::new(partial));
+    let mut slash_member = Member::default();
+    slash_member.user = author.clone();
+    slash_member.guild_id = GuildId::new(GUILD);
+    slash_member.roles = vec![RoleId::new(ROLE)];
+    let interaction: serenity::model::application::Interaction =
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "application_id": "1",
+            "type": 2,
+            "token": "token",
+            "version": 1,
+            "guild_id": GUILD.to_string(),
+            "channel_id": "2",
+            "locale": "en-US",
+            "app_permissions": "0",
+            "entitlements": [],
+            "authorizing_integration_owners": {},
+            "attachment_size_limit": 10000000,
+            "user": author,
+            "member": slash_member,
+            "data": {
+                "id": "3",
+                "name": "userinfo",
+                "type": 1,
+                "options": [{"name": "user", "type": 6, "value": TARGET.to_string()}]
+            }
+        }))
+        .unwrap();
+
+    crate::commands::handle_prefix(
+        &app,
+        http.as_ref(),
+        &cache,
+        Arc::clone(&cfg),
+        &message,
+        Some(&ctx),
+    )
+    .await
+    .unwrap();
+    let prefix = report_content("prefix", &captured);
+    crate::commands::handle_interaction(&app, &ctx, interaction).await;
+    let slash = report_content("slash", &captured);
+    for content in [prefix, slash] {
+        let cases = content
+            .lines()
+            .find(|line| line.contains('`') && line.contains("unavailable"))
+            .unwrap_or_else(|| panic!("no case line in {content}"));
+        assert!(cases.matches("unavailable").count() >= 6, "{cases}");
+        assert!(cases.contains("700"), "{cases}");
+        assert!(!cases.contains("#0"), "{cases}");
+        assert!(!cases.contains("<@0"), "{cases}");
+        assert!(!cases.contains("<@&0"), "{cases}");
+        assert!(!cases.contains(OVERFLOW), "{cases}");
+        assert!(content.contains("**User info**"), "{content}");
+    }
+
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+fn report_content(label: &str, captured: &Arc<std::sync::Mutex<Vec<String>>>) -> String {
+    let requests = captured.lock().unwrap().clone();
+    captured.lock().unwrap().clear();
+    let report = requests
+        .iter()
+        .find(|raw| raw.contains("**Voice:**"))
+        .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
+    let (_, body) = report
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("{label} report had no body: {report}"));
+    let payload: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error} in {body}"));
+    let message = payload
+        .get("data")
+        .filter(|data| data.is_object())
+        .unwrap_or(&payload);
+    message["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} had no content in {payload}"))
+        .to_string()
+}
+
 fn voice_line(report: &str) -> String {
     let (_, body) = report
         .split_once("\r\n\r\n")

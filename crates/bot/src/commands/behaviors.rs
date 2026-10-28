@@ -1156,8 +1156,7 @@ fn parse_channel_mention(token: &str) -> Option<ChannelId> {
     token
         .strip_prefix("<#")
         .and_then(|t| t.strip_suffix('>'))
-        .and_then(|t| t.parse::<u64>().ok())
-        .map(Into::into)
+        .and_then(|t| t.parse().ok())
 }
 
 /// Resolves `!say` arguments into the target channel and the text to post.
@@ -1448,7 +1447,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             }
             let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
             let channel = parse_channel_mention(&token)
-                .or_else(|| token.parse::<u64>().ok().map(Into::into))
+                .or_else(|| token.parse::<ChannelId>().ok())
                 .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
             crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
                 .await?;
@@ -1962,6 +1961,23 @@ mod tests {
         let (target, text) = say_target_and_text(&Args::new("<#7> hi"), ChannelId::new(7)).unwrap();
         assert_eq!(target, ChannelId::new(7));
         assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn say_rejects_zero_and_overflow_channel_tokens_without_panicking() {
+        let (target, text) =
+            say_target_and_text(&Args::new("<#0> hello"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#0> hello");
+        let (target, text) = say_target_and_text(
+            &Args::new("<#18446744073709551616> hello"),
+            ChannelId::new(7),
+        )
+        .unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "<#18446744073709551616> hello");
+        assert!(parse_channel_mention("0").is_none());
+        assert!("0".parse::<ChannelId>().is_err());
     }
 
     #[test]
