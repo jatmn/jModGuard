@@ -529,11 +529,14 @@ fn resolve_requested_files_from_layers(
     Ok(found)
 }
 
+const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
 #[derive(Default)]
 struct LayerMask {
     hidden: HashSet<String>,
     hidden_prefixes: HashSet<String>,
     opaque_dirs: HashSet<String>,
+    opaque_root: bool,
 }
 
 impl LayerMask {
@@ -545,6 +548,10 @@ impl LayerMask {
     }
 
     fn mask_opaque_dir(&mut self, dir: &str) {
+        if dir.is_empty() || dir == "." {
+            self.opaque_root = true;
+            return;
+        }
         let prefix = if dir.ends_with('/') {
             dir.to_owned()
         } else {
@@ -554,7 +561,8 @@ impl LayerMask {
     }
 
     fn is_masked(&self, name: &str) -> bool {
-        self.hidden.contains(name)
+        self.opaque_root
+            || self.hidden.contains(name)
             || self
                 .hidden_prefixes
                 .iter()
@@ -563,11 +571,6 @@ impl LayerMask {
                 .opaque_dirs
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
-    }
-
-    fn drop_descendants(&self, found: &mut HashMap<String, Vec<u8>>, deleted: &str) {
-        let prefix = format!("{deleted}/");
-        found.retain(|path, _| path != deleted && !path.starts_with(&prefix));
     }
 }
 
@@ -590,43 +593,38 @@ fn merge_layer_into_found(
     let mut total = 0u64;
     let mut count = 0usize;
     let mut layer_paths = HashSet::new();
+    // Whiteouts hide only older layers. They are recorded here and committed
+    // after this layer is scanned, so a same-layer replacement and any file
+    // already taken from a newer layer stay visible.
+    let mut pending_deleted = Vec::new();
+    let mut pending_opaque = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         count += 1;
         ensure!(count <= 256, "too many layer entries");
         let path = entry.path()?;
         let raw = path.to_str().context("non-UTF8 layer path")?;
-        let normalized = raw.trim_start_matches("./");
-        ensure!(
-            !normalized.is_empty()
-                && std::path::Path::new(normalized)
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_))),
-            "unsafe layer path"
-        );
+        let normalized = normalize_layer_path(raw)?;
         let size = entry.size();
         total = total.checked_add(size).context("layer size overflow")?;
         ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
-        if let Some(dir) = opaque_whiteout_dir(normalized) {
-            mask.mask_opaque_dir(&dir);
+        if let Some(dir) = opaque_whiteout_dir(&normalized) {
+            pending_opaque.push(dir);
             continue;
         }
-        if let Some(deleted) = whiteout_target(normalized) {
-            mask.mask_deleted_path(&deleted);
-            if !found.contains_key(&deleted) {
-                found.remove(&deleted);
-            }
-            mask.drop_descendants(found, &deleted);
+        if let Some(deleted) = whiteout_target(&normalized) {
+            pending_deleted.push(deleted);
             continue;
         }
-        let name = normalized.to_owned();
+        let name = normalized;
         if !wanted.contains(name.as_str()) {
             continue;
         }
-        if mask.is_masked(&name) {
-            continue;
-        }
-        if found.contains_key(&name) {
+        ensure!(
+            layer_paths.insert(name.clone()),
+            "invalid or duplicate release file"
+        );
+        if found.contains_key(&name) || mask.is_masked(&name) {
             continue;
         }
         let kind = entry.header().entry_type();
@@ -635,36 +633,64 @@ fn merge_layer_into_found(
             "link or special file in release layer"
         );
         ensure!(kind.is_file() && size <= MAX_FILE, "invalid release file");
-        ensure!(
-            layer_paths.insert(name.clone()),
-            "invalid or duplicate release file"
-        );
         let mut data = Vec::with_capacity(size as usize);
         entry.read_to_end(&mut data)?;
         ensure!(data.len() as u64 == size, "truncated release file");
         found.insert(name, data);
     }
+    for deleted in pending_deleted {
+        mask.mask_deleted_path(&deleted);
+    }
+    for dir in pending_opaque {
+        mask.mask_opaque_dir(&dir);
+    }
     Ok(())
+}
+
+fn normalize_layer_path(raw: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(raw).components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().context("non-UTF8 layer path")?;
+                ensure!(
+                    !part.is_empty() && part != "." && part != "..",
+                    "unsafe layer path"
+                );
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe layer path");
+            }
+        }
+    }
+    ensure!(!parts.is_empty(), "unsafe layer path");
+    Ok(parts.join("/"))
 }
 
 fn opaque_whiteout_dir(normalized: &str) -> Option<String> {
     let path = std::path::Path::new(normalized);
-    if path.file_name().and_then(|name| name.to_str()) != Some(".wh..opq") {
+    if path.file_name().and_then(|name| name.to_str()) != Some(OPAQUE_WHITEOUT) {
         return None;
     }
-    let parent = path
+    match path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .and_then(|parent| parent.to_str())
-        .unwrap_or(".");
-    Some(parent.to_owned())
+    {
+        Some(parent) => parent.to_str().map(str::to_owned),
+        None => Some(String::new()),
+    }
 }
 
 fn whiteout_target(normalized: &str) -> Option<String> {
     let path = std::path::Path::new(normalized);
     let file = path.file_name().and_then(|name| name.to_str())?;
+    if file == OPAQUE_WHITEOUT {
+        return None;
+    }
     let target = file.strip_prefix(".wh.")?;
-    if target.is_empty() || target == ".wh..opq" {
+    if target.is_empty() || target.contains('/') || target.contains('\\') {
         return None;
     }
     let deleted = path
@@ -673,64 +699,6 @@ fn whiteout_target(normalized: &str) -> Option<String> {
         .map(|parent| parent.join(target))
         .unwrap_or_else(|| std::path::PathBuf::from(target));
     deleted.to_str().map(|value| value.to_owned())
-}
-
-#[cfg(test)]
-fn extract_layer_files(
-    bytes: &[u8],
-    media: &str,
-    requested: &[&str],
-) -> Result<HashMap<String, Vec<u8>>> {
-    let wanted: HashSet<&str> = requested.iter().copied().collect();
-    ensure!(wanted.len() == requested.len(), "duplicate file request");
-    let reader: Box<dyn Read + '_> = match media {
-        "application/vnd.oci.image.layer.v1.tar+gzip"
-        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
-            Box::new(flate2::read::GzDecoder::new(bytes))
-        }
-        "application/vnd.oci.image.layer.v1.tar" => Box::new(bytes),
-        _ => bail!("unsupported image layer compression"),
-    };
-    let mut archive = tar::Archive::new(reader);
-    let mut found = HashMap::new();
-    let mut total = 0u64;
-    let mut count = 0usize;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        count += 1;
-        ensure!(count <= 256, "too many layer entries");
-        let path = entry.path()?;
-        let raw = path.to_str().context("non-UTF8 layer path")?;
-        let normalized = raw.trim_start_matches("./");
-        ensure!(
-            !normalized.is_empty()
-                && std::path::Path::new(normalized)
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_))),
-            "unsafe layer path"
-        );
-        let size = entry.size();
-        total = total.checked_add(size).context("layer size overflow")?;
-        ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
-        let name = normalized.to_owned();
-        if !wanted.contains(name.as_str()) {
-            continue;
-        }
-        let kind = entry.header().entry_type();
-        ensure!(
-            kind.is_file() || kind.is_dir(),
-            "link or special file in release layer"
-        );
-        ensure!(
-            kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
-            "invalid or duplicate release file"
-        );
-        let mut data = Vec::with_capacity(size as usize);
-        entry.read_to_end(&mut data)?;
-        ensure!(data.len() as u64 == size, "truncated release file");
-        found.insert(name, data);
-    }
-    Ok(found)
 }
 
 #[cfg(test)]
@@ -793,9 +761,11 @@ mod tests {
             b"\x7fELFbody",
             tar::EntryType::Regular,
         )]);
-        let found = extract_layer_files(
-            &good,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
+        let found = resolve_requested_files_from_layers(
+            &[(
+                good.as_slice(),
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            )],
             &["usr/local/bin/jmodguard-api"],
         )
         .unwrap();
@@ -814,21 +784,29 @@ mod tests {
             ),
         ]);
         assert!(
-            extract_layer_files(
-                &duplicate,
-                "application/vnd.oci.image.layer.v1.tar+gzip",
+            resolve_requested_files_from_layers(
+                &[(
+                    duplicate.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                )],
                 &["usr/local/bin/jmodguard-api"]
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid or duplicate release file")
         );
         let link = layer(&[("usr/local/bin/jmodguard-api", b"", tar::EntryType::Symlink)]);
         assert!(
-            extract_layer_files(
-                &link,
-                "application/vnd.oci.image.layer.v1.tar+gzip",
+            resolve_requested_files_from_layers(
+                &[(
+                    link.as_slice(),
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                )],
                 &["usr/local/bin/jmodguard-api"]
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("link or special file")
         );
     }
 
@@ -977,11 +955,28 @@ mod tests {
             err.to_string().contains("missing a required file"),
             "{err:#}"
         );
+        let replaced = layer(&[
+            ("usr/local/.wh.bin", b"", tar::EntryType::Regular),
+            (
+                "usr/local/bin/jmodguard-api",
+                b"fresh",
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let merged = resolve_requested_files_from_layers(
+            &[(
+                replaced.as_slice(),
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            )],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"fresh");
     }
 
     #[test]
     fn opaque_whiteout_hides_lower_layer_descendants() {
-        let newer = layer(&[("usr/local/bin/.wh..opq", b"", tar::EntryType::Regular)]);
+        let newer = layer(&[("usr/local/bin/.wh..wh..opq", b"", tar::EntryType::Regular)]);
         let older = layer(&[(
             "usr/local/bin/jmodguard-api",
             b"stale",
@@ -1014,11 +1009,18 @@ mod tests {
             b"fresh",
             tar::EntryType::Regular,
         )]);
-        let older = layer(&[(
-            "usr/local/bin/.wh.jmodguard-api",
-            b"",
-            tar::EntryType::Regular,
-        )]);
+        let older = layer(&[
+            (
+                "usr/local/bin/.wh.jmodguard-api",
+                b"",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                b"deadbeef  usr/local/bin/jmodguard-api\n",
+                tar::EntryType::Regular,
+            ),
+        ]);
         let merged = resolve_requested_files_from_layers(
             &[
                 (
@@ -1030,10 +1032,17 @@ mod tests {
                     "application/vnd.oci.image.layer.v1.tar+gzip",
                 ),
             ],
-            &["usr/local/bin/jmodguard-api"],
+            &[
+                "usr/local/bin/jmodguard-api",
+                "usr/local/share/jmodguard/files.sha256",
+            ],
         )
         .unwrap();
         assert_eq!(merged["usr/local/bin/jmodguard-api"], b"fresh");
+        assert_eq!(
+            merged["usr/local/share/jmodguard/files.sha256"],
+            b"deadbeef  usr/local/bin/jmodguard-api\n"
+        );
     }
 
     #[test]
@@ -1072,9 +1081,11 @@ mod tests {
     fn layer_size_limit_counts_skipped_entries() {
         let huge = vec![0u8; (MAX_UNPACKED as usize) + 1];
         let blob = layer(&[("ignored/huge", huge.as_slice(), tar::EntryType::Regular)]);
-        let err = extract_layer_files(
-            &blob,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
+        let err = resolve_requested_files_from_layers(
+            &[(
+                blob.as_slice(),
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            )],
             &["usr/local/bin/jmodguard-api"],
         )
         .unwrap_err();
@@ -1082,6 +1093,254 @@ mod tests {
             err.to_string().contains("unpacked layer exceeds limit"),
             "{err:#}"
         );
+    }
+
+    fn release_paths() -> [&'static str; 2] {
+        [
+            "usr/local/bin/jmodguard-api",
+            "usr/local/share/jmodguard/files.sha256",
+        ]
+    }
+
+    fn inventory() -> &'static [u8] {
+        b"deadbeef  usr/local/bin/jmodguard-api\n"
+    }
+
+    fn gzip(bytes: &[u8]) -> (&[u8], &str) {
+        (bytes, "application/vnd.oci.image.layer.v1.tar+gzip")
+    }
+
+    #[test]
+    fn standard_opaque_whiteout_hides_lower_descendants_including_root() {
+        let lower = layer(&[
+            (
+                "usr/local/bin/jmodguard-api",
+                b"stale",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                inventory(),
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let opaque = layer(&[("usr/local/bin/.wh..wh..opq", b"", tar::EntryType::Regular)]);
+        let err =
+            resolve_requested_files_from_layers(&[gzip(&opaque), gzip(&lower)], &release_paths())
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("missing a required file"),
+            "{err:#}"
+        );
+
+        let root = layer(&[(".wh..wh..opq", b"", tar::EntryType::Regular)]);
+        let err =
+            resolve_requested_files_from_layers(&[gzip(&root), gzip(&lower)], &release_paths())
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("missing a required file"),
+            "{err:#}"
+        );
+
+        let wrong = layer(&[("usr/local/bin/.wh..opq", b"", tar::EntryType::Regular)]);
+        let merged =
+            resolve_requested_files_from_layers(&[gzip(&wrong), gzip(&lower)], &release_paths())
+                .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"stale");
+    }
+
+    #[test]
+    fn whiteouts_keep_newer_and_same_layer_files() {
+        let newest = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"fresh",
+            tar::EntryType::Regular,
+        )]);
+        let middle = layer(&[(
+            "usr/local/bin/.wh.jmodguard-api",
+            b"",
+            tar::EntryType::Regular,
+        )]);
+        let oldest = layer(&[(
+            "usr/local/share/jmodguard/files.sha256",
+            inventory(),
+            tar::EntryType::Regular,
+        )]);
+        let merged = resolve_requested_files_from_layers(
+            &[gzip(&newest), gzip(&middle), gzip(&oldest)],
+            &release_paths(),
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"fresh");
+        assert_eq!(
+            merged["usr/local/share/jmodguard/files.sha256"],
+            inventory()
+        );
+
+        for entries in [
+            [
+                (
+                    "usr/local/bin/.wh.jmodguard-api",
+                    &b""[..],
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "usr/local/bin/jmodguard-api",
+                    &b"fresh"[..],
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "usr/local/share/jmodguard/files.sha256",
+                    inventory(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+            [
+                (
+                    "usr/local/bin/jmodguard-api",
+                    &b"fresh"[..],
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "usr/local/bin/.wh.jmodguard-api",
+                    &b""[..],
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "usr/local/share/jmodguard/files.sha256",
+                    inventory(),
+                    tar::EntryType::Regular,
+                ),
+            ],
+        ] {
+            let combined = layer(&entries);
+            let merged =
+                resolve_requested_files_from_layers(&[gzip(&combined)], &release_paths()).unwrap();
+            assert_eq!(merged["usr/local/bin/jmodguard-api"], b"fresh");
+        }
+    }
+
+    #[test]
+    fn same_layer_duplicate_is_rejected_and_cross_layer_override_is_kept() {
+        let duplicated = layer(&[
+            (
+                "usr/local/bin/jmodguard-api",
+                b"one",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/bin/jmodguard-api",
+                b"two",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                inventory(),
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let err = resolve_requested_files_from_layers(&[gzip(&duplicated)], &release_paths())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid or duplicate release file"),
+            "{err:#}"
+        );
+
+        let newer = layer(&[(
+            "usr/local/bin/jmodguard-api",
+            b"fresh",
+            tar::EntryType::Regular,
+        )]);
+        let older = layer(&[
+            (
+                "usr/local/bin/jmodguard-api",
+                b"one",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/bin/jmodguard-api",
+                b"two",
+                tar::EntryType::Regular,
+            ),
+            (
+                "usr/local/share/jmodguard/files.sha256",
+                inventory(),
+                tar::EntryType::Regular,
+            ),
+        ]);
+        let err =
+            resolve_requested_files_from_layers(&[gzip(&newer), gzip(&older)], &release_paths())
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid or duplicate release file"),
+            "{err:#}"
+        );
+    }
+
+    fn raw_regular_layer(path: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name = path.as_bytes();
+        assert!(name.len() < 100, "{path}");
+        header[..name.len()].copy_from_slice(name);
+        header[100..108].copy_from_slice(b"0000755\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{size:011o}\0", size = bytes.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[156] = b'0';
+        header[257..262].copy_from_slice(b"ustar");
+        header[263..265].copy_from_slice(b"00");
+        header[148..156].fill(b' ');
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        let mut tar_bytes = header.to_vec();
+        tar_bytes.extend_from_slice(bytes);
+        tar_bytes.resize(tar_bytes.len().div_ceil(512) * 512, 0);
+        tar_bytes.extend_from_slice(&[0u8; 1024]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn unsafe_layer_paths_and_links_are_rejected() {
+        for path in [
+            "../usr/local/bin/jmodguard-api",
+            "usr/local/bin/../../etc/passwd",
+            "/usr/local/bin/jmodguard-api",
+        ] {
+            let blob = raw_regular_layer(path, b"\x7fELFbody");
+            let err = resolve_requested_files_from_layers(
+                &[gzip(&blob)],
+                &["usr/local/bin/jmodguard-api"],
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unsafe layer path"),
+                "{path}: {err:#}"
+            );
+        }
+        let link = layer(&[("usr/local/bin/jmodguard-api", b"", tar::EntryType::Link)]);
+        let err =
+            resolve_requested_files_from_layers(&[gzip(&link)], &["usr/local/bin/jmodguard-api"])
+                .unwrap_err();
+        assert!(err.to_string().contains("link or special file"), "{err:#}");
+
+        let prefixed = layer(&[(
+            "./usr/local/bin/jmodguard-api",
+            b"\x7fELFbody",
+            tar::EntryType::Regular,
+        )]);
+        let merged = resolve_requested_files_from_layers(
+            &[gzip(&prefixed)],
+            &["usr/local/bin/jmodguard-api"],
+        )
+        .unwrap();
+        assert_eq!(merged["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
     }
 
     #[test]
