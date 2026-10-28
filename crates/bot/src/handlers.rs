@@ -744,24 +744,26 @@ impl EventHandler for Handler {
             None,
         )
         .await;
-        if membership_refresh {
-            let joined_at_ms = new_member
-                .joined_at
-                .map(|joined| joined.timestamp_millis())
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-            if let Some(in_flight) =
+        let joined_at_ms = new_member
+            .joined_at
+            .map(|joined| joined.timestamp_millis())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let retry_undelivered =
+            app.rejoin_note_deliveries
+                .pending_redelivery(guild_id.get(), uid, joined_at_ms);
+        if (membership_refresh || retry_undelivered)
+            && let Some(in_flight) =
                 app.rejoin_note_deliveries
                     .begin_in_flight(guild_id.get(), uid, joined_at_ms)
-            {
-                let sent = crate::member_rejoin::maybe_emit_member_rejoin(
-                    &app,
-                    &ctx,
-                    guild_id,
-                    &new_member.user,
-                )
-                .await;
-                in_flight.complete(sent);
-            }
+        {
+            let sent = crate::member_rejoin::maybe_emit_member_rejoin(
+                &app,
+                &ctx,
+                guild_id,
+                &new_member.user,
+            )
+            .await;
+            in_flight.complete(sent);
         }
     }
 

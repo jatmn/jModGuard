@@ -599,8 +599,63 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         "join handler must not double-post the prior-case note"
     );
     assert!(
-        body.contains("if membership_refresh"),
-        "stale or superseded join observations must not emit rejoin notes"
+        body.contains("pending_redelivery"),
+        "stale join events must still retry an undelivered rejoin note"
+    );
+    assert!(
+        body.contains("membership_refresh || retry_undelivered"),
+        "only fresh stays or failed-delivery retries may emit rejoin notes"
+    );
+}
+
+#[tokio::test]
+async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
+    let f = Fixture::new();
+    f.app.activation.mark_lock_held(true);
+    const GUILD: u64 = 789;
+    const USER: u64 = 42;
+    const JOINED_AT_MS: i64 = 1_700_000_000_002;
+    let note = RejoinNote::IndexNotReady;
+    let vars = member_rejoin_vars(&user(USER), &note);
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    let refresh_attempt = f
+        .app
+        .rejoin_note_deliveries
+        .begin_in_flight(GUILD, USER, JOINED_AT_MS)
+        .expect("fresh stay reserves delivery");
+    refresh_attempt.complete(false);
+    assert!(
+        f.app
+            .rejoin_note_deliveries
+            .pending_redelivery(GUILD, USER, JOINED_AT_MS),
+        "failed delivery must remain retryable"
+    );
+    let membership_refresh = false;
+    let retry_undelivered =
+        f.app
+            .rejoin_note_deliveries
+            .pending_redelivery(GUILD, USER, JOINED_AT_MS);
+    assert!(retry_undelivered);
+    assert!(!membership_refresh);
+    let stale_retry = f
+        .app
+        .rejoin_note_deliveries
+        .begin_in_flight(GUILD, USER, JOINED_AT_MS)
+        .expect("stale add must retry the undelivered join token");
+    let sent =
+        emit_to(&f.app, &sink, GuildId::new(GUILD), "member_rejoin", vars).await == Delivery::Sent;
+    stale_retry.complete(sent);
+    assert!(sent);
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+    assert!(
+        !f.app
+            .rejoin_note_deliveries
+            .begin_attempt(GUILD, USER, JOINED_AT_MS),
+        "successful delivery must not post again"
     );
 }
 

@@ -242,6 +242,7 @@ pub struct MemberJoinContext {
 #[derive(Default)]
 struct RejoinNoteDeliveryState {
     delivered: HashMap<(u64, u64, i64), Instant>,
+    undelivered: std::collections::HashSet<(u64, u64, i64)>,
     in_flight: std::collections::HashSet<(u64, u64, i64)>,
 }
 
@@ -299,6 +300,11 @@ impl RejoinNoteDeliveries {
         Some(RejoinNoteInFlight::new(self, guild, user, joined_at_ms))
     }
 
+    pub fn pending_redelivery(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
+        let key = (guild, user, joined_at_ms);
+        self.inner.lock().undelivered.contains(&key)
+    }
+
     pub fn begin_attempt(&self, guild: u64, user: u64, joined_at_ms: i64) -> bool {
         let key = (guild, user, joined_at_ms);
         let mut state = self.inner.lock();
@@ -324,7 +330,10 @@ impl RejoinNoteDeliveries {
         let mut state = self.inner.lock();
         state.in_flight.remove(&key);
         if sent {
+            state.undelivered.remove(&key);
             state.delivered.insert(key, Instant::now());
+        } else {
+            state.undelivered.insert(key);
         }
     }
 }
