@@ -675,12 +675,39 @@ pub(crate) struct CommandBanInProgress<'a> {
     _observation: BanObservation<'a>,
 }
 
+#[cfg(test)]
+mod command_ban_in_progress_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_overlapping_command_ban_does_not_block_later_bans() {
+        let path = std::env::temp_dir().join(format!(
+            "ban_in_progress_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(crate::config::BotProcessConfig::default(), db).unwrap();
+        let first = begin_command_ban_in_progress(&app, 10, 20).expect("first ban");
+        assert!(
+            begin_command_ban_in_progress(&app, 10, 20).is_err(),
+            "overlapping ban must be rejected"
+        );
+        drop(first);
+        begin_command_ban_in_progress(&app, 10, 20).expect("ban after release");
+        drop(app);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        crate::tenant::remove_sidecars(&path);
+    }
+}
+
 pub(crate) fn begin_command_ban_in_progress(
     app: &BotState,
     guild_id: u64,
     user_id: u64,
 ) -> Result<CommandBanInProgress<'_>> {
-    if app.begin_ban_observation(guild_id, user_id) {
+    if !app.try_begin_command_ban_observation(guild_id, user_id) {
         anyhow::bail!("another ban for this user is already in progress");
     }
     Ok(CommandBanInProgress {

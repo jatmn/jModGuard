@@ -1324,6 +1324,13 @@ async fn run_command(env: CmdEnv<'_>) -> Result<BehaviorOutcome> {
     behaviors::run(&env).await
 }
 
+fn truncate_to_char_limit(text: &str, max_units: usize) -> String {
+    if text.chars().count() <= max_units {
+        return text.to_string();
+    }
+    text.chars().take(max_units).collect()
+}
+
 fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     const DISCORD_MESSAGE_LIMIT: usize = 2000;
     let clause = outcome
@@ -1364,15 +1371,28 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
         if response.contains("{mod_reason_dm_clause}") {
             return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
         }
-        let rendered = templates::render_bounded(response, &vars, body_limit);
-        if matches!(cmd.behavior, Behavior::Kick { .. } | Behavior::Ban { .. })
-            && !clause.is_empty()
+        let mut render_vars = vars.clone();
+        render_vars.remove("mod_reason_dm_clause");
+        let rendered = templates::render_bounded(response, &render_vars, body_limit);
+        if !clause.is_empty()
+            && matches!(
+                (&cmd.behavior, response),
+                (
+                    Behavior::Kick { .. },
+                    "Kicked {target} | {reason}"
+                        | "Kicked {target} | {reason}{mod_reason_dm_clause}"
+                ) | (
+                    Behavior::Ban { .. },
+                    "Banned {target} | {reason}"
+                        | "Banned {target} | {reason}{mod_reason_dm_clause}"
+                )
+            )
         {
             return format!("{rendered}{clause}");
         }
         rendered
     } else if let Some(r) = &outcome.response {
-        templates::render_bounded(r, &outcome.vars, body_limit)
+        truncate_to_char_limit(r, body_limit)
     } else {
         "done".to_string()
     }
@@ -2129,6 +2149,37 @@ mod tests {
     }
 
     #[test]
+    fn behavior_dynamic_response_preserves_literal_template_tokens() {
+        let testregex = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "testregex")
+            .unwrap();
+        let outcome = BehaviorOutcome {
+            response: Some("Normalized sample: `{user}`".into()),
+            vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            suppress_response: false,
+        };
+        assert_eq!(
+            render_outcome(&testregex, &outcome),
+            "Normalized sample: `{user}`"
+        );
+    }
+
+    #[test]
+    fn custom_command_response_does_not_append_dm_clause_or_substitute_foreign_vars() {
+        let custom = say_cmd("See {target} for details");
+        let outcome = BehaviorOutcome {
+            response: None,
+            vars: BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
+            ]),
+            suppress_response: false,
+        };
+        assert_eq!(render_outcome(&custom, &outcome), "See Member for details");
+    }
+
+    #[test]
     fn shipped_kick_ban_response_adds_dm_clause_only_for_defaults() {
         let kick = crate::defaults::default_commands()
             .into_iter()
@@ -2150,10 +2201,7 @@ mod tests {
 
         let mut custom = kick.clone();
         custom.response = "Custom kick {target}".into();
-        assert_eq!(
-            render_outcome(&custom, &with_dm),
-            "Custom kick Member | Reason DM sent."
-        );
+        assert_eq!(render_outcome(&custom, &with_dm), "Custom kick Member");
 
         with_dm.vars.remove("mod_reason_dm_clause");
         assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");
@@ -2166,18 +2214,17 @@ mod tests {
             .find(|c| c.name == "kick")
             .unwrap();
         let mut custom = kick.clone();
-        custom.response = "x".repeat(2000);
+        let clause =
+            mod_reason_dm::render_mod_reason_dm_clause(mod_reason_dm::ModReasonDmOutcome::Sent);
+        let clause_chars = clause.chars().count();
+        let body = "x".repeat(2000usize.saturating_sub(clause_chars));
+        custom.response = format!("{body}{{mod_reason_dm_clause}}");
         let outcome = BehaviorOutcome {
             response: None,
             vars: BTreeMap::from([
                 ("target".into(), "Member".into()),
                 ("reason".into(), "spam".into()),
-                (
-                    "mod_reason_dm_clause".into(),
-                    mod_reason_dm::render_mod_reason_dm_clause(
-                        mod_reason_dm::ModReasonDmOutcome::Sent,
-                    ),
-                ),
+                ("mod_reason_dm_clause".into(), clause),
             ]),
             suppress_response: false,
         };

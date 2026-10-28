@@ -62,6 +62,14 @@ async fn mod_reason_dm_if_requested_already_removed(
     Some(mod_reason_dm::send_mod_reason_dm_already_removed(env, target, action, reason).await)
 }
 
+fn abort_if_mod_reason_dm_cancelled(dm: Option<mod_reason_dm::ModReasonDmOutcome>) -> Result<()> {
+    if dm == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+        Err(anyhow!("writer lease is not held"))
+    } else {
+        Ok(())
+    }
+}
+
 fn apply_mod_reason_dm_clause(
     vars: &mut std::collections::BTreeMap<String, String>,
     dm: Option<mod_reason_dm::ModReasonDmOutcome>,
@@ -131,6 +139,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         env, target, "banned", dm_reason,
                     )
                     .await;
+                    abort_if_mod_reason_dm_cancelled(dm_outcome)?;
                 }
                 crate::member_directory::BanContinuation::RecordOnly {
                     reason: discord_reason,
@@ -140,6 +149,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         env, target, "banned", dm_reason,
                     )
                     .await;
+                    abort_if_mod_reason_dm_cancelled(dm_outcome)?;
                     if continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -200,7 +210,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
                     let operation_id = pending_ban.operation_id().to_owned();
                     dm_outcome = mod_reason_dm_if_requested(env, target, "banned", &reason).await;
-                    if dm_outcome == Some(mod_reason_dm::ModReasonDmOutcome::Cancelled) {
+                    if abort_if_mod_reason_dm_cancelled(dm_outcome).is_err() {
                         if let Some(attempt) = attempted {
                             attempt
                                 .finish(env.app, crate::db::guild_data::CaseOutcome::Failed)
@@ -2069,5 +2079,55 @@ mod tests {
         let (_, text) =
             say_target_and_text(&Args::new("<#42>   padded  "), ChannelId::new(7)).unwrap();
         assert_eq!(text, "padded");
+    }
+
+    #[test]
+    fn cancelled_mod_reason_dm_aborts_present_ban_followup() {
+        let err =
+            abort_if_mod_reason_dm_cancelled(Some(mod_reason_dm::ModReasonDmOutcome::Cancelled))
+                .expect_err("cancelled DM must abort");
+        assert_eq!(err.to_string(), "writer lease is not held");
+        assert!(
+            abort_if_mod_reason_dm_cancelled(Some(mod_reason_dm::ModReasonDmOutcome::Sent)).is_ok()
+        );
+        assert!(abort_if_mod_reason_dm_cancelled(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn record_only_skips_local_ban_row_when_reason_dm_cancelled() {
+        let path = std::env::temp_dir().join(format!(
+            "record_only_dm_cancel_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let app =
+            crate::state::BotState::new(crate::config::BotProcessConfig::default(), db).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let dm = Some(mod_reason_dm::ModReasonDmOutcome::Cancelled);
+        if abort_if_mod_reason_dm_cancelled(dm).is_ok() {
+            continue_present_command_ban(
+                &app,
+                Some(enrollment.clone()),
+                99,
+                Some("target"),
+                None,
+                42,
+                "mod",
+                "raid",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let rows = db::list_enrolled_bans(&app.db, enrollment, 10)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "cancelled DM must not record a ban row");
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
