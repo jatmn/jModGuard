@@ -261,7 +261,7 @@ async fn stale_configuration_writes_preserve_rows_and_both_version_markers() {
             let request = f.scope(10).await;
             let target = if global { 0 } else { 10 };
             let rule = crate::defaults::default_rules().remove(0);
-            let command = crate::defaults::default_commands().remove(0);
+            let command = crate::defaults::custom_command_fixture("fixture");
             upsert_rule(&f.db, target, "fixture", &rule).await.unwrap();
             upsert_command(&f.db, target, "fixture", &command)
                 .await
@@ -279,7 +279,13 @@ async fn stale_configuration_writes_preserve_rows_and_both_version_markers() {
             let results = [
                 upsert_enrolled_rule(&f.db, scope.clone(), "new", &rule).await,
                 delete_enrolled_rule(&f.db, scope.clone(), "fixture").await,
-                upsert_enrolled_command(&f.db, scope.clone(), "new", &command).await,
+                upsert_enrolled_command(
+                    &f.db,
+                    scope.clone(),
+                    "new",
+                    &crate::defaults::custom_command_fixture("new"),
+                )
+                .await,
                 delete_enrolled_command(&f.db, scope.clone(), "fixture").await,
                 upsert_enrolled_template(&f.db, scope.clone(), "message_edit", "changed").await,
                 delete_enrolled_template(&f.db, scope.clone(), "message_edit").await,
@@ -334,7 +340,7 @@ async fn current_configuration_edits_preserve_validation_noops_and_exact_badword
     let other = f.scope(20).await;
     let scope = edit_scope(&request, false);
     let rule = crate::defaults::default_rules().remove(0);
-    let command = crate::defaults::default_commands().remove(0);
+    let command = crate::defaults::custom_command_fixture("fixture");
     upsert_enrolled_rule(&f.db, scope.clone(), "fixture", &rule)
         .await
         .unwrap();

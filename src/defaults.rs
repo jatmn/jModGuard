@@ -118,6 +118,25 @@ fn action(
     }
 }
 
+/// Writable non-built-in command for configuration writer and API tests.
+pub fn custom_command_fixture(name: &str) -> CommandDef {
+    CommandDef {
+        name: name.into(),
+        aliases: vec![],
+        category: "Fixture".into(),
+        description: "fixture".into(),
+        usage: format!("!{name}"),
+        enabled: true,
+        permission: "everyone".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior: Behavior::Say,
+        response: String::new(),
+        log_event: String::new(),
+    }
+}
+
 #[allow(clippy::vec_init_then_push)]
 pub fn default_commands() -> Vec<CommandDef> {
     let mut out = Vec::new();
@@ -493,9 +512,7 @@ pub fn default_global_seed_commands() -> Vec<CommandDef> {
 
 pub fn merge_binary_overlay_commands(commands: &mut std::collections::HashMap<String, CommandDef>) {
     for cmd in default_commands() {
-        if BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str())
-            && !commands.contains_key(&cmd.name)
-        {
+        if BINARY_OVERLAY_COMMAND_NAMES.contains(&cmd.name.as_str()) {
             commands.insert(cmd.name.clone(), cmd);
         }
     }
@@ -796,6 +813,35 @@ pub fn sample_plan_command() -> CommandDef {
 #[cfg(test)]
 mod rolling_upgrade_tests {
     use super::*;
+
+    #[test]
+    fn merge_binary_overlay_commands_replaces_stale_voice_rows() {
+        let voice = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "voice")
+            .expect("voice command");
+        let mut commands = std::collections::HashMap::from([(
+            "voice".into(),
+            CommandDef {
+                name: "voice".into(),
+                description: "stale".into(),
+                behavior: Behavior::Help,
+                aliases: vec![],
+                category: String::new(),
+                usage: String::new(),
+                enabled: true,
+                permission: "everyone".into(),
+                roles: vec![],
+                channels: vec![],
+                cooldown_secs: 0,
+                response: String::new(),
+                log_event: String::new(),
+            },
+        )]);
+        merge_binary_overlay_commands(&mut commands);
+        assert_eq!(commands["voice"].description, voice.description);
+        assert!(matches!(commands["voice"].behavior, Behavior::Voice));
+    }
 
     #[test]
     fn voice_command_is_binary_overlay_not_global_seed() {

@@ -560,7 +560,7 @@ async fn directory_wipe_advances_config_observation() {
     db::patch_settings(&f.db, 10, Some(Some("old!".into())), None, None)
         .await
         .unwrap();
-    let command = db::list_commands(&f.db, 0).await.unwrap().remove(0).1;
+    let command = crate::defaults::custom_command_fixture("removed-command");
     db::upsert_command(&f.db, 10, "removed-command", &command)
         .await
         .unwrap();

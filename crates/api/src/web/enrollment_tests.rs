@@ -1233,8 +1233,7 @@ async fn configuration_crud_routes_use_scoped_writes_for_current_guild_and_globa
     let f = Fixture::new(true).await;
     f.enroll(10).await;
     let rule = crate::defaults::default_rules().remove(0);
-    let mut command = crate::defaults::default_commands().remove(0);
-    command.name = "fixture".into();
+    let command = crate::defaults::custom_command_fixture("fixture");
     for (guild, scope) in [(10, "guild"), (10, "global"), (0, "global")] {
         let base = format!("/api/guilds/{guild}");
         let rule_path = format!("{base}/rules/{}", crate::types::RULE_IDS[0]);
@@ -1335,7 +1334,7 @@ async fn configuration_edits_reject_missing_and_replaced_page_memberships() {
     let old = loaded["enrollment_id"].as_str().unwrap();
     db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
     let rule = crate::defaults::default_rules().remove(0);
-    let command = crate::defaults::default_commands().remove(0);
+    let command = crate::defaults::custom_command_fixture("fixture");
     let version = db::get_config_version(&f.app.db).await.unwrap();
     for scope in ["guild", "global"] {
         let scope_body = serde_json::json!({"scope":scope}).to_string();
@@ -2597,8 +2596,7 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
         db::upsert_template(&f.app.db, guild, "fixture", label)
             .await
             .unwrap();
-        let mut command = crate::defaults::default_commands()[0].clone();
-        command.name = "fixture".into();
+        let mut command = crate::defaults::custom_command_fixture("fixture");
         command.description = label.into();
         db::upsert_command(&f.app.db, guild, "fixture", &command)
             .await

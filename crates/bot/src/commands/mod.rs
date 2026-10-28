@@ -1774,6 +1774,7 @@ mod tests {
                 // A new global command changes every guild's effective payload.
                 let mut global = command.clone();
                 global.name = "shared".into();
+                global.aliases.clear();
                 db::upsert_command(&app.db, 0, &global.name, &global)
                     .await
                     .unwrap();

@@ -1598,11 +1598,7 @@ fn slash_registry_version_bumps_only_on_command_writes() {
         "settings must not bump slash_registry_version"
     );
 
-    let mut cmd = crate::defaults::default_commands()
-        .into_iter()
-        .next()
-        .expect("defaults include commands");
-    cmd.name = "slashpressure".into();
+    let cmd = crate::defaults::custom_command_fixture("slashpressure");
     tokio_test_block_on(crate::db::upsert_command(&db, 1, "slashpressure", &cmd)).unwrap();
     assert_eq!(
         tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
@@ -3122,6 +3118,40 @@ fn builtin_command_stored_guild_override_ignored_on_load() {
 }
 
 #[test]
+fn builtin_voice_stored_guild_override_ignored_on_load() {
+    let tmp = tmp_db_path("builtin_voice_guild_override_ignored");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped_voice = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "voice")
+        .expect("voice");
+    let mut override_row = shipped_voice.clone();
+    override_row.description = "legacy guild voice override".into();
+    override_row.enabled = false;
+    override_row.behavior = crate::types::Behavior::Say;
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'voice',?2)",
+            params![10_i64, serde_json::to_string(&override_row)?],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(
+        parts.commands["voice"].description,
+        shipped_voice.description
+    );
+    assert_eq!(parts.commands["voice"].enabled, shipped_voice.enabled);
+    assert!(matches!(
+        parts.commands["voice"].behavior,
+        crate::types::Behavior::Voice
+    ));
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();
@@ -3729,13 +3759,8 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                     assert_eq!(parts.templates[event], new);
                 }
             }
-            if guild == 456 {
-                assert_eq!(parts.commands["stats"].permission, "everyone");
-                assert!(parts.commands["stats"].aliases.is_empty());
-            } else {
-                assert_eq!(parts.commands["stats"].permission, "admin");
-                assert!(parts.commands["stats"].matches("status"));
-            }
+            assert_eq!(parts.commands["stats"].permission, "admin");
+            assert!(parts.commands["stats"].matches("status"));
         }
         // Even a deliberate reversion to old wording is retained after the one-time upgrade.
         db.with_conn(|conn| {
