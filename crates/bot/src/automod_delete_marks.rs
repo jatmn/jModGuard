@@ -162,9 +162,22 @@ impl AutomodDeleteMarks {
         settlement_retained(gateway.retained.clone().or(entry_retained))
     }
 
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len() <= self.entries.len().saturating_mul(2).max(1) {
+            return;
+        }
+        let live: VecDeque<MarkKey> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|key| self.entries.contains_key(key))
+            .collect();
+        self.order = live;
+    }
+
     fn remove_key(&mut self, key: MarkKey) {
         self.entries.remove(&key);
-        self.order.retain(|candidate| *candidate != key);
+        self.compact_order_if_needed();
         let target = Self::message_target(key.0, key.1, key.2);
         if let Some(keys) = self.by_message.get_mut(&target) {
             keys.retain(|candidate| *candidate != key);
@@ -299,17 +312,21 @@ impl AutomodDeleteMarks {
     }
 
     fn evict_one(&mut self, now: Instant) -> bool {
-        for key in &self.order {
+        let len = self.order.len();
+        for _ in 0..len {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
             let target = Self::message_target(key.0, key.1, key.2);
             let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
-            if self
-                .entries
-                .get(key)
-                .is_some_and(|entry| Self::can_evict_for_capacity(entry, &gateway, now))
-            {
-                self.remove_key(*key);
+            if Self::can_evict_for_capacity(entry, &gateway, now) {
+                self.remove_key(key);
                 return true;
             }
+            self.order.push_back(key);
         }
         false
     }
@@ -380,7 +397,16 @@ impl AutomodDeleteMarks {
                 if entry.confirmed {
                     let rule_id = entry.rule_id.clone();
                     let rule_name = entry.rule_name.clone();
+                    let siblings_remain = self
+                        .by_message
+                        .get(&target)
+                        .is_some_and(|keys| keys.iter().any(|candidate| candidate != key));
                     self.remove_key(*key);
+                    if siblings_remain {
+                        let state = self.gateway.entry(target).or_default();
+                        state.observed = true;
+                        state.settled = true;
+                    }
                     return GatewayDeleteObservation::Automod { rule_id, rule_name };
                 }
             }
@@ -491,6 +517,18 @@ impl AutomodDeleteMarks {
         let entry = self.entries.get(&key)?;
         if entry.confirmed || !gateway.observed || gateway.settled {
             return None;
+        }
+        if self.by_message.get(&target).is_some_and(|keys| {
+            keys.iter().any(|candidate| {
+                *candidate != key
+                    && self
+                        .entries
+                        .get(candidate)
+                        .is_some_and(|sibling| sibling.confirmed)
+            })
+        }) {
+            self.remove_key(key);
+            return self.try_release_deferred_settlement(target);
         }
         Some(self.finalize_automod_settlement(target, key, &gateway))
     }
@@ -1281,6 +1319,45 @@ mod tests {
         }
         assert_eq!(marks.len(), 0);
         marks.assert_heaps_bounded();
+        assert!(
+            marks.order.len() <= 1,
+            "insertion order retained {} stale keys",
+            marks.order.len()
+        );
+    }
+
+    #[test]
+    fn gateway_after_younger_confirm_does_not_replay_plain_on_older_failure() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        assert!(marks.confirm(1, 2, 3, second, now).is_none());
+        assert!(matches!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::Automod { rule_id, .. } if rule_id == "repeat_text"
+        ));
+        let removal = marks.remove_unconfirmed(1, 2, 3, first, now);
+        assert_eq!(removal.action, UnconfirmedMarkRemoval::Removed);
+        assert!(removal.released_settlement.is_none());
+    }
+
+    #[test]
+    fn uncertain_older_attempt_releases_deferred_younger_success() {
+        let mut marks = AutomodDeleteMarks::default();
+        let now = Instant::now();
+        let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
+        let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
+        assert_eq!(
+            marks.observe_gateway_delete(1, 2, 3, None, now),
+            GatewayDeleteObservation::PendingAutomod
+        );
+        assert!(marks.confirm(1, 2, 3, second, now).is_none());
+        let settlement = marks
+            .take_uncertain_gateway_settlement(1, 2, 3, first, now)
+            .expect("older uncertainty releases younger automod settlement");
+        assert_eq!(settlement.rule_id, "repeat_text");
+        assert!(marks.confirm(1, 2, 3, second, now).is_none());
     }
 
     #[test]
