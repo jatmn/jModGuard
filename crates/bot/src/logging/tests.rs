@@ -4054,6 +4054,25 @@ fn retain_current_stay_preserves_other_members_delivery_state() {
 }
 
 #[test]
+fn rejoin_delivery_burst_respects_settled_entry_cap() {
+    let deliveries = RejoinNoteDeliveries::default();
+    let overflow = REJOIN_NOTE_DELIVERY_LIMIT + 256;
+    for index in 0..overflow {
+        let stay = format!("stay-{index}");
+        deliveries.finish_attempt(1, index as u64, &stay, true);
+    }
+    assert!(
+        deliveries.test_settled_entry_count() <= REJOIN_NOTE_DELIVERY_LIMIT,
+        "delivered stays must stay within the hard cap"
+    );
+    deliveries.finish_attempt(1, 9_999, "stay-retry", false);
+    assert!(
+        deliveries.pending_redelivery(1, 9_999, "stay-retry"),
+        "fresh undelivered stays must survive eviction of older settled entries"
+    );
+}
+
+#[test]
 fn rejoin_note_leave_clears_member_state() {
     let deliveries = RejoinNoteDeliveries::default();
     deliveries.finish_attempt(9, 8, "stay-leave", false);

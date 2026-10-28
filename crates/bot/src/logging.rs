@@ -14,7 +14,7 @@ use crate::db::guild_data::MessageSnapshot;
 use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,8 @@ const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
 pub(crate) const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
+pub(crate) const REJOIN_NOTE_DELIVERY_LIMIT: usize = 4096;
+const REJOIN_NOTE_PRUNE_BATCH: usize = 64;
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
@@ -245,7 +247,10 @@ type RejoinStayKey = (u64, u64, String);
 struct RejoinNoteDeliveryState {
     delivered: HashMap<RejoinStayKey, Instant>,
     undelivered: HashMap<RejoinStayKey, Instant>,
-    in_flight: std::collections::HashSet<RejoinStayKey>,
+    in_flight: HashSet<RejoinStayKey>,
+    delivered_order: VecDeque<RejoinStayKey>,
+    undelivered_order: VecDeque<RejoinStayKey>,
+    stays_by_member: HashMap<(u64, u64), HashSet<String>>,
 }
 
 fn rejoin_stay_key(guild: u64, user: u64, stay_id: &str) -> RejoinStayKey {
@@ -293,35 +298,185 @@ impl Drop for RejoinNoteInFlight<'_> {
     }
 }
 
-impl RejoinNoteDeliveries {
-    fn prune_stale(state: &mut RejoinNoteDeliveryState) {
-        state
-            .delivered
-            .retain(|_, delivered| delivered.elapsed() < MEMBER_JOINS_KEEP);
-        state
-            .undelivered
-            .retain(|_, marked| marked.elapsed() < MEMBER_JOINS_KEEP);
+impl RejoinNoteDeliveryState {
+    fn track_stay(&mut self, guild: u64, user: u64, stay_id: &str) {
+        self.stays_by_member
+            .entry((guild, user))
+            .or_default()
+            .insert(stay_id.to_owned());
     }
 
+    fn untrack_stay(&mut self, guild: u64, user: u64, stay_id: &str) {
+        let member = (guild, user);
+        if let Some(stays) = self.stays_by_member.get_mut(&member) {
+            stays.remove(stay_id);
+            if stays.is_empty() {
+                self.stays_by_member.remove(&member);
+            }
+        }
+    }
+
+    fn remove_key(&mut self, key: &RejoinStayKey) {
+        if self.in_flight.contains(key) {
+            return;
+        }
+        if self.delivered.remove(key).is_some() {
+            self.untrack_stay(key.0, key.1, &key.2);
+        }
+        if self.undelivered.remove(key).is_some() {
+            self.untrack_stay(key.0, key.1, &key.2);
+        }
+    }
+
+    fn prune_delivered_front(&mut self) -> bool {
+        while let Some(key) = self.delivered_order.front().cloned() {
+            match self.delivered.get(&key) {
+                None => {
+                    self.delivered_order.pop_front();
+                    continue;
+                }
+                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
+                Some(_) => {
+                    self.delivered_order.pop_front();
+                    if !self.in_flight.contains(&key) {
+                        self.delivered.remove(&key);
+                        self.untrack_stay(key.0, key.1, &key.2);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn prune_undelivered_front(&mut self) -> bool {
+        while let Some(key) = self.undelivered_order.front().cloned() {
+            match self.undelivered.get(&key) {
+                None => {
+                    self.undelivered_order.pop_front();
+                    continue;
+                }
+                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
+                Some(_) => {
+                    self.undelivered_order.pop_front();
+                    if !self.in_flight.contains(&key) {
+                        self.undelivered.remove(&key);
+                        self.untrack_stay(key.0, key.1, &key.2);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn evict_oldest_delivered(&mut self) -> bool {
+        while let Some(key) = self.delivered_order.front().cloned() {
+            match self.delivered.get(&key) {
+                None => {
+                    self.delivered_order.pop_front();
+                    continue;
+                }
+                Some(_) if self.in_flight.contains(&key) => return false,
+                Some(_) => {
+                    self.delivered_order.pop_front();
+                    self.delivered.remove(&key);
+                    self.untrack_stay(key.0, key.1, &key.2);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn evict_oldest_expired_undelivered(&mut self) -> bool {
+        while let Some(key) = self.undelivered_order.front().cloned() {
+            match self.undelivered.get(&key) {
+                None => {
+                    self.undelivered_order.pop_front();
+                    continue;
+                }
+                Some(at) if at.elapsed() < MEMBER_JOINS_KEEP => return false,
+                Some(_) if self.in_flight.contains(&key) => return false,
+                Some(_) => {
+                    self.undelivered_order.pop_front();
+                    self.undelivered.remove(&key);
+                    self.untrack_stay(key.0, key.1, &key.2);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn prune_incremental(&mut self) {
+        for _ in 0..REJOIN_NOTE_PRUNE_BATCH {
+            if !self.prune_delivered_front() && !self.prune_undelivered_front() {
+                break;
+            }
+        }
+        self.enforce_limit();
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.delivered.len() + self.undelivered.len() > REJOIN_NOTE_DELIVERY_LIMIT {
+            if self.evict_oldest_delivered() {
+                continue;
+            }
+            if self.evict_oldest_expired_undelivered() {
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn record_delivered(&mut self, key: RejoinStayKey) {
+        self.undelivered.remove(&key);
+        self.delivered.insert(key.clone(), Instant::now());
+        self.delivered_order.push_back(key.clone());
+        self.track_stay(key.0, key.1, &key.2);
+    }
+
+    fn record_undelivered(&mut self, key: RejoinStayKey) {
+        self.delivered.remove(&key);
+        self.undelivered.insert(key.clone(), Instant::now());
+        self.undelivered_order.push_back(key.clone());
+        self.track_stay(key.0, key.1, &key.2);
+    }
+}
+
+impl RejoinNoteDeliveries {
     pub fn clear_member(&self, guild: u64, user: u64) {
         let mut state = self.inner.lock();
-        state
-            .delivered
-            .retain(|(g, u, _), _| *g != guild || *u != user);
-        state
-            .undelivered
-            .retain(|(g, u, _), _| *g != guild || *u != user);
-        state
-            .in_flight
-            .retain(|(g, u, _)| *g != guild || *u != user);
+        let stays = state
+            .stays_by_member
+            .remove(&(guild, user))
+            .unwrap_or_default();
+        for stay_id in stays {
+            let key = rejoin_stay_key(guild, user, &stay_id);
+            state.in_flight.remove(&key);
+            state.delivered.remove(&key);
+            state.undelivered.remove(&key);
+        }
     }
 
     pub fn retain_current_stay(&self, guild: u64, user: u64, stay_id: &str) {
         let mut state = self.inner.lock();
-        let superseded = |key: &RejoinStayKey| key.0 == guild && key.1 == user && key.2 != stay_id;
-        state.delivered.retain(|key, _| !superseded(key));
-        state.undelivered.retain(|key, _| !superseded(key));
-        state.in_flight.retain(|key| !superseded(key));
+        let stays = state
+            .stays_by_member
+            .get(&(guild, user))
+            .cloned()
+            .unwrap_or_default();
+        for other in stays {
+            if other == stay_id {
+                continue;
+            }
+            let key = rejoin_stay_key(guild, user, &other);
+            if state.in_flight.contains(&key) {
+                continue;
+            }
+            state.remove_key(&key);
+        }
     }
 
     pub fn begin_in_flight(
@@ -347,7 +502,7 @@ impl RejoinNoteDeliveries {
         }
         let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
-        Self::prune_stale(&mut state);
+        state.prune_incremental();
         state.undelivered.contains_key(&key)
     }
 
@@ -357,7 +512,7 @@ impl RejoinNoteDeliveries {
         }
         let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
-        Self::prune_stale(&mut state);
+        state.prune_incremental();
         if state.in_flight.contains(&key) {
             return false;
         }
@@ -368,7 +523,8 @@ impl RejoinNoteDeliveries {
         {
             return false;
         }
-        state.in_flight.insert(key);
+        state.in_flight.insert(key.clone());
+        state.track_stay(guild, user, stay_id);
         true
     }
 
@@ -380,11 +536,17 @@ impl RejoinNoteDeliveries {
         let mut state = self.inner.lock();
         state.in_flight.remove(&key);
         if sent {
-            state.undelivered.remove(&key);
-            state.delivered.insert(key, Instant::now());
+            state.record_delivered(key);
         } else {
-            state.undelivered.insert(key, Instant::now());
+            state.record_undelivered(key);
         }
+        state.enforce_limit();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_settled_entry_count(&self) -> usize {
+        let state = self.inner.lock();
+        state.delivered.len() + state.undelivered.len()
     }
 
     #[cfg(test)]
