@@ -4220,8 +4220,7 @@ mod tests {
                     server_stop,
                     |method, path, body| {
                         if method == "POST" && path.ends_with("/messages") {
-                            if path.ends_with("/channels/998/messages")
-                                && !log_post_delay.is_zero()
+                            if path.ends_with("/channels/998/messages") && !log_post_delay.is_zero()
                             {
                                 std::thread::sleep(log_post_delay);
                             }
