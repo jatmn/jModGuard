@@ -774,6 +774,8 @@ struct Supervisor {
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
     pending_boot_mismatch: VecDeque<PendingBootMismatch>,
+    /// Installed release retained while the baked executable is running temporarily.
+    baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
     receipt_attempt: u32,
     receipt_not_before: Option<Instant>,
@@ -1465,6 +1467,9 @@ impl Supervisor {
         if self.running.is_some() {
             anyhow::bail!("application process is already running");
         }
+        if path != self.baked {
+            self.baked_fallback_installed = None;
+        }
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
         }
@@ -1597,7 +1602,17 @@ impl Supervisor {
         } else {
             let installed_digest = release.as_ref().map(|release| release.digest.clone());
             let saved = if release.is_none() {
-                self.control.baked_running(&self.role, seen, now()).await
+                if running_from_baked {
+                    if let Some(installed) = self.baked_fallback_installed.clone() {
+                        self.control
+                            .running(&self.role, Some(installed), seen, now())
+                            .await
+                    } else {
+                        self.control.baked_running(&self.role, seen, now()).await
+                    }
+                } else {
+                    self.control.baked_running(&self.role, seen, now()).await
+                }
             } else {
                 self.control.running(&self.role, release, seen, now()).await
             };
@@ -1857,9 +1872,10 @@ impl Supervisor {
         );
         self.record_boot_mismatch_for_installed(release, reason)
             .await?;
+        self.baked_fallback_installed = Some(release.clone());
         let baked = self.baked.clone();
         let base_sha = self.base_sha.clone();
-        self.start(&baked, &base_sha, Some(release.clone())).await?;
+        self.start(&baked, &base_sha, None).await?;
         Ok(())
     }
 
@@ -3002,6 +3018,7 @@ async fn main() -> Result<()> {
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: VecDeque::new(),
+        baked_fallback_installed: None,
         pending_startup,
         receipt_attempt: 0,
         receipt_not_before: None,

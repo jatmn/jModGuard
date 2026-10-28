@@ -282,6 +282,7 @@ fn controller(
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: VecDeque::new(),
+        baked_fallback_installed: None,
         pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,
