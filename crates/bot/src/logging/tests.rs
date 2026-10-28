@@ -240,14 +240,43 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
     assert!(rendered.encode_utf16().count() <= 2000);
 }
 
+fn render_shipped_delete(event: &'static str, row: &MessageSnapshot) -> String {
+    let mut report = MessageReport {
+        guild_id: GuildId::new(789),
+        event,
+        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
+    };
+    if event == "automod_delete" {
+        report.vars.insert("rule".into(), "Bad words".into());
+        report.vars.insert("rule_id".into(), "badword".into());
+    }
+    report
+        .vars
+        .insert("time".into(), "2026-10-27T00:00:00Z".into());
+    apply_retained_delete(&mut report, Some(row));
+    let template = default_template(event);
+    bound_default_message_vars(event, &mut report.vars);
+    let rendered = templates::render_bounded(template, &report.vars, 2000);
+    assert!(
+        rendered.encode_utf16().count() <= 2000,
+        "{event}: {rendered}"
+    );
+    assert!(
+        rendered.contains("**Last observed text:** old retained text"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("{coverage}"), "{rendered}");
+    rendered
+}
+
 #[test]
-fn shipped_automod_delete_template_renders_gap_coverage() {
-    let row = MessageSnapshot {
+fn shipped_automod_delete_template_renders_gap_and_partial_coverage() {
+    let mut row = MessageSnapshot {
         guild_id: 789,
         channel_id: 456,
         message_id: 123,
         fields: crate::db::guild_data::SnapshotFields {
-            content: Some("after uncertain REST".into()),
+            content: Some("old retained text".into()),
             author_id: Some(42),
             ..Default::default()
         },
@@ -262,26 +291,19 @@ fn shipped_automod_delete_template_renders_gap_coverage() {
         content_supplied: true,
         attachments_supplied: false,
     };
-    let mut report = MessageReport {
-        guild_id: GuildId::new(789),
-        event: "automod_delete",
-        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
-    };
-    report.vars.insert("rule".into(), "Bad words".into());
-    report.vars.insert("rule_id".into(), "badword".into());
-    report
-        .vars
-        .insert("time".into(), "2026-10-27T00:00:00Z".into());
-    apply_retained_delete(&mut report, Some(&row));
-    let template = default_template("automod_delete");
-    bound_default_message_vars("automod_delete", &mut report.vars);
-    let rendered = templates::render_bounded(template, &report.vars, 2000);
-    assert!(rendered.contains("**Last observed text:**"));
-    assert!(rendered.contains("after uncertain REST"));
-    assert!(rendered.contains("**Coverage:** last observed; observation gap or restart"));
-    assert!(!rendered.contains("{coverage}"));
-    assert!(!rendered.contains("**Text:**"));
-    assert!(rendered.encode_utf16().count() <= 2000);
+    let automod_gap = render_shipped_delete("automod_delete", &row);
+    let plain_gap = render_shipped_delete("message_delete", &row);
+    let gap = "**Coverage:** last observed; observation gap or restart";
+    assert!(automod_gap.contains(gap), "{automod_gap}");
+    assert!(plain_gap.contains(gap), "{plain_gap}");
+    assert!(!automod_gap.contains("**Text:**"), "{automod_gap}");
+
+    row.continuous = true;
+    let automod_partial = render_shipped_delete("automod_delete", &row);
+    let plain_partial = render_shipped_delete("message_delete", &row);
+    let partial = "**Coverage:** last observed; later edits may be missing";
+    assert!(automod_partial.contains(partial), "{automod_partial}");
+    assert!(plain_partial.contains(partial), "{plain_partial}");
 }
 
 #[tokio::test]
