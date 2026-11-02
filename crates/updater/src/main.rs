@@ -1544,7 +1544,6 @@ impl Supervisor {
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
         }
-        self.end_idle().await?;
         let baked_fallback =
             path == self.baked && release.is_none() && self.baked_fallback_installed.is_some();
         let before_spawn = async {
@@ -1554,8 +1553,8 @@ impl Supervisor {
                 let _ = resume.await;
             }
             if baked_fallback {
-                // Receipts, idle shutdown and reading the binary can all await.
-                // Recheck the outage contract after them, immediately before spawn.
+                // Receipts and reading the binary can await. Keep idle liveness
+                // available while the final outage schema reads are pending.
                 let schema = self.control.schema_version().await?;
                 let state = self.control.component(&self.role).await?;
                 ensure!(
@@ -1567,13 +1566,15 @@ impl Supervisor {
                     db::APP_ONLY_SCHEMA_CHANGE_REFUSED
                 );
             }
-            Ok(())
+            // Release the idle listener only after validation succeeds, so a
+            // stalled or failed database read cannot take process health down.
+            self.end_idle().await
         };
         let child = match launch_mode_checked(path, sha, release, false, before_spawn).await {
             Ok(child) => child,
             Err(error) => {
-                // The listener was released before spawn. Put it back on this
-                // tick; a later poll must not be what makes /health exist again.
+                // Spawn can fail after the listener is released. Restore it on
+                // this tick; validation failures leave the existing listener up.
                 if let Err(idle_error) = self.idle().await {
                     tracing::warn!(
                         "launcher health was not restored after a failed start: {idle_error:#}"

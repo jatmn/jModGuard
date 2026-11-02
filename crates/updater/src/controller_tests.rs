@@ -126,7 +126,7 @@ async fn executable(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
     let code = format!(
         r#"
-use std::io::Write;
+use std::io::{{Read, Write}};
 use std::sync::atomic::{{AtomicBool, Ordering}};
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: i32) {{ STOP.store(true, Ordering::SeqCst); }}
@@ -149,6 +149,13 @@ fn main() {{
         let mut log = std::fs::OpenOptions::new().create(true).append(true).open(root.join("events")).unwrap();
         writeln!(log, "{name}.{{suffix}}").unwrap();
     }};
+    // Optional real maintenance socket for outage liveness regressions.
+    let maintenance_listener = if maintenance && root.join("bind-maintenance-{name}").exists() {{
+        let bind = std::fs::read_to_string(root.join("bind-maintenance-{name}")).unwrap();
+        let listener = std::net::TcpListener::bind(bind.trim()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        Some(listener)
+    }} else {{ None }};
     if !maintenance {{
         event("start");
         let _health = if root.join("bind-health-{name}").exists() {{
@@ -196,6 +203,14 @@ fn main() {{
         event("ready");
     }}
     while !STOP.load(Ordering::SeqCst) {{
+        if let Some(listener) = &maintenance_listener
+            && let Ok((mut stream, _)) = listener.accept()
+        {{
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }}
         if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
             if let Some(code) = complete_exit_code(&raw) {{
                 std::process::exit(code);
@@ -9143,13 +9158,14 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
     let root = std::env::temp_dir().join(format!("boot-reread-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let baked = executable(&root, "baked-bot").await;
-    let (db, control) = open_launcher_db(&root).await;
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
     let core = control.schema_version().await.unwrap();
     let (refused, reserved) = refused_registry().await;
     for role in ["bot", "api"] {
         let release = release_at(role, 'c', core);
         install_for_outage(&db, &control, &release, 1_700_000_000).await;
-        for changed in ["core", "guild", "neither"] {
+        for changed in ["core", "guild", "read-error", "neither"] {
             set_core_schema(&db, core).await;
             control
                 .running(role, None, fresh_observation(1_700_000_000), 1_700_000_000)
@@ -9163,10 +9179,28 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
                 control.clone(),
                 &root,
             );
+            let reserved_health = bind_reclaimable_health_port().await;
+            let addr = reserved_health.local_addr().unwrap();
+            drop(reserved_health);
+            if role == "bot" {
+                service.health_bind = Some(addr.to_string());
+            } else {
+                tokio::fs::write(root.join("bind-maintenance-baked-bot"), addr.to_string())
+                    .await
+                    .unwrap();
+            }
+            service.idle().await.unwrap();
+            tokio::time::timeout(POLL, async {
+                while !launcher_health_responds(addr).await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("idle listener never became available");
             let (reached, at_spawn) = tokio::sync::oneshot::channel();
             let (resume, resumed) = tokio::sync::oneshot::channel();
             service.before_spawn_gate = Some((reached, resumed));
-            let restore = tokio::spawn(async move {
+            let mut restore = tokio::spawn(async move {
                 let result = service.restore(&state).await;
                 (service, result)
             });
@@ -9184,13 +9218,46 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
                         .await
                         .unwrap();
                 }
+                "read-error" => {
+                    db.with_conn(|conn| {
+                        conn.execute_batch_bounded(
+                            "ALTER TABLE component_updates RENAME TO unavailable_updates",
+                            4_000_000,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
                 _ => {}
             }
+            let (releases, blockers) = block_sqlite_pool(&db).await;
             resume.send(()).unwrap();
+            let pending = tokio::time::timeout(Duration::from_millis(100), &mut restore)
+                .await
+                .is_err();
+            let healthy_while_blocked = launcher_health_responds(addr).await;
+            drop(releases);
+            for blocker in blockers {
+                blocker.await.unwrap();
+            }
             let (mut service, result) = restore.await.unwrap();
             let started = service.running.is_some();
+            let healthy_after_refusal = started || launcher_health_responds(addr).await;
             service.stop_application().await.unwrap();
             service.end_idle().await.unwrap();
+            assert!(
+                pending,
+                "{role}: final schema read must wait for the SQLite pool"
+            );
+            assert!(
+                healthy_while_blocked,
+                "{role}: idle listener disappeared during the final schema read ({changed})"
+            );
+            assert!(
+                healthy_after_refusal,
+                "{role}: failed final validation lost the idle listener"
+            );
             match changed {
                 "core" => {
                     assert!(!started, "{role}: changed core must prevent spawn");
@@ -9210,6 +9277,19 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
                             .to_string()
                             .contains(db::APP_ONLY_SCHEMA_CHANGE_REFUSED)
                     );
+                }
+                "read-error" => {
+                    assert!(!started, "{role}: failed final read must prevent spawn");
+                    assert!(result.is_err());
+                    db.with_conn(|conn| {
+                        conn.execute_batch_bounded(
+                            "ALTER TABLE unavailable_updates RENAME TO component_updates",
+                            4_000_000,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                 }
                 _ => {
                     result.unwrap();
