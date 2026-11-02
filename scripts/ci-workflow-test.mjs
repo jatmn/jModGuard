@@ -336,4 +336,109 @@ try {
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true });
 }
+const publisher = fs.readFileSync(path.join(root, "scripts/publish-image.sh"), "utf8");
+const signFn = publisher.slice(
+  publisher.indexOf("publish_component_sign() {"),
+  publisher.indexOf("\npublish_component_phase()"),
+);
+assert.match(signFn, /resolve_promotion_target/);
+assert.match(signFn, /JMODGUARD_DEFER_PROMOTION/);
+assert.doesNotMatch(signFn, /promote_image_tag|registry_promote_tag/);
+assert.ok(signFn.indexOf("resolve_promotion_target") < signFn.indexOf("JMODGUARD_DEFER_PROMOTION"));
+assert.ok(signFn.indexOf("JMODGUARD_DEFER_PROMOTION") < signFn.indexOf("commit_queued_promotions"));
+assert.match(promoteScript, /export JMODGUARD_DEFER_PROMOTION=1/);
+assert.match(promoteScript, /finish_deferred_promotions/);
+assert.doesNotMatch(promoteScript, /bash scripts\/publish-image\.sh/);
+const deferAt = promoteScript.indexOf("export JMODGUARD_DEFER_PROMOTION=1");
+const loopAt = promoteScript.indexOf("for component in");
+const finishAt = promoteScript.indexOf("finish_deferred_promotions");
+assert.ok(deferAt < loopAt && loopAt < finishAt, "promotion must resolve every component before it commits tags");
+
+const oldBot = "sha256:" + "a".repeat(64);
+const oldWeb = "sha256:" + "b".repeat(64);
+const nextDigest = "sha256:" + "c".repeat(64);
+const botRef = "ghcr.io/jatmn/jmodguard-bot:" + "a".repeat(40);
+const apiRef = "ghcr.io/jatmn/jmodguard-api:" + "b".repeat(40);
+const webRef = "ghcr.io/jatmn/jmodguard-webui:latest";
+const atomicDir = fs.mkdtempSync(path.join(os.tmpdir(), "promote-atomic-"));
+const trace = path.join(atomicDir, "trace");
+const atomic = [
+  "set -euo pipefail",
+  "export JMODGUARD_PUBLISH_IMAGE_LIB=1",
+  "source scripts/publish-image.sh",
+  "declare -A CUR=()",
+  'CUR["$BOT_REF"]="$OLD_BOT"',
+  'CUR["$WEB_REF"]="$OLD_WEB"',
+  "PHASE=forward",
+  "inspect_digest() {",
+  "  printf 'inspect %s\\n' \"$1\" >>\"$TRACE\"",
+  "  if [[ -n \"${CUR[$1]+x}\" ]]; then",
+  "    printf '%s\\t10\\n' \"${CUR[$1]}\"",
+  "    return 0",
+  "  fi",
+  "  return 1",
+  "}",
+  "registry_promote_tag() {",
+  "  local tag=\"\" digest=\"\" prev=\"\" arg",
+  "  for arg in \"$@\"; do",
+  "    if [[ \"$prev\" == --tag ]]; then tag=\"$arg\"; fi",
+  "    if [[ \"$arg\" == *@sha256:* ]]; then digest=\"${arg#*@}\"; fi",
+  "    prev=\"$arg\"",
+  "  done",
+  "  if [[ \"$PHASE\" == rollback ]]; then",
+  "    printf 'restore %s %s\\n' \"$tag\" \"$digest\" >>\"$TRACE\"",
+  "    CUR[\"$tag\"]=\"$digest\"",
+  "    return 0",
+  "  fi",
+  "  if [[ \"$tag\" == \"$WEB_REF\" ]]; then",
+  "    printf 'promote-fail %s\\n' \"$tag\" >>\"$TRACE\"",
+  "    PHASE=rollback",
+  "    return 1",
+  "  fi",
+  "  printf 'promote %s %s\\n' \"$tag\" \"$digest\" >>\"$TRACE\"",
+  "  CUR[\"$tag\"]=\"$digest\"",
+  "  return 0",
+  "}",
+  "registry_delete_tag() {",
+  "  printf 'delete %s\\n' \"$1\" >>\"$TRACE\"",
+  "  unset \"CUR[$1]\"",
+  "  return 0",
+  "}",
+  "resolve_promotion_target \"${BOT_REF%:*}\" \"${BOT_REF##*:}\" \"$NEW\"",
+  "resolve_promotion_target \"${API_REF%:*}\" \"${API_REF##*:}\" \"$NEW\"",
+  "resolve_promotion_target \"${WEB_REF%:*}\" \"${WEB_REF##*:}\" \"$NEW\"",
+  "finish_deferred_promotions",
+].join("\n");
+let atomicResult;
+try {
+  atomicResult = spawnSync("bash", ["-c", atomic], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TRACE: trace,
+      BOT_REF: botRef,
+      API_REF: apiRef,
+      WEB_REF: webRef,
+      OLD_BOT: oldBot,
+      OLD_WEB: oldWeb,
+      NEW: nextDigest,
+    },
+  });
+  assert.notEqual(atomicResult.status, 0, atomicResult.stderr || atomicResult.stdout);
+  const lines = fs.readFileSync(trace, "utf8").trim().split("\n");
+  const firstWrite = lines.findIndex(line => /^(promote |promote-fail |restore |delete )/.test(line));
+  assert.equal(firstWrite, 3, "resolving tags mutated the registry before every image was checked: " + lines.join(" | "));
+  assert.ok(lines.slice(0, 3).every(line => line.startsWith("inspect ")));
+  assert.ok(lines.includes("promote " + botRef + " " + nextDigest));
+  assert.ok(lines.includes("promote " + apiRef + " " + nextDigest));
+  assert.ok(lines.includes("promote-fail " + webRef));
+  const webRestore = lines.indexOf("restore " + webRef + " " + oldWeb);
+  const apiDelete = lines.indexOf("delete " + apiRef);
+  const botRestore = lines.indexOf("restore " + botRef + " " + oldBot);
+  assert.ok(webRestore !== -1 && apiDelete !== -1 && botRestore !== -1, lines.join(" | "));
+  assert.ok(webRestore < apiDelete && apiDelete < botRestore, "rollback must undo the newest tag first");
+} finally {
+  fs.rmSync(atomicDir, { recursive: true, force: true });
+}
 console.log("ci-workflow-test: ok");

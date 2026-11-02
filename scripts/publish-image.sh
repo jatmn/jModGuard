@@ -458,8 +458,31 @@ if (process.env.LAYOUT !== "legacy" && !labels["org.opencontainers.image.revisio
 JS
 }
 
+declare -g -a PROMOTION_QUEUE=()
+declare -g -a PROMOTION_DONE=()
+declare -g -a PROMOTION_SCRATCHES=()
+declare -g -a PROMOTION_ROLLBACK=()
+
 registry_promote_tag() {
   docker buildx imagetools create "$@" || return 1
+}
+
+registry_delete_tag() {
+  local image_tag="$1" package tag token version_id
+  [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
+  package="${BASH_REMATCH[1]}"
+  tag="${BASH_REMATCH[2]}"
+  token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
+  [[ -n "$token" ]] || return 1
+  version_id="$(
+    GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
+      "/orgs/jatmn/packages/container/${package}/versions" \
+      --jq ".[] | select(.metadata.container.tags == [\"${tag}\"]) | .id"
+  )" || return 1
+  version_id="${version_id%%$'\n'*}"
+  [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --method DELETE \
+    "/orgs/jatmn/packages/container/${package}/versions/${version_id}" >/dev/null
 }
 
 promote_image_tag() {
@@ -476,15 +499,94 @@ promote_image_tag() {
 }
 
 rollback_promoted_tags() {
-  local entry image_tag previous image
-  for entry in "${PROMOTION_ROLLBACK[@]:-}"; do
+  local entry image_tag previous image i
+  [[ -v PROMOTION_ROLLBACK ]] || return 0
+  [[ "${#PROMOTION_ROLLBACK[@]}" -eq 0 ]] && return 0
+  for ((i=${#PROMOTION_ROLLBACK[@]}-1; i>=0; i--)); do
+    entry="${PROMOTION_ROLLBACK[i]}"
     image_tag="${entry%%|*}"
     previous="${entry#*|}"
     if [[ -n "$previous" ]]; then
       image="${image_tag%:*}"
       registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
+    else
+      registry_delete_tag "$image_tag" >/dev/null 2>&1 || true
     fi
   done
+}
+
+promotion_tag_list() {
+  local sha="$1" label="$2" channel="$3"
+  printf '%s\n' "$sha"
+  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
+    printf '%s\n' "$label"
+  fi
+  if [[ "$channel" != "nightly" ]]; then
+    printf '%s\n' latest
+  fi
+  if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
+    printf '%s\n' "$channel"
+  fi
+}
+
+resolve_promotion_target() {
+  local image="$1" tag="$2" digest="$3" previous=""
+  if previous="$(inspect_digest "${image}:${tag}" 2>/dev/null | cut -f1)"; then
+    [[ "$previous" =~ ^sha256:[0-9a-f]{64}$ ]] || previous=""
+  else
+    previous=""
+  fi
+  PROMOTION_QUEUE+=("${image}|${tag}|${digest}|${previous}")
+}
+
+cleanup_promotion_scratch() {
+  local dir
+  [[ "${#PROMOTION_SCRATCHES[@]}" -eq 0 ]] && return 0
+  for dir in "${PROMOTION_SCRATCHES[@]}"; do
+    rm -rf "$dir"
+  done
+  PROMOTION_SCRATCHES=()
+}
+
+abort_promotion() {
+  rollback_promoted_tags
+  cleanup_promotion_scratch
+  publish_fail "failed to promote $1"
+}
+
+commit_queued_promotions() {
+  local entry image tag digest previous
+  local -a PROMOTION_ROLLBACK=()
+  [[ "${#PROMOTION_QUEUE[@]}" -eq 0 ]] && return 0
+  for entry in "${PROMOTION_QUEUE[@]}"; do
+    IFS='|' read -r image tag digest previous <<<"$entry"
+    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
+    registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
+      || abort_promotion "${image}:${tag}"
+    digest_matches_ref "${image}:${tag}" "$digest" \
+      || abort_promotion "${image}:${tag}"
+  done
+  PROMOTION_QUEUE=()
+}
+
+finish_deferred_promotions() {
+  local entry component dir published rest
+  commit_queued_promotions
+  if [[ "${#PROMOTION_DONE[@]}" -gt 0 ]]; then
+    for entry in "${PROMOTION_DONE[@]}"; do
+      component="${entry%%$'\t'*}"
+      rest="${entry#*$'\t'}"
+      dir="${rest%%$'\t'*}"
+      published="${rest#*$'\t'}"
+      if [[ -n "$dir" ]]; then
+        JMODGUARD_PUBLISH_STATE_DIR="$dir" clear_publish_state "$component"
+      fi
+      echo "Published ${published}"
+    done
+  fi
+  PROMOTION_DONE=()
+  cleanup_promotion_scratch
+  trap - EXIT
 }
 
 checked_request() {
@@ -941,8 +1043,7 @@ publish_component_sign() {
   local component="$1"
   local selection mode ref head resolved sha label image channel published_digest staging_ref
   local state handoff sign_flag handoff_sign_expected=""
-  local username token source_token scratch
-  local -a PROMOTION_ROLLBACK=()
+  local username token source_token scratch tag
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
@@ -994,7 +1095,8 @@ publish_component_sign() {
   fi
   require_signing_secrets
   scratch="$(scratch_dir publish-sign)"
-  trap 'rm -rf "$scratch"' EXIT
+  PROMOTION_SCRATCHES+=("$scratch")
+  trap cleanup_promotion_scratch EXIT
   validate_signing_key_pair
   redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   export DOCKER_CONFIG="${scratch}/docker"
@@ -1007,28 +1109,19 @@ publish_component_sign() {
     || publish_fail 'staging reference does not match the verified build digest'
   sign_published_digest "$component" "$image" "$published_digest" \
     || publish_fail 'published image failed signing'
-  promote_with_rollback() {
-    local tag="$1"
-    promote_image_tag "$image" "$tag" "$published_digest" || {
-      rollback_promoted_tags
-      publish_fail "failed to promote ${image}:${tag}"
-    }
-  }
-  promote_with_rollback "$sha"
-  assert_digest_matches_ref "${image}:${sha}" "$published_digest"
-  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
-    promote_with_rollback "$label"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    resolve_promotion_target "$image" "$tag" "$published_digest"
+  done < <(promotion_tag_list "$sha" "$label" "$channel")
+  if [[ "${JMODGUARD_DEFER_PROMOTION:-}" == 1 ]]; then
+    PROMOTION_DONE+=("${component}"$'\t'"${JMODGUARD_PUBLISH_STATE_DIR:-}"$'\t'"${image}:${sha}")
+    return 0
   fi
-  if [[ "$channel" != "nightly" ]]; then
-    promote_with_rollback latest
-  fi
-  if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
-    promote_with_rollback "$channel"
-  fi
+  commit_queued_promotions
   clear_publish_state "$component"
   echo "Published ${image}:${sha}"
   trap - EXIT
-  rm -rf "$scratch"
+  cleanup_promotion_scratch
 }
 
 publish_component_phase() {
