@@ -473,8 +473,16 @@ registry_user_versions_path() {
 
 registry_fetch_versions() {
   local package="$1" token="$2"
+  # gh api --paginate prints one JSON array per page. Combine them before matching.
   GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
-    "$(registry_user_versions_path "$package")"
+    "$(registry_user_versions_path "$package")?per_page=100" \
+    | jq -se '
+        if any(.[]; type != "array") then
+          error("package version list page is not a JSON array")
+        else
+          [ .[][] ]
+        end
+      '
 }
 
 registry_delete_version() {
@@ -493,8 +501,10 @@ registry_classify_tag_version() {
         else
           "untag \(.[0].id)"
         end
+      elif length == 0 then
+        "none"
       else
-        empty
+        "many \(length)"
       end
   '
 }
@@ -503,12 +513,23 @@ registry_disposable_version_id() {
   local tag="$1" keep_id="$2"
   jq -r --arg tag "$tag" --argjson keep "$keep_id" '
     (map(select(.id == $keep)) | first) as $kept
-    | if $kept == null then empty
-      elif (($kept.metadata.container.tags // []) | index($tag) != null) then empty
+    | if $kept == null then "kept-missing"
+      elif (($kept.metadata.container.tags // []) | index($tag) != null) then "tag-still-present"
       else
         [ .[] | select(.id != $keep and ((.metadata.container.tags // []) == [$tag])) ]
-        | if length == 1 then .[0].id else empty end
+        | if length == 1 then "delete \(.[0].id)"
+          elif length == 0 then "none"
+          else "many \(length)"
+          end
       end
+  '
+}
+
+registry_preserved_digest() {
+  local version_id="$1"
+  jq -er --argjson id "$version_id" '
+    ([.[] | select(.id == $id)] | first | .name // empty)
+    | select(test("^sha256:[0-9a-f]{64}$"))
   '
 }
 
@@ -526,24 +547,67 @@ registry_move_tag_onto_empty_image() {
 }
 
 registry_delete_detached_tag() {
-  local package="$1" token="$2" tag="$3" keep_id="$4"
-  local payload disposable attempt
+  local package="$1" token="$2" tag="$3" keep_id="$4" digest="$5"
+  local payload decision attempt disposable_id image_tag
+  decision="unreadable"
   for attempt in 1 2 3; do
-    payload="$(registry_fetch_versions "$package" "$token")" || return 1
-    disposable="$(printf '%s\n' "$payload" | registry_disposable_version_id "$tag" "$keep_id")" || return 1
-    if [[ "$disposable" =~ ^[0-9]+$ ]]; then
-      registry_delete_version "$package" "$token" "$disposable"
-      return
+    if ! payload="$(registry_fetch_versions "$package" "$token")"; then
+      decision="list"
+    elif ! decision="$(printf '%s\n' "$payload" | registry_disposable_version_id "$tag" "$keep_id")"; then
+      decision="unreadable"
     fi
+    case "$decision" in
+      delete\ [0-9]*)
+        disposable_id="${decision#delete }"
+        if [[ "$disposable_id" =~ ^[0-9]+$ ]]; then
+          if registry_delete_version "$package" "$token" "$disposable_id"; then
+            return 0
+          fi
+          echo "registry tag ${tag} disposable package version ${disposable_id} could not be deleted" >&2
+          return 1
+        fi
+        decision="unreadable"
+        ;;
+    esac
     if [[ "$attempt" != 3 ]]; then
       sleep 2
     fi
   done
+  case "$decision" in
+    none)
+      echo "registry tag ${tag} matched no disposable package version" >&2
+      ;;
+    many\ *)
+      echo "registry tag ${tag} matched ${decision#many } disposable package versions" >&2
+      ;;
+    kept-missing)
+      echo "registry tag ${tag} preserved package version ${keep_id} was not listed" >&2
+      ;;
+    tag-still-present)
+      echo "registry tag ${tag} is still on preserved package version ${keep_id}" >&2
+      ;;
+    list)
+      echo "registry tag ${tag} package version list failed" >&2
+      ;;
+    *)
+      echo "registry tag ${tag} disposable package version match was unreadable" >&2
+      ;;
+  esac
+  if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "registry tag ${tag} cleanup failed and preserved version ${keep_id} has no digest to restore" >&2
+    return 1
+  fi
+  image_tag="ghcr.io/jatmn/${package}:${tag}"
+  if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "ghcr.io/jatmn/${package}@${digest}" >/dev/null; then
+    echo "registry tag ${tag} could not be restored to ${digest}" >&2
+    return 1
+  fi
+  echo "registry tag ${tag} restored to ${digest}" >&2
   return 1
 }
 
 registry_delete_tag() {
-  local image_tag="$1" package tag token payload decision action version_id
+  local image_tag="$1" package tag token payload decision action version_id digest
   [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
   package="${BASH_REMATCH[1]}"
   tag="${BASH_REMATCH[2]}"
@@ -551,7 +615,22 @@ registry_delete_tag() {
   [[ -n "$token" ]] || return 1
   payload="$(registry_fetch_versions "$package" "$token")" || return 1
   decision="$(printf '%s\n' "$payload" | registry_classify_tag_version "$tag")" || return 1
-  [[ -n "$decision" ]] || return 1
+  case "$decision" in
+    none)
+      echo "registry tag ${tag} matched no package version" >&2
+      return 1
+      ;;
+    many\ *)
+      echo "registry tag ${tag} matched ${decision#many } package versions" >&2
+      return 1
+      ;;
+    delete\ [0-9]*|untag\ [0-9]*)
+      ;;
+    *)
+      echo "registry tag ${tag} package version match was unreadable" >&2
+      return 1
+      ;;
+  esac
   action="${decision%% *}"
   version_id="${decision#* }"
   [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
@@ -560,8 +639,12 @@ registry_delete_tag() {
       registry_delete_version "$package" "$token" "$version_id"
       ;;
     untag)
+      digest="$(printf '%s\n' "$payload" | registry_preserved_digest "$version_id")" || {
+        echo "registry tag ${tag} preserved version ${version_id} has no digest to restore" >&2
+        return 1
+      }
       registry_move_tag_onto_empty_image "$image_tag" || return 1
-      registry_delete_detached_tag "$package" "$token" "$tag" "$version_id"
+      registry_delete_detached_tag "$package" "$token" "$tag" "$version_id" "$digest"
       ;;
     *)
       return 1

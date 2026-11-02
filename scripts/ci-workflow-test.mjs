@@ -442,8 +442,10 @@ try {
   fs.rmSync(atomicDir, { recursive: true, force: true });
 }
 
-function packageVersion(id, tags) {
-  return { id, metadata: { package_type: "container", container: { tags } } };
+function packageVersion(id, tags, name = `sha256:${id.toString(16).padStart(64, "0")}`) {
+  const version = { id, metadata: { package_type: "container", container: { tags } } };
+  if (name) version.name = name;
+  return version;
 }
 function runRegistryDelete(tag, responses) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "registry-delete-"));
@@ -455,6 +457,19 @@ function runRegistryDelete(tag, responses) {
   const stateFile = path.join(dir, "state");
   fs.mkdirSync(bin);
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
+  fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
+    'import { readFileSync } from "node:fs";',
+    'const responses = JSON.parse(readFileSync(process.argv[2], "utf8"));',
+    'const index = Number(process.argv[3]);',
+    'const emitAll = process.argv[4] === "1";',
+    'const entry = responses[Math.min(index, responses.length) - 1];',
+    'const multi = Array.isArray(entry) && entry.length > 0 && entry.every((item) => Array.isArray(item));',
+    'const pages = multi ? entry : [entry];',
+    'for (const page of emitAll ? pages : pages.slice(0, 1)) {',
+    '  process.stdout.write(JSON.stringify(page) + "\\n");',
+    '}',
+    '',
+  ].join("\n"));
   fs.writeFileSync(path.join(bin, "gh"), `#!/bin/bash
 set -euo pipefail
 printf 'token=%s\\n' "\${GH_TOKEN-}" >>${JSON.stringify(ghLog)}
@@ -462,8 +477,12 @@ printf 'args=%s\\n' "$*" >>${JSON.stringify(ghLog)}
 method=GET
 req_path=""
 prev=""
+has_paginate=0
+has_per_page=0
 for arg in "$@"; do
   if [[ "\$prev" == --method ]]; then method="\$arg"; fi
+  if [[ "\$arg" == --paginate ]]; then has_paginate=1; fi
+  if [[ "\$arg" =~ (^|[?&])per_page=100(\$|&) ]]; then has_per_page=1; fi
   case "\$arg" in
     /users/*|/user/*|/orgs/*) req_path="\$arg" ;;
   esac
@@ -477,7 +496,9 @@ n=0
 if [[ -f ${JSON.stringify(stateFile)} ]]; then n=\$(cat ${JSON.stringify(stateFile)}); fi
 n=\$((n + 1))
 printf '%s' "\$n" >${JSON.stringify(stateFile)}
-node -e 'const pages=require(process.argv[1]); const i=Number(process.argv[2]); process.stdout.write(JSON.stringify(pages[Math.min(i, pages.length)-1]));' ${JSON.stringify(responsesFile)} "\$n"
+emit_all=0
+if [[ "\$has_paginate" == 1 && "\$has_per_page" == 1 ]]; then emit_all=1; fi
+node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all"
 `);
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/bash
 printf '%s\\n' "\$*" >>${JSON.stringify(dockerLog)}
@@ -511,22 +532,29 @@ exit 0
     method: match[1],
     path: match[2],
   }));
+  const args = [...ghText.matchAll(/^args=(.*)$/gm)].map(match => match[1]);
   const tokens = [...ghText.matchAll(/^token=(.*)$/gm)].map(match => match[1]);
   const dockerText = fs.existsSync(dockerLog) ? fs.readFileSync(dockerLog, "utf8") : "";
   const status = Number(fs.readFileSync(statusFile, "utf8").trim());
   fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(result.error, undefined, result.error && result.error.message);
-  return { status, calls, tokens, dockerText, stdout: result.stdout, stderr: result.stderr };
+  return { status, calls, args, tokens, dockerText, stdout: result.stdout, stderr: result.stderr };
 }
 function assertUserPackageRoute(outcome) {
   assert.ok(outcome.calls.length > 0, outcome.stderr || outcome.stdout);
+  assert.equal(outcome.args.length, outcome.calls.length);
   assert.ok(outcome.tokens.every(token => token === "promote-job-token"), outcome.tokens.join(","));
-  for (const call of outcome.calls) {
+  outcome.calls.forEach((call, index) => {
     assert.equal(call.path.startsWith("/users/jatmn/packages/container/jmodguard-bot/versions"), true, call.path);
     assert.equal(call.path.includes("/orgs/"), false, call.path);
-  }
+    if (call.method !== "GET") return;
+    assert.equal(call.path, "/users/jatmn/packages/container/jmodguard-bot/versions?per_page=100", call.path);
+    assert.match(outcome.args[index], /(^| )--paginate( |$)/);
+    assert.match(outcome.args[index], /(?:^|[?&])per_page=100(?:&|$)/);
+  });
 }
 const versionsRoot = "/users/jatmn/packages/container/jmodguard-bot/versions";
+const versionsList = `${versionsRoot}?per_page=100`;
 const singleTag = "a".repeat(40);
 const stagedTag = "b".repeat(40);
 const absentTag = "c".repeat(40);
@@ -537,7 +565,7 @@ const single = runRegistryDelete(singleTag, [[
 assertUserPackageRoute(single);
 assert.equal(single.status, 0, single.stderr);
 assert.deepEqual(single.calls, [
-  { method: "GET", path: versionsRoot },
+  { method: "GET", path: versionsList },
   { method: "DELETE", path: `${versionsRoot}/11` },
 ]);
 assert.equal(single.dockerText, "");
@@ -551,10 +579,11 @@ const staged = runRegistryDelete(stagedTag, [
 assertUserPackageRoute(staged);
 assert.equal(staged.status, 0, staged.stderr);
 assert.deepEqual(staged.calls, [
-  { method: "GET", path: versionsRoot },
-  { method: "GET", path: versionsRoot },
+  { method: "GET", path: versionsList },
+  { method: "GET", path: versionsList },
   { method: "DELETE", path: `${versionsRoot}/99` },
 ]);
+assert.doesNotMatch(staged.dockerText, /imagetools/);
 assert.equal(staged.calls.some(call => call.path.endsWith("/21")), false);
 assert.match(staged.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag}`));
 assert.match(staged.dockerText, /--push/);
@@ -563,6 +592,76 @@ const absent = runRegistryDelete(absentTag, [[
 ]]);
 assertUserPackageRoute(absent);
 assert.notEqual(absent.status, 0);
-assert.deepEqual(absent.calls, [{ method: "GET", path: versionsRoot }]);
+assert.deepEqual(absent.calls, [{ method: "GET", path: versionsList }]);
 assert.equal(absent.dockerText, "");
+assert.match(absent.stderr, /registry tag .* matched no package version/);
+const preservedDigest = "sha256:" + "d".repeat(64);
+const stagingName = `_publish-${"b".repeat(12)}-7`;
+function sharedThen(pages) {
+  return [
+    [packageVersion(21, [stagingName, stagedTag], preservedDigest)],
+    pages,
+  ];
+}
+function assertSplitDelete(outcome) {
+  assertUserPackageRoute(outcome);
+  assert.equal(outcome.status, 0, outcome.stderr);
+  assert.deepEqual(outcome.calls, [
+    { method: "GET", path: versionsList },
+    { method: "GET", path: versionsList },
+    { method: "DELETE", path: `${versionsRoot}/99` },
+  ]);
+  assert.equal(outcome.calls.some(call => call.path.endsWith("/21")), false);
+  assert.match(outcome.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag}`));
+  assert.match(outcome.dockerText, /--push/);
+  assert.doesNotMatch(outcome.dockerText, /imagetools/);
+}
+const preservedFirst = runRegistryDelete(stagedTag, sharedThen([
+  [packageVersion(21, [stagingName], preservedDigest)],
+  [packageVersion(99, [stagedTag])],
+]));
+assertSplitDelete(preservedFirst);
+const disposableFirst = runRegistryDelete(stagedTag, sharedThen([
+  [packageVersion(99, [stagedTag])],
+  [packageVersion(21, [stagingName], preservedDigest)],
+]));
+assertSplitDelete(disposableFirst);
+function assertNoPartialUntag(outcome, message) {
+  assertUserPackageRoute(outcome);
+  assert.notEqual(outcome.status, 0);
+  assert.match(outcome.stderr, message);
+  assert.match(outcome.stderr, new RegExp(`restored to ${preservedDigest}`));
+  assert.equal(outcome.calls.some(call => call.method === "DELETE"), false, JSON.stringify(outcome.calls));
+  const pushed = outcome.dockerText.indexOf("--push");
+  const restored = outcome.dockerText.indexOf("imagetools create");
+  assert.ok(pushed !== -1 && restored > pushed, outcome.dockerText);
+  assert.match(outcome.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
+}
+const noDisposable = runRegistryDelete(stagedTag, sharedThen([
+  [packageVersion(21, [stagingName], preservedDigest)],
+  [packageVersion(50, ["latest"])],
+]));
+assertNoPartialUntag(noDisposable, /matched no disposable package version/);
+const manyDisposable = runRegistryDelete(stagedTag, sharedThen([
+  [packageVersion(21, [stagingName], preservedDigest), packageVersion(99, [stagedTag])],
+  [packageVersion(100, [stagedTag])],
+]));
+assertNoPartialUntag(manyDisposable, /matched 2 disposable package versions/);
+const manyVersions = runRegistryDelete(singleTag, [[
+  [packageVersion(11, [singleTag])],
+  [packageVersion(13, [singleTag])],
+]]);
+assertUserPackageRoute(manyVersions);
+assert.notEqual(manyVersions.status, 0);
+assert.match(manyVersions.stderr, /matched 2 package versions/);
+assert.equal(manyVersions.dockerText, "");
+assert.equal(manyVersions.calls.some(call => call.method === "DELETE"), false, JSON.stringify(manyVersions.calls));
+const noDigest = runRegistryDelete(stagedTag, [[
+  packageVersion(21, [stagingName, stagedTag], null),
+]]);
+assertUserPackageRoute(noDigest);
+assert.notEqual(noDigest.status, 0);
+assert.match(noDigest.stderr, /preserved version 21 has no digest to restore/);
+assert.equal(noDigest.dockerText, "");
+assert.equal(noDigest.calls.some(call => call.method === "DELETE"), false);
 console.log("ci-workflow-test: ok");
