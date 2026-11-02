@@ -467,22 +467,106 @@ registry_promote_tag() {
   docker buildx imagetools create "$@" || return 1
 }
 
+registry_user_versions_path() {
+  printf '/users/jatmn/packages/container/%s/versions' "$1"
+}
+
+registry_fetch_versions() {
+  local package="$1" token="$2"
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
+    "$(registry_user_versions_path "$package")"
+}
+
+registry_delete_version() {
+  local package="$1" token="$2" version_id="$3"
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --method DELETE \
+    "$(registry_user_versions_path "$package")/${version_id}" >/dev/null
+}
+
+registry_classify_tag_version() {
+  local tag="$1"
+  jq -r --arg tag "$tag" '
+    [ .[] | select((.metadata.container.tags // []) | index($tag) != null) ]
+    | if length == 1 then
+        if (.[0].metadata.container.tags | length) == 1 then
+          "delete \(.[0].id)"
+        else
+          "untag \(.[0].id)"
+        end
+      else
+        empty
+      end
+  '
+}
+
+registry_disposable_version_id() {
+  local tag="$1" keep_id="$2"
+  jq -r --arg tag "$tag" --argjson keep "$keep_id" '
+    (map(select(.id == $keep)) | first) as $kept
+    | if $kept == null then empty
+      elif (($kept.metadata.container.tags // []) | index($tag) != null) then empty
+      else
+        [ .[] | select(.id != $keep and ((.metadata.container.tags // []) == [$tag])) ]
+        | if length == 1 then .[0].id else empty end
+      end
+  '
+}
+
+registry_move_tag_onto_empty_image() {
+  local image_tag="$1" dir
+  dir="$(mktemp -d)" || return 1
+  printf 'FROM scratch\n' >"${dir}/Dockerfile"
+  if ! docker buildx build --builder default --platform linux/amd64 \
+    --provenance=false --sbom=false --push --progress plain \
+    --file "${dir}/Dockerfile" --tag "$image_tag" "$dir"; then
+    rm -rf "$dir"
+    return 1
+  fi
+  rm -rf "$dir"
+}
+
+registry_delete_detached_tag() {
+  local package="$1" token="$2" tag="$3" keep_id="$4"
+  local payload disposable attempt
+  for attempt in 1 2 3; do
+    payload="$(registry_fetch_versions "$package" "$token")" || return 1
+    disposable="$(printf '%s\n' "$payload" | registry_disposable_version_id "$tag" "$keep_id")" || return 1
+    if [[ "$disposable" =~ ^[0-9]+$ ]]; then
+      registry_delete_version "$package" "$token" "$disposable"
+      return
+    fi
+    if [[ "$attempt" != 3 ]]; then
+      sleep 2
+    fi
+  done
+  return 1
+}
+
 registry_delete_tag() {
-  local image_tag="$1" package tag token version_id
+  local image_tag="$1" package tag token payload decision action version_id
   [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
   package="${BASH_REMATCH[1]}"
   tag="${BASH_REMATCH[2]}"
   token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
   [[ -n "$token" ]] || return 1
-  version_id="$(
-    GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
-      "/orgs/jatmn/packages/container/${package}/versions" \
-      --jq ".[] | select(.metadata.container.tags == [\"${tag}\"]) | .id"
-  )" || return 1
-  version_id="${version_id%%$'\n'*}"
+  payload="$(registry_fetch_versions "$package" "$token")" || return 1
+  decision="$(printf '%s\n' "$payload" | registry_classify_tag_version "$tag")" || return 1
+  [[ -n "$decision" ]] || return 1
+  action="${decision%% *}"
+  version_id="${decision#* }"
   [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
-  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --method DELETE \
-    "/orgs/jatmn/packages/container/${package}/versions/${version_id}" >/dev/null
+  case "$action" in
+    delete)
+      registry_delete_version "$package" "$token" "$version_id"
+      ;;
+    untag)
+      registry_move_tag_onto_empty_image "$image_tag" || return 1
+      registry_delete_detached_tag "$package" "$token" "$tag" "$version_id"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 promote_image_tag() {
