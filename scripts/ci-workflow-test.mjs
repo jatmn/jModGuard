@@ -513,7 +513,8 @@ function packageVersion(id, tags, name = `sha256:${id.toString(16).padStart(64, 
   if (name) version.name = name;
   return version;
 }
-function runRegistryDelete(tag, responses) {
+function runRegistryDelete(tag, responses, options = {}) {
+  const deleteStatus = Number.isInteger(options.deleteStatus) ? options.deleteStatus : 0;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "registry-delete-"));
   const bin = path.join(dir, "bin");
   const ghLog = path.join(dir, "gh.log");
@@ -556,7 +557,7 @@ for arg in "$@"; do
 done
 printf 'method=%s path=%s\\n' "\$method" "\$req_path" >>${JSON.stringify(ghLog)}
 if [[ "\$method" == DELETE ]]; then
-  exit 0
+  exit ${deleteStatus}
 fi
 n=0
 if [[ -f ${JSON.stringify(stateFile)} ]]; then n=\$(cat ${JSON.stringify(stateFile)}); fi
@@ -713,6 +714,23 @@ const manyDisposable = runRegistryDelete(stagedTag, sharedThen([
   [packageVersion(100, [stagedTag])],
 ]));
 assertNoPartialUntag(manyDisposable, /matched 2 disposable package versions/);
+const deleteFailed = runRegistryDelete(stagedTag, sharedThen([
+  [packageVersion(21, [stagingName], preservedDigest)],
+  [packageVersion(99, [stagedTag])],
+]), { deleteStatus: 1 });
+assertUserPackageRoute(deleteFailed);
+assert.notEqual(deleteFailed.status, 0);
+assert.match(deleteFailed.stderr, /disposable package version 99 could not be deleted/);
+assert.match(deleteFailed.stderr, new RegExp(`restored to ${preservedDigest}`));
+assert.deepEqual(deleteFailed.calls, [
+  { method: "GET", path: versionsList },
+  { method: "GET", path: versionsList },
+  { method: "DELETE", path: `${versionsRoot}/99` },
+]);
+const deletePushed = deleteFailed.dockerText.indexOf("--push");
+const deleteRestored = deleteFailed.dockerText.indexOf("imagetools create");
+assert.ok(deletePushed !== -1 && deleteRestored > deletePushed, deleteFailed.dockerText);
+assert.match(deleteFailed.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
 const manyVersions = runRegistryDelete(singleTag, [[
   [packageVersion(11, [singleTag])],
   [packageVersion(13, [singleTag])],
