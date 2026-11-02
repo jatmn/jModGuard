@@ -472,22 +472,25 @@ async fn automod_try_delete_message(
         }
     };
     let raced = if forced_cancel {
-        crate::discord::DiscordCall::Cancelled
+        Ok(crate::discord::DiscordCall::Cancelled)
     } else {
-        crate::discord::race_discord_call(
-            &app.activation,
-            http.delete_message(channel.into(), message.into(), None),
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::discord::race_discord_call(
+                &app.activation,
+                http.delete_message(channel.into(), message.into(), None),
+            ),
         )
         .await
     };
     match raced {
-        crate::discord::DiscordCall::Finished(Ok(_)) => {
+        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
             logging::complete_prepared_automod_delete(
                 app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
             )
             .await;
         }
-        crate::discord::DiscordCall::Finished(Err(error)) => {
+        Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
             let removal = app.automod_delete_marks.remove_unconfirmed(
                 guild_id,
                 channel,
@@ -529,7 +532,7 @@ async fn automod_try_delete_message(
                 Instant::now(),
             );
         }
-        crate::discord::DiscordCall::Cancelled => {
+        Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
             let skip_uncertain = {
                 #[cfg(test)]
                 {
@@ -3861,6 +3864,93 @@ mod tests {
             None,
         )
         .expect("plain delete");
+        assert_eq!(report.event, "message_delete");
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn stalled_automod_delete_times_out_and_clears_its_mark() {
+        use serenity::model::id::{ChannelId, GuildId, MessageId};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "automod_timeout_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        app.activation.mark_lock_held(true);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let n = stream.read(&mut bytes).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&bytes[..n]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("DELETE "));
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .ratelimiter_disabled(true)
+            .build();
+        let task_app = Arc::clone(&app);
+        let task = tokio::spawn(async move {
+            super::automod_try_delete_message(
+                &task_app,
+                &http,
+                10,
+                70,
+                42,
+                "badword",
+                "Bad words",
+                "blocked term",
+            )
+            .await;
+        });
+        received.await.unwrap();
+        assert!(app.automod_delete_marks.inner.lock().contains(10, 70, 42));
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        assert!(!task.is_finished(), "delete timed out before ten seconds");
+        tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let finished = task.is_finished();
+        if !finished {
+            task.abort();
+        }
+        let _ = task.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            finished,
+            "stalled REST delete exceeded its ten-second deadline"
+        );
+        assert!(!app.automod_delete_marks.inner.lock().contains(10, 70, 42));
+        let report = crate::logging::observed_delete_report(
+            &app,
+            GuildId::new(10),
+            ChannelId::new(70),
+            MessageId::new(42),
+            None,
+        )
+        .expect("a later external deletion stays plain");
         assert_eq!(report.event, "message_delete");
         drop(app);
         let _ = std::fs::remove_file(&path);
