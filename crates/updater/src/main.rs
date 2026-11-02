@@ -6,7 +6,7 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 #[cfg(test)]
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
-use jmodguard_updater::oci::{Registry, sha256_hex};
+use jmodguard_updater::oci::{Registry, registry_unreachable, sha256_hex};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1566,6 +1566,49 @@ impl Supervisor {
         Ok(false)
     }
 
+    /// Outage recovery may start the built-in binary only at its exact core
+    /// schema. A newer bot migrates on open, and that migration stays inside
+    /// the paired stop, prepare, and `Ack::Starting` sequence.
+    fn baked_core_fits(&self, schema: i64) -> bool {
+        schema == self.baked_compatibility.core
+    }
+
+    /// Whether the recorded guild schema equals the binary about to start.
+    /// Rollback already uses this comparison, and an independent switch uses
+    /// the same equality before replacing a service. A built-in binary has no
+    /// release, so its guild schema is this image's baked guild schema.
+    fn recorded_guild_matches(
+        &self,
+        state: &db::ComponentUpdate,
+        release: Option<&ComponentRelease>,
+    ) -> bool {
+        let guild = release
+            .and_then(|release| release.upgrade.as_ref())
+            .map_or(self.baked_compatibility.guild, |contract| {
+                contract.guild_schema
+            });
+        state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(guild)
+    }
+
+    async fn start_baked_after_registry_outage(
+        &mut self,
+        state: &db::ComponentUpdate,
+        schema: i64,
+    ) -> Result<()> {
+        ensure!(
+            self.baked_core_fits(schema),
+            "baked application cannot open database; use owner recovery"
+        );
+        ensure!(
+            self.recorded_guild_matches(state, None),
+            db::APP_ONLY_SCHEMA_CHANGE_REFUSED
+        );
+        tracing::error!("registry unreachable at boot; starting the built-in application");
+        let path = self.baked.clone();
+        let sha = self.base_sha.clone();
+        self.start(&path, &sha, None).await
+    }
+
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some((failed, error)) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
@@ -1601,13 +1644,20 @@ impl Supervisor {
                 release.base_abi == self.base_abi,
                 "installed application requires a different base ABI"
             );
-            let path = stage(
+            let path = match stage(
                 &self.registry,
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
             )
-            .await?;
+            .await
+            {
+                Ok(path) => path,
+                Err(error) if registry_unreachable(&error) => {
+                    return self.start_baked_after_registry_outage(state, schema).await;
+                }
+                Err(error) => return Err(error),
+            };
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
         } else {
@@ -1926,15 +1976,8 @@ impl Supervisor {
                             && schema <= r.max_schema),
                     "rollback schema is incompatible"
                 );
-                let previous_guild = previous
-                    .as_ref()
-                    .and_then(|r| r.upgrade.as_ref())
-                    .map_or(self.baked_compatibility.guild, |contract| {
-                        contract.guild_schema
-                    });
                 ensure!(
-                    state.observed.as_ref().and_then(|seen| seen.guild_schema)
-                        == Some(previous_guild),
+                    self.recorded_guild_matches(&state, previous.as_ref()),
                     "rollback guild schema is incompatible"
                 );
                 let failed = self
@@ -2135,14 +2178,8 @@ impl Supervisor {
                 }),
             "rollback schema is incompatible"
         );
-        let previous_guild = previous
-            .as_ref()
-            .and_then(|r| r.upgrade.as_ref())
-            .map_or(self.baked_compatibility.guild, |contract| {
-                contract.guild_schema
-            });
         ensure!(
-            state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(previous_guild),
+            self.recorded_guild_matches(state, previous.as_ref()),
             "rollback guild schema is incompatible"
         );
         // Keep the failed identity until the restarted prior is ready. A later
