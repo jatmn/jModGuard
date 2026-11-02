@@ -244,6 +244,19 @@ fn revision_nineteen_observation_can_install_a_newer_launcher() {
 }
 
 #[test]
+fn prior_revisions_can_install_signature_payload_fix() {
+    for revision in [26, 27, 28, 29] {
+        let advice = launcher_advice(
+            revision,
+            jmodguard::db::LAUNCHER_REVISION,
+            jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+        );
+        assert_eq!(advice["state"], "optional");
+        assert_eq!(advice["installable"], true);
+    }
+}
+
+#[test]
 fn required_verifier_launcher_is_blocked_before_the_verifier_era() {
     let verifier = jmodguard::db::VERIFIER_LAUNCHER_REVISION;
     for minimum in [verifier, verifier + 1] {

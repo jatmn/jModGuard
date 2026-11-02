@@ -3,6 +3,7 @@
 
 pub mod oci;
 pub mod signature;
+#[cfg(test)]
 pub mod signing_fixture;
 pub mod storage;
 

@@ -2,11 +2,11 @@
 //! Tiny ELF fixtures stand in for Discord/application work; their readiness and
 //! exit behavior are real, while the test explicitly simulates a future migration.
 use super::*;
+use crate::signature::signature_rejection_phrase;
+use crate::signature::signature_tag_for_digest;
+use crate::signing_fixture::{BadSignature, SigningFixture, SigningKeyChoice};
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
-use jmodguard_updater::signature::signature_rejection_phrase;
-use jmodguard_updater::signature::signature_tag_for_digest;
-use jmodguard_updater::signing_fixture::{BadSignature, SigningFixture, SigningKeyChoice};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -70,7 +70,7 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
         objects,
         role,
         &manifest_hash,
-        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
+        &crate::signing_fixture::signature_not_after_far_future(),
         SigningKeyChoice::Current,
     );
     ComponentRelease {
@@ -8368,13 +8368,10 @@ async fn expired_signature_blocks_a_fresh_stage_and_still_boot_repairs() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        fresh.to_string(),
-        jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE
-    );
+    assert_eq!(fresh.to_string(), crate::signature::EXPIRED_IMAGE_SIGNATURE);
     assert_eq!(
         signature_rejection_phrase(&fresh),
-        Some(jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE)
+        Some(crate::signature::EXPIRED_IMAGE_SIGNATURE)
     );
     assert_nothing_staged(&root, &service.staging);
     service
