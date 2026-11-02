@@ -2,7 +2,7 @@
 
 The old general SQL message archive remains retired. A separate, rolling guild-store
 snapshot keeps the latest observed text and attachment metadata for eligible human
-messages in guilds with an edit, delete or bulk-delete log destination. It expires
+messages in guilds with an edit, delete, bulk-delete, or automod_delete log destination. It expires
 at most 24 hours after the original message creation; edits never extend that time.
 Capacity pressure can evict it earlier. It stores no attachment bytes. The bounded [member directory](MEMBERS.md) retains current
 member identity and known join dates, plus people with confirmed ban history. It does
@@ -46,10 +46,19 @@ Joining, leaving and talking still do not maintain a general activity archive.
   distinguish retained, known missing, storage unknown and filtered entries,
   and attach a transient
   UTF-8 transcript capped at 256 KiB. The summary keeps the total and filtered
-  counts without including ignored authors' content. A definite
+  counts without including ignored authors' content. A source-channel exclusion
+  or a bulk destination already known to be unavailable suppresses that report,
+  including when a pending automod delete falls back through `message_bulk_delete`.
+  A user filter still sends the summary and filtered count without that author's
+  content. A definite
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
-  ambiguous timeout is never resent. The transcript is not archived.
+  ambiguous timeout or cancellation is never resent, and it does not release a
+  deferred replay of the same deletion. That in-flight, deferred, or ambiguous
+  bulk record stays until settlement or the bulk-log cap; the ten-minute mark
+  expiry does not drop it. A delivered bulk row still expires on that timer. A pending automod delete replayed through
+  `message_bulk_delete` because no `message_delete` channel is configured uses
+  that same attachment fallback. The transcript is not archived.
 - Join reports use the delivered user and the join timestamp in the Gateway member
   payload; they do not look up a saved directory join date. Leave reports use the
   saved directory stay when an authoritative departure decision is available,
