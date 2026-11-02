@@ -11,11 +11,12 @@ const publication = fs.readFileSync(path.join(root, ".github/workflows/publish.y
 const combined = workflow + "\n" + publication.replace(/^  ci:\n[\s\S]*?(?=^  release:)/m, "");
 const jobs = new Map([...combined.matchAll(/^  ([a-z][a-z-]*):\n([\s\S]*?)(?=^  [a-z][a-z-]*:\n|$(?![\s\S]))/gm)]
   .map(match => [match[1], match[2]]));
-for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish-build", "publish-sign"]) {
+for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish-build", "publish-promote"]) {
   assert.ok(jobs.has(name), "missing job: " + name);
 }
 const publishBuild = jobs.get("publish-build");
-const publishSign = jobs.get("publish-sign");
+const publishPromote = jobs.get("publish-promote");
+assert.equal(jobs.has("publish-sign"), false, "promotion must not stay in the per-component sign matrix");
 assert.doesNotMatch(combined, /^  (?:pull_request_target|workflow_run):/m);
 assert.doesNotMatch(workflow, /\bself-hosted\b|^    paths(?:-ignore)?:/m);
 assert.match(workflow, /^permissions:\n  contents: read$/m);
@@ -40,20 +41,70 @@ assert.match(publishBuild, /upload-artifact@/);
 assert.match(publishBuild, /publish-state-\$\{\{ matrix\.component \}\}/);
 assert.doesNotMatch(publishBuild, /outputs:\s*\n\s+should_sign:/);
 assert.match(publishBuild, /cosign-installer@/);
-assert.match(publishSign, /needs: \[.*publish-build.*\]/);
-assert.doesNotMatch(publishSign, /should_sign/);
-assert.match(publishSign, /download-artifact@/);
-assert.match(publishSign, /JMODGUARD_UPDATE_SIGNING_KEY/);
-assert.match(publishSign, /JMODGUARD_PUBLISH_PHASE: sign/);
-assert.doesNotMatch(publishSign, /JMODGUARD_PUBLISH_PHASE: build/);
-assert.match(publishSign, /packages: write/);
-assert.doesNotMatch(publishSign, /contents: write/);
+assert.match(publishPromote, /needs: \[.*publish-build.*\]/);
+assert.doesNotMatch(publishPromote, /should_sign/);
+assert.match(publishPromote, /download-artifact@/);
+assert.match(publishPromote, /JMODGUARD_UPDATE_SIGNING_KEY/);
+assert.match(publishPromote, /JMODGUARD_PUBLISH_PHASE: sign/);
+assert.doesNotMatch(publishPromote, /JMODGUARD_PUBLISH_PHASE: build/);
+assert.match(publishPromote, /packages: write/);
+assert.doesNotMatch(publishPromote, /contents: write/);
+assert.doesNotMatch(publishPromote, /continue-on-error|fail-fast:|matrix:|^\s+strategy:/m);
+assert.match(publishPromote, /needs\.publish-build\.result == 'success'/);
+assert.doesNotMatch(publishBuild, /JMODGUARD_PUBLISH_PHASE: sign/);
 assert.match(jobs.get("release"), /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
 assert.match(jobs.get("release"), /sha: \$\{\{ steps\.release\.outputs\.sha \}\}/);
 assert.match(jobs.get("prepare-publication"), /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.release\.outputs\.created == 'true' && needs\.release\.outputs\.sha \|\| '' \}\}/);
 assert.match(jobs.get("prepare-publication"), /release_sha: \$\{\{ steps\.prepare\.outputs\.release_sha \}\}/);
 assert.match(publishBuild, /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
-assert.match(publishSign, /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
+assert.match(publishPromote, /JMODGUARD_RELEASE_SHA: \$\{\{ needs\.prepare-publication\.outputs\.release_sha \}\}/);
+function stepScript(job, stepName) {
+  const block = job.match(new RegExp(`^      - name: ${stepName}\\n([\\s\\S]*?)(?=^      - |$(?![\\s\\S]))`, "m"))?.[1];
+  assert.ok(block, "missing step: " + stepName);
+  const body = block.match(/^        run: \|\n([\s\S]*)/m)?.[1];
+  assert.ok(body, "missing run script: " + stepName);
+  return body.replace(/^ {10}/gm, "");
+}
+const matrixComponents = publishBuild.match(/component: \[([^\]]+)\]/)[1].split(",").map(item => item.trim());
+const requireScript = stepScript(publishPromote, "Require every component build");
+const promoteScript = stepScript(publishPromote, "Sign and promote every component");
+const requiredComponents = requireScript.match(/for component in ([^;\n]+)/)[1].trim().split(/\s+/);
+const promotedComponents = promoteScript.match(/for component in ([^;\n]+)/)[1].trim().split(/\s+/);
+assert.deepEqual(matrixComponents, ["bot", "api", "webui"]);
+assert.deepEqual(requiredComponents, matrixComponents, "promotion must require every matrix build");
+assert.deepEqual(promotedComponents, matrixComponents, "promotion must cover every matrix build");
+const buildSteps = [...publishBuild.matchAll(/^      - ([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)].map(match => match[1]);
+const recordStep = buildSteps.find(step => step.startsWith("name: Record successful component build"));
+const okStep = buildSteps.find(step => step.includes("publish-build-ok-${{ matrix.component }}"));
+assert.ok(recordStep && okStep);
+assert.ok(publishBuild.indexOf("JMODGUARD_PUBLISH_PHASE: build") < publishBuild.indexOf(recordStep));
+assert.ok(publishBuild.indexOf(recordStep) < publishBuild.indexOf(okStep));
+assert.doesNotMatch(recordStep, /\bif:/);
+assert.doesNotMatch(okStep, /if:\s*always\(\)/);
+const promoteAt = publishPromote.indexOf("JMODGUARD_PUBLISH_PHASE: sign");
+const beforePromote = publishPromote.slice(0, promoteAt);
+assert.ok(beforePromote.indexOf("publish-build-ok-*") < beforePromote.indexOf("Require every component build"));
+assert.ok(beforePromote.includes("Require every component build"));
+function promotionGate(present) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "publish-ok-"));
+  try {
+    for (const component of present) {
+      const marker = path.join(dir, "publish-build-ok", `publish-build-ok-${component}`);
+      fs.mkdirSync(marker, { recursive: true });
+      fs.writeFileSync(path.join(marker, "ok"), `${component}\n`);
+    }
+    return spawnSync("bash", ["-c", requireScript], {
+      encoding: "utf8", env: { ...process.env, RUNNER_TEMP: dir },
+    }).status;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+assert.equal(promotionGate(matrixComponents), 0, "every component build must allow the promotion gate");
+for (const missing of matrixComponents) {
+  assert.notEqual(promotionGate(matrixComponents.filter(component => component !== missing)), 0,
+    `missing ${missing} build must block promotion`);
+}
 assert.doesNotMatch(combined, /gh pr merge|enablePullRequestAutoMerge|auto-merge/);
 for (const match of combined.matchAll(/^\s+(?:- )?uses: (\S+)/gm)) {
   if (match[1].startsWith("./")) continue;
@@ -235,7 +286,7 @@ try {
   assert.ok(jobs.has("release-ci"), "differing release source requires validation");
   assert.match(jobs.get("release-ci"), /uses: \.\/\.github\/workflows\/ci\.yml/);
   assert.match(publishBuild, /needs: \[.*release-ci.*\]/);
-  assert.match(publishSign, /needs: \[.*release-ci.*\]/);
+  assert.match(publishPromote, /needs: \[.*release-ci.*\]/);
   for (const source of [release, base]) {
     context.needs["prepare-publication"].outputs.release_sha = source;
     assert.ok(condition(jobs.get("release-ci"), context));
@@ -255,9 +306,9 @@ try {
         assert.equal(condition(publishBuild, context), result === "success");
         context.needs["publish-build"] = { result: result, outputs: {} };
         assert.equal(
-          condition(publishSign, context),
+          condition(publishPromote, context),
           result === "success",
-          "signing must follow a successful build matrix",
+          "promotion must follow a successful build matrix",
         );
       }
     }
@@ -268,9 +319,9 @@ try {
     context.needs["release-ci"].result = "skipped";
     assert.ok(condition(publishBuild, context), "same-source and manual routes keep original checks");
     context.needs["publish-build"] = { result: "failure", outputs: {} };
-    assert.equal(condition(publishSign, context), false, "failed build must not run signing");
+    assert.equal(condition(publishPromote, context), false, "failed build must not promote");
     context.needs["publish-build"].result = "success";
-    assert.ok(condition(publishSign, context), "successful build must allow per-component signing");
+    assert.ok(condition(publishPromote, context), "successful builds must allow promotion");
   }
 
   // Saved main and release plans both skip release creation before restoration,
