@@ -926,14 +926,28 @@ impl Supervisor {
         state: &db::ComponentUpdate,
     ) -> Result<(PathBuf, String, Option<ComponentRelease>)> {
         if let Some(release) = state.installed.clone() {
-            let path = stage(
+            let path = match stage(
                 &self.registry,
                 &release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
                 StageTrust::InstalledRelease,
             )
-            .await?;
+            .await
+            {
+                Ok(path) => path,
+                Err(error) if registry_unreachable(&error) => {
+                    let schema = self.control.schema_version().await?;
+                    let fallback = self
+                        .baked_registry_fallback(state, schema, &release)
+                        .await?;
+                    tracing::error!(
+                        "registry unreachable; using the built-in application for rollback"
+                    );
+                    return Ok(fallback);
+                }
+                Err(error) => return Err(error),
+            };
             let sha = release.source_sha.clone();
             Ok((path, sha, Some(release)))
         } else {
@@ -1921,12 +1935,12 @@ impl Supervisor {
         }
     }
 
-    async fn start_baked_after_registry_outage(
+    async fn baked_registry_fallback(
         &mut self,
         state: &db::ComponentUpdate,
         schema: i64,
         release: &ComponentRelease,
-    ) -> Result<()> {
+    ) -> Result<(PathBuf, String, Option<ComponentRelease>)> {
         ensure!(
             self.baked_core_fits(schema),
             "baked application cannot open database; use owner recovery"
@@ -1935,12 +1949,20 @@ impl Supervisor {
             self.recorded_guild_matches(state, None),
             db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
-        tracing::error!("registry unreachable at boot; starting the built-in application");
         self.baked_fallback_installed = Some(release.clone());
         self.record_boot_mismatch_for_installed(release, REGISTRY_OUTAGE_BOOT_MISMATCH)
             .await?;
-        let path = self.baked.clone();
-        let sha = self.base_sha.clone();
+        Ok((self.baked.clone(), self.base_sha.clone(), None))
+    }
+
+    async fn start_baked_after_registry_outage(
+        &mut self,
+        state: &db::ComponentUpdate,
+        schema: i64,
+        release: &ComponentRelease,
+    ) -> Result<()> {
+        let (path, sha, _) = self.baked_registry_fallback(state, schema, release).await?;
+        tracing::error!("registry unreachable at boot; starting the built-in application");
         self.start(&path, &sha, None).await
     }
 
@@ -2463,8 +2485,16 @@ impl Supervisor {
         {
             Ok(path) => path,
             Err(error) => {
-                self.record_component_failure(candidate, format!("download: {error:#}"))
-                    .await?;
+                if registry_unreachable(&error) && self.running.is_none() {
+                    if self.standby.is_none() {
+                        self.standby = Some(self.installed_fallback(&state).await?);
+                    }
+                    self.rollback_independent(&state, candidate, format!("download: {error:#}"))
+                        .await?;
+                } else {
+                    self.record_component_failure(candidate, format!("download: {error:#}"))
+                        .await?;
+                }
                 return Ok(false);
             }
         };

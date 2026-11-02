@@ -9302,3 +9302,159 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
     drop((db, control));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_outage_recovers_without_a_child_and_preserves_a_live_child() {
+    for live_child in [false, true] {
+        let root =
+            std::env::temp_dir().join(format!("runtime-outage-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let baked = executable(&root, "baked-bot").await;
+        let (db, control) = open_launcher_db(&root).await;
+        let schema = control.schema_version().await.unwrap();
+        let installed = release_at("bot", 'c', schema);
+        let stamp = 1_700_000_000;
+        install_for_outage(&db, &control, &installed, stamp).await;
+        control
+            .running("bot", None, fresh_observation(now()), now())
+            .await
+            .unwrap();
+        control
+            .running("api", None, fresh_observation(now()), now())
+            .await
+            .unwrap();
+        let candidate = release_at("bot", 'd', schema);
+        control
+            .checked("bot", "latest", Some(candidate.clone()), None, now())
+            .await
+            .unwrap();
+        db::request_component_install(&db, "bot", &candidate.digest, now())
+            .await
+            .unwrap();
+        let (base, server) = status_registry(503).await;
+        let mut service = controller(
+            "bot",
+            baked.clone(),
+            Registry::new(&base).unwrap(),
+            control.clone(),
+            &root,
+        );
+        let original_pid = if live_child {
+            let installed_path = root.join("installed-bot");
+            tokio::fs::copy(&baked, &installed_path).await.unwrap();
+            service
+                .start(
+                    &installed_path,
+                    &installed.source_sha,
+                    Some(installed.clone()),
+                )
+                .await
+                .unwrap();
+            wait_for_ready_file(&service).await;
+            assert!(service.report_ready().await.unwrap());
+            service.running.as_ref().unwrap().child.id()
+        } else {
+            // The persisted rejection is the real runtime path that retries a
+            // candidate without first restoring an installed child.
+            service.rejected_loaded = true;
+            service.rejected_candidate = Some(candidate.clone());
+            service.persisted_candidate_digest = Some(candidate.digest.clone());
+            None
+        };
+        let result = service.normal().await;
+        assert!(result.is_ok(), "{result:?}");
+        let child = service
+            .running
+            .as_ref()
+            .expect("outage must leave an application running");
+        if live_child {
+            assert_eq!(child.child.id(), original_pid);
+            assert_eq!(child.release.as_ref(), Some(&installed));
+        } else {
+            assert_eq!(child.path, baked);
+            assert!(child.release.is_none());
+        }
+        wait_for_ready_file(&service).await;
+        assert!(service.report_ready().await.unwrap());
+        let kept = control.component("bot").await.unwrap();
+        assert_eq!(kept.installed, Some(installed));
+        assert_eq!(kept.installed_at, Some(stamp));
+        assert!(kept.desired.is_none());
+        assert_eq!(
+            db::read_boot_mismatch_map(&db)
+                .await
+                .unwrap()
+                .contains_key("bot"),
+            !live_child
+        );
+        service.stop_application().await.unwrap();
+        service.end_idle().await.unwrap();
+        server.abort();
+        drop((service, control, db));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn installed_outage_fallback_uses_the_existing_schema_and_registry_gates() {
+    let root =
+        std::env::temp_dir().join(format!("installed-outage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let schema = control.schema_version().await.unwrap();
+    let installed = release_at("bot", 'c', schema);
+    install_for_outage(&db, &control, &installed, 1_700_000_000).await;
+    let state = control.component("bot").await.unwrap();
+    for (status, core_offset, guild_offset, allowed) in [
+        (503, 0, 0, true),
+        (429, 0, 0, true),
+        (503, 1, 0, false),
+        (503, 0, 1, false),
+        (403, 0, 0, false),
+    ] {
+        let (base, server) = status_registry(status).await;
+        let mut service = controller(
+            "bot",
+            baked.clone(),
+            Registry::new(&base).unwrap(),
+            control.clone(),
+            &root,
+        );
+        service.baked_compatibility.core += core_offset;
+        service.baked_compatibility.guild += guild_offset;
+        let fallback = service.installed_fallback(&state).await;
+        assert_eq!(
+            fallback.is_ok(),
+            allowed,
+            "status={status}, core={core_offset}, guild={guild_offset}: {fallback:?}"
+        );
+        if let Ok((path, sha, release)) = fallback {
+            assert_eq!(path, baked);
+            assert_eq!(sha, service.base_sha);
+            assert!(release.is_none());
+            service.standby = Some((path, sha, release));
+            service
+                .rollback_independent(
+                    &state,
+                    release_at("bot", 'd', schema),
+                    "download unavailable".into(),
+                )
+                .await
+                .unwrap();
+            wait_for_ready_file(&service).await;
+            assert!(service.report_ready().await.unwrap());
+            assert_eq!(
+                control.component("bot").await.unwrap().installed,
+                Some(installed.clone())
+            );
+            service.stop_application().await.unwrap();
+        } else {
+            assert!(service.baked_fallback_installed.is_none());
+            assert!(service.running.is_none());
+        }
+        server.abort();
+    }
+    drop((control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
