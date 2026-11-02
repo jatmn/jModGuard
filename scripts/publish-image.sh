@@ -474,7 +474,8 @@ registry_user_versions_path() {
 registry_fetch_versions() {
   local package="$1" token="$2"
   # gh api --paginate prints one JSON array per page. Combine them before matching.
-  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
+  # Bound the entire scan; pipefail rejects partial pages when the deadline expires.
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" timeout --kill-after=5s 60s gh api --paginate \
     "$(registry_user_versions_path "$package")?per_page=100" \
     | jq -se '
         if any(.[]; type != "array") then
