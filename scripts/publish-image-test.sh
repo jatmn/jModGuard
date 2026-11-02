@@ -1377,7 +1377,7 @@ printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FO
 rm -rf "$trusted_sign_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
-# A retried publish-sign job must sign the existing staging digest without rebuilding.
+# Signing interrupted before deferred promotion must be retryable without rebuilding.
 reload_publisher
 mock_publish_helpers
 FAIL_SIGN=0
@@ -1400,20 +1400,39 @@ changed_since_publication() { return 0; }
 ( publish_component api ) >/dev/null 2>&1 || fail 'build phase must stage the image before sign retry'
 : >"$TRACE_FILE"
 JMODGUARD_PUBLISH_PHASE=sign
-export JMODGUARD_PUBLISH_PHASE
-GITHUB_RUN_ATTEMPT=2
-export GITHUB_RUN_ATTEMPT
+JMODGUARD_DEFER_PROMOTION=1
+export JMODGUARD_PUBLISH_PHASE JMODGUARD_DEFER_PROMOTION
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 export JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
-( publish_component api ) >/dev/null 2>&1 || fail 'sign retry must succeed using the staged registry digest'
+# Exit this shell after signing, losing its in-memory queue before finish.
+( publish_component api ) >/dev/null 2>&1 || fail 'first deferred sign must succeed'
+grep -q '^sign api ' "$TRACE_FILE" || fail 'interrupted attempt must reach signing'
+grep -q '^docker buildx imagetools create ' "$TRACE_FILE" \
+  && fail 'interrupted signing must not promote tags'
+[[ -s "$sign_retry_dir/api.json" ]] || fail 'interrupted signing must retain build state'
+: >"$TRACE_FILE"
+GITHUB_RUN_ATTEMPT=2
+export GITHUB_RUN_ATTEMPT
+(
+  publish_component api
+  grep -q '^docker buildx imagetools create ' "$TRACE_FILE" \
+    && fail 'retry must defer tag writes until finish'
+  [[ -s "$sign_retry_dir/api.json" ]] || fail 'retry must retain state until finish'
+  finish_deferred_promotions
+) >/dev/null 2>&1 || fail 'sign retry must succeed using the staged registry digest'
 load_trace
 printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
   && fail 'sign retry must not rebuild the image'
 printf '%s\n' "${CALLS[@]}" | grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
   || fail 'sign retry must sign the staged registry digest'
+for tag in "$HEAD_SHA" latest; do
+  grep '^docker buildx imagetools create ' "$TRACE_FILE" | grep -Fq -- ":${tag} " \
+    || fail "retry must promote ${tag} after finish"
+done
+[[ ! -e "$sign_retry_dir/api.json" ]] || fail 'successful finish must clear build state'
 rm -rf "$sign_retry_dir"
-unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
+unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR JMODGUARD_DEFER_PROMOTION GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
 
 # Historical WebUI sources without an independent package must skip signing cleanly.
 reload_publisher
