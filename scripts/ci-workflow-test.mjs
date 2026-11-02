@@ -83,7 +83,14 @@ assert.doesNotMatch(recordStep, /\bif:/);
 assert.doesNotMatch(okStep, /if:\s*always\(\)/);
 const promoteAt = publishPromote.indexOf("JMODGUARD_PUBLISH_PHASE: sign");
 const beforePromote = publishPromote.slice(0, promoteAt);
-assert.ok(beforePromote.indexOf("publish-build-ok-*") < beforePromote.indexOf("Require every component build"));
+const promoteSteps = [...publishPromote.matchAll(/^      - ([\s\S]*?)(?=^      - |$(?![\s\S]))/gm)].map(match => match[1]);
+const buildOkDownload = promoteSteps.find(step => /^          pattern: publish-build-ok-\*$/m.test(step));
+assert.ok(buildOkDownload, "promotion must download the build-success artifacts");
+assert.match(buildOkDownload, /^uses: actions\/download-artifact@[0-9a-f]{40}/);
+assert.match(buildOkDownload, /^          path: \$\{\{ runner.temp \}\}\/publish-build-ok$/m);
+assert.doesNotMatch(buildOkDownload, /\bif:|merge-multiple:\s*true/);
+assert.ok(beforePromote.indexOf(buildOkDownload) >= 0);
+assert.ok(beforePromote.indexOf(buildOkDownload) < beforePromote.indexOf("Require every component build"));
 assert.ok(beforePromote.includes("Require every component build"));
 function promotionGate(present) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "publish-ok-"));
@@ -458,7 +465,7 @@ function runPromotionScript(script, env = {}) {
 
 // Run the actual workflow shell and publisher entry points. Only external signing,
 // request metadata and registry I/O are simulated; queue/commit/rollback stay real.
-function runPromoteJob(mode) {
+function runPromoteJob(mode, retry = false) {
   return runPromotionScript(`
 set -euo pipefail
 export JMODGUARD_PUBLISH_PHASE=sign
@@ -480,29 +487,45 @@ source() {
     [[ "$MODE" != sign-fail || "$1" != webui ]] || return 1
   }
   clear_publish_state() { printf 'clear %s\\n' "$1" >>"$TRACE"; }
-  declare -g -A CUR=()
   inspect_digest() {
     printf 'inspect %s\\n' "$1" >>"$TRACE"
     if [[ "$1" == *:_publish-* ]]; then printf '%s\\t10\\n' "$NEW"; return; fi
-    if [[ "$MODE" == newer-absent && "$1" == "ghcr.io/jatmn/jmodguard-bot:$SHA" && -z "\${CUR[$1]+x}" ]]; then return 2; fi
-    printf '%s\\t10\\n' "\${CUR[$1]:-$OLD}"
+    local state="$RUNNER_TEMP/\${1##*/}"
+    if [[ "$MODE" == newer-absent && "$1" == *jmodguard-bot:"$SHA" && ! -f "$state" ]]; then return 2; fi
+    if [[ -f "$state" ]]; then
+      printf '%s\\t10\\n' "$(cat "$state")"
+    else
+      printf '%s\\t10\\n' "$OLD"
+    fi
   }
   registry_delete_tag() { printf 'delete %s\\n' "$1" >>"$TRACE"; }
   registry_promote_tag() {
     local ref="$3" digest="\${4#*@}"
     printf 'write %s %s\\n' "$ref" "$digest" >>"$TRACE"
-    CUR["$ref"]="$digest"
+    printf '%s\\n' "$digest" >"$RUNNER_TEMP/\${ref##*/}"
     if [[ "$digest" == "$NEW" && "$ref" == *jmodguard-api:* ]]; then
       case "$MODE" in
         INT|TERM) kill -s "$MODE" "$BASHPID" ;;
         exit) exit 7 ;;
         newer|newer-absent)
-          CUR["ghcr.io/jatmn/jmodguard-bot:$SHA"]="$OTHER"
+          printf '%s\\n' "$OTHER" >"$RUNNER_TEMP/jmodguard-bot:$SHA"
           return 1 ;;
       esac
     fi
   }
 }
+${retry ? `
+set +e
+(
+${promoteScript}
+)
+status=$?
+set -e
+printf 'interrupted %s\\n' "$status" >>"$TRACE"
+[[ "$status" == 143 ]]
+printf 'retry\\n' >>"$TRACE"
+MODE=success
+` : ""}
 ${promoteScript}
 `, {
     // Exercise every workflow path without the optional ambient temp variable.
@@ -549,6 +572,37 @@ for (const mode of ["success", "sign-fail", "INT", "TERM", "exit", "newer", "new
     }
   }
 }
+
+// Retry the interrupted three-component workflow in a fresh shell with the same
+// simulated registry. The production queue and rollback traps run on each attempt.
+const retryResult = runPromoteJob("TERM", true);
+assert.equal(retryResult.status, 0, retryResult.stderr);
+const retryLines = retryResult.trace.trim().split("\n");
+const retryAt = retryLines.indexOf("retry");
+assert.ok(retryAt > 0, retryResult.trace);
+const interruptedLines = retryLines.slice(0, retryAt);
+assert.equal(interruptedLines.at(-1), "interrupted 143");
+const retryRefs = matrixComponents.flatMap(component => ["a".repeat(40), "latest"]
+  .map(tag => `${botRef.split("-bot:")[0]}-${component}:${tag}`));
+const changedRefs = retryRefs.slice(0, 3);
+assert.deepEqual(interruptedLines.filter(line => line.startsWith("write ")), [
+  ...changedRefs.map(ref => `write ${ref} ${nextDigest}`),
+  ...changedRefs.toReversed().map(ref => `write ${ref} ${oldBot}`),
+]);
+assert.equal(interruptedLines.some(line => line.startsWith("clear ")), false,
+  "interrupted finish must retain every component's build state");
+const retriedLines = retryLines.slice(retryAt + 1);
+const retryWritesAt = retriedLines.findIndex(line => line.startsWith("write "));
+assert.ok(retryWritesAt >= 0, retryResult.trace);
+assert.deepEqual(retriedLines.slice(0, retryWritesAt).filter(line => line.startsWith("sign ")),
+  matrixComponents.map(component => `sign ${component}`), "retry must sign all three components before promotion");
+const retryWrites = retryRefs.map(ref => `write ${ref} ${nextDigest}`);
+assert.deepEqual(retriedLines.filter(line => line.startsWith("write ")), retryWrites);
+const lastRetryWriteAt = retriedLines.indexOf(retryWrites.at(-1));
+assert.equal(retriedLines.slice(0, lastRetryWriteAt).some(line => line.startsWith("clear ")), false,
+  "retry must retain build state until every tag is promoted");
+assert.deepEqual(retriedLines.slice(lastRetryWriteAt + 1).filter(line => line.startsWith("clear ")),
+  matrixComponents.map(component => `clear ${component}`));
 
 const keptDigest = "sha256:" + "a".repeat(64);
 const nextKept = "sha256:" + "c".repeat(64);
