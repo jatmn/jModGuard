@@ -1052,10 +1052,26 @@ fn channel_for(
     if let Some(channel) = cfg.log_channels.get(event).copied() {
         return Some(channel);
     }
+    if event == "automod_delete" {
+        return cfg.log_channels.get("message_delete").copied();
+    }
     if event == "member_rejoin" {
         return cfg.log_channels.get("member_join").copied();
     }
     None
+}
+
+/// Ignore list for an event. `automod_delete` uses the message-delete list
+/// when it is delivered on that event's channel.
+fn event_log_filter<'a>(
+    cfg: &'a crate::state::CachedGuildConfig,
+    event: &str,
+) -> Option<&'a db::LogFilter> {
+    if event == "automod_delete" && !cfg.log_channels.contains_key("automod_delete") {
+        cfg.log_filters.get("message_delete")
+    } else {
+        cfg.log_filters.get(event)
+    }
 }
 
 /// Resolve one observed ban/unban against Discord's bounded recent audit window.
@@ -1445,11 +1461,7 @@ async fn emit_to_observed_with_audit(
         let Some(channel_id) = channel_for(&cfg, event) else {
             return Ok(Delivery::Unconfigured);
         };
-        if cfg
-            .log_filters
-            .get(event)
-            .is_some_and(|filter| excluded(filter, &vars))
-        {
+        if event_log_filter(&cfg, event).is_some_and(|filter| excluded(filter, &vars)) {
             return Ok(Delivery::Unconfigured);
         }
         if member_audit_action(event).is_some() {
@@ -2583,12 +2595,45 @@ pub(crate) fn message_update_report(
     })
 }
 
+pub(crate) fn automod_delete_report(
+    app: &BotState,
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    mark: &crate::automod_delete_marks::AutomodDeleteMark,
+) -> MessageReport {
+    let mut vars = message_vars(guild_id, channel, id);
+    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
+        vars.extend(templates::user_vars(
+            snippet.author,
+            &snippet.author.to_string(),
+            &snippet.author.to_string(),
+        ));
+    }
+    vars.insert("rule".into(), mark.rule_name.clone());
+    vars.insert("rule_id".into(), mark.rule_id.clone());
+    vars.insert("reason".into(), mark.reason.clone());
+    MessageReport {
+        guild_id,
+        event: "automod_delete",
+        vars,
+    }
+}
+
 pub(crate) fn message_delete_report(
     app: &BotState,
     guild_id: GuildId,
     channel: ChannelId,
     id: MessageId,
 ) -> MessageReport {
+    if let Some(mark) = app.automod_delete_marks.lock().take_live(
+        guild_id.get(),
+        channel.get(),
+        id.get(),
+        Instant::now(),
+    ) {
+        return automod_delete_report(app, guild_id, channel, id, &mark);
+    }
     let mut vars = message_vars(guild_id, channel, id);
     if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
         vars.extend(templates::user_vars(
