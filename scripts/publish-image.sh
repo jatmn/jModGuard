@@ -564,9 +564,9 @@ registry_delete_detached_tag() {
           if registry_delete_version "$package" "$token" "$disposable_id"; then
             return 0
           fi
-          break
+        else
+          decision="unreadable"
         fi
-        decision="unreadable"
         ;;
     esac
     if [[ "$attempt" != 3 ]]; then
@@ -610,7 +610,7 @@ registry_delete_detached_tag() {
 }
 
 registry_delete_tag() {
-  local image_tag="$1" package tag token payload decision action version_id digest
+  local image_tag="$1" package tag token payload decision action version_id digest attempt
   [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
   package="${BASH_REMATCH[1]}"
   tag="${BASH_REMATCH[2]}"
@@ -639,7 +639,16 @@ registry_delete_tag() {
   [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
   case "$action" in
     delete)
-      registry_delete_version "$package" "$token" "$version_id"
+      for attempt in 1 2 3; do
+        if registry_delete_version "$package" "$token" "$version_id"; then
+          return 0
+        fi
+        if [[ "$attempt" != 3 ]]; then
+          sleep 2
+        fi
+      done
+      echo "registry tag ${tag} package version ${version_id} could not be deleted" >&2
+      return 1
       ;;
     untag)
       digest="$(printf '%s\n' "$payload" | registry_preserved_digest "$version_id")" || {
