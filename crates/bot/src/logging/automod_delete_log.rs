@@ -268,6 +268,7 @@ async fn gateway_delete_before_rest_confirm_reconciles_automod_delete() {
         123,
         &reconcile.rule_id,
         &reconcile.rule_name,
+        &reconcile.reason,
         reconcile.retained.as_ref(),
         false,
     )
@@ -316,6 +317,7 @@ async fn gateway_first_spam_delete_reconciles_with_only_automod_channel() {
         123,
         &reconcile.rule_id,
         &reconcile.rule_name,
+        &reconcile.reason,
         reconcile.retained.as_ref(),
         false,
     )
@@ -439,6 +441,7 @@ async fn gateway_first_user_ignore_filters_plain_peek_and_reconciled_automod() {
         123,
         &reconcile.rule_id,
         &reconcile.rule_name,
+        &reconcile.reason,
         reconcile.retained.as_ref(),
         false,
     )
@@ -542,6 +545,7 @@ fn automod_delete_report_peeks_snippet_identity() {
         MessageId::new(123),
         "badword",
         "Bad words",
+        "",
         None,
     );
     assert_eq!(automod.vars["user_id"], "42");
@@ -636,6 +640,7 @@ async fn deferred_settlement_reapplies_stashed_retained_snapshot() {
         123,
         &reconcile.rule_id,
         &reconcile.rule_name,
+        &reconcile.reason,
         reconcile.retained.as_ref(),
         false,
     )
@@ -687,10 +692,149 @@ async fn rest_failure_replay_uses_stashed_retained_snapshot() {
     assert!(body.contains("plain replay body"));
 }
 
+const PRE_PR_AUTOMOD_DELETE_TEMPLATE: &str = "**:wastebasket: {rule} (`{rule_id}`) deleted `{message_id}` in {channel}**\n\n**Reason:** {reason}";
+
 #[tokio::test]
-async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() {
+async fn saved_pre_pr_automod_delete_template_renders_reason() {
     let f = Fixture::new();
-    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_template(
+        &f.app.db,
+        789,
+        "automod_delete",
+        PRE_PR_AUTOMOD_DELETE_TEMPLATE,
+    )
+    .await
+    .unwrap();
+    f.app.invalidate_configs();
+    let prepared = f.app.automod_delete_marks.prepare_delete(
+        789,
+        456,
+        123,
+        "badword",
+        "Bad words",
+        "blocked term",
+    );
+    f.app
+        .automod_delete_marks
+        .confirm(789, 456, 123, prepared.attempt);
+    let report = observed_delete_report(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        None,
+    )
+    .expect("confirmed delete");
+    assert_eq!(
+        report.vars.get("reason").map(String::as_str),
+        Some("blocked term")
+    );
+    let sink = Sink::default();
+    emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
+    let body = sink.messages.lock().unwrap()[0].1.to_string();
+    assert!(body.contains("**Reason:** blocked term"), "{body}");
+    assert!(!body.contains("{reason}"), "{body}");
+}
+
+#[tokio::test]
+async fn external_bulk_during_pending_delete_timeout_stays_a_plain_delete() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let prepared =
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, 123, "badword", "Bad words", "");
+    let mut transcript = BulkTranscript::new(2);
+    let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
+        &f.app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        &[MessageId::new(123), MessageId::new(124)],
+        &mut transcript,
+        true,
+    );
+    assert!(
+        peeled.iter().all(|report| report.event != "automod_delete"),
+        "an external bulk delete is not this bot's confirmed delete"
+    );
+    let sink = Sink::default();
+    if let Some(settlement) = f
+        .app
+        .automod_delete_marks
+        .take_uncertain_gateway_settlement(789, 456, 123, prepared.attempt)
+    {
+        emit_reconciled_automod_delete(
+            &f.app,
+            &sink,
+            789,
+            456,
+            123,
+            &settlement.rule_id,
+            &settlement.rule_name,
+            &settlement.reason,
+            settlement.retained.as_ref(),
+            settlement.fallback_to_bulk,
+        )
+        .await;
+    } else {
+        let removal =
+            f.app
+                .automod_delete_marks
+                .remove_unconfirmed(789, 456, 123, prepared.attempt);
+        if let Some(settlement) = removal.released_settlement.as_ref() {
+            emit_reconciled_automod_delete(
+                &f.app,
+                &sink,
+                789,
+                456,
+                123,
+                &settlement.rule_id,
+                &settlement.rule_name,
+                &settlement.reason,
+                settlement.retained.as_ref(),
+                settlement.fallback_to_bulk,
+            )
+            .await;
+        }
+        replay_unconfirmed_plain_delete(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            &removal,
+        )
+        .await;
+    }
+    let bodies = sink_bodies(&sink);
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("902") && body.contains("Message deleted")),
+        "{bodies:?}"
+    );
+    assert!(
+        bodies.iter().all(|body| !body.contains("Automod deleted")),
+        "{bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn uncertain_gateway_timeout_keeps_plain_delete_and_retained_text() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
         .await
         .unwrap();
     f.app.invalidate_configs();
@@ -710,28 +854,37 @@ async fn uncertain_gateway_settlement_emits_automod_delete_with_retained_text() 
         )
         .is_none()
     );
-    let settlement = f
+    assert!(
+        f.app
+            .automod_delete_marks
+            .take_uncertain_gateway_settlement(789, 456, 123, delete_attempt)
+            .is_none()
+    );
+    let removal = f
         .app
         .automod_delete_marks
-        .take_uncertain_gateway_settlement(789, 456, 123, delete_attempt)
-        .expect("gateway pending settlement");
+        .remove_unconfirmed(789, 456, 123, delete_attempt);
+    assert_eq!(
+        removal.action,
+        crate::automod_delete_marks::UnconfirmedMarkRemoval::ReplayPlainDelete
+    );
     let sink = Sink::default();
-    emit_reconciled_automod_delete(
+    replay_unconfirmed_plain_delete(
         &f.app,
         &sink,
-        789,
-        456,
-        123,
-        &settlement.rule_id,
-        &settlement.rule_name,
-        settlement.retained.as_ref(),
-        false,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+        &removal,
     )
     .await;
-    let body = sink.messages.lock().unwrap()[0].1.to_string();
-    assert!(body.contains("after uncertain REST"));
-    assert!(body.contains("**Last observed text:**"));
-    assert!(body.contains("**Coverage:** last observed; observation gap or restart"));
+    let sent = sink.messages.lock().unwrap();
+    assert_eq!(sent[0].0, ChannelId::new(902));
+    let body = sent[0].1.to_string();
+    assert!(body.contains("Message deleted"), "{body}");
+    assert!(!body.contains("Automod deleted"), "{body}");
+    assert!(body.contains("after uncertain REST"), "{body}");
+    assert!(body.contains("**Last observed text:**"), "{body}");
 }
 
 #[test]
@@ -791,6 +944,7 @@ async fn saturated_report_slots_still_log_reconciled_automod_delete() {
         123,
         "badword",
         "Bad words",
+        "",
         None,
         false,
     )
@@ -803,6 +957,7 @@ async fn saturated_report_slots_still_log_reconciled_automod_delete() {
         124,
         "badword".into(),
         "Bad words".into(),
+        String::new(),
         None,
         false,
     );
@@ -956,6 +1111,7 @@ async fn account_pending_bulk(
                 123,
                 &settlement.rule_id,
                 &settlement.rule_name,
+                &settlement.reason,
                 settlement.retained.as_ref(),
                 false,
             )
@@ -997,6 +1153,7 @@ async fn account_pending_bulk(
                     123,
                     &settlement.rule_id,
                     &settlement.rule_name,
+                    &settlement.reason,
                     settlement.retained.as_ref(),
                     false,
                 )
@@ -1061,7 +1218,7 @@ async fn account_pending_bulk(
         .any(|body| body.contains("902") && body.contains("Message deleted"));
     let bulk_logged = bodies.iter().any(|body| body.contains("903"));
     match outcome {
-        BulkOutcome::Success | BulkOutcome::Uncertain | BulkOutcome::Cancel => {
+        BulkOutcome::Success => {
             if automod || message {
                 assert!(automod_logged, "automod report missing: {label}");
                 assert!(
@@ -1085,7 +1242,7 @@ async fn account_pending_bulk(
                 assert!(messages.is_empty(), "{label}");
             }
         }
-        BulkOutcome::Failure | BulkOutcome::Race => {
+        BulkOutcome::Failure | BulkOutcome::Race | BulkOutcome::Uncertain | BulkOutcome::Cancel => {
             if filter_channel {
                 assert!(
                     messages.is_empty(),
@@ -1690,6 +1847,7 @@ async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
             message,
             "badword".into(),
             "Bad words".into(),
+            String::new(),
             Some(sample_retained("queued-snapshot-secret")),
             false,
         );
@@ -1713,6 +1871,7 @@ async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
         99,
         "badword".into(),
         "Bad words".into(),
+        String::new(),
         Some(sample_retained("admitted-snapshot")),
         false,
     );
@@ -1749,10 +1908,14 @@ async fn saturated_delete_emits_automod_delete_on_the_dedicated_channel() {
             .insert(789, 456, message, "filler", "Filler");
     }
     let gateway_first = 50_000;
-    let prepared =
-        f.app
-            .automod_delete_marks
-            .prepare_delete(789, 456, gateway_first, "badword", "Bad words");
+    let prepared = f.app.automod_delete_marks.prepare_delete(
+        789,
+        456,
+        gateway_first,
+        "badword",
+        "Bad words",
+        "",
+    );
     assert_eq!(prepared.disposition, DeleteDisposition::Unmarked);
     assert!(
         observed_delete_report(
@@ -1775,6 +1938,7 @@ async fn saturated_delete_emits_automod_delete_on_the_dedicated_channel() {
         &prepared,
         "badword",
         "Bad words",
+        "",
     )
     .await;
     let bodies = sink_bodies(&sink);
@@ -1808,6 +1972,7 @@ async fn saturated_delete_emits_automod_delete_on_the_dedicated_channel() {
         rest_first,
         "repeat_text",
         "Repeated text",
+        "",
     );
     assert_eq!(prepared.disposition, DeleteDisposition::Unmarked);
     let sink = Sink::default();
@@ -1820,6 +1985,7 @@ async fn saturated_delete_emits_automod_delete_on_the_dedicated_channel() {
         &prepared,
         "repeat_text",
         "Repeated text",
+        "",
     )
     .await;
     assert!(
@@ -1960,10 +2126,10 @@ async fn deferred_bulk_only_success_reports_when_the_send_fails() {
         .await
         .unwrap();
     f.app.invalidate_configs();
-    let prepared = f
-        .app
-        .automod_delete_marks
-        .prepare_delete(789, 456, 123, "badword", "Bad words");
+    let prepared =
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, 123, "badword", "Bad words", "");
     assert_eq!(
         prepared.disposition,
         crate::automod_delete_marks::DeleteDisposition::Stored
@@ -1995,6 +2161,7 @@ async fn deferred_bulk_only_success_reports_when_the_send_fails() {
         &prepared,
         "badword",
         "Bad words",
+        "",
     )
     .await;
     assert!(
@@ -2058,14 +2225,22 @@ async fn overlapping_saturated_attempts_share_one_report() {
                 .insert(789, 456, message, "filler", "Filler");
         }
         let message = 50_000;
-        let first =
-            f.app
-                .automod_delete_marks
-                .prepare_delete(789, 456, message, "badword", "Bad words");
-        let second =
-            f.app
-                .automod_delete_marks
-                .prepare_delete(789, 456, message, "badword", "Bad words");
+        let first = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            message,
+            "badword",
+            "Bad words",
+            "",
+        );
+        let second = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            message,
+            "badword",
+            "Bad words",
+            "",
+        );
         assert_eq!(first.disposition, DeleteDisposition::Unmarked);
         assert_eq!(second.disposition, DeleteDisposition::Unmarked);
         assert!(
@@ -2090,6 +2265,7 @@ async fn overlapping_saturated_attempts_share_one_report() {
                 &second,
                 "badword",
                 "Bad words",
+                "",
             )
             .await;
             let removal =
@@ -2130,6 +2306,7 @@ async fn overlapping_saturated_attempts_share_one_report() {
                 &second,
                 "badword",
                 "Bad words",
+                "",
             )
             .await;
         }
@@ -2184,10 +2361,14 @@ async fn freed_live_slot_keeps_a_successful_overflow_owner() {
             }
         }
         let message = 50_000;
-        let first =
-            f.app
-                .automod_delete_marks
-                .prepare_delete(789, 456, message, "badword", "Bad words");
+        let first = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            message,
+            "badword",
+            "Bad words",
+            "",
+        );
         assert_eq!(first.disposition, DeleteDisposition::Unmarked);
         let younger = if younger_already_pending {
             let younger = f.app.automod_delete_marks.prepare_delete(
@@ -2196,6 +2377,7 @@ async fn freed_live_slot_keeps_a_successful_overflow_owner() {
                 message,
                 "badword",
                 "Bad words",
+                "",
             );
             assert_eq!(younger.disposition, DeleteDisposition::Unmarked);
             Some(younger)
@@ -2212,6 +2394,7 @@ async fn freed_live_slot_keeps_a_successful_overflow_owner() {
             &first,
             "badword",
             "Bad words",
+            "",
         )
         .await;
         let freed = f.app.automod_delete_marks.remove_unconfirmed(
@@ -2221,10 +2404,14 @@ async fn freed_live_slot_keeps_a_successful_overflow_owner() {
             filler.expect("filler attempt"),
         );
         assert_eq!(freed.action, UnconfirmedMarkRemoval::Removed);
-        let later =
-            f.app
-                .automod_delete_marks
-                .prepare_delete(789, 456, message, "badword", "Bad words");
+        let later = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            message,
+            "badword",
+            "Bad words",
+            "",
+        );
         assert_eq!(
             later.disposition,
             DeleteDisposition::Unmarked,
@@ -2299,11 +2486,11 @@ async fn overlapping_saturated_failures_replay_one_plain_delete() {
     let first =
         f.app
             .automod_delete_marks
-            .prepare_delete(789, 456, message, "badword", "Bad words");
+            .prepare_delete(789, 456, message, "badword", "Bad words", "");
     let second =
         f.app
             .automod_delete_marks
-            .prepare_delete(789, 456, message, "badword", "Bad words");
+            .prepare_delete(789, 456, message, "badword", "Bad words", "");
     assert_eq!(first.disposition, DeleteDisposition::Unmarked);
     assert_eq!(second.disposition, DeleteDisposition::Unmarked);
     assert!(
@@ -2402,6 +2589,7 @@ async fn peeled_delete_uses_bulk_when_the_individual_route_disappears() {
         123,
         &settlement.rule_id,
         &settlement.rule_name,
+        &settlement.reason,
         settlement.retained.as_ref(),
         settlement.fallback_to_bulk,
     )

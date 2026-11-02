@@ -2572,6 +2572,7 @@ pub(crate) async fn settle_bulk_delivery(
                 item.message,
                 &settlement.rule_id,
                 &settlement.rule_name,
+                &settlement.reason,
                 settlement.retained.as_ref(),
                 settlement.fallback_to_bulk,
             )
@@ -2932,6 +2933,7 @@ pub(crate) fn message_delete_report_peek(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn automod_delete_report(
     app: &BotState,
     guild_id: GuildId,
@@ -2939,12 +2941,14 @@ pub(crate) fn automod_delete_report(
     id: MessageId,
     rule_id: &str,
     rule_name: &str,
+    reason: &str,
     retained: Option<&MessageSnapshot>,
 ) -> MessageReport {
     let mut vars = message_vars(guild_id, channel, id);
     apply_delete_snippet(app, guild_id, channel, id, &mut vars, false);
     vars.insert("rule_id".into(), rule_id.to_owned());
     vars.insert("rule".into(), rule_name.to_owned());
+    vars.insert("reason".into(), reason.to_owned());
     let mut report = MessageReport {
         guild_id,
         event: "automod_delete",
@@ -3191,9 +3195,13 @@ pub(crate) fn place_bulk_delete(
         reserve_pending,
     );
     let mut report = match observation {
-        GatewayDeleteObservation::Automod { rule_id, rule_name } => {
-            automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
-        }
+        GatewayDeleteObservation::Automod {
+            rule_id,
+            rule_name,
+            reason,
+        } => automod_delete_report(
+            app, guild_id, channel, id, &rule_id, &rule_name, &reason, retained,
+        ),
         GatewayDeleteObservation::PendingAutomod => {
             return BulkDeletePlacement {
                 report: None,
@@ -3233,9 +3241,13 @@ fn classify_observed_delete(
         retained_for_mark,
     );
     let mut report = match observation {
-        GatewayDeleteObservation::Automod { rule_id, rule_name } => {
-            automod_delete_report(app, guild_id, channel, id, &rule_id, &rule_name, retained)
-        }
+        GatewayDeleteObservation::Automod {
+            rule_id,
+            rule_name,
+            reason,
+        } => automod_delete_report(
+            app, guild_id, channel, id, &rule_id, &rule_name, &reason, retained,
+        ),
         GatewayDeleteObservation::PendingAutomod | GatewayDeleteObservation::Suppressed => {
             return None;
         }
@@ -3258,6 +3270,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
     message: u64,
     rule_id: &str,
     rule_name: &str,
+    reason: &str,
     retained: Option<&MessageSnapshot>,
     fallback_to_bulk: bool,
 ) {
@@ -3269,6 +3282,7 @@ pub(crate) async fn emit_reconciled_automod_delete(
         message,
         rule_id,
         rule_name,
+        reason,
         retained,
         fallback_to_bulk,
         Admission::Immediate,
@@ -3285,6 +3299,7 @@ async fn emit_reconciled_automod_delete_with(
     message: u64,
     rule_id: &str,
     rule_name: &str,
+    reason: &str,
     retained: Option<&MessageSnapshot>,
     fallback_to_bulk: bool,
     admission: Admission,
@@ -3316,6 +3331,7 @@ async fn emit_reconciled_automod_delete_with(
         MessageId::new(message),
         rule_id,
         rule_name,
+        reason,
         retained.as_ref(),
     );
     match admission {
@@ -3350,6 +3366,7 @@ pub(crate) fn spawn_reconciled_automod_delete(
     message: u64,
     rule_id: String,
     rule_name: String,
+    reason: String,
     retained: Option<db::guild_data::MessageSnapshot>,
     fallback_to_bulk: bool,
 ) {
@@ -3367,6 +3384,7 @@ pub(crate) fn spawn_reconciled_automod_delete(
             message,
             &rule_id,
             &rule_name,
+            &reason,
             retained.as_ref(),
             fallback_to_bulk,
             Admission::Held,
@@ -3388,6 +3406,7 @@ pub(crate) async fn complete_prepared_automod_delete(
     prepared: &crate::automod_delete_marks::PreparedAutomodDelete,
     rule_id: &str,
     rule_name: &str,
+    reason: &str,
 ) {
     let needs_route = matches!(
         prepared.disposition,
@@ -3414,6 +3433,7 @@ pub(crate) async fn complete_prepared_automod_delete(
         bulk_route,
         rule_id,
         rule_name,
+        reason,
     ) else {
         return;
     };
@@ -3425,6 +3445,7 @@ pub(crate) async fn complete_prepared_automod_delete(
         message,
         &settlement.rule_id,
         &settlement.rule_name,
+        &settlement.reason,
         settlement.retained.as_ref(),
         settlement.fallback_to_bulk,
     )
@@ -3443,6 +3464,7 @@ pub(crate) async fn spawn_prepared_automod_delete(
     prepared: crate::automod_delete_marks::PreparedAutomodDelete,
     rule_id: String,
     rule_name: String,
+    reason: String,
 ) {
     let needs_route = matches!(
         prepared.disposition,
@@ -3469,6 +3491,7 @@ pub(crate) async fn spawn_prepared_automod_delete(
         bulk_route,
         &rule_id,
         &rule_name,
+        &reason,
     ) else {
         return;
     };
@@ -3480,6 +3503,7 @@ pub(crate) async fn spawn_prepared_automod_delete(
         message,
         settlement.rule_id,
         settlement.rule_name,
+        settlement.reason,
         settlement.retained,
         settlement.fallback_to_bulk,
     );

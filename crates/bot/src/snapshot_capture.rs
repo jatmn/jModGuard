@@ -3134,6 +3134,7 @@ mod tests {
                 blocked,
                 &settlement.rule_id,
                 &settlement.rule_name,
+                &settlement.reason,
                 settlement.retained.as_ref(),
                 settlement.fallback_to_bulk,
             )

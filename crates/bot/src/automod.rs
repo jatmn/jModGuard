@@ -430,6 +430,7 @@ tokio::task_local! {
     static AUTOMOD_DELETE_CANCEL_PROBE: std::sync::Arc<AutomodDeleteCancelProbe>;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn automod_try_delete_message(
     app: &std::sync::Arc<BotState>,
     http: &serenity::http::Http,
@@ -438,6 +439,7 @@ async fn automod_try_delete_message(
     message: u64,
     rule_id: &str,
     rule_name: &str,
+    reason: &str,
 ) {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -448,7 +450,7 @@ async fn automod_try_delete_message(
     }
     let prepared = app
         .automod_delete_marks
-        .prepare_delete(guild_id, channel, message, rule_id, rule_name);
+        .prepare_delete(guild_id, channel, message, rule_id, rule_name, reason);
     let delete_attempt = prepared.attempt;
     let recovery = app
         .remembered_discord_targets
@@ -481,7 +483,7 @@ async fn automod_try_delete_message(
     match raced {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             logging::complete_prepared_automod_delete(
-                app, http, guild_id, channel, message, &prepared, rule_id, rule_name,
+                app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
             )
             .await;
         }
@@ -501,6 +503,7 @@ async fn automod_try_delete_message(
                     message,
                     &settlement.rule_id,
                     &settlement.rule_name,
+                    &settlement.reason,
                     settlement.retained.as_ref(),
                     settlement.fallback_to_bulk,
                 )
@@ -552,6 +555,7 @@ async fn automod_try_delete_message(
                     message,
                     &settlement.rule_id,
                     &settlement.rule_name,
+                    &settlement.reason,
                     settlement.retained.as_ref(),
                     settlement.fallback_to_bulk,
                 )
@@ -572,6 +576,7 @@ async fn automod_try_delete_message(
                         message,
                         &settlement.rule_id,
                         &settlement.rule_name,
+                        &settlement.reason,
                         settlement.retained.as_ref(),
                         settlement.fallback_to_bulk,
                     )
@@ -802,6 +807,7 @@ pub(crate) async fn execute_pending_with(
                 id,
                 pending.rule_id.as_str(),
                 pending.rule_name.as_str(),
+                reason.as_str(),
             )
             .await;
         }
@@ -837,6 +843,7 @@ pub(crate) async fn execute_pending_with(
                     id,
                     pending.rule_id.as_str(),
                     pending.rule_name.as_str(),
+                    reason.as_str(),
                 )
                 .await;
             }
@@ -3978,6 +3985,7 @@ mod tests {
                         42,
                         "badword",
                         "Bad words",
+                        "blocked term",
                     )
                     .await;
                 })

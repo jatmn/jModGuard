@@ -530,9 +530,14 @@ async fn punish_proven_match(
         } else {
             None
         };
-        let prepared =
-            app.automod_delete_marks
-                .prepare_delete(found.guild, *channel, *message, rule, name);
+        let prepared = app.automod_delete_marks.prepare_delete(
+            found.guild,
+            *channel,
+            *message,
+            rule,
+            name,
+            &found.reason,
+        );
         let delete_attempt = prepared.attempt;
         let result = tokio::time::timeout(
             Duration::from_secs(10),
@@ -566,6 +571,7 @@ async fn punish_proven_match(
                     prepared,
                     rule.to_owned(),
                     name.to_owned(),
+                    found.reason.clone(),
                 )
                 .await;
                 CaseOutcome::Succeeded
@@ -586,6 +592,7 @@ async fn punish_proven_match(
                         *message,
                         settlement.rule_id,
                         settlement.rule_name,
+                        settlement.reason,
                         settlement.retained,
                         settlement.fallback_to_bulk,
                     );
@@ -622,6 +629,7 @@ async fn punish_proven_match(
                         *message,
                         settlement.rule_id,
                         settlement.rule_name,
+                        settlement.reason,
                         settlement.retained,
                         settlement.fallback_to_bulk,
                     );
@@ -641,6 +649,7 @@ async fn punish_proven_match(
                             *message,
                             settlement.rule_id,
                             settlement.rule_name,
+                            settlement.reason,
                             settlement.retained,
                             settlement.fallback_to_bulk,
                         );
