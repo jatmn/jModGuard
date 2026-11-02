@@ -179,6 +179,12 @@ pub enum ControlOp {
         error: String,
         now: i64,
     },
+    RecordBootMismatch {
+        record: BootMismatchRecord,
+    },
+    ClearBootMismatch {
+        component: String,
+    },
     ObserveLauncher {
         component: String,
         revision: u32,
@@ -362,6 +368,8 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::LookupResult
         | ControlOp::RecordComponentFailure { .. }
         | ControlOp::RecordComponentRollback { .. }
+        | ControlOp::RecordBootMismatch { .. }
+        | ControlOp::ClearBootMismatch { .. }
         | ControlOp::ObserveLauncher { .. }
         | ControlOp::ClearSupersededLauncher { .. }
         | ControlOp::ClearUncontractedLauncher { .. }
@@ -770,6 +778,14 @@ async fn apply_control_inner(
         } => {
             record_component_rollback(db, &component, &failed, previous, observation, &error, now)
                 .await?;
+            saved_null()
+        }
+        ControlOp::RecordBootMismatch { record } => {
+            record_boot_mismatch(db, record).await?;
+            saved_null()
+        }
+        ControlOp::ClearBootMismatch { component } => {
+            clear_boot_mismatch(db, &component).await?;
             saved_null()
         }
         ControlOp::ObserveLauncher {
