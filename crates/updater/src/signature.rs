@@ -118,16 +118,21 @@ fn trusted_key(pem: &str) -> Result<TrustedKey> {
     })
 }
 
-/// The committed public key is the only trust root. A test build may substitute
-/// one PEM. Previous-key files are not read.
+/// The committed public key is always trusted. Only unit-test builds may add
+/// a fixture PEM. Previous-key files are not read.
 fn trusted_keys() -> Result<Vec<TrustedKey>> {
-    #[cfg(debug_assertions)]
-    if let Ok(pem) = std::env::var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM")
-        && !pem.is_empty()
-    {
-        return Ok(vec![trusted_key(&pem)?]);
-    }
-    Ok(vec![trusted_key(CURRENT_PUBLIC_PEM)?])
+    let keys = vec![trusted_key(CURRENT_PUBLIC_PEM)?];
+    #[cfg(test)]
+    let keys = {
+        let mut keys = keys;
+        if let Ok(pem) = std::env::var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM")
+            && !pem.is_empty()
+        {
+            keys.push(trusted_key(&pem)?);
+        }
+        keys
+    };
+    Ok(keys)
 }
 
 fn docker_reference(component: &str) -> Result<&'static str> {
@@ -302,6 +307,7 @@ pub fn signature_rejection_phrase(error: &anyhow::Error) -> Option<&'static str>
     })
 }
 
+#[cfg(test)]
 pub mod test_support {
     use super::*;
     use ring::rand::SystemRandom;
