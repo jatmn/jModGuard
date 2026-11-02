@@ -247,8 +247,10 @@ jobs:
           JMODGUARD_UPDATE_SIGNING_PASSWORD: ${{ secrets.JMODGUARD_UPDATE_SIGNING_PASSWORD }}
         run: |
           set -euo pipefail
+          JMODGUARD_PUBLISH_IMAGE_LIB=1 source scripts/publish-image.sh
+          export JMODGUARD_DEFER_PROMOTION=1
           for component in bot api webui; do
-            COMPONENT="$component" \
             JMODGUARD_PUBLISH_STATE_DIR="${RUNNER_TEMP}/publish-states/publish-state-${component}" \
-              bash scripts/publish-image.sh "$component"
+              publish_component "$component"
           done
+          finish_deferred_promotions
