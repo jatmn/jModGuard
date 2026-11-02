@@ -1323,7 +1323,7 @@ async fn stale_complete_upgrade_ignores_unrelated_restore_failure() {
     tokio::fs::create_dir_all(&root).await.unwrap();
     let (db, control, coordinated) = completed_coordinated_upgrade(&root).await;
     let stamp = now();
-    let mut independent = release_at("bot", 'c', db::CORE_SCHEMA_VERSION + 1);
+    let mut independent = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
     independent.source_sha = "d".repeat(40);
     control
         .checked("bot", "latest", Some(independent.clone()), None, stamp)
@@ -1341,15 +1341,17 @@ async fn stale_complete_upgrade_ignores_unrelated_restore_failure() {
     assert_ne!(installed.digest, coordinated.digest);
     let before = control.upgrade().await.unwrap().unwrap();
     assert_eq!(before.phase, Phase::Complete);
+    // An outage can now start the built-in binary; use a permanent restore failure.
+    let (base, server) = status_registry(403).await;
     let mut bot = offline_controller("bot", control.clone(), &root);
+    bot.registry = Registry::new(&base).unwrap();
     let error = bot.tick().await.unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("installed application cannot open database"),
+        error.to_string().contains("registry returned HTTP 403"),
         "{error:#}"
     );
     assert_complete_unchanged(&before, &control.upgrade().await.unwrap().unwrap());
+    server.abort();
     drop((bot, control, db));
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
@@ -9528,6 +9530,133 @@ async fn installed_outage_fallback_uses_the_existing_schema_and_registry_gates()
             assert!(service.baked_fallback_installed.is_none());
             assert!(service.running.is_none());
         }
+        server.abort();
+    }
+    drop((control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn cold_start_before_installed_stage(required_launcher: bool) {
+    for role in ["bot", "api"] {
+        let root =
+            std::env::temp_dir().join(format!("early-outage-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let baked = executable(&root, "baked").await;
+        let (db, control) = open_launcher_db(&root).await;
+        let schema = control.schema_version().await.unwrap();
+        let mut installed = release_at(role, 'c', schema);
+        if required_launcher {
+            let launcher = installed.launcher.as_mut().unwrap();
+            launcher.revision = db::LAUNCHER_REVISION + 1;
+            launcher.min_revision = launcher.revision;
+        } else {
+            installed.min_schema = schema + 1;
+            installed.max_schema = schema + 1;
+            installed.result_schema = schema + 1;
+        }
+        install_for_outage(&db, &control, &installed, 1_700_000_000).await;
+        for (status, core_offset, guild_offset, allowed) in [
+            (0, 0, 0, true),
+            (503, 0, 0, true),
+            (429, 0, 0, true),
+            (403, 0, 0, false),
+            (503, 1, 0, false),
+            (503, 0, 1, false),
+        ] {
+            let (base, server, reserved) = if status == 0 {
+                let (base, socket) = refused_registry().await;
+                (base, None, Some(socket))
+            } else {
+                let (base, server) = status_registry(status).await;
+                (base, Some(server), None)
+            };
+            let mut service = controller(
+                role,
+                baked.clone(),
+                Registry::new(&base).unwrap(),
+                control.clone(),
+                &root,
+            );
+            service.baked_compatibility.core += core_offset;
+            service.baked_compatibility.guild += guild_offset;
+            let (result, logs) = with_contract_warnings(service.normal()).await;
+            if allowed {
+                assert!(!result.unwrap(), "outage must not request launcher reexec");
+                let running = service.running.as_ref().expect("built-in child must start");
+                assert_eq!(running.path, baked);
+                assert!(running.release.is_none());
+                wait_for_ready_file(&service).await;
+                assert!(service.report_ready().await.unwrap());
+                assert!(logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+                assert!(
+                    db::read_boot_mismatch_map(&db)
+                        .await
+                        .unwrap()
+                        .contains_key(role)
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{role}: status={status}, core={core_offset}, guild={guild_offset}"
+                );
+                assert!(service.running.is_none());
+                assert!(!logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+            }
+            assert_eq!(control.schema_version().await.unwrap(), schema);
+            let state = control.component(role).await.unwrap();
+            assert_eq!(state.installed, Some(installed.clone()));
+            assert!(state.desired_launcher.is_none());
+            assert!(!root.join("jmodguard-launcher-next").exists());
+            service.stop_application().await.unwrap();
+            service.end_idle().await.unwrap();
+            if let Some(server) = server {
+                server.abort();
+            }
+            drop(reserved);
+        }
+        drop((control, db));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_start_schema_refusal_considers_built_in_on_outage() {
+    cold_start_before_installed_stage(false).await;
+}
+
+#[tokio::test]
+async fn cold_start_required_launcher_considers_built_in_on_outage() {
+    cold_start_before_installed_stage(true).await;
+}
+
+#[tokio::test]
+async fn cold_start_incompatible_installed_release_stays_refused_when_reachable() {
+    let root =
+        std::env::temp_dir().join(format!("early-reachable-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked").await;
+    let binary = tokio::fs::read(&baked).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    for role in ["bot", "api"] {
+        let mut objects = HashMap::new();
+        let installed = image(&mut objects, role, &binary);
+        install_for_outage(&db, &control, &installed, 1_700_000_000).await;
+        let (registry, server) = serve_objects(objects).await;
+        let mut service = controller(role, baked.clone(), registry, control.clone(), &root);
+        let error = service.normal().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("installed application cannot open database")
+        );
+        assert!(service.running.is_none());
+        assert!(
+            !db::read_boot_mismatch_map(&db)
+                .await
+                .unwrap()
+                .contains_key(role)
+        );
+        service.end_idle().await.unwrap();
         server.abort();
     }
     drop((control, db));

@@ -245,7 +245,7 @@ fn revision_nineteen_observation_can_install_a_newer_launcher() {
 
 #[test]
 fn prior_revisions_can_install_signature_payload_fix() {
-    for revision in [26, 27] {
+    for revision in [26, 27, 28, 29] {
         let advice = launcher_advice(
             revision,
             jmodguard::db::LAUNCHER_REVISION,

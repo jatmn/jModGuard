@@ -2004,10 +2004,6 @@ impl Supervisor {
         if let Some(release) = &state.installed {
             let schema = self.control.schema_version().await?;
             ensure!(
-                schema >= release.min_schema && schema <= release.max_schema,
-                "installed application cannot open database; use owner recovery"
-            );
-            ensure!(
                 release.base_abi == self.base_abi,
                 "installed application requires a different base ABI"
             );
@@ -2028,6 +2024,12 @@ impl Supervisor {
                 }
                 Err(error) => return Err(error),
             };
+            // Establish registry availability before refusing the installed
+            // schema, so an outage can still use the compatible baked binary.
+            ensure!(
+                schema >= release.min_schema && schema <= release.max_schema,
+                "installed application cannot open database; use owner recovery"
+            );
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
         } else {
@@ -2287,10 +2289,17 @@ impl Supervisor {
         if self.running.is_none() && !retrying_rejected {
             let restored = async {
                 if let Some(installed) = &state.installed {
-                    match self.required_launcher(installed, None).await? {
-                        ControlStep::Reexec => return Ok(ControlStep::Reexec),
-                        ControlStep::Proceed => {}
-                        ControlStep::Defer => return Ok(ControlStep::Defer),
+                    match self.required_launcher(installed, None).await {
+                        Ok(ControlStep::Reexec) => return Ok(ControlStep::Reexec),
+                        Ok(ControlStep::Proceed) => {}
+                        Ok(ControlStep::Defer) => return Ok(ControlStep::Defer),
+                        Err(error) if registry_unreachable(&error) => {
+                            let schema = self.control.schema_version().await?;
+                            self.start_baked_after_registry_outage(&state, schema, installed)
+                                .await?;
+                            return Ok(ControlStep::Proceed);
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 self.restore(&state).await?;
