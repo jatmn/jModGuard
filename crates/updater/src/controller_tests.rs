@@ -4,9 +4,20 @@
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
+use jmodguard_updater::signature::signature_rejection_phrase;
+use jmodguard_updater::signing_fixture::{BadSignature, SigningFixture, SigningKeyChoice};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+fn test_signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::new();
+        fixture.apply_env();
+        fixture
+    })
+}
 
 async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) -> Response {
     match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
@@ -54,6 +65,13 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     objects.insert(config_hash, config);
     objects.insert(layer_hash, layer);
     objects.insert(manifest_hash.clone(), manifest);
+    test_signing().sign(
+        objects,
+        role,
+        &manifest_hash,
+        &jmodguard_updater::signing_fixture::signature_not_after_far_future(),
+        SigningKeyChoice::Current,
+    );
     ComponentRelease {
         component: role.into(),
         channel: "latest".into(),
@@ -8071,5 +8089,76 @@ async fn baked_auth_rejection_after_ready_is_held() {
     assert_eq!(independent_exit_starts(&root).await, ["baked-bot.start"]);
     bot.end_idle().await.unwrap();
     drop((bot, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+fn installed_state(release: ComponentRelease) -> db::ComponentUpdate {
+    db::ComponentUpdate {
+        component: release.component.clone(),
+        channel: "latest".into(),
+        cadence: "off".into(),
+        candidate: None,
+        checked_at: None,
+        check_error: None,
+        desired: None,
+        desired_launcher: None,
+        installed: Some(release),
+        installed_launcher: None,
+        launcher_sha256: None,
+        launcher_installed_at: None,
+        previous: None,
+        observed: None,
+        observed_at: None,
+        installed_at: Some(1),
+        state: "idle".into(),
+        last_error: None,
+    }
+}
+
+async fn boot_repair_refuses(
+    control: &UpdateControl,
+    root: &Path,
+    mut release: ComponentRelease,
+    objects: HashMap<String, Vec<u8>>,
+    phrase: &'static str,
+) {
+    let schema = control.schema_version().await.unwrap();
+    release.min_schema = schema;
+    release.max_schema = schema;
+    release.result_schema = schema;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let mut service = controller("bot", root.join("baked"), registry, control.clone(), root);
+    let error = service
+        .restore(&installed_state(release))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), phrase, "{error:?}");
+    assert_eq!(signature_rejection_phrase(&error), Some(phrase));
+    assert!(service.running.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
+    let root = std::env::temp_dir().join(format!("sig-boot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (_db, control) = open_launcher_db(&root).await;
+    for bad in BadSignature::ALL {
+        let mut objects = HashMap::new();
+        let release = image(&mut objects, "bot", b"\x7fELFboot");
+        test_signing().damage(&mut objects, "bot", &release.digest, bad);
+        boot_repair_refuses(&control, &root, release, objects, bad.phrase()).await;
+    }
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

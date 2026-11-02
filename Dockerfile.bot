@@ -16,6 +16,7 @@ RUN rustup show
 COPY Cargo.toml Cargo.lock LICENSE.md ./
 COPY src ./src
 COPY crates ./crates
+COPY deploy ./deploy
 COPY migrations ./migrations
 COPY vendor ./vendor
 COPY scripts/bootstrap-container.sh ./scripts/bootstrap-container.sh

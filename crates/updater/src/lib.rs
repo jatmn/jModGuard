@@ -2,6 +2,8 @@
 //! the owner API and the role-specific service launcher.
 
 pub mod oci;
+pub mod signature;
+pub mod signing_fixture;
 pub mod storage;
 
 #[cfg(test)]
