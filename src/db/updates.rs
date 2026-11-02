@@ -401,6 +401,32 @@ pub async fn request_launcher_install(
                 .is_none_or(|release| release.digest != digest),
             "launcher release is already installed"
         );
+        let observed: Option<String> = tx.query_row(
+            "SELECT observed FROM component_updates WHERE component=?1",
+            params![component.clone()],
+            |row| Ok(row.get(0)?),
+        )?;
+        // A missing or unreadable observation cannot prove a verifier is
+        // already running. Refuse a verifier-era target before recording it.
+        let candidate_revision = candidate.launcher.as_ref().map(|contract| contract.revision);
+        let needs_verifier_hop = candidate_revision.is_some_and(|revision| {
+            revision >= crate::db::VERIFIER_LAUNCHER_REVISION
+        });
+        let running = match parse_observation(observed) {
+            Ok(seen) => seen.map(|seen| seen.launcher_revision),
+            Err(_) if needs_verifier_hop => {
+                anyhow::bail!("{}", crate::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(revision) = candidate_revision
+            && needs_verifier_hop
+            && running.is_none_or(|running| {
+                crate::db::pre_verifier_launcher_hop(running, revision)
+            })
+        {
+            anyhow::bail!("{}", crate::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
+        }
         tx.execute_rows(
             "UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
             params![component, serde_json::to_string(&candidate)?], 1,
@@ -884,7 +910,71 @@ pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_budget::BoundedWrites;
+    use super::super::{SqlExecutor, params};
     use super::*;
+
+    async fn set_observed(db: &Db, observed: Option<&str>) {
+        let observed = observed.map(str::to_owned);
+        db.with_conn(move |conn| {
+            conn.execute_rows(
+                "UPDATE component_updates SET observed=?2 WHERE component=?1",
+                params!["api", observed],
+                1,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn desired_launcher_set(db: &Db) -> bool {
+        db.with_conn(|conn| {
+            let raw: Option<String> = conn.query_row(
+                "SELECT desired_launcher FROM component_updates WHERE component=?1",
+                params!["api"],
+                |row| Ok(row.get(0)?),
+            )?;
+            Ok(raw.is_some())
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn assert_hop_refused(db: &Db, digest: &str, now: i64) {
+        let refused = request_launcher_install(db, "api", digest, now)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            crate::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED
+        );
+        assert!(!desired_launcher_set(db).await);
+    }
+
+    fn verifier_observation() -> ComponentObservation {
+        ComponentObservation {
+            guild_schema: Some(1),
+            update_protocol: crate::db::UPDATE_CONTROL_PROTOCOL,
+            launcher_revision: crate::db::VERIFIER_LAUNCHER_REVISION,
+            source_sha: "d".repeat(40),
+            executable_sha256: "e".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "b".repeat(40),
+            started_at: 90,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "debian-bookworm-amd64".into(),
+        }
+    }
+
+    async fn observe_verifier(db: &Db, component: &str, now: i64) {
+        record_component_running(db, component, None, verifier_observation(), now)
+            .await
+            .unwrap();
+    }
 
     fn candidate(sha: char) -> ComponentRelease {
         ComponentRelease {
@@ -1333,6 +1423,7 @@ mod tests {
         request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
+        observe_verifier(&db, "api", 100).await;
         request_launcher_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
@@ -1587,6 +1678,7 @@ mod tests {
         request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
+        observe_verifier(&db, "api", 100).await;
         request_launcher_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
@@ -1866,6 +1958,7 @@ mod tests {
         request_component_install(&db, "api", &api.digest, 7312)
             .await
             .unwrap();
+        observe_verifier(&db, "api", 7312).await;
         request_launcher_install(&db, "api", &api.digest, 7312)
             .await
             .unwrap();
@@ -1895,6 +1988,66 @@ mod tests {
         request_component_install(&db, "webui", &webui.digest, 7401)
             .await
             .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_verifier_observation_cannot_select_the_verifier_launcher() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_updates_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let release = candidate('a');
+        let observation = |revision: u32| ComponentObservation {
+            guild_schema: Some(1),
+            update_protocol: crate::db::UPDATE_CONTROL_PROTOCOL,
+            launcher_revision: revision,
+            source_sha: "d".repeat(40),
+            executable_sha256: "e".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "b".repeat(40),
+            started_at: 90,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "debian-bookworm-amd64".into(),
+        };
+        record_update_check(
+            &db,
+            "api",
+            &release.channel,
+            Some(release.clone()),
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        set_observed(&db, None).await;
+        assert_hop_refused(&db, &release.digest, 100).await;
+        set_observed(&db, Some("{")).await;
+        assert_hop_refused(&db, &release.digest, 101).await;
+        record_component_running(&db, "api", None, observation(18), 102)
+            .await
+            .unwrap();
+        assert_hop_refused(&db, &release.digest, 102).await;
+        record_component_running(
+            &db,
+            "api",
+            None,
+            observation(crate::db::VERIFIER_LAUNCHER_REVISION),
+            103,
+        )
+        .await
+        .unwrap();
+        request_launcher_install(&db, "api", &release.digest, 103)
+            .await
+            .expect("a revision-19 launcher can select a newer launcher");
+        assert!(desired_launcher_set(&db).await);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

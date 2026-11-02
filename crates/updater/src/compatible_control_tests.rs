@@ -134,8 +134,7 @@ fn app_only_schema_refuse_requires_launcher_revision_eighteen() {
     }
 }
 
-#[test]
-fn revision_eighteen_deployment_is_offered_the_verifier_launcher() {
+fn launcher_advice(running: u32, available: u32) -> serde_json::Value {
     let now = 1_700_000_000;
     let guild = jmodguard::db::guild_data::SCHEMA_VERSION;
     let candidate = ComponentRelease {
@@ -153,7 +152,7 @@ fn revision_eighteen_deployment_is_offered_the_verifier_launcher() {
         max_api: 1,
         launcher_protocol: 1,
         launcher: Some(LauncherCompatibility {
-            revision: jmodguard::db::LAUNCHER_REVISION,
+            revision: available,
             min_revision: jmodguard::db::REQUIRED_LAUNCHER_REVISION,
         }),
         base_abi: "debian-bookworm-amd64".into(),
@@ -191,17 +190,47 @@ fn revision_eighteen_deployment_is_offered_the_verifier_launcher() {
             base_abi: "debian-bookworm-amd64".into(),
             guild_schema: Some(guild),
             update_protocol: UPDATE_CONTROL_PROTOCOL,
-            launcher_revision: 18,
+            launcher_revision: running,
         }),
         observed_at: Some(now),
         installed_at: None,
         state: "idle".into(),
         last_error: None,
     };
-    let advice = super::launcher_status(&row, now);
-    assert_eq!(advice["running"], 18);
-    assert_eq!(advice["available"], jmodguard::db::LAUNCHER_REVISION);
-    assert_eq!(advice["minimum"], jmodguard::db::REQUIRED_LAUNCHER_REVISION);
-    assert_eq!(advice["state"], "optional");
-    assert_eq!(advice["installable"], true);
+    super::launcher_status(&row, now)
+}
+
+#[test]
+fn revision_eighteen_observation_is_not_offered_the_verifier_launcher() {
+    for available in [
+        jmodguard::db::VERIFIER_LAUNCHER_REVISION,
+        jmodguard::db::LAUNCHER_REVISION,
+    ] {
+        let advice = launcher_advice(18, available);
+        assert_eq!(advice["running"], 18);
+        assert_eq!(advice["available"], available);
+        assert_eq!(advice["minimum"], jmodguard::db::REQUIRED_LAUNCHER_REVISION);
+        assert_eq!(advice["state"], "blocked");
+        assert_eq!(advice["installable"], false);
+        assert_eq!(
+            advice["reason"],
+            jmodguard::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED
+        );
+    }
+}
+
+#[test]
+fn revision_nineteen_observation_can_install_a_newer_launcher() {
+    let verifier = jmodguard::db::VERIFIER_LAUNCHER_REVISION;
+    let same = launcher_advice(verifier, verifier);
+    assert_eq!(same["running"], verifier);
+    assert_eq!(same["state"], "satisfied");
+    assert_eq!(same["installable"], false);
+
+    assert!(jmodguard::db::LAUNCHER_REVISION > verifier);
+    let newer = launcher_advice(verifier, jmodguard::db::LAUNCHER_REVISION);
+    assert_eq!(newer["running"], verifier);
+    assert_eq!(newer["available"], jmodguard::db::LAUNCHER_REVISION);
+    assert_eq!(newer["state"], "optional");
+    assert_eq!(newer["installable"], true);
 }

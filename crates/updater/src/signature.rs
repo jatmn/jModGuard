@@ -12,6 +12,14 @@ pub const BAD_IMAGE_SIGNATURE: &str = "bad image signature";
 pub const EXPIRED_IMAGE_SIGNATURE: &str = "expired image signature";
 pub const UNTRUSTED_IMAGE_SIGNATURE_KEY: &str = "image signature used an untrusted key";
 
+/// New installs refuse a signature at or after `io.jmodguard.not-after`.
+/// Boot repair of an already-installed release may accept that same signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureExpiry {
+    Enforce,
+    AllowExpired,
+}
+
 const CURRENT_PUBLIC_PEM: &str = include_str!("../../../deploy/update-signing.pub");
 const PAYLOAD_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
 const SIGNATURE_TYPE: &str = "cosign container image signature";
@@ -186,6 +194,7 @@ pub fn verify_manifest_signature(
     manifest_bytes: &[u8],
     signature_body: &[u8],
     now: DateTime<Utc>,
+    expiry: SignatureExpiry,
 ) -> Result<()> {
     let envelope: Envelope =
         serde_json::from_slice(signature_body).map_err(|_| ImageSignatureRejection {
@@ -274,12 +283,14 @@ pub fn verify_manifest_signature(
             phrase: EXPIRED_IMAGE_SIGNATURE,
         })?
         .with_timezone(&Utc);
-    ensure!(
-        now < expires,
-        ImageSignatureRejection {
-            phrase: EXPIRED_IMAGE_SIGNATURE,
-        }
-    );
+    if expiry == SignatureExpiry::Enforce {
+        ensure!(
+            now < expires,
+            ImageSignatureRejection {
+                phrase: EXPIRED_IMAGE_SIGNATURE,
+            }
+        );
+    }
     Ok(())
 }
 
@@ -459,6 +470,7 @@ mod tests {
             manifest,
             &serde_json::to_vec(&envelope).unwrap(),
             Utc::now(),
+            SignatureExpiry::Enforce,
         )
         .unwrap_err();
         assert_eq!(

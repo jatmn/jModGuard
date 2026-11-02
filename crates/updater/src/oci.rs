@@ -231,6 +231,7 @@ impl Registry {
         repo: &str,
         manifest_digest: &str,
         manifest_bytes: &[u8],
+        expiry: signature::SignatureExpiry,
     ) -> Result<()> {
         let signature = self.signature_body(repo, manifest_digest).await?;
         let now = Utc::now();
@@ -246,6 +247,7 @@ impl Registry {
                 manifest_bytes,
                 &signature,
                 now,
+                expiry,
             );
         }
         let manifest: Manifest =
@@ -286,6 +288,7 @@ impl Registry {
                 manifest_bytes,
                 &envelope,
                 now,
+                expiry,
             ) {
                 Ok(()) => return Ok(()),
                 Err(error) => last = Some(error),
@@ -400,8 +403,14 @@ impl Registry {
         );
         let repo = repository(component)?;
         let (manifest, image_digest, manifest_bytes) = self.manifest(repo, reference).await?;
-        self.verify_manifest(component, repo, &image_digest, &manifest_bytes)
-            .await?;
+        self.verify_manifest(
+            component,
+            repo,
+            &image_digest,
+            &manifest_bytes,
+            signature::SignatureExpiry::Enforce,
+        )
+        .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config.architecture == "amd64" && config.os == "linux",
@@ -479,6 +488,27 @@ impl Registry {
         release: &ComponentRelease,
         requested: &[&str],
     ) -> Result<HashMap<String, Vec<u8>>> {
+        self.files_with(release, requested, signature::SignatureExpiry::Enforce)
+            .await
+    }
+
+    /// Re-read an already-installed release. The signature must still verify.
+    /// `io.jmodguard.not-after` does not block this download.
+    pub async fn files_for_installed_restore(
+        &self,
+        release: &ComponentRelease,
+        requested: &[&str],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.files_with(release, requested, signature::SignatureExpiry::AllowExpired)
+            .await
+    }
+
+    async fn files_with(
+        &self,
+        release: &ComponentRelease,
+        requested: &[&str],
+        expiry: signature::SignatureExpiry,
+    ) -> Result<HashMap<String, Vec<u8>>> {
         release.validate()?;
         let repo = repository(&release.component)?;
         ensure!(
@@ -491,7 +521,7 @@ impl Registry {
         );
         let (manifest, digest, manifest_bytes) = self.manifest(repo, &release.digest).await?;
         ensure!(digest == release.digest, "manifest digest mismatch");
-        self.verify_manifest(&release.component, repo, &digest, &manifest_bytes)
+        self.verify_manifest(&release.component, repo, &digest, &manifest_bytes, expiry)
             .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
