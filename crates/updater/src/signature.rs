@@ -148,14 +148,23 @@ pub fn envelope_from_cosign_payload(payload: &[u8], signature_b64: &str) -> Resu
         .map_err(|_| ImageSignatureRejection {
             phrase: BAD_IMAGE_SIGNATURE,
         })?;
-    let keyid = trusted_keys()
-        .ok()
-        .and_then(|keys| {
-            keys.iter()
-                .find(|key| key.key.verify(payload, &signature_bytes).is_ok())
-                .map(|key| key.keyid.clone())
-        })
-        .unwrap_or_default();
+    let keys = trusted_keys().map_err(|_| ImageSignatureRejection {
+        phrase: BAD_IMAGE_SIGNATURE,
+    })?;
+    // The Cosign annotation has no key id. A signer exists only when a pinned
+    // key verifies these bytes. Failure here is a bad signature, not an
+    // untrusted key.
+    let Some(keyid) = keys.iter().find_map(|key| {
+        key.key
+            .verify(payload, &signature_bytes)
+            .is_ok()
+            .then(|| key.keyid.clone())
+    }) else {
+        return Err(ImageSignatureRejection {
+            phrase: BAD_IMAGE_SIGNATURE,
+        }
+        .into());
+    };
     let envelope = serde_json::json!({
         "payloadType": PAYLOAD_TYPE,
         "payload": STANDARD.encode(payload),
@@ -210,10 +219,12 @@ pub fn verify_manifest_signature(
         phrase: BAD_IMAGE_SIGNATURE,
     })?;
     let Some(trusted) = keys.iter().find(|key| key.keyid == entry.keyid) else {
-        return Err(ImageSignatureRejection {
-            phrase: UNTRUSTED_IMAGE_SIGNATURE_KEY,
-        }
-        .into());
+        let phrase = if entry.keyid.is_empty() {
+            BAD_IMAGE_SIGNATURE
+        } else {
+            UNTRUSTED_IMAGE_SIGNATURE_KEY
+        };
+        return Err(ImageSignatureRejection { phrase }.into());
     };
     trusted
         .key
@@ -403,13 +414,17 @@ pub mod test_support {
         .unwrap()
     }
 
-    /// Keep the trusted key id and change the signature bytes.
-    pub fn tamper_signature(envelope: &[u8]) -> Vec<u8> {
-        let mut value: serde_json::Value = serde_json::from_slice(envelope).unwrap();
-        let sig = value["signatures"][0]["sig"].as_str().unwrap();
+    /// Flip one byte of the Cosign layer annotation. The payload and key stay
+    /// those of the pinned signer; the annotation itself carries no key id.
+    pub fn tamper_cosign_annotation(manifest: &[u8]) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(manifest).unwrap();
+        let sig = value["layers"][0]["annotations"]["dev.cosignproject.cosign/signature"]
+            .as_str()
+            .unwrap();
         let mut raw = STANDARD.decode(sig).unwrap();
         raw[0] ^= 0xff;
-        value["signatures"][0]["sig"] = json!(STANDARD.encode(raw));
+        value["layers"][0]["annotations"]["dev.cosignproject.cosign/signature"] =
+            json!(STANDARD.encode(raw));
         serde_json::to_vec(&value).unwrap()
     }
 }
@@ -427,5 +442,28 @@ mod tests {
         assert_eq!(sec1[0], 0x04);
         let key = trusted_key(CURRENT_PUBLIC_PEM).unwrap();
         assert_eq!(key.keyid.len(), 64);
+    }
+
+    #[test]
+    fn missing_signer_is_a_bad_signature() {
+        let manifest = b"manifest-bytes";
+        let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
+        let envelope = serde_json::json!({
+            "payloadType": PAYLOAD_TYPE,
+            "payload": STANDARD.encode(b"{}"),
+            "signatures": [{"keyid": "", "sig": STANDARD.encode([1u8; 64])}]
+        });
+        let error = verify_manifest_signature(
+            "bot",
+            &digest,
+            manifest,
+            &serde_json::to_vec(&envelope).unwrap(),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            signature_rejection_phrase(&error),
+            Some(BAD_IMAGE_SIGNATURE)
+        );
     }
 }

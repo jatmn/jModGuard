@@ -256,6 +256,16 @@ async fn signature_policy_refuses_before_staging_download() {
         let source = char::from(b'a' + index as u8);
         let digest = image(&mut fixture, source, b"\x7fELFsigned", "development");
         signing().damage(&mut fixture.objects, "api", &digest, bad);
+        if matches!(bad, BadSignature::Wrong) {
+            let tag = jmodguard_updater::signature::signature_tag_for_digest(&digest).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+            assert!(body.get("payloadType").is_none());
+            assert!(
+                body["layers"][0]["annotations"]["dev.cosignproject.cosign/signature"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
         fixture.tag = digest.clone();
         let release = api_release(&digest, source);
         let (registry, server) = serve(fixture).await;

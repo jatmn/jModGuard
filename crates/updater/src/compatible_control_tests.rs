@@ -1,8 +1,8 @@
 //! Admission tests for [`compatible_control`].
 use super::compatible_control;
 use jmodguard::db::{
-    ComponentRelease, LauncherCompatibility, UPDATE_CONTROL_PROTOCOL, UpdateControl,
-    UpgradeCompatibility,
+    ComponentObservation, ComponentRelease, ComponentUpdate, LauncherCompatibility,
+    UPDATE_CONTROL_PROTOCOL, UpdateControl, UpgradeCompatibility,
 };
 
 async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
@@ -129,5 +129,79 @@ async fn update_control_accepts_equal_schema() {
 
 #[test]
 fn app_only_schema_refuse_requires_launcher_revision_eighteen() {
-    assert_eq!(jmodguard::db::LAUNCHER_REVISION, 18);
+    const {
+        assert!(jmodguard::db::LAUNCHER_REVISION >= 18);
+    }
+}
+
+#[test]
+fn revision_eighteen_deployment_is_offered_the_verifier_launcher() {
+    let now = 1_700_000_000;
+    let guild = jmodguard::db::guild_data::SCHEMA_VERSION;
+    let candidate = ComponentRelease {
+        component: "bot".into(),
+        channel: "latest".into(),
+        release_id: "fixture".into(),
+        source_sha: "c".repeat(40),
+        published_at: "2026-10-01T00:00:00Z".into(),
+        image: "ghcr.io/jatmn/jmodguard-bot".into(),
+        digest: format!("sha256:{}", "a".repeat(64)),
+        min_schema: 15,
+        max_schema: 15,
+        result_schema: 15,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: Some(LauncherCompatibility {
+            revision: jmodguard::db::LAUNCHER_REVISION,
+            min_revision: jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+        }),
+        base_abi: "debian-bookworm-amd64".into(),
+        upgrade: Some(UpgradeCompatibility {
+            control_protocol: UPDATE_CONTROL_PROTOCOL,
+            min_core: 15,
+            min_guild: 1,
+            guild_schema: guild,
+        }),
+    };
+    let row = ComponentUpdate {
+        component: "bot".into(),
+        channel: "latest".into(),
+        cadence: "off".into(),
+        candidate: Some(candidate),
+        checked_at: Some(now),
+        check_error: None,
+        desired: None,
+        desired_launcher: None,
+        installed: None,
+        installed_launcher: None,
+        launcher_sha256: None,
+        launcher_installed_at: None,
+        previous: None,
+        observed: Some(ComponentObservation {
+            source_sha: "d".repeat(40),
+            executable_sha256: "e".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "d".repeat(40),
+            started_at: now,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "debian-bookworm-amd64".into(),
+            guild_schema: Some(guild),
+            update_protocol: UPDATE_CONTROL_PROTOCOL,
+            launcher_revision: 18,
+        }),
+        observed_at: Some(now),
+        installed_at: None,
+        state: "idle".into(),
+        last_error: None,
+    };
+    let advice = super::launcher_status(&row, now);
+    assert_eq!(advice["running"], 18);
+    assert_eq!(advice["available"], jmodguard::db::LAUNCHER_REVISION);
+    assert_eq!(advice["minimum"], jmodguard::db::REQUIRED_LAUNCHER_REVISION);
+    assert_eq!(advice["state"], "optional");
+    assert_eq!(advice["installable"], true);
 }

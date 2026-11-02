@@ -1,7 +1,7 @@
 //! Small registry fixture for signature verification tests.
 use crate::signature::signature_tag_for_digest;
 use crate::signature::test_support::{
-    generate_key_pair, sign_manifest, sign_manifest_cosign, tamper_signature,
+    generate_key_pair, sign_manifest, sign_manifest_cosign, tamper_cosign_annotation,
 };
 use chrono::{Duration, Utc};
 use std::collections::HashMap;
@@ -165,16 +165,8 @@ impl SigningFixture {
                 objects.remove(&tag);
             }
             BadSignature::Wrong => {
-                objects.insert(
-                    tag,
-                    tamper_signature(&sign_manifest(
-                        &self.private_pem,
-                        &self.public_pem,
-                        component,
-                        manifest_digest,
-                        &future,
-                    )),
-                );
+                let manifest = objects[&tag].clone();
+                objects.insert(tag, tamper_cosign_annotation(&manifest));
             }
             BadSignature::Expired => {
                 objects.remove(&tag);
@@ -187,13 +179,19 @@ impl SigningFixture {
                 );
             }
             BadSignature::Untrusted => {
+                // The annotation path cannot name a signer. Untrusted means the
+                // envelope carries a key id that is not the pinned key.
                 objects.remove(&tag);
-                self.sign(
-                    objects,
-                    component,
-                    manifest_digest,
-                    &future,
-                    SigningKeyChoice::Unknown,
+                let (public_pem, private_pem) = generate_key_pair();
+                objects.insert(
+                    tag,
+                    sign_manifest(
+                        &private_pem,
+                        &public_pem,
+                        component,
+                        manifest_digest,
+                        &future,
+                    ),
                 );
             }
         }
