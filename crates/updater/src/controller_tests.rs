@@ -8427,7 +8427,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
         "{logs:?}"
     );
 
-    for status in [503u16, 429] {
+    for status in [408u16, 429, 500, 502, 503, 504, 599] {
         let (base, server) = status_registry(status).await;
         let (error, started, logs) =
             restore_installed("bot", &control, &root, &baked, &base, current, None).await;
@@ -8440,17 +8440,22 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
         );
     }
 
-    let (base, server) = status_registry(500).await;
-    let (error, started, logs) =
-        restore_installed("bot", &control, &root, &baked, &base, current, None).await;
-    server.abort();
-    let error = error.expect_err("HTTP 500 is not this outage");
-    assert!(error.contains("registry returned HTTP 500"), "{error}");
-    assert!(started.is_none(), "{started:?}");
-    assert!(
-        !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
-        "{logs:?}"
-    );
+    for status in [400u16, 401, 403, 404] {
+        let (base, server) = status_registry(status).await;
+        let (error, started, logs) =
+            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+        server.abort();
+        let error = error.expect_err("a permanent response must refuse fallback");
+        assert!(
+            error.contains(&format!("registry returned HTTP {status}")),
+            "{error}"
+        );
+        assert!(started.is_none(), "{started:?}");
+        assert!(
+            !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+            "{logs:?}"
+        );
+    }
 
     let (error, started, logs) =
         restore_installed("api", &control, &root, &baked, &refused, current, None).await;
@@ -8492,6 +8497,36 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     assert!(started.is_none(), "{started:?}");
 
     drop(reserved);
+    drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_start_starts_built_in_binary_when_registry_request_times_out() {
+    let root = std::env::temp_dir().join(format!("boot-timeout-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let current = control.schema_version().await.unwrap();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let restored = tokio::time::timeout(
+        Duration::from_secs(40),
+        restore_installed("bot", &control, &root, &baked, &base, current, None),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    let (error, started, logs) = restored.expect("registry request must respect its deadline");
+    assert!(error.is_ok(), "{error:?}");
+    assert_eq!(started.as_deref(), Some(baked.as_path()));
+    assert!(logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
     drop((db, control));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
