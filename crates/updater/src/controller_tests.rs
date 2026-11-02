@@ -8166,6 +8166,40 @@ fn expire_signature(objects: &mut HashMap<String, Vec<u8>>, component: &str, dig
 }
 
 #[tokio::test]
+async fn required_verifier_launcher_refuses_before_staging_or_selection() {
+    for role in ["bot", "api"] {
+        for minimum in [
+            db::VERIFIER_LAUNCHER_REVISION,
+            db::VERIFIER_LAUNCHER_REVISION + 1,
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("required-verifier-{:032x}", rand::random::<u128>()));
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            let (db, control) = open_launcher_db(&root).await;
+            let mut service = offline_controller(role, control.clone(), &root);
+            service.launcher_revision = db::VERIFIER_LAUNCHER_REVISION - 1;
+            let mut release = release_at(role, 'c', db::CORE_SCHEMA_VERSION);
+            release.launcher.as_mut().unwrap().min_revision = minimum;
+            let Err(error) = service.required_launcher(&release, None).await else {
+                panic!("required verifier hop must refuse before staging");
+            };
+            assert_eq!(error.to_string(), db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
+            assert_nothing_staged(&root, &service.staging);
+            assert!(
+                control
+                    .component(role)
+                    .await
+                    .unwrap()
+                    .desired_launcher
+                    .is_none()
+            );
+            drop((service, control, db));
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn revision_eighteen_handoff_does_not_stage_an_unverified_image() {
     for bad in [BadSignature::Unsigned, BadSignature::Wrong] {
         let root = std::env::temp_dir().join(format!("rev18-hop-{:032x}", rand::random::<u128>()));

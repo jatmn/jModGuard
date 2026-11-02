@@ -134,7 +134,7 @@ fn app_only_schema_refuse_requires_launcher_revision_eighteen() {
     }
 }
 
-fn launcher_advice(running: u32, available: u32) -> serde_json::Value {
+fn launcher_advice(running: u32, available: u32, minimum: u32) -> serde_json::Value {
     let now = 1_700_000_000;
     let guild = jmodguard::db::guild_data::SCHEMA_VERSION;
     let candidate = ComponentRelease {
@@ -153,7 +153,7 @@ fn launcher_advice(running: u32, available: u32) -> serde_json::Value {
         launcher_protocol: 1,
         launcher: Some(LauncherCompatibility {
             revision: available,
-            min_revision: jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+            min_revision: minimum,
         }),
         base_abi: "debian-bookworm-amd64".into(),
         upgrade: Some(UpgradeCompatibility {
@@ -206,7 +206,7 @@ fn revision_eighteen_observation_is_not_offered_the_verifier_launcher() {
         jmodguard::db::VERIFIER_LAUNCHER_REVISION,
         jmodguard::db::LAUNCHER_REVISION,
     ] {
-        let advice = launcher_advice(18, available);
+        let advice = launcher_advice(18, available, jmodguard::db::REQUIRED_LAUNCHER_REVISION);
         assert_eq!(advice["running"], 18);
         assert_eq!(advice["available"], available);
         assert_eq!(advice["minimum"], jmodguard::db::REQUIRED_LAUNCHER_REVISION);
@@ -222,15 +222,43 @@ fn revision_eighteen_observation_is_not_offered_the_verifier_launcher() {
 #[test]
 fn revision_nineteen_observation_can_install_a_newer_launcher() {
     let verifier = jmodguard::db::VERIFIER_LAUNCHER_REVISION;
-    let same = launcher_advice(verifier, verifier);
+    let same = launcher_advice(
+        verifier,
+        verifier,
+        jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+    );
     assert_eq!(same["running"], verifier);
     assert_eq!(same["state"], "satisfied");
     assert_eq!(same["installable"], false);
 
     assert!(jmodguard::db::LAUNCHER_REVISION > verifier);
-    let newer = launcher_advice(verifier, jmodguard::db::LAUNCHER_REVISION);
+    let newer = launcher_advice(
+        verifier,
+        jmodguard::db::LAUNCHER_REVISION,
+        jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+    );
     assert_eq!(newer["running"], verifier);
     assert_eq!(newer["available"], jmodguard::db::LAUNCHER_REVISION);
     assert_eq!(newer["state"], "optional");
     assert_eq!(newer["installable"], true);
+}
+
+#[test]
+fn required_verifier_launcher_is_blocked_before_the_verifier_era() {
+    let verifier = jmodguard::db::VERIFIER_LAUNCHER_REVISION;
+    for minimum in [verifier, verifier + 1] {
+        let advice = launcher_advice(verifier - 1, minimum, minimum);
+        assert_eq!(advice["state"], "blocked");
+        assert_eq!(advice["installable"], false);
+        assert_eq!(advice["running"], verifier - 1);
+        assert_eq!(advice["minimum"], minimum);
+        assert_eq!(advice["available"], minimum);
+        assert_eq!(
+            advice["reason"],
+            jmodguard::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED
+        );
+    }
+    let advice = launcher_advice(verifier, verifier + 1, verifier + 1);
+    assert_eq!(advice["state"], "required_first");
+    assert_eq!(advice["installable"], false);
 }
