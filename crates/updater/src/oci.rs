@@ -278,6 +278,7 @@ impl Registry {
             };
             let payload = match self.blob(repo, layer, MAX_MANIFEST).await {
                 Ok(payload) => payload,
+                Err(error) if registry_unreachable(&error) => return Err(error),
                 Err(_) => {
                     last = Some(
                         signature::ImageSignatureRejection {

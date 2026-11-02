@@ -30,6 +30,7 @@ struct RegistryFixture {
     tag: String,
     objects: HashMap<String, Vec<u8>>,
     delayed_payload: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    failed_payload: Option<(String, StatusCode)>,
 }
 
 async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Uri) -> Response {
@@ -47,6 +48,14 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
         let now = chrono::Utc::now();
         assert!(now < *expires, "payload request must start before expiry");
         tokio::time::sleep((*expires - now).to_std().unwrap()).await;
+    }
+    if let Some((failed, status)) = &fixture.failed_payload
+        && key == failed
+    {
+        return Response::builder()
+            .status(*status)
+            .body(Body::empty())
+            .unwrap();
     }
     match fixture.objects.get(key) {
         Some(bytes) => Response::builder()
@@ -374,6 +383,49 @@ async fn damaged_cosign_payloads_are_skipped_and_report_signature_rejection() {
                 }
             }
             server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cosign_payload_outages_propagate_without_signature_rejection() {
+    for status in [408, 429, 500, 503, 599] {
+        for valid_older in [false, true] {
+            let mut fixture = RegistryFixture::default();
+            let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
+            let tag = signature::signature_tag_for_digest(&digest).unwrap();
+            if !valid_older {
+                fixture.objects.remove(&tag);
+            }
+            signing().sign(
+                &mut fixture.objects,
+                "api",
+                &digest,
+                "2020-01-01T00:00:00Z",
+                SigningKeyChoice::Current,
+            );
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+            let payload = manifest["layers"].as_array().unwrap().last().unwrap()["digest"]
+                .as_str()
+                .unwrap();
+            fixture.failed_payload = Some((payload.into(), StatusCode::from_u16(status).unwrap()));
+            let release = api_release(&digest, 'e');
+            fixture.tag = digest;
+            let (registry, server) = serve(fixture).await;
+            let discovered = registry.discover("api", "latest").await;
+            let files = registry
+                .files(&release, &["usr/local/bin/jmodguard-api"])
+                .await;
+            server.abort();
+            let _ = server.await;
+            for error in [discovered.unwrap_err(), files.unwrap_err()] {
+                assert!(
+                    oci::registry_unreachable(&error),
+                    "payload HTTP {status} must remain unreachable: {error:#}"
+                );
+                assert_eq!(signature_rejection_phrase(&error), None);
+            }
         }
     }
 }
