@@ -561,6 +561,7 @@ fn automod_delete_report_peeks_snippet_identity() {
 #[test]
 fn bulk_peel_only_when_automod_individually_routable() {
     let automod = Some(MessageReport {
+        retained_expiries: Default::default(),
         guild_id: GuildId::new(789),
         event: "automod_delete",
         vars: BTreeMap::new(),
@@ -2767,5 +2768,236 @@ async fn full_mark_maps_leave_only_the_gateway_report() {
         let sent = sink.messages.lock().unwrap();
         assert_eq!(sent.len(), 1, "full maps must not produce two reports");
         assert_eq!(sent[0].0, ChannelId::new(902));
+    }
+}
+
+#[tokio::test]
+async fn queued_bulk_fallback_rechecks_configuration() {
+    for automod in [false, true] {
+        for change in ["disabled", "channel", "user", "destination"] {
+            let f = Fixture::new();
+            db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+                .await
+                .unwrap();
+            f.app.invalidate_configs();
+            let retained = sample_retained("queued-private-text");
+            let sink = Sink::default();
+            let held = f.app.log_delivery_slots.try_acquire_many(4).unwrap();
+            let send = async {
+                if automod {
+                    emit_reconciled_automod_delete(
+                        &f.app,
+                        &sink,
+                        789,
+                        456,
+                        123,
+                        "badword",
+                        "Bad words",
+                        "",
+                        Some(&retained),
+                        true,
+                    )
+                    .await;
+                } else {
+                    emit_replayed_plain_delete(
+                        &f.app,
+                        &sink,
+                        GuildId::new(789),
+                        ChannelId::new(456),
+                        MessageId::new(123),
+                        Some(&retained),
+                        false,
+                    )
+                    .await;
+                }
+            };
+            tokio::pin!(send);
+            tokio::select! {
+                _ = &mut send => panic!("fallback completed before admission"),
+                _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while f.app.log_delivery_waiters.available_permits() == 128 {
+                        tokio::task::yield_now().await;
+                    }
+                }) => {
+                    assert_eq!(f.app.log_delivery_waiters.available_permits(), 127);
+                }
+            }
+            match change {
+                "disabled" => db::delete_log_channel(&f.app.db, 789, "message_bulk_delete")
+                    .await
+                    .unwrap(),
+                "channel" => {
+                    set_log_filter(
+                        &f.app,
+                        "message_bulk_delete",
+                        Some(r#"{"channels":["456"],"users":[]}"#),
+                    )
+                    .await
+                }
+                "user" => {
+                    set_log_filter(
+                        &f.app,
+                        "message_bulk_delete",
+                        Some(r#"{"channels":[],"users":["42"]}"#),
+                    )
+                    .await
+                }
+                "destination" => db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 904)
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            f.app.invalidate_configs();
+            drop(held);
+            send.await;
+            let bodies = sink_bodies(&sink);
+            match change {
+                "disabled" | "channel" => {
+                    assert!(bodies.is_empty(), "{automod} {change}: {bodies:?}")
+                }
+                "user" => {
+                    assert_eq!(bodies.len(), 1, "{automod}: {bodies:?}");
+                    assert!(!bodies[0].contains("queued-private-text"), "{bodies:?}");
+                    assert!(bodies[0].contains("excluded"), "{bodies:?}");
+                }
+                "destination" => {
+                    assert_eq!(bodies.len(), 1, "{automod}: {bodies:?}");
+                    assert!(bodies[0].starts_with("904 "), "{bodies:?}");
+                    assert!(bodies[0].contains("queued-private-text"), "{bodies:?}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn queued_individual_delete_drops_expired_snapshot() {
+    for automod in [false, true] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        let mut retained = sample_retained("expired-snapshot-secret");
+        retained.expires_at_ms = chrono::Utc::now().timestamp_millis() + 1_500;
+        let sink = Sink::default();
+        let held = f.app.log_delivery_slots.try_acquire_many(4).unwrap();
+        let send = async {
+            if automod {
+                emit_reconciled_automod_delete(
+                    &f.app,
+                    &sink,
+                    789,
+                    456,
+                    123,
+                    "badword",
+                    "Bad words",
+                    "",
+                    Some(&retained),
+                    false,
+                )
+                .await;
+            } else {
+                emit_plain_message_delete(
+                    &f.app,
+                    &sink,
+                    GuildId::new(789),
+                    ChannelId::new(456),
+                    MessageId::new(123),
+                    Some(&retained),
+                )
+                .await;
+            }
+        };
+        tokio::pin!(send);
+        tokio::select! {
+            _ = &mut send => panic!("delete completed before admission"),
+            _ = tokio::time::timeout(Duration::from_secs(2), async {
+                while f.app.log_delivery_waiters.available_permits() == 128 {
+                    tokio::task::yield_now().await;
+                }
+            }) => {
+                assert_eq!(f.app.log_delivery_waiters.available_permits(), 127);
+            }
+        }
+        assert!(retained.expires_at_ms > chrono::Utc::now().timestamp_millis());
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        drop(held);
+        send.await;
+        let bodies = sink_bodies(&sink);
+        assert_eq!(bodies.len(), 1, "{automod}: {bodies:?}");
+        assert!(bodies[0].contains("123"), "{bodies:?}");
+        assert!(bodies[0].contains("unavailable"), "{bodies:?}");
+        assert!(!bodies[0].contains("expired-snapshot-secret"), "{bodies:?}");
+    }
+}
+
+#[tokio::test]
+async fn queued_prebuilt_report_drops_expired_fields() {
+    for reserved in [false, true] {
+        for edit in [false, true] {
+            let f = Fixture::new();
+            let event = if edit {
+                "message_edit"
+            } else {
+                "automod_delete"
+            };
+            db::upsert_log_channel(&f.app.db, 789, event, 902)
+                .await
+                .unwrap();
+            f.app.invalidate_configs();
+            let mut retained = sample_retained("expired-snapshot-secret");
+            retained.expires_at_ms = chrono::Utc::now().timestamp_millis() + 1_500;
+            retained.fields.attachments = Some(vec![db::guild_data::SnapshotAttachment {
+                id: 1,
+                filename: "expired-attachment".into(),
+                size: 1,
+                content_type: None,
+                url: String::new(),
+            }]);
+            retained.attachments_supplied = true;
+            let mut report = automod_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(123),
+                "badword",
+                "Bad words",
+                "",
+                None,
+            );
+            if edit {
+                report.event = "message_edit";
+                let after = sample_retained("still-valid-edit");
+                apply_retained_edit(&mut report, Some(&retained), Some(&after));
+            } else {
+                apply_retained_delete(&mut report, Some(&retained));
+            }
+            let sink = Sink::default();
+            let held = f.app.log_delivery_slots.try_acquire_many(4).unwrap();
+            let reservation = reserved.then(|| reserve_log_delivery(&f.app).unwrap());
+            let send = emit_message_report(&f.app, &sink, report, reservation);
+            tokio::pin!(send);
+            // Poll the actual dispatcher continuation, including a pre-reserved waiter.
+            use std::future::Future;
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx))).await;
+            assert!(first.is_pending());
+            assert_eq!(f.app.log_delivery_waiters.available_permits(), 127);
+            assert!(retained.expires_at_ms > chrono::Utc::now().timestamp_millis());
+            tokio::time::sleep(Duration::from_millis(1_600)).await;
+            drop(held);
+            assert_eq!(send.await, Delivery::Sent);
+            let bodies = sink_bodies(&sink);
+            assert_eq!(bodies.len(), 1, "{bodies:?}");
+            assert!(bodies[0].contains("123"), "{bodies:?}");
+            assert!(bodies[0].contains("snapshot expired"), "{bodies:?}");
+            assert!(!bodies[0].contains("expired-snapshot-secret"), "{bodies:?}");
+            assert!(!bodies[0].contains("expired-attachment"), "{bodies:?}");
+            if edit {
+                assert!(bodies[0].contains("still-valid-edit"), "{bodies:?}");
+            }
+        }
     }
 }

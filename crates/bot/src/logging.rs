@@ -1122,26 +1122,6 @@ pub async fn emit(
     emit_to(app, ctx.http.as_ref(), guild_id, event, vars).await;
 }
 
-/// Send on a delivery permit the caller already holds.
-pub(crate) async fn emit_held(
-    app: &Arc<BotState>,
-    ctx: &Context,
-    guild_id: GuildId,
-    event: &str,
-    vars: BTreeMap<String, String>,
-) -> Delivery {
-    emit_to_observed(
-        app,
-        ctx.http.as_ref(),
-        guild_id,
-        event,
-        vars,
-        None,
-        Admission::Held,
-    )
-    .await
-}
-
 /// Sends a lifecycle notice through the configured system log channel.
 pub async fn emit_system_notice(
     app: &Arc<BotState>,
@@ -1372,9 +1352,8 @@ async fn acquire_log_delivery(app: &BotState) -> Option<tokio::sync::OwnedSemaph
 enum Admission {
     Immediate,
     WaitForShutdown,
-    /// Caller acquired `log_delivery_slots` before spawning and holds that
-    /// permit until this send finishes. Do not take a second one.
-    Held,
+    /// Caller holds `log_delivery_slots`. Preserve its delivery-budget start.
+    Held(Instant),
 }
 
 pub(crate) async fn emit_to(
@@ -1539,7 +1518,10 @@ async fn emit_to_observed_with_audit(
             .observe_event(guild_id.get(), target, event, observed)
     });
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
-    let started = Instant::now();
+    let started = match admission {
+        Admission::Held(started) => started,
+        _ => Instant::now(),
+    };
     let _permit = match admission {
         Admission::Immediate => {
             let Some(permit) = acquire_log_delivery(app).await else {
@@ -1561,7 +1543,7 @@ async fn emit_to_observed_with_audit(
             };
             Some(permit)
         }
-        Admission::Held => None,
+        Admission::Held(_) => None,
     };
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
@@ -1864,6 +1846,44 @@ pub(crate) struct MessageReport {
     pub guild_id: GuildId,
     pub event: &'static str,
     pub vars: BTreeMap<String, String>,
+    pub retained_expiries: BTreeMap<&'static str, i64>,
+}
+
+/// Keep snapshot expiry attached to pre-built fields through delivery admission.
+pub(crate) async fn emit_message_report(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    mut report: MessageReport,
+    reservation: Option<LogDeliveryReservation>,
+) -> Delivery {
+    let started = Instant::now();
+    let Some(reservation) = reservation.or_else(|| reserve_log_delivery(app)) else {
+        return Delivery::Dropped;
+    };
+    let Some(_permit) = reservation.acquire(app).await else {
+        return Delivery::Dropped;
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    for (field, expires_at_ms) in report.retained_expiries {
+        if expires_at_ms <= now {
+            report
+                .vars
+                .insert(field.into(), "unavailable (snapshot expired)".into());
+            report
+                .vars
+                .insert("coverage".into(), "retained snapshot unavailable".into());
+        }
+    }
+    emit_to_observed(
+        app,
+        sink,
+        report.guild_id,
+        report.event,
+        report.vars,
+        None,
+        Admission::Held(started),
+    )
+    .await
 }
 
 fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<String, String> {
@@ -2144,6 +2164,7 @@ pub(crate) fn apply_retained_edit(
     after: Option<&MessageSnapshot>,
 ) {
     if let Some(row) = before {
+        report.retained_expiries.insert("before", row.expires_at_ms);
         report.vars.insert("before".into(), retained_content(row));
         report.vars.insert(
             "coverage".into(),
@@ -2159,6 +2180,10 @@ pub(crate) fn apply_retained_edit(
             .insert("before".into(), "unavailable (not captured)".into());
     }
     if let Some(row) = after {
+        report.retained_expiries.insert("after", row.expires_at_ms);
+        report
+            .retained_expiries
+            .insert("attachments", row.expires_at_ms);
         report.vars.insert("after".into(), retained_content(row));
         report
             .vars
@@ -2175,6 +2200,12 @@ pub(crate) fn apply_retained_edit(
 
 pub(crate) fn apply_retained_delete(report: &mut MessageReport, row: Option<&MessageSnapshot>) {
     if let Some(row) = row {
+        report
+            .retained_expiries
+            .insert("content", row.expires_at_ms);
+        report
+            .retained_expiries
+            .insert("attachments", row.expires_at_ms);
         report.vars.insert("content".into(), retained_content(row));
         report
             .vars
@@ -2215,7 +2246,13 @@ pub(crate) struct BulkTranscript {
     pub pending_automod: Vec<MessageId>,
     included_authors: HashSet<i64>,
     bytes: usize,
-    entries: Vec<String>,
+    entries: Vec<BulkTranscriptEntry>,
+}
+
+struct BulkTranscriptEntry {
+    id: MessageId,
+    text: String,
+    expires_at_ms: Option<i64>,
 }
 
 impl BulkTranscript {
@@ -2258,20 +2295,45 @@ impl BulkTranscript {
             self.unavailable += 1;
             format!("Message {} | retained content unavailable\n\n", id)
         };
-        self.push_line(line);
+        self.push_line(id, line, row.map(|row| row.expires_at_ms));
     }
 
     pub fn push_unknown(&mut self, id: MessageId) {
         self.unknown += 1;
-        self.push_line(format!("Message {} | snapshot storage unavailable\n\n", id));
+        self.push_line(
+            id,
+            format!("Message {} | snapshot storage unavailable\n\n", id),
+            None,
+        );
     }
 
-    fn push_line(&mut self, line: String) {
+    fn push_line(&mut self, id: MessageId, line: String, expires_at_ms: Option<i64>) {
         if self.bytes.saturating_add(line.len()).saturating_add(200) <= 256 * 1024 {
             self.bytes += line.len();
-            self.entries.push(line);
+            self.entries.push(BulkTranscriptEntry {
+                id,
+                text: line,
+                expires_at_ms,
+            });
         } else {
             self.omitted += 1;
+        }
+    }
+
+    fn expire_retained(&mut self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        for entry in &mut self.entries {
+            if entry.expires_at_ms.is_some_and(|expiry| expiry <= now) {
+                self.bytes -= entry.text.len();
+                entry.text = format!(
+                    "Message {} | retained content unavailable (snapshot expired)\n\n",
+                    entry.id
+                );
+                self.bytes += entry.text.len();
+                entry.expires_at_ms = None;
+                self.retained -= 1;
+                self.unavailable += 1;
+            }
         }
     }
 
@@ -2301,7 +2363,7 @@ impl BulkTranscript {
         let mut text = String::with_capacity(self.bytes.saturating_add(200));
         text.push_str("jModGuard last-observed deleted messages\n\n");
         for entry in &self.entries {
-            text.push_str(entry);
+            text.push_str(&entry.text);
         }
         if self.omitted > 0 {
             text.push_str(&format!(
@@ -2322,6 +2384,7 @@ fn fallback_bulk_parts(
     let mut shown = 0usize;
     let mut clipped = 0usize;
     for entry in &transcript.entries {
+        let entry = &entry.text;
         let slot = parts.len() - 1;
         let limit = if slot == 0 { 1100 } else { 1700 };
         if !parts[slot].is_empty()
@@ -2697,8 +2760,13 @@ pub(crate) async fn emit_retained_bulk_to(
     sink: &impl LogDelivery,
     guild: GuildId,
     channel: ChannelId,
-    transcript: BulkTranscript,
+    mut transcript: BulkTranscript,
 ) -> BulkDeliveryOutcome {
+    let time = chrono::Utc::now().to_rfc3339();
+    let Some(_permit) = acquire_log_delivery(app).await else {
+        return BulkDeliveryOutcome::Failed;
+    };
+    transcript.expire_retained();
     let vars = BTreeMap::from([
         ("channel".into(), format!("<#{channel}>")),
         ("channel_id".into(), channel.to_string()),
@@ -2715,11 +2783,8 @@ pub(crate) async fn emit_retained_bulk_to(
                 transcript.omitted, transcript.filtered
             ),
         ),
-        ("time".into(), chrono::Utc::now().to_rfc3339()),
+        ("time".into(), time),
     ]);
-    let Some(_permit) = acquire_log_delivery(app).await else {
-        return BulkDeliveryOutcome::Failed;
-    };
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
     let started = Instant::now();
     let cfg = match tokio::time::timeout(
@@ -2929,6 +2994,7 @@ pub(crate) fn message_update_report(
         guild_id,
         event: "message_edit",
         vars,
+        retained_expiries: BTreeMap::new(),
     })
 }
 
@@ -2966,6 +3032,7 @@ pub(crate) fn message_delete_report(
         guild_id,
         event: "message_delete",
         vars,
+        retained_expiries: BTreeMap::new(),
     }
 }
 
@@ -2984,6 +3051,7 @@ pub(crate) fn message_delete_report_peek(
         guild_id,
         event: "message_delete",
         vars,
+        retained_expiries: BTreeMap::new(),
     }
 }
 
@@ -3007,6 +3075,7 @@ pub(crate) fn automod_delete_report(
         guild_id,
         event: "automod_delete",
         vars,
+        retained_expiries: BTreeMap::new(),
     };
     if let Some(row) = retained {
         apply_retained_delete(&mut report, Some(row));
@@ -3051,11 +3120,25 @@ pub(crate) async fn emit_plain_message_delete(
     retained: Option<&MessageSnapshot>,
 ) {
     let retained = settle_automod_retained(app, guild_id.get(), channel.get(), id.get(), retained);
+    let started = Instant::now();
+    let Some(_permit) = acquire_log_delivery(app).await else {
+        return;
+    };
+    let retained = crate::automod_delete_marks::settlement_retained(retained);
     let mut report = message_delete_report(app, guild_id, channel, id);
     if let Some(row) = retained.as_ref() {
         apply_retained_delete(&mut report, Some(row));
     }
-    emit_to(app, sink, report.guild_id, report.event, report.vars).await;
+    emit_to_observed(
+        app,
+        sink,
+        report.guild_id,
+        report.event,
+        report.vars,
+        None,
+        Admission::Held(started),
+    )
+    .await;
 }
 
 /// REST failed or was cancelled after a gateway delete was held back.
@@ -3115,7 +3198,7 @@ async fn emit_failure_bulk(
         return;
     }
     let _permit = match admission {
-        Admission::Held => None,
+        Admission::Held(_) => None,
         Admission::Immediate | Admission::WaitForShutdown => {
             let Some(permit) = acquire_log_delivery(app).await else {
                 return;
@@ -3123,7 +3206,13 @@ async fn emit_failure_bulk(
             Some(permit)
         }
     };
-    let Some(destination) = channel_for(cfg, "message_bulk_delete") else {
+    let Ok(cfg) = app.configs.get(&app.db, guild_id.get()).await else {
+        return;
+    };
+    if bulk_log_suppressed(app, &cfg, guild_id.get(), channel) {
+        return;
+    }
+    let Some(destination) = channel_for(&cfg, "message_bulk_delete") else {
         return;
     };
     let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
@@ -3377,6 +3466,20 @@ async fn emit_reconciled_automod_delete_with(
         }
         return;
     }
+    let started = match admission {
+        Admission::Held(started) => started,
+        _ => Instant::now(),
+    };
+    let _permit = match admission {
+        Admission::Held(_) => None,
+        Admission::Immediate | Admission::WaitForShutdown => {
+            let Some(permit) = acquire_log_delivery(app).await else {
+                return;
+            };
+            Some(permit)
+        }
+    };
+    let retained = crate::automod_delete_marks::settlement_retained(retained);
     let report = automod_delete_report(
         app,
         GuildId::new(guild_id),
@@ -3387,23 +3490,16 @@ async fn emit_reconciled_automod_delete_with(
         reason,
         retained.as_ref(),
     );
-    match admission {
-        Admission::Held => {
-            emit_to_observed(
-                app,
-                sink,
-                report.guild_id,
-                report.event,
-                report.vars,
-                None,
-                Admission::Held,
-            )
-            .await;
-        }
-        Admission::Immediate | Admission::WaitForShutdown => {
-            emit_to(app, sink, report.guild_id, report.event, report.vars).await;
-        }
-    }
+    emit_to_observed(
+        app,
+        sink,
+        report.guild_id,
+        report.event,
+        report.vars,
+        None,
+        Admission::Held(started),
+    )
+    .await;
 }
 
 /// Reconciled automod delete logging without blocking the enforcement caller.
@@ -3441,7 +3537,7 @@ pub(crate) fn spawn_reconciled_automod_delete(
             &reason,
             retained.as_ref(),
             fallback_to_bulk,
-            Admission::Held,
+            Admission::Held(Instant::now()),
         )
         .await;
     });
