@@ -84,6 +84,17 @@ fn receipt_not_saved(status: impl Into<String>) -> anyhow::Error {
     .into()
 }
 
+/// An older bot writer has no boot-mismatch operation. Its frame decoder
+/// answers that unknown operation with `write failed`. The receipt was not
+/// saved. Selection and activation failures keep that reply as a hard error.
+fn unsupported_boot_receipt(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string() == "write failed" {
+        receipt_not_saved("not supported")
+    } else {
+        error
+    }
+}
+
 fn require_progress(current: bool) -> Result<()> {
     if !current {
         return Err(UpgradeProgressChanged.into());
@@ -938,7 +949,8 @@ impl UpdateControl {
         if !self.writes_locally() {
             return self
                 .forward_process(ControlOp::RecordBootMismatch { record })
-                .await;
+                .await
+                .map_err(unsupported_boot_receipt);
         }
         record_boot_mismatch(&self.db, record).await
     }
@@ -949,7 +961,8 @@ impl UpdateControl {
                 .forward_process(ControlOp::ClearBootMismatch {
                     component: component.to_owned(),
                 })
-                .await;
+                .await
+                .map_err(unsupported_boot_receipt);
         }
         clear_boot_mismatch(&self.db, component).await
     }

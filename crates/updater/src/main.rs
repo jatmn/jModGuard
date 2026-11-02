@@ -2280,8 +2280,12 @@ impl Supervisor {
                     .as_ref()
                     .and_then(|r| r.release.clone())
                     .context("failed replacement missing")?;
+                // The restarted process keeps the standby identity. An outage
+                // fallback's baked child has no release of its own; the receipt
+                // still names the retained installed selection.
+                let retained = self.durable_baked_selection(path == self.baked, &previous);
                 self.stop_application().await?;
-                self.start(&path, &sha, previous.clone()).await?;
+                self.start(&path, &sha, previous).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
                 let message = format!("{error:#}");
                 match self
@@ -2289,7 +2293,7 @@ impl Supervisor {
                     .rolled_back(
                         &self.role,
                         &failed,
-                        previous,
+                        retained,
                         deployment_observation(
                             child,
                             &self.base_sha,

@@ -612,6 +612,8 @@ pub async fn record_component_failure(
 
 /// A failed replacement must no longer look installed. Preserve the last
 /// healthy observation and clear the request so it cannot retry on each poll.
+/// When the rollback target is already the installed release, keep its
+/// original install time.
 pub async fn record_component_rollback(
     db: &Db,
     component: &str,
@@ -632,7 +634,7 @@ pub async fn record_component_rollback(
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute_rows("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component.clone(),previous,now,observation,error,failed], 1)?;
+        tx.execute_rows("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL WHEN installed IS ?2 THEN installed_at ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component.clone(),previous,now,observation,error,failed], 1)?;
         update_control::clear_rejected_candidate_conn(&tx, &component)?;
         tx.commit()?;
         Ok(())
