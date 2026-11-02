@@ -283,6 +283,8 @@ fn controller(
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: std::collections::VecDeque::new(),
+        boot_receipt_attempt: 0,
+        boot_receipt_not_before: None,
         baked_fallback_installed: None,
         pending_startup: Vec::new(),
         receipt_attempt: 0,
@@ -303,7 +305,7 @@ async fn restart(service: &mut Supervisor) {
     service.persisted_candidate_digest = None;
     service.rollback = None;
     service.pending_failure = None;
-    service.pending_boot_mismatch.clear();
+    service.clear_pending_boot_mismatch();
     service.baked_fallback_installed = None;
     service.pending_startup.clear();
     service.receipt_attempt = 0;
@@ -8854,6 +8856,7 @@ struct OlderBootWriter {
     addr: std::net::SocketAddr,
     secret: String,
     fail_activation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    diagnostic_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -8868,12 +8871,14 @@ impl Drop for OlderBootWriter {
 }
 
 fn older_boot_writer() -> OlderBootWriter {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let secret = "x".repeat(32);
     let key = jmodguard::control::load_writer_key(&secret).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let fail_activation = std::sync::Arc::new(AtomicBool::new(false));
+    let diagnostic_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let requests = std::sync::Arc::clone(&diagnostic_requests);
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let fail_flag = std::sync::Arc::clone(&fail_activation);
     let stop_flag = std::sync::Arc::clone(&stop);
@@ -8895,9 +8900,14 @@ fn older_boot_writer() -> OlderBootWriter {
                                 op,
                                 db::ControlOp::RecordBootMismatch { .. }
                                     | db::ControlOp::ClearBootMismatch { .. }
-                            ) || (fail_flag.load(Ordering::Relaxed)
-                                && matches!(op, db::ControlOp::RecordComponentRunning { .. }));
+                            );
                             if unsupported {
+                                requests.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if unsupported
+                                || (fail_flag.load(Ordering::Relaxed)
+                                    && matches!(op, db::ControlOp::RecordComponentRunning { .. }))
+                            {
                                 db::ControlReply::Failed {
                                     message: "write failed".into(),
                                     code: None,
@@ -8926,6 +8936,7 @@ fn older_boot_writer() -> OlderBootWriter {
         addr,
         secret,
         fail_activation,
+        diagnostic_requests,
         stop,
         thread: Some(thread),
     }
@@ -8975,6 +8986,33 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         Some(PendingBootMismatch::Record { .. })
     ));
 
+    wait_for_ready_file(&service).await;
+    // Exercise the production ordering: retry diagnostics before readiness.
+    // Make each poll retry-eligible without waiting for the backoff in real time.
+    for _ in 0..3 {
+        service.receipt_not_before = None;
+        service.boot_receipt_not_before = None;
+        let before = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        service.tick_control().await.unwrap();
+        assert!(service.reported, "pending Record must not starve readiness");
+        assert!(matches!(
+            service.pending_boot_mismatch.front(),
+            Some(PendingBootMismatch::Record { .. })
+        ));
+        let after = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+        service.tick_control().await.unwrap();
+        assert_eq!(
+            peer.diagnostic_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "unsupported Record must remain deferred even after readiness succeeds"
+        );
+    }
     service.stop_application().await.unwrap();
     let installed = root.join("installed-api");
     tokio::fs::copy(&baked, &installed).await.unwrap();
@@ -8983,11 +9021,8 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         .await
         .unwrap();
     wait_for_ready_file(&service).await;
-    // The outage record was not saved and armed the receipt backoff. A later
-    // poll sends the managed readiness receipt, including the clear.
-    service.receipt_attempt = 0;
-    service.receipt_not_before = None;
-    let ready = service.normal().await;
+    // Managed readiness must proceed while the outage record is still deferred.
+    let ready = service.tick_control().await;
     assert!(
         ready.is_ok(),
         "clearing a mismatch the older writer cannot store must not fail readiness: {ready:?}"
@@ -9008,6 +9043,39 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         service.pending_boot_mismatch.back(),
         Some(PendingBootMismatch::Clear)
     ));
+
+    assert!(service.reported);
+    // A later managed child must also report readiness when Clear is retried first.
+    service.stop_application().await.unwrap();
+    service
+        .start(&installed, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    wait_for_ready_file(&service).await;
+    for _ in 0..3 {
+        service.receipt_not_before = None;
+        service.boot_receipt_not_before = None;
+        let before = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        service.tick_control().await.unwrap();
+        assert!(service.reported, "pending Clear must not starve readiness");
+        assert!(matches!(
+            service.pending_boot_mismatch.front(),
+            Some(PendingBootMismatch::Clear)
+        ));
+        let after = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "the pending Clear must have been retried");
+        service.tick_control().await.unwrap();
+        assert_eq!(
+            peer.diagnostic_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "unsupported Clear must remain deferred even after readiness succeeds"
+        );
+    }
 
     peer.fail_activation
         .store(true, std::sync::atomic::Ordering::Relaxed);

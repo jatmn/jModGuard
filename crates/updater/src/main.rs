@@ -767,6 +767,9 @@ struct Supervisor {
     rollback: Option<(ComponentRelease, String)>,
     pending_failure: Option<PendingFailure>,
     pending_boot_mismatch: VecDeque<PendingBootMismatch>,
+    // Diagnostic retries must not postpone supported readiness/activation receipts.
+    boot_receipt_attempt: u32,
+    boot_receipt_not_before: Option<Instant>,
     /// Installed release retained while the built-in executable is covering a registry outage.
     baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
@@ -1007,6 +1010,18 @@ impl Supervisor {
         Ok(())
     }
 
+    fn note_boot_receipt_delay(&mut self) {
+        let delay = Duration::from_secs(1_u64 << self.boot_receipt_attempt.min(6))
+            .min(Duration::from_secs(60));
+        self.boot_receipt_attempt = self.boot_receipt_attempt.saturating_add(1);
+        self.boot_receipt_not_before = Some(Instant::now() + delay);
+    }
+
+    fn reset_boot_receipt_backoff(&mut self) {
+        self.boot_receipt_attempt = 0;
+        self.boot_receipt_not_before = None;
+    }
+
     fn baked_child_running(&self) -> bool {
         self.running
             .as_ref()
@@ -1104,10 +1119,15 @@ impl Supervisor {
 
     fn clear_pending_boot_mismatch(&mut self) {
         self.pending_boot_mismatch.clear();
+        self.reset_boot_receipt_backoff();
     }
 
     async fn flush_pending_boot_mismatch(&mut self) -> Result<()> {
-        if self.pending_boot_mismatch.is_empty() || !self.receipt_wait_elapsed() {
+        if self.pending_boot_mismatch.is_empty()
+            || self
+                .boot_receipt_not_before
+                .is_some_and(|at| Instant::now() < at)
+        {
             return Ok(());
         }
         self.keep_record_ahead_of_clear();
@@ -1138,11 +1158,11 @@ impl Supervisor {
                     })
                     .await
                 {
-                    Ok(()) => self.reset_receipt_backoff(),
+                    Ok(()) => self.reset_boot_receipt_backoff(),
                     Err(error) if Self::receipt_not_saved(&error) => {
                         tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                         self.queue_pending_boot_record((*release).clone(), reason);
-                        self.note_receipt_delay();
+                        self.note_boot_receipt_delay();
                     }
                     Err(error) => return Err(error),
                 }
@@ -1151,12 +1171,11 @@ impl Supervisor {
                 match self.control.clear_boot_mismatch(&self.role).await {
                     Ok(()) => {
                         self.clear_pending_boot_mismatch();
-                        self.reset_receipt_backoff();
                     }
                     Err(error) if Self::receipt_not_saved(&error) => {
                         tracing::warn!("boot mismatch clear was not saved: {error:#}");
                         self.queue_pending_boot_clear_retry();
-                        self.note_receipt_delay();
+                        self.note_boot_receipt_delay();
                     }
                     Err(error) => return Err(error),
                 }
@@ -1674,7 +1693,6 @@ impl Supervisor {
                                 Err(error) if Self::receipt_not_saved(&error) => {
                                     tracing::warn!("boot mismatch clear was not saved: {error:#}");
                                     self.queue_pending_boot_clear_after_recovery();
-                                    self.note_receipt_delay();
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -1838,7 +1856,7 @@ impl Supervisor {
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                 self.queue_pending_boot_record(release.clone(), reason.to_owned());
-                self.note_receipt_delay();
+                self.note_boot_receipt_delay();
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1854,7 +1872,7 @@ impl Supervisor {
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch clear was not saved: {error:#}");
                 self.queue_pending_boot_clear_retry();
-                self.note_receipt_delay();
+                self.note_boot_receipt_delay();
                 Err(error)
             }
             Err(error) => Err(error),
@@ -3018,6 +3036,8 @@ async fn main() -> Result<()> {
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: VecDeque::new(),
+        boot_receipt_attempt: 0,
+        boot_receipt_not_before: None,
         baked_fallback_installed: None,
         pending_startup,
         receipt_attempt: 0,
