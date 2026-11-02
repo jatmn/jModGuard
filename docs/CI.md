@@ -128,6 +128,20 @@ Actions secret and is removed from the workflow environment before build steps; 
 empty signing secret fails publication before any moving tag is updated.
 Nightly tags never move `latest`. An explicit rerun republishes its pinned source.
 
+If **Promote images** fails or is cancelled after signing but before
+`finish_deferred_promotions`, signatures may already exist, but that attempt has
+not moved any publication tags. The promotion queue exists only in that job's
+shell; signing alone does not complete publication. Rerun the failed **Promote
+images** job in the same workflow run while its build artifacts are available
+(the `publish-state-*` and `publish-build-ok-*` artifacts are retained for one day).
+The job restores the pinned plan and build handoffs, signs the existing staging
+digests again, reconstructs every component's queue, and calls
+`finish_deferred_promotions` after the whole signing loop succeeds. It does not
+rebuild images. Calling only `finish_deferred_promotions` in a fresh shell cannot
+recover the lost queue. If the build artifacts or staging images are unavailable,
+start a fresh owner-dispatched **Publish** run with the original full source SHA
+or release tag as described above, so all components are built again.
+
 Each component compares its actual production inputs against the source revision
 in its public `latest` image and confirms `latest` and the recorded SHA tag agree.
 Unchanged inputs skip compilation and registry login. Bot-only production source

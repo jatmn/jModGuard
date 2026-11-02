@@ -524,6 +524,19 @@ function runRegistryDelete(tag, responses, options = {}) {
   const stateFile = path.join(dir, "state");
   fs.mkdirSync(bin);
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
+  if (options.stallFrom) {
+    const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
+    assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
+    fs.symlinkSync(timeoutCommand.stdout.trim(), path.join(bin, "real-timeout"));
+    // Exercise the real timeout with a shorter deadline, keeping production's arguments checked.
+    fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
+set -euo pipefail
+[[ "$1" == --kill-after=5s && "$2" == 60s ]] || exit 2
+shift 2
+exec real-timeout --kill-after=1s 1s "$@"
+`);
+    fs.chmodSync(path.join(bin, "timeout"), 0o755);
+  }
   fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
     'import { readFileSync } from "node:fs";',
     'const responses = JSON.parse(readFileSync(process.argv[2], "utf8"));',
@@ -566,6 +579,10 @@ printf '%s' "\$n" >${JSON.stringify(stateFile)}
 emit_all=0
 if [[ "\$has_paginate" == 1 && "\$has_per_page" == 1 ]]; then emit_all=1; fi
 node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all"
+# Emit a valid partial result before stalling on a later page.
+if [[ ${options.stallFrom || 0} -gt 0 && "\$n" -ge ${options.stallFrom || 0} ]]; then
+  exec sleep 5
+fi
 `);
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/bash
 printf '%s\\n' "\$*" >>${JSON.stringify(dockerLog)}
@@ -636,6 +653,11 @@ assert.deepEqual(single.calls, [
   { method: "DELETE", path: `${versionsRoot}/11` },
 ]);
 assert.equal(single.dockerText, "");
+const timedOutInitial = runRegistryDelete(singleTag, [[packageVersion(11, [singleTag])]], { stallFrom: 1 });
+assertUserPackageRoute(timedOutInitial);
+assert.notEqual(timedOutInitial.status, 0, "a timed-out partial list must fail");
+assert.deepEqual(timedOutInitial.calls, [{ method: "GET", path: versionsList }]);
+assert.equal(timedOutInitial.dockerText, "", "a partial list must not mutate registry tags");
 const staged = runRegistryDelete(stagedTag, [
   [packageVersion(21, [`_publish-${"b".repeat(12)}-7`, stagedTag])],
   [
@@ -704,6 +726,12 @@ function assertNoPartialUntag(outcome, message) {
   assert.ok(pushed !== -1 && restored > pushed, outcome.dockerText);
   assert.match(outcome.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
 }
+const timedOutDetached = runRegistryDelete(stagedTag, sharedThen([
+  packageVersion(21, [stagingName], preservedDigest),
+  packageVersion(99, [stagedTag]),
+]), { stallFrom: 2 });
+assertNoPartialUntag(timedOutDetached, /package version list failed/);
+assert.equal(timedOutDetached.calls.filter(call => call.method === "GET").length, 4);
 const noDisposable = runRegistryDelete(stagedTag, sharedThen([
   [packageVersion(21, [stagingName], preservedDigest)],
   [packageVersion(50, ["latest"])],
