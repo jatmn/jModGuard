@@ -849,8 +849,10 @@ assert.match(deleteFailed.stderr, /disposable package version 99 could not be de
 assert.match(deleteFailed.stderr, new RegExp(`restored to ${preservedDigest}`));
 assert.deepEqual(deleteFailed.calls, [
   { method: "GET", path: versionsList },
-  { method: "GET", path: versionsList },
-  { method: "DELETE", path: `${versionsRoot}/99` },
+  ...Array.from({ length: 3 }, () => [
+    { method: "GET", path: versionsList },
+    { method: "DELETE", path: `${versionsRoot}/99` },
+  ]).flat(),
 ]);
 const deletePushed = deleteFailed.dockerText.indexOf("--push");
 const deleteRestored = deleteFailed.dockerText.indexOf("imagetools create");
