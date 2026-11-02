@@ -244,14 +244,16 @@ fn revision_nineteen_observation_can_install_a_newer_launcher() {
 }
 
 #[test]
-fn revision_twenty_six_can_install_signature_payload_fix() {
-    let advice = launcher_advice(
-        26,
-        jmodguard::db::LAUNCHER_REVISION,
-        jmodguard::db::REQUIRED_LAUNCHER_REVISION,
-    );
-    assert_eq!(advice["state"], "optional");
-    assert_eq!(advice["installable"], true);
+fn prior_revisions_can_install_signature_payload_fix() {
+    for revision in [26, 27] {
+        let advice = launcher_advice(
+            revision,
+            jmodguard::db::LAUNCHER_REVISION,
+            jmodguard::db::REQUIRED_LAUNCHER_REVISION,
+        );
+        assert_eq!(advice["state"], "optional");
+        assert_eq!(advice["installable"], true);
+    }
 }
 
 #[test]

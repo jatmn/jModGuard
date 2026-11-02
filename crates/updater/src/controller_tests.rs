@@ -8553,6 +8553,50 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
 }
 
 #[tokio::test]
+async fn cold_start_refuses_truncated_registry_body() {
+    let root = std::env::temp_dir().join(format!("boot-truncated-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let current = control.schema_version().await.unwrap();
+
+    for reset in [false, true] {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+            // Let restore reach the response body before closing the connection.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if reset {
+                stream.set_zero_linger().unwrap();
+            }
+        });
+        let (result, started, logs) =
+            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+        server.await.unwrap();
+        assert!(started.is_none(), "reset={reset}: {started:?}");
+        let error = result.expect_err("a truncated manifest must refuse fallback");
+        assert!(error.contains("error decoding response body"), "{error}");
+        assert!(!logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+    }
+
+    drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
 async fn cold_start_starts_built_in_binary_when_registry_request_times_out() {
     let root = std::env::temp_dir().join(format!("boot-timeout-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();

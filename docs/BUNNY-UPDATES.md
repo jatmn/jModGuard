@@ -112,10 +112,10 @@ repository; publication fails closed when that Actions secret is missing.
 
 The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Signature verification applies only once a revision-19 launcher is already running. A revision-18 launcher has no verifier and is not offered that hop, so it cannot stage the image. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`.
 
-Launcher revision 27 includes the signature-payload fixes: it considers every
+Launcher revision 28 includes the signature-payload fixes: it considers every
 annotated signature layer, skips missing or damaged payloads, and checks expiry
 after each fetch. Payload fetch outages retain the registry-unreachable status
-used by recovery. This is an optional launcher update from revision 26; the
+used by recovery. This is an optional launcher update from revisions 26 and 27; the
 application minimum remains 7.
 
 ### Expiry-safe cold-boot rollout

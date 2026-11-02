@@ -40,6 +40,15 @@ pub fn registry_unreachable(error: &anyhow::Error) -> bool {
     if signature::signature_rejection_phrase(error).is_some() {
         return false;
     }
+    // A response body failure can retain a nested connection reset. Once the
+    // response is being read, that reset indicates a failed download.
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|request| request.is_body() || request.is_decode())
+    }) {
+        return false;
+    }
     if error.chain().any(|cause| {
         if let Some(request) = cause.downcast_ref::<reqwest::Error>()
             && (request.is_connect()
@@ -723,6 +732,49 @@ mod tests {
             let _ = server.await;
             assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
             assert_eq!(registry_unreachable(&error), !partial_body, "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_truncated_body_is_not_unreachable() {
+        for reset in [false, true] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+                // Let the reader receive the successful headers and partial body.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if reset {
+                    stream.set_zero_linger().unwrap();
+                }
+            });
+            let error = Registry::new(&base)
+                .unwrap()
+                .get_limited(base, None, None, 1024)
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_decode());
+            if reset {
+                assert!(error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+                }));
+            }
+            assert!(!registry_unreachable(&error), "reset={reset}: {error:#}");
         }
     }
 
