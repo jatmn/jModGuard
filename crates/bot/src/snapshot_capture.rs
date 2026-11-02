@@ -1711,14 +1711,15 @@ fn dispatch_delivery_admitted_report(
     context: &Context,
     report: MessageReport,
 ) {
-    let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
-        logging::record_delivery_failure(app);
+    let Some(reservation) = logging::reserve_log_delivery(app) else {
         return;
     };
     let app = Arc::clone(app);
     let context = context.clone();
     tokio::spawn(async move {
-        let _permit = permit;
+        let Some(_permit) = reservation.acquire(&app).await else {
+            return;
+        };
         logging::emit_held(&app, &context, report.guild_id, report.event, report.vars).await;
     });
 }

@@ -1111,7 +1111,7 @@ pub(crate) async fn lookup_member_audit(
     .flatten()
 }
 
-/// Sends one best-effort Discord log report. No message history or retry queue.
+/// Sends one best-effort Discord log report with bounded slot-admission retries.
 pub async fn emit(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -1314,6 +1314,60 @@ pub(crate) enum Delivery {
     NothingToSend,
 }
 
+/// Bounded process-wide retry of slot admission, never of a Discord request.
+/// Reserve before spawning so queued payloads cannot create unbounded tasks.
+pub(crate) enum LogDeliveryReservation {
+    Ready(tokio::sync::OwnedSemaphorePermit),
+    Waiting {
+        _queue_permit: tokio::sync::OwnedSemaphorePermit,
+        deadline: tokio::time::Instant,
+    },
+}
+
+pub(crate) fn reserve_log_delivery(app: &BotState) -> Option<LogDeliveryReservation> {
+    if let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() {
+        return Some(LogDeliveryReservation::Ready(permit));
+    }
+    let Ok(permit) = Arc::clone(&app.log_delivery_waiters).try_acquire_owned() else {
+        record_delivery_failure(app);
+        return None;
+    };
+    Some(LogDeliveryReservation::Waiting {
+        _queue_permit: permit,
+        deadline: tokio::time::Instant::now()
+            + Duration::from_secs(app.cfg.log.discord_timeout_secs),
+    })
+}
+
+impl LogDeliveryReservation {
+    pub(crate) async fn acquire(self, app: &BotState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match self {
+            Self::Ready(permit) => Some(permit),
+            Self::Waiting {
+                _queue_permit,
+                deadline,
+            } => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    Arc::clone(&app.log_delivery_slots).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => Some(permit),
+                    _ => {
+                        record_delivery_failure(app);
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn acquire_log_delivery(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    reserve_log_delivery(app)?.acquire(app).await
+}
+
 #[derive(Clone, Copy)]
 enum Admission {
     Immediate,
@@ -1488,9 +1542,7 @@ async fn emit_to_observed_with_audit(
     let started = Instant::now();
     let _permit = match admission {
         Admission::Immediate => {
-            // Routine and startup reports never queue raw event content.
-            let Ok(permit) = app.log_delivery_slots.try_acquire() else {
-                record_delivery_failure(app);
+            let Some(permit) = acquire_log_delivery(app).await else {
                 return (Delivery::Dropped, None);
             };
             Some(permit)
@@ -1498,8 +1550,11 @@ async fn emit_to_observed_with_audit(
         Admission::WaitForShutdown => {
             // A stop notice gets the same total deadline for admission and
             // delivery. It does not retry a failed Discord request.
-            let Ok(Ok(permit)) =
-                tokio::time::timeout(deadline, app.log_delivery_slots.acquire()).await
+            let Ok(Ok(permit)) = tokio::time::timeout(
+                deadline,
+                Arc::clone(&app.log_delivery_slots).acquire_owned(),
+            )
+            .await
             else {
                 record_delivery_failure(app);
                 return (Delivery::Failed, None);
@@ -2662,8 +2717,7 @@ pub(crate) async fn emit_retained_bulk_to(
         ),
         ("time".into(), chrono::Utc::now().to_rfc3339()),
     ]);
-    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
-        record_delivery_failure(app);
+    let Some(_permit) = acquire_log_delivery(app).await else {
         return BulkDeliveryOutcome::Failed;
     };
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
@@ -3063,8 +3117,7 @@ async fn emit_failure_bulk(
     let _permit = match admission {
         Admission::Held => None,
         Admission::Immediate | Admission::WaitForShutdown => {
-            let Ok(permit) = app.log_delivery_slots.try_acquire() else {
-                record_delivery_failure(app);
+            let Some(permit) = acquire_log_delivery(app).await else {
                 return;
             };
             Some(permit)
@@ -3354,9 +3407,9 @@ async fn emit_reconciled_automod_delete_with(
 }
 
 /// Reconciled automod delete logging without blocking the enforcement caller.
-/// Delivery admission is taken before the spawn, and that permit is held for
-/// the send. Report-slot pressure does not apply. A full delivery budget does
-/// not queue the retained snapshot on a task.
+/// Delivery or bounded waiting capacity is reserved before the spawn.
+/// Report-slot pressure does not apply; a queued report expires if no delivery
+/// slot becomes available within the configured timeout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reconciled_automod_delete(
     app: std::sync::Arc<BotState>,
@@ -3370,12 +3423,13 @@ pub(crate) fn spawn_reconciled_automod_delete(
     retained: Option<db::guild_data::MessageSnapshot>,
     fallback_to_bulk: bool,
 ) {
-    let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
-        record_delivery_failure(&app);
+    let Some(reservation) = reserve_log_delivery(&app) else {
         return;
     };
     tokio::spawn(async move {
-        let _permit = permit;
+        let Some(_permit) = reservation.acquire(&app).await else {
+            return;
+        };
         emit_reconciled_automod_delete_with(
             &app,
             sink.as_ref(),
@@ -3394,8 +3448,8 @@ pub(crate) fn spawn_reconciled_automod_delete(
 }
 
 /// REST succeeded. Stored marks reconcile through the placement owner. A delete
-/// that could not take a mark emits `automod_delete` itself when an individual
-/// route exists, and leaves a bulk-only delete for the gateway transcript.
+/// with an overflow row emits `automod_delete` itself when an individual
+/// route exists. A delete with no correlation row leaves reporting to the gateway.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn complete_prepared_automod_delete(
     app: &Arc<BotState>,

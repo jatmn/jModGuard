@@ -59,6 +59,21 @@ Joining, leaving and talking still do not maintain a general activity archive.
   expiry does not drop it. A delivered bulk row still expires on that timer. A pending automod delete replayed through
   `message_bulk_delete` because no `message_delete` channel is configured uses
   that same attachment fallback. The transcript is not archived.
+- Automod delete REST calls stop waiting after ten seconds. A timeout is not
+  proof that automod deleted the message; an observed deletion is replayed as
+  plain unless another correlated attempt already succeeded. Pending single gateway
+  deletions that settle successfully can use the bulk-delete destination when
+  no individual delete destination is configured.
+  Correlation remains process-only, with 4096 live marks and 4096 overflow rows.
+  If both maps are full, deletion still runs and only the gateway reports it,
+  without automod attribution. Restart loses these marks; durable replay is
+  outside this contract.
+- Delivery slot pressure queues at most 128 waiting reports across the bot.
+  Each waits up to the configured Discord timeout for a slot, then uses the
+  existing delivery deadline and filters. Routine reports include admission in
+  their total deadline. Full queues and expired waits drop the report and count
+  a delivery failure. This retries admission only: a failed or ambiguous Discord
+  request is never resent. Waiting reports are in memory and are lost on restart.
 - Join reports use the delivered user and the join timestamp in the Gateway member
   payload; they do not look up a saved directory join date. Leave reports use the
   saved directory stay when an authoritative departure decision is available,
@@ -156,13 +171,13 @@ require the [fresh database baseline](DATABASE-BASELINE.md); their databases are
 The bot admits up to `log.discord_concurrency` reports (default 8), with a total deadline
 of `log.discord_timeout_secs` (default 10). Both have environment overrides documented
 in `config.example.toml`. Bot Discord report concurrency is a bot process setting. Routine and startup
-report admission never waits, so overload drops those reports rather than building
-a content backlog. On graceful shutdown, the bot attempts one system notice
+reports share the bounded 128-report admission queue described above; their
+slot wait counts against the total deadline. On graceful shutdown, the bot attempts one system notice
 for each cached server with a configured system channel. That notice may wait
 for a delivery slot within the same per-notice deadline. All
 shutdown notices share a three-second process budget; unfinished sends are
 cancelled so the bot can close its Discord shards within the updater's drain
-window. There is no application retry or replay queue;
+window. Admission retries are process-only; there is no failed-send retry or durable replay;
 Serenity retains its normal request/rate-limit behavior within the deadline.
 The current shared limit does not establish per-guild fairness.
 

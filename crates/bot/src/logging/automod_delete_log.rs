@@ -1822,72 +1822,52 @@ async fn ambiguous_bulk_log_survives_ttl_without_a_second_report() {
 }
 
 #[tokio::test]
-async fn saturated_delivery_slots_do_not_queue_reconciled_payloads() {
+async fn saturated_delivery_slots_retry_a_bounded_number_of_reconciled_payloads() {
     use std::sync::atomic::Ordering;
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
         .await
         .unwrap();
     f.app.invalidate_configs();
-    let held: Vec<_> = (0..4)
-        .map(|_| {
-            std::sync::Arc::clone(&f.app.log_delivery_slots)
-                .try_acquire_owned()
-                .unwrap()
-        })
-        .collect();
-    let before_refs = Arc::strong_count(&f.app);
-    let before_failures = f.app.log_delivery_failures.load(Ordering::Relaxed);
-    for message in 0..32u64 {
+    let held = Arc::clone(&f.app.log_delivery_slots)
+        .try_acquire_many_owned(4)
+        .unwrap();
+    let sink = Arc::new(Sink::default());
+    for message in 1..=130 {
         spawn_reconciled_automod_delete(
             Arc::clone(&f.app),
-            Arc::new(Sink::default()),
+            Arc::clone(&sink),
             789,
             456,
             message,
             "badword".into(),
             "Bad words".into(),
             String::new(),
-            Some(sample_retained("queued-snapshot-secret")),
+            Some(sample_retained("queued-snapshot")),
             false,
         );
     }
-    assert_eq!(
-        Arc::strong_count(&f.app),
-        before_refs,
-        "delivery admission spawned reconciled tasks while every slot was held"
-    );
+    assert!(sink.messages.lock().unwrap().is_empty());
     assert_eq!(
         f.app.log_delivery_failures.load(Ordering::Relaxed),
-        before_failures + 32
+        2,
+        "only reports beyond the 128 waiting-report budget should drop"
     );
     drop(held);
-    let sink = Arc::new(Sink::default());
-    spawn_reconciled_automod_delete(
-        Arc::clone(&f.app),
-        Arc::clone(&sink),
-        789,
-        456,
-        99,
-        "badword".into(),
-        "Bad words".into(),
-        String::new(),
-        Some(sample_retained("admitted-snapshot")),
-        false,
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while sink.messages.lock().unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "an admitted reconciled delete did not log after a delivery slot freed"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sink.messages.lock().unwrap().len() < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued reports should send when delivery slots free");
     let sent = sink.messages.lock().unwrap();
-    assert_eq!(sent[0].0, ChannelId::new(901));
-    let body = sent[0].1.to_string();
-    assert!(body.contains("Bad words"), "{body}");
-    assert!(body.contains("admitted-snapshot"), "{body}");
+    assert_eq!(sent.len(), 128);
+    assert!(
+        sent.iter()
+            .all(|(channel, body)| *channel == ChannelId::new(901)
+                && body.to_string().contains("queued-snapshot"))
+    );
 }
 
 #[tokio::test]
@@ -2604,4 +2584,188 @@ async fn peeled_delete_uses_bulk_when_the_individual_route_disappears() {
         bodies.iter().all(|body| !body.starts_with("901 ")),
         "{bodies:?}"
     );
+}
+
+#[tokio::test]
+async fn single_gateway_success_uses_bulk_only_route() {
+    use crate::automod_delete_marks::MAX_AUTOMOD_DELETE_MARKS;
+
+    for overflow in [false, true] {
+        let f = Fixture::new();
+        db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+            .await
+            .unwrap();
+        f.app.invalidate_configs();
+        if overflow {
+            for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
+                f.app
+                    .automod_delete_marks
+                    .insert(789, 456, message, "filler", "Filler");
+            }
+        }
+        let prepared = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            50_000,
+            "badword",
+            "Bad words",
+            "blocked term",
+        );
+        assert!(
+            observed_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(50_000),
+                None,
+            )
+            .is_none()
+        );
+        let sink = Sink::default();
+        complete_prepared_automod_delete(
+            &f.app,
+            &sink,
+            789,
+            456,
+            50_000,
+            &prepared,
+            "badword",
+            "Bad words",
+            "blocked term",
+        )
+        .await;
+        let messages = sink.messages.lock().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "single gateway success lost its bulk-only owner (overflow={overflow})"
+        );
+        assert_eq!(messages[0].0, ChannelId::new(903));
+    }
+}
+
+#[tokio::test]
+async fn prepared_success_confirms_before_delivery_admission() {
+    for spawned in [false, true] {
+        let f = Fixture::new();
+        let permits = Arc::clone(&f.app.log_delivery_slots)
+            .acquire_many_owned(f.app.cfg.log.discord_concurrency as u32)
+            .await
+            .unwrap();
+        let prepared = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            123,
+            "badword",
+            "Bad words",
+            "blocked term",
+        );
+        let sink = Arc::new(Sink::default());
+        if spawned {
+            spawn_prepared_automod_delete(
+                Arc::clone(&f.app),
+                Arc::clone(&sink),
+                789,
+                456,
+                123,
+                prepared,
+                "badword".into(),
+                "Bad words".into(),
+                "blocked term".into(),
+            )
+            .await;
+        } else {
+            complete_prepared_automod_delete(
+                &f.app,
+                sink.as_ref(),
+                789,
+                456,
+                123,
+                &prepared,
+                "badword",
+                "Bad words",
+                "blocked term",
+            )
+            .await;
+        }
+        drop(permits);
+        let report = observed_delete_report(
+            &f.app,
+            GuildId::new(789),
+            ChannelId::new(456),
+            MessageId::new(123),
+            None,
+        )
+        .expect("success stays confirmed even while all delivery slots are held");
+        assert_eq!(report.event, "automod_delete");
+        assert_eq!(report.vars["rule"], "Bad words");
+    }
+}
+
+#[tokio::test]
+async fn full_mark_maps_leave_only_the_gateway_report() {
+    use crate::automod_delete_marks::{DeleteDisposition, MAX_AUTOMOD_DELETE_MARKS};
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 902)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    for message in 0..(MAX_AUTOMOD_DELETE_MARKS as u64 * 2) {
+        f.app
+            .automod_delete_marks
+            .prepare_delete(789, 456, message, "filler", "Filler", "");
+    }
+    for gateway_first in [false, true] {
+        let message = if gateway_first { 50_000 } else { 50_001 };
+        let prepared = f.app.automod_delete_marks.prepare_delete(
+            789,
+            456,
+            message,
+            "badword",
+            "Bad words",
+            "blocked term",
+        );
+        assert_eq!(prepared.disposition, DeleteDisposition::Untracked);
+        let sink = Sink::default();
+        if gateway_first {
+            let report = observed_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                None,
+            )
+            .unwrap();
+            emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
+        }
+        complete_prepared_automod_delete(
+            &f.app,
+            &sink,
+            789,
+            456,
+            message,
+            &prepared,
+            "badword",
+            "Bad words",
+            "blocked term",
+        )
+        .await;
+        if !gateway_first {
+            let report = observed_delete_report(
+                &f.app,
+                GuildId::new(789),
+                ChannelId::new(456),
+                MessageId::new(message),
+                None,
+            )
+            .unwrap();
+            emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await;
+        }
+        let sent = sink.messages.lock().unwrap();
+        assert_eq!(sent.len(), 1, "full maps must not produce two reports");
+        assert_eq!(sent[0].0, ChannelId::new(902));
+    }
 }

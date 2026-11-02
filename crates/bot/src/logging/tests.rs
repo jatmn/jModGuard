@@ -1482,7 +1482,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
 }
 
 #[tokio::test]
-async fn disabled_and_overloaded_delivery_do_not_queue_reports() {
+async fn disabled_reports_and_expired_admission_do_not_send() {
     let f = Fixture::new();
     let sink = Sink::default();
     assert_eq!(
@@ -5083,4 +5083,40 @@ fn rejoin_note_leave_clears_member_state() {
     deliveries.clear_member(9, 8);
     assert!(!deliveries.pending_redelivery(9, 8, "stay-leave"));
     assert!(deliveries.begin_attempt(9, 8, "stay-leave"));
+}
+
+#[tokio::test]
+async fn routine_report_retries_slot_admission_and_expires_within_its_deadline() {
+    use std::future::Future;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    for release in [true, false] {
+        let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+        let mut report = Box::pin(emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "system",
+            BTreeMap::new(),
+        ));
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "a busy slot should queue a routine report"
+        );
+        if release {
+            drop(permit);
+            assert_eq!(report.await, Delivery::Sent);
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(f.app.cfg.log.discord_timeout_secs + 1)).await;
+            assert_eq!(report.await, Delivery::Dropped);
+            tokio::time::resume();
+        }
+    }
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
 }

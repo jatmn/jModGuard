@@ -94,7 +94,7 @@ pub(crate) enum DeleteDisposition {
     /// That mark still owns correlation.
     Shadowed,
     /// Both the mark cache and the suppression map were full. The delete still
-    /// runs. A later gateway echo may also log as `message_delete`.
+    /// runs, and the gateway owns the only report without automod attribution.
     Untracked,
 }
 
@@ -476,7 +476,7 @@ impl AutomodDeleteMarks {
                 self.unmarked_overflow_warned = true;
                 tracing::warn!(
                     cap = MAX_AUTOMOD_DELETE_MARKS,
-                    "automod delete marks and overflow suppression are full; the delete still runs, and a gateway echo may also log as message_delete"
+                    "automod delete marks and overflow suppression are full; the delete still runs, and only the gateway reports it without automod attribution"
                 );
             }
             return;
@@ -1591,9 +1591,13 @@ impl AutomodDeleteMarkAccess {
         message: u64,
         retained: Option<MessageSnapshot>,
     ) -> GatewayDeleteObservation {
-        self.inner
-            .lock()
-            .observe_gateway_delete(guild, channel, message, retained, Instant::now())
+        let mut marks = self.inner.lock();
+        let observation =
+            marks.observe_gateway_delete(guild, channel, message, retained, Instant::now());
+        if matches!(observation, GatewayDeleteObservation::PendingAutomod) {
+            marks.note_report_owner(guild, channel, message, ReportOwner::Individual);
+        }
+        observation
     }
 
     /// A pending id stayed in a bulk transcript.
@@ -1709,18 +1713,9 @@ impl AutomodDeleteMarkAccess {
                 bulk_route,
                 now,
             ),
-            DeleteDisposition::Untracked => {
-                if !individual_route {
-                    return None;
-                }
-                Some(AutomodSettlement {
-                    rule_id: rule_id.to_owned(),
-                    rule_name: rule_name.to_owned(),
-                    reason: reason.to_owned(),
-                    retained: None,
-                    fallback_to_bulk: bulk_route,
-                })
-            }
+            // No identity can suppress a gateway echo at this capacity. Keep
+            // the gateway as the sole report owner instead of emitting twice.
+            DeleteDisposition::Untracked => None,
         }
     }
 
