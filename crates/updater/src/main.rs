@@ -322,9 +322,20 @@ async fn launch_mode(
     release: Option<ComponentRelease>,
     maintenance: bool,
 ) -> Result<Running> {
+    launch_mode_checked(path, source_sha, release, maintenance, async { Ok(()) }).await
+}
+
+async fn launch_mode_checked(
+    path: &Path,
+    source_sha: &str,
+    release: Option<ComponentRelease>,
+    maintenance: bool,
+    before_spawn: impl std::future::Future<Output = Result<()>>,
+) -> Result<Running> {
     let ready_file = ready_path();
     let bytes = tokio::fs::read(path).await?;
     let hash = sha256_hex(&bytes);
+    before_spawn.await?;
     let child = Command::new(path)
         .env("JMODGUARD_READY_FILE", &ready_file)
         .env(
@@ -750,6 +761,12 @@ struct Supervisor {
     /// Test-only stall after `idle` and before the pre-control hold check.
     #[cfg(test)]
     after_idle_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Test-only handoff immediately before the final spawn checks.
+    #[cfg(test)]
+    before_spawn_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
@@ -1528,7 +1545,31 @@ impl Supervisor {
             release.supports_launcher(self.launcher_revision)?;
         }
         self.end_idle().await?;
-        let child = match launch(path, sha, release).await {
+        let baked_fallback =
+            path == self.baked && release.is_none() && self.baked_fallback_installed.is_some();
+        let before_spawn = async {
+            #[cfg(test)]
+            if let Some((reached, resume)) = self.before_spawn_gate.take() {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+            if baked_fallback {
+                // Receipts, idle shutdown and reading the binary can all await.
+                // Recheck the outage contract after them, immediately before spawn.
+                let schema = self.control.schema_version().await?;
+                let state = self.control.component(&self.role).await?;
+                ensure!(
+                    self.baked_core_fits(schema),
+                    "baked application cannot open database; use owner recovery"
+                );
+                ensure!(
+                    self.recorded_guild_matches(&state, None),
+                    db::APP_ONLY_SCHEMA_CHANGE_REFUSED
+                );
+            }
+            Ok(())
+        };
+        let child = match launch_mode_checked(path, sha, release, false, before_spawn).await {
             Ok(child) => child,
             Err(error) => {
                 // The listener was released before spawn. Put it back on this
@@ -3021,6 +3062,8 @@ async fn main() -> Result<()> {
         readiness_error_gate: None,
         #[cfg(test)]
         before_idle_gate: None,
+        #[cfg(test)]
+        before_spawn_gate: None,
         #[cfg(test)]
         after_idle_gate: None,
         staging: PathBuf::from("/tmp/jmodguard-updates"),

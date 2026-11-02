@@ -271,6 +271,7 @@ fn controller(
         exit_control_gate: None,
         readiness_error_gate: None,
         before_idle_gate: None,
+        before_spawn_gate: None,
         after_idle_gate: None,
         staging: root.join(format!("staged-{role}")),
         prepared: None,
@@ -8395,6 +8396,10 @@ async fn restore_installed(
     // Record the compiled guild schema. A case can point the baked image at a
     // different guild schema and must then be refused.
     state.observed = Some(fresh_observation(1));
+    control
+        .running(role, None, fresh_observation(1), 1)
+        .await
+        .unwrap();
     let (restored, logs) = with_contract_warnings(service.restore(&state)).await;
     let started = service.running.as_ref().map(|child| {
         assert!(
@@ -9130,5 +9135,90 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
     drop(reserved);
     drop(peer);
     drop((service, control, writer, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn outage_spawn_rereads_core_and_guild_schemas() {
+    let root = std::env::temp_dir().join(format!("boot-reread-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let core = control.schema_version().await.unwrap();
+    let (refused, reserved) = refused_registry().await;
+    for role in ["bot", "api"] {
+        let release = release_at(role, 'c', core);
+        install_for_outage(&db, &control, &release, 1_700_000_000).await;
+        for changed in ["core", "guild", "neither"] {
+            set_core_schema(&db, core).await;
+            control
+                .running(role, None, fresh_observation(1_700_000_000), 1_700_000_000)
+                .await
+                .unwrap();
+            let state = control.component(role).await.unwrap();
+            let mut service = controller(
+                role,
+                baked.clone(),
+                Registry::new(&refused).unwrap(),
+                control.clone(),
+                &root,
+            );
+            let (reached, at_spawn) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            service.before_spawn_gate = Some((reached, resumed));
+            let restore = tokio::spawn(async move {
+                let result = service.restore(&state).await;
+                (service, result)
+            });
+            tokio::time::timeout(Duration::from_secs(10), at_spawn)
+                .await
+                .unwrap()
+                .unwrap();
+            match changed {
+                "core" => set_core_schema(&db, core + 1).await,
+                "guild" => {
+                    let mut seen = fresh_observation(1_700_000_001);
+                    seen.guild_schema = Some(db::guild_data::SCHEMA_VERSION + 1);
+                    control
+                        .running(role, None, seen, 1_700_000_001)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            resume.send(()).unwrap();
+            let (mut service, result) = restore.await.unwrap();
+            let started = service.running.is_some();
+            service.stop_application().await.unwrap();
+            service.end_idle().await.unwrap();
+            match changed {
+                "core" => {
+                    assert!(!started, "{role}: changed core must prevent spawn");
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("baked application cannot open database")
+                    );
+                    assert_eq!(control.schema_version().await.unwrap(), core + 1);
+                }
+                "guild" => {
+                    assert!(!started, "{role}: changed guild must prevent spawn");
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains(db::APP_ONLY_SCHEMA_CHANGE_REFUSED)
+                    );
+                }
+                _ => {
+                    result.unwrap();
+                    assert!(started, "{role}: unchanged schemas must permit spawn");
+                }
+            }
+        }
+    }
+    drop(reserved);
+    drop((db, control));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
