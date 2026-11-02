@@ -146,6 +146,7 @@ stable_tag() {
   [[ "${1:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+# Status 1 means no Stable/Nightly channel; callers intentionally accept it.
 channel_for() {
   local mode="$1"
   local tag="${2:-}"
@@ -617,13 +618,25 @@ registry_restore_preserved_tag() {
 
 registry_delete_tag() {
   local image_tag="$1" package tag token payload decision action version_id digest attempt
-  [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
+  [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || {
+    echo 'registry tag deletion received an invalid image tag reference' >&2
+    return 1
+  }
   package="${BASH_REMATCH[1]}"
   tag="${BASH_REMATCH[2]}"
   token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
-  [[ -n "$token" ]] || return 1
-  payload="$(registry_fetch_versions "$package" "$token")" || return 1
-  decision="$(printf '%s\n' "$payload" | registry_classify_tag_version "$tag")" || return 1
+  [[ -n "$token" ]] || {
+    echo "registry tag ${tag} deletion requires GHCR_TOKEN or GITHUB_TOKEN" >&2
+    return 1
+  }
+  payload="$(registry_fetch_versions "$package" "$token")" || {
+    echo "registry tag ${tag} package version list failed" >&2
+    return 1
+  }
+  decision="$(printf '%s\n' "$payload" | registry_classify_tag_version "$tag")" || {
+    echo "registry tag ${tag} package version match was unreadable" >&2
+    return 1
+  }
   case "$decision" in
     none)
       echo "registry tag ${tag} matched no package version" >&2
@@ -642,7 +655,10 @@ registry_delete_tag() {
   esac
   action="${decision%% *}"
   version_id="${decision#* }"
-  [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
+  [[ "$version_id" =~ ^[0-9]+$ ]] || {
+    echo "registry tag ${tag} package version ID was invalid" >&2
+    return 1
+  }
   case "$action" in
     delete)
       for attempt in 1 2 3; do
@@ -1262,7 +1278,10 @@ publish_component_build() {
   JMODGUARD_PUBLISH_CLEANUP_CONTEXT="$context"
   JMODGUARD_PUBLISH_CLEANUP_SCRATCH="$scratch"
   cleanup_publish() {
-    run_git worktree remove --force "$JMODGUARD_PUBLISH_CLEANUP_CONTEXT" >/dev/null 2>&1 || true
+    # run_git exits on failure; contain that exit so scratch cleanup still runs.
+    if ! (run_git worktree remove --force "$JMODGUARD_PUBLISH_CLEANUP_CONTEXT" >/dev/null); then
+      echo 'Image publication cleanup could not remove the source worktree' >&2
+    fi
     rm -rf "$JMODGUARD_PUBLISH_CLEANUP_SCRATCH"
   }
   trap cleanup_publish EXIT
