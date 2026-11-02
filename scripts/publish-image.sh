@@ -601,12 +601,17 @@ registry_delete_detached_tag() {
     return 1
   fi
   image_tag="ghcr.io/jatmn/${package}:${tag}"
-  if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "ghcr.io/jatmn/${package}@${digest}" >/dev/null; then
-    echo "registry tag ${tag} could not be restored to ${digest}" >&2
+  registry_restore_preserved_tag "$image_tag" "$digest" || return 1
+  return 1
+}
+
+registry_restore_preserved_tag() {
+  local image_tag="$1" digest="$2"
+  if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "${image_tag%:*}@${digest}" >/dev/null; then
+    echo "registry tag ${image_tag##*:} could not be restored to ${digest}" >&2
     return 1
   fi
-  echo "registry tag ${tag} restored to ${digest}" >&2
-  return 1
+  echo "registry tag ${image_tag##*:} restored to ${digest}" >&2
 }
 
 registry_delete_tag() {
@@ -646,7 +651,11 @@ registry_delete_tag() {
         echo "registry tag ${tag} preserved version ${version_id} has no digest to restore" >&2
         return 1
       }
-      registry_move_tag_onto_empty_image "$image_tag" || return 1
+      if ! registry_move_tag_onto_empty_image "$image_tag"; then
+        # A failed push can still have been accepted by the registry.
+        registry_restore_preserved_tag "$image_tag" "$digest" || return 1
+        return 1
+      fi
       registry_delete_detached_tag "$package" "$token" "$tag" "$version_id" "$digest"
       ;;
     *)
@@ -685,20 +694,34 @@ promote_image_tag() {
   elif [[ "$rc" -ne 0 ]]; then
     return 1
   fi
-  PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
+  PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}|${digest}")
   registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
     || return 1
   digest_matches_ref "${image}:${tag}" "$digest" || return 1
 }
 
 rollback_promoted_tags() {
-  local entry image_tag previous image i failed=0
+  local entry image_tag previous expected current rc image i failed=0
   [[ -v PROMOTION_ROLLBACK ]] || return 0
   [[ "${#PROMOTION_ROLLBACK[@]}" -eq 0 ]] && return 0
   for ((i=${#PROMOTION_ROLLBACK[@]}-1; i>=0; i--)); do
     entry="${PROMOTION_ROLLBACK[i]}"
-    image_tag="${entry%%|*}"
-    previous="${entry#*|}"
+    IFS='|' read -r image_tag previous expected <<<"$entry"
+    rc=0
+    current="$(promotion_previous_digest "$image_tag")" || rc=$?
+    if [[ "$rc" -eq 2 && -z "$previous" ]]; then
+      continue
+    elif [[ "$rc" -ne 0 ]]; then
+      echo "rollback cannot inspect ${image_tag}; leaving it unchanged" >&2
+      failed=1
+      continue
+    elif [[ "$current" == "$previous" ]]; then
+      continue
+    elif [[ "$current" != "$expected" ]]; then
+      echo "rollback skipped ${image_tag}: changed since promotion" >&2
+      failed=1
+      continue
+    fi
     if [[ -n "$previous" ]]; then
       image="${image_tag%:*}"
       if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null; then
@@ -712,6 +735,7 @@ rollback_promoted_tags() {
       fi
     fi
   done
+  PROMOTION_ROLLBACK=()
   return "$failed"
 }
 
@@ -762,19 +786,36 @@ abort_promotion() {
   publish_fail "failed to promote ${target}"
 }
 
+promotion_exit() {
+  local status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ! rollback_promoted_tags; then
+    echo 'promotion interrupted; rollback failed' >&2
+    [[ "$status" -ne 0 ]] || status=1
+  fi
+  cleanup_promotion_scratch
+  exit "$status"
+}
+
 commit_queued_promotions() {
   local entry image tag digest previous
-  local -a PROMOTION_ROLLBACK=()
   [[ "${#PROMOTION_QUEUE[@]}" -eq 0 ]] && return 0
+  PROMOTION_ROLLBACK=()
+  trap promotion_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   for entry in "${PROMOTION_QUEUE[@]}"; do
     IFS='|' read -r image tag digest previous <<<"$entry"
-    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
+    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}|${digest}")
     registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
       || abort_promotion "${image}:${tag}"
     digest_matches_ref "${image}:${tag}" "$digest" \
       || abort_promotion "${image}:${tag}"
   done
+  PROMOTION_ROLLBACK=()
   PROMOTION_QUEUE=()
+  trap - INT TERM
 }
 
 finish_deferred_promotions() {
