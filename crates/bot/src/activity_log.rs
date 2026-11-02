@@ -858,6 +858,17 @@ mod tests {
             "thread_create" => thread_created(&thread("topic title", false)).unwrap(),
             "thread_update" => thread_updated(None, &thread("topic title", false)).unwrap(),
             "thread_delete" => thread_deleted(&thread("topic title", false)).unwrap(),
+            "automod_delete" => ActivityReport {
+                event: "automod_delete",
+                vars: BTreeMap::from([
+                    ("rule".into(), "Spam rule".into()),
+                    ("rule_id".into(), "repeat_text".into()),
+                    ("reason".into(), "repeated text".into()),
+                    ("message_id".into(), "123".into()),
+                    ("channel".into(), "<#456>".into()),
+                    ("time".into(), "2020-01-01T00:00:00+00:00".into()),
+                ]),
+            },
             "member_rejoin" => ActivityReport {
                 event: "member_rejoin",
                 vars: {

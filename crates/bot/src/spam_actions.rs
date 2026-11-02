@@ -523,7 +523,20 @@ async fn punish_proven_match(
             own_deletes.push(deleted);
         }
         let outcome = match result {
-            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+                app.automod_delete_marks.lock().remember(
+                    found.guild,
+                    *channel,
+                    *message,
+                    crate::automod_delete_marks::AutomodDeleteMark {
+                        rule_id: rule.to_owned(),
+                        rule_name: name.to_owned(),
+                        reason: found.reason.clone(),
+                    },
+                    Instant::now(),
+                );
+                CaseOutcome::Succeeded
+            }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
@@ -1526,6 +1539,20 @@ pub(crate) mod tests {
             seen.iter()
                 .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
             "the matched message must be deleted: {seen:?}"
+        );
+        let mark = app
+            .automod_delete_marks
+            .lock()
+            .take_live(10, 11, 42, Instant::now());
+        let mark = mark.expect("successful spam delete records a mark");
+        assert_eq!(mark.rule_id, "repeat_text");
+        assert_eq!(mark.rule_name, "Repeated text");
+        assert_eq!(mark.reason, "repeated text");
+        assert!(
+            app.automod_delete_marks
+                .lock()
+                .take_live(10, 11, 42, Instant::now())
+                .is_none()
         );
         assert!(
             seen.iter().all(|line| !line.contains("/bans/")),

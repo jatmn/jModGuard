@@ -423,6 +423,7 @@ async fn automod_try_delete_message(
     guild_id: u64,
     channel: u64,
     message: u64,
+    rule: crate::automod_delete_marks::AutomodDeleteMark,
 ) {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -434,18 +435,30 @@ async fn automod_try_delete_message(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    if let crate::discord::DiscordCall::Finished(Err(error)) = crate::discord::race_discord_call(
+    match crate::discord::race_discord_call(
         &app.activation,
         http.delete_message(channel.into(), message.into(), None),
     )
     .await
     {
-        app.remembered_discord_targets.remember_rest_rejection(
-            recovery,
-            &error,
-            target,
-            Instant::now(),
-        );
+        crate::discord::DiscordCall::Finished(Ok(())) => {
+            app.automod_delete_marks.lock().remember(
+                guild_id,
+                channel,
+                message,
+                rule,
+                Instant::now(),
+            );
+        }
+        crate::discord::DiscordCall::Finished(Err(error)) => {
+            app.remembered_discord_targets.remember_rest_rejection(
+                recovery,
+                &error,
+                target,
+                Instant::now(),
+            );
+        }
+        crate::discord::DiscordCall::Cancelled => {}
     }
 }
 
@@ -648,7 +661,19 @@ pub(crate) async fn execute_pending_with(
             if !app.activation.may_record() {
                 return;
             }
-            automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
+            automod_try_delete_message(
+                app,
+                http,
+                guild_id.get(),
+                ch,
+                id,
+                crate::automod_delete_marks::AutomodDeleteMark {
+                    rule_id: pending.rule_id.clone(),
+                    rule_name: pending.rule_name.clone(),
+                    reason: reason.clone(),
+                },
+            )
+            .await;
         }
         // This return precedes the ban handoff and operation identity creation.
         if log_automod {
@@ -674,7 +699,19 @@ pub(crate) async fn execute_pending_with(
                 if !app.activation.may_record() {
                     return;
                 }
-                automod_try_delete_message(app, http, guild_id.get(), ch, id).await;
+                automod_try_delete_message(
+                    app,
+                    http,
+                    guild_id.get(),
+                    ch,
+                    id,
+                    crate::automod_delete_marks::AutomodDeleteMark {
+                        rule_id: pending.rule_id.clone(),
+                        rule_name: pending.rule_name.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await;
             }
         }
         "warn" => {
@@ -3393,6 +3430,66 @@ mod tests {
             (active, total),
             (1, 1),
             "the echo must not add or replace the active ban"
+        );
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn successful_automod_delete_records_rule_mark() {
+        let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_lines = std::sync::Arc::clone(&lines);
+        let server_stop = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            crate::spam_actions::tests::serve_discord_stub(
+                listener,
+                server_lines,
+                server_stop,
+                |_, _, _| None,
+            )
+        });
+        let path = std::env::temp_dir().join(format!(
+            "automod_delete_mark_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        let http = serenity::http::HttpBuilder::new("token")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        super::automod_try_delete_message(
+            &app,
+            &http,
+            10,
+            11,
+            42,
+            crate::automod_delete_marks::AutomodDeleteMark {
+                rule_id: "badword".into(),
+                rule_name: "Bad words".into(),
+                reason: "blocked term".into(),
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server.join();
+        let mark = app
+            .automod_delete_marks
+            .lock()
+            .take_live(10, 11, 42, Instant::now())
+            .expect("successful delete records a mark");
+        assert_eq!(mark.rule_id, "badword");
+        assert_eq!(mark.rule_name, "Bad words");
+        assert_eq!(mark.reason, "blocked term");
+        assert!(
+            lines
+                .lock()
+                .iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42"))
         );
         drop(app);
         let _ = std::fs::remove_file(&path);

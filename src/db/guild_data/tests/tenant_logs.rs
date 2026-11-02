@@ -62,6 +62,12 @@ async fn log_mappings_are_membership_scoped_persistent_and_bounded_by_event_type
             .await
             .unwrap();
     }
+    assert!(
+        store
+            .set_log_channel(a.clone(), &revision, "automod_delete", Some(123))
+            .await
+            .is_err()
+    );
     assert_eq!(
         store
             .log_channels(a.clone())

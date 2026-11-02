@@ -1427,8 +1427,22 @@ impl EventHandler for Handler {
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         if !hooked {
-            let report =
-                logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
+            let report = if let Some(mark) = self.app.automod_delete_marks.lock().take_live(
+                guild_id.get(),
+                channel_id.get(),
+                deleted_message_id.get(),
+                Instant::now(),
+            ) {
+                logging::automod_delete_report(
+                    &self.app,
+                    guild_id,
+                    channel_id,
+                    deleted_message_id,
+                    &mark,
+                )
+            } else {
+                logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id)
+            };
             logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
         }
     }
