@@ -7,12 +7,20 @@ use axum::{
     routing::get,
 };
 use jmodguard::db::ComponentRelease;
-use jmodguard_updater::oci::Registry;
-use jmodguard_updater::signature::signature_rejection_phrase;
-use jmodguard_updater::signing_fixture::{
+// The source modules compile with cfg(test), keeping fixture trust out of the
+// normal library that the production-trust regression also exercises below.
+#[path = "../src/oci.rs"]
+pub mod oci;
+#[path = "../src/signature.rs"]
+pub mod signature;
+#[path = "../src/signing_fixture.rs"]
+pub mod signing_fixture;
+use oci::Registry;
+use serde_json::json;
+use signature::signature_rejection_phrase;
+use signing_fixture::{
     BadSignature, SigningFixture, SigningKeyChoice, signature_not_after_far_future,
 };
-use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use std::{collections::HashMap, io::Write};
 use tokio::sync::RwLock;
@@ -21,6 +29,8 @@ use tokio::sync::RwLock;
 struct RegistryFixture {
     tag: String,
     objects: HashMap<String, Vec<u8>>,
+    delayed_payload: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    failed_payload: Option<(String, StatusCode)>,
 }
 
 async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Uri) -> Response {
@@ -32,6 +42,21 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
     } else {
         reference
     };
+    if let Some((delayed, expires)) = &fixture.delayed_payload
+        && key == delayed
+    {
+        let now = chrono::Utc::now();
+        assert!(now < *expires, "payload request must start before expiry");
+        tokio::time::sleep((*expires - now).to_std().unwrap()).await;
+    }
+    if let Some((failed, status)) = &fixture.failed_payload
+        && key == failed
+    {
+        return Response::builder()
+            .status(*status)
+            .body(Body::empty())
+            .unwrap();
+    }
     match fixture.objects.get(key) {
         Some(bytes) => Response::builder()
             .status(StatusCode::OK)
@@ -287,13 +312,15 @@ async fn signature_policy_refuses_before_staging_download() {
 async fn expired_cosign_layer_does_not_hide_an_older_valid_signature() {
     let mut fixture = RegistryFixture::default();
     let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
-    signing().sign(
-        &mut fixture.objects,
-        "api",
-        &digest,
-        "2020-01-01T00:00:00Z",
-        SigningKeyChoice::Current,
-    );
+    for _ in 0..9 {
+        signing().sign(
+            &mut fixture.objects,
+            "api",
+            &digest,
+            "2020-01-01T00:00:00Z",
+            SigningKeyChoice::Current,
+        );
+    }
     let release = api_release(&digest, 'e');
     fixture.tag = digest;
     let (registry, server) = serve(fixture).await;
@@ -305,4 +332,155 @@ async fn expired_cosign_layer_does_not_hide_an_older_valid_signature() {
         b"\x7fELFsigned"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn damaged_cosign_payloads_are_skipped_and_report_signature_rejection() {
+    for missing in [true, false] {
+        for valid_older in [true, false] {
+            let mut fixture = RegistryFixture::default();
+            let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
+            let tag = jmodguard_updater::signature::signature_tag_for_digest(&digest).unwrap();
+            if !valid_older {
+                fixture.objects.remove(&tag);
+            }
+            signing().sign(
+                &mut fixture.objects,
+                "api",
+                &digest,
+                "2020-01-01T00:00:00Z",
+                SigningKeyChoice::Current,
+            );
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+            let payload = manifest["layers"].as_array().unwrap().last().unwrap()["digest"]
+                .as_str()
+                .unwrap();
+            if missing {
+                fixture.objects.remove(payload);
+            } else {
+                fixture.objects.insert(payload.into(), b"damaged".to_vec());
+            }
+            let release = api_release(&digest, 'e');
+            fixture.tag = digest;
+            let (registry, server) = serve(fixture).await;
+            let discovered = registry.discover("api", "latest").await;
+            let files = registry
+                .files(&release, &["usr/local/bin/jmodguard-api"])
+                .await;
+            if valid_older {
+                assert_eq!(discovered.unwrap().digest, release.digest);
+                assert_eq!(
+                    files.unwrap()["usr/local/bin/jmodguard-api"],
+                    b"\x7fELFsigned"
+                );
+            } else {
+                for error in [discovered.unwrap_err(), files.unwrap_err()] {
+                    assert_eq!(
+                        signature_rejection_phrase(&error),
+                        Some("bad image signature")
+                    );
+                }
+            }
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cosign_payload_outages_propagate_without_signature_rejection() {
+    for status in [408, 429, 500, 503, 599] {
+        for valid_older in [false, true] {
+            let mut fixture = RegistryFixture::default();
+            let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
+            let tag = signature::signature_tag_for_digest(&digest).unwrap();
+            if !valid_older {
+                fixture.objects.remove(&tag);
+            }
+            signing().sign(
+                &mut fixture.objects,
+                "api",
+                &digest,
+                "2020-01-01T00:00:00Z",
+                SigningKeyChoice::Current,
+            );
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+            let payload = manifest["layers"].as_array().unwrap().last().unwrap()["digest"]
+                .as_str()
+                .unwrap();
+            fixture.failed_payload = Some((payload.into(), StatusCode::from_u16(status).unwrap()));
+            let release = api_release(&digest, 'e');
+            fixture.tag = digest;
+            let (registry, server) = serve(fixture).await;
+            let discovered = registry.discover("api", "latest").await;
+            let files = registry
+                .files(&release, &["usr/local/bin/jmodguard-api"])
+                .await;
+            server.abort();
+            let _ = server.await;
+            for error in [discovered.unwrap_err(), files.unwrap_err()] {
+                assert!(
+                    oci::registry_unreachable(&error),
+                    "payload HTTP {status} must remain unreachable: {error:#}"
+                );
+                assert_eq!(signature_rejection_phrase(&error), None);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cosign_payload_fetch_crossing_expiry_is_refused() {
+    let mut fixture = RegistryFixture::default();
+    let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
+    let tag = jmodguard_updater::signature::signature_tag_for_digest(&digest).unwrap();
+    fixture.objects.remove(&tag);
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(3);
+    signing().sign(
+        &mut fixture.objects,
+        "api",
+        &digest,
+        &expires.to_rfc3339(),
+        SigningKeyChoice::Current,
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+    fixture.delayed_payload = Some((
+        manifest["layers"][0]["digest"].as_str().unwrap().into(),
+        expires,
+    ));
+    fixture.tag = digest;
+    let (registry, server) = serve(fixture).await;
+    let result = registry.discover("api", "latest").await;
+    server.abort();
+    assert_eq!(
+        signature_rejection_phrase(&result.unwrap_err()),
+        Some("expired image signature")
+    );
+}
+
+#[test]
+fn normal_library_ignores_test_signing_pem() {
+    let fixture = signing();
+    let manifest = b"manifest-bytes";
+    let digest = digest(manifest);
+    let envelope = signature::test_support::sign_manifest(
+        &fixture.private_pem,
+        &fixture.public_pem,
+        "api",
+        &digest,
+        &signature_not_after_far_future(),
+    );
+    let result = jmodguard_updater::signature::verify_manifest_signature(
+        "api",
+        &digest,
+        manifest,
+        &envelope,
+        chrono::Utc::now(),
+        jmodguard_updater::signature::SignatureExpiry::Enforce,
+    );
+    assert_eq!(
+        jmodguard_updater::signature::signature_rejection_phrase(&result.unwrap_err()),
+        Some("image signature used an untrusted key")
+    );
 }

@@ -13,7 +13,6 @@ use std::path::Component;
 use std::time::Duration;
 
 const MAX_MANIFEST: usize = 2 * 1024 * 1024;
-const MAX_SIGNATURE_LAYERS: usize = 8;
 const MAX_CONFIG: usize = 256 * 1024;
 const MAX_LAYER: usize = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
@@ -252,7 +251,6 @@ impl Registry {
         expiry: signature::SignatureExpiry,
     ) -> Result<()> {
         let signature = self.signature_body(repo, manifest_digest).await?;
-        let now = Utc::now();
         if serde_json::from_slice::<serde_json::Value>(&signature)
             .ok()
             .is_some_and(|value| {
@@ -264,7 +262,7 @@ impl Registry {
                 manifest_digest,
                 manifest_bytes,
                 &signature,
-                now,
+                Utc::now(),
                 expiry,
             );
         }
@@ -279,11 +277,7 @@ impl Registry {
             }
         );
         let mut last = None;
-        let mut tried = 0usize;
         for layer in manifest.layers.iter().rev() {
-            if tried >= MAX_SIGNATURE_LAYERS {
-                break;
-            }
             let Some(signature_b64) = layer
                 .annotations
                 .get("dev.cosignproject.cosign/signature")
@@ -291,8 +285,19 @@ impl Registry {
             else {
                 continue;
             };
-            tried += 1;
-            let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
+            let payload = match self.blob(repo, layer, MAX_MANIFEST).await {
+                Ok(payload) => payload,
+                Err(error) if registry_unreachable(&error) => return Err(error),
+                Err(_) => {
+                    last = Some(
+                        signature::ImageSignatureRejection {
+                            phrase: signature::BAD_IMAGE_SIGNATURE,
+                        }
+                        .into(),
+                    );
+                    continue;
+                }
+            };
             let envelope = match signature::envelope_from_cosign_payload(&payload, signature_b64) {
                 Ok(envelope) => envelope,
                 Err(error) => {
@@ -305,7 +310,7 @@ impl Registry {
                 manifest_digest,
                 manifest_bytes,
                 &envelope,
-                now,
+                Utc::now(),
                 expiry,
             ) {
                 Ok(()) => return Ok(()),
