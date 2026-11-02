@@ -652,14 +652,37 @@ registry_delete_tag() {
   esac
 }
 
-promote_image_tag() {
-  local image="$1" tag="$2" digest="$3"
-  local previous="" restored
-  if previous="$(inspect_digest "${image}:${tag}" 2>/dev/null | cut -f1)"; then
-    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
-  else
-    PROMOTION_ROLLBACK+=("${image}:${tag}|")
+# Status 0 prints the tag's current digest. Status 2 means the tag is
+# confirmed absent. Any other status means the digest is unknown: recording
+# an empty previous digest would make rollback delete an existing tag.
+promotion_previous_digest() {
+  local ref="$1" previous="" rc=0
+  set +e
+  previous="$(inspect_digest "$ref" 2>/dev/null | cut -f1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 && "$previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "$previous"
+    return 0
   fi
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  return 1
+}
+
+promote_image_tag() {
+  local image="$1" tag="$2" digest="$3" previous="" rc=0
+  set +e
+  previous="$(promotion_previous_digest "${image}:${tag}")"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    previous=""
+  elif [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
   registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
     || return 1
   digest_matches_ref "${image}:${tag}" "$digest" || return 1
@@ -697,11 +720,15 @@ promotion_tag_list() {
 }
 
 resolve_promotion_target() {
-  local image="$1" tag="$2" digest="$3" previous=""
-  if previous="$(inspect_digest "${image}:${tag}" 2>/dev/null | cut -f1)"; then
-    [[ "$previous" =~ ^sha256:[0-9a-f]{64}$ ]] || previous=""
-  else
+  local image="$1" tag="$2" digest="$3" previous="" rc=0
+  set +e
+  previous="$(promotion_previous_digest "${image}:${tag}")"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
     previous=""
+  elif [[ "$rc" -ne 0 ]]; then
+    publish_fail "cannot inspect ${image}:${tag} before promotion"
   fi
   PROMOTION_QUEUE+=("${image}|${tag}|${digest}|${previous}")
 }
@@ -851,9 +878,33 @@ JS
   write_publication_plan "$plan"
 }
 
+registry_manifest_absent() {
+  local errfile="$1"
+  grep -Eq ': not found$|manifest unknown' "$errfile" || return 1
+  if grep -Eq 'failed to do request|unauthorized|authentication required|denied:|no such host|timeout|connection refused|connection reset' "$errfile"; then
+    return 1
+  fi
+  return 0
+}
+
 inspect_digest() {
-  local raw
-  raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}')"
+  local raw="" err rc=0
+  err="$(mktemp)" || return 1
+  set +e
+  raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    if registry_manifest_absent "$err"; then
+      rm -f "$err"
+      return 2
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  set +e
   MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
@@ -863,6 +914,9 @@ if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
 if (!Number.isInteger(size) || size <= 0) process.exit(2);
 process.stdout.write(`${digest}\t${size}\n`);
 JS
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 1
 }
 
 source_image_layout() {

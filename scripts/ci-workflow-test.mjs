@@ -376,7 +376,7 @@ const atomic = [
   "    printf '%s\\t10\\n' \"${CUR[$1]}\"",
   "    return 0",
   "  fi",
-  "  return 1",
+  "  return 2",
   "}",
   "registry_promote_tag() {",
   "  local tag=\"\" digest=\"\" prev=\"\" arg",
@@ -441,6 +441,72 @@ try {
 } finally {
   fs.rmSync(atomicDir, { recursive: true, force: true });
 }
+
+function runPromotionScript(script, env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "promote-inspect-"));
+  const trace = path.join(dir, "trace");
+  const result = spawnSync("bash", ["-c", script], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, TRACE: trace, ...env },
+  });
+  const traceText = fs.existsSync(trace) ? fs.readFileSync(trace, "utf8") : "";
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr, trace: traceText };
+}
+const keptDigest = "sha256:" + "a".repeat(64);
+const nextKept = "sha256:" + "c".repeat(64);
+const inspectError = runPromotionScript([
+  "set -euo pipefail",
+  "export JMODGUARD_PUBLISH_IMAGE_LIB=1",
+  "source scripts/publish-image.sh",
+  "inspect_digest() { return 1; }",
+  "registry_promote_tag() { printf 'promote\\n' >>\"$TRACE\"; return 1; }",
+  "registry_delete_tag() { printf 'delete %s\\n' \"$1\" >>\"$TRACE\"; return 0; }",
+  "resolve_promotion_target ghcr.io/jatmn/jmodguard-bot latest \"$NEW\"",
+  "printf 'queue %s\\n' \"${PROMOTION_QUEUE[0]}\" >>\"$TRACE\"",
+  "finish_deferred_promotions",
+].join("\n"), { NEW: nextKept });
+assert.notEqual(inspectError.status, 0, inspectError.stdout);
+assert.match(inspectError.stderr, /cannot inspect ghcr\.io\/jatmn\/jmodguard-bot:latest before promotion/);
+assert.equal(inspectError.trace, "", "inspection failure must not promote or delete: " + inspectError.trace);
+const confirmedAbsent = runPromotionScript([
+  "set -euo pipefail",
+  "export JMODGUARD_PUBLISH_IMAGE_LIB=1",
+  "source scripts/publish-image.sh",
+  "docker() { printf 'ERROR: ghcr.io/jatmn/jmodguard-bot:latest: not found\\n' >&2; return 1; }",
+  "registry_promote_tag() { printf 'promote\\n' >>\"$TRACE\"; return 0; }",
+  "registry_delete_tag() { printf 'delete %s\\n' \"$1\" >>\"$TRACE\"; return 0; }",
+  "resolve_promotion_target ghcr.io/jatmn/jmodguard-bot latest \"$NEW\"",
+  "printf 'queue %s\\n' \"${PROMOTION_QUEUE[0]}\" >>\"$TRACE\"",
+].join("\n"), { NEW: nextKept });
+assert.equal(confirmedAbsent.status, 0, confirmedAbsent.stderr);
+assert.equal(confirmedAbsent.trace, `queue ghcr.io/jatmn/jmodguard-bot|latest|${nextKept}|\n`);
+assert.doesNotMatch(confirmedAbsent.trace, /delete |promote/);
+const transportError = runPromotionScript([
+  "set -euo pipefail",
+  "export JMODGUARD_PUBLISH_IMAGE_LIB=1",
+  "source scripts/publish-image.sh",
+  "docker() { printf 'ERROR: failed to do request: dial tcp: lookup ghcr.io: no such host\\n' >&2; return 1; }",
+  "registry_promote_tag() { printf 'promote\\n' >>\"$TRACE\"; return 0; }",
+  "registry_delete_tag() { printf 'delete %s\\n' \"$1\" >>\"$TRACE\"; return 0; }",
+  "resolve_promotion_target ghcr.io/jatmn/jmodguard-bot latest \"$NEW\"",
+  "printf 'queue %s\\n' \"${PROMOTION_QUEUE[0]}\" >>\"$TRACE\"",
+  "finish_deferred_promotions",
+].join("\n"), { NEW: nextKept });
+assert.notEqual(transportError.status, 0, transportError.stdout);
+assert.match(transportError.stderr, /cannot inspect ghcr\.io\/jatmn\/jmodguard-bot:latest before promotion/);
+assert.equal(transportError.trace, "", "a transport error must not promote or delete: " + transportError.trace);
+const recordedDigest = runPromotionScript([
+  "set -euo pipefail",
+  "export JMODGUARD_PUBLISH_IMAGE_LIB=1",
+  "source scripts/publish-image.sh",
+  "docker() { printf '{\"digest\":\"%s\",\"size\":10}\\n' \"$OLD\"; }",
+  "resolve_promotion_target ghcr.io/jatmn/jmodguard-bot latest \"$NEW\"",
+  "printf 'queue %s\\n' \"${PROMOTION_QUEUE[0]}\" >>\"$TRACE\"",
+].join("\n"), { NEW: nextKept, OLD: keptDigest });
+assert.equal(recordedDigest.status, 0, recordedDigest.stderr);
+assert.equal(recordedDigest.trace, `queue ghcr.io/jatmn/jmodguard-bot|latest|${nextKept}|${keptDigest}\n`);
 
 function packageVersion(id, tags, name = `sha256:${id.toString(16).padStart(64, "0")}`) {
   const version = { id, metadata: { package_type: "container", container: { tags } } };
