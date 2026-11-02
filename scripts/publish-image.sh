@@ -563,8 +563,7 @@ registry_delete_detached_tag() {
           if registry_delete_version "$package" "$token" "$disposable_id"; then
             return 0
           fi
-          echo "registry tag ${tag} disposable package version ${disposable_id} could not be deleted" >&2
-          return 1
+          break
         fi
         decision="unreadable"
         ;;
@@ -588,6 +587,9 @@ registry_delete_detached_tag() {
       ;;
     list)
       echo "registry tag ${tag} package version list failed" >&2
+      ;;
+    delete\ [0-9]*)
+      echo "registry tag ${tag} disposable package version ${decision#delete } could not be deleted" >&2
       ;;
     *)
       echo "registry tag ${tag} disposable package version match was unreadable" >&2
