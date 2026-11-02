@@ -79,6 +79,14 @@ if ! grep -Fiq "not required" "$root/docs/WEBUI.md"; then
 fi
 require_absent docs/WEBUI.md "examples/private-ops"
 
+# test_expiry_safe_cold_boot_requires_both_base_images
+require_contains docs/BUNNY-UPDATES.md '[expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout)'
+require_contains docs/BUNNY-UPDATES.md 'both bot and API base images'
+require_contains docs/BUNNY-UPDATES.md 'baked launcher revision 21 or newer'
+require_contains docs/BUNNY-UPDATES.md 'optional runtime launcher update from revision 19 is insufficient'
+require_contains docs/BUNNY-UPDATES.md 'application minimum remains 7'
+require_contains docs/BUNNY-UPDATES.md 'signature-verifier threshold remains 19'
+
 # test_bunny_publish_script_env_names_in_operator_docs
 require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_ZONE"
 require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_PASSWORD"
