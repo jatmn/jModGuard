@@ -1419,6 +1419,7 @@ impl tracing::Subscriber for ContractWarnings {
         let mut message = String::new();
         event.record(&mut MessageVisit(&mut message));
         if message.contains("no capability contract")
+            || message.contains("registry unreachable at boot; starting the built-in application")
             || (event.metadata().level() == &tracing::Level::ERROR
                 && message == "discord token rejected; bot held, fix token and restart container")
             || (event.metadata().level() == &tracing::Level::WARN
@@ -8160,5 +8161,289 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
         test_signing().damage(&mut objects, "bot", &release.digest, bad);
         boot_repair_refuses(&control, &root, release, objects, bad.phrase()).await;
     }
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+const BUILT_IN_OUTAGE_LOG: &str = "registry unreachable at boot; starting the built-in application";
+
+async fn status_registry(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut incoming = [0u8; 1024];
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::io::AsyncReadExt::read(&mut socket, &mut incoming),
+                )
+                .await;
+                let response = format!(
+                    "HTTP/1.1 {status} status\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{address}"), server)
+}
+
+async fn refused_registry() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    assert!(
+        tokio::net::TcpListener::bind(address).await.is_err(),
+        "the refused endpoint must stay reserved until the request completes"
+    );
+    (format!("http://{address}"), socket)
+}
+
+async fn restore_installed(
+    role: &str,
+    control: &UpdateControl,
+    root: &Path,
+    baked: &Path,
+    base: &str,
+    schema: i64,
+    baked_guild: Option<i64>,
+) -> (Result<(), String>, Option<PathBuf>, Vec<String>) {
+    let registry = Registry::new(base).unwrap();
+    let mut service = controller(role, baked.to_path_buf(), registry, control.clone(), root);
+    if let Some(guild) = baked_guild {
+        service.baked_compatibility.guild = guild;
+    }
+    let mut release = release_at(role, 'c', schema);
+    release.min_schema = schema;
+    release.max_schema = schema;
+    let mut state = installed_state(release);
+    // Record the compiled guild schema. A case can point the baked image at a
+    // different guild schema and must then be refused.
+    state.observed = Some(fresh_observation(1));
+    let (restored, logs) = with_contract_warnings(service.restore(&state)).await;
+    let started = service.running.as_ref().map(|child| {
+        assert!(
+            child.release.is_none(),
+            "built-in start must not claim the installed release"
+        );
+        child.path.clone()
+    });
+    service.stop_application().await.unwrap();
+    service.end_idle().await.unwrap();
+    (restored.map_err(|error| error.to_string()), started, logs)
+}
+
+#[tokio::test]
+async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
+    let root = std::env::temp_dir().join(format!("boot-outage-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let current = control.schema_version().await.unwrap();
+    assert_eq!(current, db::CORE_SCHEMA_VERSION);
+
+    let (refused, reserved) = refused_registry().await;
+    let (error, started, logs) =
+        restore_installed("bot", &control, &root, &baked, &refused, current, None).await;
+    assert!(error.is_ok(), "{error:?}");
+    assert_eq!(started.as_deref(), Some(baked.as_path()));
+    assert!(
+        logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+
+    for status in [503u16, 429] {
+        let (base, server) = status_registry(status).await;
+        let (error, started, logs) =
+            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+        server.abort();
+        assert!(error.is_ok(), "HTTP {status}: {error:?}");
+        assert_eq!(started.as_deref(), Some(baked.as_path()), "HTTP {status}");
+        assert!(
+            logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+            "HTTP {status}: {logs:?}"
+        );
+    }
+
+    let (base, server) = status_registry(500).await;
+    let (error, started, logs) =
+        restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+    server.abort();
+    let error = error.expect_err("HTTP 500 is not this outage");
+    assert!(error.contains("registry returned HTTP 500"), "{error}");
+    assert!(started.is_none(), "{started:?}");
+    assert!(
+        !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+
+    let (error, started, logs) =
+        restore_installed("api", &control, &root, &baked, &refused, current, None).await;
+    assert!(error.is_ok(), "{error:?}");
+    assert_eq!(started.as_deref(), Some(baked.as_path()));
+    assert!(logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+
+    db.with_conn(|conn| {
+        conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION - 1)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let older = control.schema_version().await.unwrap();
+    let (error, started, logs) =
+        restore_installed("api", &control, &root, &baked, &refused, older, None).await;
+    let error = error.expect_err("an older database is outside the API built-in schema");
+    assert!(
+        error.contains("baked application cannot open database; use owner recovery"),
+        "{error}"
+    );
+    assert!(started.is_none(), "{started:?}");
+    assert!(!logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+
+    db.with_conn(|conn| {
+        conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION + 1)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let newer = control.schema_version().await.unwrap();
+    let (error, started, _) =
+        restore_installed("bot", &control, &root, &baked, &refused, newer, None).await;
+    let error = error.expect_err("a newer database is outside the built-in schema range");
+    assert!(
+        error.contains("baked application cannot open database; use owner recovery"),
+        "{error}"
+    );
+    assert!(started.is_none(), "{started:?}");
+
+    drop(reserved);
+    drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn set_core_schema(db: &Db, version: i64) {
+    db.with_conn(move |conn| {
+        conn.pragma_update(None, "user_version", version)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cold_start_outage_refuses_a_baked_bot_schema_change() {
+    let root = std::env::temp_dir().join(format!("boot-core-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let live = control.schema_version().await.unwrap();
+    assert_eq!(live, db::CORE_SCHEMA_VERSION);
+    let (refused, reserved) = refused_registry().await;
+
+    let (error, started, logs) =
+        restore_installed("bot", &control, &root, &baked, &refused, live, None).await;
+    assert!(error.is_ok(), "{error:?}");
+    assert_eq!(started.as_deref(), Some(baked.as_path()));
+    assert!(
+        logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+    assert_eq!(control.schema_version().await.unwrap(), live);
+    assert!(control.upgrade().await.unwrap().is_none());
+
+    set_core_schema(&db, live - 1).await;
+    let (error, started, logs) =
+        restore_installed("bot", &control, &root, &baked, &refused, live - 1, None).await;
+    let error = error.expect_err("a newer baked bot must not migrate during an outage");
+    assert!(
+        error.contains("baked application cannot open database; use owner recovery"),
+        "{error}"
+    );
+    assert!(started.is_none(), "{started:?}");
+    assert!(
+        !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+    assert_eq!(control.schema_version().await.unwrap(), live - 1);
+    assert!(control.upgrade().await.unwrap().is_none());
+
+    set_core_schema(&db, live + 1).await;
+    let (error, started, logs) =
+        restore_installed("bot", &control, &root, &baked, &refused, live + 1, None).await;
+    let error = error.expect_err("an older baked bot cannot open a newer database");
+    assert!(
+        error.contains("baked application cannot open database; use owner recovery"),
+        "{error}"
+    );
+    assert!(started.is_none(), "{started:?}");
+    assert!(
+        !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+    assert_eq!(control.schema_version().await.unwrap(), live + 1);
+    assert!(control.upgrade().await.unwrap().is_none());
+
+    drop(reserved);
+    drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_start_outage_requires_matching_guild_schema() {
+    let root = std::env::temp_dir().join(format!("boot-guild-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let live = control.schema_version().await.unwrap();
+    let (refused, reserved) = refused_registry().await;
+    let recorded = db::guild_data::SCHEMA_VERSION;
+
+    for baked_guild in [recorded + 1, recorded - 1] {
+        let (error, started, logs) = restore_installed(
+            "bot",
+            &control,
+            &root,
+            &baked,
+            &refused,
+            live,
+            Some(baked_guild),
+        )
+        .await;
+        let error = error.expect_err("a guild schema mismatch must not start");
+        assert!(
+            error.contains(db::APP_ONLY_SCHEMA_CHANGE_REFUSED),
+            "baked guild {baked_guild}: {error}"
+        );
+        assert!(started.is_none(), "{started:?}");
+        assert!(
+            !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+            "{logs:?}"
+        );
+        assert_eq!(control.schema_version().await.unwrap(), live);
+        assert!(control.upgrade().await.unwrap().is_none());
+    }
+
+    let (error, started, logs) = restore_installed(
+        "bot",
+        &control,
+        &root,
+        &baked,
+        &refused,
+        live,
+        Some(recorded),
+    )
+    .await;
+    assert!(error.is_ok(), "{error:?}");
+    assert_eq!(started.as_deref(), Some(baked.as_path()));
+    assert!(
+        logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
+        "{logs:?}"
+    );
+
+    drop(reserved);
+    drop((db, control));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
