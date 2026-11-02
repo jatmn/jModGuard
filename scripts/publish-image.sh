@@ -458,33 +458,329 @@ if (process.env.LAYOUT !== "legacy" && !labels["org.opencontainers.image.revisio
 JS
 }
 
+declare -g -a PROMOTION_QUEUE=()
+declare -g -a PROMOTION_DONE=()
+declare -g -a PROMOTION_SCRATCHES=()
+declare -g -a PROMOTION_ROLLBACK=()
+
 registry_promote_tag() {
   docker buildx imagetools create "$@" || return 1
 }
 
-promote_image_tag() {
-  local image="$1" tag="$2" digest="$3"
-  local previous="" restored
-  if previous="$(inspect_digest "${image}:${tag}" 2>/dev/null | cut -f1)"; then
-    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
-  else
-    PROMOTION_ROLLBACK+=("${image}:${tag}|")
+registry_user_versions_path() {
+  printf '/users/jatmn/packages/container/%s/versions' "$1"
+}
+
+registry_fetch_versions() {
+  local package="$1" token="$2"
+  # gh api --paginate prints one JSON array per page. Combine them before matching.
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --paginate \
+    "$(registry_user_versions_path "$package")?per_page=100" \
+    | jq -se '
+        if any(.[]; type != "array") then
+          error("package version list page is not a JSON array")
+        else
+          [ .[][] ]
+        end
+      '
+}
+
+registry_delete_version() {
+  local package="$1" token="$2" version_id="$3"
+  GH_PROMPT_DISABLED=1 GH_TOKEN="$token" gh api --method DELETE \
+    "$(registry_user_versions_path "$package")/${version_id}" >/dev/null
+}
+
+registry_classify_tag_version() {
+  local tag="$1"
+  jq -r --arg tag "$tag" '
+    [ .[] | select((.metadata.container.tags // []) | index($tag) != null) ]
+    | if length == 1 then
+        if (.[0].metadata.container.tags | length) == 1 then
+          "delete \(.[0].id)"
+        else
+          "untag \(.[0].id)"
+        end
+      elif length == 0 then
+        "none"
+      else
+        "many \(length)"
+      end
+  '
+}
+
+registry_disposable_version_id() {
+  local tag="$1" keep_id="$2"
+  jq -r --arg tag "$tag" --argjson keep "$keep_id" '
+    (map(select(.id == $keep)) | first) as $kept
+    | if $kept == null then "kept-missing"
+      elif (($kept.metadata.container.tags // []) | index($tag) != null) then "tag-still-present"
+      else
+        [ .[] | select(.id != $keep and ((.metadata.container.tags // []) == [$tag])) ]
+        | if length == 1 then "delete \(.[0].id)"
+          elif length == 0 then "none"
+          else "many \(length)"
+          end
+      end
+  '
+}
+
+registry_preserved_digest() {
+  local version_id="$1"
+  jq -er --argjson id "$version_id" '
+    ([.[] | select(.id == $id)] | first | .name // empty)
+    | select(test("^sha256:[0-9a-f]{64}$"))
+  '
+}
+
+registry_move_tag_onto_empty_image() {
+  local image_tag="$1" dir
+  dir="$(mktemp -d)" || return 1
+  printf 'FROM scratch\n' >"${dir}/Dockerfile"
+  if ! docker buildx build --builder default --platform linux/amd64 \
+    --provenance=false --sbom=false --push --progress plain \
+    --file "${dir}/Dockerfile" --tag "$image_tag" "$dir"; then
+    rm -rf "$dir"
+    return 1
   fi
+  rm -rf "$dir"
+}
+
+registry_delete_detached_tag() {
+  local package="$1" token="$2" tag="$3" keep_id="$4" digest="$5"
+  local payload decision attempt disposable_id image_tag
+  decision="unreadable"
+  for attempt in 1 2 3; do
+    if ! payload="$(registry_fetch_versions "$package" "$token")"; then
+      decision="list"
+    elif ! decision="$(printf '%s\n' "$payload" | registry_disposable_version_id "$tag" "$keep_id")"; then
+      decision="unreadable"
+    fi
+    case "$decision" in
+      delete\ [0-9]*)
+        disposable_id="${decision#delete }"
+        if [[ "$disposable_id" =~ ^[0-9]+$ ]]; then
+          if registry_delete_version "$package" "$token" "$disposable_id"; then
+            return 0
+          fi
+          echo "registry tag ${tag} disposable package version ${disposable_id} could not be deleted" >&2
+          return 1
+        fi
+        decision="unreadable"
+        ;;
+    esac
+    if [[ "$attempt" != 3 ]]; then
+      sleep 2
+    fi
+  done
+  case "$decision" in
+    none)
+      echo "registry tag ${tag} matched no disposable package version" >&2
+      ;;
+    many\ *)
+      echo "registry tag ${tag} matched ${decision#many } disposable package versions" >&2
+      ;;
+    kept-missing)
+      echo "registry tag ${tag} preserved package version ${keep_id} was not listed" >&2
+      ;;
+    tag-still-present)
+      echo "registry tag ${tag} is still on preserved package version ${keep_id}" >&2
+      ;;
+    list)
+      echo "registry tag ${tag} package version list failed" >&2
+      ;;
+    *)
+      echo "registry tag ${tag} disposable package version match was unreadable" >&2
+      ;;
+  esac
+  if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "registry tag ${tag} cleanup failed and preserved version ${keep_id} has no digest to restore" >&2
+    return 1
+  fi
+  image_tag="ghcr.io/jatmn/${package}:${tag}"
+  if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "ghcr.io/jatmn/${package}@${digest}" >/dev/null; then
+    echo "registry tag ${tag} could not be restored to ${digest}" >&2
+    return 1
+  fi
+  echo "registry tag ${tag} restored to ${digest}" >&2
+  return 1
+}
+
+registry_delete_tag() {
+  local image_tag="$1" package tag token payload decision action version_id digest
+  [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || return 1
+  package="${BASH_REMATCH[1]}"
+  tag="${BASH_REMATCH[2]}"
+  token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
+  [[ -n "$token" ]] || return 1
+  payload="$(registry_fetch_versions "$package" "$token")" || return 1
+  decision="$(printf '%s\n' "$payload" | registry_classify_tag_version "$tag")" || return 1
+  case "$decision" in
+    none)
+      echo "registry tag ${tag} matched no package version" >&2
+      return 1
+      ;;
+    many\ *)
+      echo "registry tag ${tag} matched ${decision#many } package versions" >&2
+      return 1
+      ;;
+    delete\ [0-9]*|untag\ [0-9]*)
+      ;;
+    *)
+      echo "registry tag ${tag} package version match was unreadable" >&2
+      return 1
+      ;;
+  esac
+  action="${decision%% *}"
+  version_id="${decision#* }"
+  [[ "$version_id" =~ ^[0-9]+$ ]] || return 1
+  case "$action" in
+    delete)
+      registry_delete_version "$package" "$token" "$version_id"
+      ;;
+    untag)
+      digest="$(printf '%s\n' "$payload" | registry_preserved_digest "$version_id")" || {
+        echo "registry tag ${tag} preserved version ${version_id} has no digest to restore" >&2
+        return 1
+      }
+      registry_move_tag_onto_empty_image "$image_tag" || return 1
+      registry_delete_detached_tag "$package" "$token" "$tag" "$version_id" "$digest"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Status 0 prints the tag's current digest. Status 2 means the tag is
+# confirmed absent. Any other status means the digest is unknown: recording
+# an empty previous digest would make rollback delete an existing tag.
+promotion_previous_digest() {
+  local ref="$1" previous="" rc=0
+  set +e
+  previous="$(inspect_digest "$ref" 2>/dev/null | cut -f1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 && "$previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "$previous"
+    return 0
+  fi
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  return 1
+}
+
+promote_image_tag() {
+  local image="$1" tag="$2" digest="$3" previous="" rc=0
+  set +e
+  previous="$(promotion_previous_digest "${image}:${tag}")"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    previous=""
+  elif [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
   registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
     || return 1
   digest_matches_ref "${image}:${tag}" "$digest" || return 1
 }
 
 rollback_promoted_tags() {
-  local entry image_tag previous image
-  for entry in "${PROMOTION_ROLLBACK[@]:-}"; do
+  local entry image_tag previous image i
+  [[ -v PROMOTION_ROLLBACK ]] || return 0
+  [[ "${#PROMOTION_ROLLBACK[@]}" -eq 0 ]] && return 0
+  for ((i=${#PROMOTION_ROLLBACK[@]}-1; i>=0; i--)); do
+    entry="${PROMOTION_ROLLBACK[i]}"
     image_tag="${entry%%|*}"
     previous="${entry#*|}"
     if [[ -n "$previous" ]]; then
       image="${image_tag%:*}"
       registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
+    else
+      registry_delete_tag "$image_tag" >/dev/null 2>&1 || true
     fi
   done
+}
+
+promotion_tag_list() {
+  local sha="$1" label="$2" channel="$3"
+  printf '%s\n' "$sha"
+  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
+    printf '%s\n' "$label"
+  fi
+  if [[ "$channel" != "nightly" ]]; then
+    printf '%s\n' latest
+  fi
+  if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
+    printf '%s\n' "$channel"
+  fi
+}
+
+resolve_promotion_target() {
+  local image="$1" tag="$2" digest="$3" previous="" rc=0
+  set +e
+  previous="$(promotion_previous_digest "${image}:${tag}")"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    previous=""
+  elif [[ "$rc" -ne 0 ]]; then
+    publish_fail "cannot inspect ${image}:${tag} before promotion"
+  fi
+  PROMOTION_QUEUE+=("${image}|${tag}|${digest}|${previous}")
+}
+
+cleanup_promotion_scratch() {
+  local dir
+  [[ "${#PROMOTION_SCRATCHES[@]}" -eq 0 ]] && return 0
+  for dir in "${PROMOTION_SCRATCHES[@]}"; do
+    rm -rf "$dir"
+  done
+  PROMOTION_SCRATCHES=()
+}
+
+abort_promotion() {
+  rollback_promoted_tags
+  cleanup_promotion_scratch
+  publish_fail "failed to promote $1"
+}
+
+commit_queued_promotions() {
+  local entry image tag digest previous
+  local -a PROMOTION_ROLLBACK=()
+  [[ "${#PROMOTION_QUEUE[@]}" -eq 0 ]] && return 0
+  for entry in "${PROMOTION_QUEUE[@]}"; do
+    IFS='|' read -r image tag digest previous <<<"$entry"
+    PROMOTION_ROLLBACK+=("${image}:${tag}|${previous}")
+    registry_promote_tag --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}" >/dev/null \
+      || abort_promotion "${image}:${tag}"
+    digest_matches_ref "${image}:${tag}" "$digest" \
+      || abort_promotion "${image}:${tag}"
+  done
+  PROMOTION_QUEUE=()
+}
+
+finish_deferred_promotions() {
+  local entry component dir published rest
+  commit_queued_promotions
+  if [[ "${#PROMOTION_DONE[@]}" -gt 0 ]]; then
+    for entry in "${PROMOTION_DONE[@]}"; do
+      component="${entry%%$'\t'*}"
+      rest="${entry#*$'\t'}"
+      dir="${rest%%$'\t'*}"
+      published="${rest#*$'\t'}"
+      if [[ -n "$dir" ]]; then
+        JMODGUARD_PUBLISH_STATE_DIR="$dir" clear_publish_state "$component"
+      fi
+      echo "Published ${published}"
+    done
+  fi
+  PROMOTION_DONE=()
+  cleanup_promotion_scratch
+  trap - EXIT
 }
 
 checked_request() {
@@ -582,9 +878,33 @@ JS
   write_publication_plan "$plan"
 }
 
+registry_manifest_absent() {
+  local errfile="$1"
+  grep -Eq ': not found$|manifest unknown' "$errfile" || return 1
+  if grep -Eq 'failed to do request|unauthorized|authentication required|denied:|no such host|timeout|connection refused|connection reset' "$errfile"; then
+    return 1
+  fi
+  return 0
+}
+
 inspect_digest() {
-  local raw
-  raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}')"
+  local raw="" err rc=0
+  err="$(mktemp)" || return 1
+  set +e
+  raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    if registry_manifest_absent "$err"; then
+      rm -f "$err"
+      return 2
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  set +e
   MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
@@ -594,6 +914,9 @@ if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
 if (!Number.isInteger(size) || size <= 0) process.exit(2);
 process.stdout.write(`${digest}\t${size}\n`);
 JS
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 1
 }
 
 source_image_layout() {
@@ -941,8 +1264,7 @@ publish_component_sign() {
   local component="$1"
   local selection mode ref head resolved sha label image channel published_digest staging_ref
   local state handoff sign_flag handoff_sign_expected=""
-  local username token source_token scratch
-  local -a PROMOTION_ROLLBACK=()
+  local username token source_token scratch tag
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
     echo 'Test-only build; no image publication'
@@ -994,7 +1316,8 @@ publish_component_sign() {
   fi
   require_signing_secrets
   scratch="$(scratch_dir publish-sign)"
-  trap 'rm -rf "$scratch"' EXIT
+  PROMOTION_SCRATCHES+=("$scratch")
+  trap cleanup_promotion_scratch EXIT
   validate_signing_key_pair
   redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   export DOCKER_CONFIG="${scratch}/docker"
@@ -1007,28 +1330,19 @@ publish_component_sign() {
     || publish_fail 'staging reference does not match the verified build digest'
   sign_published_digest "$component" "$image" "$published_digest" \
     || publish_fail 'published image failed signing'
-  promote_with_rollback() {
-    local tag="$1"
-    promote_image_tag "$image" "$tag" "$published_digest" || {
-      rollback_promoted_tags
-      publish_fail "failed to promote ${image}:${tag}"
-    }
-  }
-  promote_with_rollback "$sha"
-  assert_digest_matches_ref "${image}:${sha}" "$published_digest"
-  if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
-    promote_with_rollback "$label"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    resolve_promotion_target "$image" "$tag" "$published_digest"
+  done < <(promotion_tag_list "$sha" "$label" "$channel")
+  if [[ "${JMODGUARD_DEFER_PROMOTION:-}" == 1 ]]; then
+    PROMOTION_DONE+=("${component}"$'\t'"${JMODGUARD_PUBLISH_STATE_DIR:-}"$'\t'"${image}:${sha}")
+    return 0
   fi
-  if [[ "$channel" != "nightly" ]]; then
-    promote_with_rollback latest
-  fi
-  if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
-    promote_with_rollback "$channel"
-  fi
+  commit_queued_promotions
   clear_publish_state "$component"
   echo "Published ${image}:${sha}"
   trap - EXIT
-  rm -rf "$scratch"
+  cleanup_promotion_scratch
 }
 
 publish_component_phase() {
