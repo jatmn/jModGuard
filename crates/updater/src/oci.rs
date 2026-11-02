@@ -33,9 +33,10 @@ fn valid_digest(value: &str) -> bool {
         && value[7..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A cold-start download failed before any image bytes were accepted.
+/// A registry request failed in a way that permits outage fallback.
 /// Connection failure, request timeout, HTTP 408/429, and server errors are
-/// unreachable. Signature refusals and other responses stay permanent failures.
+/// unreachable. Response-body failures (including truncated downloads), signature
+/// refusals, and other responses do not qualify, even after earlier fetches succeeded.
 pub fn registry_unreachable(error: &anyhow::Error) -> bool {
     if signature::signature_rejection_phrase(error).is_some() {
         return false;
