@@ -6,9 +6,15 @@ use axum::{
     response::Response,
     routing::get,
 };
-use jmodguard_updater::oci::{Registry, sha256_hex};
+use jmodguard::db::ComponentRelease;
+use jmodguard_updater::oci::Registry;
+use jmodguard_updater::signature::signature_rejection_phrase;
+use jmodguard_updater::signing_fixture::{
+    BadSignature, SigningFixture, SigningKeyChoice, signature_not_after_far_future,
+};
 use serde_json::json;
-use std::{collections::HashMap, io::Write, sync::Arc};
+use std::sync::{Arc, OnceLock};
+use std::{collections::HashMap, io::Write};
 use tokio::sync::RwLock;
 
 #[derive(Default)]
@@ -38,8 +44,17 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
     }
 }
 
+fn signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::new();
+        fixture.apply_env();
+        fixture
+    })
+}
+
 fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{}", sha256_hex(bytes))
+    format!("sha256:{}", jmodguard_updater::oci::sha256_hex(bytes))
 }
 
 fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &str) -> String {
@@ -86,6 +101,13 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
     let manifest_digest = digest(&manifest);
     fixture.objects.insert(sha, manifest.clone());
     fixture.objects.insert(manifest_digest.clone(), manifest);
+    signing().sign(
+        &mut fixture.objects,
+        "api",
+        &manifest_digest,
+        &signature_not_after_far_future(),
+        SigningKeyChoice::Current,
+    );
     manifest_digest
 }
 
@@ -184,6 +206,103 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
             .files(&approved, &["usr/local/bin/jmodguard-api"])
             .await
             .is_err()
+    );
+    server.abort();
+}
+
+fn api_release(digest: &str, source: char) -> ComponentRelease {
+    ComponentRelease {
+        component: "api".into(),
+        channel: "latest".into(),
+        release_id: format!("v1.0.{source}"),
+        source_sha: source.to_string().repeat(40),
+        published_at: "2026-09-23T00:00:00Z".into(),
+        image: "ghcr.io/jatmn/jmodguard-api".into(),
+        digest: digest.into(),
+        min_schema: 15,
+        max_schema: 15,
+        result_schema: 15,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: Some(jmodguard::db::LauncherCompatibility {
+            revision: 7,
+            min_revision: 4,
+        }),
+        base_abi: "debian-bookworm-amd64".into(),
+        upgrade: Some(jmodguard::db::UpgradeCompatibility {
+            control_protocol: 3,
+            min_core: 15,
+            min_guild: 1,
+            guild_schema: 14,
+        }),
+    }
+}
+
+async fn serve(fixture: RegistryFixture) -> (Registry, tokio::task::JoinHandle<()>) {
+    let router = Router::new()
+        .fallback(get(serve_object))
+        .with_state(Arc::new(RwLock::new(fixture)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (Registry::new(&format!("http://{addr}")).unwrap(), server)
+}
+
+#[tokio::test]
+async fn signature_policy_refuses_before_staging_download() {
+    for (index, bad) in BadSignature::ALL.into_iter().enumerate() {
+        let mut fixture = RegistryFixture::default();
+        let source = char::from(b'a' + index as u8);
+        let digest = image(&mut fixture, source, b"\x7fELFsigned", "development");
+        signing().damage(&mut fixture.objects, "api", &digest, bad);
+        if matches!(bad, BadSignature::Wrong) {
+            let tag = jmodguard_updater::signature::signature_tag_for_digest(&digest).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&fixture.objects[&tag]).unwrap();
+            assert!(body.get("payloadType").is_none());
+            assert!(
+                body["layers"][0]["annotations"]["dev.cosignproject.cosign/signature"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
+        fixture.tag = digest.clone();
+        let release = api_release(&digest, source);
+        let (registry, server) = serve(fixture).await;
+        for error in [
+            registry.discover("api", "latest").await.unwrap_err(),
+            registry
+                .files(&release, &["usr/local/bin/jmodguard-api"])
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), bad.phrase(), "{error:?}");
+            assert_eq!(signature_rejection_phrase(&error), Some(bad.phrase()));
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn expired_cosign_layer_does_not_hide_an_older_valid_signature() {
+    let mut fixture = RegistryFixture::default();
+    let digest = image(&mut fixture, 'e', b"\x7fELFsigned", "development");
+    signing().sign(
+        &mut fixture.objects,
+        "api",
+        &digest,
+        "2020-01-01T00:00:00Z",
+        SigningKeyChoice::Current,
+    );
+    let release = api_release(&digest, 'e');
+    fixture.tag = digest;
+    let (registry, server) = serve(fixture).await;
+    assert_eq!(
+        registry
+            .files(&release, &["usr/local/bin/jmodguard-api"])
+            .await
+            .unwrap()["usr/local/bin/jmodguard-api"],
+        b"\x7fELFsigned"
     );
     server.abort();
 }

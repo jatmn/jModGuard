@@ -1,6 +1,8 @@
 //! Anonymous, digest-pinned reads of the project's public GHCR OCI images.
 //! Registry tags are discovery pointers; a queued install keeps its digest.
+use crate::signature;
 use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use jmodguard::db::ComponentRelease;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use ring::digest::{SHA256, digest};
@@ -11,6 +13,7 @@ use std::path::Component;
 use std::time::Duration;
 
 const MAX_MANIFEST: usize = 2 * 1024 * 1024;
+const MAX_SIGNATURE_LAYERS: usize = 8;
 const MAX_CONFIG: usize = 256 * 1024;
 const MAX_LAYER: usize = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
@@ -46,6 +49,8 @@ struct Descriptor {
     size: u64,
     #[serde(rename = "mediaType")]
     media_type: String,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,7 +173,99 @@ impl Registry {
         Ok((body, headers))
     }
 
-    async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String)> {
+    async fn signature_body(&self, repo: &str, manifest_digest: &str) -> Result<Vec<u8>> {
+        let tag = signature::signature_tag_for_digest(manifest_digest)?;
+        let token = self.token(repo).await?;
+        let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
+        match self
+            .get_limited(url, token.as_deref(), Some(MANIFEST_ACCEPT), MAX_MANIFEST)
+            .await
+        {
+            Ok((body, _)) => Ok(body),
+            Err(error) if error.to_string().contains("registry returned HTTP 404") => {
+                bail!(signature::ImageSignatureRejection {
+                    phrase: signature::UNSIGNED_IMAGE,
+                });
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn verify_manifest(
+        &self,
+        component: &str,
+        repo: &str,
+        manifest_digest: &str,
+        manifest_bytes: &[u8],
+    ) -> Result<()> {
+        let signature = self.signature_body(repo, manifest_digest).await?;
+        let now = Utc::now();
+        if serde_json::from_slice::<serde_json::Value>(&signature)
+            .ok()
+            .is_some_and(|value| {
+                value.get("payloadType").is_some() && value.get("payload").is_some()
+            })
+        {
+            return signature::verify_manifest_signature(
+                component,
+                manifest_digest,
+                manifest_bytes,
+                &signature,
+                now,
+            );
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&signature).map_err(|_| signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            })?;
+        ensure!(
+            manifest.schema_version == 2 && !manifest.layers.is_empty(),
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
+        );
+        let mut last = None;
+        let mut tried = 0usize;
+        for layer in manifest.layers.iter().rev() {
+            if tried >= MAX_SIGNATURE_LAYERS {
+                break;
+            }
+            let Some(signature_b64) = layer
+                .annotations
+                .get("dev.cosignproject.cosign/signature")
+                .map(String::as_str)
+            else {
+                continue;
+            };
+            tried += 1;
+            let payload = self.blob(repo, layer, MAX_MANIFEST).await?;
+            let envelope = match signature::envelope_from_cosign_payload(&payload, signature_b64) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    last = Some(error);
+                    continue;
+                }
+            };
+            match signature::verify_manifest_signature(
+                component,
+                manifest_digest,
+                manifest_bytes,
+                &envelope,
+                now,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            signature::ImageSignatureRejection {
+                phrase: signature::BAD_IMAGE_SIGNATURE,
+            }
+            .into()
+        }))
+    }
+
+    async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {
         ensure!(
             !reference.contains('/') && !reference.contains('?') && !reference.contains('#'),
             "invalid image reference"
@@ -203,7 +300,7 @@ impl Registry {
                 "invalid image layer descriptor"
             );
         }
-        Ok((parsed, digest))
+        Ok((parsed, digest, bytes))
     }
 
     async fn blob(&self, repo: &str, descriptor: &Descriptor, limit: usize) -> Result<Vec<u8>> {
@@ -268,7 +365,9 @@ impl Registry {
             "invalid channel"
         );
         let repo = repository(component)?;
-        let (manifest, image_digest) = self.manifest(repo, reference).await?;
+        let (manifest, image_digest, manifest_bytes) = self.manifest(repo, reference).await?;
+        self.verify_manifest(component, repo, &image_digest, &manifest_bytes)
+            .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config.architecture == "amd64" && config.os == "linux",
@@ -356,7 +455,10 @@ impl Registry {
             !requested.is_empty() && requested.len() <= 16,
             "invalid file request"
         );
-        let (manifest, _) = self.manifest(repo, &release.digest).await?;
+        let (manifest, digest, manifest_bytes) = self.manifest(repo, &release.digest).await?;
+        ensure!(digest == release.digest, "manifest digest mismatch");
+        self.verify_manifest(&release.component, repo, &digest, &manifest_bytes)
+            .await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config
