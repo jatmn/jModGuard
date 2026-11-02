@@ -578,9 +578,9 @@ async fn watch_child_health_from(
 /// New installs refuse an expired signature. Re-downloading an already
 /// installed release does not: that image was verified when it was staged.
 #[derive(Clone, Copy)]
-enum StageTrust {
+enum StageTrust<'a> {
     NewInstall,
-    InstalledRelease,
+    InstalledRelease(&'a UpdateControl),
 }
 
 async fn stage(
@@ -588,15 +588,15 @@ async fn stage(
     release: &ComponentRelease,
     name: &str,
     dir: &Path,
-    trust: StageTrust,
+    trust: StageTrust<'_>,
 ) -> Result<PathBuf> {
     let path = format!("usr/local/bin/{name}");
     let requested = [&path, "usr/local/share/jmodguard/files.sha256"];
     let files = match trust {
         StageTrust::NewInstall => registry.files(release, &requested).await?,
-        StageTrust::InstalledRelease => {
+        StageTrust::InstalledRelease(control) => {
             registry
-                .files_for_installed_restore(release, &requested)
+                .files_for_installed_restore(control, release, &requested)
                 .await?
         }
     };
@@ -941,7 +941,7 @@ impl Supervisor {
                 &release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
-                StageTrust::InstalledRelease,
+                StageTrust::InstalledRelease(&self.control),
             )
             .await
             {
@@ -2012,7 +2012,7 @@ impl Supervisor {
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
-                StageTrust::InstalledRelease,
+                StageTrust::InstalledRelease(&self.control),
             )
             .await
             {
@@ -2089,12 +2089,18 @@ impl Supervisor {
         }) {
             bail!("{}", db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
         }
+        let state = self.control.component(&self.role).await?;
+        let trust = if state.installed_launcher.as_ref() == Some(release) {
+            StageTrust::InstalledRelease(&self.control)
+        } else {
+            StageTrust::NewInstall
+        };
         let path = stage(
             &self.registry,
             release,
             "jmodguard-launcher",
             &self.staging,
-            StageTrust::NewInstall,
+            trust,
         )
         .await?;
         let hash = sha256_hex(&tokio::fs::read(&path).await?);
