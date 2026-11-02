@@ -108,7 +108,31 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
-The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Signature verification applies only once a revision-19 launcher is already running. A revision-18 launcher has no verifier and is not offered that hop, so it cannot stage the image. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. Boot repair still checks the signature of an already-installed release, and it still starts that release after `io.jmodguard.not-after`.
+The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Signature verification applies only once a revision-19 launcher is already running. A revision-18 launcher has no verifier and is not offered that hop, so it cannot stage the image. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`.
+
+### Expiry-safe cold-boot rollout
+
+Roll both bot and API base images to builds with baked launcher revision 21 or newer
+before relying on expiry-safe application recovery after a container restart. Check
+each selected image's `io.jmodguard.launcher-revision` label, then follow the
+stop/start and readiness sequence under [Rollout after the PR](#rollout-after-the-pr).
+The repair shipped in revision 21; revision 20 added registry-outage fallback but
+does not provide this expired-signature repair.
+
+An optional runtime launcher update from revision 19 is insufficient: every
+container start runs the launcher baked into the selected base image first.
+With an old base, that controller can refuse an expired installed-launcher image
+before the newer repair code runs. If the installed application's signature has
+also expired, the old controller refuses that restore too, leaving the service
+stopped even if the newer launcher ran successfully before the restart.
+Replacing the base images puts the repair code in that initial controller;
+restarting the old images or changing only the new launcher's handoff policy
+cannot update an already-deployed revision-19 executable.
+
+This is a base-image rollout prerequisite. The application minimum remains 7,
+and the signature-verifier threshold remains 19; neither establishes that the
+baked launcher supports expiry-safe cold boot. New installs and launcher handoffs
+continue to enforce signature expiry.
 
 ## Schema upgrades and recovery
 
