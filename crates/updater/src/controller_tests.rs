@@ -8265,30 +8265,24 @@ async fn revision_nineteen_handoff_refuses_unsigned_and_wrong_signatures() {
     }
 }
 
-fn installed_state(release: ComponentRelease) -> db::ComponentUpdate {
-    db::ComponentUpdate {
-        component: release.component.clone(),
-        channel: "latest".into(),
-        cadence: "off".into(),
-        candidate: None,
-        checked_at: None,
-        check_error: None,
-        desired: None,
-        desired_launcher: None,
-        installed: Some(release),
-        installed_launcher: None,
-        launcher_sha256: None,
-        launcher_installed_at: None,
-        previous: None,
-        observed: None,
-        observed_at: None,
-        installed_at: Some(1),
-        state: "idle".into(),
-        last_error: None,
-    }
+async fn installed_state(db: &Db, release: ComponentRelease) -> db::ComponentUpdate {
+    let role = release.component.clone();
+    let stored = serde_json::to_string(&release).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed=?1,installed_at=1 WHERE component=?2",
+            params![stored, release.component],
+            128 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db::component_update(db, &role).await.unwrap()
 }
 
 async fn boot_repair_refuses(
+    db: &Db,
     control: &UpdateControl,
     root: &Path,
     mut release: ComponentRelease,
@@ -8313,7 +8307,7 @@ async fn boot_repair_refuses(
     });
     let mut service = controller("bot", root.join("baked"), registry, control.clone(), root);
     let error = service
-        .restore(&installed_state(release))
+        .restore(&installed_state(db, release).await)
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), phrase, "{error:?}");
@@ -8334,7 +8328,7 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
         let mut objects = HashMap::new();
         let release = image(&mut objects, "bot", b"\x7fELFboot");
         test_signing().damage(&mut objects, "bot", &release.digest, bad);
-        boot_repair_refuses(&control, &root, release, objects, bad.phrase()).await;
+        boot_repair_refuses(&db, &control, &root, release, objects, bad.phrase()).await;
     }
     assert!(
         db::read_boot_mismatch_map(&db).await.unwrap().is_empty(),
@@ -8344,12 +8338,77 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
 }
 
 #[tokio::test]
+async fn expired_installed_launcher_handoff_restores_only_the_recorded_release() {
+    let root =
+        std::env::temp_dir().join(format!("launcher-expired-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let baked = executable(&root, "baked").await;
+    for role in ["bot", "api"] {
+        let mut objects = HashMap::new();
+        let release = image(&mut objects, role, b"\x7fELFlauncher");
+        expire_signature(&mut objects, role, &release.digest);
+        let (registry, server) = serve_objects(objects).await;
+        let mut service = controller(role, baked.clone(), registry, control.clone(), &root);
+        service.launcher_revision = db::VERIFIER_LAUNCHER_REVISION;
+        let mut state = control.component(role).await.unwrap();
+        state.desired_launcher = Some(release.clone());
+        let error = service
+            .launcher(&state)
+            .await
+            .err()
+            .expect("new launcher install must enforce expiry");
+        assert_eq!(
+            error.to_string(),
+            jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE
+        );
+        assert_nothing_staged(&root, &service.staging);
+        let stored = serde_json::to_string(&release).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE component_updates SET installed_launcher=?1 WHERE component=?2",
+                params![stored, role],
+                128 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let state = control.component(role).await.unwrap();
+        assert!(matches!(
+            service
+                .launcher(&state)
+                .await
+                .expect("installed launcher must restore after expiry"),
+            ControlStep::Reexec
+        ));
+        let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+            .await
+            .unwrap();
+        assert_eq!(handoff.lines().nth(2), Some(release.digest.as_str()));
+        assert_eq!(
+            tokio::fs::read(handoff.lines().next().unwrap())
+                .await
+                .unwrap(),
+            b"\x7fELFlauncher"
+        );
+        tokio::fs::remove_file(root.join("jmodguard-launcher-next"))
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(&service.staging).await.unwrap();
+        server.abort();
+    }
+    drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
 async fn expired_signature_blocks_a_fresh_stage_and_still_boot_repairs() {
     let root = std::env::temp_dir().join(format!("sig-expired-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let binary = executable(&root, "expired-bot").await;
     let bytes = tokio::fs::read(&binary).await.unwrap();
-    let (_db, control) = open_launcher_db(&root).await;
+    let (db, control) = open_launcher_db(&root).await;
     let mut objects = HashMap::new();
     let mut release = image(&mut objects, "bot", &bytes);
     expire_signature(&mut objects, "bot", &release.digest);
@@ -8377,8 +8436,14 @@ async fn expired_signature_blocks_a_fresh_stage_and_still_boot_repairs() {
         Some(jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE)
     );
     assert_nothing_staged(&root, &service.staging);
+    let uninstalled = service
+        .registry
+        .files_for_installed_restore(&service.control, &release, &["usr/local/bin/jmodguard-bot"])
+        .await
+        .unwrap_err();
+    assert_eq!(uninstalled.to_string(), "release is not installed");
     service
-        .restore(&installed_state(release))
+        .restore(&installed_state(&db, release).await)
         .await
         .expect("installed release past not-after must boot-repair");
     assert!(service.running.is_some());
@@ -8428,13 +8493,14 @@ async fn refused_registry() -> (String, tokio::net::TcpSocket) {
 
 async fn restore_installed(
     role: &str,
-    control: &UpdateControl,
+    db: &Db,
     root: &Path,
     baked: &Path,
     base: &str,
     schema: i64,
     baked_guild: Option<i64>,
 ) -> (Result<(), String>, Option<PathBuf>, Vec<String>) {
+    let control = UpdateControl::from_application(db);
     let registry = Registry::new(base).unwrap();
     let mut service = controller(role, baked.to_path_buf(), registry, control.clone(), root);
     if let Some(guild) = baked_guild {
@@ -8443,7 +8509,7 @@ async fn restore_installed(
     let mut release = release_at(role, 'c', schema);
     release.min_schema = schema;
     release.max_schema = schema;
-    let mut state = installed_state(release);
+    let mut state = installed_state(db, release).await;
     // Record the compiled guild schema. A case can point the baked image at a
     // different guild schema and must then be refused.
     state.observed = Some(fresh_observation(1));
@@ -8475,7 +8541,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
 
     let (refused, reserved) = refused_registry().await;
     let (error, started, logs) =
-        restore_installed("bot", &control, &root, &baked, &refused, current, None).await;
+        restore_installed("bot", &db, &root, &baked, &refused, current, None).await;
     assert!(error.is_ok(), "{error:?}");
     assert_eq!(started.as_deref(), Some(baked.as_path()));
     assert!(
@@ -8486,7 +8552,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     for status in [408u16, 429, 500, 502, 503, 504, 599] {
         let (base, server) = status_registry(status).await;
         let (error, started, logs) =
-            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+            restore_installed("bot", &db, &root, &baked, &base, current, None).await;
         server.abort();
         assert!(error.is_ok(), "HTTP {status}: {error:?}");
         assert_eq!(started.as_deref(), Some(baked.as_path()), "HTTP {status}");
@@ -8499,7 +8565,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     for status in [400u16, 401, 403, 404] {
         let (base, server) = status_registry(status).await;
         let (error, started, logs) =
-            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+            restore_installed("bot", &db, &root, &baked, &base, current, None).await;
         server.abort();
         let error = error.expect_err("a permanent response must refuse fallback");
         assert!(
@@ -8514,7 +8580,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     }
 
     let (error, started, logs) =
-        restore_installed("api", &control, &root, &baked, &refused, current, None).await;
+        restore_installed("api", &db, &root, &baked, &refused, current, None).await;
     assert!(error.is_ok(), "{error:?}");
     assert_eq!(started.as_deref(), Some(baked.as_path()));
     assert!(logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
@@ -8527,7 +8593,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     .unwrap();
     let older = control.schema_version().await.unwrap();
     let (error, started, logs) =
-        restore_installed("api", &control, &root, &baked, &refused, older, None).await;
+        restore_installed("api", &db, &root, &baked, &refused, older, None).await;
     let error = error.expect_err("an older database is outside the API built-in schema");
     assert!(
         error.contains("baked application cannot open database; use owner recovery"),
@@ -8544,7 +8610,7 @@ async fn cold_start_starts_built_in_binary_when_registry_is_unreachable() {
     .unwrap();
     let newer = control.schema_version().await.unwrap();
     let (error, started, _) =
-        restore_installed("bot", &control, &root, &baked, &refused, newer, None).await;
+        restore_installed("bot", &db, &root, &baked, &refused, newer, None).await;
     let error = error.expect_err("a newer database is outside the built-in schema range");
     assert!(
         error.contains("baked application cannot open database; use owner recovery"),
@@ -8589,7 +8655,7 @@ async fn cold_start_refuses_truncated_registry_body() {
             }
         });
         let (result, started, logs) =
-            restore_installed("bot", &control, &root, &baked, &base, current, None).await;
+            restore_installed("bot", &db, &root, &baked, &base, current, None).await;
         server.await.unwrap();
         assert!(started.is_none(), "reset={reset}: {started:?}");
         let error = result.expect_err("a truncated manifest must refuse fallback");
@@ -8618,7 +8684,7 @@ async fn cold_start_starts_built_in_binary_when_registry_request_times_out() {
     });
     let restored = tokio::time::timeout(
         Duration::from_secs(40),
-        restore_installed("bot", &control, &root, &baked, &base, current, None),
+        restore_installed("bot", &db, &root, &baked, &base, current, None),
     )
     .await;
     server.abort();
@@ -8651,7 +8717,7 @@ async fn cold_start_outage_refuses_a_baked_bot_schema_change() {
     let (refused, reserved) = refused_registry().await;
 
     let (error, started, logs) =
-        restore_installed("bot", &control, &root, &baked, &refused, live, None).await;
+        restore_installed("bot", &db, &root, &baked, &refused, live, None).await;
     assert!(error.is_ok(), "{error:?}");
     assert_eq!(started.as_deref(), Some(baked.as_path()));
     assert!(
@@ -8663,7 +8729,7 @@ async fn cold_start_outage_refuses_a_baked_bot_schema_change() {
 
     set_core_schema(&db, live - 1).await;
     let (error, started, logs) =
-        restore_installed("bot", &control, &root, &baked, &refused, live - 1, None).await;
+        restore_installed("bot", &db, &root, &baked, &refused, live - 1, None).await;
     let error = error.expect_err("a newer baked bot must not migrate during an outage");
     assert!(
         error.contains("baked application cannot open database; use owner recovery"),
@@ -8679,7 +8745,7 @@ async fn cold_start_outage_refuses_a_baked_bot_schema_change() {
 
     set_core_schema(&db, live + 1).await;
     let (error, started, logs) =
-        restore_installed("bot", &control, &root, &baked, &refused, live + 1, None).await;
+        restore_installed("bot", &db, &root, &baked, &refused, live + 1, None).await;
     let error = error.expect_err("an older baked bot cannot open a newer database");
     assert!(
         error.contains("baked application cannot open database; use owner recovery"),
@@ -8709,16 +8775,8 @@ async fn cold_start_outage_requires_matching_guild_schema() {
     let recorded = db::guild_data::SCHEMA_VERSION;
 
     for baked_guild in [recorded + 1, recorded - 1] {
-        let (error, started, logs) = restore_installed(
-            "bot",
-            &control,
-            &root,
-            &baked,
-            &refused,
-            live,
-            Some(baked_guild),
-        )
-        .await;
+        let (error, started, logs) =
+            restore_installed("bot", &db, &root, &baked, &refused, live, Some(baked_guild)).await;
         let error = error.expect_err("a guild schema mismatch must not start");
         assert!(
             error.contains(db::APP_ONLY_SCHEMA_CHANGE_REFUSED),
@@ -8733,16 +8791,8 @@ async fn cold_start_outage_requires_matching_guild_schema() {
         assert!(control.upgrade().await.unwrap().is_none());
     }
 
-    let (error, started, logs) = restore_installed(
-        "bot",
-        &control,
-        &root,
-        &baked,
-        &refused,
-        live,
-        Some(recorded),
-    )
-    .await;
+    let (error, started, logs) =
+        restore_installed("bot", &db, &root, &baked, &refused, live, Some(recorded)).await;
     assert!(error.is_ok(), "{error:?}");
     assert_eq!(started.as_deref(), Some(baked.as_path()));
     assert!(

@@ -401,30 +401,38 @@ pub async fn request_launcher_install(
                 .is_none_or(|release| release.digest != digest),
             "launcher release is already installed"
         );
-        let observed: Option<String> = tx.query_row(
-            "SELECT observed FROM component_updates WHERE component=?1",
+        let (observed, observed_at, queued): (Option<String>, Option<i64>, Option<String>) = tx.query_row(
+            "SELECT observed,observed_at,desired_launcher FROM component_updates WHERE component=?1",
             params![component.clone()],
-            |row| Ok(row.get(0)?),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        // A missing or unreadable observation cannot prove a verifier is
-        // already running. Refuse a verifier-era target before recording it.
-        let candidate_revision = candidate.launcher.as_ref().map(|contract| contract.revision);
-        let needs_verifier_hop = candidate_revision.is_some_and(|revision| {
-            revision >= crate::db::VERIFIER_LAUNCHER_REVISION
+        let needs_verifier_hop = candidate.launcher.as_ref().is_some_and(|contract| {
+            contract.revision >= crate::db::VERIFIER_LAUNCHER_REVISION
         });
         let running = match parse_observation(observed) {
-            Ok(seen) => seen.map(|seen| seen.launcher_revision),
-            Err(_) if needs_verifier_hop => {
-                anyhow::bail!("{}", crate::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
-            }
+            Ok(seen) => seen
+                .filter(|_| !release_check_is_stale(observed_at, now))
+                .map(|seen| seen.launcher_revision),
+            Err(_) if needs_verifier_hop => None,
             Err(error) => return Err(error),
         };
-        if let Some(revision) = candidate_revision
-            && needs_verifier_hop
-            && running.is_none_or(|running| {
-                crate::db::pre_verifier_launcher_hop(running, revision)
-            })
+        if needs_verifier_hop
+            && running.is_none_or(|running| running < crate::db::VERIFIER_LAUNCHER_REVISION)
         {
+            // Commit the invalidation even though this request is refused. An
+            // already-running pre-verifier launcher can still consume the queue.
+            if parse_release(queued)?.is_some_and(|release| {
+                release.launcher.is_some_and(|contract| {
+                    contract.revision >= crate::db::VERIFIER_LAUNCHER_REVISION
+                })
+            }) {
+                tx.execute_rows(
+                    "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1",
+                    params![component],
+                    1,
+                )?;
+            }
+            tx.commit()?;
             anyhow::bail!("{}", crate::db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
         }
         tx.execute_rows(
@@ -2122,6 +2130,55 @@ mod tests {
         request_launcher_install(&db, "api", &release.digest, 103)
             .await
             .expect("a revision-19 launcher can select a newer launcher");
+        assert!(desired_launcher_set(&db).await);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_verifier_hop_clears_queued_selection_with_unknown_or_old_observation() {
+        let path = std::env::temp_dir().join(format!(
+            "launcher-refusal-{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let release = candidate('a');
+        record_update_check(
+            &db,
+            "api",
+            &release.channel,
+            Some(release.clone()),
+            None,
+            8000,
+        )
+        .await
+        .unwrap();
+        let fresh = serde_json::to_string(&verifier_observation()).unwrap();
+        let mut old = verifier_observation();
+        old.launcher_revision = crate::db::VERIFIER_LAUNCHER_REVISION - 1;
+        for (observed, observed_at) in [
+            (None, Some(8000)),
+            (Some("{".to_owned()), Some(8000)),
+            (Some(serde_json::to_string(&old).unwrap()), Some(8000)),
+            (Some(fresh.clone()), None),
+            (Some(fresh.clone()), Some(800)),
+            (Some(fresh.clone()), Some(799)),
+            (Some(fresh.clone()), Some(8001)),
+        ] {
+            // A different queued digest must also be invalidated by the refusal.
+            let queued = serde_json::to_string(&candidate('b')).unwrap();
+            db.with_conn(move |conn| {
+                conn.execute_rows("UPDATE component_updates SET observed=?1,observed_at=?2,desired_launcher=?3 WHERE component='api'", params![observed, observed_at, queued], 1)?;
+                Ok(())
+            }).await.unwrap();
+            assert_hop_refused(&db, &release.digest, 8000).await;
+        }
+        observe_verifier(&db, "api", 801).await;
+        request_launcher_install(&db, "api", &release.digest, 8000)
+            .await
+            .expect("7199-second-old observation remains fresh");
         assert!(desired_launcher_set(&db).await);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {

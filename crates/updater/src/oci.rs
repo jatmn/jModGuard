@@ -511,12 +511,20 @@ impl Registry {
     }
 
     /// Re-read an already-installed release. The signature must still verify.
-    /// `io.jmodguard.not-after` does not block this download.
+    /// `io.jmodguard.not-after` does not block this download. The durable
+    /// installation record must match before expiry can be bypassed.
     pub async fn files_for_installed_restore(
         &self,
+        control: &jmodguard::db::UpdateControl,
         release: &ComponentRelease,
         requested: &[&str],
     ) -> Result<HashMap<String, Vec<u8>>> {
+        let state = control.component(&release.component).await?;
+        ensure!(
+            state.installed.as_ref() == Some(release)
+                || state.installed_launcher.as_ref() == Some(release),
+            "release is not installed"
+        );
         self.files_with(release, requested, signature::SignatureExpiry::AllowExpired)
             .await
     }
