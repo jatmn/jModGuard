@@ -185,6 +185,13 @@ function ComponentCard({ record, revision }) {
   const [cadence, setCadence] = useState(record.cadence);
   useEffect(() => { setChannel(record.channel); setCadence(record.cadence); }, [record.channel, record.cadence, revision]);
   const content = [], details = [], heading = [];
+  const mismatch = ui.getSnapshot().snapshot.boot_mismatches?.[record.component];
+  if (mismatch) {
+    heading.push(badge("Boot mismatch", "warn", "!"));
+    line(content, "Startup problem", mismatch.reason);
+    line(content, "Expected release", `${mismatch.expected.release_id} · ${mismatch.expected.source_sha}`);
+    line(content, "Startup executable", mismatch.running || "Application stopped");
+  }
   const fresh = record.observed_at && Date.now() / 1000 - record.observed_at < 7200 && record.state !== "drift";
   const observed = fresh ? record.observed : null;
   line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? ui.getSnapshot().snapshot.base_image_sha : "unknown"));

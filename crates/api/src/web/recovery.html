@@ -20,6 +20,7 @@ let snapshot=null, selection=null, busy=false;
 async function request(path,body){const response=await fetch(path,{method:body?'POST':'GET',credentials:'same-origin',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}); const data=await response.json();if(!response.ok)throw Error(data.error||'Request failed');return data;}
 function render(){const op=snapshot?.operation, active=op&&!['complete','aborted'].includes(op.phase), stopped=op?.bot.stopped&&op?.api.stopped;
 $('status').textContent=op?`Upgrade ${op.id}\nPhase: ${op.phase}\n${op.error||''}\nBot: ${op.bot.release.source_sha}\nAPI: ${op.api.release.source_sha}`:'No coordinated upgrade is running.';
+for(const mismatch of Object.values(snapshot?.boot_mismatches||{}))$('status').textContent+=`\nBoot mismatch (${mismatch.component}): ${mismatch.reason}\nExpected release: ${mismatch.expected.release_id} · ${mismatch.expected.source_sha}\nStartup executable: ${mismatch.running||'Application stopped'}`;
 $('apply').disabled=busy||!snapshot?.apply_enabled||!selection||(active&&!(op.error&&stopped));
 $('retry').disabled=busy||!snapshot?.apply_enabled||!active||!op.error||!stopped;
 $('cancel').disabled=busy||!active||op.irreversible;

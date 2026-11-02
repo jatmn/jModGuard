@@ -15,8 +15,12 @@ pub mod oci;
 pub mod signature;
 #[cfg(test)]
 pub mod signing_fixture;
+#[cfg(not(test))]
+use jmodguard_updater::signature::signature_rejection_phrase;
 #[cfg(test)]
 use oci::{Registry, registry_unreachable, sha256_hex};
+#[cfg(test)]
+use signature::signature_rejection_phrase;
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -721,11 +725,12 @@ enum StartupReceipt {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum PendingBootMismatch {
     Record {
         release: Box<ComponentRelease>,
         reason: String,
+        running: String,
     },
     Clear,
 }
@@ -1072,7 +1077,7 @@ impl Supervisor {
     fn pending_record_blocks_clear(&self) -> bool {
         self.pending_boot_mismatch
             .iter()
-            .any(|pending| matches!(pending, PendingBootMismatch::Record { .. }))
+            .any(|pending| matches!(pending, PendingBootMismatch::Record { running, .. } if !running.is_empty()))
             && !self.baked_child_running()
     }
 
@@ -1109,15 +1114,25 @@ impl Supervisor {
         self.baked_fallback_installed.clone()
     }
 
-    fn queue_pending_boot_record(&mut self, release: ComponentRelease, reason: String) {
+    fn queue_pending_boot_record(
+        &mut self,
+        release: ComponentRelease,
+        reason: String,
+        running: String,
+    ) {
+        // A new failure supersedes a recovery clear from an earlier start.
+        self.pending_boot_mismatch
+            .retain(|pending| !matches!(pending, PendingBootMismatch::Clear));
         for pending in &mut self.pending_boot_mismatch {
             if let PendingBootMismatch::Record {
                 release: existing,
                 reason: existing_reason,
+                running: existing_running,
             } = pending
             {
                 **existing = release;
                 *existing_reason = reason;
+                *existing_running = running;
                 self.keep_record_ahead_of_clear();
                 return;
             }
@@ -1125,6 +1140,7 @@ impl Supervisor {
         let record = PendingBootMismatch::Record {
             release: Box::new(release),
             reason,
+            running,
         };
         if let Some(index) = self
             .pending_boot_mismatch
@@ -1178,19 +1194,25 @@ impl Supervisor {
             .iter()
             .position(|pending| match pending {
                 PendingBootMismatch::Clear => !record_blocked,
-                PendingBootMismatch::Record { .. } => self.baked_child_running(),
+                PendingBootMismatch::Record { running, .. } => {
+                    running.is_empty() || self.baked_child_running()
+                }
             });
         let Some(index) = index else {
             return Ok(());
         };
         let pending = self.pending_boot_mismatch.remove(index).unwrap();
         match pending {
-            PendingBootMismatch::Record { release, reason } => {
+            PendingBootMismatch::Record {
+                release,
+                reason,
+                running,
+            } => {
                 match self
                     .control
                     .record_boot_mismatch(db::BootMismatchRecord {
                         component: self.role.clone(),
-                        running: self.base_sha.clone(),
+                        running: running.clone(),
                         expected: db::BootMismatchExpected {
                             release_id: release.release_id.clone(),
                             source_sha: release.source_sha.clone(),
@@ -1202,7 +1224,7 @@ impl Supervisor {
                     Ok(()) => self.reset_boot_receipt_backoff(),
                     Err(error) if Self::receipt_not_saved(&error) => {
                         tracing::warn!("boot mismatch receipt was not saved: {error:#}");
-                        self.queue_pending_boot_record((*release).clone(), reason);
+                        self.queue_pending_boot_record((*release).clone(), reason, running);
                         self.note_boot_receipt_delay();
                     }
                     Err(error) => return Err(error),
@@ -1904,12 +1926,13 @@ impl Supervisor {
         &mut self,
         release: &ComponentRelease,
         reason: &str,
+        running: String,
     ) -> Result<()> {
         match self
             .control
             .record_boot_mismatch(db::BootMismatchRecord {
                 component: self.role.clone(),
-                running: self.base_sha.clone(),
+                running: running.clone(),
                 expected: db::BootMismatchExpected {
                     release_id: release.release_id.clone(),
                     source_sha: release.source_sha.clone(),
@@ -1918,10 +1941,13 @@ impl Supervisor {
             })
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.clear_pending_boot_mismatch();
+                Ok(())
+            }
             Err(error) if Self::receipt_not_saved(&error) => {
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
-                self.queue_pending_boot_record(release.clone(), reason.to_owned());
+                self.queue_pending_boot_record(release.clone(), reason.to_owned(), running);
                 self.note_boot_receipt_delay();
                 Ok(())
             }
@@ -1930,6 +1956,8 @@ impl Supervisor {
     }
 
     async fn clear_boot_mismatch_when_saved(&mut self) -> Result<()> {
+        // Recovery is a new diagnostic state; do not inherit a failed Record's delay.
+        self.reset_boot_receipt_backoff();
         match self.control.clear_boot_mismatch(&self.role).await {
             Ok(()) => {
                 self.clear_pending_boot_mismatch();
@@ -1960,8 +1988,12 @@ impl Supervisor {
             db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
         self.baked_fallback_installed = Some(release.clone());
-        self.record_boot_mismatch_for_installed(release, REGISTRY_OUTAGE_BOOT_MISMATCH)
-            .await?;
+        self.record_boot_mismatch_for_installed(
+            release,
+            REGISTRY_OUTAGE_BOOT_MISMATCH,
+            self.base_sha.clone(),
+        )
+        .await?;
         Ok((self.baked.clone(), self.base_sha.clone(), None))
     }
 
@@ -2058,6 +2090,34 @@ impl Supervisor {
         Ok(())
     }
 
+    fn boot_mismatch_handoff_path(&self) -> PathBuf {
+        self.staging
+            .join(format!("{}-boot-mismatch.json", self.role))
+    }
+
+    async fn save_boot_mismatch_handoff(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.staging).await?;
+        let path = self.boot_mismatch_handoff_path();
+        let temporary = path.with_extension("tmp");
+        tokio::fs::write(&temporary, serde_json::to_vec(&self.pending_boot_mismatch)?).await?;
+        tokio::fs::rename(temporary, path).await?;
+        Ok(())
+    }
+
+    async fn load_boot_mismatch_handoff(&mut self) -> Result<()> {
+        let path = self.boot_mismatch_handoff_path();
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                self.pending_boot_mismatch = serde_json::from_slice(&bytes)?;
+                self.reset_boot_receipt_backoff();
+                tokio::fs::remove_file(path).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     async fn handoff(
         &mut self,
         release: &ComponentRelease,
@@ -2125,6 +2185,7 @@ impl Supervisor {
             .parent()
             .context("missing staging parent")?
             .join("jmodguard-launcher-next");
+        self.save_boot_mismatch_handoff().await?;
         tokio::fs::write(
             control_file,
             format!("{}\n{}\n{}\n", path.display(), hash, release.digest),
@@ -2317,6 +2378,18 @@ impl Supervisor {
                 Ok(ControlStep::Defer) => return Ok(false),
                 Ok(ControlStep::Proceed) => {}
                 Err(error) => {
+                    let signature_rejection = signature_rejection_phrase(&error);
+                    let registry_failure = error.chain().any(|cause| cause.is::<reqwest::Error>())
+                        || error.to_string().starts_with("registry returned HTTP ");
+                    if self.running.is_none()
+                        && self.rollback.is_none()
+                        && (signature_rejection.is_some() || registry_failure)
+                        && let Some(installed) = &state.installed
+                    {
+                        let reason = signature_rejection.unwrap_or("registry download failed");
+                        self.record_boot_mismatch_for_installed(installed, reason, String::new())
+                            .await?;
+                    }
                     if let Some(op) = self.control.upgrade().await?.filter(|op| {
                         self.rollback.is_none()
                             && op.phase == Phase::Complete
@@ -3147,6 +3220,7 @@ async fn main() -> Result<()> {
         reported: false,
         last_observed: None,
     };
+    supervisor.load_boot_mismatch_handoff().await?;
     loop {
         tokio::select! {
             _ = jmodguard::shutdown_signal() => break,

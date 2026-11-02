@@ -923,3 +923,25 @@ test("failed aggregate retains the last successful detail with a stale warning",
   assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
   assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
 });
+
+
+test("boot mismatch shows expected and actual startup independently of installed state", () => {
+  const view = page();
+  render(view, record());
+  run(`ui.getSnapshot().snapshot.boot_mismatches = { api: {
+    component: "api", running: "", expected: { release_id: "retained-release", source_sha: "expected-sha" },
+    reason: "image signature rejected"
+  } }; ui.set({ ...ui.getSnapshot() });`, view.context);
+  let text = textOf(view.elements.get("update-cards"));
+  assert.match(text, /Boot mismatch/);
+  assert.match(text, /retained-release/);
+  assert.match(text, /expected-sha/);
+  assert.match(text, /Application stopped/);
+  assert.match(text, /image signature rejected/);
+  run(`ui.getSnapshot().snapshot.boot_mismatches.api.running = "baked-sha"; ui.set({ ...ui.getSnapshot() });`, view.context);
+  text = textOf(view.elements.get("update-cards"));
+  assert.match(text, /baked-sha/);
+  assert.doesNotMatch(text, /Application stopped/);
+  run(`ui.getSnapshot().snapshot.boot_mismatches = {}; ui.set({ ...ui.getSnapshot() });`, view.context);
+  assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Boot mismatch/);
+});
