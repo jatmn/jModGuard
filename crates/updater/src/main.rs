@@ -2042,14 +2042,17 @@ impl Supervisor {
             "launcher component mismatch"
         );
         jmodguard_updater::launcher_compatible(release, &self.base_abi)?;
-        // Optional hop only. A revision below the verifier has no signature
-        // check, so it must not download the image. Required handoffs for the
-        // minimum of 7 stay on their existing path.
-        if !required
-            && release.launcher.as_ref().is_some_and(|contract| {
-                db::pre_verifier_launcher_hop(self.launcher_revision, contract.revision)
-            })
-        {
+        // Apply refusal to required handoffs once their minimum requires a verifier.
+        if release.launcher.as_ref().is_some_and(|contract| {
+            db::pre_verifier_launcher_hop(
+                self.launcher_revision,
+                if required {
+                    contract.min_revision
+                } else {
+                    contract.revision
+                },
+            )
+        }) {
             bail!("{}", db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
         }
         let path = stage(
