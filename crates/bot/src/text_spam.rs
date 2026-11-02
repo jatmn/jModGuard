@@ -1430,7 +1430,7 @@ mod tests {
         let task = tokio::spawn(async move {
             spam_actions::enforce(
                 &app_enforce,
-                &http,
+                std::sync::Arc::new(http),
                 &cache,
                 found,
                 "repeat_text",
