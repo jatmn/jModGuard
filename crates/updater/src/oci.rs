@@ -34,6 +34,41 @@ fn valid_digest(value: &str) -> bool {
         && value[7..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A cold-start download failed before any image bytes were accepted.
+/// Connection failure, HTTP 503, and HTTP 429 are unreachable. Signature
+/// refusals and every other registry response stay permanent failures.
+pub fn registry_unreachable(error: &anyhow::Error) -> bool {
+    if signature::signature_rejection_phrase(error).is_some() {
+        return false;
+    }
+    if error.chain().any(|cause| {
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_connect()
+                || request
+                    .status()
+                    .is_some_and(|status| matches!(status.as_u16(), 429 | 503))
+            {
+                return true;
+            }
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+            )
+        })
+    }) {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains("registry returned HTTP 503") || message.contains("registry returned HTTP 429")
+}
+
 fn repository(component: &str) -> Result<&'static str> {
     match component {
         "bot" => Ok("jatmn/jmodguard-bot"),
@@ -567,6 +602,20 @@ mod tests {
         let diagnostic = format!("{error:#} {error:?}");
         assert!(!diagnostic.contains("PRIVATE_"));
         assert!(!diagnostic.contains(&format!("http://{addr}")));
+        assert!(
+            super::registry_unreachable(&error),
+            "connection failure must be unreachable: {error:#} {error:?}"
+        );
+        let unavailable = anyhow::Error::msg("registry returned HTTP 503 Service Unavailable");
+        let limited = anyhow::Error::msg("registry returned HTTP 429 Too Many Requests");
+        let server = anyhow::Error::msg("registry returned HTTP 500 Internal Server Error");
+        let unsigned = anyhow::Error::new(signature::ImageSignatureRejection {
+            phrase: signature::UNSIGNED_IMAGE,
+        });
+        assert!(super::registry_unreachable(&unavailable));
+        assert!(super::registry_unreachable(&limited));
+        assert!(!super::registry_unreachable(&server));
+        assert!(!super::registry_unreachable(&unsigned));
     }
 
     use super::*;

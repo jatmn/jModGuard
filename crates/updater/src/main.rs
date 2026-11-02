@@ -6,7 +6,7 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 #[cfg(test)]
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
-use jmodguard_updater::oci::{Registry, sha256_hex};
+use jmodguard_updater::oci::{Registry, registry_unreachable, sha256_hex};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1566,6 +1566,25 @@ impl Supervisor {
         Ok(false)
     }
 
+    /// Core schema this container's built-in binary can open. The bot's
+    /// published migration origin is 15 through its compiled schema. The API
+    /// opens only that exact schema.
+    fn baked_core_fits(&self, schema: i64) -> bool {
+        schema == self.baked_compatibility.core
+            || (self.role == "bot" && (15..=self.baked_compatibility.core).contains(&schema))
+    }
+
+    async fn start_baked_after_registry_outage(&mut self, schema: i64) -> Result<()> {
+        ensure!(
+            self.baked_core_fits(schema),
+            "baked application cannot open database; use owner recovery"
+        );
+        tracing::error!("registry unreachable at boot; starting the built-in application");
+        let path = self.baked.clone();
+        let sha = self.base_sha.clone();
+        self.start(&path, &sha, None).await
+    }
+
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some((failed, error)) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
@@ -1601,13 +1620,20 @@ impl Supervisor {
                 release.base_abi == self.base_abi,
                 "installed application requires a different base ABI"
             );
-            let path = stage(
+            let path = match stage(
                 &self.registry,
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
             )
-            .await?;
+            .await
+            {
+                Ok(path) => path,
+                Err(error) if registry_unreachable(&error) => {
+                    return self.start_baked_after_registry_outage(schema).await;
+                }
+                Err(error) => return Err(error),
+            };
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
         } else {
