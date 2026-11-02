@@ -134,6 +134,7 @@ async fn status(State(state): State<Arc<RecoveryState>>, session: Session) -> Re
     let result = async {
         Ok::<_, anyhow::Error>(json!({
             "operation":control.upgrade().await?,
+            "boot_mismatches":control.boot_mismatches().await?,
             "launchers":control.components().await?.into_iter().filter(|row| row.component != "webui").map(|row| (row.component.clone(), jmodguard_updater::launcher_status(&row, chrono::Utc::now().timestamp()))).collect::<serde_json::Map<String, Value>>(),
             "components":control.components().await?.into_iter().filter(|row| row.component != "webui").collect::<Vec<_>>(),
             "core_schema":control.schema_version().await?,
@@ -823,6 +824,26 @@ mod tests {
         let owner_cookie = cookie(&store, 123).await;
         let other_cookie = cookie(&store, 456).await;
         let router = maintenance_router(state, store);
+        let mismatch = db::BootMismatchRecord {
+            component: "api".into(),
+            running: String::new(),
+            expected: db::BootMismatchExpected {
+                release_id: "retained-release".into(),
+                source_sha: "a".repeat(40),
+            },
+            reason: "image signature rejected".into(),
+        };
+        control
+            .record_boot_mismatch(mismatch.clone())
+            .await
+            .unwrap();
+        let (status, body) =
+            request(&router, "GET", "/api/service-upgrade", &owner_cookie, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["boot_mismatches"]["api"],
+            serde_json::to_value(mismatch).unwrap()
+        );
         let input = json!({"bot_digest":format!("sha256:{}", "a".repeat(64)), "api_digest":format!("sha256:{}", "b".repeat(64)), "confirmed":true});
         for (session, origin, expected) in [
             ("", "https://api.example.test", StatusCode::UNAUTHORIZED),

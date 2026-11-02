@@ -1109,7 +1109,23 @@ async fn owner_administration_does_not_fetch_guilds_while_rate_limited() {
     f.app.guild_cache.clear();
     f.app.user_cache.clear();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let mismatch = db::BootMismatchRecord {
+        component: "api".into(),
+        running: String::new(),
+        expected: db::BootMismatchExpected {
+            release_id: "retained-release".into(),
+            source_sha: "a".repeat(40),
+        },
+        reason: "image signature rejected".into(),
+    };
+    db::record_boot_mismatch(&f.app.db, mismatch.clone())
+        .await
+        .unwrap();
     let (status, body) = f.request("POST", "/api/updates", "").await;
+    assert_eq!(
+        body["boot_mismatches"]["api"],
+        serde_json::to_value(mismatch).unwrap()
+    );
     assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");

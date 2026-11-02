@@ -254,6 +254,7 @@ async fn status_response(app: &Arc<ApiState>, written: Option<db::ComponentUpdat
     }
     Ok(Json(json!({
         "components":updates,
+        "boot_mismatches":db::read_boot_mismatch_map(&app.db).await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "boot mismatch state unavailable"))?,
         "coordinated_upgrade_path":"/api/service-upgrade/recovery",
         "service_upgrade":db::UpdateControl::from_application(&app.db).upgrade().await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update control unavailable"))?,
         "compatibility":compatibility,

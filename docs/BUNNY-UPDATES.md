@@ -18,7 +18,7 @@ When the installed WebUI differs from this tab, **Reload page** loads the new UI
 
 GitHub Actions publishes each component to its own GHCR package: `jmodguard-bot`, `jmodguard-api`, and `jmodguard-webui`. The owner controls default to the `latest` image published by trusted GitHub Actions builds; an ordinary `main` publication is sufficient, with no Stable or Nightly release build needed for on-demand checking and installation. The updater resolves that moving tag to an exact OCI digest before downloading. Stable and Nightly registry tags remain optional future discovery pointers. The WebUI image contains five static files under `webui/`. Bot/API images contain their baked application, a launcher, and `files.sha256` in the final COPY layer. The launcher downloads only the selected role binary from a verified image digest and checks it against that inventory. There is no second compiled bot/API release package, GitHub-to-Bunny push, or Bunny account API key.
 
-Bunny selects the base bot/API images. Runtime updates replace executables inside those containers; they do not change the selected image or base OS. The page distinguishes the base-image build SHA, running executable SHA, and verified file checksum. On container restart the stable launcher reads durable selections **before** starting an application and fetches the digest-pinned installed release again if ephemeral files were lost. A successful fetch keeps that installation identity and time. When that fetch fails because the registry is unreachable — a connection failure, a request timeout before a response, HTTP 408, HTTP 429, or any HTTP 5xx status — and the built-in binary's core schema equals the database and its guild schema equals the recorded guild schema, the launcher logs that choice and starts the built-in binary. Launcher revision 29 extends the same outage fallback to an installed release that excludes the live core schema, or a required newer launcher whose download fails with an outage. A reachable registry does not permit the incompatible installed application to start. That start does not migrate. It keeps the installed release, its install time, and the previous release, and it records `update_boot_mismatch_v1` until a later start is that installed release again. It stops when the binary would have to change either schema. A database error, a refused image signature, a response-body timeout, or a registry response outside those outage statuses leaves the application stopped and does not write that record.
+Bunny selects the base bot/API images. Runtime updates replace executables inside those containers; they do not change the selected image or base OS. The page distinguishes the base-image build SHA, running executable SHA, and verified file checksum. On container restart the stable launcher reads durable selections **before** starting an application and fetches the digest-pinned installed release again if ephemeral files were lost. A successful fetch keeps that installation identity and time. When that fetch fails because the registry is unreachable — a connection failure, a request timeout before a response, HTTP 408, HTTP 429, or any HTTP 5xx status — and the built-in binary's core schema equals the database and its guild schema equals the recorded guild schema, the launcher logs that choice and starts the built-in binary. Launcher revision 29 extends the same outage fallback to an installed release that excludes the live core schema, or a required newer launcher whose download fails with an outage. A reachable registry does not permit the incompatible installed application to start. That start does not migrate. It keeps the installed release, its install time, and the previous release, and it records `update_boot_mismatch_v1` until a later start is that installed release again. It stops when the binary would have to change either schema. A database error, a refused image signature, a response-body timeout, or a registry response outside those outage statuses still leaves the application stopped. From launcher revision 32, a refused signature or registry download failure during installed boot also records the expected release, an empty running SHA (application stopped), and the signature rejection reason or `registry download failed`, when receipt storage is available. This diagnostic does not authorize a fallback or alter signature verification.
 
 A runtime candidate download outage keeps an already-running application alive. If a rejected candidate is being retried without a running child, the launcher rolls back to the retained or installed application. When fetching that installed fallback encounters an outage, it uses the built-in binary under the same core and guild schema checks as cold start, logs the choice, and retains the installed selection and mismatch record. A schema mismatch or permanent registry failure still refuses that fallback.
 
@@ -111,6 +111,36 @@ cosign public key is committed at `deploy/update-signing.pub`. The private signi
 repository; publication fails closed when that Actions secret is missing.
 
 The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Release discovery also verifies signatures and enforces expiry, regardless of the observed launcher revision. Launcher image staging verifies signatures once a revision-19 or newer launcher is running. A revision-18 launcher has no verifier and is refused that hop. The durable request requires a fresh launcher observation and clears a queued verifier-era selection on refusal. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`.
+
+### Boot-mismatch diagnostics and mixed-fleet rollout
+
+Administration's component cards and the maintenance recovery page show the
+expected release and source SHA, the startup executable (or “Application stopped”),
+and the reason from `update_boot_mismatch_v1`. These are saved startup diagnostics,
+not a live health probe. The owner update and recovery endpoints return the map as
+`boot_mismatches`. Successful installed-release readiness clears the diagnostic.
+
+Launcher revision 32 starts a recovery Clear with a fresh retry delay instead of
+inheriting the failed Record's backoff. Pending diagnostics remain independent of
+readiness receipts. An explicit launcher handoff saves pending mismatch operations
+locally and the replacement launcher reloads them before its first control poll.
+This handoff snapshot does not survive loss of the container's ephemeral files;
+a later cold boot reconstructs its current mismatch from the installed selection.
+
+For fleets with launchers below revision 22, update the bot's base image first to
+one containing both the current bot control writer and launcher, then update the
+API base image. Keep the existing core/guild compatibility and paired-upgrade
+rules; use the coordinated path if the application update changes either schema.
+If the installed selection restores an older bot application, update that selection
+to the compatible signed release too. Verify the running bot application supports
+the mismatch operations and is the active writer, and check the running launcher
+observations for both roles before relying on mismatch diagnostics. Updating only the bot launcher
+does not teach an older bot application the mismatch control operations. A newer
+API with an older writer keeps serving but defers those diagnostics until the
+writer supports them. An older API launcher does not gain the new recovery behavior
+until it is replaced. Below revision 19, use the verified base-image rollout rather
+than an in-place launcher hop, as required by the signature-verifier gate. The
+application minimum stays at revision 7; this ordering is an operator rollout step.
 
 Launcher revision 31 also restores a recorded installed launcher after signature expiry. This restore still verifies its signature and requires a matching durable installation record. New launcher selections continue to enforce expiry.
 

@@ -10,7 +10,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 31;
+pub const LAUNCHER_REVISION: u32 = 32;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -722,6 +722,10 @@ impl UpdateControl {
 
     pub async fn components(&self) -> Result<Vec<ComponentUpdate>> {
         component_updates(&self.db).await
+    }
+
+    pub async fn boot_mismatches(&self) -> Result<BootMismatchMap> {
+        read_boot_mismatch_map(&self.db).await
     }
 
     pub async fn component(&self, role: &str) -> Result<ComponentUpdate> {
