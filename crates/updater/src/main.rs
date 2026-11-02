@@ -1566,18 +1566,42 @@ impl Supervisor {
         Ok(false)
     }
 
-    /// Core schema this container's built-in binary can open. The bot's
-    /// published migration origin is 15 through its compiled schema. The API
-    /// opens only that exact schema.
+    /// Outage recovery may start the built-in binary only at its exact core
+    /// schema. A newer bot migrates on open, and that migration stays inside
+    /// the paired stop, prepare, and `Ack::Starting` sequence.
     fn baked_core_fits(&self, schema: i64) -> bool {
         schema == self.baked_compatibility.core
-            || (self.role == "bot" && (15..=self.baked_compatibility.core).contains(&schema))
     }
 
-    async fn start_baked_after_registry_outage(&mut self, schema: i64) -> Result<()> {
+    /// Whether the recorded guild schema equals the binary about to start.
+    /// Rollback already uses this comparison, and an independent switch uses
+    /// the same equality before replacing a service. A built-in binary has no
+    /// release, so its guild schema is this image's baked guild schema.
+    fn recorded_guild_matches(
+        &self,
+        state: &db::ComponentUpdate,
+        release: Option<&ComponentRelease>,
+    ) -> bool {
+        let guild = release
+            .and_then(|release| release.upgrade.as_ref())
+            .map_or(self.baked_compatibility.guild, |contract| {
+                contract.guild_schema
+            });
+        state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(guild)
+    }
+
+    async fn start_baked_after_registry_outage(
+        &mut self,
+        state: &db::ComponentUpdate,
+        schema: i64,
+    ) -> Result<()> {
         ensure!(
             self.baked_core_fits(schema),
             "baked application cannot open database; use owner recovery"
+        );
+        ensure!(
+            self.recorded_guild_matches(state, None),
+            db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
         tracing::error!("registry unreachable at boot; starting the built-in application");
         let path = self.baked.clone();
@@ -1630,7 +1654,7 @@ impl Supervisor {
             {
                 Ok(path) => path,
                 Err(error) if registry_unreachable(&error) => {
-                    return self.start_baked_after_registry_outage(schema).await;
+                    return self.start_baked_after_registry_outage(state, schema).await;
                 }
                 Err(error) => return Err(error),
             };
@@ -1952,15 +1976,8 @@ impl Supervisor {
                             && schema <= r.max_schema),
                     "rollback schema is incompatible"
                 );
-                let previous_guild = previous
-                    .as_ref()
-                    .and_then(|r| r.upgrade.as_ref())
-                    .map_or(self.baked_compatibility.guild, |contract| {
-                        contract.guild_schema
-                    });
                 ensure!(
-                    state.observed.as_ref().and_then(|seen| seen.guild_schema)
-                        == Some(previous_guild),
+                    self.recorded_guild_matches(&state, previous.as_ref()),
                     "rollback guild schema is incompatible"
                 );
                 let failed = self
@@ -2161,14 +2178,8 @@ impl Supervisor {
                 }),
             "rollback schema is incompatible"
         );
-        let previous_guild = previous
-            .as_ref()
-            .and_then(|r| r.upgrade.as_ref())
-            .map_or(self.baked_compatibility.guild, |contract| {
-                contract.guild_schema
-            });
         ensure!(
-            state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(previous_guild),
+            self.recorded_guild_matches(state, previous.as_ref()),
             "rollback guild schema is incompatible"
         );
         // Keep the failed identity until the restarted prior is ready. A later
