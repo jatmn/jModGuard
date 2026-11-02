@@ -141,6 +141,7 @@ fn retained_edit_and_delete_reports_distinguish_empty_missing_and_gap() {
 
     after.fields.content = Some(String::new());
     let mut deletion = MessageReport {
+        retained_expiries: Default::default(),
         guild_id: GuildId::new(789),
         event: "message_delete",
         vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
@@ -175,6 +176,7 @@ fn refused_edit_uses_retained_author_for_existing_user_filter() {
         attachments_supplied: false,
     };
     let mut report = MessageReport {
+        retained_expiries: Default::default(),
         guild_id: GuildId::new(789),
         event: "message_edit",
         vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
@@ -242,6 +244,7 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
 
 fn render_shipped_delete(event: &'static str, row: &MessageSnapshot) -> String {
     let mut report = MessageReport {
+        retained_expiries: Default::default(),
         guild_id: GuildId::new(789),
         event,
         vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
@@ -431,6 +434,7 @@ async fn committed_snapshot_transition_reaches_edit_and_delete_delivery() {
         .unwrap()
         .unwrap();
     let mut deletion = MessageReport {
+        retained_expiries: Default::default(),
         guild_id: GuildId::new(789),
         event: "message_delete",
         vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
@@ -1482,7 +1486,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
 }
 
 #[tokio::test]
-async fn disabled_and_overloaded_delivery_do_not_queue_reports() {
+async fn disabled_reports_and_expired_admission_do_not_send() {
     let f = Fixture::new();
     let sink = Sink::default();
     assert_eq!(
@@ -5083,4 +5087,85 @@ fn rejoin_note_leave_clears_member_state() {
     deliveries.clear_member(9, 8);
     assert!(!deliveries.pending_redelivery(9, 8, "stay-leave"));
     assert!(deliveries.begin_attempt(9, 8, "stay-leave"));
+}
+
+#[tokio::test]
+async fn routine_report_retries_slot_admission_and_expires_within_its_deadline() {
+    use std::future::Future;
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    for release in [true, false] {
+        let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+        let mut report = Box::pin(emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "system",
+            BTreeMap::new(),
+        ));
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(report.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "a busy slot should queue a routine report"
+        );
+        if release {
+            drop(permit);
+            assert_eq!(report.await, Delivery::Sent);
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(f.app.cfg.log.discord_timeout_secs + 1)).await;
+            assert_eq!(report.await, Delivery::Dropped);
+            tokio::time::resume();
+        }
+    }
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn queued_bulk_transcript_expires_before_attachment_and_text_fallback() {
+    use std::future::Future;
+    let f = Fixture::with_timeout(30);
+    db::upsert_log_channel(&f.app.db, 789, "message_bulk_delete", 903)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let mut expired = replay_snapshot("expired-bulk-secret");
+    expired.expires_at_ms = chrono::Utc::now().timestamp_millis() + 1_500;
+    let valid = replay_snapshot("still-valid-bulk-text");
+    let mut transcript = BulkTranscript::new(2);
+    transcript.push(MessageId::new(123), Some(&expired));
+    transcript.push(MessageId::new(124), Some(&valid));
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Forbidden).await;
+    let held = f.app.log_delivery_slots.acquire().await.unwrap();
+    let send = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        transcript,
+    );
+    tokio::pin!(send);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx))).await;
+    assert!(first.is_pending());
+    assert_eq!(f.app.log_delivery_waiters.available_permits(), 127);
+    assert!(expired.expires_at_ms > chrono::Utc::now().timestamp_millis());
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    drop(held);
+    let outcome = send.await;
+    let seen = request_text(&requests.lock().unwrap());
+    server.abort();
+    let _ = server.await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Delivered);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(request_names_transcript(seen[0].as_bytes()));
+    for request in seen {
+        assert!(request.contains("Message 123"), "{request}");
+        assert!(request.contains("snapshot expired"), "{request}");
+        assert!(request.contains("still-valid-bulk-text"), "{request}");
+        assert!(!request.contains("expired-bulk-secret"), "{request}");
+    }
 }
