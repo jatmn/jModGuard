@@ -35,8 +35,8 @@ fn valid_digest(value: &str) -> bool {
 }
 
 /// A cold-start download failed before any image bytes were accepted.
-/// Connection failure, HTTP 503, and HTTP 429 are unreachable. Signature
-/// refusals and every other registry response stay permanent failures.
+/// Connection failure, request timeout, HTTP 408/429, and server errors are
+/// unreachable. Signature refusals and other responses stay permanent failures.
 pub fn registry_unreachable(error: &anyhow::Error) -> bool {
     if signature::signature_rejection_phrase(error).is_some() {
         return false;
@@ -44,9 +44,10 @@ pub fn registry_unreachable(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         if let Some(request) = cause.downcast_ref::<reqwest::Error>()
             && (request.is_connect()
+                || (request.is_request() && request.is_timeout())
                 || request
                     .status()
-                    .is_some_and(|status| matches!(status.as_u16(), 429 | 503)))
+                    .is_some_and(|status| registry_outage_status(status.as_u16())))
         {
             return true;
         }
@@ -65,7 +66,15 @@ pub fn registry_unreachable(error: &anyhow::Error) -> bool {
         return true;
     }
     let message = error.to_string();
-    message.contains("registry returned HTTP 503") || message.contains("registry returned HTTP 429")
+    message
+        .split_once("registry returned HTTP ")
+        .and_then(|(_, response)| response.split_whitespace().next())
+        .and_then(|status| status.parse().ok())
+        .is_some_and(registry_outage_status)
+}
+
+fn registry_outage_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 fn repository(component: &str) -> Result<&'static str> {
@@ -643,8 +652,73 @@ mod tests {
         });
         assert!(super::registry_unreachable(&unavailable));
         assert!(super::registry_unreachable(&limited));
-        assert!(!super::registry_unreachable(&server));
+        assert!(super::registry_unreachable(&server));
         assert!(!super::registry_unreachable(&unsigned));
+    }
+
+    #[test]
+    fn registry_status_classification() {
+        for status in 100..=599 {
+            let expected = matches!(status, 408 | 429 | 500..=599);
+            let error = anyhow::anyhow!("registry returned HTTP {status} status");
+            assert_eq!(registry_unreachable(&error), expected, "HTTP {status}");
+            let response = axum::http::Response::builder()
+                .status(status)
+                .body("")
+                .unwrap();
+            if let Err(error) = reqwest::Response::from(response).error_for_status() {
+                let error = anyhow::Error::new(error.without_url());
+                assert_eq!(
+                    registry_unreachable(&error),
+                    expected,
+                    "typed HTTP {status}"
+                );
+                let rejected = anyhow::Error::new(signature::ImageSignatureRejection {
+                    phrase: signature::UNSIGNED_IMAGE,
+                })
+                .context(format!("registry returned HTTP {status}"));
+                assert!(!registry_unreachable(&rejected));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_request_timeout_is_unreachable_but_body_timeout_is_not() {
+        for partial_body in [false, true] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                if partial_body {
+                    tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap();
+                }
+                std::future::pending::<()>().await;
+            });
+            let mut registry = Registry::new(&base).unwrap();
+            registry.http = reqwest::Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let error = registry
+                .get_limited(base, None, None, 1024)
+                .await
+                .unwrap_err();
+            server.abort();
+            let _ = server.await;
+            assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
+            assert_eq!(registry_unreachable(&error), !partial_body, "{error:#}");
+        }
     }
 
     use super::*;
