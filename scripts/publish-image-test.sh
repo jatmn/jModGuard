@@ -673,14 +673,13 @@ GHCR_TOKEN=fixture-token
 GITHUB_TOKEN=""
 PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
 export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
-run_git() {
+git() {
   case "$1" in
     rev-parse) printf '%s\n' "$HEAD_SHA" ;;
     status) printf '' ;;
     worktree)
-      if [[ "$2" == add ]]; then
-        publish_fail 'worktree add failed'
-      fi
+      echo "worktree $2 failed" >&2
+      return 1
       ;;
     *) fail "unexpected git $*" ;;
   esac
@@ -695,12 +694,15 @@ run_docker() {
 read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
 redact_tokens() { :; }
 changed_since_publication() { return 0; }
-if ( publish_component api ) >/dev/null 2>&1; then
+if cleanup_output="$(publish_component api 2>&1)"; then
   fail 'worktree failure must abort publish'
 fi
+[[ "$cleanup_output" == *'worktree remove failed'* ]] \
+  || fail "worktree cleanup must preserve the removal error: $cleanup_output"
 if compgen -G "${publish_scratch_parent}/publish-*" >/dev/null; then
   fail "publish scratch must be removed after worktree failure: $(ls -A "$publish_scratch_parent")"
 fi
+unset -f git
 rm -rf "$publish_scratch_parent"
 TMPDIR="$saved_publish_tmp"
 export TMPDIR
@@ -1767,13 +1769,48 @@ rollback_promoted_tags
   || fail 'rollback must restore the first promoted tag to its previous digest'
 [[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
 
+# Early registry-delete failures must explain which prerequisite failed.
+reload_publisher
+for delete_case in invalid-ref missing-token list-failure malformed-list invalid-id; do
+  if delete_output="$(
+    GHCR_TOKEN=fixture
+    delete_ref="${ROLLBACK_IMAGE}:latest"
+    case "$delete_case" in
+      invalid-ref) delete_ref=invalid ;;
+      missing-token) unset GHCR_TOKEN GITHUB_TOKEN ;;
+      list-failure) registry_fetch_versions() { return 1; } ;;
+      malformed-list)
+        registry_fetch_versions() {
+          printf '[{"metadata":{"container":{"tags":1}}}]'
+        }
+        ;;
+      invalid-id)
+        registry_fetch_versions() {
+          printf '[{"id":"1invalid","metadata":{"container":{"tags":["latest"]}}}]'
+        }
+        ;;
+    esac
+    registry_delete_tag "$delete_ref" 2>&1
+  )"; then
+    fail "registry delete accepted $delete_case"
+  fi
+  case "$delete_case" in
+    invalid-ref) expected_error='invalid image tag reference' ;;
+    missing-token) expected_error='requires GHCR_TOKEN or GITHUB_TOKEN' ;;
+    list-failure) expected_error='package version list failed' ;;
+    malformed-list) expected_error='package version match was unreadable' ;;
+    invalid-id) expected_error='package version ID was invalid' ;;
+  esac
+  [[ "$delete_output" == *"$expected_error"* ]] \
+    || fail "registry delete did not explain $delete_case: $delete_output"
+done
+
 # Promote abort must report imagetools restore and registry delete failures.
 reload_publisher
 unset -f docker
 ABORT_RESTORE_TAG="ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}"
 ABORT_DELETE_TAG="ghcr.io/jatmn/jmodguard-api:latest"
 ABORT_PREV="sha256:$(printf 'd%.0s' {1..64})"
-ABORT_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/promote-abort-scratch-XXXXXX")"
 docker() {
   if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
     echo 'imagetools: restore write failed' >&2
@@ -1783,27 +1820,49 @@ docker() {
   return 1
 }
 inspect_digest() { printf '%s\t10\n' "$MOCK_BUILD_DIGEST"; }
-PROMOTION_ROLLBACK=("${ABORT_DELETE_TAG}||${MOCK_BUILD_DIGEST}" "${ABORT_RESTORE_TAG}|${ABORT_PREV}|${MOCK_BUILD_DIGEST}")
-PROMOTION_SCRATCHES=("$ABORT_SCRATCH")
-set +e
-abort_output="$(
-  unset GHCR_TOKEN GITHUB_TOKEN
-  abort_promotion "$ABORT_RESTORE_TAG" 2>&1
-)"
-abort_status=$?
-set -e
-[[ "$abort_status" -ne 0 ]] || fail 'promote abort must fail when rollback I/O fails'
-printf '%s\n' "$abort_output" | grep -q 'imagetools: restore write failed' \
-  || fail "promote abort swallowed the imagetools restore error: $abort_output"
-printf '%s\n' "$abort_output" | grep -q "rollback failed to restore ${ABORT_RESTORE_TAG} to ${ABORT_PREV}" \
-  || fail "promote abort must name the tag whose imagetools restore failed: $abort_output"
-printf '%s\n' "$abort_output" | grep -q "rollback failed to delete ${ABORT_DELETE_TAG}" \
-  || fail "promote abort must name the tag whose registry delete failed: $abort_output"
-printf '%s\n' "$abort_output" | grep -q 'command not found' \
-  && fail "registry delete must use the production helper: $abort_output"
-printf '%s\n' "$abort_output" | grep -q "failed to promote ${ABORT_RESTORE_TAG}; rollback failed" \
-  || fail "promote abort must report the rollback failure: $abort_output"
-[[ ! -d "$ABORT_SCRATCH" ]] || fail 'promote abort must remove promotion scratch when rollback I/O fails'
+for abort_case in missing-token registry-io; do
+  ABORT_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/promote-abort-scratch-XXXXXX")"
+  PROMOTION_ROLLBACK=("${ABORT_DELETE_TAG}||${MOCK_BUILD_DIGEST}" "${ABORT_RESTORE_TAG}|${ABORT_PREV}|${MOCK_BUILD_DIGEST}")
+  PROMOTION_SCRATCHES=("$ABORT_SCRATCH")
+  set +e
+  abort_output="$(
+    if [[ "$abort_case" == missing-token ]]; then
+      unset GHCR_TOKEN GITHUB_TOKEN
+    else
+      GHCR_TOKEN=fixture
+      registry_fetch_versions() {
+        printf '[{"id":1,"metadata":{"container":{"tags":["latest"]}}}]'
+      }
+      gh() {
+        [[ "$1 $2 $3" == 'api --method DELETE' ]] || fail "unexpected gh $*"
+        echo 'registry: delete request failed' >&2
+        return 1
+      }
+    fi
+    abort_promotion "$ABORT_RESTORE_TAG" 2>&1
+  )"
+  abort_status=$?
+  set -e
+  [[ "$abort_status" -ne 0 ]] || fail 'promote abort must fail when rollback I/O fails'
+  printf '%s\n' "$abort_output" | grep -q 'imagetools: restore write failed' \
+    || fail "promote abort swallowed the imagetools restore error: $abort_output"
+  printf '%s\n' "$abort_output" | grep -q "rollback failed to restore ${ABORT_RESTORE_TAG} to ${ABORT_PREV}" \
+    || fail "promote abort must name the tag whose imagetools restore failed: $abort_output"
+  printf '%s\n' "$abort_output" | grep -q "rollback failed to delete ${ABORT_DELETE_TAG}" \
+    || fail "promote abort must name the tag whose registry delete failed: $abort_output"
+  printf '%s\n' "$abort_output" | grep -q 'command not found' \
+    && fail "registry delete must use the production helper: $abort_output"
+  printf '%s\n' "$abort_output" | grep -q "failed to promote ${ABORT_RESTORE_TAG}; rollback failed" \
+    || fail "promote abort must report the rollback failure: $abort_output"
+  [[ ! -d "$ABORT_SCRATCH" ]] || fail 'promote abort must remove promotion scratch when rollback I/O fails'
+  if [[ "$abort_case" == missing-token ]]; then
+    [[ "$abort_output" == *'requires GHCR_TOKEN or GITHUB_TOKEN'* ]] \
+      || fail "registry delete must explain missing credentials: $abort_output"
+  else
+    [[ "$abort_output" == *'registry: delete request failed'* ]] \
+      || fail "promote abort swallowed the registry I/O error: $abort_output"
+  fi
+done
 unset -f docker
 
 reload_publisher
