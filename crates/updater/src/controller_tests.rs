@@ -8306,13 +8306,25 @@ async fn boot_repair_refuses(
         .unwrap();
     });
     let mut service = controller("bot", root.join("baked"), registry, control.clone(), root);
-    let error = service
-        .restore(&installed_state(db, release).await)
-        .await
-        .unwrap_err();
+    installed_state(db, release.clone()).await;
+    let error = service.normal().await.unwrap_err();
     assert_eq!(error.to_string(), phrase, "{error:?}");
     assert_eq!(signature_rejection_phrase(&error), Some(phrase));
     assert!(service.running.is_none());
+    let mismatch = db::read_boot_mismatch_map(db).await.unwrap();
+    assert_eq!(mismatch["bot"].expected.release_id, release.release_id);
+    assert_eq!(mismatch["bot"].reason, phrase);
+    assert!(mismatch["bot"].running.is_empty());
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        release.digest
+    );
     server.abort();
 }
 
@@ -8330,10 +8342,6 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
         test_signing().damage(&mut objects, "bot", &release.digest, bad);
         boot_repair_refuses(&db, &control, &root, release, objects, bad.phrase()).await;
     }
-    assert!(
-        db::read_boot_mismatch_map(&db).await.unwrap().is_empty(),
-        "a refused signature must not record a boot mismatch"
-    );
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
@@ -9200,6 +9208,9 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         .await
         .unwrap();
     wait_for_ready_file(&service).await;
+    // Recovery must not inherit the maximum delay of an unsaved Record.
+    service.boot_receipt_attempt = 6;
+    service.boot_receipt_not_before = Some(Instant::now() + Duration::from_secs(60));
     // Managed readiness must proceed while the outage record is still deferred.
     let ready = service.tick_control().await;
     assert!(
@@ -9224,6 +9235,7 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
     ));
 
     assert!(service.reported);
+    assert!(service.boot_receipt_not_before.unwrap() <= Instant::now() + Duration::from_secs(1));
     // A later managed child must also report readiness when Clear is retried first.
     service.stop_application().await.unwrap();
     service
@@ -9707,5 +9719,193 @@ async fn cold_start_incompatible_installed_release_stays_refused_when_reachable(
         server.abort();
     }
     drop((control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn boot_mismatch_receipts_replay_after_handoff_and_reach_the_bot_writer() {
+    let root = std::env::temp_dir().join(format!("boot-replay-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let db_path = root.join("core.db");
+    let db = Db::open(&db_path, 2).unwrap();
+    let writer = UpdateControl::from_application(&db);
+    let schema = writer.schema_version().await.unwrap();
+    let installed = release_at("api", 'c', schema);
+    let stamp = 1_700_000_000;
+    install_for_outage(&db, &writer, &installed, stamp).await;
+    let secret = "x".repeat(32);
+    let mut cfg = jmodguard::config::BotProcessConfig::default();
+    cfg.db.path = db_path.clone();
+    cfg.bot.control_bind = format!("{}:0", std::net::Ipv4Addr::LOCALHOST);
+    cfg.bot.control_secret = jmodguard::config::ControlSecret::new(secret.clone());
+    let bot = jmodguard_bot::state::BotState::new(cfg, db.clone()).unwrap();
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .unwrap();
+    let link = jmodguard::control::try_writer_link(&bound.to_string(), &secret)
+        .unwrap()
+        .unwrap();
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "api",
+        baked.clone(),
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    service.normal().await.unwrap();
+    wait_for_ready_file(&service).await;
+    assert!(
+        !service.report_ready().await.unwrap(),
+        "activation still waits for its own receipt"
+    );
+    assert!(
+        service.running.is_some(),
+        "unsaved receipts must not stop the ready process"
+    );
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    assert!(matches!(
+        service.pending_boot_mismatch.front(),
+        Some(PendingBootMismatch::Record { .. })
+    ));
+
+    let mut objects = HashMap::new();
+    let launcher = image(&mut objects, "api", &tokio::fs::read(&baked).await.unwrap());
+    let (registry, server) = serve_objects(objects).await;
+    service.registry = registry.clone();
+    service.receipt_not_before = None;
+    assert!(matches!(
+        service.handoff(&launcher, None, false).await.unwrap(),
+        ControlStep::Reexec
+    ));
+    drop(service);
+    let mut service = controller(
+        "api",
+        baked.clone(),
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    service.load_boot_mismatch_handoff().await.unwrap();
+    assert!(matches!(
+        service.pending_boot_mismatch.front(),
+        Some(PendingBootMismatch::Record { .. })
+    ));
+    service.normal().await.unwrap();
+    wait_for_ready_file(&service).await;
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        )
+        .await
+        .unwrap()
+    );
+    service.boot_receipt_not_before = None;
+    service.receipt_not_before = None;
+    service.tick_control().await.unwrap();
+    assert!(service.reported);
+    assert!(service.pending_boot_mismatch.is_empty());
+    let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatch["api"].expected.release_id, installed.release_id);
+    assert_eq!(mismatch["api"].running, service.base_sha);
+
+    // The same real control server refuses Clear while it is not the writer.
+    bot.activation.mark_lock_held(false);
+    let error = service.clear_boot_mismatch_when_saved().await.unwrap_err();
+    assert!(error.is::<db::ReceiptNotSaved>());
+    assert!(
+        db::read_boot_mismatch_map(&db)
+            .await
+            .unwrap()
+            .contains_key("api")
+    );
+    service.registry = registry;
+    assert!(matches!(
+        service.handoff(&launcher, None, false).await.unwrap(),
+        ControlStep::Reexec
+    ));
+    drop(service);
+    let mut service = controller(
+        "api",
+        baked,
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    service.load_boot_mismatch_handoff().await.unwrap();
+    assert!(matches!(
+        service.pending_boot_mismatch.front(),
+        Some(PendingBootMismatch::Clear)
+    ));
+    bot.activation.mark_lock_held(true);
+    service.flush_pending_boot_mismatch().await.unwrap();
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    assert!(service.pending_boot_mismatch.is_empty());
+    // A refused download also retries its stopped diagnostic without a child.
+    bot.activation.mark_lock_held(false);
+    let (base, refusal_server) = status_registry(403).await;
+    service.registry = Registry::new(&base).unwrap();
+    assert!(service.normal().await.is_err());
+    assert!(service.running.is_none());
+    assert!(
+        matches!(service.pending_boot_mismatch.front(), Some(PendingBootMismatch::Record { running, .. }) if running.is_empty())
+    );
+    bot.activation.mark_lock_held(true);
+    service.boot_receipt_not_before = None;
+    service.flush_pending_boot_mismatch().await.unwrap();
+    let stopped = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert!(stopped["api"].running.is_empty());
+    assert_eq!(stopped["api"].reason, "registry download failed");
+    refusal_server.abort();
+    let kept = writer.component("api").await.unwrap();
+    assert_eq!(kept.installed.unwrap().digest, installed.digest);
+    assert_eq!(kept.installed_at, Some(stamp));
+    server.abort();
+    drop((service, control, writer, bot, db, reserved));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn permanent_registry_boot_failure_records_a_stopped_application() {
+    let root = std::env::temp_dir().join(format!("boot-refusal-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let installed = release_at("api", 'c', control.schema_version().await.unwrap());
+    install_for_outage(&db, &control, &installed, 1_700_000_000).await;
+    let (base, server) = status_registry(403).await;
+    let mut service = controller(
+        "api",
+        root.join("baked"),
+        Registry::new(&base).unwrap(),
+        control.clone(),
+        &root,
+    );
+    assert!(service.normal().await.is_err());
+    assert!(service.running.is_none());
+    let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert!(mismatch["api"].running.is_empty());
+    assert_eq!(mismatch["api"].expected.release_id, installed.release_id);
+    assert_eq!(mismatch["api"].reason, "registry download failed");
+    assert_eq!(
+        control
+            .component("api")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        installed.digest
+    );
+    server.abort();
+    drop((service, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
