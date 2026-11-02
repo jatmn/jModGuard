@@ -5,6 +5,7 @@ use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
 use jmodguard_updater::signature::signature_rejection_phrase;
+use jmodguard_updater::signature::signature_tag_for_digest;
 use jmodguard_updater::signing_fixture::{BadSignature, SigningFixture, SigningKeyChoice};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -7919,9 +7920,15 @@ async fn rejected_marker_tracks_the_candidate_digest() {
     bot.standby = Some(bot.installed_fallback(&state).await.unwrap());
     let registry = bot.registry.clone();
     let staging = bot.staging.clone();
-    let path = stage(&registry, &alternate, "jmodguard-bot", &staging)
-        .await
-        .unwrap();
+    let path = stage(
+        &registry,
+        &alternate,
+        "jmodguard-bot",
+        &staging,
+        StageTrust::NewInstall,
+    )
+    .await
+    .unwrap();
     bot.start(&path, &alternate.source_sha, Some(alternate.clone()))
         .await
         .unwrap();
@@ -8092,6 +8099,113 @@ async fn baked_auth_rejection_after_ready_is_held() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+fn assert_nothing_staged(root: &std::path::Path, staging: &std::path::Path) {
+    assert!(
+        !root.join("jmodguard-launcher-next").exists(),
+        "handoff must not publish a launcher"
+    );
+    if staging.exists() {
+        assert!(
+            std::fs::read_dir(staging).unwrap().next().is_none(),
+            "unsigned or refused image must not be staged"
+        );
+    }
+}
+
+async fn serve_objects(
+    objects: HashMap<String, Vec<u8>>,
+) -> (Registry, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    (registry, server)
+}
+
+fn expire_signature(objects: &mut HashMap<String, Vec<u8>>, component: &str, digest: &str) {
+    let tag = signature_tag_for_digest(digest).unwrap();
+    objects.remove(&tag);
+    test_signing().sign(
+        objects,
+        component,
+        digest,
+        "2020-01-01T00:00:00Z",
+        SigningKeyChoice::Current,
+    );
+}
+
+#[tokio::test]
+async fn revision_eighteen_handoff_does_not_stage_an_unverified_image() {
+    for bad in [BadSignature::Unsigned, BadSignature::Wrong] {
+        let root = std::env::temp_dir().join(format!("rev18-hop-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (db, control) = open_launcher_db(&root).await;
+        let mut objects = HashMap::new();
+        let mut release = image(&mut objects, "bot", b"\x7fELFuntrusted");
+        release.launcher.as_mut().unwrap().revision = db::VERIFIER_LAUNCHER_REVISION;
+        test_signing().damage(&mut objects, "bot", &release.digest, bad);
+        store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
+        let (registry, server) = serve_objects(objects).await;
+        let mut bot = controller(
+            "bot",
+            root.join("baked-bot"),
+            registry,
+            control.clone(),
+            &root,
+        );
+        bot.launcher_revision = 18;
+        let Err(error) = bot.launcher(&control.component("bot").await.unwrap()).await else {
+            panic!("pre-verifier handoff must refuse before staging");
+        };
+        assert_eq!(error.to_string(), db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
+        assert!(signature_rejection_phrase(&error).is_none());
+        assert_nothing_staged(&root, &bot.staging);
+        server.abort();
+        drop((bot, control, db));
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn revision_nineteen_handoff_refuses_unsigned_and_wrong_signatures() {
+    for bad in [BadSignature::Unsigned, BadSignature::Wrong] {
+        let root = std::env::temp_dir().join(format!("rev19-hop-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let (db, control) = open_launcher_db(&root).await;
+        let mut objects = HashMap::new();
+        let mut release = image(&mut objects, "bot", b"\x7fELFchecked");
+        release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION;
+        test_signing().damage(&mut objects, "bot", &release.digest, bad);
+        store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
+        let (registry, server) = serve_objects(objects).await;
+        let mut bot = controller(
+            "bot",
+            root.join("baked-bot"),
+            registry,
+            control.clone(),
+            &root,
+        );
+        bot.launcher_revision = db::VERIFIER_LAUNCHER_REVISION;
+        let Err(error) = bot.launcher(&control.component("bot").await.unwrap()).await else {
+            panic!("verifier handoff must refuse an unsigned or wrong signature");
+        };
+        assert_eq!(error.to_string(), bad.phrase());
+        assert_eq!(signature_rejection_phrase(&error), Some(bad.phrase()));
+        assert_nothing_staged(&root, &bot.staging);
+        server.abort();
+        drop((bot, control, db));
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+}
+
 fn installed_state(release: ComponentRelease) -> db::ComponentUpdate {
     db::ComponentUpdate {
         component: release.component.clone(),
@@ -8155,10 +8269,58 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
     tokio::fs::create_dir_all(&root).await.unwrap();
     let (_db, control) = open_launcher_db(&root).await;
     for bad in BadSignature::ALL {
+        if matches!(bad, BadSignature::Expired) {
+            continue;
+        }
         let mut objects = HashMap::new();
         let release = image(&mut objects, "bot", b"\x7fELFboot");
         test_signing().damage(&mut objects, "bot", &release.digest, bad);
         boot_repair_refuses(&control, &root, release, objects, bad.phrase()).await;
     }
     tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_signature_blocks_a_fresh_stage_and_still_boot_repairs() {
+    let root = std::env::temp_dir().join(format!("sig-expired-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = executable(&root, "expired-bot").await;
+    let bytes = tokio::fs::read(&binary).await.unwrap();
+    let (_db, control) = open_launcher_db(&root).await;
+    let mut objects = HashMap::new();
+    let mut release = image(&mut objects, "bot", &bytes);
+    expire_signature(&mut objects, "bot", &release.digest);
+    let schema = control.schema_version().await.unwrap();
+    release.min_schema = schema;
+    release.max_schema = schema;
+    release.result_schema = schema;
+    let (registry, server) = serve_objects(objects).await;
+    let mut service = controller("bot", root.join("baked"), registry, control, &root);
+    let fresh = stage(
+        &service.registry,
+        &release,
+        "jmodguard-bot",
+        &service.staging,
+        StageTrust::NewInstall,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        fresh.to_string(),
+        jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE
+    );
+    assert_eq!(
+        signature_rejection_phrase(&fresh),
+        Some(jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE)
+    );
+    assert_nothing_staged(&root, &service.staging);
+    service
+        .restore(&installed_state(release))
+        .await
+        .expect("installed release past not-after must boot-repair");
+    assert!(service.running.is_some());
+    service.stop_application().await.unwrap();
+    server.abort();
+    drop(service);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
 }

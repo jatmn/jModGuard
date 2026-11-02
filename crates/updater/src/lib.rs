@@ -153,6 +153,17 @@ pub fn launcher_status(row: &db::ComponentUpdate, now: i64) -> serde_json::Value
     let contract = release.launcher.as_ref().expect("validated contract");
     let required = seen.launcher_revision < contract.min_revision;
     let newer = seen.launcher_revision < contract.revision;
+    // A revision older than the verifier would stage this hop with no signature check.
+    if !required && db::pre_verifier_launcher_hop(seen.launcher_revision, contract.revision) {
+        return serde_json::json!({
+            "state": "blocked",
+            "running": seen.launcher_revision,
+            "minimum": contract.min_revision,
+            "available": contract.revision,
+            "installable": false,
+            "reason": db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED,
+        });
+    }
     serde_json::json!({"state":if required { "required_first" } else if newer { "optional" } else { "satisfied" },
         "running":seen.launcher_revision,"minimum":contract.min_revision,"available":contract.revision,
         "installable":seen.self_update_enabled && newer && !required,

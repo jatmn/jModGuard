@@ -108,7 +108,7 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
-The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. The same check runs when boot repair downloads the installed release. An unsigned image, a wrong signature, an expired signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, `expired image signature`, or `image signature used an untrusted key`.
+The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Signature verification applies only once a revision-19 launcher is already running. A revision-18 launcher has no verifier and is not offered that hop, so it cannot stage the image. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. Boot repair still checks the signature of an already-installed release, and it still starts that release after `io.jmodguard.not-after`.
 
 ## Schema upgrades and recovery
 

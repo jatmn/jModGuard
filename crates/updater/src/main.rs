@@ -551,16 +551,31 @@ async fn watch_child_health_from(
     }
 }
 
+/// New installs refuse an expired signature. Re-downloading an already
+/// installed release does not: that image was verified when it was staged.
+#[derive(Clone, Copy)]
+enum StageTrust {
+    NewInstall,
+    InstalledRelease,
+}
+
 async fn stage(
     registry: &Registry,
     release: &ComponentRelease,
     name: &str,
     dir: &Path,
+    trust: StageTrust,
 ) -> Result<PathBuf> {
     let path = format!("usr/local/bin/{name}");
-    let files = registry
-        .files(release, &[&path, "usr/local/share/jmodguard/files.sha256"])
-        .await?;
+    let requested = [&path, "usr/local/share/jmodguard/files.sha256"];
+    let files = match trust {
+        StageTrust::NewInstall => registry.files(release, &requested).await?,
+        StageTrust::InstalledRelease => {
+            registry
+                .files_for_installed_restore(release, &requested)
+                .await?
+        }
+    };
     let binary = files
         .get(&path)
         .context("image did not include expected executable")?;
@@ -881,6 +896,7 @@ impl Supervisor {
                 &release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
+                StageTrust::InstalledRelease,
             )
             .await?;
             let sha = release.source_sha.clone();
@@ -1510,6 +1526,7 @@ impl Supervisor {
                 &target,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
+                StageTrust::NewInstall,
             )
             .await?;
             self.prepared = Some((id.into(), path));
@@ -1606,6 +1623,7 @@ impl Supervisor {
                 release,
                 &format!("jmodguard-{}", self.role),
                 &self.staging,
+                StageTrust::InstalledRelease,
             )
             .await?;
             self.start(&path, &release.source_sha, Some(release.clone()))
@@ -1654,7 +1672,24 @@ impl Supervisor {
             "launcher component mismatch"
         );
         jmodguard_updater::launcher_compatible(release, &self.base_abi)?;
-        let path = stage(&self.registry, release, "jmodguard-launcher", &self.staging).await?;
+        // Optional hop only. A revision below the verifier has no signature
+        // check, so it must not download the image. Required handoffs for the
+        // minimum of 7 stay on their existing path.
+        if !required
+            && release.launcher.as_ref().is_some_and(|contract| {
+                db::pre_verifier_launcher_hop(self.launcher_revision, contract.revision)
+            })
+        {
+            bail!("{}", db::PRE_VERIFIER_LAUNCHER_HOP_REFUSED);
+        }
+        let path = stage(
+            &self.registry,
+            release,
+            "jmodguard-launcher",
+            &self.staging,
+            StageTrust::NewInstall,
+        )
+        .await?;
         let hash = sha256_hex(&tokio::fs::read(&path).await?);
         if required
             && let Err(error) = self
@@ -2055,6 +2090,7 @@ impl Supervisor {
             &candidate,
             &format!("jmodguard-{}", self.role),
             &self.staging,
+            StageTrust::NewInstall,
         )
         .await
         {
