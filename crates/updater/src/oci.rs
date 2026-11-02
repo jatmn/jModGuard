@@ -42,14 +42,13 @@ pub fn registry_unreachable(error: &anyhow::Error) -> bool {
         return false;
     }
     if error.chain().any(|cause| {
-        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
-            if request.is_connect()
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>()
+            && (request.is_connect()
                 || request
                     .status()
-                    .is_some_and(|status| matches!(status.as_u16(), 429 | 503))
-            {
-                return true;
-            }
+                    .is_some_and(|status| matches!(status.as_u16(), 429 | 503)))
+        {
+            return true;
         }
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
             matches!(
