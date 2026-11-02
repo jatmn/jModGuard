@@ -793,7 +793,7 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "automod_delete",
-            "**:wastebasket: {rule} (`{rule_id}`) deleted `{message_id}` in {channel}**\n\n**Reason:** {reason}",
+            "**:wastebasket: Automod deleted message in {channel}**\n\n**Rule:** {rule} (`{rule_id}`)\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
         ),
         (
             "member_rejoin",

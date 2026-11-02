@@ -4059,6 +4059,27 @@ mod tests {
         expected_deletes: usize,
         expected_bans: usize,
     ) {
+        image_dispatch_race_with_log_delay(
+            known_bad,
+            change,
+            trigger_method,
+            trigger_path,
+            expected_deletes,
+            expected_bans,
+            Duration::ZERO,
+        )
+        .await;
+    }
+
+    async fn image_dispatch_race_with_log_delay(
+        known_bad: bool,
+        change: DispatchChange,
+        trigger_method: &str,
+        trigger_path: &str,
+        expected_deletes: usize,
+        expected_bans: usize,
+        log_post_delay: Duration,
+    ) {
         use crate::spam_actions::{Kind, Match, MatchPolicy, ReportDisposition};
         let _serial = crate::spam_actions::tests::IMAGE_ENFORCEMENT_TEST_LOCK
             .lock()
@@ -4123,6 +4144,11 @@ mod tests {
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
+        if !log_post_delay.is_zero() {
+            crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
+                .await
+                .unwrap();
+        }
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
@@ -4187,6 +4213,8 @@ mod tests {
         let server_stop = Arc::clone(&stop);
         let trigger = (trigger_method.to_owned(), trigger_path.to_owned());
         let runtime = tokio::runtime::Handle::current();
+        let scope = scope.clone();
+        let ctx = ctx.clone();
         let server = Server(
             stop,
             Some(std::thread::spawn(move || {
@@ -4194,11 +4222,17 @@ mod tests {
                     listener,
                     server_lines,
                     server_stop,
-                    |method, path, body| {
-                        if method == "POST" && path.ends_with("/channels/999/messages") {
-                            server_reports
-                                .lock()
-                                .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                    move |method, path, body| {
+                        if method == "POST" && path.ends_with("/messages") {
+                            if path.ends_with("/channels/998/messages") && !log_post_delay.is_zero()
+                            {
+                                std::thread::sleep(log_post_delay);
+                            }
+                            if path.ends_with("/channels/999/messages") {
+                                server_reports
+                                    .lock()
+                                    .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+                            }
                         }
                         let status = (method == "DELETE"
                             && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
@@ -4342,7 +4376,7 @@ mod tests {
         );
         let disposition = crate::spam_actions::enforce(
             &app,
-            &http,
+            std::sync::Arc::clone(&http),
             &serenity::cache::Cache::new(),
             found,
             "attachment_flood",
@@ -4395,7 +4429,7 @@ mod tests {
             }
         }
         let reports = reports.lock().clone();
-        if expected_deletes > 0 {
+        if expected_deletes > 0 && log_post_delay.is_zero() {
             assert_eq!(
                 reports.len(),
                 1,
@@ -4513,6 +4547,20 @@ mod tests {
     #[tokio::test]
     async fn repeated_image_still_present_dispatches_deletes_and_ban() {
         image_dispatch_race(false, DispatchChange::None, "GET", "/members/99", 3, 1).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_enforcement_survives_slow_automod_log_post() {
+        image_dispatch_race_with_log_delay(
+            false,
+            DispatchChange::OwnDeleteEcho,
+            "GET",
+            "/members/99",
+            3,
+            1,
+            Duration::from_millis(1200),
+        )
+        .await;
     }
 
     #[tokio::test]
