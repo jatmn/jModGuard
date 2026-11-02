@@ -224,17 +224,17 @@ done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=21 min-launcher-revision=7; do
+for field in launcher-revision=22 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 21;$/pub const LAUNCHER_REVISION: u32 = 22;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 22;$/pub const LAUNCHER_REVISION: u32 = 23;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
-for field in launcher-revision=22 min-launcher-revision=7; do
+for field in launcher-revision=23 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 rm -rf "$launcher_source"
@@ -1479,7 +1479,10 @@ docker() {
     done
     [[ -n "$ref" && -n "$digest" ]] && ROLLBACK_PROMOTE_TAG_DIGEST["$ref"]="$digest"
     PROD_PROMOTE_CREATE=$((PROD_PROMOTE_CREATE + 1))
-    [[ "$PROD_PROMOTE_CREATE" -lt 2 ]] || return 1
+    # Only the second promotion fails. A later restore must be able to succeed.
+    if [[ "$PROD_PROMOTE_CREATE" -eq 2 ]]; then
+      return 1
+    fi
     return 0
   fi
   return 0
@@ -1743,6 +1746,44 @@ rollback_promoted_tags
 [[ "${ROLLBACK_TAG_DIGEST[${ROLLBACK_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PREV" ]] \
   || fail 'rollback must restore the first promoted tag to its previous digest'
 [[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
+
+# Promote abort must report imagetools restore and registry delete failures.
+reload_publisher
+unset -f docker
+ABORT_RESTORE_TAG="ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}"
+ABORT_DELETE_TAG="ghcr.io/jatmn/jmodguard-api:latest"
+ABORT_PREV="sha256:$(printf 'd%.0s' {1..64})"
+ABORT_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/promote-abort-scratch-XXXXXX")"
+docker() {
+  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
+    echo 'imagetools: restore write failed' >&2
+    return 1
+  fi
+  echo "unexpected docker $*" >&2
+  return 1
+}
+PROMOTION_ROLLBACK=("${ABORT_DELETE_TAG}|" "${ABORT_RESTORE_TAG}|${ABORT_PREV}")
+PROMOTION_SCRATCHES=("$ABORT_SCRATCH")
+set +e
+abort_output="$(
+  unset GHCR_TOKEN GITHUB_TOKEN
+  abort_promotion "$ABORT_RESTORE_TAG" 2>&1
+)"
+abort_status=$?
+set -e
+[[ "$abort_status" -ne 0 ]] || fail 'promote abort must fail when rollback I/O fails'
+printf '%s\n' "$abort_output" | grep -q 'imagetools: restore write failed' \
+  || fail "promote abort swallowed the imagetools restore error: $abort_output"
+printf '%s\n' "$abort_output" | grep -q "rollback failed to restore ${ABORT_RESTORE_TAG} to ${ABORT_PREV}" \
+  || fail "promote abort must name the tag whose imagetools restore failed: $abort_output"
+printf '%s\n' "$abort_output" | grep -q "rollback failed to delete ${ABORT_DELETE_TAG}" \
+  || fail "promote abort must name the tag whose registry delete failed: $abort_output"
+printf '%s\n' "$abort_output" | grep -q 'command not found' \
+  && fail "registry delete must use the production helper: $abort_output"
+printf '%s\n' "$abort_output" | grep -q "failed to promote ${ABORT_RESTORE_TAG}; rollback failed" \
+  || fail "promote abort must report the rollback failure: $abort_output"
+[[ ! -d "$ABORT_SCRATCH" ]] || fail 'promote abort must remove promotion scratch when rollback I/O fails'
+unset -f docker
 
 reload_publisher
 SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"

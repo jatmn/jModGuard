@@ -692,7 +692,7 @@ promote_image_tag() {
 }
 
 rollback_promoted_tags() {
-  local entry image_tag previous image i
+  local entry image_tag previous image i failed=0
   [[ -v PROMOTION_ROLLBACK ]] || return 0
   [[ "${#PROMOTION_ROLLBACK[@]}" -eq 0 ]] && return 0
   for ((i=${#PROMOTION_ROLLBACK[@]}-1; i>=0; i--)); do
@@ -701,11 +701,18 @@ rollback_promoted_tags() {
     previous="${entry#*|}"
     if [[ -n "$previous" ]]; then
       image="${image_tag%:*}"
-      registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null 2>&1 || true
+      if ! registry_promote_tag --prefer-index=false --tag "$image_tag" "${image}@${previous}" >/dev/null; then
+        echo "rollback failed to restore ${image_tag} to ${previous}" >&2
+        failed=1
+      fi
     else
-      registry_delete_tag "$image_tag" >/dev/null 2>&1 || true
+      if ! registry_delete_tag "$image_tag" >/dev/null; then
+        echo "rollback failed to delete ${image_tag}" >&2
+        failed=1
+      fi
     fi
   done
+  return "$failed"
 }
 
 promotion_tag_list() {
@@ -746,9 +753,13 @@ cleanup_promotion_scratch() {
 }
 
 abort_promotion() {
-  rollback_promoted_tags
+  local target="$1" rollback_status=0
+  rollback_promoted_tags || rollback_status=$?
   cleanup_promotion_scratch
-  publish_fail "failed to promote $1"
+  if [[ "$rollback_status" -ne 0 ]]; then
+    publish_fail "failed to promote ${target}; rollback failed"
+  fi
+  publish_fail "failed to promote ${target}"
 }
 
 commit_queued_promotions() {

@@ -282,6 +282,10 @@ fn controller(
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
+        pending_boot_mismatch: std::collections::VecDeque::new(),
+        boot_receipt_attempt: 0,
+        boot_receipt_not_before: None,
+        baked_fallback_installed: None,
         pending_startup: Vec::new(),
         receipt_attempt: 0,
         receipt_not_before: None,
@@ -301,6 +305,8 @@ async fn restart(service: &mut Supervisor) {
     service.persisted_candidate_digest = None;
     service.rollback = None;
     service.pending_failure = None;
+    service.clear_pending_boot_mismatch();
+    service.baked_fallback_installed = None;
     service.pending_startup.clear();
     service.receipt_attempt = 0;
     service.receipt_not_before = None;
@@ -8268,7 +8274,7 @@ async fn boot_repair_refuses(
 async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
     let root = std::env::temp_dir().join(format!("sig-boot-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
-    let (_db, control) = open_launcher_db(&root).await;
+    let (db, control) = open_launcher_db(&root).await;
     for bad in BadSignature::ALL {
         if matches!(bad, BadSignature::Expired) {
             continue;
@@ -8278,6 +8284,10 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
         test_signing().damage(&mut objects, "bot", &release.digest, bad);
         boot_repair_refuses(&control, &root, release, objects, bad.phrase()).await;
     }
+    assert!(
+        db::read_boot_mismatch_map(&db).await.unwrap().is_empty(),
+        "a refused signature must not record a boot mismatch"
+    );
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
@@ -8607,5 +8617,483 @@ async fn cold_start_outage_requires_matching_guild_schema() {
 
     drop(reserved);
     drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+async fn wait_for_ready_file(service: &Supervisor) {
+    let ready = service.running.as_ref().expect("child").ready_file.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tokio::fs::metadata(&ready).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child ready file");
+}
+
+async fn install_for_outage(
+    db: &Db,
+    control: &UpdateControl,
+    release: &ComponentRelease,
+    stamp: i64,
+) {
+    control
+        .checked(
+            &release.component,
+            "latest",
+            Some(release.clone()),
+            None,
+            stamp,
+        )
+        .await
+        .unwrap();
+    db::request_component_install(db, &release.component, &release.digest, stamp)
+        .await
+        .unwrap();
+    control
+        .running(
+            &release.component,
+            Some(release.clone()),
+            fresh_observation(stamp),
+            stamp,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn outage_fallback_keeps_the_installed_release_and_records_the_mismatch() {
+    let root = std::env::temp_dir().join(format!("boot-keep-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let schema = control.schema_version().await.unwrap();
+    let release = release_at("bot", 'c', schema);
+    let stamp = 1_700_000_000;
+    install_for_outage(&db, &control, &release, stamp).await;
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "bot",
+        baked.clone(),
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let state = control.component("bot").await.unwrap();
+    service.restore(&state).await.unwrap();
+    assert_eq!(
+        service.running.as_ref().map(|child| child.path.as_path()),
+        Some(baked.as_path())
+    );
+    assert!(service.running.as_ref().unwrap().release.is_none());
+    let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatch["bot"].reason, "registry unreachable");
+    assert_eq!(mismatch["bot"].expected.release_id, release.release_id);
+    assert_eq!(mismatch["bot"].running, "b".repeat(40));
+    wait_for_ready_file(&service).await;
+    assert!(service.report_ready().await.unwrap());
+    let kept = control.component("bot").await.unwrap();
+    assert_eq!(kept.installed.unwrap().digest, release.digest);
+    assert_eq!(kept.installed_at, Some(stamp));
+    assert!(kept.previous.is_none());
+    assert!(
+        db::read_boot_mismatch_map(&db)
+            .await
+            .unwrap()
+            .contains_key("bot")
+    );
+
+    service.stop_application().await.unwrap();
+    let installed_path = root.join("installed-bot");
+    tokio::fs::copy(&baked, &installed_path).await.unwrap();
+    service
+        .start(&installed_path, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    wait_for_ready_file(&service).await;
+    assert!(service.report_ready().await.unwrap());
+    let restored = control.component("bot").await.unwrap();
+    assert_eq!(restored.installed.unwrap().digest, release.digest);
+    assert_eq!(restored.installed_at, Some(stamp));
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    service.stop_application().await.unwrap();
+    drop(reserved);
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn outage_fallback_rollback_keeps_the_installed_release() {
+    let root = std::env::temp_dir().join(format!("boot-rollback-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let schema = control.schema_version().await.unwrap();
+    let release = release_at("bot", 'c', schema);
+    let stamp = 1_700_000_000;
+    install_for_outage(&db, &control, &release, stamp).await;
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "bot",
+        baked,
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let state = control.component("bot").await.unwrap();
+    service.restore(&state).await.unwrap();
+    wait_for_ready_file(&service).await;
+    let failed = release_at("bot", 'd', schema);
+    service.rollback = Some((failed, "spawn: replacement failed".into()));
+    assert!(service.report_ready().await.unwrap());
+    let kept = control.component("bot").await.unwrap();
+    assert_eq!(kept.installed.unwrap().digest, release.digest);
+    assert_eq!(kept.installed_at, Some(stamp));
+    service.stop_application().await.unwrap();
+    drop(reserved);
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
+    let root = std::env::temp_dir().join(format!(
+        "boot-immediate-rollback-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let desired = executable(&root, "desired-bot").await;
+    let mut objects = HashMap::new();
+    let mut candidate = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(&desired).await.unwrap(),
+    );
+    candidate.min_schema = db::CORE_SCHEMA_VERSION;
+    candidate.max_schema = db::CORE_SCHEMA_VERSION;
+    candidate.result_schema = db::CORE_SCHEMA_VERSION;
+    candidate.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let (db, control) = open_launcher_db(&root).await;
+    let schema = control.schema_version().await.unwrap();
+    let release = release_at("bot", 'c', schema);
+    let stamp = 1_700_000_000;
+    install_for_outage(&db, &control, &release, stamp).await;
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "bot",
+        baked,
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let state = control.component("bot").await.unwrap();
+    service.restore(&state).await.unwrap();
+    wait_for_ready_file(&service).await;
+    assert!(service.report_ready().await.unwrap());
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, now())
+        .await
+        .unwrap();
+    service.registry = registry;
+    tokio::fs::write(root.join("hold-desired-bot-ready"), "hold")
+        .await
+        .unwrap();
+    assert!(!service.normal().await.unwrap());
+    assert_eq!(
+        service
+            .running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        candidate.digest
+    );
+    let elapsed = READY_TIMEOUT + Duration::from_secs(1);
+    let child = service.running.as_mut().unwrap();
+    child.started_at = now() - elapsed.as_secs() as i64;
+    child.started = Instant::now() - elapsed;
+    assert!(!service.normal().await.unwrap());
+    let kept = control.component("bot").await.unwrap();
+    assert_eq!(kept.installed.as_ref().unwrap().digest, release.digest);
+    assert_eq!(kept.installed_at, Some(stamp));
+    assert!(service.running.as_ref().unwrap().release.is_none());
+    assert_eq!(service.running.as_ref().unwrap().path, service.baked);
+    wait_for_ready_file(&service).await;
+    assert!(service.report_ready().await.unwrap());
+    let kept = control.component("bot").await.unwrap();
+    assert_eq!(kept.installed.unwrap().digest, release.digest);
+    assert_eq!(kept.installed_at, Some(stamp));
+    service.stop_application().await.unwrap();
+    drop(reserved);
+    server.abort();
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+struct OlderBootWriter {
+    addr: std::net::SocketAddr,
+    secret: String,
+    fail_activation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    diagnostic_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OlderBootWriter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn older_boot_writer() -> OlderBootWriter {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let secret = "x".repeat(32);
+    let key = jmodguard::control::load_writer_key(&secret).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fail_activation = std::sync::Arc::new(AtomicBool::new(false));
+    let diagnostic_requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let requests = std::sync::Arc::clone(&diagnostic_requests);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let fail_flag = std::sync::Arc::clone(&fail_activation);
+    let stop_flag = std::sync::Arc::clone(&stop);
+    listener.set_nonblocking(true).unwrap();
+    let thread = std::thread::spawn(move || {
+        let nonces = std::sync::Mutex::new(jmodguard::control::NonceWindow::new());
+        while !stop_flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let Ok(body) = jmodguard::control::read_frame(&mut stream) else {
+                        continue;
+                    };
+                    let reply = match jmodguard::control::open_frame(&key, &body, &nonces) {
+                        Ok((op, ..)) => {
+                            let unsupported = matches!(
+                                op,
+                                db::ControlOp::RecordBootMismatch { .. }
+                                    | db::ControlOp::ClearBootMismatch { .. }
+                            );
+                            if unsupported {
+                                requests.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if unsupported
+                                || (fail_flag.load(Ordering::Relaxed)
+                                    && matches!(op, db::ControlOp::RecordComponentRunning { .. }))
+                            {
+                                db::ControlReply::Failed {
+                                    message: "write failed".into(),
+                                    code: None,
+                                }
+                            } else {
+                                db::ControlReply::Saved {
+                                    body: serde_json::Value::Null,
+                                }
+                            }
+                        }
+                        Err(error) => db::ControlReply::Failed {
+                            message: jmodguard::control::public_error(&error),
+                            code: None,
+                        },
+                    };
+                    let _ = jmodguard::control::write_frame(&mut stream, &reply);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    OlderBootWriter {
+        addr,
+        secret,
+        fail_activation,
+        diagnostic_requests,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+#[tokio::test]
+async fn older_writer_boot_receipt_does_not_block_api_startup() {
+    let root =
+        std::env::temp_dir().join(format!("boot-older-writer-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let (db, writer) = open_launcher_db(&root).await;
+    let schema = writer.schema_version().await.unwrap();
+    let release = release_at("api", 'c', schema);
+    let stamp = 1_700_000_000;
+    install_for_outage(&db, &writer, &release, stamp).await;
+    let peer = older_boot_writer();
+    let link = jmodguard::control::try_writer_link(&peer.addr.to_string(), &peer.secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&root.join("core.db")))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    assert!(!control.writes_locally());
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "api",
+        baked.clone(),
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let started = service.normal().await;
+    assert!(
+        started.is_ok(),
+        "outage fallback must start when the bot writer does not know the mismatch op: {started:?}"
+    );
+    assert_eq!(
+        service.running.as_ref().map(|child| child.path.as_path()),
+        Some(baked.as_path())
+    );
+    assert!(service.running.as_ref().unwrap().release.is_none());
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    assert!(matches!(
+        service.pending_boot_mismatch.front(),
+        Some(PendingBootMismatch::Record { .. })
+    ));
+
+    wait_for_ready_file(&service).await;
+    // Exercise the production ordering: retry diagnostics before readiness.
+    // Make each poll retry-eligible without waiting for the backoff in real time.
+    for _ in 0..3 {
+        service.receipt_not_before = None;
+        service.boot_receipt_not_before = None;
+        let before = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        service.tick_control().await.unwrap();
+        assert!(service.reported, "pending Record must not starve readiness");
+        assert!(matches!(
+            service.pending_boot_mismatch.front(),
+            Some(PendingBootMismatch::Record { .. })
+        ));
+        let after = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+        service.tick_control().await.unwrap();
+        assert_eq!(
+            peer.diagnostic_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "unsupported Record must remain deferred even after readiness succeeds"
+        );
+    }
+    service.stop_application().await.unwrap();
+    let installed = root.join("installed-api");
+    tokio::fs::copy(&baked, &installed).await.unwrap();
+    service
+        .start(&installed, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    wait_for_ready_file(&service).await;
+    // Managed readiness must proceed while the outage record is still deferred.
+    let ready = service.tick_control().await;
+    assert!(
+        ready.is_ok(),
+        "clearing a mismatch the older writer cannot store must not fail readiness: {ready:?}"
+    );
+    assert_eq!(
+        service
+            .running
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .digest,
+        release.digest
+    );
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    assert!(matches!(
+        service.pending_boot_mismatch.back(),
+        Some(PendingBootMismatch::Clear)
+    ));
+
+    assert!(service.reported);
+    // A later managed child must also report readiness when Clear is retried first.
+    service.stop_application().await.unwrap();
+    service
+        .start(&installed, &release.source_sha, Some(release.clone()))
+        .await
+        .unwrap();
+    wait_for_ready_file(&service).await;
+    for _ in 0..3 {
+        service.receipt_not_before = None;
+        service.boot_receipt_not_before = None;
+        let before = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        service.tick_control().await.unwrap();
+        assert!(service.reported, "pending Clear must not starve readiness");
+        assert!(matches!(
+            service.pending_boot_mismatch.front(),
+            Some(PendingBootMismatch::Clear)
+        ));
+        let after = peer
+            .diagnostic_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "the pending Clear must have been retried");
+        service.tick_control().await.unwrap();
+        assert_eq!(
+            peer.diagnostic_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "unsupported Clear must remain deferred even after readiness succeeds"
+        );
+    }
+
+    peer.fail_activation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let error = control
+        .running(
+            "api",
+            Some(release.clone()),
+            fresh_observation(now()),
+            now(),
+        )
+        .await
+        .expect_err("an activation write failure stays a hard error");
+    assert!(!error.is::<db::ReceiptNotSaved>(), "{error:#}");
+    assert_eq!(error.to_string(), "write failed");
+
+    service.stop_application().await.unwrap();
+    drop(reserved);
+    drop(peer);
+    drop((service, control, writer, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
