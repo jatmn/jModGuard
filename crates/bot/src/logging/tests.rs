@@ -4273,3 +4273,140 @@ fn rejoin_note_leave_clears_member_state() {
     assert!(!deliveries.pending_redelivery(9, 8, "stay-leave"));
     assert!(deliveries.begin_attempt(9, 8, "stay-leave"));
 }
+
+fn remember_delete(app: &BotState, message: u64, at: std::time::Instant) {
+    app.automod_delete_marks.lock().remember(
+        789,
+        456,
+        message,
+        crate::automod_delete_marks::AutomodDeleteMark {
+            rule_id: "badword".into(),
+            rule_name: "Bad words".into(),
+            reason: "blocked term".into(),
+        },
+        at,
+    );
+}
+
+#[test]
+fn live_mark_reports_automod_delete_once() {
+    let path = std::env::temp_dir().join(format!(
+        "log_automod_del_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let now = std::time::Instant::now();
+    remember_delete(&app, 123, now);
+    remember_message(&app, 789, 456, 123, Some(77), Some("hello there"), None);
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.event, "automod_delete");
+    assert_eq!(report.vars["rule"], "Bad words");
+    assert_eq!(report.vars["rule_id"], "badword");
+    assert_eq!(report.vars["reason"], "blocked term");
+    assert_eq!(report.vars["message_id"], "123");
+    assert_eq!(report.vars["user_id"], "77");
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
+    let rendered = templates::render(default_template(report.event), &report.vars);
+    assert!(rendered.contains("Bad words"));
+    assert!(rendered.contains("badword"));
+    assert!(rendered.contains("123"));
+    assert!(rendered.contains("blocked term"));
+    let again = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(again.event, "message_delete");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn expired_mark_stays_a_plain_delete() {
+    let path = std::env::temp_dir().join(format!(
+        "log_automod_exp_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let expired = std::time::Instant::now()
+        - crate::automod_delete_marks::TTL
+        - std::time::Duration::from_secs(1);
+    remember_delete(&app, 123, expired);
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.event, "message_delete");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn automod_delete_falls_back_to_message_delete_channel_and_ignores() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    let guild = GuildId::new(789);
+    let vars = BTreeMap::from([
+        ("rule".into(), "Bad words".into()),
+        ("rule_id".into(), "badword".into()),
+        ("reason".into(), "blocked term".into()),
+        ("message_id".into(), "123".into()),
+        ("user_id".into(), "77".into()),
+        ("channel_id".into(), "88".into()),
+        ("channel".into(), "<#88>".into()),
+    ]);
+    assert_eq!(
+        emit_to(&f.app, &sink, guild, "automod_delete", vars.clone()).await,
+        Delivery::Sent
+    );
+    assert_eq!(sink.messages.lock().unwrap()[0].0, ChannelId::new(456));
+    sink.messages.lock().unwrap().clear();
+
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_delete',?1)",
+                db::params![r#"{"users":["77"],"channels":[]}"#],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    assert_eq!(
+        emit_to(&f.app, &sink, guild, "automod_delete", vars.clone()).await,
+        Delivery::Unconfigured
+    );
+    assert!(sink.messages.lock().unwrap().is_empty());
+
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "UPDATE log_filters SET data=?1 WHERE guild_id=789 AND event_type='message_delete'",
+                db::params![r#"{"users":[],"channels":["88"]}"#],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    assert_eq!(
+        emit_to(&f.app, &sink, guild, "automod_delete", vars).await,
+        Delivery::Unconfigured
+    );
+    assert!(sink.messages.lock().unwrap().is_empty());
+}
