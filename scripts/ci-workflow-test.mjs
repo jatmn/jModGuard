@@ -433,11 +433,12 @@ try {
   assert.ok(lines.includes("promote " + botRef + " " + nextDigest));
   assert.ok(lines.includes("promote " + apiRef + " " + nextDigest));
   assert.ok(lines.includes("promote-fail " + webRef));
-  const webRestore = lines.indexOf("restore " + webRef + " " + oldWeb);
+  assert.equal(lines.includes("restore " + webRef + " " + oldWeb), false,
+    "a failed write that left the original digest must not rewrite that tag");
   const apiDelete = lines.indexOf("delete " + apiRef);
   const botRestore = lines.indexOf("restore " + botRef + " " + oldBot);
-  assert.ok(webRestore !== -1 && apiDelete !== -1 && botRestore !== -1, lines.join(" | "));
-  assert.ok(webRestore < apiDelete && apiDelete < botRestore, "rollback must undo the newest tag first");
+  assert.ok(apiDelete !== -1 && botRestore !== -1, lines.join(" | "));
+  assert.ok(apiDelete < botRestore, "rollback must undo the newest changed tag first");
 } finally {
   fs.rmSync(atomicDir, { recursive: true, force: true });
 }
@@ -454,6 +455,100 @@ function runPromotionScript(script, env = {}) {
   fs.rmSync(dir, { recursive: true, force: true });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr, trace: traceText };
 }
+
+// Run the actual workflow shell and publisher entry points. Only external signing,
+// request metadata and registry I/O are simulated; queue/commit/rollback stay real.
+function runPromoteJob(mode) {
+  return runPromotionScript(`
+set -euo pipefail
+export JMODGUARD_PUBLISH_PHASE=sign
+export RUNNER_TEMP="$TMPDIR"
+source() {
+  builtin source "$@"
+  checked_request() { printf 'main\\t\\t%s\\n' "$SHA"; }
+  read_plan() { printf '%s\\t\\n' "$SHA"; }
+  read_publish_handoff() { return 1; }
+  read_publish_state() { return 1; }
+  require_signing_secrets() { :; }
+  validate_signing_key_pair() { :; }
+  capture_signing_secrets() { :; }
+  ensure_signing_secrets_captured() { :; }
+  persist_signing_secrets_to_files() { :; }
+  redact_tokens() { :; }
+  run_docker() { cat >/dev/null; }
+  sign_published_digest() {
+    printf 'sign %s\\n' "$1" >>"$TRACE"
+    [[ "$MODE" != sign-fail || "$1" != webui ]] || return 1
+  }
+  clear_publish_state() { printf 'clear %s\\n' "$1" >>"$TRACE"; }
+  declare -g -A CUR=()
+  inspect_digest() {
+    printf 'inspect %s\\n' "$1" >>"$TRACE"
+    if [[ "$1" == *:_publish-* ]]; then printf '%s\\t10\\n' "$NEW"; return; fi
+    if [[ "$MODE" == newer-absent && "$1" == "ghcr.io/jatmn/jmodguard-bot:$SHA" && -z "\${CUR[$1]+x}" ]]; then return 2; fi
+    printf '%s\\t10\\n' "\${CUR[$1]:-$OLD}"
+  }
+  registry_delete_tag() { printf 'delete %s\\n' "$1" >>"$TRACE"; }
+  registry_promote_tag() {
+    local ref="$3" digest="\${4#*@}"
+    printf 'write %s %s\\n' "$ref" "$digest" >>"$TRACE"
+    CUR["$ref"]="$digest"
+    if [[ "$digest" == "$NEW" && "$ref" == *jmodguard-api:* ]]; then
+      case "$MODE" in
+        INT|TERM) kill -s "$MODE" "$BASHPID" ;;
+        exit) exit 7 ;;
+        newer|newer-absent)
+          CUR["ghcr.io/jatmn/jmodguard-bot:$SHA"]="$OTHER"
+          return 1 ;;
+      esac
+    fi
+  }
+}
+${promoteScript}
+`, {
+    MODE: mode, SHA: "a".repeat(40), OLD: oldBot, NEW: nextDigest, OTHER: oldWeb,
+    GHCR_USERNAME: "test-publisher", GHCR_TOKEN: "test-token",
+  });
+}
+for (const mode of ["success", "sign-fail", "INT", "TERM", "exit", "newer", "newer-absent"]) {
+  const result = runPromoteJob(mode);
+  const lines = result.trace.trim().split("\n");
+  const writes = lines.filter(line => line.startsWith("write "));
+  if (mode === "sign-fail") {
+    assert.notEqual(result.status, 0, result.stderr);
+    assert.deepEqual(writes, [], "a later signing failure must leave every tag unchanged");
+    continue;
+  }
+  const firstWrite = lines.findIndex(line => line.startsWith("write "));
+  for (const component of matrixComponents) {
+    const signedAt = lines.indexOf(`sign ${component}`);
+    const resolvedAt = lines.indexOf(`inspect ghcr.io/jatmn/jmodguard-${component}:latest`);
+    assert.ok(signedAt >= 0 && signedAt < firstWrite, result.trace);
+    assert.ok(resolvedAt >= 0 && resolvedAt < firstWrite, result.trace);
+  }
+  if (mode === "success") {
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(writes, matrixComponents.flatMap(component => ["a".repeat(40), "latest"]
+      .map(tag => `write ghcr.io/jatmn/jmodguard-${component}:${tag} ${nextDigest}`)));
+    assert.equal(lines.filter(line => line.startsWith("clear ")).length, 3);
+  } else {
+    assert.notEqual(result.status, 0, result.stderr);
+    const restored = writes.filter(line => line.endsWith(oldBot));
+    const expected = [
+      `write ghcr.io/jatmn/jmodguard-api:${"a".repeat(40)} ${oldBot}`,
+      `write ghcr.io/jatmn/jmodguard-bot:latest ${oldBot}`,
+      `write ghcr.io/jatmn/jmodguard-bot:${"a".repeat(40)} ${oldBot}`,
+    ];
+    assert.deepEqual(restored, mode.startsWith("newer") ? expected.slice(0, 2) : expected, result.trace);
+    assert.equal(lines.some(line => line.startsWith("clear ")), false);
+    if (mode.startsWith("newer")) {
+      assert.match(result.stderr, /rollback skipped .* changed since promotion/);
+      assert.equal(lines.some(line => line.startsWith("delete ")), false,
+        "rollback must not delete a newer tag even when the original tag was absent");
+    }
+  }
+}
+
 const keptDigest = "sha256:" + "a".repeat(64);
 const nextKept = "sha256:" + "c".repeat(64);
 const inspectError = runPromotionScript([
@@ -586,6 +681,7 @@ fi
 `);
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/bash
 printf '%s\\n' "\$*" >>${JSON.stringify(dockerLog)}
+if [[ "$1 $2" == "buildx build" ]]; then exit ${options.pushStatus || 0}; fi
 exit 0
 `);
   fs.chmodSync(path.join(bin, "gh"), 0o755);
@@ -759,6 +855,13 @@ const deletePushed = deleteFailed.dockerText.indexOf("--push");
 const deleteRestored = deleteFailed.dockerText.indexOf("imagetools create");
 assert.ok(deletePushed !== -1 && deleteRestored > deletePushed, deleteFailed.dockerText);
 assert.match(deleteFailed.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
+const pushFailed = runRegistryDelete(stagedTag, sharedThen([
+  packageVersion(21, [stagingName], preservedDigest),
+  packageVersion(99, [stagedTag]),
+]), { pushStatus: 1 });
+assert.notEqual(pushFailed.status, 0);
+assert.match(pushFailed.dockerText, new RegExp(`imagetools create --prefer-index=false --tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
+assert.equal(pushFailed.calls.some(call => call.method === "DELETE"), false);
 const manyVersions = runRegistryDelete(singleTag, [[
   [packageVersion(11, [singleTag])],
   [packageVersion(13, [singleTag])],
