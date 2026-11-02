@@ -168,6 +168,19 @@ jobs:
           JMODGUARD_PUBLISH_PHASE: build
           JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
         run: bash scripts/publish-image.sh "$COMPONENT"
+      - name: Record successful component build
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          dir="${RUNNER_TEMP}/publish-build-ok"
+          mkdir -p "$dir"
+          printf '%s\n' "$COMPONENT" > "$dir/ok"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: publish-build-ok-${{ matrix.component }}
+          path: ${{ runner.temp }}/publish-build-ok/ok
+          if-no-files-found: error
+          retention-days: 1
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
@@ -176,8 +189,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-  publish-sign:
-    name: Publish sign / ${{ matrix.component }}
+  publish-promote:
+    name: Promote images
     needs: [ci, release, prepare-publication, release-ci, publish-build]
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
@@ -187,17 +200,13 @@ jobs:
        (needs.release-ci.result == 'skipped' &&
         (needs.prepare-publication.outputs.release_sha == '' ||
          needs.prepare-publication.outputs.release_sha == github.sha)))
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [bot, api, webui]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
     concurrency:
-      group: publish-sign-${{ matrix.component }}
+      group: publish-promote
       cancel-in-progress: false
     env:
       GITHUB_TOKEN: ${{ github.token }}
@@ -218,14 +227,28 @@ jobs:
           package-manager-cache: false
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: publish-state-${{ matrix.component }}
-          path: ${{ runner.temp }}/jmodguard-publish-state
+          pattern: publish-build-ok-*
+          path: ${{ runner.temp }}/publish-build-ok
+      - name: Require every component build
+        run: |
+          set -euo pipefail
+          for component in bot api webui; do
+            test -s "${RUNNER_TEMP}/publish-build-ok/publish-build-ok-${component}/ok"
+          done
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: publish-state-*
+          path: ${{ runner.temp }}/publish-states
       - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
-      - name: Sign and promote component image
+      - name: Sign and promote every component
         env:
-          COMPONENT: ${{ matrix.component }}
           JMODGUARD_PUBLISH_PHASE: sign
-          JMODGUARD_PUBLISH_STATE_DIR: ${{ runner.temp }}/jmodguard-publish-state
           JMODGUARD_UPDATE_SIGNING_KEY: ${{ secrets.JMODGUARD_UPDATE_SIGNING_KEY }}
           JMODGUARD_UPDATE_SIGNING_PASSWORD: ${{ secrets.JMODGUARD_UPDATE_SIGNING_PASSWORD }}
-        run: bash scripts/publish-image.sh "$COMPONENT"
+        run: |
+          set -euo pipefail
+          for component in bot api webui; do
+            COMPONENT="$component" \
+            JMODGUARD_PUBLISH_STATE_DIR="${RUNNER_TEMP}/publish-states/publish-state-${component}" \
+              bash scripts/publish-image.sh "$component"
+          done

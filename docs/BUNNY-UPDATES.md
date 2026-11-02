@@ -108,6 +108,8 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
+The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. The same check runs when boot repair downloads the installed release. An unsigned image, a wrong signature, an expired signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, `expired image signature`, or `image signature used an untrusted key`.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
