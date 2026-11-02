@@ -1699,7 +1699,7 @@ fn dispatch_observed_report(app: &Arc<BotState>, context: &Context, report: Mess
         let context = context.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            logging::emit(&app, &context, report.guild_id, report.event, report.vars).await;
+            logging::emit_message_report(&app, context.http.as_ref(), report, None).await;
         });
         return;
     }
@@ -1711,15 +1711,13 @@ fn dispatch_delivery_admitted_report(
     context: &Context,
     report: MessageReport,
 ) {
-    let Ok(permit) = Arc::clone(&app.log_delivery_slots).try_acquire_owned() else {
-        logging::record_delivery_failure(app);
+    let Some(reservation) = logging::reserve_log_delivery(app) else {
         return;
     };
     let app = Arc::clone(app);
     let context = context.clone();
     tokio::spawn(async move {
-        let _permit = permit;
-        logging::emit_held(&app, &context, report.guild_id, report.event, report.vars).await;
+        logging::emit_message_report(&app, context.http.as_ref(), report, Some(reservation)).await;
     });
 }
 
@@ -1828,7 +1826,7 @@ async fn submit_peeled_bulk_deletes_admitted(
     // This task already holds the report permit. Emit peeled automod reports
     // here instead of acquiring a second report slot.
     for report in peeled {
-        logging::emit(app, context, report.guild_id, report.event, report.vars).await;
+        logging::emit_message_report(app, context.http.as_ref(), report, None).await;
     }
     let pending = transcript.pending_automod.clone();
     if !transcript.worth_sending() {
@@ -3449,6 +3447,7 @@ mod tests {
             attachments_supplied: false,
         };
         let mut report = MessageReport {
+            retained_expiries: Default::default(),
             guild_id: GuildId::new(1),
             event: "message_edit",
             vars: std::collections::BTreeMap::new(),

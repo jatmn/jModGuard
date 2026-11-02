@@ -1758,6 +1758,7 @@ promote_image_tag "$ROLLBACK_IMAGE" "${HEAD_SHA}" "$ROLLBACK_DIGEST" \
   || fail 'first promotion must succeed'
 ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_DIGEST"
 [[ "${#PROMOTION_ROLLBACK[@]}" -eq 1 ]] || fail 'first promotion must record rollback state'
+ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:latest"]="$ROLLBACK_PREV"
 if promote_image_tag "$ROLLBACK_IMAGE" latest "$ROLLBACK_DIGEST"; then
   fail 'second promotion must fail when digest verification mismatches'
 fi
@@ -1841,7 +1842,8 @@ docker() {
   echo "unexpected docker $*" >&2
   return 1
 }
-PROMOTION_ROLLBACK=("${ABORT_DELETE_TAG}|" "${ABORT_RESTORE_TAG}|${ABORT_PREV}")
+inspect_digest() { printf '%s\t10\n' "$MOCK_BUILD_DIGEST"; }
+PROMOTION_ROLLBACK=("${ABORT_DELETE_TAG}||${MOCK_BUILD_DIGEST}" "${ABORT_RESTORE_TAG}|${ABORT_PREV}|${MOCK_BUILD_DIGEST}")
 PROMOTION_SCRATCHES=("$ABORT_SCRATCH")
 set +e
 abort_output="$(
