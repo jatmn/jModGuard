@@ -861,21 +861,12 @@ mod tests {
             "automod_delete" => ActivityReport {
                 event: "automod_delete",
                 vars: BTreeMap::from([
-                    ("channel".into(), "<#456>".into()),
-                    (
-                        "message_url".into(),
-                        "https://discord.com/channels/789/456/123".into(),
-                    ),
-                    ("mention".into(), "<@42>".into()),
                     ("rule".into(), "Spam rule".into()),
-                    ("rule_id".into(), "spam".into()),
-                    ("time".into(), chrono::Utc::now().to_rfc3339()),
-                    ("content".into(), "(redacted)".into()),
-                    ("attachments".into(), "none".into()),
-                    (
-                        "coverage".into(),
-                        "last observed; observation gap or restart".into(),
-                    ),
+                    ("rule_id".into(), "repeat_text".into()),
+                    ("reason".into(), "repeated text".into()),
+                    ("message_id".into(), "123".into()),
+                    ("channel".into(), "<#456>".into()),
+                    ("time".into(), "2020-01-01T00:00:00+00:00".into()),
                 ]),
             },
             "member_rejoin" => ActivityReport {
@@ -907,20 +898,10 @@ mod tests {
             assert!(rendered.encode_utf16().count() <= 2000, "{event}");
             assert!(!rendered.contains("{user}"), "{event}: {rendered}");
             assert!(!rendered.contains("message body"), "{event}");
-            if event == "automod_delete" {
-                assert!(rendered.contains("**Last observed text:**"), "{rendered}");
-                assert!(
-                    rendered.contains("**Coverage:** last observed; observation gap or restart"),
-                    "{rendered}"
-                );
-                assert!(!rendered.contains("{coverage}"), "{rendered}");
-            }
-            if event != "automod_delete" {
-                assert!(
-                    !report.vars.contains_key("content"),
-                    "{event} must not carry message text"
-                );
-            }
+            assert!(
+                !report.vars.contains_key("content"),
+                "{event} must not carry message text"
+            );
         }
     }
 

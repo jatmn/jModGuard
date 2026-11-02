@@ -1426,15 +1426,23 @@ impl EventHandler for Handler {
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        if !hooked
-            && let Some(report) = logging::observed_delete_report(
-                &self.app,
-                guild_id,
-                channel_id,
-                deleted_message_id,
-                None,
-            )
-        {
+        if !hooked {
+            let report = if let Some(mark) = self.app.automod_delete_marks.lock().take_live(
+                guild_id.get(),
+                channel_id.get(),
+                deleted_message_id.get(),
+                Instant::now(),
+            ) {
+                logging::automod_delete_report(
+                    &self.app,
+                    guild_id,
+                    channel_id,
+                    deleted_message_id,
+                    &mark,
+                )
+            } else {
+                logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id)
+            };
             logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
         }
     }
@@ -1472,57 +1480,11 @@ impl EventHandler for Handler {
         }
         if !hooked {
             let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
-            let cfg = self
-                .app
-                .configs
-                .get(&self.app.db, guild_id.get())
-                .await
-                .ok();
-            let automod_individual = cfg
-                .as_ref()
-                .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
             let mut transcript = logging::BulkTranscript::new(ids.len());
-            let peeled = crate::snapshot_capture::peel_automod_bulk_chunk(
-                &self.app,
-                guild_id,
-                channel_id,
-                &ids,
-                &mut transcript,
-                automod_individual,
-            );
-            for report in peeled {
-                logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
+            for id in ids {
+                transcript.push_unknown(id);
             }
-            let pending = transcript.pending_automod.clone();
-            if transcript.worth_sending() {
-                if !pending.is_empty() {
-                    logging::begin_bulk_delivery(&self.app, guild_id, channel_id, &pending);
-                }
-                let outcome =
-                    logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript)
-                        .await;
-                if !pending.is_empty() {
-                    logging::settle_bulk_delivery(
-                        &self.app,
-                        ctx.http.as_ref(),
-                        guild_id,
-                        channel_id,
-                        &pending,
-                        outcome,
-                    )
-                    .await;
-                }
-            } else if !pending.is_empty() {
-                logging::settle_bulk_delivery(
-                    &self.app,
-                    ctx.http.as_ref(),
-                    guild_id,
-                    channel_id,
-                    &pending,
-                    logging::BulkDeliveryOutcome::Failed,
-                )
-                .await;
-            }
+            logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript).await;
         }
     }
 
