@@ -615,34 +615,37 @@ function runRegistryDelete(tag, responses, options = {}) {
   const bin = path.join(dir, "bin");
   const ghLog = path.join(dir, "gh.log");
   const dockerLog = path.join(dir, "docker.log");
+  const timeoutLog = path.join(dir, "timeout.log");
+  const pagesLog = path.join(dir, "pages.log");
   const statusFile = path.join(dir, "status");
   const responsesFile = path.join(dir, "responses.json");
   const stateFile = path.join(dir, "state");
   fs.mkdirSync(bin);
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
-  if (options.stallFrom) {
-    const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
-    assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
-    fs.symlinkSync(timeoutCommand.stdout.trim(), path.join(bin, "real-timeout"));
-    // Exercise the real timeout with a shorter deadline, keeping production's arguments checked.
-    fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
+  const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
+  assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
+  fs.symlinkSync(timeoutCommand.stdout.trim(), path.join(bin, "real-timeout"));
+  // Record production arguments in every case; shorten only the stalling cases.
+  fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
 set -euo pipefail
-[[ "$1" == --kill-after=5s && "$2" == 60s ]] || exit 2
-shift 2
-exec real-timeout --kill-after=1s 1s "$@"
+printf '%s\\n' "$*" >>${JSON.stringify(timeoutLog)}
+${options.stallFrom ? 'shift 2\nexec real-timeout --kill-after=1s 1s "$@"' : 'exec real-timeout "$@"'}
 `);
-    fs.chmodSync(path.join(bin, "timeout"), 0o755);
-  }
+  fs.chmodSync(path.join(bin, "timeout"), 0o755);
   fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
-    'import { readFileSync } from "node:fs";',
+    'import { appendFileSync, readFileSync } from "node:fs";',
+    'import { setTimeout } from "node:timers/promises";',
     'const responses = JSON.parse(readFileSync(process.argv[2], "utf8"));',
     'const index = Number(process.argv[3]);',
     'const emitAll = process.argv[4] === "1";',
     'const entry = responses[Math.min(index, responses.length) - 1];',
     'const multi = Array.isArray(entry) && entry.length > 0 && entry.every((item) => Array.isArray(item));',
     'const pages = multi ? entry : [entry];',
-    'for (const page of emitAll ? pages : pages.slice(0, 1)) {',
+    'const stall = Number(process.argv[5]) > 0 && index >= Number(process.argv[5]);',
+    'for (const [pageIndex, page] of (emitAll ? pages : pages.slice(0, 1)).entries()) {',
     '  process.stdout.write(JSON.stringify(page) + "\\n");',
+    '  appendFileSync(process.argv[6], `${index}:${pageIndex + 1}\\n`);',
+    '  if (stall && emitAll && pageIndex === 0 && pages.length > 1) await setTimeout(5000);',
     '}',
     '',
   ].join("\n"));
@@ -674,11 +677,7 @@ n=\$((n + 1))
 printf '%s' "\$n" >${JSON.stringify(stateFile)}
 emit_all=0
 if [[ "\$has_paginate" == 1 && "\$has_per_page" == 1 ]]; then emit_all=1; fi
-node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all"
-# Emit a valid partial result before stalling on a later page.
-if [[ ${options.stallFrom || 0} -gt 0 && "\$n" -ge ${options.stallFrom || 0} ]]; then
-  exec sleep 5
-fi
+node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all" ${options.stallFrom || 0} ${JSON.stringify(pagesLog)}
 `);
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/bash
 printf '%s\\n' "\$*" >>${JSON.stringify(dockerLog)}
@@ -717,9 +716,15 @@ exit 0
   const tokens = [...ghText.matchAll(/^token=(.*)$/gm)].map(match => match[1]);
   const dockerText = fs.existsSync(dockerLog) ? fs.readFileSync(dockerLog, "utf8") : "";
   const status = Number(fs.readFileSync(statusFile, "utf8").trim());
+  const timeoutCalls = fs.existsSync(timeoutLog) ? fs.readFileSync(timeoutLog, "utf8").trim().split("\n") : [];
+  const pages = fs.readFileSync(pagesLog, "utf8").trim().split("\n");
+  assert.equal(timeoutCalls.length, calls.filter(call => call.method === "GET").length);
+  for (const call of timeoutCalls) {
+    assert.match(call, /^--kill-after=5s 60s gh api --paginate /);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(result.error, undefined, result.error && result.error.message);
-  return { status, calls, args, tokens, dockerText, stdout: result.stdout, stderr: result.stderr };
+  return { status, calls, args, tokens, pages, dockerText, stdout: result.stdout, stderr: result.stderr };
 }
 function assertUserPackageRoute(outcome) {
   assert.ok(outcome.calls.length > 0, outcome.stderr || outcome.stdout);
@@ -750,8 +755,12 @@ assert.deepEqual(single.calls, [
   { method: "DELETE", path: `${versionsRoot}/11` },
 ]);
 assert.equal(single.dockerText, "");
-const timedOutInitial = runRegistryDelete(singleTag, [[packageVersion(11, [singleTag])]], { stallFrom: 1 });
+const timedOutInitial = runRegistryDelete(singleTag, [[
+  [packageVersion(11, [singleTag])],
+  [packageVersion(12, [singleTag])],
+]], { stallFrom: 1 });
 assertUserPackageRoute(timedOutInitial);
+assert.deepEqual(timedOutInitial.pages, ["1:1"], "the same paginate invocation must stall before its second page");
 assert.notEqual(timedOutInitial.status, 0, "a timed-out partial list must fail");
 assert.deepEqual(timedOutInitial.calls, [{ method: "GET", path: versionsList }]);
 assert.equal(timedOutInitial.dockerText, "", "a partial list must not mutate registry tags");
@@ -824,10 +833,11 @@ function assertNoPartialUntag(outcome, message) {
   assert.match(outcome.dockerText, new RegExp(`--tag ghcr\\.io/jatmn/jmodguard-bot:${stagedTag} ghcr\\.io/jatmn/jmodguard-bot@${preservedDigest}`));
 }
 const timedOutDetached = runRegistryDelete(stagedTag, sharedThen([
-  packageVersion(21, [stagingName], preservedDigest),
-  packageVersion(99, [stagedTag]),
+  [packageVersion(21, [stagingName], preservedDigest), packageVersion(99, [stagedTag])],
+  [packageVersion(100, [stagedTag])],
 ]), { stallFrom: 2 });
 assertNoPartialUntag(timedOutDetached, /package version list failed/);
+assert.deepEqual(timedOutDetached.pages, ["1:1", "2:1", "3:1", "4:1"], "each retry must stall before its second page");
 assert.equal(timedOutDetached.calls.filter(call => call.method === "GET").length, 4);
 const noDisposable = runRegistryDelete(stagedTag, sharedThen([
   [packageVersion(21, [stagingName], preservedDigest)],
@@ -849,8 +859,10 @@ assert.match(deleteFailed.stderr, /disposable package version 99 could not be de
 assert.match(deleteFailed.stderr, new RegExp(`restored to ${preservedDigest}`));
 assert.deepEqual(deleteFailed.calls, [
   { method: "GET", path: versionsList },
-  { method: "GET", path: versionsList },
-  { method: "DELETE", path: `${versionsRoot}/99` },
+  ...Array.from({ length: 3 }, () => [
+    { method: "GET", path: versionsList },
+    { method: "DELETE", path: `${versionsRoot}/99` },
+  ]).flat(),
 ]);
 const deletePushed = deleteFailed.dockerText.indexOf("--push");
 const deleteRestored = deleteFailed.dockerText.indexOf("imagetools create");

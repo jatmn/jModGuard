@@ -475,7 +475,8 @@ registry_user_versions_path() {
 registry_fetch_versions() {
   local package="$1" token="$2"
   # gh api --paginate prints one JSON array per page. Combine them before matching.
-  # Bound the entire scan; pipefail rejects partial pages when the deadline expires.
+  # Bound the entire scan; timeout exits nonzero on expiry, and pipefail propagates
+  # that failure even if jq successfully combines the partial pages.
   GH_PROMPT_DISABLED=1 GH_TOKEN="$token" timeout --kill-after=5s 60s gh api --paginate \
     "$(registry_user_versions_path "$package")?per_page=100" \
     | jq -se '
@@ -565,9 +566,9 @@ registry_delete_detached_tag() {
           if registry_delete_version "$package" "$token" "$disposable_id"; then
             return 0
           fi
-          break
+        else
+          decision="unreadable"
         fi
-        decision="unreadable"
         ;;
     esac
     if [[ "$attempt" != 3 ]]; then
@@ -616,7 +617,7 @@ registry_restore_preserved_tag() {
 }
 
 registry_delete_tag() {
-  local image_tag="$1" package tag token payload decision action version_id digest
+  local image_tag="$1" package tag token payload decision action version_id digest attempt
   [[ "$image_tag" =~ ^ghcr\.io/jatmn/([a-z0-9._-]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]] || {
     echo 'registry tag deletion received an invalid image tag reference' >&2
     return 1
@@ -660,7 +661,16 @@ registry_delete_tag() {
   }
   case "$action" in
     delete)
-      registry_delete_version "$package" "$token" "$version_id"
+      for attempt in 1 2 3; do
+        if registry_delete_version "$package" "$token" "$version_id"; then
+          return 0
+        fi
+        if [[ "$attempt" != 3 ]]; then
+          sleep 2
+        fi
+      done
+      echo "registry tag ${tag} package version ${version_id} could not be deleted" >&2
+      return 1
       ;;
     untag)
       digest="$(printf '%s\n' "$payload" | registry_preserved_digest "$version_id")" || {

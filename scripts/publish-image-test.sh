@@ -1805,6 +1805,66 @@ for delete_case in invalid-ref missing-token list-failure malformed-list invalid
     || fail "registry delete did not explain $delete_case: $delete_output"
 done
 
+# Exercise both DELETE branches with transient and exhausted registry failures.
+for delete_mode in direct detached; do
+  for delete_failures in 1 3; do
+    (
+      reload_publisher
+      DELETE_CALLS=0
+      MOVED=0
+      RESTORED=0
+      GHCR_TOKEN=fixture-token
+      DELETE_TAG="${HEAD_SHA}"
+      DELETE_DIGEST="sha256:$(printf 'd%.0s' {1..64})"
+      registry_fetch_versions() {
+        if [[ "$delete_mode" == direct ]]; then
+          printf '[{"id":11,"metadata":{"container":{"tags":["%s"]}}}]' "$DELETE_TAG"
+        elif [[ "$MOVED" == 0 ]]; then
+          printf '[{"id":21,"name":"%s","metadata":{"container":{"tags":["kept","%s"]}}}]' "$DELETE_DIGEST" "$DELETE_TAG"
+        else
+          printf '[{"id":21,"name":"%s","metadata":{"container":{"tags":["kept"]}}},{"id":99,"metadata":{"container":{"tags":["%s"]}}}]' "$DELETE_DIGEST" "$DELETE_TAG"
+        fi
+      }
+      gh() {
+        local expected=11
+        [[ "$delete_mode" == direct ]] || expected=99
+        [[ "$*" == "api --method DELETE /users/jatmn/packages/container/jmodguard-bot/versions/${expected}" ]] \
+          || fail "unexpected DELETE: $*"
+        DELETE_CALLS=$((DELETE_CALLS + 1))
+        [[ "$DELETE_CALLS" -gt "$delete_failures" ]]
+      }
+      docker() {
+        case "$1 $2 $3" in
+          'buildx build --builder') MOVED=1 ;;
+          'buildx imagetools create')
+            [[ "$DELETE_CALLS" == 3 ]] || fail 'restore must follow all DELETE attempts'
+            [[ "$*" == "buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-bot:${DELETE_TAG} ghcr.io/jatmn/jmodguard-bot@${DELETE_DIGEST}" ]] \
+              || fail "unexpected restore: $*"
+            RESTORED=1 ;;
+          *) fail "unexpected docker: $*" ;;
+        esac
+      }
+      sleep() { :; }
+      delete_status=0
+      registry_delete_tag "ghcr.io/jatmn/jmodguard-bot:${DELETE_TAG}" || delete_status=$?
+      if [[ "$delete_failures" == 1 ]]; then
+        assert_eq "$delete_status" 0
+        assert_eq "$DELETE_CALLS" 2
+        assert_eq "$RESTORED" 0
+      else
+        [[ "$delete_status" -ne 0 ]] || fail 'exhausted DELETE retries must fail'
+        assert_eq "$DELETE_CALLS" 3
+        if [[ "$delete_mode" == detached ]]; then
+          assert_eq "$RESTORED" 1
+        else
+          assert_eq "$MOVED" 0
+          assert_eq "$RESTORED" 0
+        fi
+      fi
+    )
+  done
+done
+
 # Promote abort must report imagetools restore and registry delete failures.
 reload_publisher
 unset -f docker
