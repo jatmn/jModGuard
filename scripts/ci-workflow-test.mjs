@@ -449,7 +449,7 @@ function runPromotionScript(script, env = {}) {
   const result = spawnSync("bash", ["-c", script], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, TRACE: trace, ...env },
+    env: { ...process.env, TRACE: trace, ...env, RUNNER_TEMP: dir },
   });
   const traceText = fs.existsSync(trace) ? fs.readFileSync(trace, "utf8") : "";
   fs.rmSync(dir, { recursive: true, force: true });
@@ -462,7 +462,6 @@ function runPromoteJob(mode) {
   return runPromotionScript(`
 set -euo pipefail
 export JMODGUARD_PUBLISH_PHASE=sign
-export RUNNER_TEMP="$TMPDIR"
 source() {
   builtin source "$@"
   checked_request() { printf 'main\\t\\t%s\\n' "$SHA"; }
@@ -506,6 +505,8 @@ source() {
 }
 ${promoteScript}
 `, {
+    // Exercise every workflow path without the optional ambient temp variable.
+    TMPDIR: undefined,
     MODE: mode, SHA: "a".repeat(40), OLD: oldBot, NEW: nextDigest, OTHER: oldWeb,
     GHCR_USERNAME: "test-publisher", GHCR_TOKEN: "test-token",
   });
