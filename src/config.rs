@@ -118,6 +118,10 @@ pub struct BotConfig {
     pub control_bind: String,
     /// API dial target for the control link. No default. Empty disables writes.
     pub control_target: String,
+    /// Bot-launcher listener for paired-upgrade steps and owner upgrade recovery.
+    pub launcher_bind: String,
+    /// API dial target for the bot launcher link. Empty leaves paired upgrades pending.
+    pub launcher_target: String,
     /// API loopback bind for container-use readings (`JMODGUARD_READ_BIND`).
     pub read_bind: String,
     /// Bot dial target for private API container-use readings. Empty disables them.
@@ -358,6 +362,8 @@ impl Default for BotConfig {
             message_capture_enabled: true,
             control_bind: "127.0.0.1:8082".into(),
             control_target: String::new(),
+            launcher_bind: "127.0.0.1:8084".into(),
+            launcher_target: String::new(),
             read_bind: crate::read_link::default_read_bind().to_owned(),
             read_target: String::new(),
             control_secret: ControlSecret::default(),
@@ -873,6 +879,12 @@ impl Config {
         if let Ok(value) = env::var("JMODGUARD_CONTROL_TARGET") {
             self.bot.control_target = value;
         }
+        if let Ok(value) = env::var("JMODGUARD_LAUNCHER_CONTROL_BIND") {
+            self.bot.launcher_bind = value;
+        }
+        if let Ok(value) = env::var("JMODGUARD_LAUNCHER_CONTROL_TARGET") {
+            self.bot.launcher_target = value;
+        }
         if let Ok(value) = env::var("JMODGUARD_READ_BIND") {
             self.bot.read_bind = value;
         }
@@ -1304,7 +1316,10 @@ mod tests {
         assert_eq!(control, 8082);
         let read = port_of(&cfg.bot.read_bind);
         assert_eq!(read, 8083);
-        let mut ports = [bot_health, api_bind, control, read];
+        let launcher = port_of(&cfg.bot.launcher_bind);
+        assert_eq!(launcher, 8084);
+        assert!(cfg.bot.launcher_target.is_empty());
+        let mut ports = [bot_health, api_bind, control, read, launcher];
         ports.sort_unstable();
         assert!(
             ports.windows(2).all(|pair| pair[0] != pair[1]),

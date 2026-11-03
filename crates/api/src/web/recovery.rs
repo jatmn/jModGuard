@@ -17,6 +17,31 @@ pub struct RecoveryState {
     /// stays read-only and uses `writer` when the control target is set.
     pub api: Option<Arc<super::state::ApiState>>,
     pub writer: Option<jmodguard::control::WriterLink>,
+    /// Bot launcher link for owner upgrade actions. The bot launcher keeps
+    /// running while a failed paired upgrade has stopped the bot process.
+    pub launcher: Option<jmodguard::control::WriterLink>,
+}
+
+/// Empty or unusable `JMODGUARD_LAUNCHER_CONTROL_TARGET` leaves no link.
+pub fn launcher_link(cfg: &ApiProcessConfig) -> Option<jmodguard::control::WriterLink> {
+    jmodguard::control::try_writer_link(
+        cfg.bot.launcher_target.as_str(),
+        cfg.bot.control_secret.as_str(),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Paired-upgrade Check, Apply and Cancel prefer the bot launcher link.
+async fn upgrade_value<T: serde::de::DeserializeOwned>(
+    state: &RecoveryState,
+    local: impl std::future::Future<Output = anyhow::Result<T>>,
+    op: crate::db::ControlOp,
+) -> anyhow::Result<T> {
+    match state.launcher.clone() {
+        Some(link) if !state.control.writes_locally() => reply_value(link.submit(op, 0).await?),
+        _ => control_value(state, local, op).await,
+    }
 }
 
 async fn control_value<T: serde::de::DeserializeOwned>(
@@ -34,7 +59,12 @@ async fn control_value<T: serde::de::DeserializeOwned>(
     let Some(writer) = state.writer.clone() else {
         anyhow::bail!("{}", jmodguard::control::CONTROL_LINK_UNAVAILABLE);
     };
-    let reply = writer.submit(op, 0).await?;
+    reply_value(writer.submit(op, 0).await?)
+}
+
+fn reply_value<T: serde::de::DeserializeOwned>(
+    reply: crate::db::ControlReply,
+) -> anyhow::Result<T> {
     let body = match reply {
         crate::db::ControlReply::Saved { body } | crate::db::ControlReply::Unchanged { body } => {
             body
@@ -161,7 +191,7 @@ async fn check(
     let now = chrono::Utc::now().timestamp();
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
-    let owner = control_value(
+    let owner = upgrade_value(
         &state,
         state.control.acquire_pair_check(now),
         crate::db::ControlOp::AcquirePairCheck { now },
@@ -182,7 +212,7 @@ async fn check(
         // Both images must resolve before either channel or candidate changes.
         // One transaction commits the pair; a missing counterpart or a failed
         // second write leaves the previous selection in place.
-        control_value(
+        upgrade_value(
             &state,
             state
                 .control
@@ -199,7 +229,7 @@ async fn check(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = control_value(
+    if let Err(error) = upgrade_value(
         &state,
         state.control.release_pair_check(&owner),
         crate::db::ControlOp::ReleasePairCheck {
@@ -241,7 +271,7 @@ async fn apply(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    let operation = control_value(
+    let operation = upgrade_value(
         &state,
         state
             .control
@@ -269,7 +299,7 @@ async fn cancel(
     Json(input): Json<Cancel>,
 ) -> Reply {
     mutation(&state, &session, &headers).await?;
-    control_value(
+    upgrade_value(
         &state,
         state.control.abort_upgrade(&input.id),
         crate::db::ControlOp::AbortUpgrade {
@@ -340,6 +370,7 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
     if writer.is_none() {
         tracing::warn!("control link unavailable");
     }
+    let launcher = launcher_link(&cfg);
     let state = Arc::new(RecoveryState {
         cfg: Arc::new(cfg),
         oauth,
@@ -347,6 +378,7 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
         apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
         api: None,
         writer,
+        launcher,
     });
     let app = maintenance_router(state, MemoryStore::default());
     axum::serve(listener, app)
@@ -496,6 +528,7 @@ mod tests {
                 apply_enabled: false,
                 api: (!maintenance).then(|| app.clone()),
                 writer: None,
+                launcher: None,
             });
             for scenario in ["missing", "nonowner", "load", "retired", "dead"] {
                 if maintenance && matches!(scenario, "retired" | "dead") {
@@ -805,17 +838,32 @@ mod tests {
                         base_abi: "debian-bookworm-amd64".into(),
                         guild_schema: Some(store_guild),
                         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
-                        launcher_revision: 0,
+                        launcher_revision: db::LAUNCHER_REVISION,
+                        baked_launcher_revision: db::LAUNCHER_REVISION,
                     },
                     now,
                 )
                 .await
                 .unwrap();
         }
+        // No bot process and no writer link: owner actions reach the fenced
+        // bot launcher, as after a failed pair has stopped both applications.
+        control.arm_launcher_fence(&"cc".repeat(16));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let secret = "k".repeat(32);
+        let bound = jmodguard::launcher_link::spawn(control.clone(), "127.0.0.1:0", &secret)
+            .expect("launcher link");
+        cfg.bot.launcher_target = bound.to_string();
+        cfg.bot.control_secret = crate::config::ControlSecret::new(secret);
+        let reader = UpdateControl::open(&cfg.db_open_options())
+            .unwrap()
+            .unwrap();
+        assert!(!reader.writes_locally());
         let state = Arc::new(RecoveryState {
             oauth: Arc::new(oauth::OAuthClient::from_config(&cfg).unwrap()),
+            launcher: launcher_link(&cfg),
             cfg: Arc::new(cfg),
-            control: control.clone(),
+            control: reader,
             apply_enabled: true,
             api: None,
             writer: None,
@@ -877,6 +925,68 @@ mod tests {
             assert_uncacheable_headers(response.headers());
             assert!(control.upgrade().await.unwrap().is_none());
         }
+        // Recovery Check reaches the fenced bot launcher with no bot process or
+        // writer link. A held API lease refuses it before any registry request,
+        // and the bot lease it took through the launcher is released again.
+        let foreign = "f".repeat(32);
+        assert!(
+            db::claim_update_lease(&db, "api", &foreign, now, 240)
+                .await
+                .unwrap()
+        );
+        let (status, body) = request(
+            &router,
+            "POST",
+            "/api/service-upgrade/check",
+            &owner_cookie,
+            r#"{"channel":"latest"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "matching pair unavailable: another update operation is running"
+        );
+        let lease_owner = |role: &'static str| {
+            db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT lease_owner FROM component_updates WHERE component=?1",
+                    db::params![role],
+                    |row| {
+                        let owner: Option<String> = row.get(0)?;
+                        Ok(owner)
+                    },
+                )
+            })
+        };
+        assert_eq!(lease_owner("bot").await.unwrap(), None);
+        assert_eq!(lease_owner("api").await.unwrap(), Some(foreign.clone()));
+        db::release_update_lease(&db, "api", &foreign)
+            .await
+            .unwrap();
+        // Revision-38 launchers on an older API image (a launcher-only update):
+        // its baked API, which serves maintenance after a failed pair, would
+        // send owner recovery to the stopped bot, so the pair is refused.
+        let mut seen = control.component("api").await.unwrap().observed.unwrap();
+        assert!(seen.launcher_revision >= db::PAIRED_LAUNCHER_REVISION);
+        seen.baked_launcher_revision = db::PAIRED_LAUNCHER_REVISION - 1;
+        control
+            .running("api", None, seen.clone(), now)
+            .await
+            .unwrap();
+        let (status, body) = request(
+            &router,
+            "POST",
+            "/api/service-upgrade",
+            &owner_cookie,
+            &input.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], db::PAIRED_RECOVERY_REQUIRED);
+        assert!(control.upgrade().await.unwrap().is_none());
+        seen.baked_launcher_revision = db::LAUNCHER_REVISION;
+        control.running("api", None, seen, now).await.unwrap();
         for confirmed in [false, true] {
             let mut input = input.clone();
             input["confirmed"] = json!(confirmed);
@@ -894,18 +1004,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            if confirmed {
-                let body = axum::body::to_bytes(response.into_body(), 4096)
-                    .await
-                    .unwrap();
-                let text = String::from_utf8(body.to_vec()).unwrap();
-                assert!(text.contains(db::PAIRED_UPGRADES_DISABLED), "{text}");
-            }
+            let expected = if confirmed {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            };
+            assert_eq!(response.status(), expected);
         }
-        assert!(control.upgrade().await.unwrap().is_none());
+        assert!(control.upgrade().await.unwrap().is_some());
         let upgrade_id = control
-            .queue_paired_upgrade_for_tests(
+            .request_upgrade(
                 &format!("sha256:{}", "a".repeat(64)),
                 &format!("sha256:{}", "b".repeat(64)),
                 false,

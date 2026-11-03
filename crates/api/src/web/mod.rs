@@ -1599,6 +1599,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
             api: Some(Arc::clone(&app)),
             writer: None,
+            launcher: recovery::launcher_link(&app.cfg),
         })))
         .layer(axum::middleware::from_fn(save::middleware))
         .layer(session_layer)
@@ -2082,6 +2083,7 @@ mod tests {
             control.launcher_running("api", &release, "hash", 1).await,
             control.launcher_failed("api", &release.digest, "err").await,
             control.failed("api", &release, "err").await,
+            control.upgrade_error("missing", "err").await,
         ] {
             let error =
                 result.expect_err("a read-only launcher must not pretend a receipt was saved");
@@ -2090,7 +2092,6 @@ mod tests {
                 "{error:#}"
             );
         }
-        control.upgrade_error("missing", "err").await.unwrap();
         let after = control.component("api").await.unwrap();
         assert_eq!(
             serde_json::to_string(&before).unwrap(),

@@ -4,13 +4,18 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
-pub const PAIRED_UPGRADES_DISABLED: &str =
-    "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
+/// First launcher revision that routes API paired-upgrade steps and owner
+/// recovery through the bot launcher link. Older launchers cannot advance a pair.
+pub const PAIRED_LAUNCHER_REVISION: u32 = 38;
+pub const PAIRED_LAUNCHER_REQUIRED: &str = "paired bot and API upgrades need revision-38 launchers on both services; install new images first";
+/// After a failed pair the API supervisor serves maintenance from its baked
+/// binary, so that image must also route owner recovery to the bot launcher.
+pub const PAIRED_RECOVERY_REQUIRED: &str = "paired bot and API upgrades need a revision-38 API image for owner recovery; a launcher-only update is not enough, install a new API image first";
 pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 37;
+pub const LAUNCHER_REVISION: u32 = 38;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -56,7 +61,7 @@ fn warn_api_launcher_cannot_record_upgrade() {
         return;
     }
     tracing::warn!(
-        "API launcher cannot record paired-upgrade progress; the upgrade will not advance"
+        "API launcher has no bot launcher link (JMODGUARD_LAUNCHER_CONTROL_TARGET); paired upgrades will not advance"
     );
 }
 
@@ -108,6 +113,8 @@ fn require_progress(current: bool) -> Result<()> {
 pub struct UpdateControl {
     db: Db,
     writer: Option<crate::control::WriterLink>,
+    /// API launcher only: the bot launcher link for paired-upgrade steps.
+    launcher: Option<crate::control::WriterLink>,
     confirmed_fence_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
@@ -118,6 +125,9 @@ pub struct BakedCompatibility {
     pub source_sha: String,
     pub core: i64,
     pub guild: i64,
+    /// Launcher revision of the baked image's build. Rows from older images read as 0.
+    #[serde(default)]
+    pub launcher_revision: u32,
 }
 
 impl BakedCompatibility {
@@ -126,6 +136,7 @@ impl BakedCompatibility {
             source_sha: source_sha.into(),
             core: CORE_SCHEMA_VERSION,
             guild: guild_data::SCHEMA_VERSION,
+            launcher_revision: LAUNCHER_REVISION,
         }
     }
 }
@@ -463,6 +474,41 @@ pub async fn record_required_launcher(
     .await
 }
 
+/// Saved or Unchanged is the only durable reply. A missing link, a refused
+/// writer, or an in-progress recovery is [`ReceiptNotSaved`]. A compare
+/// failure stays a normal error so the caller does not retry a changed selection.
+async fn forward(
+    link: Option<&crate::control::WriterLink>,
+    op: ControlOp,
+) -> Result<serde_json::Value> {
+    let Some(link) = link else {
+        return Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE));
+    };
+    match link.submit(op, 0).await {
+        Ok(ControlReply::Saved { body } | ControlReply::Unchanged { body }) => Ok(body),
+        Ok(ControlReply::Waiting) => Err(receipt_not_saved("waiting")),
+        Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
+        Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
+        Ok(ControlReply::Failed { message, .. }) if transient_receipt(&message) => {
+            tracing::warn!("API launcher receipt was not recorded: {message}");
+            Err(receipt_not_saved(message))
+        }
+        Ok(ControlReply::Failed { message, .. })
+            if message == UpgradeProgressChanged.to_string() =>
+        {
+            Err(UpgradeProgressChanged.into())
+        }
+        Ok(ControlReply::Failed { message, .. }) => {
+            tracing::warn!("API launcher receipt was not recorded: {message}");
+            anyhow::bail!("{message}")
+        }
+        Err(error) => {
+            tracing::warn!("API launcher receipt was not recorded: {error:#}");
+            Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE))
+        }
+    }
+}
+
 impl UpdateControl {
     /// None means verified empty or an interrupted initial bootstrap without
     /// any managed selections, where the baked bot may finish initialization.
@@ -542,6 +588,7 @@ impl UpdateControl {
         Ok((!empty.get()).then_some(Self {
             db,
             writer: None,
+            launcher: None,
             confirmed_fence_deadline: Arc::new(Mutex::new(None)),
         }))
     }
@@ -550,6 +597,7 @@ impl UpdateControl {
         Self {
             db: db.clone(),
             writer: None,
+            launcher: None,
             confirmed_fence_deadline: Arc::new(Mutex::new(None)),
         }
     }
@@ -557,6 +605,96 @@ impl UpdateControl {
     pub fn with_writer_link(mut self, link: crate::control::WriterLink) -> Self {
         self.writer = Some(link);
         self
+    }
+
+    /// Paired-upgrade steps go to the bot launcher, which keeps running and
+    /// keeps its fence while the bot process is stopped.
+    pub fn with_launcher_link(mut self, link: crate::control::WriterLink) -> Self {
+        self.launcher = Some(link);
+        self
+    }
+
+    /// Bot-launcher side of the launcher link. Only API paired-upgrade steps
+    /// and owner upgrade recovery (Check, Apply, Cancel) are accepted. Every
+    /// write runs under this launcher's fence, never the bot process's writer lease.
+    pub async fn apply_launcher_op(&self, op: ControlOp) -> Result<ControlReply> {
+        if matches!(op, ControlOp::LookupResult) {
+            // Results are not cached. Every accepted step is safe to resend.
+            return Ok(ControlReply::Failed {
+                code: None,
+                message: crate::control::OUTCOME_UNKNOWN.into(),
+            });
+        }
+        let fenced = self.writes_locally()
+            && self.db.launcher_instance().is_some()
+            && self
+                .launcher_fence_deadline()
+                .is_some_and(|deadline| std::time::Instant::now() < deadline);
+        if !fenced {
+            return Ok(ControlReply::Failed {
+                code: None,
+                message: crate::control::NOT_THE_WRITER.into(),
+            });
+        }
+        let body = match op {
+            ControlOp::JoinUpgrade { id, role, instance } if role == "api" => {
+                serde_json::to_value(self.join_upgrade(&id, &role, &instance).await?)?
+            }
+            ControlOp::AcknowledgeUpgrade {
+                id,
+                role,
+                instance,
+                action,
+            } if role == "api" => {
+                serde_json::to_value(self.acknowledge(&id, &role, &instance, action).await?)?
+            }
+            ControlOp::RecordUpgradeError { id, error } => {
+                self.upgrade_error(&id, &error).await?;
+                serde_json::Value::Null
+            }
+            ControlOp::SelectRequiredLauncher {
+                release,
+                operation: Some(operation),
+            } if release.component == "api" => {
+                self.select_required_launcher(&release, Some(&operation))
+                    .await?;
+                serde_json::Value::Null
+            }
+            ControlOp::RequestUpgrade {
+                bot_digest,
+                api_digest,
+                recover,
+                now,
+            } => serde_json::to_value(
+                self.request_upgrade(&bot_digest, &api_digest, recover, now)
+                    .await?,
+            )?,
+            ControlOp::AbortUpgrade { id } => {
+                self.abort_upgrade(&id).await?;
+                serde_json::Value::Null
+            }
+            // Owner recovery Check: both leases, the matching pair, release.
+            ControlOp::AcquirePairCheck { now } => {
+                serde_json::to_value(self.acquire_pair_check(now).await?)?
+            }
+            ControlOp::RecordPairCheck {
+                owner,
+                channel,
+                bot,
+                api,
+                now,
+            } => {
+                self.record_pair_check(&owner, &channel, bot, api, now)
+                    .await?;
+                serde_json::Value::Null
+            }
+            ControlOp::ReleasePairCheck { owner } => {
+                self.release_pair_check(&owner).await?;
+                serde_json::Value::Null
+            }
+            _ => anyhow::bail!("write failed"),
+        };
+        Ok(ControlReply::Saved { body })
     }
 
     /// Bot-launcher fence. The API launcher never calls this and never writes.
@@ -971,32 +1109,23 @@ impl UpdateControl {
         clear_boot_mismatch(&self.db, component).await
     }
 
-    /// Saved or Unchanged is the only durable reply. A missing link, a refused
-    /// writer, or an in-progress recovery is [`ReceiptNotSaved`]. A compare
-    /// failure stays a normal error so the caller does not retry a changed selection.
     async fn forward_process(&self, op: ControlOp) -> Result<()> {
-        let Some(link) = &self.writer else {
+        if self.writer.is_none() {
             warn_api_launcher_observation_not_forwarded();
-            return Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE));
-        };
-        match link.submit(op, 0).await {
-            Ok(ControlReply::Saved { .. } | ControlReply::Unchanged { .. }) => Ok(()),
-            Ok(ControlReply::Waiting) => Err(receipt_not_saved("waiting")),
-            Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
-            Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
-            Ok(ControlReply::Failed { message, .. }) if transient_receipt(&message) => {
-                tracing::warn!("API launcher receipt was not recorded: {message}");
-                Err(receipt_not_saved(message))
-            }
-            Ok(ControlReply::Failed { message, .. }) => {
-                tracing::warn!("API launcher receipt was not recorded: {message}");
-                anyhow::bail!("{message}")
-            }
-            Err(error) => {
-                tracing::warn!("API launcher receipt was not recorded: {error:#}");
-                Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE))
-            }
         }
+        forward(self.writer.as_ref(), op).await.map(|_| ())
+    }
+
+    /// Paired-upgrade steps from the read-only API launcher, sent to the bot
+    /// launcher. A changed operation keeps its type so the caller retries from
+    /// durable state instead of failing the upgrade.
+    async fn forward_upgrade<T: serde::de::DeserializeOwned>(&self, op: ControlOp) -> Result<T> {
+        if self.launcher.is_none() {
+            warn_api_launcher_cannot_record_upgrade();
+        }
+        Ok(serde_json::from_value(
+            forward(self.launcher.as_ref(), op).await?,
+        )?)
     }
 
     pub async fn failed(&self, role: &str, release: &ComponentRelease, error: &str) -> Result<()> {
@@ -1170,23 +1299,9 @@ impl UpdateControl {
         record_launcher_failure(&self.db, role, digest, error).await
     }
 
-    /// Paired upgrades stay refused until signed, launcher-routed upgrades land.
-    pub async fn request_upgrade(
-        &self,
-        bot_digest: &str,
-        api_digest: &str,
-        recover: bool,
-        now: i64,
-    ) -> Result<ServiceUpgrade> {
-        let _ = (bot_digest, api_digest, recover, now);
-        anyhow::bail!("{PAIRED_UPGRADES_DISABLED}");
-    }
-
     /// Pin both checked targets atomically before either service is interrupted.
     /// Recovery is an explicit owner action and may only move forwards.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn queue_paired_upgrade_for_tests(
+    pub async fn request_upgrade(
         &self,
         bot_digest: &str,
         api_digest: &str,
@@ -1286,6 +1401,7 @@ impl UpdateControl {
                 "release cannot upgrade the current databases; downgrades are not allowed");
             for (state, target) in [(&bot, &target_bot), (&api, &target_api)] {
                 let observed = state.observed.as_ref().context("service has not been observed")?;
+                anyhow::ensure!(observed.launcher_revision >= PAIRED_LAUNCHER_REVISION, PAIRED_LAUNCHER_REQUIRED);
                 anyhow::ensure!(observed.update_protocol >= UPDATE_CONTROL_PROTOCOL && observed.self_update_enabled
                     && observed.base_abi == target.base_abi, "service needs the coordinated-update baseline enabled");
                 if recovering.is_none() {
@@ -1298,6 +1414,12 @@ impl UpdateControl {
                         "an independent update is already pending");
                 }
             }
+            // After a failed pair the API supervisor serves maintenance from its
+            // baked binary. A launcher-only update does not make that image route
+            // owner recovery to the bot launcher, so admission checks the image.
+            let api_seen = api.observed.as_ref().context("API has not been observed")?;
+            anyhow::ensure!(recovering.is_some() || api_seen.baked_launcher_revision >= PAIRED_LAUNCHER_REVISION,
+                PAIRED_RECOVERY_REQUIRED);
             let service = |release| UpgradeService { release, instance: String::new(), prepared: false, stopped: false, ready: false };
             let upgrade = ServiceUpgrade {
                 id: format!("{:032x}", rand::random::<u128>()), phase: UpgradePhase::Preparing,
@@ -1325,12 +1447,14 @@ impl UpdateControl {
         operation: Option<&str>,
     ) -> Result<()> {
         if !self.writes_locally() {
-            return self
-                .forward_process(ControlOp::SelectRequiredLauncher {
-                    release: release.clone(),
-                    operation: operation.map(str::to_owned),
-                })
-                .await;
+            let op = ControlOp::SelectRequiredLauncher {
+                release: release.clone(),
+                operation: operation.map(str::to_owned),
+            };
+            if operation.is_some() {
+                return self.forward_upgrade(op).await;
+            }
+            return self.forward_process(op).await;
         }
         record_required_launcher(&self.db, release, operation.map(str::to_owned)).await
     }
@@ -1361,8 +1485,13 @@ impl UpdateControl {
         instance: &str,
     ) -> Result<ServiceUpgrade> {
         if !self.writes_locally() {
-            warn_api_launcher_cannot_record_upgrade();
-            return self.upgrade().await?.context("no coordinated upgrade");
+            return self
+                .forward_upgrade(ControlOp::JoinUpgrade {
+                    id: id.to_owned(),
+                    role: role.to_owned(),
+                    instance: instance.to_owned(),
+                })
+                .await;
         }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
@@ -1401,8 +1530,14 @@ impl UpdateControl {
         action: UpgradeAcknowledgement,
     ) -> Result<ServiceUpgrade> {
         if !self.writes_locally() {
-            warn_api_launcher_cannot_record_upgrade();
-            return self.upgrade().await?.context("no coordinated upgrade");
+            return self
+                .forward_upgrade(ControlOp::AcknowledgeUpgrade {
+                    id: id.to_owned(),
+                    role: role.to_owned(),
+                    instance: instance.to_owned(),
+                    action,
+                })
+                .await;
         }
         let (id, role, instance) = (id.to_owned(), role.to_owned(), instance.to_owned());
         self.db
@@ -1484,10 +1619,12 @@ impl UpdateControl {
     }
 
     pub async fn upgrade_error(&self, id: &str, error: &str) -> Result<()> {
-        if !self.writes_locally() {
-            return Ok(());
-        }
         let (id, error) = (id.to_owned(), error.chars().take(300).collect::<String>());
+        if !self.writes_locally() {
+            return self
+                .forward_upgrade(ControlOp::RecordUpgradeError { id, error })
+                .await;
+        }
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_immediate()?;
@@ -1580,7 +1717,8 @@ mod tests {
                             base_abi: "debian-bookworm-amd64".into(),
                             guild_schema: Some(guild_data::SCHEMA_VERSION),
                             update_protocol: UPDATE_CONTROL_PROTOCOL,
-                            launcher_revision: 0,
+                            launcher_revision: LAUNCHER_REVISION,
+                            baked_launcher_revision: LAUNCHER_REVISION,
                         },
                         100,
                     )
@@ -1596,7 +1734,7 @@ mod tests {
         }
         async fn queue(&self, recover: bool, now: i64) -> Result<ServiceUpgrade> {
             self.control
-                .queue_paired_upgrade_for_tests(
+                .request_upgrade(
                     &format!("sha256:{}", "a".repeat(64)),
                     &format!("sha256:{}", "b".repeat(64)),
                     recover,
@@ -2100,6 +2238,15 @@ mod tests {
             reader
                 .clear_uncontracted_launcher("api", &upgrade.api.release)
                 .await,
+            reader
+                .join_upgrade(&upgrade.id, "api", "api")
+                .await
+                .map(|_| ()),
+            reader
+                .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Prepared)
+                .await
+                .map(|_| ()),
+            reader.upgrade_error(&upgrade.id, "api-role").await,
         ] {
             let error =
                 result.expect_err("a read-only launcher must not pretend a receipt was saved");
@@ -2108,15 +2255,6 @@ mod tests {
                 "missing link is not durable: {error:#}"
             );
         }
-        reader
-            .join_upgrade(&upgrade.id, "api", "api")
-            .await
-            .unwrap();
-        reader
-            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Prepared)
-            .await
-            .unwrap();
-        reader.upgrade_error(&upgrade.id, "api-role").await.unwrap();
         assert_eq!(probe.immediate(), 0);
         assert!(!tripped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
@@ -2323,37 +2461,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn paired_upgrade_request_is_refused_until_issue_188() {
+    async fn paired_upgrade_needs_launcher_routed_launchers_on_both_services() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        let bot = format!("sha256:{}", "a".repeat(64));
-        let api = format!("sha256:{}", "b".repeat(64));
-        for recover in [false, true] {
-            let error = f
-                .control
-                .request_upgrade(&bot, &api, recover, 100)
-                .await
-                .unwrap_err();
-            assert_eq!(error.to_string(), PAIRED_UPGRADES_DISABLED);
-            let applied = crate::db::apply_control(
-                &f.control.db,
-                None,
-                crate::db::ControlOp::RequestUpgrade {
-                    bot_digest: bot.clone(),
-                    api_digest: api.clone(),
-                    recover,
-                    now: 100,
-                },
-                None,
-            )
+        let op = crate::db::ControlOp::RequestUpgrade {
+            bot_digest: format!("sha256:{}", "a".repeat(64)),
+            api_digest: format!("sha256:{}", "b".repeat(64)),
+            recover: false,
+            now: 200,
+        };
+        f.control
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION - 1)
+            .await
+            .unwrap();
+        let refused = crate::db::apply_control(&f.control.db, None, op.clone(), None)
             .await
             .unwrap_err();
-            assert_eq!(applied.to_string(), PAIRED_UPGRADES_DISABLED);
-            assert_eq!(
-                crate::control::public_error(&applied),
-                PAIRED_UPGRADES_DISABLED
-            );
-        }
+        assert_eq!(
+            crate::control::public_error(&refused),
+            PAIRED_LAUNCHER_REQUIRED
+        );
         assert!(f.control.upgrade().await.unwrap().is_none());
+        f.control
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION)
+            .await
+            .unwrap();
+        let reply = crate::db::apply_control(&f.control.db, None, op, None)
+            .await
+            .unwrap();
+        assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
+        let queued = f.control.upgrade().await.unwrap().unwrap();
+        assert_eq!(queued.phase, UpgradePhase::Preparing);
+    }
+
+    /// A launcher-only update can put revision-38 launchers on an older image.
+    /// After a failed pair that image's baked API serves maintenance, and an
+    /// older one cannot reach the bot launcher, so the pair is refused first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_needs_a_baked_api_that_routes_owner_recovery() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let (_, link) = launcher_linked(&f).await;
+        let op = ControlOp::RequestUpgrade {
+            bot_digest: format!("sha256:{}", "a".repeat(64)),
+            api_digest: format!("sha256:{}", "b".repeat(64)),
+            recover: false,
+            now: 200,
+        };
+        let observe = async |baked: u32| {
+            let mut seen = f.control.component("api").await.unwrap().observed.unwrap();
+            seen.baked_launcher_revision = baked;
+            f.control.running("api", None, seen, 150).await.unwrap();
+        };
+        for baked in [0, PAIRED_LAUNCHER_REVISION - 1] {
+            observe(baked).await;
+            let seen = f.control.component("api").await.unwrap().observed.unwrap();
+            assert!(seen.launcher_revision >= PAIRED_LAUNCHER_REVISION);
+            let refused = crate::db::apply_control(&f.control.db, None, op.clone(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::control::public_error(&refused),
+                PAIRED_RECOVERY_REQUIRED
+            );
+            let refused = link.submit(op.clone(), 0).await.unwrap();
+            assert!(
+                matches!(&refused, ControlReply::Failed { message, .. } if message == PAIRED_RECOVERY_REQUIRED),
+                "{refused:?}"
+            );
+            assert!(f.control.upgrade().await.unwrap().is_none());
+        }
+        observe(PAIRED_LAUNCHER_REVISION).await;
+        let reply = link.submit(op, 0).await.unwrap();
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert!(f.control.upgrade().await.unwrap().unwrap().phase.active());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2417,26 +2596,54 @@ mod tests {
         assert!(f.control.upgrade().await.unwrap().is_none());
     }
 
+    /// A fenced bot launcher serving its link, and a read-only API launcher
+    /// that sends its paired steps there over real loopback TCP.
+    async fn launcher_linked(f: &Fixture) -> (UpdateControl, crate::control::WriterLink) {
+        f.control.arm_launcher_fence(&"cc".repeat(16));
+        assert!(f.control.renew_launcher_fence().await.unwrap());
+        let secret = "k".repeat(32);
+        let bound = crate::launcher_link::spawn(f.control.clone(), "127.0.0.1:0", &secret)
+            .expect("launcher link");
+        let link = crate::control::try_writer_link(&bound.to_string(), &secret)
+            .unwrap()
+            .unwrap();
+        let mut opts = f.opts.clone();
+        opts.read_only = true;
+        let api = UpdateControl::open(&opts)
+            .unwrap()
+            .unwrap()
+            .with_launcher_link(link.clone());
+        assert!(!api.writes_locally());
+        (api, link)
+    }
+
     /// Bot-launcher writes land with no `active_bot_lease` (the bot process is
-    /// stopped). The read-only API launcher does not record these steps.
+    /// stopped). The read-only API launcher's steps reach the bot launcher link.
     #[tokio::test(flavor = "multi_thread")]
     async fn paired_upgrade_completes_while_the_bot_process_is_stopped() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        let launcher = "cc".repeat(16);
-        f.control.arm_launcher_fence(&launcher);
+        let (api, _) = launcher_linked(&f).await;
+        let side = |role: &str| if role == "api" { &api } else { &f.control };
         let upgrade = f.queue(false, 200).await.unwrap();
         for role in ["bot", "api"] {
-            f.control
+            side(role)
                 .join_upgrade(&upgrade.id, role, role)
                 .await
                 .unwrap();
-            f.control
+            side(role)
                 .acknowledge(&upgrade.id, role, role, UpgradeAcknowledgement::Prepared)
                 .await
                 .unwrap();
         }
-        f.control
-            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+        let prepared = f.control.upgrade().await.unwrap().unwrap();
+        assert!(prepared.api.prepared, "the API prepared step is stored");
+        assert_eq!(prepared.phase, UpgradePhase::StoppingApi);
+        let stale = api
+            .acknowledge(&upgrade.id, "api", "old", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap_err();
+        assert!(stale.is::<UpgradeProgressChanged>(), "{stale:#}");
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
             .await
             .unwrap();
         let stopped = f
@@ -2446,45 +2653,209 @@ mod tests {
             .unwrap();
         assert!(stopped.bot.stopped, "the bot process is stopped");
         assert!(matches!(stopped.phase, UpgradePhase::StartingBot));
-        let lease: Option<String> = f
+        assert!(
+            active_bot_lease(&f.control).await.is_none(),
+            "the bot process is not holding the writer lease"
+        );
+        for role in ["bot", "api"] {
+            for action in [
+                UpgradeAcknowledgement::Starting,
+                UpgradeAcknowledgement::Ready,
+            ] {
+                side(role)
+                    .acknowledge(&upgrade.id, role, role, action)
+                    .await
+                    .unwrap();
+            }
+        }
+        let done = f.control.upgrade().await.unwrap().unwrap();
+        assert_eq!(done.phase, UpgradePhase::Complete);
+        assert!(done.error.is_none());
+    }
+
+    /// After a failed pair stops both applications, owner recovery goes to the
+    /// bot launcher link instead of the stopped bot process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_recovery_after_a_failed_pair_reaches_the_bot_launcher() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let (api, link) = launcher_linked(&f).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        f.control
+            .join_upgrade(&upgrade.id, "bot", "bot")
+            .await
+            .unwrap();
+        api.join_upgrade(&upgrade.id, "api", "api").await.unwrap();
+        api.upgrade_error(&upgrade.id, "api: staged binary failed")
+            .await
+            .unwrap();
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        let failed = f
             .control
-            .db
-            .with_conn(|conn| {
-                let tx = conn.transaction_primary_snapshot()?;
-                let value = tx
-                    .query_row(
-                        "SELECT value FROM meta WHERE key='active_bot_lease'",
-                        (),
-                        |row| Ok(row.get(0)?),
-                    )
-                    .optional()?;
-                tx.finish_read()?;
-                Ok(value)
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        assert_eq!(failed.error.as_deref(), Some("api: staged binary failed"));
+        assert!(failed.bot.stopped && failed.api.stopped);
+        assert!(active_bot_lease(&f.control).await.is_none());
+        let reply = link
+            .submit(
+                ControlOp::RequestUpgrade {
+                    bot_digest: upgrade.bot.release.digest.clone(),
+                    api_digest: upgrade.api.release.digest.clone(),
+                    recover: true,
+                    now: 300,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let ControlReply::Saved { body } = reply else {
+            panic!("recovery was not saved: {reply:?}");
+        };
+        let recovered: ServiceUpgrade = serde_json::from_value(body).unwrap();
+        assert_ne!(recovered.id, upgrade.id);
+        assert!(recovered.error.is_none());
+        assert_eq!(recovered.phase, UpgradePhase::Preparing);
+        // The link refuses bot-role steps and every non-upgrade write.
+        for op in [
+            ControlOp::AcknowledgeUpgrade {
+                id: recovered.id.clone(),
+                role: "bot".into(),
+                instance: "bot".into(),
+                action: UpgradeAcknowledgement::Prepared,
+            },
+            ControlOp::ObserveLauncher {
+                component: "api".into(),
+                revision: 1,
+            },
+        ] {
+            let refused = link.submit(op, 0).await.unwrap();
+            assert!(
+                matches!(&refused, ControlReply::Failed { message, .. } if message == "write failed"),
+                "{refused:?}"
+            );
+        }
+        let current = f.control.upgrade().await.unwrap().unwrap();
+        assert!(!current.bot.prepared);
+        assert_eq!(
+            f.control
+                .component("api")
+                .await
+                .unwrap()
+                .observed
+                .unwrap()
+                .launcher_revision,
+            LAUNCHER_REVISION
+        );
+        // A launcher that does not hold the fence takes nothing.
+        let other = UpdateControl::open(&f.opts).unwrap().unwrap();
+        other.arm_launcher_fence(&"dd".repeat(16));
+        assert!(!other.renew_launcher_fence().await.unwrap());
+        let refused = other
+            .apply_launcher_op(ControlOp::AbortUpgrade {
+                id: recovered.id.clone(),
             })
             .await
             .unwrap();
         assert!(
-            lease.is_none(),
-            "the bot process is not holding the writer lease"
+            matches!(&refused, ControlReply::Failed { message, .. } if message == crate::control::NOT_THE_WRITER)
         );
+        assert!(f.control.upgrade().await.unwrap().unwrap().phase.active());
+    }
+
+    /// After a failed pair stops both applications, recovery Check reaches the
+    /// bot launcher link: it takes both leases, records a newer matching pair,
+    /// releases them, and that newer pair can then be applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_check_selects_a_newer_pair_through_the_bot_launcher() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let (api, link) = launcher_linked(&f).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
         f.control
-            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Starting)
+            .join_upgrade(&upgrade.id, "bot", "bot")
+            .await
+            .unwrap();
+        api.join_upgrade(&upgrade.id, "api", "api").await.unwrap();
+        api.upgrade_error(&upgrade.id, "api: staged binary failed")
+            .await
+            .unwrap();
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
             .await
             .unwrap();
         f.control
-            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Ready)
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
             .await
             .unwrap();
-        f.control
-            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Starting)
-            .await
-            .unwrap();
-        let done = f
-            .control
-            .acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Ready)
-            .await
-            .unwrap();
-        assert_eq!(done.phase, UpgradePhase::Complete);
-        assert!(done.error.is_none());
+        assert!(active_bot_lease(&f.control).await.is_none());
+        let submit = async |op: ControlOp| match link.submit(op, 0).await.unwrap() {
+            ControlReply::Saved { body } => body,
+            other => panic!("launcher link did not save: {other:?}"),
+        };
+        let owner: String =
+            serde_json::from_value(submit(ControlOp::AcquirePairCheck { now: 300 }).await).unwrap();
+        let leases = || async {
+            let mut owners = Vec::new();
+            for role in ["bot", "api"] {
+                let role = role.to_owned();
+                owners.push(
+                    f.control
+                        .db
+                        .with_conn(move |conn| {
+                            conn.query_row(
+                                "SELECT lease_owner FROM component_updates WHERE component=?1",
+                                params![role],
+                                |row| {
+                                    let owner: Option<String> = row.get(0)?;
+                                    Ok(owner)
+                                },
+                            )
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            owners
+        };
+        assert_eq!(leases().await, [Some(owner.clone()), Some(owner.clone())]);
+        let newer = |role: &str, digit: char| {
+            let mut release = upgrade.service(role).unwrap().release.clone();
+            release.source_sha = "9".repeat(40);
+            release.digest = format!("sha256:{}", digit.to_string().repeat(64));
+            release
+        };
+        let (bot, api_release) = (newer("bot", 'e'), newer("api", 'f'));
+        submit(ControlOp::RecordPairCheck {
+            owner: owner.clone(),
+            channel: "latest".into(),
+            bot: bot.clone(),
+            api: api_release.clone(),
+            now: 300,
+        })
+        .await;
+        submit(ControlOp::ReleasePairCheck {
+            owner: owner.clone(),
+        })
+        .await;
+        assert_eq!(leases().await, [None, None]);
+        for (role, release) in [("bot", &bot), ("api", &api_release)] {
+            let state = f.control.component(role).await.unwrap();
+            assert_eq!(state.candidate.unwrap().digest, release.digest);
+        }
+        let recovered: ServiceUpgrade = serde_json::from_value(
+            submit(ControlOp::RequestUpgrade {
+                bot_digest: bot.digest.clone(),
+                api_digest: api_release.digest.clone(),
+                recover: true,
+                now: 300,
+            })
+            .await,
+        )
+        .unwrap();
+        assert_ne!(recovered.id, upgrade.id);
+        assert_eq!(recovered.bot.release.digest, bot.digest);
+        assert_eq!(recovered.api.release.digest, api_release.digest);
+        assert_eq!(recovered.phase, UpgradePhase::Preparing);
     }
 }
