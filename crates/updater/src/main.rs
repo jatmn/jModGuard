@@ -2802,7 +2802,9 @@ impl Supervisor {
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
-                if error.is::<db::UpgradeProgressChanged>() {
+                // An unsaved API step through the bot launcher link is retried
+                // on the next poll; it is not a failed upgrade.
+                if error.is::<db::UpgradeProgressChanged>() || Self::receipt_not_saved(&error) {
                     return Ok(false);
                 }
                 let _ = self
@@ -2991,11 +2993,16 @@ where
 async fn main() -> Result<()> {
     let role = role()?;
     let base_sha = std::env::var("JMODGUARD_BASE_SHA").unwrap_or_else(|_| "unknown".into());
-    let mut api_control: Option<(String, String)> = None;
+    let mut api_control: Option<(String, String, String)> = None;
+    let mut launcher_link: Option<(String, String)> = None;
     let (opts, health_bind) = if role == "bot" {
         let cfg = BotProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
         jmodguard::set_shutdown_context("launcher");
+        launcher_link = Some((
+            cfg.bot.launcher_bind.clone(),
+            cfg.bot.control_secret.as_str().to_owned(),
+        ));
         (cfg.db_open_options(), cfg.health_bind())
     } else {
         let cfg = ApiProcessConfig::load()?;
@@ -3003,6 +3010,7 @@ async fn main() -> Result<()> {
         jmodguard::set_shutdown_context("launcher");
         api_control = Some((
             cfg.bot.control_target.clone(),
+            cfg.bot.launcher_target.clone(),
             cfg.bot.control_secret.as_str().to_owned(),
         ));
         (cfg.db_open_options(), None)
@@ -3083,10 +3091,21 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(POLL) => {},
         }
     };
-    let control = if let Some((target, secret)) = api_control.as_ref() {
-        match api_writer_link(target, secret) {
+    let control = if let Some((target, launcher_target, secret)) = api_control.as_ref() {
+        let control = match api_writer_link(target, secret) {
             Some(link) => control.with_writer_link(link),
             None => control,
+        };
+        // Paired-upgrade steps go to the bot launcher, which stays up while
+        // the bot process is stopped. Without it a pair stays pending.
+        match jmodguard::control::try_writer_link(launcher_target, secret) {
+            Ok(Some(link)) => control.with_launcher_link(link),
+            _ => {
+                tracing::warn!(
+                    "API launcher has no usable JMODGUARD_LAUNCHER_CONTROL_TARGET; paired upgrades will not advance"
+                );
+                control
+            }
         }
     } else {
         control
@@ -3113,6 +3132,9 @@ async fn main() -> Result<()> {
             }
             jmodguard::log_shutdown_finished("launcher");
             return Ok(());
+        }
+        if let Some((bind, secret)) = launcher_link.as_ref() {
+            jmodguard::launcher_link::spawn(control.clone(), bind, secret);
         }
         Some(spawn_launcher_fence_renewal(control.clone()))
     } else {
@@ -3144,13 +3166,15 @@ async fn main() -> Result<()> {
         if let Some(digest) = failed.as_deref()
             && let Some(op) = control.upgrade().await?.filter(|op| op.phase.active())
             && op.service(&role)?.release.digest == digest
-        {
-            control
+            && let Err(error) = control
                 .upgrade_error(
                     &op.id,
                     "required launcher failed; retry the selected pair from recovery",
                 )
-                .await?;
+                .await
+        {
+            // The API serves without the bot launcher; the pair stays pending.
+            tracing::warn!("paired-upgrade error was not recorded: {error:#}");
         }
         planned
     } else {

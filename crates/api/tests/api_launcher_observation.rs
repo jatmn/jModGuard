@@ -285,11 +285,8 @@ async fn read_only_api_stores_required_launcher_selection_and_applies_every_rece
         .reader
         .select_required_launcher(&release, Some("not-an-operation"))
         .await
-        .expect_err("an operation id is a paired upgrade");
-    assert!(
-        refused.to_string().contains(db::PAIRED_UPGRADES_DISABLED),
-        "{refused:#}"
-    );
+        .expect_err("a paired step needs the bot launcher link");
+    assert!(refused.is::<db::ReceiptNotSaved>(), "{refused:#}");
     assert!(
         linked
             .reader

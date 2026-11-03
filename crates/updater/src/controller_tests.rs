@@ -478,7 +478,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         .await
         .expect("same-schema pair should be admitted");
     let operation = control
-        .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, false, now())
+        .request_upgrade(&bot_release.digest, &api_release.digest, false, now())
         .await
         .unwrap();
     // Simulate an older capable controller executing the real prerequisite path.
@@ -710,7 +710,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
                 .unwrap();
         }
         control
-            .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, true, now())
+            .request_upgrade(&bot_release.digest, &api_release.digest, true, now())
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1132,7 +1132,7 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
             .unwrap();
     }
     let op = control
-        .queue_paired_upgrade_for_tests(&target.digest, &api.digest, false, now())
+        .request_upgrade(&target.digest, &api.digest, false, now())
         .await
         .unwrap();
     restart(&mut bot).await; // application stopped for the launcher handoff
@@ -1250,7 +1250,7 @@ async fn completed_coordinated_upgrade(root: &Path) -> (Db, UpdateControl, Compo
             .unwrap();
     }
     let op = control
-        .queue_paired_upgrade_for_tests(&bot.digest, &api.digest, false, stamp)
+        .request_upgrade(&bot.digest, &api.digest, false, stamp)
         .await
         .unwrap();
     let seen = control.component("bot").await.unwrap().observed.unwrap();
