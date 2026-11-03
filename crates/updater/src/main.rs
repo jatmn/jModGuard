@@ -1222,12 +1222,16 @@ impl Supervisor {
                     .await
                 {
                     Ok(()) => self.reset_boot_receipt_backoff(),
-                    Err(error) if Self::receipt_not_saved(&error) => {
+                    Err(error) => {
+                        // Removing the queue entry is not an acknowledgement.
+                        // Keep it until storage accepts it or recovery supersedes it.
                         tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                         self.queue_pending_boot_record((*release).clone(), reason, running);
                         self.note_boot_receipt_delay();
+                        if !Self::receipt_not_saved(&error) {
+                            return Err(error);
+                        }
                     }
-                    Err(error) => return Err(error),
                 }
             }
             PendingBootMismatch::Clear => {
@@ -1580,6 +1584,18 @@ impl Supervisor {
         sha: &str,
         release: Option<ComponentRelease>,
     ) -> Result<()> {
+        // Keep the startup future off the stack of nested supervisor calls,
+        // including the direct rollback calls below.
+        Box::pin(self.start_checked(path, sha, release, true)).await
+    }
+
+    async fn start_checked(
+        &mut self,
+        path: &Path,
+        sha: &str,
+        release: Option<ComponentRelease>,
+        baked_restore: bool,
+    ) -> Result<()> {
         ensure!(
             !self.restart.held,
             "bot held after Discord token rejection; restart container"
@@ -1590,27 +1606,34 @@ impl Supervisor {
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
         }
-        let baked_fallback =
-            path == self.baked && release.is_none() && self.baked_fallback_installed.is_some();
+        let built_in = path == self.baked && release.is_none();
+        let baked_fallback = built_in && self.baked_fallback_installed.is_some();
         let before_spawn = async {
             #[cfg(test)]
             if let Some((reached, resume)) = self.before_spawn_gate.take() {
                 let _ = reached.send(());
                 let _ = resume.await;
             }
-            if baked_fallback {
-                // Receipts and reading the binary can await. Keep idle liveness
-                // available while the final outage schema reads are pending.
+            if built_in {
+                // Reading the binary can await. Keep idle liveness available
+                // while the final built-in schema reads are pending.
                 let schema = self.control.schema_version().await?;
                 let state = self.control.component(&self.role).await?;
-                ensure!(
-                    self.baked_core_fits(schema),
-                    "baked application cannot open database; use owner recovery"
-                );
-                ensure!(
-                    self.recorded_guild_matches(&state, None),
-                    db::APP_ONLY_SCHEMA_CHANGE_REFUSED
-                );
+                if baked_restore && !baked_fallback {
+                    ensure!(
+                        self.baked_restore_fits(&state, schema).await?,
+                        "baked application cannot open database; use owner recovery"
+                    );
+                } else {
+                    ensure!(
+                        self.baked_core_fits(schema),
+                        "baked application cannot open database; use owner recovery"
+                    );
+                    ensure!(
+                        self.recorded_guild_matches(&state, None),
+                        db::APP_ONLY_SCHEMA_CHANGE_REFUSED
+                    );
+                }
             }
             // Release the idle listener only after validation succeeds, so a
             // stalled or failed database read cannot take process health down.
@@ -1641,6 +1664,15 @@ impl Supervisor {
         self.reported = false;
         self.last_observed = None;
         self.arm_child_health_watch();
+        if baked_fallback {
+            let installed = self.baked_fallback_installed.clone().unwrap();
+            self.record_boot_mismatch_for_installed(
+                &installed,
+                REGISTRY_OUTAGE_BOOT_MISMATCH,
+                self.base_sha.clone(),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1945,13 +1977,18 @@ impl Supervisor {
                 self.clear_pending_boot_mismatch();
                 Ok(())
             }
-            Err(error) if Self::receipt_not_saved(&error) => {
+            Err(error) => {
+                // A spawned fallback no longer retries restore, so retain its
+                // diagnostic even when storage returns an ordinary SQL error.
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                 self.queue_pending_boot_record(release.clone(), reason.to_owned(), running);
                 self.note_boot_receipt_delay();
-                Ok(())
+                if Self::receipt_not_saved(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1988,12 +2025,6 @@ impl Supervisor {
             db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
         self.baked_fallback_installed = Some(release.clone());
-        self.record_boot_mismatch_for_installed(
-            release,
-            REGISTRY_OUTAGE_BOOT_MISMATCH,
-            self.base_sha.clone(),
-        )
-        .await?;
         Ok((self.baked.clone(), self.base_sha.clone(), None))
     }
 
@@ -2008,13 +2039,9 @@ impl Supervisor {
         self.start(&path, &sha, None).await
     }
 
-    async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
-        if let Some((failed, error)) = self.rollback.clone() {
-            return self.rollback_independent(state, failed, error).await;
-        }
-        // One-time deployment of this baseline replaces pre-protocol selections
-        // whose metadata caused the schema15/16 lockout. Operators stop both old
-        // services for this rollout. Never discard a protocol-2 managed selection.
+    /// Preserve the legacy baseline and uninstalled bot migration exceptions.
+    /// Re-evaluate them with fresh state before a built-in restore spawns.
+    async fn baked_restore_fits(&self, state: &db::ComponentUpdate, schema: i64) -> Result<bool> {
         let legacy_baseline = state
             .observed
             .as_ref()
@@ -2024,11 +2051,35 @@ impl Supervisor {
                 .as_ref()
                 .is_none_or(|release| release.upgrade.is_none())
             && self.control.upgrade().await?.is_none();
-        let schema = self.control.schema_version().await?;
         if legacy_baseline
             && ((self.role == "bot" && schema <= self.baked_compatibility.core)
                 || schema == self.baked_compatibility.core)
         {
+            return Ok(true);
+        }
+        if state.installed.is_some() {
+            return Ok(false);
+        }
+        // A baked bot owns migrations only without managed history or a
+        // durable paired operation. The API still requires its exact schema.
+        let baked_migration = self.role == "bot"
+            && (15..=self.baked_compatibility.core).contains(&schema)
+            && state.previous.is_none()
+            && (state.desired.is_none() || state.state == "queued")
+            && state
+                .observed
+                .as_ref()
+                .is_none_or(|seen| seen.max_schema <= self.baked_compatibility.core)
+            && self.control.upgrade().await?.is_none();
+        Ok(schema == self.baked_compatibility.core || baked_migration)
+    }
+
+    async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
+        if let Some((failed, error)) = self.rollback.clone() {
+            return self.rollback_independent(state, failed, error).await;
+        }
+        let schema = self.control.schema_version().await?;
+        if self.baked_restore_fits(state, schema).await? {
             let path = self.baked.clone();
             let sha = self.base_sha.clone();
             return self.start(&path, &sha, None).await;
@@ -2065,27 +2116,7 @@ impl Supervisor {
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
         } else {
-            // A baked bot owns migrations. A protocol-aware observation alone
-            // does not make an uninstalled, queued release a managed baseline.
-            // Keep that queue intact, but never replace managed history or a
-            // durable paired operation. Published baked migration origins start
-            // at core15; the API still requires its exact runtime schema.
-            let baked_migration = self.role == "bot"
-                && (15..=self.baked_compatibility.core).contains(&schema)
-                && state.previous.is_none()
-                && (state.desired.is_none() || state.state == "queued")
-                && state
-                    .observed
-                    .as_ref()
-                    .is_none_or(|seen| seen.max_schema <= self.baked_compatibility.core)
-                && self.control.upgrade().await?.is_none();
-            ensure!(
-                schema == self.baked_compatibility.core || baked_migration,
-                "baked application cannot open database; use owner recovery"
-            );
-            let path = self.baked.clone();
-            let sha = self.base_sha.clone();
-            self.start(&path, &sha, None).await?;
+            anyhow::bail!("baked application cannot open database; use owner recovery");
         }
         Ok(())
     }
@@ -2442,7 +2473,9 @@ impl Supervisor {
                 self.stop_application().await?;
                 return Ok(false);
             }
-            if let Some((path, sha, previous)) = self.standby.take() {
+            if self.rollback.is_none()
+                && let Some((path, sha, previous)) = self.standby.clone()
+            {
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
                 let schema = self.control.schema_version().await?;
@@ -2467,10 +2500,13 @@ impl Supervisor {
                 // fallback's baked child has no release of its own; the receipt
                 // still names the retained installed selection.
                 let retained = self.durable_baked_selection(path == self.baked, &previous);
-                self.stop_application().await?;
-                self.start(&path, &sha, previous).await?;
-                let child = self.running.as_ref().context("rollback did not start")?;
                 let message = format!("{error:#}");
+                // Stop, spawn, and post-spawn receipts can fail. Retain both
+                // identities until settlement so the failed selection stays held.
+                self.rollback = Some((failed.clone(), message.clone()));
+                self.stop_application().await?;
+                Box::pin(self.start_checked(&path, &sha, previous, false)).await?;
+                let child = self.running.as_ref().context("rollback did not start")?;
                 match self
                     .control
                     .rolled_back(
@@ -2493,16 +2529,28 @@ impl Supervisor {
                         // The receipt cleared the saved candidate. Drop the
                         // in-memory digest so a later rejection is saved again.
                         self.persisted_candidate_digest = None;
+                        self.rollback = None;
+                        self.standby = None;
                         return Ok(false);
                     }
                     Err(save) if Self::receipt_not_saved(&save) => {
                         tracing::warn!("rollback receipt was not saved: {save:#}");
-                        self.rollback = Some((failed, message));
                         self.note_receipt_delay();
                         return Ok(false);
                     }
                     Err(save) => return Err(save),
                 }
+            } else if self.rollback.is_some() {
+                // A receipt error must not replace the saved failed candidate
+                // with the fallback's release or restart a healthy fallback.
+                if let Some(child) = self.running.as_mut()
+                    && child.child.try_wait()?.is_some()
+                {
+                    // restore() retries from self.rollback and standby after
+                    // restart backoff, preserving the strict rollback gates.
+                    self.stop_application().await?;
+                }
+                return Err(error);
             } else {
                 self.stop_child(true).await?;
                 return Err(error);
@@ -2679,7 +2727,7 @@ impl Supervisor {
         self.clear_rejected_marker().await;
         self.rollback = Some((failed, error));
         self.stop_application().await?;
-        self.start(&path, &sha, previous).await
+        Box::pin(self.start_checked(&path, &sha, previous, false)).await
     }
 
     async fn tick(&mut self) -> Result<bool> {

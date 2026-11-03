@@ -2854,6 +2854,13 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             "baked migrator must start from core16"
         );
         assert!(bot.running.as_ref().unwrap().release.is_none());
+        // A crash before bootstrap completes must retain baked migration eligibility.
+        bot.stop_child(true).await.unwrap();
+        bot.restart_exited_child().await.unwrap();
+        assert!(
+            bot.running.is_some(),
+            "baked migrator must restart from core16"
+        );
         // Real application bootstrap applies the remaining migrations and the readiness
         // marker. The ELF child itself deliberately does no DB/application work.
         let migrated = Db::open(&path, 2).unwrap();
@@ -8914,6 +8921,100 @@ async fn outage_fallback_keeps_the_installed_release_and_records_the_mismatch() 
 }
 
 #[tokio::test]
+async fn outage_diagnostic_recovers_after_post_spawn_write_failure() {
+    outage_diagnostic_recovers_after_write_failure(0).await;
+}
+
+#[tokio::test]
+async fn outage_diagnostic_recovers_after_repeated_retry_write_failures() {
+    outage_diagnostic_recovers_after_write_failure(2).await;
+}
+
+async fn outage_diagnostic_recovers_after_write_failure(failed_retries: usize) {
+    for role in ["bot", "api"] {
+        let root =
+            std::env::temp_dir().join(format!("outage-receipt-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let baked = executable(&root, "baked").await;
+        let (db, control) = open_launcher_db(&root).await;
+        let installed = release_at(role, 'c', control.schema_version().await.unwrap());
+        let stamp = 1_700_000_000;
+        install_for_outage(&db, &control, &installed, stamp).await;
+        let (refused, reserved) = refused_registry().await;
+        let mut service = controller(
+            role,
+            baked.clone(),
+            Registry::new(&refused).unwrap(),
+            control.clone(),
+            &root,
+        );
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER fail_outage_receipt BEFORE INSERT ON meta
+                 WHEN NEW.key = 'update_boot_mismatch_v1'
+                 BEGIN SELECT RAISE(FAIL, 'injected outage receipt failure'); END;",
+                64 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = service.tick().await.unwrap_err();
+        assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("injected outage receipt failure"));
+        let pid = service.running.as_ref().unwrap().child.id();
+        assert_eq!(service.running.as_ref().unwrap().path, baked);
+        assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+        wait_for_ready_file(&service).await;
+        let mut retry_errors = Vec::new();
+        for _ in 0..failed_retries {
+            // Advance the existing retry deadline without slowing the test.
+            service.boot_receipt_not_before = None;
+            retry_errors.push(service.tick().await.err());
+        }
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded("DROP TRIGGER fail_outage_receipt", 64 * 1024)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        service.boot_receipt_not_before = None;
+        for _ in 0..3 {
+            service.tick().await.unwrap();
+        }
+        let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+        let kept = control.component(role).await.unwrap();
+        let same_child = service.running.as_ref().unwrap().child.id() == pid;
+        let reported = service.reported;
+        service.stop_application().await.unwrap();
+        service.end_idle().await.unwrap();
+        drop((service, control, db, reserved));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+
+        assert!(
+            mismatch.contains_key(role),
+            "{role}: live outage fallback lost its boot mismatch after receipt storage recovered"
+        );
+        assert_eq!(mismatch[role].reason, REGISTRY_OUTAGE_BOOT_MISMATCH);
+        assert_eq!(mismatch[role].running, "b".repeat(40));
+        assert_eq!(mismatch[role].expected.release_id, installed.release_id);
+        assert_eq!(mismatch[role].expected.source_sha, installed.source_sha);
+        assert!(
+            same_child,
+            "receipt recovery must retain the running fallback"
+        );
+        assert!(reported);
+        assert_eq!(kept.installed.unwrap(), installed);
+        assert_eq!(kept.installed_at, Some(stamp));
+        for error in retry_errors {
+            let error = error.expect("the queued diagnostic must retry while storage is failing");
+            assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+            assert!(format!("{error:#}").contains("injected outage receipt failure"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn outage_fallback_rollback_keeps_the_installed_release() {
     let root = std::env::temp_dir().join(format!("boot-rollback-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
@@ -8948,6 +9049,50 @@ async fn outage_fallback_rollback_keeps_the_installed_release() {
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
+    immediate_rollback(None, false).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_boot_mismatch_write_failure() {
+    immediate_rollback(Some("boot_mismatch"), false).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_rollback_receipt_failure() {
+    immediate_rollback(Some("rollback_receipt"), false).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_spawn_failure() {
+    immediate_rollback(Some("spawn"), false).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_schema_refusal() {
+    immediate_rollback(Some("schema"), false).await;
+}
+
+#[tokio::test]
+async fn baked_immediate_rollback_restarts_exited_fallback_before_settlement() {
+    immediate_rollback(Some("fallback_exit"), false).await;
+}
+
+#[tokio::test]
+async fn managed_immediate_rollback_restarts_exited_fallback_before_settlement() {
+    immediate_rollback(Some("fallback_exit"), true).await;
+}
+
+#[tokio::test]
+async fn baked_immediate_rollback_retains_identity_across_receipt_failures() {
+    immediate_rollback(Some("repeated_receipt"), false).await;
+}
+
+#[tokio::test]
+async fn managed_immediate_rollback_retains_identity_across_receipt_failures() {
+    immediate_rollback(Some("repeated_receipt"), true).await;
+}
+
+async fn immediate_rollback(fault: Option<&str>, managed: bool) {
     let root = std::env::temp_dir().join(format!(
         "boot-immediate-rollback-{:032x}",
         rand::random::<u128>()
@@ -8993,7 +9138,15 @@ async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
         &root,
     );
     let state = control.component("bot").await.unwrap();
-    service.restore(&state).await.unwrap();
+    if managed {
+        let installed = executable(&root, "installed-bot").await;
+        service
+            .start(&installed, &release.source_sha, Some(release.clone()))
+            .await
+            .unwrap();
+    } else {
+        service.restore(&state).await.unwrap();
+    }
     wait_for_ready_file(&service).await;
     assert!(service.report_ready().await.unwrap());
     let seen = control.component("bot").await.unwrap().observed.unwrap();
@@ -9025,15 +9178,154 @@ async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
     let child = service.running.as_mut().unwrap();
     child.started_at = now() - elapsed.as_secs() as i64;
     child.started = Instant::now() - elapsed;
-    assert!(!service.normal().await.unwrap());
+    match fault {
+        Some("boot_mismatch") => {
+            db.with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER fail_rollback BEFORE INSERT ON meta
+                     WHEN NEW.key = 'update_boot_mismatch_v1'
+                     BEGIN SELECT RAISE(FAIL, 'injected boot mismatch failure'); END;",
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        Some("rollback_receipt" | "fallback_exit" | "repeated_receipt") => {
+            db.with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER fail_rollback BEFORE UPDATE ON component_updates
+                     WHEN NEW.component = 'bot' AND NEW.state = 'failed'
+                     BEGIN SELECT RAISE(FAIL, 'injected rollback receipt failure'); END;",
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        Some("spawn") => {
+            tokio::fs::rename(&service.baked, root.join("saved-baked"))
+                .await
+                .unwrap();
+        }
+        Some("schema") => {
+            db.with_conn(|conn| {
+                conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION + 1)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        None => {}
+        Some(other) => panic!("unknown fault {other}"),
+    }
+    let result = service.normal().await;
+    if let Some(fault) = fault {
+        let error = result.unwrap_err();
+        assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+        match fault {
+            "boot_mismatch" | "rollback_receipt" | "fallback_exit" | "repeated_receipt" => {
+                assert!(format!("{error:#}").contains("injected"), "{error:#}");
+                let fallback_pid = service.running.as_ref().unwrap().child.id();
+                if fault == "repeated_receipt" {
+                    wait_for_ready_file(&service).await;
+                    for _ in 0..3 {
+                        let error = service.tick().await.unwrap_err();
+                        assert!(format!("{error:#}").contains("injected rollback receipt failure"));
+                        assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                        assert_eq!(service.running.as_ref().unwrap().child.id(), fallback_pid);
+                        assert_eq!(
+                            control.component("bot").await.unwrap().desired,
+                            Some(candidate.clone())
+                        );
+                    }
+                }
+                if fault == "fallback_exit" {
+                    let hold = root.join(if managed {
+                        "hold-installed-bot-ready"
+                    } else {
+                        "hold-baked-bot-ready"
+                    });
+                    tokio::fs::write(&hold, "hold").await.unwrap();
+                    let child = &mut service.running.as_mut().unwrap().child;
+                    child.kill().await.unwrap();
+                    child.wait().await.unwrap();
+                    let error = service.normal().await.unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("application exited"),
+                        "{error:#}"
+                    );
+                    assert!(
+                        service.running.is_none(),
+                        "exited fallback must be released for restore"
+                    );
+                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    service.restart.not_before = None;
+                    assert!(!service.tick().await.unwrap());
+                    assert_ne!(service.running.as_ref().unwrap().child.id(), fallback_pid);
+                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    tokio::fs::remove_file(hold).await.unwrap();
+                }
+                db.with_conn(|conn| {
+                    conn.execute_batch_bounded("DROP TRIGGER fail_rollback", 64 * 1024)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            "spawn" => {
+                assert!(service.running.is_none());
+                tokio::fs::rename(root.join("saved-baked"), &service.baked)
+                    .await
+                    .unwrap();
+                assert!(!service.normal().await.unwrap());
+            }
+            "schema" => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("rollback schema is incompatible")
+                );
+                db.with_conn(|conn| {
+                    conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                assert!(!service.normal().await.unwrap());
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        assert!(!result.unwrap());
+    }
     let kept = control.component("bot").await.unwrap();
     assert_eq!(kept.installed.as_ref().unwrap().digest, release.digest);
     assert_eq!(kept.installed_at, Some(stamp));
-    assert!(service.running.as_ref().unwrap().release.is_none());
-    assert_eq!(service.running.as_ref().unwrap().path, service.baked);
+    let expected_release = managed.then_some(release.clone());
+    assert_eq!(service.running.as_ref().unwrap().release, expected_release);
+    assert_eq!(
+        service.running.as_ref().unwrap().path,
+        if managed {
+            root.join("installed-bot")
+        } else {
+            service.baked.clone()
+        }
+    );
     wait_for_ready_file(&service).await;
-    assert!(service.report_ready().await.unwrap());
+    assert!(!service.normal().await.unwrap());
+    assert!(!service.normal().await.unwrap());
+    assert_eq!(
+        service.running.as_ref().unwrap().release,
+        expected_release,
+        "failed candidate was dispatched again after rollback recovery"
+    );
+    assert!(service.rollback.is_none());
+    assert!(service.standby.is_none());
     let kept = control.component("bot").await.unwrap();
+    assert!(kept.desired.is_none());
     assert_eq!(kept.installed.unwrap().digest, release.digest);
     assert_eq!(kept.installed_at, Some(stamp));
     service.stop_application().await.unwrap();
@@ -9293,8 +9585,7 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
-#[tokio::test]
-async fn outage_spawn_rereads_core_and_guild_schemas() {
+async fn built_in_spawn_rereads_schemas(start_path: &str) {
     let root = std::env::temp_dir().join(format!("boot-reread-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let baked = executable(&root, "baked-bot").await;
@@ -9304,11 +9595,21 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
     let (refused, reserved) = refused_registry().await;
     for role in ["bot", "api"] {
         let release = release_at(role, 'c', core);
-        install_for_outage(&db, &control, &release, 1_700_000_000).await;
+        if start_path == "outage" {
+            install_for_outage(&db, &control, &release, 1_700_000_000).await;
+        }
         for changed in ["core", "guild", "read-error", "neither"] {
+            // Baked restore and its restart keep their existing core-only policy.
+            if changed == "guild" && matches!(start_path, "restore" | "legacy" | "restart") {
+                continue;
+            }
             set_core_schema(&db, core).await;
+            let mut seen = fresh_observation(1_700_000_000);
+            if start_path == "legacy" {
+                seen.update_protocol = 0;
+            }
             control
-                .running(role, None, fresh_observation(1_700_000_000), 1_700_000_000)
+                .running(role, None, seen, 1_700_000_000)
                 .await
                 .unwrap();
             let state = control.component(role).await.unwrap();
@@ -9337,11 +9638,30 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
             })
             .await
             .expect("idle listener never became available");
+            if start_path == "restart" {
+                service.restore(&state).await.unwrap();
+                service.stop_child(true).await.unwrap();
+            } else if start_path == "rollback" {
+                service.standby = Some((baked.clone(), service.base_sha.clone(), None));
+            }
             let (reached, at_spawn) = tokio::sync::oneshot::channel();
             let (resume, resumed) = tokio::sync::oneshot::channel();
             service.before_spawn_gate = Some((reached, resumed));
+            let start_path = start_path.to_owned();
             let mut restore = tokio::spawn(async move {
-                let result = service.restore(&state).await;
+                let result = match start_path.as_str() {
+                    "restart" => service.restart_exited_child().await,
+                    "rollback" => {
+                        service
+                            .rollback_independent(
+                                &state,
+                                release_at(role, 'd', core),
+                                "failed".into(),
+                            )
+                            .await
+                    }
+                    _ => service.restore(&state).await,
+                };
                 (service, result)
             });
             tokio::time::timeout(Duration::from_secs(10), at_spawn)
@@ -9373,15 +9693,19 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
             }
             let (releases, blockers) = block_sqlite_pool(&db).await;
             resume.send(()).unwrap();
-            let pending = tokio::time::timeout(Duration::from_millis(100), &mut restore)
+            let early = tokio::time::timeout(Duration::from_millis(100), &mut restore)
                 .await
-                .is_err();
+                .ok();
+            let pending = early.is_none();
             let healthy_while_blocked = launcher_health_responds(addr).await;
             drop(releases);
             for blocker in blockers {
                 blocker.await.unwrap();
             }
-            let (mut service, result) = restore.await.unwrap();
+            let (mut service, result) = match early {
+                Some(result) => result.unwrap(),
+                None => restore.await.unwrap(),
+            };
             let started = service.running.is_some();
             let healthy_after_refusal = started || launcher_health_responds(addr).await;
             service.stop_application().await.unwrap();
@@ -9436,10 +9760,68 @@ async fn outage_spawn_rereads_core_and_guild_schemas() {
                     assert!(started, "{role}: unchanged schemas must permit spawn");
                 }
             }
+            if !started {
+                assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+                assert!(service.pending_boot_mismatch.is_empty());
+            }
+            control.clear_boot_mismatch(role).await.unwrap();
         }
     }
     drop(reserved);
     drop((db, control));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn outage_spawn_rereads_core_and_guild_schemas() {
+    built_in_spawn_rereads_schemas("outage").await;
+}
+
+#[tokio::test]
+async fn other_built_in_starts_reread_schemas() {
+    for start_path in ["restore", "legacy", "restart", "rollback"] {
+        built_in_spawn_rereads_schemas(start_path).await;
+    }
+}
+
+#[tokio::test]
+async fn outage_failed_spawn_does_not_record_running_receipt() {
+    let root = std::env::temp_dir().join(format!("failed-spawn-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let core = control.schema_version().await.unwrap();
+    let installed = release_at("bot", 'c', core);
+    install_for_outage(&db, &control, &installed, 1_700_000_000).await;
+    let (refused, reserved) = refused_registry().await;
+    let mut service = controller(
+        "bot",
+        baked.clone(),
+        Registry::new(&refused).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let state = control.component("bot").await.unwrap();
+    let (reached, at_spawn) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    service.before_spawn_gate = Some((reached, resumed));
+    let restore = tokio::spawn(async move {
+        let result = service.restore(&state).await;
+        (service, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), at_spawn)
+        .await
+        .unwrap()
+        .unwrap();
+    // Reading the real executable succeeded, but process creation will fail.
+    tokio::fs::remove_file(&baked).await.unwrap();
+    resume.send(()).unwrap();
+    let (service, result) = restore.await.unwrap();
+    assert!(result.is_err());
+    assert!(service.running.is_none());
+    assert!(service.pending_boot_mismatch.is_empty());
+    assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+    drop((service, control, db, reserved));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
@@ -9599,7 +9981,7 @@ async fn installed_outage_fallback_uses_the_existing_schema_and_registry_gates()
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
-async fn cold_start_before_installed_stage(required_launcher: bool) {
+async fn cold_start_before_installed_stage(required_launcher: bool, self_update: bool) {
     for role in ["bot", "api"] {
         let root =
             std::env::temp_dir().join(format!("early-outage-{:032x}", rand::random::<u128>()));
@@ -9640,10 +10022,26 @@ async fn cold_start_before_installed_stage(required_launcher: bool) {
                 control.clone(),
                 &root,
             );
+            service.enabled = self_update;
             service.baked_compatibility.core += core_offset;
             service.baked_compatibility.guild += guild_offset;
             let (result, logs) = with_contract_warnings(service.normal()).await;
-            if allowed {
+            if required_launcher && !self_update {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("self-update to be enabled")
+                );
+                assert!(service.running.is_none());
+                assert!(service.pending_boot_mismatch.is_empty());
+                assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+                assert!(
+                    !service.staging.exists(),
+                    "disabled handoff must not stage a download"
+                );
+                assert!(!logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)));
+            } else if allowed {
                 assert!(!result.unwrap(), "outage must not request launcher reexec");
                 let running = service.running.as_ref().expect("built-in child must start");
                 assert_eq!(running.path, baked);
@@ -9684,12 +10082,17 @@ async fn cold_start_before_installed_stage(required_launcher: bool) {
 
 #[tokio::test]
 async fn cold_start_schema_refusal_considers_built_in_on_outage() {
-    cold_start_before_installed_stage(false).await;
+    cold_start_before_installed_stage(false, true).await;
 }
 
 #[tokio::test]
 async fn cold_start_required_launcher_considers_built_in_on_outage() {
-    cold_start_before_installed_stage(true).await;
+    cold_start_before_installed_stage(true, true).await;
+}
+
+#[tokio::test]
+async fn cold_start_required_launcher_refuses_handoff_with_self_update_disabled() {
+    cold_start_before_installed_stage(true, false).await;
 }
 
 #[tokio::test]
