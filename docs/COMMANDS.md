@@ -43,8 +43,10 @@ The expiry is saved with the ban and survives a restart. The existing action
 worker lifts due bans on its next poll; overdue bans are processed after startup.
 Omitting the duration leaves a new ban permanent. Supplying a duration for an
 already banned user sets a new expiry. A manual unban cancels the pending expiry.
+The expiry is saved before the moderation log is delivered.
 An automatic unban is attempted once; a failed or uncertain Discord request is
-logged for moderator follow-up and is not retried.
+logged for moderator follow-up and is not retried. See
+[Timed-ban expiry](BOT-ACTIONS.md#timed-ban-expiry) for the operator checks.
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/userinfo`, `/purge`, `/say`, `/slowmode`, `/voice`,
