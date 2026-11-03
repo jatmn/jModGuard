@@ -107,11 +107,21 @@ pub(crate) fn is_remote_interactive_timeout(error: &anyhow::Error) -> bool {
     })
 }
 
+/// These failures leave a baton unusable even if the server transaction has
+/// not reached its timeout. Retire it without replaying the failed operation.
+fn is_remote_stream_lost(error: &anyhow::Error) -> bool {
+    is_remote_interactive_timeout(error)
+        || error.chain().any(|cause| {
+            let message = cause.to_string().to_ascii_lowercase();
+            message.contains("invalid baton") || message.contains("no runtime")
+        })
+}
+
 /// A read already produced its snapshot. ROLLBACK is only how we avoid COMMIT
 /// semantics; if the provider already dropped the transaction, the read is
 /// still determinate.
 fn remote_read_rollback_is_complete(error: &anyhow::Error) -> bool {
-    is_remote_interactive_timeout(error)
+    is_remote_stream_lost(error)
 }
 
 /// Hidden helper for unit tests in dependent crates.
@@ -571,7 +581,7 @@ impl DbRuntime {
                 if rolled_back {
                     // The ending statement already closed the stream. Drop off
                     // this runtime so libsql does not spawn a second rollback.
-                    drop_transaction_without_runtime(tx);
+                    self.drop_transaction(tx);
                 } else {
                     // Still inside this runtime, so libsql can send close.
                     drop(tx);
@@ -597,16 +607,14 @@ impl DbRuntime {
         Arc::ptr_eq(&self._thread, &other._thread)
     }
 
-    /// Drop a remote connection on this runtime. libsql sends a stream close
-    /// only when a tokio runtime is current; an off-runtime drop logs that no
-    /// runtime was available and never sends it.
-    pub(crate) fn spawn_drop<T>(&self, value: T)
-    where
-        T: Send + 'static,
-    {
-        self.handle.spawn(async move {
-            drop(value);
-        });
+    fn drop_transaction(&self, inner: libsql::Transaction) {
+        // Suppress libSQL's duplicate, unbounded rollback callback off-runtime,
+        // but keep its stream alive until it can be dropped on its owner.
+        let stream = self
+            .is_remote()
+            .then(|| RuntimeOwned::new((*inner).clone(), self));
+        drop_transaction_without_runtime(inner);
+        drop(stream);
     }
 
     /// Close a startup connection on this runtime and wait until that drop
@@ -746,8 +754,40 @@ fn active_caller_abandon() -> Option<Arc<AbandonWatch>> {
 pub(crate) const ACTIVE_BOT_LEASE_CAS: &str = "UPDATE meta SET value=?2 || max(CAST(substr(value,34) AS INTEGER), CAST(substr(?1,34) AS INTEGER)) WHERE key='active_bot_lease' AND substr(value,1,33)=?2 AND CAST(substr(value,34) AS INTEGER) > ?3 AND (SELECT value FROM meta WHERE key='active_bot_generation')=?4 AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
 pub(crate) const LAUNCHER_FENCE_CAS: &str = "UPDATE meta SET value=?1 WHERE key='launcher_lease' AND (substr(value,1,33)=?2 OR CAST(substr(value,34) AS INTEGER) <= ?3) AND COALESCE((SELECT value FROM meta WHERE key='restore_fence'),'0')!='1'";
 
+/// libSQL stream destructors use the ambient Tokio handle to send Close.
+/// Keep that cleanup on the same runtime as the calls, including idle pool,
+/// lease and prepared-statement disposal from temporary caller runtimes.
+struct RuntimeOwned<T> {
+    value: Option<T>,
+    handle: tokio::runtime::Handle,
+}
+
+impl<T> RuntimeOwned<T> {
+    fn new(value: T, runtime: &DbRuntime) -> Self {
+        Self {
+            value: Some(value),
+            handle: runtime.handle.clone(),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for RuntimeOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value.as_ref().expect("runtime-owned value")
+    }
+}
+
+impl<T> Drop for RuntimeOwned<T> {
+    fn drop(&mut self) {
+        let _owner = self.handle.enter();
+        drop(self.value.take());
+    }
+}
+
 pub struct Connection {
-    inner: libsql::Connection,
+    inner: RuntimeOwned<libsql::Connection>,
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
     tainted: Arc<AtomicBool>,
@@ -1143,7 +1183,7 @@ impl Connection {
         let database = Arc::new(database);
         let inner = database.connect()?;
         Ok(Self {
-            inner,
+            inner: RuntimeOwned::new(inner, &runtime),
             database,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
@@ -1160,7 +1200,7 @@ impl Connection {
 
     pub fn from_database(database: Arc<libsql::Database>, runtime: DbRuntime) -> Result<Self> {
         Ok(Self {
-            inner: database.connect()?,
+            inner: RuntimeOwned::new(runtime.block_on(async { database.connect() })?, &runtime),
             database,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
@@ -1575,7 +1615,7 @@ impl SqlExecutor for Connection {
             .runtime
             .block_on_database("prepare", self.inner.prepare(sql))?;
         Ok(Statement {
-            inner,
+            inner: RuntimeOwned::new(inner, &self.runtime),
             runtime: self.runtime.clone(),
             read_deadline: None,
             client_deadline: Arc::new(AtomicBool::new(false)),
@@ -1593,7 +1633,7 @@ impl SqlExecutor for Connection {
 }
 
 pub struct Statement {
-    inner: libsql::Statement,
+    inner: RuntimeOwned<libsql::Statement>,
     runtime: DbRuntime,
     /// Absolute budget copied from a remote read or snapshot. Autocommit
     /// prepares and statements after a capture write leave this empty.
@@ -1641,7 +1681,7 @@ impl Statement {
         if let Err(error) = &mapped {
             if is_database_operation_timeout(error) {
                 client_deadline.store(true, Ordering::Release);
-            } else if is_remote_interactive_timeout(error) {
+            } else if is_remote_stream_lost(error) {
                 stream_exhausted.store(true, Ordering::Release);
             }
         }
@@ -1828,7 +1868,7 @@ impl Transaction {
             self.client_deadline.store(true, Ordering::Release);
             return;
         }
-        if is_remote_interactive_timeout(error) {
+        if is_remote_stream_lost(error) {
             self.stream_exhausted.store(true, Ordering::Release);
         }
     }
@@ -2244,9 +2284,8 @@ impl Transaction {
                     self.pending_config_version.load(Ordering::Acquire),
                     Ordering::SeqCst,
                 );
-                drop_transaction_without_runtime(
-                    self.inner.take().expect("transaction already completed"),
-                );
+                self.runtime
+                    .drop_transaction(self.inner.take().expect("transaction already completed"));
                 Ok(())
             }
             Err(commit_error) if self.runtime.is_remote() => {
@@ -2271,7 +2310,7 @@ impl Transaction {
                     );
                 }
                 let inner = self.inner.take().expect("transaction already completed");
-                drop_transaction_without_runtime(inner);
+                self.runtime.drop_transaction(inner);
                 let Some(receipt) = self.mutation_receipt.as_deref() else {
                     return Err(DatabaseCommitIndeterminate(commit_error).into());
                 };
@@ -2308,7 +2347,7 @@ impl Transaction {
             // the client deadline and cannot change the rows already collected.
             self.connection_tainted.store(true, Ordering::Release);
             let inner = self.inner.take().expect("transaction already completed");
-            drop_transaction_without_runtime(inner);
+            self.runtime.drop_transaction(inner);
             return Ok(());
         }
         let result = if let Some(result) = self.budgeted_read_rollback("finish read transaction") {
@@ -2327,7 +2366,7 @@ impl Transaction {
             self.note_remote_stream_loss(error);
         }
         let inner = self.inner.take().expect("transaction already completed");
-        drop_transaction_without_runtime(inner);
+        self.runtime.drop_transaction(inner);
         match result {
             Ok(_) => Ok(()),
             // The rows were already collected. The provider closing the stream
@@ -2353,7 +2392,10 @@ impl Transaction {
     }
 
     fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<bool> {
-        let connection = self.database.connect()?;
+        let connection = RuntimeOwned::new(
+            self.runtime.block_on(async { self.database.connect() })?,
+            &self.runtime,
+        );
         let mut transaction = Some(self.runtime.complete_or_release_open(
             "begin commit reconciliation",
             connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate),
@@ -2381,7 +2423,8 @@ impl Transaction {
                 .expect("transaction active")
                 .execute_batch("ROLLBACK"),
         );
-        drop_transaction_without_runtime(transaction.take().expect("transaction active"));
+        self.runtime
+            .drop_transaction(transaction.take().expect("transaction active"));
         drop(connection);
         match (query, cleanup) {
             // Once the primary receipt query answered, the original outcome
@@ -2486,7 +2529,7 @@ impl Drop for Transaction {
             // a new one.
             let inner = self.inner.take().expect("transaction already completed");
             if self.runtime.is_remote() {
-                drop_transaction_without_runtime(inner);
+                self.runtime.drop_transaction(inner);
             } else {
                 std::mem::forget(inner);
             }
@@ -2495,7 +2538,7 @@ impl Drop for Transaction {
         }
         if let Some(released) = self.budgeted_read_rollback("rollback transaction") {
             let inner = self.inner.take().expect("transaction already completed");
-            drop_transaction_without_runtime(inner);
+            self.runtime.drop_transaction(inner);
             if released.is_err() {
                 self.connection_tainted.store(true, Ordering::Release);
             }
@@ -2508,7 +2551,7 @@ impl Drop for Transaction {
             // libSQL does not spawn a second unbounded rollback.
             let released = self.release_remote_write_lock();
             let inner = self.inner.take().expect("transaction already completed");
-            drop_transaction_without_runtime(inner);
+            self.runtime.drop_transaction(inner);
             if released.is_err() {
                 self.connection_tainted.store(true, Ordering::Release);
             }
@@ -2526,7 +2569,7 @@ impl Drop for Transaction {
         );
         let inner = self.inner.take().expect("transaction already completed");
         match result {
-            Ok(_) => drop_transaction_without_runtime(inner),
+            Ok(_) => self.runtime.drop_transaction(inner),
             Err(error) => {
                 // The local libSQL transaction destructor retries rollback with
                 // `unwrap()`, while the remote destructor may spawn unbounded
@@ -2536,12 +2579,12 @@ impl Drop for Transaction {
                 // process-aborting destructor panic. The owning connection is
                 // marked unusable either way.
                 if self.runtime.is_remote() {
-                    drop_transaction_without_runtime(inner);
+                    self.runtime.drop_transaction(inner);
                 } else {
                     std::mem::forget(inner);
                 }
                 self.connection_tainted.store(true, Ordering::Release);
-                if self.runtime.is_remote() && is_remote_interactive_timeout(&error) {
+                if self.runtime.is_remote() && is_remote_stream_lost(&error) {
                     tracing::debug!(%error, "discarded timed-out remote transaction stream");
                 } else {
                     tracing::warn!(%error, "failed to roll back uncommitted database transaction");
@@ -2554,7 +2597,7 @@ impl Drop for Transaction {
 pub(crate) fn drop_pooled_connection(connection: Connection) {
     if connection.runtime.is_remote() {
         let runtime = connection.runtime.clone();
-        runtime.spawn_drop(connection);
+        runtime.close_connection(connection);
         return;
     }
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -2679,7 +2722,7 @@ impl SqlExecutor for Transaction {
             self.read_deadline
         };
         Ok(Statement {
-            inner,
+            inner: RuntimeOwned::new(inner, &self.runtime),
             runtime: self.runtime.clone(),
             read_deadline,
             client_deadline: Arc::clone(&self.client_deadline),
