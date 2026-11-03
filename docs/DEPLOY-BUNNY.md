@@ -283,7 +283,8 @@ check on the API's `/ready` can stall a rolling update the same way.
 Listeners: API web and health on port 8080 (`JMODGUARD_WEB_BIND`); API
 container-read on loopback `127.0.0.1:8083` (`JMODGUARD_READ_BIND`);
 bot health on port 8081 (`JMODGUARD_HEALTH_BIND`); bot control on loopback
-`127.0.0.1:8082` (`JMODGUARD_CONTROL_BIND`). The control and read binds are
+`127.0.0.1:8082` (`JMODGUARD_CONTROL_BIND`); bot launcher link on loopback
+`127.0.0.1:8084` (`JMODGUARD_LAUNCHER_CONTROL_BIND`). The control and read binds are
 loopback-only. Wildcard or non-loopback read binds are refused. Neither
 private listener is a public or CDN endpoint. `POST /private/container-use`
 is served only on the read listener, not on port 8080.
@@ -314,6 +315,7 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 JMODGUARD_HEALTH_BIND=0.0.0.0:8081
 JMODGUARD_CONTROL_BIND=127.0.0.1:8082
+JMODGUARD_LAUNCHER_CONTROL_BIND=127.0.0.1:8084
 JMODGUARD_CONTROL_SECRET=SECRET
 JMODGUARD_READ_TARGET=127.0.0.1:8083
 ```
@@ -382,6 +384,7 @@ JMODGUARD_CONFIG_POLL_SECS=5
 JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 JMODGUARD_CONTROL_TARGET=127.0.0.1:<control-port>
+JMODGUARD_LAUNCHER_CONTROL_TARGET=127.0.0.1:8084
 JMODGUARD_CONTROL_SECRET=SECRET
 JMODGUARD_READ_BIND=127.0.0.1:8083
 ```
@@ -393,6 +396,11 @@ bytes. It is independent of both database tokens. The API dials
 is the bot's control port, 8082 by default. Unset or empty, the API still
 serves reads and writes return `control link unavailable`. Do not put the
 control listener behind a public or CDN endpoint.
+
+`JMODGUARD_LAUNCHER_CONTROL_TARGET` (no default) dials the bot launcher link
+with the same secret. The bot launcher keeps running while the bot process is
+stopped, so paired bot and API upgrades and their owner recovery go there.
+Unset, a paired upgrade stays pending before anything stops.
 
 The API container-read listener is `JMODGUARD_READ_BIND` (default
 `127.0.0.1:8083`). A refused bind disables container readings for `!stats`;

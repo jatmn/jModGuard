@@ -213,7 +213,7 @@ pub enum ControlOp {
         digest: String,
         error: String,
     },
-    /// `operation` must be absent. Paired upgrades are refused.
+    /// `operation` names the paired upgrade that needs this launcher.
     SelectRequiredLauncher {
         release: ComponentRelease,
         operation: Option<String>,
@@ -301,6 +301,22 @@ pub enum ControlOp {
     },
     AbortUpgrade {
         id: String,
+    },
+    /// API paired-upgrade steps. Only the bot launcher link applies these.
+    JoinUpgrade {
+        id: String,
+        role: String,
+        instance: String,
+    },
+    AcknowledgeUpgrade {
+        id: String,
+        role: String,
+        instance: String,
+        action: UpgradeAcknowledgement,
+    },
+    RecordUpgradeError {
+        id: String,
+        error: String,
     },
 }
 
@@ -394,7 +410,10 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::RecordPairCheck { .. }
         | ControlOp::ReleasePairCheck { .. }
         | ControlOp::RequestUpgrade { .. }
-        | ControlOp::AbortUpgrade { .. } => ControlActorNeed::Process,
+        | ControlOp::AbortUpgrade { .. }
+        | ControlOp::JoinUpgrade { .. }
+        | ControlOp::AcknowledgeUpgrade { .. }
+        | ControlOp::RecordUpgradeError { .. } => ControlActorNeed::Process,
     }
 }
 
@@ -833,10 +852,7 @@ async fn apply_control_inner(
             saved_null()
         }
         ControlOp::SelectRequiredLauncher { release, operation } => {
-            if operation.is_some() {
-                anyhow::bail!(PAIRED_UPGRADES_DISABLED);
-            }
-            record_required_launcher(db, &release, None).await?;
+            record_required_launcher(db, &release, operation).await?;
             saved_null()
         }
         ControlOp::RecordWebuiDrift { error } => {
@@ -1011,6 +1027,11 @@ async fn apply_control_inner(
                 .await?;
             saved_null()
         }
+        // The bot launcher applies these under its own fence. The bot process
+        // is stopped for part of a paired upgrade, so it never takes them.
+        ControlOp::JoinUpgrade { .. }
+        | ControlOp::AcknowledgeUpgrade { .. }
+        | ControlOp::RecordUpgradeError { .. } => anyhow::bail!("write failed"),
     }
 }
 

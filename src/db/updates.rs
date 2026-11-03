@@ -139,6 +139,10 @@ pub struct ComponentObservation {
     pub update_protocol: u32,
     #[serde(default)]
     pub launcher_revision: u32,
+    /// Launcher revision of the container image's own build, whose baked API
+    /// serves maintenance after a failed pair. Older launchers report 0.
+    #[serde(default)]
+    pub baked_launcher_revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1198,6 +1202,7 @@ mod tests {
             guild_schema: Some(1),
             update_protocol: crate::db::UPDATE_CONTROL_PROTOCOL,
             launcher_revision: crate::db::VERIFIER_LAUNCHER_REVISION,
+            baked_launcher_revision: crate::db::VERIFIER_LAUNCHER_REVISION,
             source_sha: "d".repeat(40),
             executable_sha256: "e".repeat(64),
             admin_sha256: None,
@@ -1536,6 +1541,7 @@ mod tests {
             guild_schema: None,
             update_protocol: 0,
             launcher_revision: 0,
+            baked_launcher_revision: 0,
             source_sha: old.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: Some("d".repeat(64)),
@@ -1692,6 +1698,7 @@ mod tests {
             guild_schema: None,
             update_protocol: 0,
             launcher_revision: 0,
+            baked_launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1769,6 +1776,7 @@ mod tests {
             guild_schema: None,
             update_protocol: 0,
             launcher_revision: 0,
+            baked_launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1865,6 +1873,7 @@ mod tests {
             update_protocol: 0,
 
             launcher_revision: 0,
+            baked_launcher_revision: 0,
             source_sha: "c".repeat(40),
             executable_sha256: "d".repeat(64),
             admin_sha256: None,
@@ -1902,6 +1911,7 @@ mod tests {
             guild_schema: None,
             update_protocol: 0,
             launcher_revision: 0,
+            baked_launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: None,
@@ -2018,6 +2028,7 @@ mod tests {
                 guild_schema: None,
                 update_protocol: 0,
                 launcher_revision: 0,
+                baked_launcher_revision: 0,
                 source_sha: selected.source_sha.clone(),
                 executable_sha256: "c".repeat(64),
                 admin_sha256: None,
@@ -2247,6 +2258,7 @@ mod tests {
             guild_schema: Some(1),
             update_protocol: crate::db::UPDATE_CONTROL_PROTOCOL,
             launcher_revision: revision,
+            baked_launcher_revision: revision,
             source_sha: "d".repeat(40),
             executable_sha256: "e".repeat(64),
             admin_sha256: None,

@@ -162,10 +162,6 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
 
     let (status, apply_text) = post_apply(&page).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
-    assert!(
-        apply_text.contains(db::PAIRED_UPGRADES_DISABLED),
-        "{apply_text}"
-    );
     assert!(!apply_text.contains("read-only"), "{apply_text}");
 
     let cancel = tower::ServiceExt::oneshot(
@@ -193,15 +189,5 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
         "{cancel_text}"
     );
     assert!(!cancel_text.contains("read-only"), "{cancel_text}");
-    page.finish();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn paired_apply_on_the_recovery_page_is_refused() {
-    let page = RecoveryPage::open().await;
-    let (status, apply_text) = post_apply(&page).await;
-    assert_eq!(status, axum::http::StatusCode::CONFLICT);
-    let body: serde_json::Value = serde_json::from_str(&apply_text).unwrap();
-    assert_eq!(body["error"], db::PAIRED_UPGRADES_DISABLED);
     page.finish();
 }

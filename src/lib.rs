@@ -15,6 +15,7 @@ pub mod defaults;
 #[cfg(unix)]
 pub mod evidence_transfer;
 pub mod launcher_child;
+pub mod launcher_link;
 pub mod read_link;
 pub use jmodguard_runtime::cgroup;
 pub use jmodguard_runtime::health;

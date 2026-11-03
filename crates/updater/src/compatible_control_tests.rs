@@ -77,6 +77,7 @@ async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
                     guild_schema: Some(guild),
                     update_protocol: UPDATE_CONTROL_PROTOCOL,
                     launcher_revision: jmodguard::db::LAUNCHER_REVISION,
+                    baked_launcher_revision: jmodguard::db::LAUNCHER_REVISION,
                 },
                 100,
             )
@@ -191,6 +192,7 @@ fn launcher_advice(running: u32, available: u32, minimum: u32) -> serde_json::Va
             guild_schema: Some(guild),
             update_protocol: UPDATE_CONTROL_PROTOCOL,
             launcher_revision: running,
+            baked_launcher_revision: running,
         }),
         observed_at: Some(now),
         installed_at: None,
