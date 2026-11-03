@@ -2462,7 +2462,7 @@ impl Supervisor {
                 self.stop_application().await?;
                 return Ok(false);
             }
-            if let Some((path, sha, previous)) = self.standby.take() {
+            if let Some((path, sha, previous)) = self.standby.clone() {
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
                 let schema = self.control.schema_version().await?;
@@ -2487,10 +2487,13 @@ impl Supervisor {
                 // fallback's baked child has no release of its own; the receipt
                 // still names the retained installed selection.
                 let retained = self.durable_baked_selection(path == self.baked, &previous);
+                let message = format!("{error:#}");
+                // Stop, spawn, and post-spawn receipts can fail. Retain both
+                // identities until settlement so the failed selection stays held.
+                self.rollback = Some((failed.clone(), message.clone()));
                 self.stop_application().await?;
                 self.start_checked(&path, &sha, previous, false).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
-                let message = format!("{error:#}");
                 match self
                     .control
                     .rolled_back(
@@ -2513,11 +2516,12 @@ impl Supervisor {
                         // The receipt cleared the saved candidate. Drop the
                         // in-memory digest so a later rejection is saved again.
                         self.persisted_candidate_digest = None;
+                        self.rollback = None;
+                        self.standby = None;
                         return Ok(false);
                     }
                     Err(save) if Self::receipt_not_saved(&save) => {
                         tracing::warn!("rollback receipt was not saved: {save:#}");
-                        self.rollback = Some((failed, message));
                         self.note_receipt_delay();
                         return Ok(false);
                     }

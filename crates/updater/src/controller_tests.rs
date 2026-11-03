@@ -8951,6 +8951,30 @@ async fn outage_fallback_rollback_keeps_the_installed_release() {
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
+    outage_fallback_immediate_rollback(None).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_boot_mismatch_write_failure() {
+    outage_fallback_immediate_rollback(Some("boot_mismatch")).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_rollback_receipt_failure() {
+    outage_fallback_immediate_rollback(Some("rollback_receipt")).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_spawn_failure() {
+    outage_fallback_immediate_rollback(Some("spawn")).await;
+}
+
+#[tokio::test]
+async fn outage_fallback_immediate_rollback_recovers_schema_refusal() {
+    outage_fallback_immediate_rollback(Some("schema")).await;
+}
+
+async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
     let root = std::env::temp_dir().join(format!(
         "boot-immediate-rollback-{:032x}",
         rand::random::<u128>()
@@ -9028,15 +9052,106 @@ async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
     let child = service.running.as_mut().unwrap();
     child.started_at = now() - elapsed.as_secs() as i64;
     child.started = Instant::now() - elapsed;
-    assert!(!service.normal().await.unwrap());
+    match fault {
+        Some("boot_mismatch") => {
+            db.with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER fail_rollback BEFORE INSERT ON meta
+                     WHEN NEW.key = 'update_boot_mismatch_v1'
+                     BEGIN SELECT RAISE(FAIL, 'injected boot mismatch failure'); END;",
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        Some("rollback_receipt") => {
+            db.with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER fail_rollback BEFORE UPDATE ON component_updates
+                     WHEN NEW.component = 'bot' AND NEW.state = 'failed'
+                     BEGIN SELECT RAISE(FAIL, 'injected rollback receipt failure'); END;",
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        Some("spawn") => {
+            tokio::fs::rename(&service.baked, root.join("saved-baked"))
+                .await
+                .unwrap();
+        }
+        Some("schema") => {
+            db.with_conn(|conn| {
+                conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION + 1)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        None => {}
+        Some(other) => panic!("unknown fault {other}"),
+    }
+    let result = service.normal().await;
+    if let Some(fault) = fault {
+        let error = result.unwrap_err();
+        assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+        match fault {
+            "boot_mismatch" | "rollback_receipt" => {
+                assert!(format!("{error:#}").contains("injected"), "{error:#}");
+                assert!(service.running.as_ref().unwrap().release.is_none());
+                db.with_conn(|conn| {
+                    conn.execute_batch_bounded("DROP TRIGGER fail_rollback", 64 * 1024)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            "spawn" => {
+                assert!(service.running.is_none());
+                tokio::fs::rename(root.join("saved-baked"), &service.baked)
+                    .await
+                    .unwrap();
+                assert!(!service.normal().await.unwrap());
+            }
+            "schema" => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("rollback schema is incompatible")
+                );
+                db.with_conn(|conn| {
+                    conn.pragma_update(None, "user_version", db::CORE_SCHEMA_VERSION)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                assert!(!service.normal().await.unwrap());
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        assert!(!result.unwrap());
+    }
     let kept = control.component("bot").await.unwrap();
     assert_eq!(kept.installed.as_ref().unwrap().digest, release.digest);
     assert_eq!(kept.installed_at, Some(stamp));
     assert!(service.running.as_ref().unwrap().release.is_none());
     assert_eq!(service.running.as_ref().unwrap().path, service.baked);
     wait_for_ready_file(&service).await;
-    assert!(service.report_ready().await.unwrap());
+    assert!(!service.normal().await.unwrap());
+    assert!(!service.normal().await.unwrap());
+    assert!(
+        service.running.as_ref().unwrap().release.is_none(),
+        "failed candidate was dispatched again after rollback recovery"
+    );
+    assert!(service.rollback.is_none());
+    assert!(service.standby.is_none());
     let kept = control.component("bot").await.unwrap();
+    assert!(kept.desired.is_none());
     assert_eq!(kept.installed.unwrap().digest, release.digest);
     assert_eq!(kept.installed_at, Some(stamp));
     service.stop_application().await.unwrap();
