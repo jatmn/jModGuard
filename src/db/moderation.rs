@@ -1966,6 +1966,108 @@ pub async fn clear_enrolled_warns(
     .await
 }
 
+/// Attach a deadline to the current ban, scoped to the command's membership.
+pub async fn set_ban_expiry(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    user: i64,
+    expires_at: i64,
+) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let changed = tx.execute_matching(
+            "UPDATE bans SET expires_at=?1,expiry_enrollment_id=?2
+             WHERE guild_id=?3 AND user_id=?4 AND active=1",
+            params![expires_at, enrollment.id, enrollment.guild_id, user],
+        )?;
+        anyhow::ensure!(changed == 1, "active ban unavailable; expiry was not saved");
+        tx.commit()
+    })
+    .await
+}
+
+/// Identity of the ban whose deadline was consumed for a single dispatch attempt.
+#[derive(Clone, Debug)]
+pub struct ExpiredBan {
+    pub id: i64,
+    pub enrollment: GuildEnrollment,
+    pub user: i64,
+}
+
+/// Consume one due expiry before dispatch. Failed/uncertain requests are not retried.
+pub async fn take_expired_ban(db: &Db, now: i64) -> Result<Option<ExpiredBan>> {
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        let due = tx
+            .query_row(
+                "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns
+             FROM bans b JOIN guild_enrollments e
+             ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
+             WHERE b.active=1 AND b.expires_at<=?1
+             AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
+             ORDER BY b.expires_at,b.id LIMIT 1",
+                params![now],
+                |r| {
+                    Ok((
+                        r.get::<i64>(0)?,
+                        GuildEnrollment {
+                            guild_id: r.get(1)?,
+                            id: r.get(3)?,
+                            joined_at_ns: r.get(4)?,
+                        },
+                        r.get::<i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, enrollment, user)) = due {
+            tx.ensure_mutation_receipt()?;
+            tx.execute_matching("UPDATE bans SET expires_at=NULL WHERE id=?1", params![id])?;
+            tx.commit()?;
+            Ok(Some(ExpiredBan {
+                id,
+                enrollment,
+                user,
+            }))
+        } else {
+            tx.finish_read()?;
+            Ok(None)
+        }
+    })
+    .await
+}
+
+/// Re-read the claimed ban on the primary immediately before dispatch.
+/// A new deadline, cancellation, replacement ban, or membership invalidates it.
+pub async fn expired_ban_is_current(db: &Db, claimed: &ExpiredBan) -> Result<bool> {
+    let claimed = claimed.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let current = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM bans b JOIN guild_enrollments e
+                ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
+                WHERE b.id=?1 AND b.guild_id=?2 AND b.user_id=?3 AND b.active=1
+                AND b.expires_at IS NULL AND e.id=?4 AND e.joined_at_ns=?5
+                AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
+            )",
+            params![
+                claimed.id,
+                claimed.enrollment.guild_id,
+                claimed.user,
+                claimed.enrollment.id,
+                claimed.enrollment.joined_at_ns,
+            ],
+            |row| Ok(row.get::<bool>(0)?),
+        )?;
+        tx.finish_read()?;
+        Ok(current)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod query_plan_tests {
     use super::*;

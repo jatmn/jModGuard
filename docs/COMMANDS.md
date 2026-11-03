@@ -11,7 +11,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 
 | Command | Category | Permission | Description |
 |---|---|---|---|
-| `!ban <user> [--dm] [reason]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
+| `!ban <user> [--dm] [--minutes N] [reason]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
 | `!softban <user> [reason]` | Moderation | mod | Ban, delete the last 24 hours of messages, then unban so the user can rejoin |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
 | `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
@@ -36,6 +36,15 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
 
 `/kick` and `/ban` accept an optional boolean `dm` to DM the reason to the target.
+
+For a timed ban, use `!ban <user> --minutes 60 [reason]` or the optional
+`minutes` option on `/ban`. The duration must be a positive whole number.
+The expiry is saved with the ban and survives a restart. The existing action
+worker lifts due bans on its next poll; overdue bans are processed after startup.
+Omitting the duration leaves a new ban permanent. Supplying a duration for an
+already banned user sets a new expiry. A manual unban cancels the pending expiry.
+An automatic unban is attempted once; a failed or uncertain Discord request is
+logged for moderator follow-up and is not retried.
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/userinfo`, `/purge`, `/say`, `/slowmode`, `/voice`,
