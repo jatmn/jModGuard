@@ -20,6 +20,7 @@ struct HranaState {
     fail_next_cas: bool,
     fail_next_meta_probe: bool,
     reset_next_request: bool,
+    fail_next_request: Option<&'static str>,
     commit_timeouts: usize,
     rollback_requests: usize,
     in_transaction: bool,
@@ -58,6 +59,7 @@ impl HranaState {
             fail_next_cas: false,
             fail_next_meta_probe: false,
             reset_next_request: false,
+            fail_next_request: None,
             commit_timeouts: 0,
             rollback_requests: 0,
             in_transaction: false,
@@ -679,6 +681,9 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
         state.lock().unwrap().skip_immediate_lock = true;
     } else if park_request(&path, &input, &state) {
         std::future::pending::<()>().await;
+    }
+    if let Some(message) = state.lock().unwrap().fail_next_request.take() {
+        return body(StatusCode::BAD_REQUEST, message.to_owned());
     }
     let supplied_baton = input["baton"].as_str();
     let mut state = state.lock().unwrap();
@@ -2960,4 +2965,115 @@ async fn lease_window_fast_connection_reset_recovers_before_deadline() {
     drop(fixture);
     drop(local);
     super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_runtime_outlives_temporary_callers_and_closes_idle_streams() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    let owner = db.runtime.clone();
+    let expected_owner = owner.block_on(async { tokio::runtime::Handle::current().id() });
+    let db = std::thread::spawn(move || {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            db.with_conn_sync(|conn| {
+                conn.query_row("SELECT 1", (), |row| {
+                    assert_eq!(tokio::runtime::Handle::current().id(), expected_owner);
+                    Ok(row.get::<i64>(0)?)
+                })
+            })
+            .unwrap();
+        });
+        drop(caller);
+        db
+    })
+    .join()
+    .unwrap();
+    assert_eq!(db.with_conn_sync(read_one).unwrap(), 1);
+    // No ambient runtime remains on this thread when the idle connection drops.
+    std::thread::spawn(move || drop(db)).join().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.state.lock().unwrap().closes == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle stream cleanup must reach the server on its surviving owner");
+    drop(owner);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_runtime_stream_errors_discard_transactions_and_allow_reconnect() {
+    for message in [
+        "Received an invalid baton",
+        "tried to send request while no runtime was available",
+    ] {
+        for prepared in [false, true] {
+            let fixture = HranaFixture::start().await;
+            let db = fixture.db();
+            db.connections.idle.lock().unwrap().truncate(1);
+            let state = Arc::clone(&fixture.state);
+            let error = db
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let query = if prepared {
+                        let mut stmt = tx.prepare("SELECT 1")?;
+                        state.lock().unwrap().fail_next_request = Some(message);
+                        stmt.query_map((), |row| Ok(row.get::<i64>(0)?)).map(|_| ())
+                    } else {
+                        state.lock().unwrap().fail_next_request = Some(message);
+                        tx.query_row("SELECT 1", (), |_| Ok(()))
+                    };
+                    let finished = tx.finish_read();
+                    query?;
+                    finished
+                })
+                .await
+                .expect_err("stream failure must reach the caller without replay");
+            assert!(format!("{error:#}").contains(message));
+            assert_eq!(
+                fixture.rollback_requests(),
+                0,
+                "lost streams cannot roll back"
+            );
+            assert_eq!(db.connections.idle.lock().unwrap().len(), 0);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.state.lock().unwrap().closes == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("discarded transaction stream must close on its owner");
+            assert_eq!(db.with_conn(read_one).await.unwrap(), 1);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_runtime_failed_read_cleanup_is_nonfatal_and_discards_connection() {
+    for message in [
+        "Received an invalid baton",
+        "tried to send request while no runtime was available",
+    ] {
+        let fixture = HranaFixture::start().await;
+        let db = fixture.db();
+        db.connections.idle.lock().unwrap().truncate(1);
+        let state = Arc::clone(&fixture.state);
+        let value = db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                let value = tx.query_row("SELECT 1", (), |row| Ok(row.get::<i64>(0)?))?;
+                state.lock().unwrap().fail_next_request = Some(message);
+                tx.finish_read()?;
+                Ok(value)
+            })
+            .await
+            .expect("cleanup failure must not invalidate collected rows");
+        assert_eq!(value, 1);
+        assert_eq!(db.connections.idle.lock().unwrap().len(), 0);
+        assert_eq!(db.with_conn(read_one).await.unwrap(), 1);
+    }
 }
