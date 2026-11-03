@@ -536,6 +536,13 @@ pub async fn record_component_running(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if let Some(release) = release {
+            if matches!(component.as_str(), "bot" | "api") {
+                tx.execute_rows(
+                    "INSERT INTO meta(key,value) SELECT ?1,?2 FROM component_updates WHERE component=?3 AND desired=?2 AND installed IS NOT ?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![format!("container_image_reminder_{component}_v1"), release.clone(), component.clone()],
+                    1,
+                )?;
+            }
             let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND (desired=?2 OR installed=?2)", params![component.clone(),release.clone(),now,observation], 1)?;
             anyhow::ensure!(changed == 1, "desired release changed before activation");
             update_control::clear_rejected_candidate_after_activation(
@@ -549,6 +556,43 @@ pub async fn record_component_running(
         tx.commit()?;
         Ok(())
     }).await
+}
+
+/// Consume one successful application install reminder before attempting its DM.
+/// Delivery is best effort. Replayed readiness and cold restores do not enqueue it.
+pub async fn take_container_image_reminder(
+    db: &Db,
+    component: &str,
+) -> Result<Option<ComponentRelease>> {
+    anyhow::ensure!(
+        matches!(component, "bot" | "api"),
+        "invalid reminder component"
+    );
+    let component = component.to_owned();
+    db.with_conn(move |conn| {
+        let key = format!("container_image_reminder_{component}_v1");
+        if meta_string_conn(conn, &key)?.is_none() {
+            return Ok(None);
+        }
+        let tx = conn.transaction_immediate()?;
+        let pending = meta_string_conn(&tx, &key)?;
+        let installed: Option<String> = tx
+            .query_row(
+                "SELECT installed FROM component_updates WHERE component=?1",
+                params![component],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?
+            .flatten();
+        tx.execute_rows("DELETE FROM meta WHERE key=?1", params![key], 1)?;
+        tx.commit()?;
+        if pending == installed {
+            parse_release(pending)
+        } else {
+            Ok(None)
+        }
+    })
+    .await
 }
 
 /// Record a verified first/baked start when there is no selected managed app.

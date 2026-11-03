@@ -29,5 +29,6 @@ pub mod spam_actions;
 pub mod startup;
 pub mod state;
 pub mod text_spam;
+pub mod update_reminder;
 
 pub mod gateway_ban_persistence;
