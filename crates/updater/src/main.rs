@@ -1222,12 +1222,16 @@ impl Supervisor {
                     .await
                 {
                     Ok(()) => self.reset_boot_receipt_backoff(),
-                    Err(error) if Self::receipt_not_saved(&error) => {
+                    Err(error) => {
+                        // Removing the queue entry is not an acknowledgement.
+                        // Keep it until storage accepts it or recovery supersedes it.
                         tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                         self.queue_pending_boot_record((*release).clone(), reason, running);
                         self.note_boot_receipt_delay();
+                        if !Self::receipt_not_saved(&error) {
+                            return Err(error);
+                        }
                     }
-                    Err(error) => return Err(error),
                 }
             }
             PendingBootMismatch::Clear => {
@@ -1973,13 +1977,18 @@ impl Supervisor {
                 self.clear_pending_boot_mismatch();
                 Ok(())
             }
-            Err(error) if Self::receipt_not_saved(&error) => {
+            Err(error) => {
+                // A spawned fallback no longer retries restore, so retain its
+                // diagnostic even when storage returns an ordinary SQL error.
                 tracing::warn!("boot mismatch receipt was not saved: {error:#}");
                 self.queue_pending_boot_record(release.clone(), reason.to_owned(), running);
                 self.note_boot_receipt_delay();
-                Ok(())
+                if Self::receipt_not_saved(&error) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
         }
     }
 

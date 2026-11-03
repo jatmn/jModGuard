@@ -8921,6 +8921,100 @@ async fn outage_fallback_keeps_the_installed_release_and_records_the_mismatch() 
 }
 
 #[tokio::test]
+async fn outage_diagnostic_recovers_after_post_spawn_write_failure() {
+    outage_diagnostic_recovers_after_write_failure(0).await;
+}
+
+#[tokio::test]
+async fn outage_diagnostic_recovers_after_repeated_retry_write_failures() {
+    outage_diagnostic_recovers_after_write_failure(2).await;
+}
+
+async fn outage_diagnostic_recovers_after_write_failure(failed_retries: usize) {
+    for role in ["bot", "api"] {
+        let root =
+            std::env::temp_dir().join(format!("outage-receipt-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let baked = executable(&root, "baked").await;
+        let (db, control) = open_launcher_db(&root).await;
+        let installed = release_at(role, 'c', control.schema_version().await.unwrap());
+        let stamp = 1_700_000_000;
+        install_for_outage(&db, &control, &installed, stamp).await;
+        let (refused, reserved) = refused_registry().await;
+        let mut service = controller(
+            role,
+            baked.clone(),
+            Registry::new(&refused).unwrap(),
+            control.clone(),
+            &root,
+        );
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER fail_outage_receipt BEFORE INSERT ON meta
+                 WHEN NEW.key = 'update_boot_mismatch_v1'
+                 BEGIN SELECT RAISE(FAIL, 'injected outage receipt failure'); END;",
+                64 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = service.tick().await.unwrap_err();
+        assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("injected outage receipt failure"));
+        let pid = service.running.as_ref().unwrap().child.id();
+        assert_eq!(service.running.as_ref().unwrap().path, baked);
+        assert!(db::read_boot_mismatch_map(&db).await.unwrap().is_empty());
+        wait_for_ready_file(&service).await;
+        let mut retry_errors = Vec::new();
+        for _ in 0..failed_retries {
+            // Advance the existing retry deadline without slowing the test.
+            service.boot_receipt_not_before = None;
+            retry_errors.push(service.tick().await.err());
+        }
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded("DROP TRIGGER fail_outage_receipt", 64 * 1024)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        service.boot_receipt_not_before = None;
+        for _ in 0..3 {
+            service.tick().await.unwrap();
+        }
+        let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+        let kept = control.component(role).await.unwrap();
+        let same_child = service.running.as_ref().unwrap().child.id() == pid;
+        let reported = service.reported;
+        service.stop_application().await.unwrap();
+        service.end_idle().await.unwrap();
+        drop((service, control, db, reserved));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+
+        assert!(
+            mismatch.contains_key(role),
+            "{role}: live outage fallback lost its boot mismatch after receipt storage recovered"
+        );
+        assert_eq!(mismatch[role].reason, REGISTRY_OUTAGE_BOOT_MISMATCH);
+        assert_eq!(mismatch[role].running, "b".repeat(40));
+        assert_eq!(mismatch[role].expected.release_id, installed.release_id);
+        assert_eq!(mismatch[role].expected.source_sha, installed.source_sha);
+        assert!(
+            same_child,
+            "receipt recovery must retain the running fallback"
+        );
+        assert!(reported);
+        assert_eq!(kept.installed.unwrap(), installed);
+        assert_eq!(kept.installed_at, Some(stamp));
+        for error in retry_errors {
+            let error = error.expect("the queued diagnostic must retry while storage is failing");
+            assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
+            assert!(format!("{error:#}").contains("injected outage receipt failure"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn outage_fallback_rollback_keeps_the_installed_release() {
     let root = std::env::temp_dir().join(format!("boot-rollback-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
