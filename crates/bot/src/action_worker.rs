@@ -48,6 +48,11 @@ pub trait DiscordActions: Send + Sync {
     async fn membership_joined_at_ns(&self, _job: &BotAction) -> Result<Option<i64>> {
         Ok(None)
     }
+    /// The bot's own live join timestamp, for work that has no queued job.
+    /// `None` means the identity is unavailable.
+    async fn guild_joined_at_ns(&self, _guild: i64) -> Result<Option<i64>> {
+        Ok(None)
+    }
     async fn authorized(&self, job: &BotAction) -> Result<bool>;
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
@@ -71,10 +76,13 @@ impl DiscordActions for LiveDiscord<'_> {
         }))
     }
     async fn membership_joined_at_ns(&self, job: &BotAction) -> Result<Option<i64>> {
+        self.guild_joined_at_ns(job.guild_id).await
+    }
+    async fn guild_joined_at_ns(&self, guild: i64) -> Result<Option<i64>> {
         anyhow::ensure!(self.bot_user_id.get() > 1, "bot identity is not ready");
         let member = self
             .http
-            .get_member(GuildId::new(job.guild_id as u64), self.bot_user_id)
+            .get_member(GuildId::new(guild as u64), self.bot_user_id)
             .await?;
         Ok(member
             .joined_at
@@ -584,16 +592,102 @@ async fn expire_bans(
     now: i64,
     limits: &WorkerLimits,
 ) -> Result<()> {
+    // Deferred bans stay due and are skipped only for the rest of this pass.
+    // A failed membership check skips the whole guild, so one unavailable
+    // guild cannot spend every pass's batch and starve later guilds.
+    let (mut deferred, mut deferred_guilds) = (Vec::new(), Vec::new());
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
         }
-        let Some(claimed) = db::take_expired_ban(db, now).await? else {
+        let Some(due) =
+            db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
+        else {
             break;
         };
-        dispatch_expired_ban(db, app, discord, claimed, limits).await?;
+        if !expiry_membership_matches(db, app, discord, &due, limits).await? {
+            deferred_guilds.push(due.enrollment.guild_id);
+            continue;
+        }
+        // Hold the command-ban slot through dispatch and the mirror update so a
+        // concurrent ban command cannot re-arm or replace the ban meanwhile.
+        let in_progress = match app.map(|app| {
+            crate::member_directory::begin_command_ban_in_progress(
+                app,
+                due.enrollment.guild_id as u64,
+                due.user as u64,
+            )
+        }) {
+            Some(Err(_)) => {
+                deferred.push(due.id);
+                continue;
+            }
+            in_progress => in_progress,
+        };
+        if !db::claim_expired_ban(db, &due).await? {
+            deferred.push(due.id);
+            continue;
+        }
+        dispatch_expired_ban(db, app, discord, due, limits).await?;
+        drop(in_progress);
     }
     Ok(())
+}
+
+/// Confirm the expiry's captured membership with a bounded own-member read
+/// before consuming it. An unavailable read defers the expiry. A newer join is
+/// repaired like queued actions; the old membership's expiry then stays unclaimed.
+async fn expiry_membership_matches(
+    db: &Db,
+    app: Option<&crate::state::BotState>,
+    discord: &impl DiscordActions,
+    due: &db::ExpiredBan,
+    limits: &WorkerLimits,
+) -> Result<bool> {
+    let guild = due.enrollment.guild_id;
+    let timeout = std::time::Duration::from_secs(u64::from(limits.request_timeout_secs));
+    let observed = match tokio::time::timeout(timeout, discord.guild_joined_at_ns(guild)).await {
+        Ok(Ok(Some(observed))) => observed,
+        result => {
+            let reason = match result {
+                Ok(Ok(_)) => "no join timestamp".to_owned(),
+                Ok(Err(error)) => format!("{error:#}"),
+                Err(_) => "timed out".to_owned(),
+            };
+            tracing::warn!(
+                guild,
+                user = due.user,
+                "automatic unban deferred: bot membership check unavailable: {reason}"
+            );
+            return Ok(false);
+        }
+    };
+    if crate::enrollment_repair::membership_joined_at_matches(due.enrollment.joined_at_ns, observed)
+    {
+        return Ok(true);
+    }
+    tracing::warn!(
+        guild,
+        user = due.user,
+        expected_joined_at_ns = due.enrollment.joined_at_ns,
+        observed_joined_at_ns = observed,
+        "automatic unban skipped: bot membership changed since the timed ban; moderator follow-up required"
+    );
+    if let Some(app) = app {
+        match db::enroll_guild(db, guild, observed).await {
+            Ok(Some(enrollment)) => {
+                app.tenant.activate(enrollment).await?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    guild,
+                    "bot enrollment repair failed before automatic unban: {error:#}"
+                );
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn dispatch_expired_ban(
@@ -603,10 +697,19 @@ async fn dispatch_expired_ban(
     claimed: db::ExpiredBan,
     limits: &WorkerLimits,
 ) -> Result<()> {
-    // Claiming clears the old deadline; a command may have re-armed this
-    // same row or replaced the ban while the claim was being delivered.
-    if !db::expired_ban_is_current(db, &claimed).await? {
-        return Ok(());
+    // Claiming clears the old deadline; the ban may have been re-armed,
+    // cancelled or replaced, or its membership ended, since it was claimed.
+    match db::expired_ban_state(db, &claimed).await? {
+        db::ExpiredBanState::Current => {}
+        db::ExpiredBanState::Superseded => return Ok(()),
+        db::ExpiredBanState::Blocked => {
+            tracing::warn!(
+                guild = claimed.enrollment.guild_id,
+                user = claimed.user,
+                "automatic unban skipped: membership ended or guild fenced after the claim; ban remains, moderator follow-up required"
+            );
+            return Ok(());
+        }
     }
     let db::ExpiredBan {
         enrollment, user, ..
