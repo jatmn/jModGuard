@@ -8951,30 +8951,50 @@ async fn outage_fallback_rollback_keeps_the_installed_release() {
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_keeps_the_installed_release() {
-    outage_fallback_immediate_rollback(None).await;
+    immediate_rollback(None, false).await;
 }
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_recovers_boot_mismatch_write_failure() {
-    outage_fallback_immediate_rollback(Some("boot_mismatch")).await;
+    immediate_rollback(Some("boot_mismatch"), false).await;
 }
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_recovers_rollback_receipt_failure() {
-    outage_fallback_immediate_rollback(Some("rollback_receipt")).await;
+    immediate_rollback(Some("rollback_receipt"), false).await;
 }
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_recovers_spawn_failure() {
-    outage_fallback_immediate_rollback(Some("spawn")).await;
+    immediate_rollback(Some("spawn"), false).await;
 }
 
 #[tokio::test]
 async fn outage_fallback_immediate_rollback_recovers_schema_refusal() {
-    outage_fallback_immediate_rollback(Some("schema")).await;
+    immediate_rollback(Some("schema"), false).await;
 }
 
-async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
+#[tokio::test]
+async fn baked_immediate_rollback_restarts_exited_fallback_before_settlement() {
+    immediate_rollback(Some("fallback_exit"), false).await;
+}
+
+#[tokio::test]
+async fn managed_immediate_rollback_restarts_exited_fallback_before_settlement() {
+    immediate_rollback(Some("fallback_exit"), true).await;
+}
+
+#[tokio::test]
+async fn baked_immediate_rollback_retains_identity_across_receipt_failures() {
+    immediate_rollback(Some("repeated_receipt"), false).await;
+}
+
+#[tokio::test]
+async fn managed_immediate_rollback_retains_identity_across_receipt_failures() {
+    immediate_rollback(Some("repeated_receipt"), true).await;
+}
+
+async fn immediate_rollback(fault: Option<&str>, managed: bool) {
     let root = std::env::temp_dir().join(format!(
         "boot-immediate-rollback-{:032x}",
         rand::random::<u128>()
@@ -9020,7 +9040,15 @@ async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
         &root,
     );
     let state = control.component("bot").await.unwrap();
-    service.restore(&state).await.unwrap();
+    if managed {
+        let installed = executable(&root, "installed-bot").await;
+        service
+            .start(&installed, &release.source_sha, Some(release.clone()))
+            .await
+            .unwrap();
+    } else {
+        service.restore(&state).await.unwrap();
+    }
     wait_for_ready_file(&service).await;
     assert!(service.report_ready().await.unwrap());
     let seen = control.component("bot").await.unwrap().observed.unwrap();
@@ -9066,7 +9094,7 @@ async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
             .await
             .unwrap();
         }
-        Some("rollback_receipt") => {
+        Some("rollback_receipt" | "fallback_exit" | "repeated_receipt") => {
             db.with_conn(|conn| {
                 conn.execute_batch_bounded(
                     "CREATE TRIGGER fail_rollback BEFORE UPDATE ON component_updates
@@ -9100,9 +9128,48 @@ async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
         let error = result.unwrap_err();
         assert!(!Supervisor::receipt_not_saved(&error), "{error:#}");
         match fault {
-            "boot_mismatch" | "rollback_receipt" => {
+            "boot_mismatch" | "rollback_receipt" | "fallback_exit" | "repeated_receipt" => {
                 assert!(format!("{error:#}").contains("injected"), "{error:#}");
-                assert!(service.running.as_ref().unwrap().release.is_none());
+                let fallback_pid = service.running.as_ref().unwrap().child.id();
+                if fault == "repeated_receipt" {
+                    wait_for_ready_file(&service).await;
+                    for _ in 0..3 {
+                        let error = service.tick().await.unwrap_err();
+                        assert!(format!("{error:#}").contains("injected rollback receipt failure"));
+                        assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                        assert_eq!(service.running.as_ref().unwrap().child.id(), fallback_pid);
+                        assert_eq!(
+                            control.component("bot").await.unwrap().desired,
+                            Some(candidate.clone())
+                        );
+                    }
+                }
+                if fault == "fallback_exit" {
+                    let hold = root.join(if managed {
+                        "hold-installed-bot-ready"
+                    } else {
+                        "hold-baked-bot-ready"
+                    });
+                    tokio::fs::write(&hold, "hold").await.unwrap();
+                    let child = &mut service.running.as_mut().unwrap().child;
+                    child.kill().await.unwrap();
+                    child.wait().await.unwrap();
+                    let error = service.normal().await.unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("application exited"),
+                        "{error:#}"
+                    );
+                    assert!(
+                        service.running.is_none(),
+                        "exited fallback must be released for restore"
+                    );
+                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    service.restart.not_before = None;
+                    assert!(!service.tick().await.unwrap());
+                    assert_ne!(service.running.as_ref().unwrap().child.id(), fallback_pid);
+                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    tokio::fs::remove_file(hold).await.unwrap();
+                }
                 db.with_conn(|conn| {
                     conn.execute_batch_bounded("DROP TRIGGER fail_rollback", 64 * 1024)?;
                     Ok(())
@@ -9139,13 +9206,22 @@ async fn outage_fallback_immediate_rollback(fault: Option<&str>) {
     let kept = control.component("bot").await.unwrap();
     assert_eq!(kept.installed.as_ref().unwrap().digest, release.digest);
     assert_eq!(kept.installed_at, Some(stamp));
-    assert!(service.running.as_ref().unwrap().release.is_none());
-    assert_eq!(service.running.as_ref().unwrap().path, service.baked);
+    let expected_release = managed.then_some(release.clone());
+    assert_eq!(service.running.as_ref().unwrap().release, expected_release);
+    assert_eq!(
+        service.running.as_ref().unwrap().path,
+        if managed {
+            root.join("installed-bot")
+        } else {
+            service.baked.clone()
+        }
+    );
     wait_for_ready_file(&service).await;
     assert!(!service.normal().await.unwrap());
     assert!(!service.normal().await.unwrap());
-    assert!(
-        service.running.as_ref().unwrap().release.is_none(),
+    assert_eq!(
+        service.running.as_ref().unwrap().release,
+        expected_release,
         "failed candidate was dispatched again after rollback recovery"
     );
     assert!(service.rollback.is_none());

@@ -2462,7 +2462,9 @@ impl Supervisor {
                 self.stop_application().await?;
                 return Ok(false);
             }
-            if let Some((path, sha, previous)) = self.standby.clone() {
+            if self.rollback.is_none()
+                && let Some((path, sha, previous)) = self.standby.clone()
+            {
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
                 let schema = self.control.schema_version().await?;
@@ -2527,6 +2529,17 @@ impl Supervisor {
                     }
                     Err(save) => return Err(save),
                 }
+            } else if self.rollback.is_some() {
+                // A receipt error must not replace the saved failed candidate
+                // with the fallback's release or restart a healthy fallback.
+                if let Some(child) = self.running.as_mut()
+                    && child.child.try_wait()?.is_some()
+                {
+                    // restore() retries from self.rollback and standby after
+                    // restart backoff, preserving the strict rollback gates.
+                    self.stop_application().await?;
+                }
+                return Err(error);
             } else {
                 self.stop_child(true).await?;
                 return Err(error);
