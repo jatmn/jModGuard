@@ -37,6 +37,7 @@ fn observation(source_sha: &str, schema: i64, now: i64) -> ComponentObservation 
         guild_schema: Some(db::guild_data::SCHEMA_VERSION),
         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
         launcher_revision: db::LAUNCHER_REVISION,
+        baked_launcher_revision: db::LAUNCHER_REVISION,
     }
 }
 

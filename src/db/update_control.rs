@@ -8,6 +8,9 @@ pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
 /// recovery through the bot launcher link. Older launchers cannot advance a pair.
 pub const PAIRED_LAUNCHER_REVISION: u32 = 38;
 pub const PAIRED_LAUNCHER_REQUIRED: &str = "paired bot and API upgrades need revision-38 launchers on both services; install new images first";
+/// After a failed pair the API supervisor serves maintenance from its baked
+/// binary, so that image must also route owner recovery to the bot launcher.
+pub const PAIRED_RECOVERY_REQUIRED: &str = "paired bot and API upgrades need a revision-38 API image for owner recovery; a launcher-only update is not enough, install a new API image first";
 pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
@@ -122,6 +125,9 @@ pub struct BakedCompatibility {
     pub source_sha: String,
     pub core: i64,
     pub guild: i64,
+    /// Launcher revision of the baked image's build. Rows from older images read as 0.
+    #[serde(default)]
+    pub launcher_revision: u32,
 }
 
 impl BakedCompatibility {
@@ -130,6 +136,7 @@ impl BakedCompatibility {
             source_sha: source_sha.into(),
             core: CORE_SCHEMA_VERSION,
             guild: guild_data::SCHEMA_VERSION,
+            launcher_revision: LAUNCHER_REVISION,
         }
     }
 }
@@ -608,8 +615,8 @@ impl UpdateControl {
     }
 
     /// Bot-launcher side of the launcher link. Only API paired-upgrade steps
-    /// and owner upgrade recovery are accepted. Every write runs under this
-    /// launcher's fence, never the bot process's writer lease.
+    /// and owner upgrade recovery (Check, Apply, Cancel) are accepted. Every
+    /// write runs under this launcher's fence, never the bot process's writer lease.
     pub async fn apply_launcher_op(&self, op: ControlOp) -> Result<ControlReply> {
         if matches!(op, ControlOp::LookupResult) {
             // Results are not cached. Every accepted step is safe to resend.
@@ -664,6 +671,25 @@ impl UpdateControl {
             )?,
             ControlOp::AbortUpgrade { id } => {
                 self.abort_upgrade(&id).await?;
+                serde_json::Value::Null
+            }
+            // Owner recovery Check: both leases, the matching pair, release.
+            ControlOp::AcquirePairCheck { now } => {
+                serde_json::to_value(self.acquire_pair_check(now).await?)?
+            }
+            ControlOp::RecordPairCheck {
+                owner,
+                channel,
+                bot,
+                api,
+                now,
+            } => {
+                self.record_pair_check(&owner, &channel, bot, api, now)
+                    .await?;
+                serde_json::Value::Null
+            }
+            ControlOp::ReleasePairCheck { owner } => {
+                self.release_pair_check(&owner).await?;
                 serde_json::Value::Null
             }
             _ => anyhow::bail!("write failed"),
@@ -1388,6 +1414,12 @@ impl UpdateControl {
                         "an independent update is already pending");
                 }
             }
+            // After a failed pair the API supervisor serves maintenance from its
+            // baked binary. A launcher-only update does not make that image route
+            // owner recovery to the bot launcher, so admission checks the image.
+            let api_seen = api.observed.as_ref().context("API has not been observed")?;
+            anyhow::ensure!(recovering.is_some() || api_seen.baked_launcher_revision >= PAIRED_LAUNCHER_REVISION,
+                PAIRED_RECOVERY_REQUIRED);
             let service = |release| UpgradeService { release, instance: String::new(), prepared: false, stopped: false, ready: false };
             let upgrade = ServiceUpgrade {
                 id: format!("{:032x}", rand::random::<u128>()), phase: UpgradePhase::Preparing,
@@ -1686,6 +1718,7 @@ mod tests {
                             guild_schema: Some(guild_data::SCHEMA_VERSION),
                             update_protocol: UPDATE_CONTROL_PROTOCOL,
                             launcher_revision: LAUNCHER_REVISION,
+                            baked_launcher_revision: LAUNCHER_REVISION,
                         },
                         100,
                     )
@@ -2460,6 +2493,48 @@ mod tests {
         assert_eq!(queued.phase, UpgradePhase::Preparing);
     }
 
+    /// A launcher-only update can put revision-38 launchers on an older image.
+    /// After a failed pair that image's baked API serves maintenance, and an
+    /// older one cannot reach the bot launcher, so the pair is refused first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_needs_a_baked_api_that_routes_owner_recovery() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let (_, link) = launcher_linked(&f).await;
+        let op = ControlOp::RequestUpgrade {
+            bot_digest: format!("sha256:{}", "a".repeat(64)),
+            api_digest: format!("sha256:{}", "b".repeat(64)),
+            recover: false,
+            now: 200,
+        };
+        let observe = async |baked: u32| {
+            let mut seen = f.control.component("api").await.unwrap().observed.unwrap();
+            seen.baked_launcher_revision = baked;
+            f.control.running("api", None, seen, 150).await.unwrap();
+        };
+        for baked in [0, PAIRED_LAUNCHER_REVISION - 1] {
+            observe(baked).await;
+            let seen = f.control.component("api").await.unwrap().observed.unwrap();
+            assert!(seen.launcher_revision >= PAIRED_LAUNCHER_REVISION);
+            let refused = crate::db::apply_control(&f.control.db, None, op.clone(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::control::public_error(&refused),
+                PAIRED_RECOVERY_REQUIRED
+            );
+            let refused = link.submit(op.clone(), 0).await.unwrap();
+            assert!(
+                matches!(&refused, ControlReply::Failed { message, .. } if message == PAIRED_RECOVERY_REQUIRED),
+                "{refused:?}"
+            );
+            assert!(f.control.upgrade().await.unwrap().is_none());
+        }
+        observe(PAIRED_LAUNCHER_REVISION).await;
+        let reply = link.submit(op, 0).await.unwrap();
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert!(f.control.upgrade().await.unwrap().unwrap().phase.active());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn app_only_paired_queue_refuses_higher_result_schema() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
@@ -2688,5 +2763,99 @@ mod tests {
             matches!(&refused, ControlReply::Failed { message, .. } if message == crate::control::NOT_THE_WRITER)
         );
         assert!(f.control.upgrade().await.unwrap().unwrap().phase.active());
+    }
+
+    /// After a failed pair stops both applications, recovery Check reaches the
+    /// bot launcher link: it takes both leases, records a newer matching pair,
+    /// releases them, and that newer pair can then be applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_check_selects_a_newer_pair_through_the_bot_launcher() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let (api, link) = launcher_linked(&f).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        f.control
+            .join_upgrade(&upgrade.id, "bot", "bot")
+            .await
+            .unwrap();
+        api.join_upgrade(&upgrade.id, "api", "api").await.unwrap();
+        api.upgrade_error(&upgrade.id, "api: staged binary failed")
+            .await
+            .unwrap();
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        assert!(active_bot_lease(&f.control).await.is_none());
+        let submit = async |op: ControlOp| match link.submit(op, 0).await.unwrap() {
+            ControlReply::Saved { body } => body,
+            other => panic!("launcher link did not save: {other:?}"),
+        };
+        let owner: String =
+            serde_json::from_value(submit(ControlOp::AcquirePairCheck { now: 300 }).await).unwrap();
+        let leases = || async {
+            let mut owners = Vec::new();
+            for role in ["bot", "api"] {
+                let role = role.to_owned();
+                owners.push(
+                    f.control
+                        .db
+                        .with_conn(move |conn| {
+                            conn.query_row(
+                                "SELECT lease_owner FROM component_updates WHERE component=?1",
+                                params![role],
+                                |row| {
+                                    let owner: Option<String> = row.get(0)?;
+                                    Ok(owner)
+                                },
+                            )
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            owners
+        };
+        assert_eq!(leases().await, [Some(owner.clone()), Some(owner.clone())]);
+        let newer = |role: &str, digit: char| {
+            let mut release = upgrade.service(role).unwrap().release.clone();
+            release.source_sha = "9".repeat(40);
+            release.digest = format!("sha256:{}", digit.to_string().repeat(64));
+            release
+        };
+        let (bot, api_release) = (newer("bot", 'e'), newer("api", 'f'));
+        submit(ControlOp::RecordPairCheck {
+            owner: owner.clone(),
+            channel: "latest".into(),
+            bot: bot.clone(),
+            api: api_release.clone(),
+            now: 300,
+        })
+        .await;
+        submit(ControlOp::ReleasePairCheck {
+            owner: owner.clone(),
+        })
+        .await;
+        assert_eq!(leases().await, [None, None]);
+        for (role, release) in [("bot", &bot), ("api", &api_release)] {
+            let state = f.control.component(role).await.unwrap();
+            assert_eq!(state.candidate.unwrap().digest, release.digest);
+        }
+        let recovered: ServiceUpgrade = serde_json::from_value(
+            submit(ControlOp::RequestUpgrade {
+                bot_digest: bot.digest.clone(),
+                api_digest: api_release.digest.clone(),
+                recover: true,
+                now: 300,
+            })
+            .await,
+        )
+        .unwrap();
+        assert_ne!(recovered.id, upgrade.id);
+        assert_eq!(recovered.bot.release.digest, bot.digest);
+        assert_eq!(recovered.api.release.digest, api_release.digest);
+        assert_eq!(recovered.phase, UpgradePhase::Preparing);
     }
 }

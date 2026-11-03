@@ -1056,6 +1056,7 @@ fn running_observation(now: i64) -> db::ComponentObservation {
         guild_schema: Some(1),
         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
         launcher_revision: db::LAUNCHER_REVISION,
+        baked_launcher_revision: db::LAUNCHER_REVISION,
     }
 }
 

@@ -652,6 +652,9 @@ fn observation(
         ),
         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
         launcher_revision: db::LAUNCHER_REVISION,
+        // A handoff launcher may be newer than the baked API that serves
+        // maintenance after a failed pair; publish that image's own build.
+        baked_launcher_revision: baked.launcher_revision,
         source_sha: running.source_sha.clone(),
         executable_sha256: running.executable_sha256.clone(),
         admin_sha256: None,

@@ -411,6 +411,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             guild_schema: None,
             update_protocol: 0,
             launcher_revision: 0,
+            baked_launcher_revision: 0,
         };
         control
             .running(&legacy.component.clone(), Some(legacy), seen, now())
@@ -1068,6 +1069,7 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
         source_sha: base_sha.clone(),
         core: 15,
         guild: db::guild_data::SCHEMA_VERSION,
+        launcher_revision: 0,
     };
     let raw = serde_json::to_string(&old).unwrap();
     db.with_conn(move |conn| {
@@ -1109,7 +1111,13 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
     }
     let seen = control.component("bot").await.unwrap().observed.unwrap();
     assert_eq!(seen.max_schema, 15);
-    control.running("api", None, seen, now()).await.unwrap();
+    // A launcher newer than its image publishes the baked image's own build.
+    assert_eq!(seen.launcher_revision, db::LAUNCHER_REVISION);
+    assert_eq!(seen.baked_launcher_revision, 0);
+    control
+        .running("api", None, seen.clone(), now())
+        .await
+        .unwrap();
     let mut objects = HashMap::new();
     let mut target = image(&mut objects, "bot", b"\x7fELFfixture");
     target.min_schema = 15;
@@ -1131,6 +1139,17 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
             .await
             .unwrap();
     }
+    // On the API that older image's baked API would serve maintenance after a
+    // failed pair and cannot reach the bot launcher, so the pair is refused.
+    let refused = control
+        .request_upgrade(&target.digest, &api.digest, false, now())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.to_string(), db::PAIRED_RECOVERY_REQUIRED);
+    assert!(control.upgrade().await.unwrap().is_none());
+    let mut api_seen = seen;
+    api_seen.baked_launcher_revision = db::LAUNCHER_REVISION;
+    control.running("api", None, api_seen, now()).await.unwrap();
     let op = control
         .request_upgrade(&target.digest, &api.digest, false, now())
         .await
@@ -1219,6 +1238,7 @@ fn fresh_observation(stamp: i64) -> ComponentObservation {
         guild_schema: Some(db::guild_data::SCHEMA_VERSION),
         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
         launcher_revision: db::LAUNCHER_REVISION,
+        baked_launcher_revision: db::LAUNCHER_REVISION,
     }
 }
 

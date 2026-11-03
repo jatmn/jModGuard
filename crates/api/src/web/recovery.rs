@@ -32,7 +32,7 @@ pub fn launcher_link(cfg: &ApiProcessConfig) -> Option<jmodguard::control::Write
     .flatten()
 }
 
-/// Paired-upgrade Apply and Cancel prefer the bot launcher link.
+/// Paired-upgrade Check, Apply and Cancel prefer the bot launcher link.
 async fn upgrade_value<T: serde::de::DeserializeOwned>(
     state: &RecoveryState,
     local: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -191,7 +191,7 @@ async fn check(
     let now = chrono::Utc::now().timestamp();
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
-    let owner = control_value(
+    let owner = upgrade_value(
         &state,
         state.control.acquire_pair_check(now),
         crate::db::ControlOp::AcquirePairCheck { now },
@@ -212,7 +212,7 @@ async fn check(
         // Both images must resolve before either channel or candidate changes.
         // One transaction commits the pair; a missing counterpart or a failed
         // second write leaves the previous selection in place.
-        control_value(
+        upgrade_value(
             &state,
             state
                 .control
@@ -229,7 +229,7 @@ async fn check(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = control_value(
+    if let Err(error) = upgrade_value(
         &state,
         state.control.release_pair_check(&owner),
         crate::db::ControlOp::ReleasePairCheck {
@@ -839,6 +839,7 @@ mod tests {
                         guild_schema: Some(store_guild),
                         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
                         launcher_revision: db::LAUNCHER_REVISION,
+                        baked_launcher_revision: db::LAUNCHER_REVISION,
                     },
                     now,
                 )
@@ -924,6 +925,68 @@ mod tests {
             assert_uncacheable_headers(response.headers());
             assert!(control.upgrade().await.unwrap().is_none());
         }
+        // Recovery Check reaches the fenced bot launcher with no bot process or
+        // writer link. A held API lease refuses it before any registry request,
+        // and the bot lease it took through the launcher is released again.
+        let foreign = "f".repeat(32);
+        assert!(
+            db::claim_update_lease(&db, "api", &foreign, now, 240)
+                .await
+                .unwrap()
+        );
+        let (status, body) = request(
+            &router,
+            "POST",
+            "/api/service-upgrade/check",
+            &owner_cookie,
+            r#"{"channel":"latest"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "matching pair unavailable: another update operation is running"
+        );
+        let lease_owner = |role: &'static str| {
+            db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT lease_owner FROM component_updates WHERE component=?1",
+                    db::params![role],
+                    |row| {
+                        let owner: Option<String> = row.get(0)?;
+                        Ok(owner)
+                    },
+                )
+            })
+        };
+        assert_eq!(lease_owner("bot").await.unwrap(), None);
+        assert_eq!(lease_owner("api").await.unwrap(), Some(foreign.clone()));
+        db::release_update_lease(&db, "api", &foreign)
+            .await
+            .unwrap();
+        // Revision-38 launchers on an older API image (a launcher-only update):
+        // its baked API, which serves maintenance after a failed pair, would
+        // send owner recovery to the stopped bot, so the pair is refused.
+        let mut seen = control.component("api").await.unwrap().observed.unwrap();
+        assert!(seen.launcher_revision >= db::PAIRED_LAUNCHER_REVISION);
+        seen.baked_launcher_revision = db::PAIRED_LAUNCHER_REVISION - 1;
+        control
+            .running("api", None, seen.clone(), now)
+            .await
+            .unwrap();
+        let (status, body) = request(
+            &router,
+            "POST",
+            "/api/service-upgrade",
+            &owner_cookie,
+            &input.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], db::PAIRED_RECOVERY_REQUIRED);
+        assert!(control.upgrade().await.unwrap().is_none());
+        seen.baked_launcher_revision = db::LAUNCHER_REVISION;
+        control.running("api", None, seen, now).await.unwrap();
         for confirmed in [false, true] {
             let mut input = input.clone();
             input["confirmed"] = json!(confirmed);

@@ -91,7 +91,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 With the launcher-aware coordinated-update baseline installed, supported in-container upgrades
 use **Administration → Updates → Update bot and API together / recovery**.
-Paired upgrades need revision-38 launchers on both containers and the bot
+Paired upgrades need revision-38 launchers on both containers, a revision-38
+or newer API image (its baked API serves maintenance recovery), and the bot
 launcher link (`JMODGUARD_LAUNCHER_CONTROL_BIND` on the bot,
 `JMODGUARD_LAUNCHER_CONTROL_TARGET` on the API). Schema changes ship in new images.
 That flow enforces the stop/migrate/start ordering below and persists restart
