@@ -411,7 +411,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     let changes_before: i64 = count(&conn, "SELECT total_changes()");
     conn.execute_batch_bounded(MIGRATIONS[prior], 64 * 1024 * 1024)
         .unwrap();
-    conn.execute_batch_bounded(MIGRATIONS[MIGRATIONS.len() - 1], 64 * 1024 * 1024)
+    conn.execute_batch_bounded(MIGRATIONS[21], 64 * 1024 * 1024)
         .unwrap();
     assert_eq!(
         count(&conn, "SELECT total_changes()"),

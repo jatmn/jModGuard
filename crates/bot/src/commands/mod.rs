@@ -1294,6 +1294,9 @@ pub(crate) fn options_to_args_with_dm(
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
         if !s.is_empty() {
+            if matches!(cmd.behavior, Behavior::Ban { .. }) && spec.name == "minutes" {
+                out.push("--minutes".into());
+            }
             out.push(s);
         }
     }

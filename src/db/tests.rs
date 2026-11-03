@@ -322,6 +322,10 @@ fn migration_archives_legacy_global_log_channels() {
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
         conn.execute_batch_bounded("DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
+        conn.execute_batch_bounded(
+            "DROP INDEX idx_bans_expiry; ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;",
+            64 * 1024 * 1024,
+        )?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -4127,4 +4131,52 @@ pub(super) fn assert_index_plan(
             "page requires sorting: {plan:?}"
         );
     }
+}
+
+#[test]
+fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
+    let tmp = tmp_db_path("ban_expiry");
+    // Start on the pre-expiry schema, with an existing permanent ban.
+    let legacy = Connection::open(&tmp).unwrap();
+    for (index, sql) in MIGRATIONS[..22].iter().enumerate() {
+        legacy.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
+        legacy
+            .pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+    }
+    legacy
+        .execute_bounded(
+            "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,20,'2026-01-01T00:00:00Z')",
+            (),
+            4096,
+        )
+        .unwrap();
+    drop(legacy);
+    let db = Db::open(&tmp, 2).unwrap();
+    let enrollment = tokio_test_block_on(async {
+        let enrollment = enroll_guild(&db, 10, 1).await.unwrap().unwrap();
+        assert!(take_expired_ban(&db, i64::MAX).await.unwrap().is_none());
+        record_ban(&db, 10, 21, None, "temporary").await.unwrap();
+        set_ban_expiry(&db, enrollment.clone(), 21, 100)
+            .await
+            .unwrap();
+        enrollment
+    });
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        assert!(take_expired_ban(&db, 99).await.unwrap().is_none());
+        let claimed = take_expired_ban(&db, 100).await.unwrap().unwrap();
+        assert_eq!(claimed.enrollment, enrollment);
+        assert_eq!(claimed.user, 21);
+        assert!(take_expired_ban(&db, 100).await.unwrap().is_none());
+        record_ban(&db, 10, 22, None, "manual release")
+            .await
+            .unwrap();
+        set_ban_expiry(&db, enrollment, 22, 200).await.unwrap();
+        mark_unbanned(&db, 10, 22).await.unwrap();
+        assert!(take_expired_ban(&db, 200).await.unwrap().is_none());
+    });
+    drop(db);
+    cleanup_db(&tmp);
 }

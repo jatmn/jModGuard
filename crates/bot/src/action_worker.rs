@@ -566,7 +566,100 @@ pub async fn drain_with_state(
     discord: &impl DiscordActions,
     limits: &WorkerLimits,
 ) -> Result<()> {
-    drain_inner(&app.db, Some(&app.tenant), Some(app), discord, limits).await
+    drain_inner(&app.db, Some(&app.tenant), Some(app), discord, limits).await?;
+    expire_bans(
+        &app.db,
+        Some(app),
+        discord,
+        chrono::Utc::now().timestamp(),
+        limits,
+    )
+    .await
+}
+
+async fn expire_bans(
+    db: &Db,
+    app: Option<&crate::state::BotState>,
+    discord: &impl DiscordActions,
+    now: i64,
+    limits: &WorkerLimits,
+) -> Result<()> {
+    for _ in 0..limits.batch_size {
+        if app.is_some_and(|app| !app.activation.may_record()) {
+            break;
+        }
+        let Some(claimed) = db::take_expired_ban(db, now).await? else {
+            break;
+        };
+        dispatch_expired_ban(db, app, discord, claimed, limits).await?;
+    }
+    Ok(())
+}
+
+async fn dispatch_expired_ban(
+    db: &Db,
+    app: Option<&crate::state::BotState>,
+    discord: &impl DiscordActions,
+    claimed: db::ExpiredBan,
+    limits: &WorkerLimits,
+) -> Result<()> {
+    // Claiming clears the old deadline; a command may have re-armed this
+    // same row or replaced the ban while the claim was being delivered.
+    if !db::expired_ban_is_current(db, &claimed).await? {
+        return Ok(());
+    }
+    let db::ExpiredBan {
+        enrollment, user, ..
+    } = claimed;
+    let suppression = app.map(|app| {
+        app.suppress_next_gateway_case(
+            crate::state::GatewayCaseAction::Unban,
+            enrollment.guild_id as u64,
+            user as u64,
+            None,
+        )
+    });
+    let outcome = match tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(limits.request_timeout_secs)),
+        discord.unban(enrollment.guild_id, user, "Ban duration expired"),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => Outcome::uncertain("request_timed_out"),
+    };
+    if (outcome.state == "failed" || outcome.code == "already_unbanned")
+        && let (Some(app), Some(suppression)) = (app, suppression)
+    {
+        app.release_gateway_case_suppression(suppression);
+    }
+    if outcome.state == "succeeded"
+        && let Err(error) = db::mark_enrolled_unbanned(db, Some(enrollment.clone()), user).await
+    {
+        tracing::warn!(user, "expired ban mirror not saved: {error:#}");
+    }
+    if let Some(app) = app {
+        crate::cases::record_application(
+            app,
+            Some(enrollment.clone()),
+            crate::db::guild_data::CaseAction::Unban,
+            unban_case_outcome(&outcome),
+            user as u64,
+            discord.bot_user_id().map(|id| id as u64),
+            Some("Ban duration expired".into()),
+            crate::db::guild_data::CaseEvidence::Unavailable,
+        )
+        .await;
+    }
+    if outcome.state != "succeeded" {
+        tracing::warn!(
+            guild = enrollment.guild_id,
+            user,
+            outcome = outcome.code,
+            "automatic unban failed or uncertain; moderator follow-up required"
+        );
+    }
+    Ok(())
 }
 
 async fn drain_inner(

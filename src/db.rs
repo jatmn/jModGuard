@@ -88,6 +88,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0020_gateway_ban_deliveries.sql"),
     include_str!("../migrations/0021_clear_builtin_command_access.sql"),
     include_str!("../migrations/0022_clear_userinfo_command_rows.sql"),
+    include_str!("../migrations/0023_ban_expiry.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

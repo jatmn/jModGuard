@@ -144,7 +144,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "ban",
         "Moderation",
         "Ban a user from the server.",
-        "!ban <user> [--dm] [reason]",
+        "!ban <user> [--dm] [--minutes N] [reason]",
         "mod",
         Behavior::Ban {
             default_reason: "Banned by a moderator".into(),
@@ -936,6 +936,8 @@ pub fn sample_plan_command() -> CommandDef {
         log_event: String::new(),
     }
 }
+
+pub const BAN_DURATION_ERROR: &str = "Ban duration must be a positive whole number of minutes.";
 
 #[cfg(test)]
 mod rolling_upgrade_tests {
