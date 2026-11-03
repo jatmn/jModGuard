@@ -142,6 +142,22 @@ recover the lost queue. If the build artifacts or staging images are unavailable
 start a fresh owner-dispatched **Publish** run with the original full source SHA
 or release tag as described above, so all components are built again.
 
+If failure or cancellation occurs inside `finish_deferred_promotions`, some tags
+may already have moved. For example, the bot's tags may be promoted before an
+interruption while promoting the API, with WebUI promotion still pending. The
+publisher attempts to roll back changed tags in reverse order on failure, `INT`,
+`TERM`, or shell exit. It retains component build state until every queued tag
+has been promoted successfully. A hard kill can prevent rollback, and registry
+errors or a concurrent tag change can leave a partial publication. Check the job's
+rollback diagnostics and current tag digests before retrying.
+
+Recover through the same **Promote images** rerun described above. It repeats the
+three-component signing loop and reconstructs the promotion queue from the pinned plan,
+staging digests, and current registry tags. All `publish-build-ok-*` markers must
+be downloaded and present before signing starts. A successful retry promotes all
+queued tags and then clears the component build state. If the retained artifacts
+or staging images are gone, start a fresh pinned-source **Publish** run.
+
 Each component compares its actual production inputs against the source revision
 in its public `latest` image and confirms `latest` and the recorded SHA tag agree.
 Unchanged inputs skip compilation and registry login. Bot-only production source
