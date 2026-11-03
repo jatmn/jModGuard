@@ -329,12 +329,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
             refuse_bot_target(env, target)?;
-            for action in [
-                crate::db::guild_data::CaseAction::Ban,
-                crate::db::guild_data::CaseAction::Unban,
+            for (action, gateway_action) in [
+                (
+                    crate::db::guild_data::CaseAction::Ban,
+                    crate::state::GatewayCaseAction::Ban,
+                ),
+                (
+                    crate::db::guild_data::CaseAction::Unban,
+                    crate::state::GatewayCaseAction::Unban,
+                ),
             ] {
                 refuse_fenced_discord_mutation(env).await?;
                 lease_held(env)?;
+                let suppression = env.app.suppress_next_gateway_case(
+                    gateway_action,
+                    env.guild_id.get(),
+                    target.get(),
+                    None,
+                );
                 let discord = async {
                     if action == crate::db::guild_data::CaseAction::Ban {
                         // Discord deletes recent messages as part of the ban.
@@ -355,11 +367,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         }
                         crate::discord::DiscordCall::Finished(result) => result,
                     };
+                let outcome = crate::cases::classify_discord(result.as_ref().err());
+                if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                    env.app.release_gateway_case_suppression(suppression);
+                }
                 crate::cases::record_application(
                     env.app,
                     enrollment.clone(),
                     action,
-                    crate::cases::classify_discord(result.as_ref().err()),
+                    outcome,
                     target.get(),
                     Some(env.actor.get()),
                     Some(reason.clone()),

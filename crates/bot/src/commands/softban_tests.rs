@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn softban_deletes_recent_messages_then_unbans_and_reports_failures() {
-    for (ban_status, unban_status) in [(204, 204), (403, 204), (204, 403)] {
+    for (ban_status, unban_status) in [(204, 204), (403, 204), (204, 403), (408, 204), (204, 408)] {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -42,10 +42,11 @@ async fn softban_deletes_recent_messages_then_unbans_and_reports_failures() {
                     unban_status
                 };
                 captured.lock().unwrap().push(request);
-                let body = if status == 204 {
-                    ""
-                } else {
-                    r#"{"code":50013,"message":"Missing Permissions"}"#
+                let body = match status {
+                    204 => "",
+                    403 => r#"{"code":50013,"message":"Missing Permissions"}"#,
+                    408 => r#"{"code":0,"message":"Request Timeout"}"#,
+                    _ => unreachable!(),
                 };
                 let response = format!(
                     "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -112,7 +113,7 @@ async fn softban_deletes_recent_messages_then_unbans_and_reports_failures() {
         server.abort();
         let _ = server.await;
         let requests = requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), if ban_status == 403 { 1 } else { 2 });
+        assert_eq!(requests.len(), if ban_status == 204 { 2 } else { 1 });
         assert!(
             requests[0].starts_with("PUT /api/v10/guilds/10/bans/91?")
                 && requests[0].contains("delete_message_seconds=86400 "),
@@ -138,6 +139,24 @@ async fn softban_deletes_recent_messages_then_unbans_and_reports_failures() {
         } else {
             assert!(outcome.is_err(), "failed step must fail the command");
         }
+        let ban_echo = app.consume_gateway_ban_echo(10, 91).resolve();
+        assert_eq!(
+            ban_echo.suppress_case,
+            ban_status != 403,
+            "ban echo ownership for HTTP {ban_status}"
+        );
+        assert_eq!(ban_echo.owned_by_bot, ban_status != 403);
+        assert!(!app.consume_gateway_ban_echo(10, 91).resolve().suppress_case);
+        assert_eq!(
+            app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Unban, 10, 91),
+            ban_status == 204 && unban_status != 403,
+            "unban echo ownership for ban HTTP {ban_status}, unban HTTP {unban_status}"
+        );
+        assert!(!app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Unban,
+            10,
+            91
+        ));
         drop(config);
         drop(app);
         crate::tenant::remove_sidecars(&path);
