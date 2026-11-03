@@ -1029,6 +1029,12 @@ pub async fn clear_boot_mismatch(db: &Db, component: &str) -> Result<()> {
         if map.remove(&component).is_some() {
             write_boot_mismatch_map_conn(&tx, &map)?;
         }
+        // Recovery ends the episode: an identical later mismatch must alert again,
+        // even when no alert poll runs between this clear and that record.
+        let mut alerted = read_alerted_conn(&tx)?;
+        if alerted.remove(&component).is_some() {
+            write_alerted_conn(&tx, &alerted)?;
+        }
         tx.commit()?;
         Ok(())
     })
@@ -1073,6 +1079,32 @@ struct AlertedBootMismatch {
     posted: bool,
 }
 
+type Alerted = std::collections::BTreeMap<String, AlertedBootMismatch>;
+
+fn read_alerted_conn(conn: &impl SqlExecutor) -> Result<Alerted> {
+    Ok(match meta_string_conn(conn, BOOT_MISMATCH_ALERTED_META)? {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        None => Alerted::new(),
+    })
+}
+
+fn write_alerted_conn(conn: &impl SqlExecutor, alerted: &Alerted) -> Result<()> {
+    if alerted.is_empty() {
+        conn.execute_rows(
+            "DELETE FROM meta WHERE key=?1",
+            params![BOOT_MISMATCH_ALERTED_META],
+            1,
+        )?;
+    } else {
+        write_meta_string_conn(
+            conn,
+            BOOT_MISMATCH_ALERTED_META,
+            &serde_json::to_string(alerted)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// The alert channel and the mismatch states due for an alert.
 pub type BootMismatchAlerts = (Option<u64>, Vec<BootMismatchRecord>);
 
@@ -1081,16 +1113,12 @@ pub type BootMismatchAlerts = (Option<u64>, Vec<BootMismatchRecord>);
 /// (twice when it was first only logged and a channel is chosen later), so
 /// retries and restarts do not repeat it. A cleared or changed state alerts again.
 pub async fn take_boot_mismatch_alerts(db: &Db) -> Result<BootMismatchAlerts> {
-    type Alerted = std::collections::BTreeMap<String, AlertedBootMismatch>;
     /// The channel, due records and next alerted map, or `None` when nothing changes.
     fn plan(conn: &impl SqlExecutor) -> Result<Option<(BootMismatchAlerts, Alerted)>> {
         let channel = meta_string_conn(conn, UPDATE_ALERT_CHANNEL_META)?
             .and_then(|id| id.parse::<u64>().ok());
         let current = read_boot_mismatch_map_conn(conn)?;
-        let alerted: Alerted = match meta_string_conn(conn, BOOT_MISMATCH_ALERTED_META)? {
-            Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            None => Alerted::new(),
-        };
+        let alerted = read_alerted_conn(conn)?;
         let mut next = Alerted::new();
         let mut due = Vec::new();
         for (component, record) in current {
@@ -1114,19 +1142,7 @@ pub async fn take_boot_mismatch_alerts(db: &Db) -> Result<BootMismatchAlerts> {
             tx.commit()?;
             return Ok((None, Vec::new()));
         };
-        if next.is_empty() {
-            tx.execute_rows(
-                "DELETE FROM meta WHERE key=?1",
-                params![BOOT_MISMATCH_ALERTED_META],
-                1,
-            )?;
-        } else {
-            write_meta_string_conn(
-                &tx,
-                BOOT_MISMATCH_ALERTED_META,
-                &serde_json::to_string(&next)?,
-            )?;
-        }
+        write_alerted_conn(&tx, &next)?;
         tx.commit()?;
         Ok(due)
     })
@@ -2481,8 +2497,28 @@ mod tests {
         record_boot_mismatch(&db, record.clone()).await.unwrap();
         assert_eq!(
             take_boot_mismatch_alerts(&db).await.unwrap(),
-            (Some(5), vec![record])
+            (Some(5), vec![record.clone()])
         );
+        // Another component's alerted episode is independent of this clear.
+        let api = BootMismatchRecord {
+            component: "api".into(),
+            running: String::new(),
+            ..record.clone()
+        };
+        record_boot_mismatch(&db, api.clone()).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![api]);
+        // Repeated launcher writes within one episode stay suppressed.
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        // Recovery and an identical recurrence between two alert polls.
+        clear_boot_mismatch(&db, "bot").await.unwrap();
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (Some(5), vec![record.clone()])
+        );
+        record_boot_mismatch(&db, record).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
