@@ -88,6 +88,7 @@ struct MockDiscord {
     valid_channel: bool,
     outcome: Outcome,
     calls: AtomicUsize,
+    unbans: std::sync::Mutex<Vec<(i64, i64, String)>>,
     checks: AtomicUsize,
     slow_authorization: bool,
     slow_unban: bool,
@@ -102,6 +103,7 @@ impl Default for MockDiscord {
             valid_channel: true,
             outcome: Outcome::succeeded("unbanned"),
             calls: AtomicUsize::new(0),
+            unbans: std::sync::Mutex::new(Vec::new()),
             checks: AtomicUsize::new(0),
             slow_authorization: false,
             slow_unban: false,
@@ -136,7 +138,11 @@ impl DiscordActions for MockDiscord {
         anyhow::ensure!(self.check_error != Some("channel"), "channel unavailable");
         Ok(self.valid_channel)
     }
-    async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+    async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome {
+        self.unbans
+            .lock()
+            .unwrap()
+            .push((guild, user, reason.to_owned()));
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.slow_unban {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1829,4 +1835,78 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
         audit_case.as_ref().map(|m| m.id.as_str()),
         Some(real_case.id.as_str())
     );
+}
+
+#[tokio::test]
+async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    db::record_ban(&f.db, 10, 20, None, "temporary")
+        .await
+        .unwrap();
+    db::record_ban(&f.db, 10, 21, None, "permanent")
+        .await
+        .unwrap();
+    db::set_ban_expiry(&f.db, enrollment, 20, 100)
+        .await
+        .unwrap();
+    let discord = MockDiscord::default();
+    let limits = WorkerLimits::default();
+    expire_bans(&f.db, None, &discord, 99, &limits)
+        .await
+        .unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    expire_bans(&f.db, None, &discord, 100, &limits)
+        .await
+        .unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *discord.unbans.lock().unwrap(),
+        vec![(10, 20, "Ban duration expired".into())]
+    );
+    let bans = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert!(!bans.iter().find(|b| b.user_id == 20).unwrap().active);
+    assert!(bans.iter().find(|b| b.user_id == 21).unwrap().active);
+    expire_bans(&f.db, None, &discord, 101, &limits)
+        .await
+        .unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn timed_ban_failed_unban_is_not_marked_successful_or_retried() {
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    let limits = WorkerLimits::default();
+    for (user, outcome) in [
+        (20, Outcome::failed("forbidden")),
+        (21, Outcome::uncertain("discord_outcome_unknown")),
+    ] {
+        db::record_ban(&f.db, 10, user, None, "temporary")
+            .await
+            .unwrap();
+        db::set_ban_expiry(&f.db, enrollment.clone(), user, 100)
+            .await
+            .unwrap();
+        let discord = MockDiscord {
+            outcome,
+            ..Default::default()
+        };
+        expire_bans(&f.db, None, &discord, 100, &limits)
+            .await
+            .unwrap();
+        expire_bans(&f.db, None, &discord, 101, &limits)
+            .await
+            .unwrap();
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            db::list_bans(&f.db, 10, 10)
+                .await
+                .unwrap()
+                .iter()
+                .find(|b| b.user_id == user)
+                .unwrap()
+                .active
+        );
+    }
 }

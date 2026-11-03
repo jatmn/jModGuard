@@ -1966,6 +1966,67 @@ pub async fn clear_enrolled_warns(
     .await
 }
 
+/// Attach a deadline to the current ban, scoped to the command's membership.
+pub async fn set_ban_expiry(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    user: i64,
+    expires_at: i64,
+) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let changed = tx.execute_matching(
+            "UPDATE bans SET expires_at=?1,expiry_enrollment_id=?2
+             WHERE guild_id=?3 AND user_id=?4 AND active=1",
+            params![expires_at, enrollment.id, enrollment.guild_id, user],
+        )?;
+        anyhow::ensure!(changed == 1, "active ban unavailable; expiry was not saved");
+        tx.commit()
+    })
+    .await
+}
+
+/// Consume one due expiry before dispatch. Failed/uncertain requests are not retried.
+pub async fn take_expired_ban(db: &Db, now: i64) -> Result<Option<(GuildEnrollment, i64)>> {
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        let due = tx
+            .query_row(
+                "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns
+             FROM bans b JOIN guild_enrollments e
+             ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
+             WHERE b.active=1 AND b.expires_at<=?1
+             AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
+             ORDER BY b.expires_at,b.id LIMIT 1",
+                params![now],
+                |r| {
+                    Ok((
+                        r.get::<i64>(0)?,
+                        GuildEnrollment {
+                            guild_id: r.get(1)?,
+                            id: r.get(3)?,
+                            joined_at_ns: r.get(4)?,
+                        },
+                        r.get::<i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, enrollment, user)) = due {
+            tx.ensure_mutation_receipt()?;
+            tx.execute_matching("UPDATE bans SET expires_at=NULL WHERE id=?1", params![id])?;
+            tx.commit()?;
+            Ok(Some((enrollment, user)))
+        } else {
+            tx.finish_read()?;
+            Ok(None)
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod query_plan_tests {
     use super::*;

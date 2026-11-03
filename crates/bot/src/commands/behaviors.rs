@@ -103,7 +103,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             default_reason,
             delete_days,
         } => {
-            let (target, reason) = target_and_reason(env, default_reason).await?;
+            let (target, reason, minutes) = ban_args(&env.args, default_reason)?;
+            let target = resolve_target(env, target).await?;
             let reason = jmodguard::ban_reason::without_tag(&reason).to_owned();
             let target_user = user_lookup(env, target).await?;
             let member = env
@@ -314,6 +315,16 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         }
                     }
                 }
+            }
+            if let Some(minutes) = minutes {
+                let enrollment = enrollment.clone().ok_or(db::EnrollmentChanged)?;
+                db::set_ban_expiry(
+                    &env.app.db,
+                    enrollment,
+                    target.get() as i64,
+                    chrono::Utc::now().timestamp() + i64::from(minutes) * 60,
+                )
+                .await?;
             }
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
@@ -1264,6 +1275,28 @@ async fn resolve_target(env: &CmdEnv<'_>, token: String) -> Result<serenity::mod
         .ok_or_else(|| anyhow!("could not resolve user `{token}`"))
 }
 
+fn ban_args(args: &Args, default_reason: &str) -> Result<(String, String, Option<u32>)> {
+    let mut args = args.clone();
+    let target = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+    let minutes = if args.peek() == Some("--minutes") {
+        args.next_arg();
+        let value = args
+            .next_arg()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| anyhow!(jmodguard::defaults::BAN_DURATION_ERROR))?;
+        Some(value)
+    } else {
+        None
+    };
+    let reason = if args.is_empty() {
+        default_reason.to_owned()
+    } else {
+        args.rest()
+    };
+    Ok((target, reason, minutes))
+}
+
 async fn target_and_reason(
     env: &CmdEnv<'_>,
     default_reason: &str,
@@ -1721,6 +1754,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
     match behavior {
         Behavior::Ban { .. } => vec![
             opt("user", User, true, "User to ban"),
+            opt(
+                "minutes",
+                Integer,
+                false,
+                "Unban after this many minutes (omit for permanent)",
+            ),
             opt("reason", Str, false, "Ban reason"),
             opt(
                 "dm",
@@ -1809,6 +1848,62 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_ban_prefix_and_slash_parse_the_same_duration_and_reason() {
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap();
+        let options = vec![
+            ("reason".into(), "repeated spam".into()),
+            ("minutes".into(), "60".into()),
+            ("user".into(), "42".into()),
+            ("dm".into(), "true".into()),
+        ];
+        let (parts, dm) = super::super::options_to_args_with_dm(&command, &options);
+        assert!(dm);
+        for args in [
+            Args::new("42 --minutes 60 repeated spam"),
+            Args::from_parts(parts),
+        ] {
+            assert_eq!(
+                ban_args(&args, "default").unwrap(),
+                ("42".into(), "repeated spam".into(), Some(60))
+            );
+        }
+        assert_eq!(
+            ban_args(&Args::new("42 --minutes 1"), "default").unwrap(),
+            ("42".into(), "default".into(), Some(1))
+        );
+        assert_eq!(
+            ban_args(&Args::new("42 60 minutes of spam"), "default").unwrap(),
+            ("42".into(), "60 minutes of spam".into(), None)
+        );
+        let options = vec![
+            ("user".into(), "42".into()),
+            ("reason".into(), "spam".into()),
+        ];
+        let (parts, _) = super::super::options_to_args_with_dm(&command, &options);
+        assert_eq!(
+            ban_args(&Args::from_parts(parts), "default").unwrap(),
+            ("42".into(), "spam".into(), None)
+        );
+        for value in ["", "0", "-1", "1.5", "later", "4294967296"] {
+            assert!(ban_args(&Args::new(&format!("42 --minutes {value}")), "default").is_err());
+        }
+    }
+
+    #[test]
+    fn timed_ban_has_optional_minutes() {
+        let specs = super::slash_spec(&crate::types::Behavior::Ban {
+            default_reason: String::new(),
+            delete_days: 0,
+        });
+        assert!(specs.iter().any(|s| s.name == "minutes"
+            && s.kind == serenity::model::application::CommandOptionType::Integer
+            && !s.required));
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;
