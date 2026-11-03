@@ -428,6 +428,7 @@ async fn main() -> Result<()> {
                 }
                 drain_nickname_reconciles(&app, &http, &identity, &mut identity_retry).await;
                 jmodguard_bot::update_reminder::send_pending(&app, &http).await;
+                jmodguard_bot::boot_mismatch_alert::send_pending(&app, &http).await;
             }
         });
     }

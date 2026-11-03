@@ -296,6 +296,25 @@ function ComponentCard({ record, revision }) {
               disabled: value !== "off" && (!ui.getSnapshot().snapshot.unattended_enabled || record.channel === "latest") }, value === "off" ? "Automatic install off" : value)))))));
 }
 
+function AlertChannelCard({ revision }) {
+  const saved = ui.getSnapshot().snapshot?.alert_channel || "";
+  const [value, setValue] = useState(saved);
+  useEffect(() => { setValue(saved); }, [saved, revision]);
+  const blocked = ui.getSnapshot().busy || ui.getSnapshot().stale;
+  return h("section", { id: "alert-channel", className: "card bg-base-100 administration-card" },
+    h("div", { className: "card-body" },
+      h("h2", { className: "card-title" }, "Boot repair alerts"),
+      h("p", { className: "muted" }, "If boot repair cannot restore the recorded bot or API release, the bot posts the component, running version, expected release, and reason to this channel once per mismatch."),
+      !saved && h("p", { id: "alert-channel-unset", className: "muted" }, "No alert channel is set. Mismatches are logged and shown on the component cards."),
+      h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Alert channel ID"),
+        h("input", { id: "alert-channel-id", className: "input input-sm", inputMode: "numeric", value, disabled: blocked,
+          onChange: event => setValue(event.target.value) })),
+      h("div", { className: "card-actions" },
+        h("button", { id: "save-alert-channel", type: "button", className: "btn btn-sm", disabled: blocked || value.trim() === saved,
+          onClick: () => mutate({ component: "alerts" }, "Save alert channel",
+            () => request("/api/updates/alert-channel", { channel_id: value.trim() })) }, "Save alert channel"))));
+}
+
 function refresh() {
   if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
   if (refreshing) return refreshing;
@@ -488,7 +507,8 @@ function Administration() {
         h("details", null, h("summary", null, "Browser version"), h("div", null, details)),
         differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"),
         differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: display.busy, onClick: () => window.location.reload() }, "Reload page"))),
-      h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision })))),
+      h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision }))),
+      display.snapshot && h(AlertChannelCard, { revision: ui.getSnapshot().policyRevision })),
     h("section", { id: "database-usage", className: display.authorized && !display.accessDenied && display.activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
       h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
       h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${display.usageStale ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),

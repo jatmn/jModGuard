@@ -8749,6 +8749,10 @@ async fn cold_start_outage_refuses_a_baked_bot_schema_change() {
         "{error}"
     );
     assert!(started.is_none(), "{started:?}");
+    // The owner alert names the schema mismatch; nothing is running.
+    let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatch["bot"].reason, SCHEMA_MISMATCH_BOOT_MISMATCH);
+    assert_eq!(mismatch["bot"].running, "");
     assert!(
         !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
         "{logs:?}"

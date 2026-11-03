@@ -239,6 +239,9 @@ pub enum ControlOp {
         cadence: String,
         unattended_allowed: bool,
     },
+    SetUpdateAlertChannel {
+        channel_id: Option<u64>,
+    },
     RequestDueAutomaticInstall {
         component: String,
         expected_digest: String,
@@ -382,6 +385,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::TrackWebuiAssets { .. }
         | ControlOp::UntrackWebuiAssets { .. }
         | ControlOp::SetUpdatePolicy { .. }
+        | ControlOp::SetUpdateAlertChannel { .. }
         | ControlOp::RequestDueAutomaticInstall { .. }
         | ControlOp::RequestComponentInstall { .. }
         | ControlOp::RequestLauncherInstall { .. }
@@ -863,6 +867,10 @@ async fn apply_control_inner(
         } => saved_value(
             set_update_policy(db, &component, &channel, &cadence, unattended_allowed).await?,
         ),
+        ControlOp::SetUpdateAlertChannel { channel_id } => {
+            set_update_alert_channel(db, channel_id).await?;
+            saved_null()
+        }
         ControlOp::RequestDueAutomaticInstall {
             component,
             expected_digest,

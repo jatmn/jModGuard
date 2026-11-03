@@ -129,6 +129,18 @@ and the reason from `update_boot_mismatch_v1`. These are saved startup diagnosti
 not a live health probe. The owner update and recovery endpoints return the map as
 `boot_mismatches`. Successful installed-release readiness clears the diagnostic.
 
+The owner can choose a boot repair alert channel (a Discord channel ID) on the
+Administration Updates page. The API forwards that choice over the control link and
+the bot stores it in `meta.update_alert_channel_v1`. On its configuration poll the bot
+posts each new mismatch once to that channel: the component, the running build (or
+that it is stopped), the expected release and source SHA, and the reason (`registry
+unreachable`, a signature rejection, `registry download failed`, or, from launcher
+revision 38, `registry unreachable; built-in application schema does not match the
+database`). Launcher retries and restarts that save the same mismatch do not post
+again; a cleared or changed mismatch does. Without a channel the bot logs one warning
+per mismatch and the cards above still show it; choosing a channel later posts it
+once. Delivery is best effort. A stopped bot cannot post its own mismatch.
+
 Launcher revision 32 starts a recovery Clear with a fresh retry delay instead of
 inheriting the failed Record's backoff. Pending diagnostics remain independent of
 readiness receipts. An explicit launcher handoff saves pending mismatch operations

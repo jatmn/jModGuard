@@ -32,6 +32,8 @@ const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
+const SCHEMA_MISMATCH_BOOT_MISMATCH: &str =
+    "registry unreachable; built-in application schema does not match the database";
 
 /// Process-local only: container restart is the explicit reset for a bad token.
 ///
@@ -2034,7 +2036,23 @@ impl Supervisor {
         schema: i64,
         release: &ComponentRelease,
     ) -> Result<()> {
-        let (path, sha, _) = self.baked_registry_fallback(state, schema, release).await?;
+        let (path, sha, _) = match self.baked_registry_fallback(state, schema, release).await {
+            Ok(fallback) => fallback,
+            Err(error) => {
+                // The owner alert names this cause; the refusal itself is unchanged.
+                if let Err(save) = self
+                    .record_boot_mismatch_for_installed(
+                        release,
+                        SCHEMA_MISMATCH_BOOT_MISMATCH,
+                        String::new(),
+                    )
+                    .await
+                {
+                    tracing::warn!("boot mismatch receipt was not saved: {save:#}");
+                }
+                return Err(error);
+            }
+        };
         tracing::error!("registry unreachable at boot; starting the built-in application");
         self.start(&path, &sha, None).await
     }
