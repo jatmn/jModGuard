@@ -4156,7 +4156,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     let enrollment = tokio_test_block_on(async {
         let enrollment = enroll_guild(&db, 10, 1).await.unwrap().unwrap();
         assert!(
-            next_expired_ban(&db, i64::MAX, Vec::new())
+            next_expired_ban(&db, i64::MAX, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -4171,20 +4171,20 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
         assert!(
-            next_expired_ban(&db, 99, Vec::new())
+            next_expired_ban(&db, 99, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .is_none()
         );
-        let due = next_expired_ban(&db, 100, Vec::new())
+        let due = next_expired_ban(&db, 100, Vec::new(), Vec::new())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(due.enrollment, enrollment);
         assert_eq!((due.user, due.expires_at), (21, 100));
-        // Finding a due ban does not consume it; a deferred ID is skipped.
+        // Finding a due ban does not consume it; a deferred ID or guild is skipped.
         assert_eq!(
-            next_expired_ban(&db, 100, Vec::new())
+            next_expired_ban(&db, 100, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .unwrap()
@@ -4192,7 +4192,13 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
             due.id
         );
         assert!(
-            next_expired_ban(&db, 100, vec![due.id])
+            next_expired_ban(&db, 100, vec![due.id], Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            next_expired_ban(&db, 100, Vec::new(), vec![10])
                 .await
                 .unwrap()
                 .is_none()
@@ -4204,7 +4210,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
             ExpiredBanState::Current
         );
         assert!(
-            next_expired_ban(&db, 100, Vec::new())
+            next_expired_ban(&db, 100, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -4215,7 +4221,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
             .unwrap();
         assert!(!claim_expired_ban(&db, &due).await.unwrap());
         assert_eq!(
-            next_expired_ban(&db, 150, Vec::new())
+            next_expired_ban(&db, 150, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .unwrap()
@@ -4229,7 +4235,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
         mark_unbanned(&db, 10, 22).await.unwrap();
         mark_unbanned(&db, 10, 21).await.unwrap();
         assert!(
-            next_expired_ban(&db, 200, Vec::new())
+            next_expired_ban(&db, 200, Vec::new(), Vec::new())
                 .await
                 .unwrap()
                 .is_none()

@@ -1998,10 +1998,16 @@ pub struct ExpiredBan {
 }
 
 /// Find the oldest due expiry under an active, unfenced membership without
-/// consuming it, so the caller can verify live membership first. `skip` holds
-/// ban IDs already deferred in this pass.
-pub async fn next_expired_ban(db: &Db, now: i64, skip: Vec<i64>) -> Result<Option<ExpiredBan>> {
-    let skip = serde_json::to_string(&skip)?;
+/// consuming it, so the caller can verify live membership first. `skip_bans`
+/// and `skip_guilds` hold ban and guild IDs already deferred in this pass.
+pub async fn next_expired_ban(
+    db: &Db,
+    now: i64,
+    skip_bans: Vec<i64>,
+    skip_guilds: Vec<i64>,
+) -> Result<Option<ExpiredBan>> {
+    let skip_bans = serde_json::to_string(&skip_bans)?;
+    let skip_guilds = serde_json::to_string(&skip_guilds)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
         let due = tx
@@ -2011,9 +2017,10 @@ pub async fn next_expired_ban(db: &Db, now: i64, skip: Vec<i64>) -> Result<Optio
              ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
              WHERE b.active=1 AND b.expires_at<=?1
              AND b.id NOT IN (SELECT value FROM json_each(?2))
+             AND b.guild_id NOT IN (SELECT value FROM json_each(?3))
              AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
              ORDER BY b.expires_at,b.id LIMIT 1",
-                params![now, skip],
+                params![now, skip_bans, skip_guilds],
                 |r| {
                     Ok(ExpiredBan {
                         id: r.get(0)?,

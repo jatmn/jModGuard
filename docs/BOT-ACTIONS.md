@@ -188,8 +188,9 @@ The same bot task lifts due timed bans (`!ban <user> --minutes N`, see
 [COMMANDS.md](COMMANDS.md)) after each queue drain, examining at most `batch_size` due
 bans per poll. Expiries in a fenced guild wait until the fence is cleared. Before
 consuming a deadline the worker checks the bot's own join timestamp through REST, as the
-executor does. An unavailable check defers that ban to a later poll. A newer join
-repairs the enrollment; the old membership's deadline is then never dispatched.
+executor does. An unavailable check defers that guild's expiries to a later poll; the
+rest of the poll continues with other guilds. A newer join repairs the enrollment; the
+old membership's deadline is then never dispatched.
 While the deadline is consumed and the unban runs, the worker holds the same in-process
 slot as a ban command, so a concurrent ban of that user is refused instead of being
 undone. A command that holds the slot defers the expiry.

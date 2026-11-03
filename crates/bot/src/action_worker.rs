@@ -593,16 +593,20 @@ async fn expire_bans(
     limits: &WorkerLimits,
 ) -> Result<()> {
     // Deferred bans stay due and are skipped only for the rest of this pass.
-    let mut deferred = Vec::new();
+    // A failed membership check skips the whole guild, so one unavailable
+    // guild cannot spend every pass's batch and starve later guilds.
+    let (mut deferred, mut deferred_guilds) = (Vec::new(), Vec::new());
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
         }
-        let Some(due) = db::next_expired_ban(db, now, deferred.clone()).await? else {
+        let Some(due) =
+            db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
+        else {
             break;
         };
         if !expiry_membership_matches(db, app, discord, &due, limits).await? {
-            deferred.push(due.id);
+            deferred_guilds.push(due.enrollment.guild_id);
             continue;
         }
         // Hold the command-ban slot through dispatch and the mirror update so a

@@ -1931,7 +1931,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
         db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
             .await
             .unwrap();
-        let claimed = db::next_expired_ban(&f.db, 100, Vec::new())
+        let claimed = db::next_expired_ban(&f.db, 100, Vec::new(), Vec::new())
             .await
             .unwrap()
             .unwrap();
@@ -2024,6 +2024,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
 /// Reports a distinct live membership result per guild.
 struct PerGuildMembership {
     joined: std::collections::HashMap<i64, Option<i64>>,
+    checks: std::sync::Mutex<Vec<i64>>,
     unbans: std::sync::Mutex<Vec<(i64, i64)>>,
 }
 #[serenity::async_trait]
@@ -2032,6 +2033,7 @@ impl DiscordActions for PerGuildMembership {
         panic!("expiry has no queued job")
     }
     async fn guild_joined_at_ns(&self, guild: i64) -> Result<Option<i64>> {
+        self.checks.lock().unwrap().push(guild);
         match self.joined.get(&guild) {
             Some(joined) => Ok(*joined),
             None => anyhow::bail!("membership unavailable"),
@@ -2065,6 +2067,7 @@ async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
     }
     let discord = PerGuildMembership {
         joined: [(11, Some(1)), (12, None), (13, Some(1_000_000_001))].into(),
+        checks: Default::default(),
         unbans: Default::default(),
     };
     let limits = WorkerLimits::default();
@@ -2086,6 +2089,70 @@ async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
         [10, 12, 13]
             .map(|guild| (guild, 20, "Ban duration expired".to_owned()))
             .to_vec()
+    );
+}
+
+#[tokio::test]
+async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guilds() {
+    let f = Fixture::new();
+    let limits = WorkerLimits::default();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    // A full batch of earlier deadlines in guild 10, then guild 11's.
+    let stuck_users: Vec<i64> = (20..).take(limits.batch_size as usize).collect();
+    for (guild, users, expires_at) in [(10, stuck_users.clone(), 100), (11, vec![30], 101)] {
+        let enrollment = db::enroll_guild(&f.db, guild, 1).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        for user in users {
+            db::record_ban(&f.db, guild, user, None, "temporary")
+                .await
+                .unwrap();
+            db::set_ban_expiry(&f.db, enrollment.clone(), user, expires_at)
+                .await
+                .unwrap();
+        }
+    }
+    let discord = PerGuildMembership {
+        joined: [(11, Some(1))].into(),
+        checks: Default::default(),
+        unbans: Default::default(),
+    };
+
+    for poll in 0..3 {
+        drain_with_state(&app, &discord, &limits).await.unwrap();
+        // One failed check skips guild 10 for the rest of the poll.
+        let checks = std::mem::take(&mut *discord.checks.lock().unwrap());
+        let expected = if poll == 0 { vec![10, 11] } else { vec![10] };
+        assert_eq!(checks, expected, "poll {poll}");
+        assert_eq!(
+            *discord.unbans.lock().unwrap(),
+            vec![(11, 30)],
+            "poll {poll}"
+        );
+    }
+    let bans = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(
+        bans.iter().filter(|ban| ban.active).count(),
+        stuck_users.len()
+    );
+
+    // The deferred deadlines remain due once the guild's check recovers.
+    let discord = MockDiscord::default();
+    drain_with_state(&app, &discord, &limits).await.unwrap();
+    let mut lifted: Vec<_> = discord
+        .unbans
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(guild, user, _)| (*guild, *user))
+        .collect();
+    lifted.sort_unstable();
+    assert_eq!(
+        lifted,
+        stuck_users
+            .iter()
+            .map(|user| (10, *user))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2117,7 +2184,7 @@ async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
     assert_ne!(current.id, old.id);
     // The old membership's deadline is never dispatched under the new join.
     assert!(
-        db::next_expired_ban(&f.db, i64::MAX, Vec::new())
+        db::next_expired_ban(&f.db, i64::MAX, Vec::new(), Vec::new())
             .await
             .unwrap()
             .is_none()
@@ -2182,7 +2249,7 @@ async fn timed_ban_expiry_holds_the_command_ban_slot_through_dispatch() {
         .unwrap();
     assert!(discord.slot_free_during_unban.lock().unwrap().is_empty());
     assert!(
-        db::next_expired_ban(&f.db, 100, Vec::new())
+        db::next_expired_ban(&f.db, 100, Vec::new(), Vec::new())
             .await
             .unwrap()
             .is_some()
