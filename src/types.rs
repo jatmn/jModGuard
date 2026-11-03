@@ -311,6 +311,9 @@ pub enum Behavior {
         default_reason: String,
         delete_days: u8,
     },
+    Softban {
+        default_reason: String,
+    },
     Unban {
         default_reason: String,
     },

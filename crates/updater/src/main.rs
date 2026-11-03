@@ -1580,7 +1580,9 @@ impl Supervisor {
         sha: &str,
         release: Option<ComponentRelease>,
     ) -> Result<()> {
-        self.start_checked(path, sha, release, true).await
+        // Keep the startup future off the stack of nested supervisor calls,
+        // including the direct rollback calls below.
+        Box::pin(self.start_checked(path, sha, release, true)).await
     }
 
     async fn start_checked(
@@ -2494,7 +2496,7 @@ impl Supervisor {
                 // identities until settlement so the failed selection stays held.
                 self.rollback = Some((failed.clone(), message.clone()));
                 self.stop_application().await?;
-                self.start_checked(&path, &sha, previous, false).await?;
+                Box::pin(self.start_checked(&path, &sha, previous, false)).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
                 match self
                     .control
@@ -2716,7 +2718,7 @@ impl Supervisor {
         self.clear_rejected_marker().await;
         self.rollback = Some((failed, error));
         self.stop_application().await?;
-        self.start_checked(&path, &sha, previous, false).await
+        Box::pin(self.start_checked(&path, &sha, previous, false)).await
     }
 
     async fn tick(&mut self) -> Result<bool> {

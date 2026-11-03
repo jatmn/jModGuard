@@ -24,6 +24,15 @@ A runtime candidate download outage keeps an already-running application alive. 
 
 Launcher updates use the same verified role images and the fixed shell bootstrap. Images default to `JMODGUARD_SELF_UPDATE=0`, which prevents launcher handoff, including a required newer launcher for an installed application. With that gate disabled, the required handoff is refused before a registry download, so it cannot reach the download-outage fallback. A selected launcher is restored before normal application startup; the stable baked controller can recover applications if a replacement launcher fails. The one-time baseline must include this controller **and** API maintenance mode. Downloaded execution still needs a controlled proof in the actual Magic Container before enabling the update gates.
 
+With bot launcher revision 33 or newer and the matching bot application, a successful
+bot or API in-app update prompts the bot to DM the configured administrator
+(`bot.owner_id` / `JMODGUARD_OWNER_ID`) with the component, release, and source SHA,
+asking for a matching container image to be cut. The reminder survives a bot restart
+until the existing configuration poll consumes it. Delivery is best effort and attempted
+once. An unset administrator, rejected DM, timeout, or writer cutoff is logged and leaves
+the successful update intact. Repeated readiness reports and ordinary restarts do not
+send another reminder.
+
 The launcher restarts ordinary crashed children on its 5-second poll, with
 successive delays of 5, 10, 20, 40 and at most 60 seconds. A child that stays
 up for five minutes resets that backoff. Lost-lease exit code 1 still restarts

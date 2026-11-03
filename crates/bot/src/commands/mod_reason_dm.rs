@@ -263,7 +263,7 @@ async fn send_mod_reason_dm_inner(
 }
 
 #[cfg(test)]
-async fn fixture_context_for_dm_order_test(
+pub(super) async fn fixture_context_for_dm_order_test(
     http: std::sync::Arc<serenity::http::Http>,
     cache: std::sync::Arc<serenity::cache::Cache>,
 ) -> serenity::client::Context {
