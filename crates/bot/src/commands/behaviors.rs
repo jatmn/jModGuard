@@ -325,6 +325,68 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 suppress_response: false,
             })
         }
+        Behavior::Softban { default_reason } => {
+            let (target, reason) = target_and_reason(env, default_reason).await?;
+            let target_user = user_lookup(env, target).await?;
+            refuse_bot_target(env, target)?;
+            for action in [
+                crate::db::guild_data::CaseAction::Ban,
+                crate::db::guild_data::CaseAction::Unban,
+            ] {
+                refuse_fenced_discord_mutation(env).await?;
+                lease_held(env)?;
+                let discord = async {
+                    if action == crate::db::guild_data::CaseAction::Ban {
+                        // Discord deletes recent messages as part of the ban.
+                        env.guild_id
+                            .ban_with_reason(&env.ctx.http, target, 1, &reason)
+                            .await
+                    } else {
+                        env.ctx
+                            .http
+                            .remove_ban(env.guild_id, target, Some(&reason))
+                            .await
+                    }
+                };
+                let result =
+                    match crate::discord::race_discord_call(&env.app.activation, discord).await {
+                        crate::discord::DiscordCall::Cancelled => {
+                            Err(crate::discord::cutoff_discord_error())
+                        }
+                        crate::discord::DiscordCall::Finished(result) => result,
+                    };
+                crate::cases::record_application(
+                    env.app,
+                    enrollment.clone(),
+                    action,
+                    crate::cases::classify_discord(result.as_ref().err()),
+                    target.get(),
+                    Some(env.actor.get()),
+                    Some(reason.clone()),
+                    crate::db::guild_data::CaseEvidence::Unavailable,
+                )
+                .await;
+                result?;
+            }
+            log_mod(
+                env,
+                enrollment,
+                "softban",
+                target,
+                &target_user.name,
+                &reason,
+                None,
+            )
+            .await;
+            vars.insert("target".into(), target_user.name);
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason);
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+                suppress_response: false,
+            })
+        }
         Behavior::Unban { default_reason } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
@@ -1651,6 +1713,10 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
                 jmodguard::defaults::SLASH_MOD_REASON_DM_OPTION_TEMPLATE,
             ),
         ],
+        Behavior::Softban { .. } => vec![
+            opt("user", User, true, "User to softban"),
+            opt("reason", Str, false, "Softban reason"),
+        ],
         Behavior::Unban { .. } => vec![
             opt("user", User, true, "User to unban"),
             opt("reason", Str, false, "Unban reason"),
@@ -2234,3 +2300,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "softban_tests.rs"]
+mod softban_tests;
