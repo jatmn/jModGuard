@@ -12,6 +12,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | Command | Category | Permission | Description |
 |---|---|---|---|
 | `!ban <user> [--dm] [reason]` | Moderation | mod | Ban a user; optional `--dm` DMs the reason (aliases: `!yeet`, `!b`) |
+| `!softban <user> [reason]` | Moderation | mod | Ban, delete the last 24 hours of messages, then unban so the user can rejoin |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
 | `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
 | `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
@@ -38,7 +39,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/userinfo`, `/purge`, `/say`, `/slowmode`, `/voice`,
-`/unban`,
+`/unban`, `/softban`,
 `/setname`, `/prefix`, `/template`, `/rule`, `/testregex`, `/help`, `/about`,
 `/stats`).
 

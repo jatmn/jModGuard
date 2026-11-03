@@ -155,6 +155,19 @@ pub fn default_commands() -> Vec<CommandDef> {
         vec![],
     ));
     out.push(cmd(
+        "softban",
+        "Moderation",
+        "Ban, delete the last day of messages, then unban a user.",
+        "!softban <user> [reason]",
+        "mod",
+        Behavior::Softban {
+            default_reason: "Softbanned by a moderator".into(),
+        },
+        "Softbanned {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
         "unban",
         "Moderation",
         "Unban a user from the server.",
@@ -409,7 +422,7 @@ pub fn default_commands() -> Vec<CommandDef> {
 /// Built-in commands merged from the running binary but not written to global
 /// `commands` rows during rolling upgrades (older binaries cannot deserialize
 /// unknown `Behavior` kinds).
-pub const BINARY_OVERLAY_COMMAND_NAMES: &[&str] = &["voice"];
+pub const BINARY_OVERLAY_COMMAND_NAMES: &[&str] = &["voice", "softban"];
 
 pub fn is_binary_overlay_command_name(name: &str) -> bool {
     BINARY_OVERLAY_COMMAND_NAMES
@@ -419,7 +432,7 @@ pub fn is_binary_overlay_command_name(name: &str) -> bool {
 
 /// Behaviors merged from the running binary and never written to shared `commands` rows.
 pub fn is_binary_overlay_behavior(behavior: &Behavior) -> bool {
-    matches!(behavior, Behavior::Voice)
+    matches!(behavior, Behavior::Voice | Behavior::Softban { .. })
 }
 
 pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
@@ -927,6 +940,22 @@ pub fn sample_plan_command() -> CommandDef {
 #[cfg(test)]
 mod rolling_upgrade_tests {
     use super::*;
+
+    #[test]
+    fn softban_is_available_without_persisting_a_new_behavior_kind() {
+        let mut commands = std::collections::HashMap::new();
+        merge_binary_overlay_commands(&mut commands);
+        assert!(matches!(
+            commands["softban"].behavior,
+            Behavior::Softban { .. }
+        ));
+        assert!(command_def_is_binary_overlay(&commands["softban"]));
+        assert!(
+            !default_global_seed_commands()
+                .iter()
+                .any(|cmd| cmd.name == "softban")
+        );
+    }
 
     #[test]
     fn shipped_builtin_ignores_stored_access_and_definition() {
