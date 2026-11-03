@@ -93,6 +93,7 @@ struct MockDiscord {
     slow_authorization: bool,
     slow_unban: bool,
     check_error: Option<&'static str>,
+    live_joined_at_ns: Option<i64>,
 }
 impl Default for MockDiscord {
     fn default() -> Self {
@@ -108,6 +109,7 @@ impl Default for MockDiscord {
             slow_authorization: false,
             slow_unban: false,
             check_error: None,
+            live_joined_at_ns: Some(1),
         }
     }
 }
@@ -122,6 +124,13 @@ impl DiscordActions for MockDiscord {
             "membership unavailable"
         );
         Ok(self.membership_matches)
+    }
+    async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+        anyhow::ensure!(
+            self.check_error != Some("membership"),
+            "membership unavailable"
+        );
+        Ok(self.live_joined_at_ns)
     }
     async fn authorized(&self, _: &BotAction) -> Result<bool> {
         self.checks.fetch_add(1, Ordering::SeqCst);
@@ -1912,8 +1921,8 @@ async fn timed_ban_failed_unban_is_not_marked_successful_or_retried() {
 }
 
 #[tokio::test]
-async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
-    for change in ["rearm", "cancel", "replace"] {
+async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claims() {
+    for change in ["rearm", "cancel", "replace", "rejoin", "fence"] {
         let f = Fixture::new();
         let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
         db::record_ban(&f.db, 10, 20, None, "temporary")
@@ -1922,10 +1931,14 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
         db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
             .await
             .unwrap();
-        let claimed = db::take_expired_ban(&f.db, 100).await.unwrap().unwrap();
+        let claimed = db::next_expired_ban(&f.db, 100, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db::claim_expired_ban(&f.db, &claimed).await.unwrap());
 
-        // A timed-ban command or gateway observation lands after the worker's
-        // claim, before it reaches the Discord dispatch boundary.
+        // A timed-ban command, gateway observation, membership change or move
+        // fence lands after the worker's claim, before the Discord dispatch.
         match change {
             "rearm" => db::set_ban_expiry(&f.db, enrollment, 20, 200)
                 .await
@@ -1937,8 +1950,46 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
                     .await
                     .unwrap();
             }
+            "rejoin" => {
+                db::enroll_guild(&f.db, 10, 1_000_000_001)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "fence" => {
+                let destination = db::guild_stores::StoreId::new();
+                db::guild_stores::register_store(
+                    &f.db,
+                    destination.clone(),
+                    db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+                )
+                .await
+                .unwrap();
+                f.db.with_conn(move |conn| {
+                    conn.execute_bounded(
+                        "INSERT INTO guild_write_fences(
+                        guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                     ) VALUES(10,?1,'freeze',?2,?1,unixepoch())",
+                        params![format!("{:032x}", 9u128), destination.as_str()],
+                        64 * 1024 * 1024,
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
             _ => unreachable!(),
         }
+        let blocked = matches!(change, "rejoin" | "fence");
+        assert_eq!(
+            db::expired_ban_state(&f.db, &claimed).await.unwrap(),
+            if blocked {
+                db::ExpiredBanState::Blocked
+            } else {
+                db::ExpiredBanState::Superseded
+            },
+            "{change}"
+        );
         let discord = MockDiscord::default();
         let limits = WorkerLimits::default();
         dispatch_expired_ban(&f.db, None, &discord, claimed, &limits)
@@ -1947,7 +1998,8 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
         assert_eq!(discord.calls.load(Ordering::SeqCst), 0, "{change}");
         assert!(discord.unbans.lock().unwrap().is_empty(), "{change}");
 
-        // Skipping stale work must leave the replacement state intact.
+        // Skipping stale work must leave the replacement state intact, and a
+        // blocked claim leaves the ban for moderator follow-up.
         let bans = db::list_bans(&f.db, 10, 10).await.unwrap();
         assert_eq!(
             bans.iter().filter(|ban| ban.active).count(),
@@ -1967,4 +2019,181 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
             "{change}"
         );
     }
+}
+
+/// Reports a distinct live membership result per guild.
+struct PerGuildMembership {
+    joined: std::collections::HashMap<i64, Option<i64>>,
+    unbans: std::sync::Mutex<Vec<(i64, i64)>>,
+}
+#[serenity::async_trait]
+impl DiscordActions for PerGuildMembership {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        panic!("expiry has no queued job")
+    }
+    async fn guild_joined_at_ns(&self, guild: i64) -> Result<Option<i64>> {
+        match self.joined.get(&guild) {
+            Some(joined) => Ok(*joined),
+            None => anyhow::bail!("membership unavailable"),
+        }
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        panic!("expiry has no actor")
+    }
+    async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+        panic!("expiry has no log channel")
+    }
+    async fn unban(&self, guild: i64, user: i64, _: &str) -> Outcome {
+        self.unbans.lock().unwrap().push((guild, user));
+        Outcome::succeeded("unbanned")
+    }
+}
+
+#[tokio::test]
+async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
+    let f = Fixture::new();
+    // Guild 10's read fails, 11 matches, 12 has no identity and 13 shows a
+    // newer join. The earliest deadline must not block the matching guild.
+    for (guild, expires_at) in [(10, 100), (11, 101), (12, 102), (13, 103)] {
+        let enrollment = db::enroll_guild(&f.db, guild, 1).await.unwrap().unwrap();
+        db::record_ban(&f.db, guild, 20, None, "temporary")
+            .await
+            .unwrap();
+        db::set_ban_expiry(&f.db, enrollment, 20, expires_at)
+            .await
+            .unwrap();
+    }
+    let discord = PerGuildMembership {
+        joined: [(11, Some(1)), (12, None), (13, Some(1_000_000_001))].into(),
+        unbans: Default::default(),
+    };
+    let limits = WorkerLimits::default();
+    expire_bans(&f.db, None, &discord, 103, &limits)
+        .await
+        .unwrap();
+    assert_eq!(*discord.unbans.lock().unwrap(), vec![(11, 20)]);
+    for guild in [10, 12, 13] {
+        assert!(db::list_bans(&f.db, guild, 10).await.unwrap()[0].active);
+    }
+
+    // Deferred deadlines were not consumed: a confirmed membership lifts them.
+    let discord = MockDiscord::default();
+    expire_bans(&f.db, None, &discord, 103, &limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        *discord.unbans.lock().unwrap(),
+        [10, 12, 13]
+            .map(|guild| (guild, 20, "Ban duration expired".to_owned()))
+            .to_vec()
+    );
+}
+
+#[tokio::test]
+async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
+    let f = Fixture::new();
+    let old = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    db::record_ban(&f.db, 10, 20, None, "temporary")
+        .await
+        .unwrap();
+    db::set_ban_expiry(&f.db, old.clone(), 20, 100)
+        .await
+        .unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    app.tenant.activate(old.clone()).await.unwrap();
+    let discord = MockDiscord {
+        live_joined_at_ns: Some(1_000_000_001),
+        ..Default::default()
+    };
+
+    drain_with_state(&app, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    let current = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    assert_eq!(current.joined_at_ns, 1_000_000_001);
+    assert_ne!(current.id, old.id);
+    // The old membership's deadline is never dispatched under the new join.
+    assert!(
+        db::next_expired_ban(&f.db, i64::MAX, Vec::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db::list_bans(&f.db, 10, 10).await.unwrap()[0].active);
+}
+
+#[tokio::test]
+async fn timed_ban_expiry_holds_the_command_ban_slot_through_dispatch() {
+    struct SlotProbe<'a> {
+        app: &'a crate::state::BotState,
+        slot_free_during_unban: std::sync::Mutex<Vec<bool>>,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for SlotProbe<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            panic!("expiry has no queued job")
+        }
+        async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+            Ok(Some(1))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            panic!("expiry has no actor")
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            panic!("expiry has no log channel")
+        }
+        async fn unban(&self, guild: i64, user: i64, _: &str) -> Outcome {
+            // A ban command racing the dispatch must be refused, not undone.
+            let free = crate::member_directory::begin_command_ban_in_progress(
+                self.app,
+                guild as u64,
+                user as u64,
+            )
+            .is_ok();
+            self.slot_free_during_unban.lock().unwrap().push(free);
+            Outcome::succeeded("unbanned")
+        }
+    }
+
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    db::record_ban(&f.db, 10, 20, None, "temporary")
+        .await
+        .unwrap();
+    db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
+        .await
+        .unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    app.tenant.activate(enrollment).await.unwrap();
+    let discord = SlotProbe {
+        app: &app,
+        slot_free_during_unban: Default::default(),
+    };
+    let limits = WorkerLimits::default();
+
+    // A ban command already in progress defers the expiry without consuming it.
+    let command = crate::member_directory::begin_command_ban_in_progress(&app, 10, 20).unwrap();
+    expire_bans(&f.db, Some(&app), &discord, 100, &limits)
+        .await
+        .unwrap();
+    assert!(discord.slot_free_during_unban.lock().unwrap().is_empty());
+    assert!(
+        db::next_expired_ban(&f.db, 100, Vec::new())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(command);
+
+    expire_bans(&f.db, Some(&app), &discord, 100, &limits)
+        .await
+        .unwrap();
+    assert_eq!(*discord.slot_free_during_unban.lock().unwrap(), vec![false]);
+    assert!(!db::list_bans(&f.db, 10, 10).await.unwrap()[0].active);
+    // The slot is released after dispatch.
+    drop(crate::member_directory::begin_command_ban_in_progress(&app, 10, 20).unwrap());
 }

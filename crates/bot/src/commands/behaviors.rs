@@ -121,6 +121,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )?;
             #[allow(unused_assignments)]
             let mut dm_outcome = None;
+            // The deadline is saved before log delivery, which may not finish.
+            let mut log_ban = false;
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -172,16 +174,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await?
                     {
-                        log_mod(
-                            env,
-                            enrollment.clone(),
-                            "ban",
-                            target,
-                            &target_user.name,
-                            &reason,
-                            dm_outcome,
-                        )
-                        .await;
+                        log_ban = true;
                     }
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
@@ -285,16 +278,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                 )
                                 .await?
                             {
-                                log_mod(
-                                    env,
-                                    enrollment.clone(),
-                                    "ban",
-                                    target,
-                                    &target_user.name,
-                                    &reason,
-                                    dm_outcome,
-                                )
-                                .await;
+                                log_ban = true;
                             }
                         }
                         crate::db::guild_data::CaseOutcome::Failed => {
@@ -316,16 +300,34 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     }
                 }
             }
-            if let Some(minutes) = minutes {
-                let enrollment = enrollment.clone().ok_or(db::EnrollmentChanged)?;
-                db::set_ban_expiry(
-                    &env.app.db,
-                    enrollment,
-                    target.get() as i64,
-                    chrono::Utc::now().timestamp() + i64::from(minutes) * 60,
+            let expiry = match minutes {
+                Some(minutes) => match enrollment.clone() {
+                    Some(enrollment) => {
+                        db::set_ban_expiry(
+                            &env.app.db,
+                            enrollment,
+                            target.get() as i64,
+                            chrono::Utc::now().timestamp() + i64::from(minutes) * 60,
+                        )
+                        .await
+                    }
+                    None => Err(db::EnrollmentChanged.into()),
+                },
+                None => Ok(()),
+            };
+            if log_ban {
+                log_mod(
+                    env,
+                    enrollment.clone(),
+                    "ban",
+                    target,
+                    &target_user.name,
+                    &reason,
+                    dm_outcome,
                 )
-                .await?;
+                .await;
             }
+            expiry?;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
@@ -2415,3 +2417,7 @@ mod tests {
 #[cfg(test)]
 #[path = "softban_tests.rs"]
 mod softban_tests;
+
+#[cfg(test)]
+#[path = "ban_expiry_tests.rs"]
+mod ban_expiry_tests;

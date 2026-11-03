@@ -4155,7 +4155,12 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     let db = Db::open(&tmp, 2).unwrap();
     let enrollment = tokio_test_block_on(async {
         let enrollment = enroll_guild(&db, 10, 1).await.unwrap().unwrap();
-        assert!(take_expired_ban(&db, i64::MAX).await.unwrap().is_none());
+        assert!(
+            next_expired_ban(&db, i64::MAX, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
         record_ban(&db, 10, 21, None, "temporary").await.unwrap();
         set_ban_expiry(&db, enrollment.clone(), 21, 100)
             .await
@@ -4165,17 +4170,70 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     drop(db);
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
-        assert!(take_expired_ban(&db, 99).await.unwrap().is_none());
-        let claimed = take_expired_ban(&db, 100).await.unwrap().unwrap();
-        assert_eq!(claimed.enrollment, enrollment);
-        assert_eq!(claimed.user, 21);
-        assert!(take_expired_ban(&db, 100).await.unwrap().is_none());
+        assert!(
+            next_expired_ban(&db, 99, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let due = next_expired_ban(&db, 100, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(due.enrollment, enrollment);
+        assert_eq!((due.user, due.expires_at), (21, 100));
+        // Finding a due ban does not consume it; a deferred ID is skipped.
+        assert_eq!(
+            next_expired_ban(&db, 100, Vec::new())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            due.id
+        );
+        assert!(
+            next_expired_ban(&db, 100, vec![due.id])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(claim_expired_ban(&db, &due).await.unwrap());
+        assert!(!claim_expired_ban(&db, &due).await.unwrap());
+        assert_eq!(
+            expired_ban_state(&db, &due).await.unwrap(),
+            ExpiredBanState::Current
+        );
+        assert!(
+            next_expired_ban(&db, 100, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A deadline changed after it was found is not claimed.
+        set_ban_expiry(&db, enrollment.clone(), 21, 150)
+            .await
+            .unwrap();
+        assert!(!claim_expired_ban(&db, &due).await.unwrap());
+        assert_eq!(
+            next_expired_ban(&db, 150, Vec::new())
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            150
+        );
         record_ban(&db, 10, 22, None, "manual release")
             .await
             .unwrap();
         set_ban_expiry(&db, enrollment, 22, 200).await.unwrap();
         mark_unbanned(&db, 10, 22).await.unwrap();
-        assert!(take_expired_ban(&db, 200).await.unwrap().is_none());
+        mark_unbanned(&db, 10, 21).await.unwrap();
+        assert!(
+            next_expired_ban(&db, 200, Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
     });
     drop(db);
     cleanup_db(&tmp);

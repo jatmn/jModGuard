@@ -182,6 +182,26 @@ and late local effects.
 The disposable remote-libSQL smoke exercises lost completion responses without resending
 and deadline-aware log completion. Mock outcomes do not validate live Discord behavior.
 
+## Timed-ban expiry
+
+The same bot task lifts due timed bans (`!ban <user> --minutes N`, see
+[COMMANDS.md](COMMANDS.md)) after each queue drain, examining at most `batch_size` due
+bans per poll. Expiries in a fenced guild wait until the fence is cleared. Before
+consuming a deadline the worker checks the bot's own join timestamp through REST, as the
+executor does. An unavailable check defers that ban to a later poll. A newer join
+repairs the enrollment; the old membership's deadline is then never dispatched.
+While the deadline is consumed and the unban runs, the worker holds the same in-process
+slot as a ban command, so a concurrent ban of that user is refused instead of being
+undone. A command that holds the slot defers the expiry.
+
+A consumed deadline is not restored. Each automatic unban is attempted **once**: a
+failed or uncertain Discord request is not retried after a poll, restart or upgrade.
+The bot logs `automatic unban failed or uncertain; moderator follow-up required` and
+records the tenant case outcome. If the bot's membership changed, or a fence appeared
+after the deadline was consumed, it logs `automatic unban skipped` and the ban stays
+active. For either message, verify the ban in Discord and use `!unban` or the dashboard
+if the user should no longer be banned.
+
 ## HTTP, browser and deployment contract
 
 Unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and clear log channel
