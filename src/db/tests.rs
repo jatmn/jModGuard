@@ -4166,10 +4166,9 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
         assert!(take_expired_ban(&db, 99).await.unwrap().is_none());
-        assert_eq!(
-            take_expired_ban(&db, 100).await.unwrap(),
-            Some((enrollment.clone(), 21))
-        );
+        let claimed = take_expired_ban(&db, 100).await.unwrap().unwrap();
+        assert_eq!(claimed.enrollment, enrollment);
+        assert_eq!(claimed.user, 21);
         assert!(take_expired_ban(&db, 100).await.unwrap().is_none());
         record_ban(&db, 10, 22, None, "manual release")
             .await

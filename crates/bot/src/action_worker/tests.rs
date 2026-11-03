@@ -1910,3 +1910,61 @@ async fn timed_ban_failed_unban_is_not_marked_successful_or_retried() {
         );
     }
 }
+
+#[tokio::test]
+async fn timed_ban_dispatch_rejects_rearmed_cancelled_and_replaced_claims() {
+    for change in ["rearm", "cancel", "replace"] {
+        let f = Fixture::new();
+        let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+        db::record_ban(&f.db, 10, 20, None, "temporary")
+            .await
+            .unwrap();
+        db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
+            .await
+            .unwrap();
+        let claimed = db::take_expired_ban(&f.db, 100).await.unwrap().unwrap();
+
+        // A timed-ban command or gateway observation lands after the worker's
+        // claim, before it reaches the Discord dispatch boundary.
+        match change {
+            "rearm" => db::set_ban_expiry(&f.db, enrollment, 20, 200)
+                .await
+                .unwrap(),
+            "cancel" => db::mark_unbanned(&f.db, 10, 20).await.unwrap(),
+            "replace" => {
+                db::mark_unbanned(&f.db, 10, 20).await.unwrap();
+                db::record_ban(&f.db, 10, 20, None, "replacement permanent")
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let discord = MockDiscord::default();
+        let limits = WorkerLimits::default();
+        dispatch_expired_ban(&f.db, None, &discord, claimed, &limits)
+            .await
+            .unwrap();
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 0, "{change}");
+        assert!(discord.unbans.lock().unwrap().is_empty(), "{change}");
+
+        // Skipping stale work must leave the replacement state intact.
+        let bans = db::list_bans(&f.db, 10, 10).await.unwrap();
+        assert_eq!(
+            bans.iter().filter(|ban| ban.active).count(),
+            usize::from(change != "cancel"),
+            "{change}"
+        );
+        expire_bans(&f.db, None, &discord, 199, &limits)
+            .await
+            .unwrap();
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 0, "{change}");
+        expire_bans(&f.db, None, &discord, 200, &limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            discord.calls.load(Ordering::SeqCst),
+            usize::from(change == "rearm"),
+            "{change}"
+        );
+    }
+}
