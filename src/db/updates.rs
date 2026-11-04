@@ -1033,8 +1033,122 @@ pub async fn clear_boot_mismatch(db: &Db, component: &str) -> Result<()> {
         if map.remove(&component).is_some() {
             write_boot_mismatch_map_conn(&tx, &map)?;
         }
+        // Recovery ends the episode: an identical later mismatch must alert again,
+        // even when no alert poll runs between this clear and that record.
+        let mut alerted = read_alerted_conn(&tx)?;
+        if alerted.remove(&component).is_some() {
+            write_alerted_conn(&tx, &alerted)?;
+        }
         tx.commit()?;
         Ok(())
+    })
+    .await
+}
+
+/// Owner-chosen Discord channel for boot repair alerts, as a decimal snowflake.
+pub const UPDATE_ALERT_CHANNEL_META: &str = "update_alert_channel_v1";
+/// Boot mismatch states already alerted, keyed by component.
+const BOOT_MISMATCH_ALERTED_META: &str = "update_boot_mismatch_alerted_v1";
+
+/// Bot-owned write; the API forwards it over the control link. `None` clears it.
+pub async fn set_update_alert_channel(db: &Db, channel: Option<u64>) -> Result<()> {
+    anyhow::ensure!(channel != Some(0), "invalid alert channel");
+    db.with_conn(move |conn| {
+        match channel {
+            Some(id) => write_meta_string_conn(conn, UPDATE_ALERT_CHANNEL_META, &id.to_string())?,
+            None => {
+                conn.execute_rows(
+                    "DELETE FROM meta WHERE key=?1",
+                    params![UPDATE_ALERT_CHANNEL_META],
+                    1,
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn update_alert_channel(db: &Db) -> Result<Option<u64>> {
+    db.with_conn(|conn| {
+        Ok(meta_string_conn(conn, UPDATE_ALERT_CHANNEL_META)?.and_then(|id| id.parse().ok()))
+    })
+    .await
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct AlertedBootMismatch {
+    record: BootMismatchRecord,
+    /// False when only the no-channel warning was logged; a later channel posts.
+    posted: bool,
+}
+
+type Alerted = std::collections::BTreeMap<String, AlertedBootMismatch>;
+
+fn read_alerted_conn(conn: &impl SqlExecutor) -> Result<Alerted> {
+    Ok(match meta_string_conn(conn, BOOT_MISMATCH_ALERTED_META)? {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        None => Alerted::new(),
+    })
+}
+
+fn write_alerted_conn(conn: &impl SqlExecutor, alerted: &Alerted) -> Result<()> {
+    if alerted.is_empty() {
+        conn.execute_rows(
+            "DELETE FROM meta WHERE key=?1",
+            params![BOOT_MISMATCH_ALERTED_META],
+            1,
+        )?;
+    } else {
+        write_meta_string_conn(
+            conn,
+            BOOT_MISMATCH_ALERTED_META,
+            &serde_json::to_string(alerted)?,
+        )?;
+    }
+    Ok(())
+}
+
+/// The alert channel and the mismatch states due for an alert.
+pub type BootMismatchAlerts = (Option<u64>, Vec<BootMismatchRecord>);
+
+/// Consume boot mismatch states that have not been alerted yet, returning the
+/// alert channel read in the same transaction. Each state is returned once
+/// (twice when it was first only logged and a channel is chosen later), so
+/// retries and restarts do not repeat it. A cleared or changed state alerts again.
+pub async fn take_boot_mismatch_alerts(db: &Db) -> Result<BootMismatchAlerts> {
+    /// The channel, due records and next alerted map, or `None` when nothing changes.
+    fn plan(conn: &impl SqlExecutor) -> Result<Option<(BootMismatchAlerts, Alerted)>> {
+        let channel = meta_string_conn(conn, UPDATE_ALERT_CHANNEL_META)?
+            .and_then(|id| id.parse::<u64>().ok());
+        let current = read_boot_mismatch_map_conn(conn)?;
+        let alerted = read_alerted_conn(conn)?;
+        let mut next = Alerted::new();
+        let mut due = Vec::new();
+        for (component, record) in current {
+            let seen = alerted
+                .get(&component)
+                .filter(|seen| seen.record == record && (seen.posted || channel.is_none()));
+            if seen.is_none() {
+                due.push(record.clone());
+            }
+            let posted = seen.is_some_and(|seen| seen.posted) || channel.is_some();
+            next.insert(component, AlertedBootMismatch { record, posted });
+        }
+        Ok((next != alerted).then_some(((channel, due), next)))
+    }
+    db.with_conn(|conn| {
+        if plan(conn)?.is_none() {
+            return Ok((None, Vec::new()));
+        }
+        let tx = conn.transaction_immediate()?;
+        let Some((due, next)) = plan(&tx)? else {
+            tx.commit()?;
+            return Ok((None, Vec::new()));
+        };
+        write_alerted_conn(&tx, &next)?;
+        tx.commit()?;
+        Ok(due)
     })
     .await
 }
@@ -2327,6 +2441,96 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_mismatch_alerts_follow_state_and_alert_channel() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_boot_alert_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let record = BootMismatchRecord {
+            component: "bot".into(),
+            running: "b".repeat(40),
+            expected: BootMismatchExpected {
+                release_id: "release".into(),
+                source_sha: "c".repeat(40),
+            },
+            reason: "registry unreachable".into(),
+        };
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (None, vec![])
+        );
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        // No channel: due once for the warning, then quiet until a channel exists.
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (None, vec![record.clone()])
+        );
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        assert!(set_update_alert_channel(&db, Some(0)).await.is_err());
+        // The API forwards the setting over the control link.
+        let op: ControlOp = serde_json::from_value(
+            serde_json::to_value(ControlOp::SetUpdateAlertChannel {
+                channel_id: Some(u64::MAX),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        apply_control(&db, None, op, None).await.unwrap();
+        assert_eq!(update_alert_channel(&db).await.unwrap(), Some(u64::MAX));
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (Some(u64::MAX), vec![record.clone()])
+        );
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        // Clearing the channel after a post does not repeat it.
+        set_update_alert_channel(&db, None).await.unwrap();
+        assert_eq!(update_alert_channel(&db).await.unwrap(), None);
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        set_update_alert_channel(&db, Some(5)).await.unwrap();
+        // Versions match again, then the same mismatch recurs.
+        clear_boot_mismatch(&db, "bot").await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        db.with_conn(|conn| {
+            assert!(meta_string_conn(conn, BOOT_MISMATCH_ALERTED_META)?.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (Some(5), vec![record.clone()])
+        );
+        // Another component's alerted episode is independent of this clear.
+        let api = BootMismatchRecord {
+            component: "api".into(),
+            running: String::new(),
+            ..record.clone()
+        };
+        record_boot_mismatch(&db, api.clone()).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![api]);
+        // Repeated launcher writes within one episode stay suppressed.
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
+        // Recovery and an identical recurrence between two alert polls.
+        clear_boot_mismatch(&db, "bot").await.unwrap();
+        record_boot_mismatch(&db, record.clone()).await.unwrap();
+        assert_eq!(
+            take_boot_mismatch_alerts(&db).await.unwrap(),
+            (Some(5), vec![record.clone()])
+        );
+        record_boot_mismatch(&db, record).await.unwrap();
+        assert_eq!(take_boot_mismatch_alerts(&db).await.unwrap().1, vec![]);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

@@ -945,3 +945,31 @@ test("boot mismatch shows expected and actual startup independently of installed
   run(`ui.getSnapshot().snapshot.boot_mismatches = {}; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Boot mismatch/);
 });
+
+test("owner saves the boot repair alert channel as a string ID through the API", async () => {
+  let alertChannel = null;
+  const saved = [];
+  const view = await ready(async (url, options) => {
+    if (url === "/api/updates/alert-channel") {
+      saved.push(JSON.parse(options.body));
+      alertChannel = saved.at(-1).channel_id || null;
+    }
+    return response({ ...state([record("bot")]), alert_channel: alertChannel });
+  });
+  assert.match(view.elements.get("alert-channel-unset").textContent, /No alert channel is set/);
+  const input = view.elements.get("alert-channel-id");
+  // React loads before this harness creates a DOM, so it cannot observe native input events.
+  const setValue = (element, value) => flushSync(() => element[Object.keys(element).find(key => key.startsWith("__reactProps"))].onChange({ target: { value } }));
+  setValue(input, " 1234567890123456789 ");
+  await fire(view.elements.get("save-alert-channel"), "click");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(saved, [{ channel_id: "1234567890123456789" }]);
+  assert.equal(view.elements.get("alert-channel-unset"), null);
+  assert.equal(view.elements.get("alert-channel-id").value, "1234567890123456789");
+  assert.equal(view.elements.get("save-alert-channel").disabled, true);
+  setValue(input, "");
+  await fire(view.elements.get("save-alert-channel"), "click");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(saved.at(-1), { channel_id: "" });
+  assert.ok(view.elements.get("alert-channel-unset"));
+});

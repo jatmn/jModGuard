@@ -255,6 +255,7 @@ async fn status_response(app: &Arc<ApiState>, written: Option<db::ComponentUpdat
     Ok(Json(json!({
         "components":updates,
         "boot_mismatches":db::read_boot_mismatch_map(&app.db).await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "boot mismatch state unavailable"))?,
+        "alert_channel":db::update_alert_channel(&app.db).await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "alert channel unavailable"))?.map(|id| id.to_string()),
         "coordinated_upgrade_path":"/api/service-upgrade/recovery",
         "service_upgrade":db::UpdateControl::from_application(&app.db).upgrade().await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update control unavailable"))?,
         "compatibility":compatibility,
@@ -1020,6 +1021,51 @@ pub async fn policy(
     )
     .map_err(|problem| error(StatusCode::BAD_REQUEST, &format!("{problem:#}")))?;
     status_response(&app, Some(written)).await
+}
+
+#[derive(Deserialize)]
+pub struct AlertChannelRequest {
+    /// Decimal Discord channel ID; empty clears the boot repair alert channel.
+    channel_id: String,
+}
+
+pub async fn alert_channel(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: HeaderMap,
+    Json(input): Json<AlertChannelRequest>,
+) -> Reply {
+    owner(&app, &session).await?;
+    origin(&app, &headers)?;
+    let trimmed = input.channel_id.trim();
+    let channel = if trimmed.is_empty() {
+        None
+    } else {
+        Some(
+            trimmed
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "alert channel must be a Discord channel ID",
+                    )
+                })?,
+        )
+    };
+    via_bot!(
+        app.as_ref(),
+        db::set_update_alert_channel(&app.db, channel),
+        db::ControlOp::SetUpdateAlertChannel {
+            channel_id: channel
+        }
+    )
+    .map_err(|problem| error(StatusCode::BAD_REQUEST, &format!("{problem:#}")))?;
+    // A replica read can trail the write just committed through the bot.
+    let Json(mut body) = status_response(&app, None).await?;
+    body["alert_channel"] = json!(channel.map(|id| id.to_string()));
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]

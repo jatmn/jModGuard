@@ -1467,6 +1467,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         )
         .route("/api/updates/policy", axum::routing::post(updates::policy))
         .route(
+            "/api/updates/alert-channel",
+            axum::routing::post(updates::alert_channel),
+        )
+        .route(
             "/api/preview",
             axum::routing::post(preview::launch).delete(preview::exit),
         )
@@ -2149,6 +2153,11 @@ mod tests {
                 "POST",
                 "/api/updates/policy",
                 r#"{"component":"api","channel":"stable","cadence":"daily"}"#,
+            ),
+            (
+                "POST",
+                "/api/updates/alert-channel",
+                r#"{"channel_id":"123"}"#,
             ),
         ] {
             let response = test_app()
