@@ -1300,6 +1300,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .is_some()
         );
         let cases = stored_cases(&successor, enrollment).await;
         assert_eq!(cases.len(), 1);

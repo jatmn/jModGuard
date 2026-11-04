@@ -42,7 +42,10 @@ For a timed ban, use `!ban <user> --minutes 60 [reason]` or the optional
 The expiry is saved with the ban and survives a restart. The existing action
 worker lifts due bans on its next poll; overdue bans are processed after startup.
 Omitting the duration leaves a new ban permanent. Supplying a duration for an
-already banned user sets a new expiry. A manual unban cancels the pending expiry.
+already banned user sets a new expiry. The expiry attaches only to the ban the
+command observed or recorded: if that ban is lifted or replaced while the command
+runs, the command reports that the expiry was not saved and the replacement stays
+as it was. A manual unban cancels the pending expiry.
 The expiry is saved before the moderation log is delivered.
 An automatic unban is attempted once; a failed or uncertain Discord request is
 logged for moderator follow-up and is not retried. See

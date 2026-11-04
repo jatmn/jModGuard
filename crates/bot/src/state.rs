@@ -780,6 +780,8 @@ pub struct BotState {
     pub(crate) member_sync_bot_id: AtomicI64,
     pub(crate) rate_limit_wait_logged_at: parking_lot::Mutex<HashMap<String, Instant>>,
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
+    /// Timed-ban expiry: per-guild retry time after a failed membership check.
+    pub(crate) expiry_check_retries: crate::action_worker::ExpiryCheckRetries,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
     /// Test seam. Production reads [`Self::discord_cache`] instead.
@@ -893,6 +895,7 @@ impl BotState {
             member_sync_bot_id: AtomicI64::new(0),
             rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
+            expiry_check_retries: Default::default(),
             ready_shards: Mutex::new(HashSet::new()),
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),

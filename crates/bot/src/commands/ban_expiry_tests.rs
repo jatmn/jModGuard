@@ -6,11 +6,15 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Reads the active ban deadline the moment the moderation log is delivered,
-/// so a process that stops during log delivery has already saved it.
+/// so a process that stops during log delivery has already saved it. The
+/// deadline binds to the ban the command observed, never to a replacement.
 #[tokio::test]
 async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
-    // Discord reports no ban (the bot bans), or a ban the mirror lacks.
-    for discord_has_ban in [false, true] {
+    // Discord reports no ban (the bot bans), a ban the mirror lacks, a ban
+    // already recorded, or a recorded ban that an external unban and
+    // permanent reban replace while the command reads Discord.
+    for scenario in ["absent", "unrecorded", "recorded", "replaced"] {
+        let discord_has_ban = scenario != "absent";
         let path =
             std::env::temp_dir().join(format!("timed_ban_log_{:032x}.db", rand::random::<u128>()));
         let database = db::Db::open(&path, 2).unwrap();
@@ -50,6 +54,12 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
                     let request = String::from_utf8(request).unwrap();
                     let line = request.lines().next().unwrap_or_default().to_owned();
                     let (status, body) = if line.starts_with("GET /api/v10/guilds/10/bans/91 ") {
+                        if scenario == "replaced" {
+                            db::mark_unbanned(&database, 10, 91).await.unwrap();
+                            db::record_ban(&database, 10, 91, None, "permanent")
+                                .await
+                                .unwrap();
+                        }
                         if discord_has_ban {
                             (
                                 200,
@@ -113,6 +123,12 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
         app.activation.mark_lock_held(true);
         let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
         app.tenant.activate(enrollment).await.unwrap();
+        if matches!(scenario, "recorded" | "replaced") {
+            db::record_ban(&app.db, 10, 91, Some(7), "spam")
+                .await
+                .unwrap();
+        }
+        let observed = db::active_ban_row(&app.db, 10, 91).await.unwrap();
         db::upsert_log_channel(&app.db, 10, "mod_action", 555)
             .await
             .unwrap();
@@ -136,7 +152,57 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
         server.abort();
         let _ = server.await;
         let requests = requests.lock().unwrap().clone();
-        outcome.unwrap_or_else(|error| panic!("ban failed: {error:#}; requests {requests:?}"));
+        let active = app
+            .db
+            .with_conn(|conn| {
+                use jmodguard::db::SqlExecutor as _;
+                conn.query_row(
+                    "SELECT id,expires_at FROM bans WHERE guild_id=10 AND user_id=91 AND active=1",
+                    (),
+                    |row| Ok((row.get::<i64>(0)?, row.get::<Option<i64>>(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        if scenario == "replaced" {
+            // The replacement keeps no deadline; the command reports the miss.
+            let error = outcome
+                .err()
+                .expect("replacement must not take the deadline");
+            assert!(
+                error.to_string().contains("expiry was not saved"),
+                "{error:#}"
+            );
+            assert_ne!(Some(active.0), observed);
+            assert_eq!(active.1, None);
+            assert!(seen_at_log.lock().unwrap().is_empty(), "{requests:?}");
+        } else {
+            outcome.unwrap_or_else(|error| panic!("ban failed: {error:#}; requests {requests:?}"));
+        }
+        if scenario == "recorded" {
+            // An already recorded ban takes the new deadline; nothing new is logged.
+            assert_eq!(Some(active.0), observed);
+            let deadline = active.1.expect("deadline saved on the observed ban");
+            assert!(
+                (before + 3600..=after + 3600).contains(&deadline),
+                "deadline {deadline} outside [{before}, {after}] + 1h"
+            );
+            assert!(seen_at_log.lock().unwrap().is_empty(), "{requests:?}");
+        }
+        if matches!(scenario, "recorded" | "replaced") {
+            assert!(
+                requests.iter().all(|line| !line.starts_with("PUT ")),
+                "{requests:?}"
+            );
+            drop(env);
+            drop(config);
+            drop(app);
+            crate::tenant::remove_sidecars(&path);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+            continue;
+        }
         assert_eq!(
             requests
                 .iter()

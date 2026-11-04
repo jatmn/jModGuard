@@ -123,6 +123,16 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let mut dm_outcome = None;
             // The deadline is saved before log delivery, which may not finish.
             let mut log_ban = false;
+            // A deadline binds to the ban row this command observed or
+            // recorded. Capturing it before the Discord read means a
+            // replacement ban that lands meanwhile is refused, not re-armed.
+            let mut expiry_ban = match minutes {
+                Some(_) => {
+                    db::active_ban_row(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
+                        .await?
+                }
+                None => None,
+            };
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -161,7 +171,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await;
                     abort_if_mod_reason_dm_cancelled(dm_outcome)?;
-                    if continue_present_command_ban(
+                    if let Some(row) = continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
                         target.get() as i64,
@@ -174,10 +184,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await?
                     {
+                        expiry_ban = Some(row);
                         log_ban = true;
                     }
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
+                    // Discord had no ban; only the row recorded below is this ban.
+                    expiry_ban = None;
                     if !env.app.activation.may_record() {
                         return Err(anyhow!("writer lease is not held"));
                     }
@@ -267,7 +280,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     match outcome {
                         crate::db::guild_data::CaseOutcome::Succeeded => {
                             if env.app.activation.may_record()
-                                && record_ban_once(
+                                && let Some(row) = record_ban_once(
                                     env,
                                     enrollment.clone(),
                                     target,
@@ -278,6 +291,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                 )
                                 .await?
                             {
+                                expiry_ban = Some(row);
                                 log_ban = true;
                             }
                         }
@@ -301,17 +315,19 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
             }
             let expiry = match minutes {
-                Some(minutes) => match enrollment.clone() {
-                    Some(enrollment) => {
+                Some(minutes) => match (enrollment.clone(), expiry_ban) {
+                    (Some(enrollment), Some(ban)) => {
                         db::set_ban_expiry(
                             &env.app.db,
                             enrollment,
+                            ban,
                             target.get() as i64,
                             chrono::Utc::now().timestamp() + i64::from(minutes) * 60,
                         )
                         .await
                     }
-                    None => Err(db::EnrollmentChanged.into()),
+                    (None, _) => Err(db::EnrollmentChanged.into()),
+                    (Some(_), None) => Err(anyhow!("active ban unavailable; expiry was not saved")),
                 },
                 None => Ok(()),
             };
@@ -1325,14 +1341,14 @@ pub(crate) async fn continue_present_command_ban(
     actor_name: &str,
     reason: &str,
     discord_reason: Option<&str>,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     let subject = u64::try_from(target).unwrap_or(0);
     crate::cases::settle_present_application_ban(app, enrollment.clone(), subject, discord_reason)
         .await;
     if !app.activation.may_record() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(db::record_enrolled_ban_if_absent(
+    db::record_enrolled_ban_if_absent(
         &app.db,
         enrollment,
         target,
@@ -1345,8 +1361,7 @@ pub(crate) async fn continue_present_command_ban(
         db::BanRecord::Retry,
         None,
     )
-    .await?
-    .is_some())
+    .await
 }
 
 async fn record_ban_once(
@@ -1357,11 +1372,11 @@ async fn record_ban_once(
     reason: &str,
     kind: db::BanRecord,
     operation_id: Option<&str>,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     if !env.app.activation.may_record() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(db::record_enrolled_ban_if_absent(
+    db::record_enrolled_ban_if_absent(
         &env.app.db,
         enrollment,
         target.get() as i64,
@@ -1374,8 +1389,7 @@ async fn record_ban_once(
         kind,
         operation_id,
     )
-    .await?
-    .is_some())
+    .await
 }
 
 async fn user_lookup(env: &CmdEnv<'_>, id: serenity::model::id::UserId) -> Result<UserInfo> {

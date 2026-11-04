@@ -1966,10 +1966,25 @@ pub async fn clear_enrolled_warns(
     .await
 }
 
-/// Attach a deadline to the current ban, scoped to the command's membership.
+/// Primary read of the user's active ban row, captured before a timed-ban
+/// command observes Discord so [`set_ban_expiry`] can refuse a replacement.
+pub async fn active_ban_row(db: &Db, guild_id: i64, user_id: i64) -> Result<Option<i64>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let row = active_ban_id(&tx, guild_id, user_id)?;
+        tx.finish_read()?;
+        Ok(row)
+    })
+    .await
+}
+
+/// Attach a deadline to the ban row the command observed or recorded, scoped
+/// to the command's membership. A row that was lifted or replaced meanwhile is
+/// refused, so a newer ban never inherits this command's deadline.
 pub async fn set_ban_expiry(
     db: &Db,
     enrollment: GuildEnrollment,
+    ban_id: i64,
     user: i64,
     expires_at: i64,
 ) -> Result<()> {
@@ -1979,8 +1994,8 @@ pub async fn set_ban_expiry(
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let changed = tx.execute_matching(
             "UPDATE bans SET expires_at=?1,expiry_enrollment_id=?2
-             WHERE guild_id=?3 AND user_id=?4 AND active=1",
-            params![expires_at, enrollment.id, enrollment.guild_id, user],
+             WHERE id=?3 AND guild_id=?4 AND user_id=?5 AND active=1",
+            params![expires_at, enrollment.id, ban_id, enrollment.guild_id, user],
         )?;
         anyhow::ensure!(changed == 1, "active ban unavailable; expiry was not saved");
         tx.commit()

@@ -593,9 +593,13 @@ async fn expire_bans(
     limits: &WorkerLimits,
 ) -> Result<()> {
     // Deferred bans stay due and are skipped only for the rest of this pass.
-    // A failed membership check skips the whole guild, so one unavailable
-    // guild cannot spend every pass's batch and starve later guilds.
-    let (mut deferred, mut deferred_guilds) = (Vec::new(), Vec::new());
+    // A failed membership check skips the whole guild for this pass and, with
+    // a bot state, until that guild's saved retry time, so a batch of
+    // unavailable guilds cannot spend every pass and starve later guilds.
+    let mut deferred = Vec::new();
+    let mut deferred_guilds = app
+        .map(|app| app.expiry_check_retries.waiting(now))
+        .unwrap_or_default();
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
@@ -607,7 +611,14 @@ async fn expire_bans(
         };
         if !expiry_membership_matches(db, app, discord, &due, limits).await? {
             deferred_guilds.push(due.enrollment.guild_id);
+            if let Some(app) = app {
+                app.expiry_check_retries
+                    .failed(due.enrollment.guild_id, now);
+            }
             continue;
+        }
+        if let Some(app) = app {
+            app.expiry_check_retries.succeeded(due.enrollment.guild_id);
         }
         // Hold the command-ban slot through dispatch and the mirror update so a
         // concurrent ban command cannot re-arm or replace the ban meanwhile.
@@ -632,6 +643,59 @@ async fn expire_bans(
         drop(in_progress);
     }
     Ok(())
+}
+
+/// First retry delay after a guild's expiry membership check fails.
+const EXPIRY_CHECK_RETRY_BASE_SECS: i64 = 60;
+/// Longest delay; consecutive failures double the delay up to this bound.
+const EXPIRY_CHECK_RETRY_MAX_SECS: i64 = 15 * 60;
+
+#[derive(Clone, Copy, Debug)]
+struct ExpiryCheckRetry {
+    failures: u32,
+    retry_at: i64,
+}
+
+/// Per-guild retry time after a failed expiry membership check. In-process
+/// only: a restart checks each guild once more. One entry per failing guild;
+/// a success removes it and an entry unused past the longest delay is pruned.
+#[derive(Default)]
+pub(crate) struct ExpiryCheckRetries(
+    parking_lot::Mutex<std::collections::HashMap<i64, ExpiryCheckRetry>>,
+);
+
+impl ExpiryCheckRetries {
+    /// Guilds whose retry time has not yet arrived.
+    fn waiting(&self, now: i64) -> Vec<i64> {
+        let mut retries = self.0.lock();
+        retries.retain(|_, retry| now < retry.retry_at + EXPIRY_CHECK_RETRY_MAX_SECS);
+        retries
+            .iter()
+            .filter(|(_, retry)| now < retry.retry_at)
+            .map(|(guild, _)| *guild)
+            .collect()
+    }
+
+    fn failed(&self, guild: i64, now: i64) {
+        let mut retries = self.0.lock();
+        let failures = retries
+            .get(&guild)
+            .map_or(1, |retry| retry.failures.saturating_add(1));
+        let delay = EXPIRY_CHECK_RETRY_BASE_SECS
+            .saturating_mul(1 << (failures - 1).min(16))
+            .min(EXPIRY_CHECK_RETRY_MAX_SECS);
+        retries.insert(
+            guild,
+            ExpiryCheckRetry {
+                failures,
+                retry_at: now.saturating_add(delay),
+            },
+        );
+    }
+
+    fn succeeded(&self, guild: i64) {
+        self.0.lock().remove(&guild);
+    }
 }
 
 /// Confirm the expiry's captured membership with a bounded own-member read
@@ -740,6 +804,32 @@ async fn dispatch_expired_ban(
         && let Err(error) = db::mark_enrolled_unbanned(db, Some(enrollment.clone()), user).await
     {
         tracing::warn!(user, "expired ban mirror not saved: {error:#}");
+    }
+    // As for a queued unban, a confirmed removal (not Discord's idempotent
+    // 10026) is saved to the member directory so a missed Gateway callback
+    // cannot leave the user shown as banned.
+    if outcome.state == "succeeded"
+        && outcome.code != "already_unbanned"
+        && let Some(app) = app
+    {
+        let observed_at_ms = chrono::Utc::now().timestamp_millis().max(1);
+        let observed = match app.tenant.live(enrollment.clone()).await {
+            Ok((store, scope)) => store.observe_unban(scope, user, observed_at_ms).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = observed {
+            tracing::warn!(
+                guild = enrollment.guild_id,
+                user,
+                "confirmed automatic unban state not saved: {error:#}"
+            );
+            app.remember_member_gap(
+                enrollment.guild_id as u64,
+                Some(enrollment.id.clone()),
+                Some(user),
+                "confirmed unban persistence unavailable",
+            );
+        }
     }
     if let Some(app) = app {
         crate::cases::record_application(

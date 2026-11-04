@@ -1846,6 +1846,19 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
     );
 }
 
+/// Arms a deadline on the user's current ban row, as a timed-ban command does.
+async fn arm_expiry(
+    db: &Db,
+    enrollment: db::GuildEnrollment,
+    user: i64,
+    expires_at: i64,
+) -> Result<()> {
+    let ban = db::active_ban_row(db, enrollment.guild_id, user)
+        .await?
+        .expect("active ban");
+    db::set_ban_expiry(db, enrollment, ban, user, expires_at).await
+}
+
 #[tokio::test]
 async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
     let f = Fixture::new();
@@ -1856,9 +1869,7 @@ async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
     db::record_ban(&f.db, 10, 21, None, "permanent")
         .await
         .unwrap();
-    db::set_ban_expiry(&f.db, enrollment, 20, 100)
-        .await
-        .unwrap();
+    arm_expiry(&f.db, enrollment, 20, 100).await.unwrap();
     let discord = MockDiscord::default();
     let limits = WorkerLimits::default();
     expire_bans(&f.db, None, &discord, 99, &limits)
@@ -1894,7 +1905,7 @@ async fn timed_ban_failed_unban_is_not_marked_successful_or_retried() {
         db::record_ban(&f.db, 10, user, None, "temporary")
             .await
             .unwrap();
-        db::set_ban_expiry(&f.db, enrollment.clone(), user, 100)
+        arm_expiry(&f.db, enrollment.clone(), user, 100)
             .await
             .unwrap();
         let discord = MockDiscord {
@@ -1928,7 +1939,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
         db::record_ban(&f.db, 10, 20, None, "temporary")
             .await
             .unwrap();
-        db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
+        arm_expiry(&f.db, enrollment.clone(), 20, 100)
             .await
             .unwrap();
         let claimed = db::next_expired_ban(&f.db, 100, Vec::new(), Vec::new())
@@ -1940,9 +1951,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
         // A timed-ban command, gateway observation, membership change or move
         // fence lands after the worker's claim, before the Discord dispatch.
         match change {
-            "rearm" => db::set_ban_expiry(&f.db, enrollment, 20, 200)
-                .await
-                .unwrap(),
+            "rearm" => arm_expiry(&f.db, enrollment, 20, 200).await.unwrap(),
             "cancel" => db::mark_unbanned(&f.db, 10, 20).await.unwrap(),
             "replace" => {
                 db::mark_unbanned(&f.db, 10, 20).await.unwrap();
@@ -2061,9 +2070,7 @@ async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
         db::record_ban(&f.db, guild, 20, None, "temporary")
             .await
             .unwrap();
-        db::set_ban_expiry(&f.db, enrollment, 20, expires_at)
-            .await
-            .unwrap();
+        arm_expiry(&f.db, enrollment, 20, expires_at).await.unwrap();
     }
     let discord = PerGuildMembership {
         joined: [(11, Some(1)), (12, None), (13, Some(1_000_000_001))].into(),
@@ -2107,7 +2114,7 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
             db::record_ban(&f.db, guild, user, None, "temporary")
                 .await
                 .unwrap();
-            db::set_ban_expiry(&f.db, enrollment.clone(), user, expires_at)
+            arm_expiry(&f.db, enrollment.clone(), user, expires_at)
                 .await
                 .unwrap();
         }
@@ -2118,11 +2125,14 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
         unbans: Default::default(),
     };
 
-    for poll in 0..3 {
-        drain_with_state(&app, &discord, &limits).await.unwrap();
-        // One failed check skips guild 10 for the rest of the poll.
+    for (poll, now) in [200, 215, 230].into_iter().enumerate() {
+        expire_bans(&f.db, Some(&app), &discord, now, &limits)
+            .await
+            .unwrap();
+        // One failed check skips guild 10 for the rest of the poll and until
+        // its retry time.
         let checks = std::mem::take(&mut *discord.checks.lock().unwrap());
-        let expected = if poll == 0 { vec![10, 11] } else { vec![10] };
+        let expected = if poll == 0 { vec![10, 11] } else { vec![] };
         assert_eq!(checks, expected, "poll {poll}");
         assert_eq!(
             *discord.unbans.lock().unwrap(),
@@ -2138,7 +2148,15 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
 
     // The deferred deadlines remain due once the guild's check recovers.
     let discord = MockDiscord::default();
-    drain_with_state(&app, &discord, &limits).await.unwrap();
+    expire_bans(
+        &f.db,
+        Some(&app),
+        &discord,
+        200 + EXPIRY_CHECK_RETRY_BASE_SECS,
+        &limits,
+    )
+    .await
+    .unwrap();
     let mut lifted: Vec<_> = discord
         .unbans
         .lock()
@@ -2157,15 +2175,132 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
 }
 
 #[tokio::test]
+async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_guilds() {
+    let f = Fixture::new();
+    let limits = WorkerLimits::default();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    // A full batch of guilds with earlier deadlines whose checks all fail,
+    // then a healthy guild with a later deadline.
+    let failing: Vec<i64> = (10..).take(limits.batch_size as usize).collect();
+    let healthy = 99;
+    for (guild, expires_at) in failing.iter().copied().zip(100..).chain([(healthy, 150)]) {
+        let enrollment = db::enroll_guild(&f.db, guild, 1).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        db::record_ban(&f.db, guild, 20, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&f.db, enrollment, 20, expires_at).await.unwrap();
+    }
+    let discord = PerGuildMembership {
+        joined: [(healthy, Some(1))].into(),
+        checks: Default::default(),
+        unbans: Default::default(),
+    };
+    let poll = async |now: i64| {
+        expire_bans(&f.db, Some(&app), &discord, now, &limits)
+            .await
+            .unwrap();
+        std::mem::take(&mut *discord.checks.lock().unwrap())
+    };
+
+    // The failing guilds spend the first poll's whole batch.
+    assert_eq!(poll(200).await, failing);
+    assert!(discord.unbans.lock().unwrap().is_empty());
+    // The next poll skips them until their saved retry time.
+    assert_eq!(poll(215).await, vec![healthy]);
+    assert_eq!(*discord.unbans.lock().unwrap(), vec![(healthy, 20)]);
+    assert!(poll(259).await.is_empty());
+    // Each guild is checked again at its retry time; another failure doubles
+    // the delay up to the bound.
+    let base = EXPIRY_CHECK_RETRY_BASE_SECS;
+    assert_eq!(poll(200 + base).await, failing);
+    assert!(poll(200 + base + 2 * base - 1).await.is_empty());
+    assert_eq!(poll(200 + 3 * base).await, failing);
+    let mut now = 200 + 3 * base;
+    let max = EXPIRY_CHECK_RETRY_MAX_SECS;
+    for delay in [4 * base, 8 * base, max, max, max] {
+        assert!(poll(now + delay - 1).await.is_empty());
+        now += delay;
+        assert_eq!(poll(now).await, failing);
+    }
+
+    // A recovered check lifts the deferred deadlines and clears the delay.
+    let discord = MockDiscord::default();
+    now += max;
+    expire_bans(&f.db, Some(&app), &discord, now, &limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        discord
+            .unbans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(guild, _, _)| *guild)
+            .collect::<Vec<_>>(),
+        failing
+    );
+    assert!(app.expiry_check_retries.waiting(now).is_empty());
+}
+
+#[tokio::test]
+async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
+    // The expected directory ban state, or None for an unplaced tenant store.
+    for (code, still_banned) in [
+        ("unbanned", Some(false)),
+        // Discord's idempotent 10026 does not prove the user was banned.
+        ("already_unbanned", Some(true)),
+        // An unplaced tenant store records a coverage gap instead.
+        ("unbanned", None),
+    ] {
+        let f = Fixture::new();
+        let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        let live = if still_banned.is_some() {
+            app.tenant.activate(enrollment.clone()).await.unwrap();
+            let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+            assert!(store.observe_ban(scope.clone(), 20, 1).await.unwrap());
+            Some((store, scope))
+        } else {
+            None
+        };
+        db::record_ban(&f.db, 10, 20, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&f.db, enrollment.clone(), 20, 100)
+            .await
+            .unwrap();
+        let discord = MockDiscord {
+            outcome: Outcome::succeeded(code),
+            ..Default::default()
+        };
+        expire_bans(&f.db, Some(&app), &discord, 100, &WorkerLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 1, "{code}");
+        let gaps = app.pending_member_gaps(10);
+        if let Some((store, scope)) = live {
+            let member = store.get_member(scope, 20).await.unwrap().unwrap();
+            assert_eq!(Some(member.is_banned), still_banned, "{code}");
+            assert!(gaps.is_empty(), "{code}");
+        } else {
+            assert_eq!(gaps.len(), 1);
+            assert_eq!(gaps[0].users, vec![(20, true)]);
+            assert_eq!(gaps[0].reason, "confirmed unban persistence unavailable");
+        }
+    }
+}
+
+#[tokio::test]
 async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
     let f = Fixture::new();
     let old = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
     db::record_ban(&f.db, 10, 20, None, "temporary")
         .await
         .unwrap();
-    db::set_ban_expiry(&f.db, old.clone(), 20, 100)
-        .await
-        .unwrap();
+    arm_expiry(&f.db, old.clone(), 20, 100).await.unwrap();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
     app.activation.mark_lock_held(true);
     app.tenant.activate(old.clone()).await.unwrap();
@@ -2230,7 +2365,7 @@ async fn timed_ban_expiry_holds_the_command_ban_slot_through_dispatch() {
     db::record_ban(&f.db, 10, 20, None, "temporary")
         .await
         .unwrap();
-    db::set_ban_expiry(&f.db, enrollment.clone(), 20, 100)
+    arm_expiry(&f.db, enrollment.clone(), 20, 100)
         .await
         .unwrap();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
