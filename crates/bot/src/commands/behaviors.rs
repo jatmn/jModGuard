@@ -126,13 +126,29 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             // A deadline binds to the ban row this command observed or
             // recorded. Capturing it before the Discord read means a
             // replacement ban that lands meanwhile is refused, not re-armed.
-            let mut expiry_ban = match minutes {
-                Some(_) => {
-                    db::active_ban_row(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
-                        .await?
-                }
+            // An unavailable read never blocks the ban: the capture is then
+            // unknown and only a ban this command sends can take the deadline.
+            let captured = match minutes {
+                Some(_) => match db::active_ban_row(
+                    &env.app.db,
+                    env.guild_id.get() as i64,
+                    target.get() as i64,
+                )
+                .await
+                {
+                    Ok(row) => Some(row),
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = env.guild_id.get(),
+                            user_id = target.get(),
+                            "timed ban continues without its active ban row: {error:#}"
+                        );
+                        None
+                    }
+                },
                 None => None,
             };
+            let mut expiry_ban = captured.flatten();
             let decision = crate::member_directory::observe_ban_handoff(
                 env.app,
                 env.ctx.http.as_ref(),
@@ -171,22 +187,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await;
                     abort_if_mod_reason_dm_cancelled(dm_outcome)?;
-                    // A captured ban that is no longer the primary's active row
-                    // was lifted meanwhile: the Discord ban is a replacement and
-                    // the row recorded for it keeps no deadline.
-                    let observed_active = match expiry_ban {
-                        Some(ban) => {
-                            db::active_ban_row(
-                                &env.app.db,
-                                env.guild_id.get() as i64,
-                                target.get() as i64,
-                            )
-                            .await?
-                                == Some(ban)
-                        }
-                        None => true,
-                    };
-                    if let Some(row) = continue_present_command_ban(
+                    // The recording transaction decides whether the deadline
+                    // may follow the recorded row: only while the active row is
+                    // still the captured one. A lift, replacement or newly
+                    // recorded ban since the capture keeps no deadline.
+                    let recorded = continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
                         target.get() as i64,
@@ -196,14 +201,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         &env.actor_member.user.name,
                         &reason,
                         discord_reason.as_deref(),
+                        captured,
                     )
-                    .await?
-                    {
-                        if observed_active {
-                            expiry_ban = Some(row);
-                        }
-                        log_ban = true;
-                    }
+                    .await?;
+                    expiry_ban = recorded.expiry_ban;
+                    log_ban = recorded.published.is_some();
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
                     // Discord had no ban; only the row recorded below is this ban.
@@ -1358,14 +1360,18 @@ pub(crate) async fn continue_present_command_ban(
     actor_name: &str,
     reason: &str,
     discord_reason: Option<&str>,
-) -> Result<Option<i64>> {
+    captured: Option<Option<i64>>,
+) -> Result<db::CommandBanRecord> {
     let subject = u64::try_from(target).unwrap_or(0);
     crate::cases::settle_present_application_ban(app, enrollment.clone(), subject, discord_reason)
         .await;
     if !app.activation.may_record() {
-        return Ok(None);
+        return Ok(db::CommandBanRecord {
+            published: None,
+            expiry_ban: captured.flatten(),
+        });
     }
-    db::record_enrolled_ban_if_absent(
+    db::record_ban_if_absent_binding(
         &app.db,
         enrollment,
         target,
@@ -1377,6 +1383,7 @@ pub(crate) async fn continue_present_command_ban(
         None,
         db::BanRecord::Retry,
         None,
+        captured,
     )
     .await
 }
@@ -2428,6 +2435,7 @@ mod tests {
                 42,
                 "mod",
                 "raid",
+                None,
                 None,
             )
             .await

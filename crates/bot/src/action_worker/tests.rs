@@ -2420,6 +2420,8 @@ async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
         live_joined_at_ns: Some(1_000_000_001),
         ..Default::default()
     };
+    // An earlier unavailable check, whose retry time has passed.
+    app.expiry_check_retries.failed(10, 0);
 
     drain_with_state(&app, &discord, &WorkerLimits::default())
         .await
@@ -2429,6 +2431,9 @@ async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
     let current = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
     assert_eq!(current.joined_at_ns, 1_000_000_001);
     assert_ne!(current.id, old.id);
+    // Discord answered: the repair is not an unavailable check, so the guild
+    // keeps no retry time that would delay its other expiries.
+    assert!(app.expiry_check_retries.waiting(0).is_empty());
     // The old membership's deadline is never dispatched under the new join.
     assert!(
         db::next_expired_ban(&f.db, i64::MAX, Vec::new(), Vec::new())

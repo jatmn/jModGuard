@@ -13,9 +13,19 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
     // Discord reports no ban (the bot bans), a ban the mirror lacks, a ban
     // already recorded, or a recorded ban that an external unban and
     // permanent reban replace while the command reads Discord, with the
-    // reban's Gateway write either recorded or still pending.
-    for scenario in ["absent", "unrecorded", "recorded", "replaced", "lifted"] {
-        let discord_has_ban = scenario != "absent";
+    // reban's Gateway write either recorded or still pending. "lagging" is a
+    // recorded ban that a lagging read misses, so the command records it
+    // again; "unavailable" cannot read the active ban before banning.
+    for scenario in [
+        "absent",
+        "unrecorded",
+        "recorded",
+        "replaced",
+        "lifted",
+        "lagging",
+        "unavailable",
+    ] {
+        let discord_has_ban = !matches!(scenario, "absent" | "unavailable");
         let path =
             std::env::temp_dir().join(format!("timed_ban_log_{:032x}.db", rand::random::<u128>()));
         let database = db::Db::open(&path, 2).unwrap();
@@ -72,6 +82,18 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
                             (404, r#"{"code":10026,"message":"Unknown Ban"}"#)
                         }
                     } else if line.starts_with("PUT /api/v10/guilds/10/bans/91") {
+                        if scenario == "unavailable" {
+                            // The database recovers once Discord has the ban.
+                            database
+                                .with_conn(|conn| {
+                                    conn.execute_batch_bounded(
+                                        "ALTER TABLE bans_unavailable RENAME TO bans",
+                                        65_536,
+                                    )
+                                })
+                                .await
+                                .unwrap();
+                        }
                         (204, "")
                     } else if line.starts_with("POST /api/v10/channels/555/messages ") {
                         let expires_at = database
@@ -122,16 +144,36 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         cache.update(&mut event);
         let ctx = mod_reason_dm::fixture_context_for_dm_order_test(http, cache).await;
-        let app = Arc::new(crate::state::BotState::new(Default::default(), database).unwrap());
+        let mut app = crate::state::BotState::new(Default::default(), database.clone()).unwrap();
+        let lagging_path = path.with_extension("lagging.db");
+        if scenario == "lagging" {
+            // A read replica that has not seen the recorded ban.
+            Arc::get_mut(&mut app).expect("unshared state").reads =
+                db::Db::open(&lagging_path, 2).unwrap();
+        }
         app.activation.mark_lock_held(true);
         let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
         app.tenant.activate(enrollment).await.unwrap();
-        if matches!(scenario, "recorded" | "replaced" | "lifted") {
-            db::record_ban(&app.db, 10, 91, Some(7), "spam")
+        if matches!(scenario, "recorded" | "replaced" | "lifted" | "lagging") {
+            // Another moderator's ban, so recording it again is a new row.
+            let moderator = if scenario == "lagging" { 8 } else { 7 };
+            db::record_ban(&app.db, 10, 91, Some(moderator), "spam")
                 .await
                 .unwrap();
         }
         let observed = db::active_ban_row(&app.db, 10, 91).await.unwrap();
+        if scenario == "unavailable" {
+            // The active-ban read fails; the ban must still be sent.
+            database
+                .with_conn(|conn| {
+                    conn.execute_batch_bounded(
+                        "ALTER TABLE bans RENAME TO bans_unavailable",
+                        65_536,
+                    )
+                })
+                .await
+                .unwrap();
+        }
         db::upsert_log_channel(&app.db, 10, "mod_action", 555)
             .await
             .unwrap();
@@ -155,6 +197,13 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
         server.abort();
         let _ = server.await;
         let requests = requests.lock().unwrap().clone();
+        if scenario == "unavailable" {
+            assert!(
+                requests.iter().any(|line| line.starts_with("PUT ")),
+                "a failed active-ban read must not block the ban: {:?}; {requests:?}",
+                outcome.as_ref().err()
+            );
+        }
         let active = app
             .db
             .with_conn(|conn| {
@@ -195,7 +244,22 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             );
             assert!(seen_at_log.lock().unwrap().is_empty(), "{requests:?}");
         }
-        if matches!(scenario, "recorded" | "replaced" | "lifted") {
+        if scenario == "lagging" {
+            // The recorded ban was still the active row when the command
+            // recorded it again: the new row is that ban and takes the deadline.
+            assert_ne!(Some(active.0), observed);
+            let deadline = active.1.expect("deadline saved on the re-recorded ban");
+            assert!(
+                (before + 3600..=after + 3600).contains(&deadline),
+                "deadline {deadline} outside [{before}, {after}] + 1h"
+            );
+            assert_eq!(
+                *seen_at_log.lock().unwrap(),
+                [Some(deadline)],
+                "{requests:?}"
+            );
+        }
+        if matches!(scenario, "recorded" | "replaced" | "lifted" | "lagging") {
             assert!(
                 requests.iter().all(|line| !line.starts_with("PUT ")),
                 "{requests:?}"
@@ -204,8 +268,10 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             drop(config);
             drop(app);
             crate::tenant::remove_sidecars(&path);
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            for file in [&path, &lagging_path] {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+                }
             }
             continue;
         }

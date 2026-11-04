@@ -614,17 +614,24 @@ async fn expire_bans(
             exhausted = true;
             break;
         };
-        if !expiry_membership_matches(db, app, discord, &due, limits).await? {
-            deferred_guilds.push(due.enrollment.guild_id);
-            if let Some(app) = app {
+        let membership = expiry_membership(db, app, discord, &due, limits).await?;
+        if let Some(app) = app {
+            // Only an unavailable check waits for a retry time. A check that
+            // answered, including one that found and repaired a newer join,
+            // clears it.
+            if membership == ExpiryMembership::Unavailable {
                 let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
                 app.expiry_check_retries
                     .failed(due.enrollment.guild_id, now.saturating_add(elapsed));
+            } else {
+                app.expiry_check_retries.succeeded(due.enrollment.guild_id);
             }
-            continue;
         }
-        if let Some(app) = app {
-            app.expiry_check_retries.succeeded(due.enrollment.guild_id);
+        if membership != ExpiryMembership::Matches {
+            // A changed join leaves the old membership's deadlines unclaimed;
+            // the guild waits for the next poll as before.
+            deferred_guilds.push(due.enrollment.guild_id);
+            continue;
         }
         // Hold the command-ban slot through dispatch and the mirror update so a
         // concurrent ban command cannot re-arm or replace the ban meanwhile.
@@ -715,16 +722,27 @@ impl ExpiryCheckRetries {
     }
 }
 
+/// Result of the bot's own-membership check before an expiry is consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiryMembership {
+    /// The captured membership is still the bot's current join.
+    Matches,
+    /// The read failed, timed out or returned no join timestamp.
+    Unavailable,
+    /// Discord answered with a newer join; the enrollment repair was attempted.
+    Changed,
+}
+
 /// Confirm the expiry's captured membership with a bounded own-member read
 /// before consuming it. An unavailable read defers the expiry. A newer join is
 /// repaired like queued actions; the old membership's expiry then stays unclaimed.
-async fn expiry_membership_matches(
+async fn expiry_membership(
     db: &Db,
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     due: &db::ExpiredBan,
     limits: &WorkerLimits,
-) -> Result<bool> {
+) -> Result<ExpiryMembership> {
     let guild = due.enrollment.guild_id;
     let timeout = std::time::Duration::from_secs(u64::from(limits.request_timeout_secs));
     let observed = match tokio::time::timeout(timeout, discord.guild_joined_at_ns(guild)).await {
@@ -740,12 +758,12 @@ async fn expiry_membership_matches(
                 user = due.user,
                 "automatic unban deferred: bot membership check unavailable: {reason}"
             );
-            return Ok(false);
+            return Ok(ExpiryMembership::Unavailable);
         }
     };
     if crate::enrollment_repair::membership_joined_at_matches(due.enrollment.joined_at_ns, observed)
     {
-        return Ok(true);
+        return Ok(ExpiryMembership::Matches);
     }
     tracing::warn!(
         guild,
@@ -768,7 +786,7 @@ async fn expiry_membership_matches(
             }
         }
     }
-    Ok(false)
+    Ok(ExpiryMembership::Changed)
 }
 
 async fn dispatch_expired_ban(

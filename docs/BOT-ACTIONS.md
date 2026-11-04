@@ -197,7 +197,8 @@ end rather than the poll's start. A failure count is forgotten only after a poll
 every due expiry without checking that guild again. A batch of unavailable guilds
 therefore cannot hold every poll's batch and starve later guilds. A restart checks each
 guild again. A newer join repairs the enrollment; the old membership's deadline is then
-never dispatched.
+never dispatched. That check did answer, so it clears the guild's retry time instead of
+setting one.
 While the deadline is consumed and the unban runs, the worker holds the same in-process
 slot as a ban command, so a concurrent ban of that user is refused instead of being
 undone. A command that holds the slot defers the expiry.
