@@ -821,6 +821,9 @@ async fn dispatch_expired_ban(
             None,
         )
     });
+    // The unban takes effect no earlier than this request, so a ban the member
+    // directory observed after it stays ordered after the confirmed unban.
+    let requested_at_ms = chrono::Utc::now().timestamp_millis().max(1);
     let outcome = match tokio::time::timeout(
         std::time::Duration::from_secs(u64::from(limits.request_timeout_secs)),
         discord.unban(enrollment.guild_id, user, "Ban duration expired"),
@@ -842,14 +845,15 @@ async fn dispatch_expired_ban(
     }
     // As for a queued unban, a confirmed removal (not Discord's idempotent
     // 10026) is saved to the member directory so a missed Gateway callback
-    // cannot leave the user shown as banned.
+    // cannot leave the user shown as banned. It is observed at the request
+    // time: a re-ban the directory saw during the request, including one whose
+    // contested check already settled, is newer and is kept and rechecked.
     if outcome.state == "succeeded"
         && outcome.code != "already_unbanned"
         && let Some(app) = app
     {
-        let observed_at_ms = chrono::Utc::now().timestamp_millis().max(1);
         let observed = match app.tenant.live(enrollment.clone()).await {
-            Ok((store, scope)) => store.observe_unban(scope, user, observed_at_ms).await,
+            Ok((store, scope)) => store.observe_unban(scope, user, requested_at_ms).await,
             Err(error) => Err(error),
         };
         if let Err(error) = observed {

@@ -205,7 +205,9 @@ undone. A command that holds the slot defers the expiry.
 
 As for a queued unban, a confirmed automatic unban (not Discord's `already_unbanned`
 response) is saved to the guild's member directory, so a missed Gateway callback does
-not leave the user shown as banned. If that save fails, the bot logs
+not leave the user shown as banned. The save is dated when the unban request was sent,
+so a ban the directory observed after that time, such as an external re-ban during the
+request, is kept and queued for a Discord ban check. If that save fails, the bot logs
 `confirmed automatic unban state not saved` and records a member-directory coverage gap.
 
 A consumed deadline is not restored. Each automatic unban is attempted **once**: a

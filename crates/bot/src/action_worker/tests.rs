@@ -2406,6 +2406,114 @@ async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
 }
 
 #[tokio::test]
+async fn timed_ban_expiry_directory_save_keeps_a_reban_settled_during_dispatch() {
+    // An external moderator re-bans the user right after Discord applies the
+    // automatic unban. The Gateway ban arrives while the expiry holds its slot,
+    // so it queues a contested check, and the Members worker settles that check
+    // to banned before Discord's unban response reaches the expiry worker.
+    struct RebanDuringUnban<'a> {
+        app: &'a crate::state::BotState,
+        enrollment: db::GuildEnrollment,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for RebanDuringUnban<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            panic!("expiry has no queued job")
+        }
+        async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+            Ok(Some(1))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            panic!("expiry has no actor")
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            panic!("expiry has no log channel")
+        }
+        async fn unban(&self, guild: i64, user: i64, _: &str) -> Outcome {
+            let mut member = serenity::model::user::User::default();
+            member.id = UserId::new(user as u64);
+            member.name = "member".into();
+            let reban_at_ms = chrono::Utc::now().timestamp_millis();
+            crate::member_directory::observe_ban(self.app, guild as u64, &member, reban_at_ms)
+                .await
+                .expect("re-ban saved");
+            let (store, scope) = self.app.tenant.live(self.enrollment.clone()).await.unwrap();
+            let check = store
+                .next_member_target_check(scope.clone(), i64::MAX)
+                .await
+                .unwrap()
+                .expect("contested re-ban queues a check");
+            assert_eq!(check.reason, "ban_order_uncertain");
+            let verification = crate::db::guild_data::MemberVerification {
+                user_id: user,
+                revision: check.revision,
+                kind: check.kind,
+                present: true,
+                member: None,
+                ban: Some(crate::db::guild_data::MemberBanSnapshot {
+                    user_id: user,
+                    username: Some("member".into()),
+                    global_name: None,
+                    reason: None,
+                }),
+            };
+            store
+                .settle_member_target_check(scope.clone(), check, verification, reban_at_ms)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .next_member_target_check(scope, i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the settled check is removed"
+            );
+            // Discord's unban response arrives after the Gateway re-ban.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Outcome::succeeded("unbanned")
+        }
+    }
+
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    assert!(store.observe_ban(scope.clone(), 20, 1).await.unwrap());
+    db::record_ban(&f.db, 10, 20, None, "temporary")
+        .await
+        .unwrap();
+    arm_expiry(&f.db, enrollment.clone(), 20, 100)
+        .await
+        .unwrap();
+    let discord = RebanDuringUnban {
+        app: &app,
+        enrollment,
+    };
+
+    expire_bans(&f.db, Some(&app), &discord, 100, &WorkerLimits::default())
+        .await
+        .unwrap();
+
+    // The settled re-ban is not overwritten by the older unban, and the
+    // conflicting observation leaves a fresh Discord check behind it.
+    let member = store.get_member(scope.clone(), 20).await.unwrap().unwrap();
+    assert!(
+        member.is_banned,
+        "settled re-ban overwritten by the automatic unban"
+    );
+    let check = store
+        .next_member_target_check(scope, i64::MAX)
+        .await
+        .unwrap()
+        .expect("reconciliation retained after the automatic unban save");
+    assert_eq!(check.reason, "ban_order_uncertain");
+    assert!(app.pending_member_gaps(10).is_empty());
+}
+
+#[tokio::test]
 async fn timed_ban_expiry_repairs_a_missed_rejoin_without_unbanning() {
     let f = Fixture::new();
     let old = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
