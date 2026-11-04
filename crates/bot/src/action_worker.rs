@@ -598,22 +598,34 @@ async fn expire_bans(
     // unavailable guilds cannot spend every pass and starve later guilds.
     // `now` selects due bans; checks run one after another and can each take
     // up to the request timeout, so retry times count from each check's end.
+    // Guilds whose retry time has arrived are held back until no other due
+    // ban remains, then released one at a time, earliest retry time first.
+    // Enough failing guilds to fill every poll therefore cannot starve guilds
+    // that have not failed, or a retry that has waited longer.
     let started = tokio::time::Instant::now();
     let mut deferred = Vec::new();
     let mut deferred_guilds = app
         .map(|app| app.expiry_check_retries.waiting(now))
         .unwrap_or_default();
+    let mut retries = std::collections::VecDeque::from(
+        app.map(|app| app.expiry_check_retries.due(now))
+            .unwrap_or_default(),
+    );
     let mut exhausted = false;
-    for _ in 0..limits.batch_size {
+    let mut remaining = limits.batch_size;
+    while remaining > 0 {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
         }
-        let Some(due) =
-            db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
-        else {
-            exhausted = true;
-            break;
+        let skip_guilds = deferred_guilds.iter().chain(&retries).copied().collect();
+        let Some(due) = db::next_expired_ban(db, now, deferred.clone(), skip_guilds).await? else {
+            if retries.pop_front().is_none() {
+                exhausted = true;
+                break;
+            }
+            continue;
         };
+        remaining -= 1;
         let membership = expiry_membership(db, app, discord, &due, limits).await?;
         if let Some(app) = app {
             // Only an unavailable check waits for a retry time. A check that
@@ -692,6 +704,19 @@ impl ExpiryCheckRetries {
             .filter(|(_, retry)| now < retry.retry_at)
             .map(|(guild, _)| *guild)
             .collect()
+    }
+
+    /// Guilds whose retry time has arrived, earliest retry time first.
+    fn due(&self, now: i64) -> Vec<i64> {
+        let mut due: Vec<_> = self
+            .0
+            .lock()
+            .iter()
+            .filter(|(_, retry)| retry.retry_at <= now)
+            .map(|(guild, retry)| (retry.retry_at, *guild))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, guild)| guild).collect()
     }
 
     fn failed(&self, guild: i64, now: i64) {

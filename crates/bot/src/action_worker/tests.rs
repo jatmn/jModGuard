@@ -2308,13 +2308,13 @@ async fn slow_failed_checks_then_a_healthy_guild(
     assert_eq!(clock(), 200 + i64::from(limits.batch_size) * timeout);
 
     // The next poll reaches the healthy guild even though the slow failures
-    // took longer than the first retry delay.
+    // took longer than the first retry delay; due retries wait behind it.
     let second = clock();
     expire_bans(&f.db, Some(&app), &discord, second, &limits)
         .await
         .unwrap();
     let checks = std::mem::take(&mut *discord.checks.lock().unwrap());
-    assert_eq!(checks.last(), Some(&healthy));
+    assert_eq!(checks.first(), Some(&healthy));
     assert_eq!(*discord.unbans.lock().unwrap(), vec![(healthy, 20)]);
     (app, failing, timeout, second, checks)
 }
@@ -2336,14 +2336,18 @@ async fn timed_ban_expiry_retry_survives_a_maximum_slow_batch() {
     };
     let (app, failing, timeout, second, checks) =
         slow_failed_checks_then_a_healthy_guild(limits).await;
-    // Only the guilds whose retry time passed during the first poll repeat.
+    // Only the guilds whose retry time passed during the first poll repeat,
+    // after the healthy guild and in retry-time order.
     let base = EXPIRY_CHECK_RETRY_BASE_SECS;
     let due_again = failing
         .iter()
         .enumerate()
         .filter(|(index, _)| 200 + (*index as i64 + 1) * timeout + base <= second)
         .map(|(_, guild)| *guild);
-    assert_eq!(checks, due_again.chain([99]).collect::<Vec<_>>());
+    assert_eq!(
+        checks,
+        [99].into_iter().chain(due_again).collect::<Vec<_>>()
+    );
     // The first guild failed again 2 minutes into the second poll; its
     // backoff was kept, so the delay doubled.
     let retried = second + timeout;
@@ -2354,6 +2358,85 @@ async fn timed_ban_expiry_retry_survives_a_maximum_slow_batch() {
             .waiting(retried + 2 * base)
             .contains(&failing[0])
     );
+}
+
+// Paused: back-to-back polls, each check timing out on the runtime clock.
+#[tokio::test(start_paused = true)]
+async fn timed_ban_expiry_retries_cannot_fill_every_poll() {
+    // Default limits check at most one timed-out guild per 15 seconds, so 80
+    // guilds that keep failing need more checks than fit in the 15-minute
+    // longest retry delay: some failing guild is always due again.
+    let f = Fixture::new();
+    let limits = WorkerLimits::default();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    let failing: Vec<i64> = (1000..1080).collect();
+    let healthy = 99;
+    // The failing guild with the latest deadline recovers later.
+    let recovered = *failing.last().unwrap();
+    // Two hours in, the failures are at the longest delay and fill every poll.
+    let steady = 200 + 2 * 3600;
+    for (guild, expires_at) in failing
+        .iter()
+        .copied()
+        .zip(100..)
+        .chain([(healthy, steady)])
+    {
+        let enrollment = db::enroll_guild(&f.db, guild, 1).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        db::record_ban(&f.db, guild, 20, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&f.db, enrollment, 20, expires_at).await.unwrap();
+    }
+    let started = tokio::time::Instant::now();
+    let clock = || 200 + i64::try_from(started.elapsed().as_secs()).unwrap();
+    // Polls one after another with the one-second worker tick; returns the
+    // start time of the poll that lifted `guild`, if any did before `until`.
+    let run = async |discord: &PerGuildMembership, until: i64, guild: i64| {
+        while clock() < until {
+            let now = clock();
+            expire_bans(&f.db, Some(&app), discord, now, &limits)
+                .await
+                .unwrap();
+            if discord.unbans.lock().unwrap().contains(&(guild, 20)) {
+                return Some(now);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        None
+    };
+    let discord = PerGuildMembership {
+        joined: [(healthy, Some(1))].into(),
+        hang: true,
+        checks: Default::default(),
+        unbans: Default::default(),
+    };
+    assert_eq!(run(&discord, steady, healthy).await, None);
+    let checks = std::mem::take(&mut *discord.checks.lock().unwrap());
+    // Every failing guild kept being retried.
+    for guild in &failing {
+        assert!(checks.contains(guild), "guild {guild} never checked");
+    }
+
+    // A guild that never failed is reached by the first poll once its
+    // expiry is due, ahead of the retries.
+    let poll = clock();
+    assert_eq!(run(&discord, steady + 60, healthy).await, Some(poll));
+
+    // A failing guild whose check recovers is reached in retry order within
+    // its longest delay plus one check of every other failing guild.
+    let discord = PerGuildMembership {
+        joined: [(healthy, Some(1)), (recovered, Some(1))].into(),
+        hang: true,
+        checks: Default::default(),
+        unbans: Default::default(),
+    };
+    let from = clock();
+    let bound = from
+        + EXPIRY_CHECK_RETRY_MAX_SECS
+        + i64::try_from(failing.len()).unwrap() * i64::from(limits.request_timeout_secs);
+    assert!(run(&discord, bound, recovered).await.is_some());
 }
 
 #[tokio::test]

@@ -194,8 +194,10 @@ bot process: 60 seconds after that failed check finishes, doubling after each co
 failure up to 15 minutes, and cleared by a successful check. Checks in one poll run in
 turn and each may wait for the request timeout, so the delay counts from that check's
 end rather than the poll's start. A failure count is forgotten only after a poll reaches
-every due expiry without checking that guild again. A batch of unavailable guilds
-therefore cannot hold every poll's batch and starve later guilds. A restart checks each
+every due expiry without checking that guild again. A poll checks guilds without a retry
+time first. Guilds whose retry time has arrived come after them, earliest retry time first.
+Guilds that keep failing therefore cannot fill every poll's batch and starve other guilds,
+even when there are enough of them to keep every poll busy. A restart checks each
 guild again. A newer join repairs the enrollment; the old membership's deadline is then
 never dispatched. That check did answer, so it clears the guild's retry time instead of
 setting one.
