@@ -8820,6 +8820,10 @@ async fn cold_start_outage_requires_matching_guild_schema() {
             "baked guild {baked_guild}: {error}"
         );
         assert!(started.is_none(), "{started:?}");
+        // The owner alert names the guild schema, not the core schema.
+        let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+        assert_eq!(mismatch["bot"].reason, GUILD_SCHEMA_MISMATCH_BOOT_MISMATCH);
+        assert_eq!(mismatch["bot"].running, "");
         assert!(
             !logs.iter().any(|line| line.contains(BUILT_IN_OUTAGE_LOG)),
             "{logs:?}"
@@ -8827,6 +8831,28 @@ async fn cold_start_outage_requires_matching_guild_schema() {
         assert_eq!(control.schema_version().await.unwrap(), live);
         assert!(control.upgrade().await.unwrap().is_none());
     }
+
+    // When both schemas differ, the core refusal and its reason win.
+    set_core_schema(&db, live - 1).await;
+    let (error, started, _) = restore_installed(
+        "bot",
+        &db,
+        &root,
+        &baked,
+        &refused,
+        live - 1,
+        Some(recorded + 1),
+    )
+    .await;
+    let error = error.expect_err("a core and guild schema mismatch must not start");
+    assert!(
+        error.contains("baked application cannot open database; use owner recovery"),
+        "{error}"
+    );
+    assert!(started.is_none(), "{started:?}");
+    let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
+    assert_eq!(mismatch["bot"].reason, SCHEMA_MISMATCH_BOOT_MISMATCH);
+    set_core_schema(&db, live).await;
 
     let (error, started, logs) =
         restore_installed("bot", &db, &root, &baked, &refused, live, Some(recorded)).await;

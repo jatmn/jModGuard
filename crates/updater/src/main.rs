@@ -32,8 +32,11 @@ const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
+/// Durable reasons stored when an outage fallback refuses the built-in binary's
+/// core or guild schema.
 const SCHEMA_MISMATCH_BOOT_MISMATCH: &str =
     "registry unreachable; built-in application schema does not match the database";
+const GUILD_SCHEMA_MISMATCH_BOOT_MISMATCH: &str = "registry unreachable; built-in application guild schema does not match the recorded guild schema";
 
 /// Process-local only: container restart is the explicit reset for a bad token.
 ///
@@ -2043,12 +2046,14 @@ impl Supervisor {
             Ok(fallback) => fallback,
             Err(error) => {
                 // The owner alert names this cause; the refusal itself is unchanged.
+                // The fallback checks the core schema first, then the guild schema.
+                let reason = if self.baked_core_fits(schema) {
+                    GUILD_SCHEMA_MISMATCH_BOOT_MISMATCH
+                } else {
+                    SCHEMA_MISMATCH_BOOT_MISMATCH
+                };
                 if let Err(save) = self
-                    .record_boot_mismatch_for_installed(
-                        release,
-                        SCHEMA_MISMATCH_BOOT_MISMATCH,
-                        String::new(),
-                    )
+                    .record_boot_mismatch_for_installed(release, reason, String::new())
                     .await
                 {
                     tracing::warn!("boot mismatch receipt was not saved: {save:#}");
