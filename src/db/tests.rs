@@ -4162,7 +4162,8 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
                 .is_none()
         );
         record_ban(&db, 10, 21, None, "temporary").await.unwrap();
-        set_ban_expiry(&db, enrollment.clone(), 21, 100)
+        let ban = active_ban_row(&db, 10, 21).await.unwrap().unwrap();
+        set_ban_expiry(&db, enrollment.clone(), ban, 21, 100)
             .await
             .unwrap();
         enrollment
@@ -4216,7 +4217,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
                 .is_none()
         );
         // A deadline changed after it was found is not claimed.
-        set_ban_expiry(&db, enrollment.clone(), 21, 150)
+        set_ban_expiry(&db, enrollment.clone(), due.id, 21, 150)
             .await
             .unwrap();
         assert!(!claim_expired_ban(&db, &due).await.unwrap());
@@ -4231,9 +4232,43 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
         record_ban(&db, 10, 22, None, "manual release")
             .await
             .unwrap();
-        set_ban_expiry(&db, enrollment, 22, 200).await.unwrap();
+        let ban = active_ban_row(&db, 10, 22).await.unwrap().unwrap();
+        set_ban_expiry(&db, enrollment.clone(), ban, 22, 200)
+            .await
+            .unwrap();
         mark_unbanned(&db, 10, 22).await.unwrap();
         mark_unbanned(&db, 10, 21).await.unwrap();
+        // A deadline captured for one ban never attaches to its replacement,
+        // to another user's ban or to a lifted row.
+        record_ban(&db, 10, 23, None, "timed").await.unwrap();
+        let observed = active_ban_row(&db, 10, 23).await.unwrap().unwrap();
+        mark_unbanned(&db, 10, 23).await.unwrap();
+        assert!(
+            set_ban_expiry(&db, enrollment.clone(), observed, 23, 300)
+                .await
+                .is_err()
+        );
+        record_ban(&db, 10, 23, None, "permanent replacement")
+            .await
+            .unwrap();
+        let replacement = active_ban_row(&db, 10, 23).await.unwrap().unwrap();
+        assert_ne!(replacement, observed);
+        assert!(
+            set_ban_expiry(&db, enrollment.clone(), observed, 23, 300)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_ban_expiry(&db, enrollment.clone(), replacement, 24, 300)
+                .await
+                .is_err()
+        );
+        assert!(
+            next_expired_ban(&db, i64::MAX, Vec::new(), Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             next_expired_ban(&db, 200, Vec::new(), Vec::new())
                 .await

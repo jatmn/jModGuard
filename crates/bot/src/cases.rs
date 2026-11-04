@@ -1297,9 +1297,12 @@ mod tests {
                 "mod",
                 "raid",
                 Some(&discord_reason),
+                None,
             )
             .await
             .unwrap()
+            .published
+            .is_some()
         );
         let cases = stored_cases(&successor, enrollment).await;
         assert_eq!(cases.len(), 1);

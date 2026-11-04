@@ -3804,3 +3804,79 @@ async fn multiple_existing_observations_advance_active_ban_in_observation_order(
         assert!(active[0].created_at.starts_with("2024-03-01T00:00:40"));
     }
 }
+
+/// A timed ban's deadline may follow the row a command records only while the
+/// user's active row is still the one captured before the command read
+/// Discord. The check happens in the recording transaction, so a lift or
+/// replacement committed after any earlier read is still refused.
+#[tokio::test]
+async fn command_ban_record_binds_its_expiry_only_to_the_captured_ban() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let record = |user: i64, reason: &'static str, captured: Option<Option<i64>>| {
+        let (db, scope) = (f.db.clone(), scope.clone());
+        async move {
+            record_ban_if_absent_binding(
+                &db,
+                Some(scope),
+                user,
+                None,
+                None,
+                Some(7),
+                Some("moderator"),
+                reason,
+                None,
+                BanRecord::Retry,
+                None,
+                captured,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // The captured ban is still active (a lagging read chose to record):
+    // the row that replaces its mirror takes the deadline.
+    record_ban(&f.db, 10, 21, None, "spam").await.unwrap();
+    let captured = active_ban_row(&f.db, 10, 21).await.unwrap();
+    let recorded = record(21, "timed", Some(captured)).await;
+    assert!(recorded.published.is_some());
+    assert_ne!(recorded.published, captured);
+    assert_eq!(recorded.expiry_ban, recorded.published);
+    // The same dispatch writes nothing; the captured row keeps the deadline.
+    let current = active_ban_row(&f.db, 10, 21).await.unwrap();
+    let again = record(21, "timed", Some(current)).await;
+    assert_eq!(again.published, None);
+    assert_eq!(again.expiry_ban, current);
+
+    // An unban and permanent reban committed after the capture: the command
+    // still records its row, but no row may take the deadline.
+    record_ban(&f.db, 10, 22, None, "spam").await.unwrap();
+    let captured = active_ban_row(&f.db, 10, 22).await.unwrap();
+    mark_unbanned(&f.db, 10, 22).await.unwrap();
+    record_ban(&f.db, 10, 22, None, "permanent").await.unwrap();
+    let replaced = record(22, "timed", Some(captured)).await;
+    assert!(replaced.published.is_some());
+    assert_eq!(replaced.expiry_ban, None);
+    // A lift with the reban not yet recorded is refused the same way.
+    record_ban(&f.db, 10, 23, None, "spam").await.unwrap();
+    let captured = active_ban_row(&f.db, 10, 23).await.unwrap();
+    mark_unbanned(&f.db, 10, 23).await.unwrap();
+    let lifted = record(23, "timed", Some(captured)).await;
+    assert!(lifted.published.is_some());
+    assert_eq!(lifted.expiry_ban, None);
+
+    // No ban was recorded at capture: the command's own row takes the
+    // deadline, but not when another path recorded a ban meanwhile.
+    let unrecorded = record(24, "timed", Some(None)).await;
+    assert!(unrecorded.published.is_some());
+    assert_eq!(unrecorded.expiry_ban, unrecorded.published);
+    record_ban(&f.db, 10, 25, None, "permanent").await.unwrap();
+    let appeared = record(25, "timed", Some(None)).await;
+    assert!(appeared.published.is_some());
+    assert_eq!(appeared.expiry_ban, None);
+    // An unknown capture never binds; plain recording binds nothing.
+    let unknown = record(26, "timed", None).await;
+    assert!(unknown.published.is_some());
+    assert_eq!(unknown.expiry_ban, None);
+}

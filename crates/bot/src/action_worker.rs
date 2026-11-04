@@ -593,9 +593,17 @@ async fn expire_bans(
     limits: &WorkerLimits,
 ) -> Result<()> {
     // Deferred bans stay due and are skipped only for the rest of this pass.
-    // A failed membership check skips the whole guild, so one unavailable
-    // guild cannot spend every pass's batch and starve later guilds.
-    let (mut deferred, mut deferred_guilds) = (Vec::new(), Vec::new());
+    // A failed membership check skips the whole guild for this pass and, with
+    // a bot state, until that guild's saved retry time, so a batch of
+    // unavailable guilds cannot spend every pass and starve later guilds.
+    // `now` selects due bans; checks run one after another and can each take
+    // up to the request timeout, so retry times count from each check's end.
+    let started = tokio::time::Instant::now();
+    let mut deferred = Vec::new();
+    let mut deferred_guilds = app
+        .map(|app| app.expiry_check_retries.waiting(now))
+        .unwrap_or_default();
+    let mut exhausted = false;
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
@@ -603,9 +611,25 @@ async fn expire_bans(
         let Some(due) =
             db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
         else {
+            exhausted = true;
             break;
         };
-        if !expiry_membership_matches(db, app, discord, &due, limits).await? {
+        let membership = expiry_membership(db, app, discord, &due, limits).await?;
+        if let Some(app) = app {
+            // Only an unavailable check waits for a retry time. A check that
+            // answered, including one that found and repaired a newer join,
+            // clears it.
+            if membership == ExpiryMembership::Unavailable {
+                let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
+                app.expiry_check_retries
+                    .failed(due.enrollment.guild_id, now.saturating_add(elapsed));
+            } else {
+                app.expiry_check_retries.succeeded(due.enrollment.guild_id);
+            }
+        }
+        if membership != ExpiryMembership::Matches {
+            // A changed join leaves the old membership's deadlines unclaimed;
+            // the guild waits for the next poll as before.
             deferred_guilds.push(due.enrollment.guild_id);
             continue;
         }
@@ -631,19 +655,94 @@ async fn expire_bans(
         dispatch_expired_ban(db, app, discord, due, limits).await?;
         drop(in_progress);
     }
+    if exhausted && let Some(app) = app {
+        app.expiry_check_retries.forget_idle(now);
+    }
     Ok(())
+}
+
+/// First retry delay after a guild's expiry membership check fails.
+const EXPIRY_CHECK_RETRY_BASE_SECS: i64 = 60;
+/// Longest delay; consecutive failures double the delay up to this bound.
+const EXPIRY_CHECK_RETRY_MAX_SECS: i64 = 15 * 60;
+
+#[derive(Clone, Copy, Debug)]
+struct ExpiryCheckRetry {
+    failures: u32,
+    retry_at: i64,
+}
+
+/// Per-guild retry time after a failed expiry membership check. In-process
+/// only: a restart checks each guild once more. One entry per failing guild;
+/// a success removes it. An entry is dropped only after a pass checked every
+/// due ban outside waiting guilds without using it: that guild then had no due
+/// ban. A full batch never drops one, so a slow pass cannot reset the backoff
+/// of guilds that still block later guilds.
+#[derive(Default)]
+pub(crate) struct ExpiryCheckRetries(
+    parking_lot::Mutex<std::collections::HashMap<i64, ExpiryCheckRetry>>,
+);
+
+impl ExpiryCheckRetries {
+    /// Guilds whose retry time has not yet arrived.
+    fn waiting(&self, now: i64) -> Vec<i64> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|(_, retry)| now < retry.retry_at)
+            .map(|(guild, _)| *guild)
+            .collect()
+    }
+
+    fn failed(&self, guild: i64, now: i64) {
+        let mut retries = self.0.lock();
+        let failures = retries
+            .get(&guild)
+            .map_or(1, |retry| retry.failures.saturating_add(1));
+        let delay = EXPIRY_CHECK_RETRY_BASE_SECS
+            .saturating_mul(1 << (failures - 1).min(16))
+            .min(EXPIRY_CHECK_RETRY_MAX_SECS);
+        retries.insert(
+            guild,
+            ExpiryCheckRetry {
+                failures,
+                retry_at: now.saturating_add(delay),
+            },
+        );
+    }
+
+    fn succeeded(&self, guild: i64) {
+        self.0.lock().remove(&guild);
+    }
+
+    /// After a pass that checked every due ban selected at `now`: an entry
+    /// already due at `now` and not checked again had no due ban.
+    fn forget_idle(&self, now: i64) {
+        self.0.lock().retain(|_, retry| now < retry.retry_at);
+    }
+}
+
+/// Result of the bot's own-membership check before an expiry is consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiryMembership {
+    /// The captured membership is still the bot's current join.
+    Matches,
+    /// The read failed, timed out or returned no join timestamp.
+    Unavailable,
+    /// Discord answered with a newer join; the enrollment repair was attempted.
+    Changed,
 }
 
 /// Confirm the expiry's captured membership with a bounded own-member read
 /// before consuming it. An unavailable read defers the expiry. A newer join is
 /// repaired like queued actions; the old membership's expiry then stays unclaimed.
-async fn expiry_membership_matches(
+async fn expiry_membership(
     db: &Db,
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     due: &db::ExpiredBan,
     limits: &WorkerLimits,
-) -> Result<bool> {
+) -> Result<ExpiryMembership> {
     let guild = due.enrollment.guild_id;
     let timeout = std::time::Duration::from_secs(u64::from(limits.request_timeout_secs));
     let observed = match tokio::time::timeout(timeout, discord.guild_joined_at_ns(guild)).await {
@@ -659,12 +758,12 @@ async fn expiry_membership_matches(
                 user = due.user,
                 "automatic unban deferred: bot membership check unavailable: {reason}"
             );
-            return Ok(false);
+            return Ok(ExpiryMembership::Unavailable);
         }
     };
     if crate::enrollment_repair::membership_joined_at_matches(due.enrollment.joined_at_ns, observed)
     {
-        return Ok(true);
+        return Ok(ExpiryMembership::Matches);
     }
     tracing::warn!(
         guild,
@@ -687,7 +786,7 @@ async fn expiry_membership_matches(
             }
         }
     }
-    Ok(false)
+    Ok(ExpiryMembership::Changed)
 }
 
 async fn dispatch_expired_ban(
@@ -722,6 +821,9 @@ async fn dispatch_expired_ban(
             None,
         )
     });
+    // The unban takes effect no earlier than this request, so a ban the member
+    // directory observed after it stays ordered after the confirmed unban.
+    let requested_at_ms = chrono::Utc::now().timestamp_millis().max(1);
     let outcome = match tokio::time::timeout(
         std::time::Duration::from_secs(u64::from(limits.request_timeout_secs)),
         discord.unban(enrollment.guild_id, user, "Ban duration expired"),
@@ -740,6 +842,33 @@ async fn dispatch_expired_ban(
         && let Err(error) = db::mark_enrolled_unbanned(db, Some(enrollment.clone()), user).await
     {
         tracing::warn!(user, "expired ban mirror not saved: {error:#}");
+    }
+    // As for a queued unban, a confirmed removal (not Discord's idempotent
+    // 10026) is saved to the member directory so a missed Gateway callback
+    // cannot leave the user shown as banned. It is observed at the request
+    // time: a re-ban the directory saw during the request, including one whose
+    // contested check already settled, is newer and is kept and rechecked.
+    if outcome.state == "succeeded"
+        && outcome.code != "already_unbanned"
+        && let Some(app) = app
+    {
+        let observed = match app.tenant.live(enrollment.clone()).await {
+            Ok((store, scope)) => store.observe_unban(scope, user, requested_at_ms).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = observed {
+            tracing::warn!(
+                guild = enrollment.guild_id,
+                user,
+                "confirmed automatic unban state not saved: {error:#}"
+            );
+            app.remember_member_gap(
+                enrollment.guild_id as u64,
+                Some(enrollment.id.clone()),
+                Some(user),
+                "confirmed unban persistence unavailable",
+            );
+        }
     }
     if let Some(app) = app {
         crate::cases::record_application(

@@ -188,12 +188,27 @@ The same bot task lifts due timed bans (`!ban <user> --minutes N`, see
 [COMMANDS.md](COMMANDS.md)) after each queue drain, examining at most `batch_size` due
 bans per poll. Expiries in a fenced guild wait until the fence is cleared. Before
 consuming a deadline the worker checks the bot's own join timestamp through REST, as the
-executor does. An unavailable check defers that guild's expiries to a later poll; the
-rest of the poll continues with other guilds. A newer join repairs the enrollment; the
-old membership's deadline is then never dispatched.
+executor does. An unavailable check defers that guild's expiries; the rest of the poll
+continues with other guilds. The guild is then skipped until a retry time held in the
+bot process: 60 seconds after that failed check finishes, doubling after each consecutive
+failure up to 15 minutes, and cleared by a successful check. Checks in one poll run in
+turn and each may wait for the request timeout, so the delay counts from that check's
+end rather than the poll's start. A failure count is forgotten only after a poll reaches
+every due expiry without checking that guild again. A batch of unavailable guilds
+therefore cannot hold every poll's batch and starve later guilds. A restart checks each
+guild again. A newer join repairs the enrollment; the old membership's deadline is then
+never dispatched. That check did answer, so it clears the guild's retry time instead of
+setting one.
 While the deadline is consumed and the unban runs, the worker holds the same in-process
 slot as a ban command, so a concurrent ban of that user is refused instead of being
 undone. A command that holds the slot defers the expiry.
+
+As for a queued unban, a confirmed automatic unban (not Discord's `already_unbanned`
+response) is saved to the guild's member directory, so a missed Gateway callback does
+not leave the user shown as banned. The save is dated when the unban request was sent,
+so a ban the directory observed after that time, such as an external re-ban during the
+request, is kept and queued for a Discord ban check. If that save fails, the bot logs
+`confirmed automatic unban state not saved` and records a member-directory coverage gap.
 
 A consumed deadline is not restored. Each automatic unban is attempted **once**: a
 failed or uncertain Discord request is not retried after a poll, restart or upgrade.

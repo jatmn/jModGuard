@@ -560,6 +560,58 @@ pub async fn record_enrolled_ban_if_absent(
     kind: BanRecord,
     operation_id: Option<&str>,
 ) -> Result<Option<i64>> {
+    record_ban_if_absent_binding(
+        db,
+        enrollment,
+        user_id,
+        user_name,
+        user_display_name,
+        moderator_id,
+        moderator_name,
+        reason,
+        occurred_at,
+        kind,
+        operation_id,
+        None,
+    )
+    .await
+    .map(|recorded| recorded.published)
+}
+
+/// What [`record_ban_if_absent_binding`] wrote, and which row a timed ban may bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandBanRecord {
+    /// The row inserted or filled; `Some` means the caller may publish.
+    pub published: Option<i64>,
+    /// The row a timed ban's deadline may bind to. Decided in the recording
+    /// transaction: `Some` only while the user's active row is still the one
+    /// captured before the command read Discord.
+    pub expiry_ban: Option<i64>,
+}
+
+/// [`record_enrolled_ban_if_absent`] that also decides, in the same
+/// transaction, whether the command's deadline may bind to the result.
+/// `captured` is the active ban row (`Some(None)`: none) read before the
+/// command observed Discord, or `None` when it is unknown. While the active
+/// row still matches the capture, the recorded row (or the captured row, when
+/// nothing is written) may take the deadline. A lift, replacement or newly
+/// recorded ban since the capture leaves `expiry_ban` empty: a check made
+/// before this transaction cannot authorize that rebinding.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_ban_if_absent_binding(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    user_name: Option<&str>,
+    user_display_name: Option<&str>,
+    moderator_id: Option<i64>,
+    moderator_name: Option<&str>,
+    reason: &str,
+    occurred_at: Option<&str>,
+    kind: BanRecord,
+    operation_id: Option<&str>,
+    captured: Option<Option<i64>>,
+) -> Result<CommandBanRecord> {
     let (now, reason) = (
         occurred_at.map(str::to_owned).unwrap_or_else(now_str),
         reason.to_string(),
@@ -574,6 +626,18 @@ pub async fn record_enrolled_ban_if_absent(
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let keeps_capture = match captured {
+            Some(captured) => active_ban_id(&tx, guild_id, user_id)? == captured,
+            None => false,
+        };
+        let bind = |row: Option<i64>| CommandBanRecord {
+            published: row,
+            expiry_ban: if keeps_capture {
+                row.or(captured.flatten())
+            } else {
+                None
+            },
+        };
         let same_dispatch: Option<i64> = tx
             .query_row(
                 "SELECT id FROM bans
@@ -586,7 +650,7 @@ pub async fn record_enrolled_ban_if_absent(
             .optional()?;
         if kind == BanRecord::Retry && same_dispatch.is_some() {
             tx.finish_read()?;
-            return Ok(None);
+            return Ok(bind(None));
         }
         let same_attempt: Option<i64> = match operation_id.as_deref() {
             Some(operation_id) => tx
@@ -624,7 +688,7 @@ pub async fn record_enrolled_ban_if_absent(
             )?;
             anyhow::ensure!(updated == 1, "gateway ban echo was no longer this attempt");
             tx.commit()?;
-            return Ok(Some(row_id));
+            return Ok(bind(Some(row_id)));
         }
         tx.execute_matching(
             "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
@@ -638,7 +702,7 @@ pub async fn record_enrolled_ban_if_absent(
         )?;
         let row_id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(Some(row_id))
+        Ok(bind(Some(row_id)))
     })
     .await
 }
@@ -1966,10 +2030,25 @@ pub async fn clear_enrolled_warns(
     .await
 }
 
-/// Attach a deadline to the current ban, scoped to the command's membership.
+/// Primary read of the user's active ban row, captured before a timed-ban
+/// command observes Discord so [`set_ban_expiry`] can refuse a replacement.
+pub async fn active_ban_row(db: &Db, guild_id: i64, user_id: i64) -> Result<Option<i64>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let row = active_ban_id(&tx, guild_id, user_id)?;
+        tx.finish_read()?;
+        Ok(row)
+    })
+    .await
+}
+
+/// Attach a deadline to the ban row the command observed or recorded, scoped
+/// to the command's membership. A row that was lifted or replaced meanwhile is
+/// refused, so a newer ban never inherits this command's deadline.
 pub async fn set_ban_expiry(
     db: &Db,
     enrollment: GuildEnrollment,
+    ban_id: i64,
     user: i64,
     expires_at: i64,
 ) -> Result<()> {
@@ -1979,8 +2058,8 @@ pub async fn set_ban_expiry(
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let changed = tx.execute_matching(
             "UPDATE bans SET expires_at=?1,expiry_enrollment_id=?2
-             WHERE guild_id=?3 AND user_id=?4 AND active=1",
-            params![expires_at, enrollment.id, enrollment.guild_id, user],
+             WHERE id=?3 AND guild_id=?4 AND user_id=?5 AND active=1",
+            params![expires_at, enrollment.id, ban_id, enrollment.guild_id, user],
         )?;
         anyhow::ensure!(changed == 1, "active ban unavailable; expiry was not saved");
         tx.commit()
