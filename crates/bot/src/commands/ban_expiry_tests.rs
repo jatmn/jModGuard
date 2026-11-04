@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
     // Discord reports no ban (the bot bans), a ban the mirror lacks, a ban
     // already recorded, or a recorded ban that an external unban and
-    // permanent reban replace while the command reads Discord.
-    for scenario in ["absent", "unrecorded", "recorded", "replaced"] {
+    // permanent reban replace while the command reads Discord, with the
+    // reban's Gateway write either recorded or still pending.
+    for scenario in ["absent", "unrecorded", "recorded", "replaced", "lifted"] {
         let discord_has_ban = scenario != "absent";
         let path =
             std::env::temp_dir().join(format!("timed_ban_log_{:032x}.db", rand::random::<u128>()));
@@ -54,8 +55,10 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
                     let request = String::from_utf8(request).unwrap();
                     let line = request.lines().next().unwrap_or_default().to_owned();
                     let (status, body) = if line.starts_with("GET /api/v10/guilds/10/bans/91 ") {
-                        if scenario == "replaced" {
+                        if matches!(scenario, "replaced" | "lifted") {
                             db::mark_unbanned(&database, 10, 91).await.unwrap();
+                        }
+                        if scenario == "replaced" {
                             db::record_ban(&database, 10, 91, None, "permanent")
                                 .await
                                 .unwrap();
@@ -123,7 +126,7 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
         app.activation.mark_lock_held(true);
         let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
         app.tenant.activate(enrollment).await.unwrap();
-        if matches!(scenario, "recorded" | "replaced") {
+        if matches!(scenario, "recorded" | "replaced" | "lifted") {
             db::record_ban(&app.db, 10, 91, Some(7), "spam")
                 .await
                 .unwrap();
@@ -164,7 +167,7 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             })
             .await
             .unwrap();
-        if scenario == "replaced" {
+        if matches!(scenario, "replaced" | "lifted") {
             // The replacement keeps no deadline; the command reports the miss.
             let error = outcome
                 .err()
@@ -175,7 +178,10 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             );
             assert_ne!(Some(active.0), observed);
             assert_eq!(active.1, None);
-            assert!(seen_at_log.lock().unwrap().is_empty(), "{requests:?}");
+            // A lift the mirror saw first leaves the Discord ban to be recorded
+            // and logged, still without a deadline.
+            let logged: &[Option<i64>] = if scenario == "lifted" { &[None] } else { &[] };
+            assert_eq!(*seen_at_log.lock().unwrap(), logged, "{requests:?}");
         } else {
             outcome.unwrap_or_else(|error| panic!("ban failed: {error:#}; requests {requests:?}"));
         }
@@ -189,7 +195,7 @@ async fn timed_ban_saves_its_deadline_before_moderation_log_delivery() {
             );
             assert!(seen_at_log.lock().unwrap().is_empty(), "{requests:?}");
         }
-        if matches!(scenario, "recorded" | "replaced") {
+        if matches!(scenario, "recorded" | "replaced" | "lifted") {
             assert!(
                 requests.iter().all(|line| !line.starts_with("PUT ")),
                 "{requests:?}"

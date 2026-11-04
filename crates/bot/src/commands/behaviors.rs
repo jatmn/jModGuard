@@ -171,6 +171,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await;
                     abort_if_mod_reason_dm_cancelled(dm_outcome)?;
+                    // A captured ban that is no longer the primary's active row
+                    // was lifted meanwhile: the Discord ban is a replacement and
+                    // the row recorded for it keeps no deadline.
+                    let observed_active = match expiry_ban {
+                        Some(ban) => {
+                            db::active_ban_row(
+                                &env.app.db,
+                                env.guild_id.get() as i64,
+                                target.get() as i64,
+                            )
+                            .await?
+                                == Some(ban)
+                        }
+                        None => true,
+                    };
                     if let Some(row) = continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -184,7 +199,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     )
                     .await?
                     {
-                        expiry_ban = Some(row);
+                        if observed_active {
+                            expiry_ban = Some(row);
+                        }
                         log_ban = true;
                     }
                 }
