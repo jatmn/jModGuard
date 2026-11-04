@@ -135,7 +135,7 @@ the bot stores it in `meta.update_alert_channel_v1`. On its configuration poll t
 posts each new mismatch once to that channel: the component, the running build (or
 that it is stopped), the expected release and source SHA, and the reason (`registry
 unreachable`, a signature rejection, `registry download failed`, or, from launcher
-revision 38, `registry unreachable; built-in application schema does not match the
+revision 39, `registry unreachable; built-in application schema does not match the
 database`). Launcher retries and restarts that save the same mismatch do not post
 again; a cleared or changed mismatch does. Without a channel the bot logs one warning
 per mismatch and the cards above still show it; choosing a channel later posts it
