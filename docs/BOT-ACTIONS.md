@@ -190,8 +190,11 @@ bans per poll. Expiries in a fenced guild wait until the fence is cleared. Befor
 consuming a deadline the worker checks the bot's own join timestamp through REST, as the
 executor does. An unavailable check defers that guild's expiries; the rest of the poll
 continues with other guilds. The guild is then skipped until a retry time held in the
-bot process: 60 seconds after the first failure, doubling after each consecutive failure
-up to 15 minutes, and cleared by a successful check. A batch of unavailable guilds
+bot process: 60 seconds after that failed check finishes, doubling after each consecutive
+failure up to 15 minutes, and cleared by a successful check. Checks in one poll run in
+turn and each may wait for the request timeout, so the delay counts from that check's
+end rather than the poll's start. A failure count is forgotten only after a poll reaches
+every due expiry without checking that guild again. A batch of unavailable guilds
 therefore cannot hold every poll's batch and starve later guilds. A restart checks each
 guild again. A newer join repairs the enrollment; the old membership's deadline is then
 never dispatched.

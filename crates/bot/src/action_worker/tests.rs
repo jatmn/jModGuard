@@ -2030,9 +2030,11 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
     }
 }
 
-/// Reports a distinct live membership result per guild.
+/// Reports a distinct live membership result per guild. With `hang`, a check
+/// of a guild not in `joined` never answers, so it reaches the request timeout.
 struct PerGuildMembership {
     joined: std::collections::HashMap<i64, Option<i64>>,
+    hang: bool,
     checks: std::sync::Mutex<Vec<i64>>,
     unbans: std::sync::Mutex<Vec<(i64, i64)>>,
 }
@@ -2045,6 +2047,7 @@ impl DiscordActions for PerGuildMembership {
         self.checks.lock().unwrap().push(guild);
         match self.joined.get(&guild) {
             Some(joined) => Ok(*joined),
+            None if self.hang => std::future::pending().await,
             None => anyhow::bail!("membership unavailable"),
         }
     }
@@ -2074,6 +2077,7 @@ async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
     }
     let discord = PerGuildMembership {
         joined: [(11, Some(1)), (12, None), (13, Some(1_000_000_001))].into(),
+        hang: false,
         checks: Default::default(),
         unbans: Default::default(),
     };
@@ -2099,7 +2103,8 @@ async fn timed_ban_expiry_defers_until_live_membership_is_confirmed() {
     );
 }
 
-#[tokio::test]
+// Paused: retry times count from each check's end on the runtime clock.
+#[tokio::test(start_paused = true)]
 async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guilds() {
     let f = Fixture::new();
     let limits = WorkerLimits::default();
@@ -2121,6 +2126,7 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
     }
     let discord = PerGuildMembership {
         joined: [(11, Some(1))].into(),
+        hang: false,
         checks: Default::default(),
         unbans: Default::default(),
     };
@@ -2174,7 +2180,8 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
     );
 }
 
-#[tokio::test]
+// Paused: retry times count from each check's end on the runtime clock.
+#[tokio::test(start_paused = true)]
 async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_guilds() {
     let f = Fixture::new();
     let limits = WorkerLimits::default();
@@ -2194,6 +2201,7 @@ async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_g
     }
     let discord = PerGuildMembership {
         joined: [(healthy, Some(1))].into(),
+        hang: false,
         checks: Default::default(),
         unbans: Default::default(),
     };
@@ -2242,6 +2250,110 @@ async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_g
         failing
     );
     assert!(app.expiry_check_retries.waiting(now).is_empty());
+}
+
+/// A full batch of earlier guilds whose checks each hang until the request
+/// timeout, then a healthy guild. Runs one poll that spends the batch on the
+/// slow failures, then starts the next poll as soon as it ends (the earliest a
+/// worker tick can follow a long pass). Returns the state, failing guilds, timeout, and the
+/// second poll's start time and checks.
+async fn slow_failed_checks_then_a_healthy_guild(
+    limits: WorkerLimits,
+) -> (
+    std::sync::Arc<crate::state::BotState>,
+    Vec<i64>,
+    i64,
+    i64,
+    Vec<i64>,
+) {
+    let f = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    let failing: Vec<i64> = (1000..).take(limits.batch_size as usize).collect();
+    let healthy = 99;
+    let healthy_expires_at = 100 + i64::from(limits.batch_size);
+    for (guild, expires_at) in failing
+        .iter()
+        .copied()
+        .zip(100..)
+        .chain([(healthy, healthy_expires_at)])
+    {
+        let enrollment = db::enroll_guild(&f.db, guild, 1).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        db::record_ban(&f.db, guild, 20, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&f.db, enrollment, 20, expires_at).await.unwrap();
+    }
+    let discord = PerGuildMembership {
+        joined: [(healthy, Some(1))].into(),
+        hang: true,
+        checks: Default::default(),
+        unbans: Default::default(),
+    };
+    // Wall clock for the polls: 200 when the first poll starts, advancing
+    // with the paused runtime clock that the request timeouts use.
+    let started = tokio::time::Instant::now();
+    let clock = || 200 + i64::try_from(started.elapsed().as_secs()).unwrap();
+    let timeout = i64::from(limits.request_timeout_secs);
+
+    expire_bans(&f.db, Some(&app), &discord, clock(), &limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::mem::take(&mut *discord.checks.lock().unwrap()),
+        failing
+    );
+    assert!(discord.unbans.lock().unwrap().is_empty());
+    assert_eq!(clock(), 200 + i64::from(limits.batch_size) * timeout);
+
+    // The next poll reaches the healthy guild even though the slow failures
+    // took longer than the first retry delay.
+    let second = clock();
+    expire_bans(&f.db, Some(&app), &discord, second, &limits)
+        .await
+        .unwrap();
+    let checks = std::mem::take(&mut *discord.checks.lock().unwrap());
+    assert_eq!(checks.last(), Some(&healthy));
+    assert_eq!(*discord.unbans.lock().unwrap(), vec![(healthy, 20)]);
+    (app, failing, timeout, second, checks)
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_ban_expiry_retry_counts_from_each_slow_check_with_default_limits() {
+    // Four 15-second timeouts end the first poll at its first retry time.
+    let (_, _, _, _, checks) =
+        slow_failed_checks_then_a_healthy_guild(WorkerLimits::default()).await;
+    assert_eq!(checks, vec![99]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_ban_expiry_retry_survives_a_maximum_slow_batch() {
+    // 64 two-minute timeouts outlast the longest delay and its old pruning.
+    let limits = WorkerLimits {
+        batch_size: 64,
+        request_timeout_secs: 120,
+    };
+    let (app, failing, timeout, second, checks) =
+        slow_failed_checks_then_a_healthy_guild(limits).await;
+    // Only the guilds whose retry time passed during the first poll repeat.
+    let base = EXPIRY_CHECK_RETRY_BASE_SECS;
+    let due_again = failing
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| 200 + (*index as i64 + 1) * timeout + base <= second)
+        .map(|(_, guild)| *guild);
+    assert_eq!(checks, due_again.chain([99]).collect::<Vec<_>>());
+    // The first guild failed again 2 minutes into the second poll; its
+    // backoff was kept, so the delay doubled.
+    let retried = second + timeout;
+    let waiting = app.expiry_check_retries.waiting(retried + 2 * base - 1);
+    assert!(waiting.contains(&failing[0]));
+    assert!(
+        !app.expiry_check_retries
+            .waiting(retried + 2 * base)
+            .contains(&failing[0])
+    );
 }
 
 #[tokio::test]

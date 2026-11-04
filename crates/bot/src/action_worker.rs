@@ -596,10 +596,14 @@ async fn expire_bans(
     // A failed membership check skips the whole guild for this pass and, with
     // a bot state, until that guild's saved retry time, so a batch of
     // unavailable guilds cannot spend every pass and starve later guilds.
+    // `now` selects due bans; checks run one after another and can each take
+    // up to the request timeout, so retry times count from each check's end.
+    let started = tokio::time::Instant::now();
     let mut deferred = Vec::new();
     let mut deferred_guilds = app
         .map(|app| app.expiry_check_retries.waiting(now))
         .unwrap_or_default();
+    let mut exhausted = false;
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
@@ -607,13 +611,15 @@ async fn expire_bans(
         let Some(due) =
             db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
         else {
+            exhausted = true;
             break;
         };
         if !expiry_membership_matches(db, app, discord, &due, limits).await? {
             deferred_guilds.push(due.enrollment.guild_id);
             if let Some(app) = app {
+                let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
                 app.expiry_check_retries
-                    .failed(due.enrollment.guild_id, now);
+                    .failed(due.enrollment.guild_id, now.saturating_add(elapsed));
             }
             continue;
         }
@@ -642,6 +648,9 @@ async fn expire_bans(
         dispatch_expired_ban(db, app, discord, due, limits).await?;
         drop(in_progress);
     }
+    if exhausted && let Some(app) = app {
+        app.expiry_check_retries.forget_idle(now);
+    }
     Ok(())
 }
 
@@ -658,7 +667,10 @@ struct ExpiryCheckRetry {
 
 /// Per-guild retry time after a failed expiry membership check. In-process
 /// only: a restart checks each guild once more. One entry per failing guild;
-/// a success removes it and an entry unused past the longest delay is pruned.
+/// a success removes it. An entry is dropped only after a pass checked every
+/// due ban outside waiting guilds without using it: that guild then had no due
+/// ban. A full batch never drops one, so a slow pass cannot reset the backoff
+/// of guilds that still block later guilds.
 #[derive(Default)]
 pub(crate) struct ExpiryCheckRetries(
     parking_lot::Mutex<std::collections::HashMap<i64, ExpiryCheckRetry>>,
@@ -667,9 +679,8 @@ pub(crate) struct ExpiryCheckRetries(
 impl ExpiryCheckRetries {
     /// Guilds whose retry time has not yet arrived.
     fn waiting(&self, now: i64) -> Vec<i64> {
-        let mut retries = self.0.lock();
-        retries.retain(|_, retry| now < retry.retry_at + EXPIRY_CHECK_RETRY_MAX_SECS);
-        retries
+        self.0
+            .lock()
             .iter()
             .filter(|(_, retry)| now < retry.retry_at)
             .map(|(guild, _)| *guild)
@@ -695,6 +706,12 @@ impl ExpiryCheckRetries {
 
     fn succeeded(&self, guild: i64) {
         self.0.lock().remove(&guild);
+    }
+
+    /// After a pass that checked every due ban selected at `now`: an entry
+    /// already due at `now` and not checked again had no due ban.
+    fn forget_idle(&self, now: i64) {
+        self.0.lock().retain(|_, retry| now < retry.retry_at);
     }
 }
 
