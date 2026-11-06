@@ -133,7 +133,7 @@ serves them at `http://localhost:8080`.
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
 
-For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` are set on the API container (never git); see
+For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.
 
 **Another host or CDN.** Copy the five generated files to the site root

@@ -148,10 +148,11 @@ Set these on the **API container** (Bunny's container environment, never git):
 | `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
 | `BUNNY_STORAGE_ENDPOINT` | Regional host; default `storage.bunnycdn.com` |
 | `BUNNY_PULL_ZONE_ID` | Admin Pull Zone id purged after a WebUI install |
-| `BUNNY_PURGE_API_KEY` | API key scoped to PullZone.Purge (not the account API key) |
+| `BUNNY_PURGE_API_KEY` | API key scoped to PullZone.Purge, where the account offers scoped keys (never the account API key) |
 
 Set both purge values or neither. Neither skips the purge with a warning;
-exactly one fails the install.
+exactly one fails the install. Without a scoped purge key, leave both unset
+and purge the Pull Zone from the dashboard after each WebUI install.
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 5),
