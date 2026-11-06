@@ -155,8 +155,9 @@ database backup unless a release note says otherwise.
 
 Both containers ship together in one app update. The bot container migrates,
 and the API container keeps `/health` at 200 and `/ready` at 503 until the
-schema matches. Both must keep using the same Bunny Database. Upload
-matching built `dist/frontend/` to Storage and purge the Pull Zone when the page needs
+schema matches. Both must keep using the same Bunny Database. Install the
+matching WebUI from **Administration → Updates**, which publishes to Storage and
+purges the Pull Zone ([BUNNY-UPDATES.md](BUNNY-UPDATES.md)), when the page needs
 the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **Override Origin URL** (`OriginUrl`), not OriginMagicContainers.

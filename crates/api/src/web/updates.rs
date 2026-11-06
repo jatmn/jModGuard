@@ -275,6 +275,97 @@ fn storage() -> anyhow::Result<Storage> {
     )
 }
 
+const BUNNY_API: &str = "https://api.bunny.net";
+const PURGE_ATTEMPTS: u32 = 6;
+const PURGE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Pull Zone purge target for a managed WebUI install. The key is a scoped
+/// PullZone.Purge API key, never the account API key.
+struct PullZonePurge {
+    zone: String,
+    key: String,
+}
+
+impl PullZonePurge {
+    /// Both values unset skips the purge; exactly one set is partial
+    /// configuration and fails closed before Storage is touched.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<Self>> {
+        let read = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        match (read("BUNNY_PULL_ZONE_ID"), read("BUNNY_PURGE_API_KEY")) {
+            (None, None) => Ok(None),
+            (Some(zone), Some(key)) => {
+                anyhow::ensure!(
+                    !zone.starts_with('0') && zone.bytes().all(|c| c.is_ascii_digit()),
+                    "BUNNY_PULL_ZONE_ID must be a positive numeric Pull Zone ID"
+                );
+                anyhow::ensure!(
+                    axum::http::HeaderValue::from_str(&key).is_ok(),
+                    "BUNNY_PURGE_API_KEY is not a valid header value"
+                );
+                Ok(Some(Self { zone, key }))
+            }
+            _ => anyhow::bail!(
+                "set both BUNNY_PULL_ZONE_ID and BUNNY_PURGE_API_KEY to purge the Pull Zone, or neither to skip the purge"
+            ),
+        }
+    }
+}
+
+/// Purge the WebUI Pull Zone after a successful Storage publish. Never logs
+/// the key or a response body.
+async fn purge_webui_cache(
+    purge: Option<&PullZonePurge>,
+    api: &str,
+    retry_delay: Duration,
+) -> anyhow::Result<()> {
+    let Some(purge) = purge else {
+        tracing::warn!(
+            "BUNNY_PULL_ZONE_ID and BUNNY_PURGE_API_KEY are unset; skipping Pull Zone purge, so cached WebUI HTML may stay stale until its cache time expires"
+        );
+        return Ok(());
+    };
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = format!("{api}/pullzone/{}/purgeCache", purge.zone);
+    for attempt in 1..=PURGE_ATTEMPTS {
+        match http
+            .post(&url)
+            .header("AccessKey", &purge.key)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+        {
+            Ok(response)
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT
+                ) =>
+            {
+                return Ok(());
+            }
+            Ok(response) => tracing::warn!(
+                attempt,
+                status = response.status().as_u16(),
+                "Bunny Pull Zone purge attempt failed"
+            ),
+            Err(error) => tracing::warn!(
+                attempt,
+                "Bunny Pull Zone purge attempt failed: {}",
+                error.without_url()
+            ),
+        }
+        if attempt < PURGE_ATTEMPTS {
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+    anyhow::bail!(
+        "Bunny Pull Zone purge failed after {PURGE_ATTEMPTS} attempts; Storage already has the new WebUI files, and the CDN may serve stale HTML until a purge succeeds"
+    )
+}
+
 #[derive(Deserialize)]
 pub struct CheckRequest {
     component: String,
@@ -1305,6 +1396,7 @@ async fn run_webui_install(
 
 async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow::Result<()> {
     let storage = storage()?;
+    let purge = PullZonePurge::from_lookup(|name| std::env::var(name).ok())?;
     let now = chrono::Utc::now().timestamp();
     let result = async {
         via_bot!(
@@ -1317,6 +1409,7 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
         )?;
         let registry = Registry::ghcr()?;
         let _files = storage.publish(&registry, release).await?;
+        purge_webui_cache(purge.as_ref(), BUNNY_API, PURGE_RETRY_DELAY).await?;
         let index = storage
             .get("index.html")
             .await?
@@ -1361,6 +1454,144 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PurgeFixture {
+        statuses: Vec<StatusCode>,
+        requests: Vec<(String, String, String)>,
+    }
+
+    /// Local Bunny API stand-in: answers scripted statuses in order, then 200.
+    async fn purge_server(
+        statuses: Vec<StatusCode>,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<PurgeFixture>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        async fn endpoint(
+            State(state): State<Arc<tokio::sync::Mutex<PurgeFixture>>>,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
+            headers: HeaderMap,
+            body: String,
+        ) -> StatusCode {
+            let mut fixture = state.lock().await;
+            let key = headers
+                .get("AccessKey")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            fixture
+                .requests
+                .push((format!("{method} {}", uri.path()), key, body));
+            if fixture.statuses.is_empty() {
+                StatusCode::OK
+            } else {
+                fixture.statuses.remove(0)
+            }
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(PurgeFixture {
+            statuses,
+            ..PurgeFixture::default()
+        }));
+        let router = axum::Router::new()
+            .fallback(axum::routing::any(endpoint))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{address}"), state, server)
+    }
+
+    fn purge_env(zone: Option<&str>, key: Option<&str>) -> anyhow::Result<Option<PullZonePurge>> {
+        PullZonePurge::from_lookup(|name| match name {
+            "BUNNY_PULL_ZONE_ID" => zone.map(str::to_owned),
+            "BUNNY_PURGE_API_KEY" => key.map(str::to_owned),
+            "BUNNY_API_KEY" => Some("account-key-must-not-be-used".into()),
+            _ => None,
+        })
+    }
+
+    async fn run_purge(
+        zone: Option<&str>,
+        key: Option<&str>,
+        statuses: Vec<StatusCode>,
+    ) -> (anyhow::Result<()>, Vec<(String, String, String)>) {
+        let (api, state, server) = purge_server(statuses).await;
+        let result = match purge_env(zone, key) {
+            Ok(purge) => purge_webui_cache(purge.as_ref(), &api, Duration::from_millis(1)).await,
+            Err(error) => Err(error),
+        };
+        let requests = state.lock().await.requests.clone();
+        server.abort();
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn webui_purge_skips_when_neither_value_is_set() {
+        let (result, requests) = run_purge(None, None, vec![]).await;
+        result.unwrap();
+        assert!(requests.is_empty());
+        let (result, requests) = run_purge(Some(""), Some(""), vec![]).await;
+        result.unwrap();
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webui_purge_fails_closed_on_partial_configuration() {
+        for (zone, key) in [(Some("123"), None), (None, Some("purge-only-secret"))] {
+            let (result, requests) = run_purge(zone, key, vec![]).await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("BUNNY_PULL_ZONE_ID and BUNNY_PURGE_API_KEY"));
+            assert!(!error.contains("purge-only-secret"));
+            assert!(requests.is_empty());
+        }
+        for zone in ["0", "012", "12/34", "abc"] {
+            assert!(purge_env(Some(zone), Some("purge-only-secret")).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn webui_purge_posts_scoped_key_and_accepts_ok_or_no_content() {
+        for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (result, requests) =
+                run_purge(Some("123"), Some("purge-only-secret"), vec![status]).await;
+            result.unwrap();
+            assert_eq!(
+                requests,
+                vec![(
+                    "POST /pullzone/123/purgeCache".to_owned(),
+                    "purge-only-secret".to_owned(),
+                    "{}".to_owned(),
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webui_purge_retries_until_success() {
+        let failures = vec![
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::ACCEPTED,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::UNAUTHORIZED,
+        ];
+        let (result, requests) = run_purge(Some("123"), Some("purge-only-secret"), failures).await;
+        result.unwrap();
+        assert_eq!(requests.len(), PURGE_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn webui_purge_fails_after_all_attempts() {
+        let failures = vec![StatusCode::SERVICE_UNAVAILABLE; PURGE_ATTEMPTS as usize + 1];
+        let (result, requests) = run_purge(Some("123"), Some("purge-only-secret"), failures).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("purge failed after 6 attempts"));
+        assert!(!error.contains("purge-only-secret"));
+        assert_eq!(requests.len(), PURGE_ATTEMPTS as usize);
+    }
 
     #[test]
     fn scheduled_auto_install_allows_only_promoted_cadences() {
