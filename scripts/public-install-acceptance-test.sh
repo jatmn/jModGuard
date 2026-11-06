@@ -96,6 +96,10 @@ for relative in docs/DEPLOY-BUNNY.md docs/WEBUI.md docs/BUNNY-UPDATES.md; do
   require_absent "$relative" "publish-frontend-bunny.sh"
 done
 require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_ZONE"
+# Mutable HTML keeps edge cache time 0 and browser revalidation after purge is live.
+require_contains docs/BUNNY-UPDATES.md "Keep that rule after purge is live"
+require_absent docs/BUNNY-UPDATES.md "Until purge is live"
+require_absent docs/BUNNY-UPDATES.md "only until purge is live"
 require_contains docs/WEBUI.md "BUNNY_STORAGE_ZONE"
 
 # test_bunny_dashboard_copy_matches_live_controls

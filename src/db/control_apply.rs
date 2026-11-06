@@ -221,6 +221,9 @@ pub enum ControlOp {
     RecordWebuiDrift {
         error: String,
     },
+    SetWebuiPurgePending {
+        error: Option<String>,
+    },
     RecordWebuiInstalledVerified {
         release: ComponentRelease,
         observation: ComponentObservation,
@@ -397,6 +400,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::RecordLauncherFailure { .. }
         | ControlOp::SelectRequiredLauncher { .. }
         | ControlOp::RecordWebuiDrift { .. }
+        | ControlOp::SetWebuiPurgePending { .. }
         | ControlOp::RecordWebuiInstalledVerified { .. }
         | ControlOp::TrackWebuiAssets { .. }
         | ControlOp::UntrackWebuiAssets { .. }
@@ -857,6 +861,10 @@ async fn apply_control_inner(
         }
         ControlOp::RecordWebuiDrift { error } => {
             record_webui_drift(db, &error).await?;
+            saved_null()
+        }
+        ControlOp::SetWebuiPurgePending { error } => {
+            set_webui_purge_pending(db, error).await?;
             saved_null()
         }
         ControlOp::RecordWebuiInstalledVerified {
