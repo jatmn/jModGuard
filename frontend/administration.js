@@ -236,7 +236,8 @@ function ComponentCard({ record, revision }) {
     }
   }
   const inProgress = pending(record);
-  const problem = record.check_error || record.last_error || record.state === "failed" || record.state === "drift";
+  const purgePending = record.component === "webui" && ui.getSnapshot().snapshot.webui_purge_pending;
+  const problem = record.check_error || record.last_error || purgePending || record.state === "failed" || record.state === "drift";
   heading.push(badge(ui.getSnapshot().stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
     ui.getSnapshot().stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
     ui.getSnapshot().stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
@@ -245,6 +246,7 @@ function ComponentCard({ record, revision }) {
     line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
   }
   line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
+  if (purgePending) line(content, "CDN purge", `Pending: ${purgePending}. Check now retries the purge.`);
   line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
   line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
   const pairActive = ui.getSnapshot().snapshot.service_upgrade && !["complete", "aborted"].includes(ui.getSnapshot().snapshot.service_upgrade.phase);

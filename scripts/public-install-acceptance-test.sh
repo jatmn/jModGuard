@@ -87,13 +87,20 @@ require_contains docs/BUNNY-UPDATES.md 'optional runtime launcher update from re
 require_contains docs/BUNNY-UPDATES.md 'application minimum remains 7'
 require_contains docs/BUNNY-UPDATES.md 'signature-verifier threshold remains 19'
 
-# test_bunny_publish_script_env_names_in_operator_docs
+# test_managed_webui_env_names_in_operator_docs
+for relative in docs/DEPLOY-BUNNY.md docs/WEBUI.md docs/BUNNY-UPDATES.md; do
+  require_contains "$relative" "BUNNY_STORAGE_PASSWORD"
+  require_contains "$relative" "BUNNY_PULL_ZONE_ID"
+  require_contains "$relative" "BUNNY_PURGE_API_KEY"
+  require_absent "$relative" "BUNNY_API_KEY"
+  require_absent "$relative" "publish-frontend-bunny.sh"
+done
 require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_ZONE"
-require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_PASSWORD"
-require_contains docs/DEPLOY-BUNNY.md "BUNNY_PULL_ZONE_ID"
-require_contains docs/DEPLOY-BUNNY.md "BUNNY_API_KEY"
+# Mutable HTML keeps edge cache time 0 and browser revalidation after purge is live.
+require_contains docs/BUNNY-UPDATES.md "Keep that rule after purge is live"
+require_absent docs/BUNNY-UPDATES.md "Until purge is live"
+require_absent docs/BUNNY-UPDATES.md "only until purge is live"
 require_contains docs/WEBUI.md "BUNNY_STORAGE_ZONE"
-require_contains docs/WEBUI.md "BUNNY_PULL_ZONE_ID"
 
 # test_bunny_dashboard_copy_matches_live_controls
 for relative in docs/DEPLOY-BUNNY.md docs/WEBUI.md docs/UPGRADE.md docs/SETUP.md; do
@@ -178,6 +185,8 @@ JS
 [[ ! -e "$root/scripts/frontend_release.py" ]] || fail "scripts/frontend_release.py must not exist"
 [[ ! -e "$root/scripts/frontend-release-test.py" ]] || fail "scripts/frontend-release-test.py must not exist"
 [[ ! -e "$root/scripts/frontend_publication.py" ]] || fail "scripts/frontend_publication.py must not exist"
+[[ ! -e "$root/scripts/publish-frontend-bunny.sh" ]] || fail "scripts/publish-frontend-bunny.sh must not exist"
+[[ ! -e "$root/scripts/frontend_publication.sh" ]] || fail "scripts/frontend_publication.sh must not exist"
 [[ ! -e "$root/docs/examples/private-ops" ]] || fail "docs/examples/private-ops must not exist"
 for relative in \
   docs/INSTALL.md \
@@ -188,9 +197,7 @@ for relative in \
   docs/CI.md \
   AGENTS.md \
   README.md \
-  scripts/ci-preflight.sh \
-  scripts/publish-frontend-bunny.sh \
-  scripts/frontend_publication.sh
+  scripts/ci-preflight.sh
 do
   require_absent "$relative" "frontend_release.py"
   require_absent "$relative" "frontend-release-test.py"
@@ -226,8 +233,6 @@ require_absent docs/INSTALL.md "python3 scripts/install-local"
 require_contains docs/INSTALL.md "scripts/public-install-acceptance-test.sh"
 require_contains docs/OVERHAUL.md "scripts/public-install-acceptance-test.sh"
 require_contains scripts/ci-preflight.sh "bash scripts/public-install-acceptance-test.sh"
-require_contains scripts/publish-frontend-bunny.sh "frontend_publication.sh"
-require_absent scripts/publish-frontend-bunny.sh "frontend_publication.py"
 require_absent scripts/ci-preflight.sh "public-install-acceptance-test.py"
 
 # Remaining CI/tooling must not require Python.

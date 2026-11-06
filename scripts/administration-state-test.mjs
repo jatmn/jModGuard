@@ -487,6 +487,24 @@ test("pending installs surface terminal failures and leave Check now available f
   assert.equal(updateButton(view, "webui").disabled, false);
 });
 
+test("a pending CDN purge keeps a reconciled WebUI release in Needs attention", () => {
+  const view = page();
+  const webui = record("webui");
+  webui.installed = { ...webui.candidate };
+  webui.observed = { ...webui.observed, source_sha: webui.candidate.source_sha };
+  const show = (pending) => run("ui.set({ snapshot: " + JSON.stringify({
+    components: [webui], compatibility: { webui: { installable: true } },
+    apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
+    webui_purge_pending: pending,
+  }) + ", stale: false, authorized: true });", view.context);
+  show(null);
+  assert.match(textOf(view.elements.get("update-cards")), /Up to date/);
+  show("Bunny Pull Zone purge failed after 6 attempts");
+  const text = textOf(view.elements.get("update-cards"));
+  assert.match(text, /Needs attention/);
+  assert.match(text, /CDN purge.*Pending: Bunny Pull Zone purge failed after 6 attempts\. Check now retries the purge\./);
+});
+
 test("a failed policy save restores the server's channel and displays the error", async () => {
   const item = record("api");
   const view = await ready(async (url) => {
