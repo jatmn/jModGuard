@@ -407,9 +407,16 @@ async fn purge_and_record(
     }
 }
 
-/// Managed WebUI install order: purge configuration is checked before
-/// `publish` runs, and the Pull Zone is purged only after it succeeds. A
-/// publication failure sends no purge.
+/// Pending-purge marker held while a configured install publishes and purges.
+const PURGE_PENDING_DURING_INSTALL: &str =
+    "WebUI Storage publication started before a Pull Zone purge was accepted";
+
+/// Managed WebUI install order: purge configuration is checked and, when
+/// configured, the pending-purge marker is made durable before `publish` runs,
+/// so a restart or failed purge after the Storage cutover stays retryable. The
+/// install fails closed if the marker cannot be kept. The Pull Zone is purged
+/// only after publication succeeds; a publication failure sends no purge and
+/// restores the marker's previous state.
 async fn publish_then_purge<T>(
     app: &ApiState,
     lookup: impl Fn(&str) -> Option<String>,
@@ -418,7 +425,22 @@ async fn publish_then_purge<T>(
     retry_delay: Duration,
 ) -> anyhow::Result<T> {
     let purge = PullZonePurge::from_lookup(lookup)?;
-    let published = publish().await?;
+    let mut provisional = false;
+    if purge.is_some() && db::webui_purge_pending(&app.db).await?.is_none() {
+        set_purge_pending(app, Some(PURGE_PENDING_DURING_INSTALL.to_owned()))
+            .await
+            .context("WebUI pending purge could not be recorded before publication")?;
+        provisional = true;
+    }
+    let published = match publish().await {
+        Ok(published) => published,
+        Err(error) => {
+            if provisional && let Err(clear_error) = set_purge_pending(app, None).await {
+                tracing::warn!("WebUI pending purge marker was not cleared: {clear_error:#}");
+            }
+            return Err(error);
+        }
+    };
     purge_and_record(app, purge.as_ref(), api, retry_delay).await?;
     Ok(published)
 }
@@ -1733,7 +1755,8 @@ mod tests {
             assert!(format!("{:#}", result.unwrap_err()).contains("BUNNY_PULL_ZONE_ID"));
         }
         assert!(!published.get());
-        // A publication failure sends no purge and records no pending purge.
+        assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
+        // A publication failure sends no purge and leaves nothing pending.
         let result = publish_then_purge(
             &app,
             purge_values(Some("123"), Some("purge-only-secret")),
@@ -1745,11 +1768,16 @@ mod tests {
         assert!(format!("{:#}", result.unwrap_err()).contains("Storage upload failed"));
         assert!(state.lock().await.requests.is_empty());
         assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
-        // Publication completes before the single purge request.
+        // The purge obligation is durable before publication, which completes
+        // before the single purge request; the accepted purge clears it.
         let result = publish_then_purge(
             &app,
             purge_values(Some("123"), Some("purge-only-secret")),
             async || {
+                assert_eq!(
+                    db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                    Some(PURGE_PENDING_DURING_INSTALL)
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 assert!(state.lock().await.requests.is_empty());
                 published.set(true);
@@ -1762,13 +1790,79 @@ mod tests {
         assert_eq!(result.unwrap(), "published");
         assert!(published.get());
         assert_eq!(state.lock().await.requests.len(), 1);
+        assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
+        // A publication failure keeps an earlier unresolved purge.
+        db::set_webui_purge_pending(&app.db, Some("earlier purge failed".into()))
+            .await
+            .unwrap();
+        let result = publish_then_purge(
+            &app,
+            purge_values(Some("123"), Some("purge-only-secret")),
+            async || -> anyhow::Result<()> { anyhow::bail!("Storage upload failed") },
+            &api,
+            delay,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(state.lock().await.requests.len(), 1);
+        assert_eq!(
+            db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+            Some("earlier purge failed")
+        );
         server.abort();
         remove_test_db(app, path);
     }
 
     #[tokio::test]
-    async fn webui_purge_failure_survives_storage_reconciliation_until_a_purge_succeeds() {
+    async fn webui_install_fails_closed_when_the_pending_purge_write_is_rejected() {
         let (app, path) = purge_test_app();
+        // A read-only API whose control write is rejected, as by an older bot
+        // that does not know SetWebuiPurgePending.
+        let mut cfg = (*app.cfg).clone();
+        cfg.db.path = path.clone();
+        let reader = Db::open_with(cfg.db_open_options()).unwrap();
+        assert!(reader.is_read_only());
+        let rejecting = ApiState::new(cfg, reader).unwrap();
+        let (api, state, server) = purge_server(vec![]).await;
+        let published = std::cell::Cell::new(false);
+        let error = publish_then_purge(
+            &rejecting,
+            purge_values(Some("123"), Some("purge-only-secret")),
+            async || {
+                published.set(true);
+                Ok(())
+            },
+            &api,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("could not be recorded before publication"));
+        assert!(!published.get());
+        assert!(state.lock().await.requests.is_empty());
+        assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
+        // Without purge configuration there is no obligation to record.
+        publish_then_purge(
+            &rejecting,
+            purge_values(None, None),
+            async || {
+                published.set(true);
+                Ok(())
+            },
+            &api,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert!(published.get());
+        assert!(state.lock().await.requests.is_empty());
+        server.abort();
+        drop(rejecting);
+        remove_test_db(app, path);
+    }
+
+    #[tokio::test]
+    async fn webui_purge_obligation_survives_failed_or_interrupted_purge_through_reconciliation() {
         let release = ComponentRelease {
             upgrade: None,
             component: "webui".into(),
@@ -1803,73 +1897,107 @@ mod tests {
             self_update_enabled: true,
             base_abi: "static-webui-v1".into(),
         };
-        db::record_update_check(
-            &app.db,
-            "webui",
-            &release.channel,
-            Some(release.clone()),
-            None,
-            100,
-        )
-        .await
-        .unwrap();
-        let (_, lease) = queue_webui_install(None, &app.db, &release.digest, 101)
+        // Every attempt fails, or the install is cancelled (as by an API
+        // restart) while waiting to retry after its first failed attempt.
+        for interrupted in [false, true] {
+            let (app, path) = purge_test_app();
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &release.channel,
+                Some(release.clone()),
+                None,
+                100,
+            )
             .await
             .unwrap();
-        db::release_update_lease(&app.db, "webui", &lease)
+            let (_, lease) = queue_webui_install(None, &app.db, &release.digest, 101)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            let failures = vec![StatusCode::SERVICE_UNAVAILABLE; PURGE_ATTEMPTS as usize];
+            let (api, state, server) = purge_server(failures).await;
+            let configured = purge_values(Some("123"), Some("purge-only-secret"));
+            let attempts = if interrupted {
+                let install = publish_then_purge(
+                    &app,
+                    &configured,
+                    async || Ok(()),
+                    &api,
+                    Duration::from_secs(3600),
+                );
+                tokio::select! {
+                    _ = install => panic!("install finished instead of waiting to retry"),
+                    () = async {
+                        while state.lock().await.requests.is_empty() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    } => {}
+                }
+                1
+            } else {
+                let error = publish_then_purge(
+                    &app,
+                    &configured,
+                    async || Ok(()),
+                    &api,
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap_err();
+                // run_webui_install records the failure.
+                db::record_component_failure(&app.db, "webui", &release, &format!("{error:#}"))
+                    .await
+                    .unwrap();
+                PURGE_ATTEMPTS as usize
+            };
+            assert_eq!(state.lock().await.requests.len(), attempts);
+            // Storage reconciliation adopts the verified published release.
+            record_running(
+                &app,
+                "webui",
+                Some(release.clone()),
+                observation.clone(),
+                102,
+            )
             .await
             .unwrap();
-        let failures = vec![StatusCode::SERVICE_UNAVAILABLE; PURGE_ATTEMPTS as usize];
-        let (api, state, server) = purge_server(failures).await;
-        let delay = Duration::from_millis(1);
-        let configured = purge_values(Some("123"), Some("purge-only-secret"));
-        let error = publish_then_purge(&app, &configured, async || Ok(()), &api, delay)
-            .await
-            .unwrap_err();
-        // run_webui_install records the failure; Storage reconciliation then
-        // adopts the verified published release and marks it running.
-        db::record_component_failure(&app.db, "webui", &release, &format!("{error:#}"))
-            .await
-            .unwrap();
-        record_running(
-            &app,
-            "webui",
-            Some(release.clone()),
-            observation.clone(),
-            102,
-        )
-        .await
-        .unwrap();
-        db::record_webui_installed_verified(&app.db, &release, observation, 103)
-            .await
-            .unwrap();
-        let row = db::component_update(&app.db, "webui").await.unwrap();
-        assert_eq!(row.state, "running");
-        assert!(row.last_error.is_none());
-        let pending = db::webui_purge_pending(&app.db).await.unwrap().unwrap();
-        assert!(pending.contains("purge failed after 6 attempts"));
-        assert!(!pending.contains("purge-only-secret"));
-        let status = status_response(&app, None).await.unwrap().0;
-        assert_eq!(status["webui_purge_pending"], pending.as_str());
-        // A check without purge values cannot resolve it.
-        retry_pending_purge(&app, purge_values(None, None), &api, delay)
-            .await
-            .unwrap();
-        assert!(db::webui_purge_pending(&app.db).await.unwrap().is_some());
-        assert_eq!(state.lock().await.requests.len(), PURGE_ATTEMPTS as usize);
-        // A check whose purge is accepted clears it.
-        retry_pending_purge(&app, &configured, &api, delay)
-            .await
-            .unwrap();
-        assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
-        assert_eq!(
-            state.lock().await.requests.len(),
-            PURGE_ATTEMPTS as usize + 1
-        );
-        let status = status_response(&app, None).await.unwrap().0;
-        assert!(status["webui_purge_pending"].is_null());
-        server.abort();
-        remove_test_db(app, path);
+            db::record_webui_installed_verified(&app.db, &release, observation.clone(), 103)
+                .await
+                .unwrap();
+            let row = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(row.state, "running");
+            assert!(row.last_error.is_none());
+            let pending = db::webui_purge_pending(&app.db).await.unwrap().unwrap();
+            if interrupted {
+                assert_eq!(pending, PURGE_PENDING_DURING_INSTALL);
+            } else {
+                assert!(pending.contains("purge failed after 6 attempts"));
+            }
+            assert!(!pending.contains("purge-only-secret"));
+            let status = status_response(&app, None).await.unwrap().0;
+            assert_eq!(status["webui_purge_pending"], pending.as_str());
+            // A check without purge values cannot resolve it.
+            let delay = Duration::from_millis(1);
+            retry_pending_purge(&app, purge_values(None, None), &api, delay)
+                .await
+                .unwrap();
+            assert!(db::webui_purge_pending(&app.db).await.unwrap().is_some());
+            assert_eq!(state.lock().await.requests.len(), attempts);
+            // A check whose purge is accepted clears it.
+            state.lock().await.statuses.clear();
+            retry_pending_purge(&app, &configured, &api, delay)
+                .await
+                .unwrap();
+            assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
+            assert_eq!(state.lock().await.requests.len(), attempts + 1);
+            let status = status_response(&app, None).await.unwrap().0;
+            assert!(status["webui_purge_pending"].is_null());
+            server.abort();
+            remove_test_db(app, path);
+        }
     }
 
     #[test]
