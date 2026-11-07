@@ -4138,6 +4138,7 @@ fn expired_ban_selection_puts_listed_guilds_last_in_list_order() {
     let tmp = tmp_db_path("expiry_last_guilds");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
+        let mut bans = Vec::new();
         for (guild, expires_at) in [(10, 100), (11, 101), (12, 102)] {
             let enrollment = enroll_guild(&db, guild, 1).await.unwrap().unwrap();
             record_ban(&db, guild, 20, None, "timed").await.unwrap();
@@ -4145,12 +4146,17 @@ fn expired_ban_selection_puts_listed_guilds_last_in_list_order() {
             set_ban_expiry(&db, enrollment, ban, 20, expires_at)
                 .await
                 .unwrap();
+            bans.push(ban);
         }
+        let next_skipping =
+            async |skip_bans: Vec<i64>, skip_guilds: Vec<i64>, last_guilds: Vec<i64>| {
+                next_expired_ban(&db, 200, skip_bans, skip_guilds, last_guilds)
+                    .await
+                    .unwrap()
+                    .map(|due| due.enrollment.guild_id)
+            };
         let next = async |skip_guilds: Vec<i64>, last_guilds: Vec<i64>| {
-            next_expired_ban(&db, 200, Vec::new(), skip_guilds, last_guilds)
-                .await
-                .unwrap()
-                .map(|due| due.enrollment.guild_id)
+            next_skipping(Vec::new(), skip_guilds, last_guilds).await
         };
         // Unlisted guilds first by deadline, then listed guilds in list order;
         // listed guilds without a due ban are passed over in the same read.
@@ -4159,6 +4165,16 @@ fn expired_ban_selection_puts_listed_guilds_last_in_list_order() {
         assert_eq!(next(vec![12], vec![99, 11, 10]).await, Some(11));
         assert_eq!(next(vec![11, 12], vec![98, 99, 10]).await, Some(10));
         assert_eq!(next(vec![10, 11, 12], vec![98, 99]).await, None);
+        // A listed guild whose only due ban was deferred is passed over too.
+        assert_eq!(
+            next_skipping(vec![bans[0]], vec![12], vec![10, 11]).await,
+            Some(11)
+        );
+        // Without retries, deferred bans and guilds are still skipped.
+        assert_eq!(
+            next_skipping(vec![bans[0]], vec![11], Vec::new()).await,
+            Some(12)
+        );
     });
     drop(db);
     cleanup_db(&tmp);
