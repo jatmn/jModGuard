@@ -551,7 +551,9 @@ run_timed_cargo_test() {
   local nextest_help nextest_ok=0 cfg
   if command -v cargo-nextest >/dev/null 2>&1; then
     nextest_help="$(cargo nextest run --help 2>&1 || true)"
-    if printf '%s\n' "$nextest_help" | grep -Fq -- '--config-file'; then
+    # Match in the shell: piping the multi-KB help into grep -q can end in
+    # SIGPIPE (141) under pipefail, which would look like a missing option.
+    if [[ "$nextest_help" == *--config-file* ]]; then
       nextest_ok=1
     fi
   fi
@@ -628,14 +630,14 @@ EOF
     for h in "${harness[@]}"; do
       case "$h" in
         --include-ignored)
-          if printf '%s\n' "$nextest_help" | grep -Fq -- '--run-ignored'; then
+          if [[ "$nextest_help" == *--run-ignored* ]]; then
             nextest_args+=(--run-ignored all)
           else
             can_nextest=0
           fi
           ;;
         --nocapture)
-          if printf '%s\n' "$nextest_help" | grep -Fq -- '--no-capture'; then
+          if [[ "$nextest_help" == *--no-capture* ]]; then
             nextest_args+=(--no-capture)
           else
             can_nextest=0

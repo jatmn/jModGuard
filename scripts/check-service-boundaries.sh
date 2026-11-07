@@ -117,13 +117,15 @@ for event in guild_ban_addition guild_ban_removal; do
     receiver='receive_ban'
     case_guard='record_unresolved_gateway_observation(echo.suppress_case)'
   fi
-  printf '%s\n' "$function" | grep -Fq "$suppression" \
+  # Match in the shell: piping a multi-KB function into grep -q can end in
+  # SIGPIPE (141) under pipefail when grep exits before printf finishes.
+  [[ "$function" == *"$suppression"* ]] \
     || fail "Gateway $event must capture bot echo suppression"
-  printf '%s\n' "$function" | grep -Fq "gateway_ban_persistence::$receiver(" \
+  [[ "$function" == *"gateway_ban_persistence::$receiver("* ]] \
     || fail "Gateway $event must delegate to its retained persistence owner"
   owner="$(extract_persistence "$receiver")"
   for required in 'tokio::spawn(async move' "$case_guard" 'gateway_case(' 'save(&app.db, delivery).await?'; do
-    printf '%s\n' "$owner" | grep -Fq "$required" \
+    [[ "$owner" == *"$required"* ]] \
       || fail "Gateway $event retained owner must suppress echoes and durably retain external cases: $required"
   done
 done
