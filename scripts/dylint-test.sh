@@ -36,6 +36,9 @@ if [ "${1:-}" = install ] && [ "${2:-}" = --list ]; then
     ver="${DYLINT_TEST_LISTED_VERSION:-6.1.0}"
   fi
   printf 'cargo-dylint v%s:\n    cargo-dylint\n\ndylint-link v%s:\n    dylint-link\n' "$ver" "$ver"
+  if [ -n "${DYLINT_TEST_LARGE_CARGO_LIST:-}" ]; then
+    cat "$DYLINT_TEST_LARGE_CARGO_LIST"
+  fi
 elif [ "${1:-}" = install ]; then
   {
     field RUSTFLAGS
@@ -122,6 +125,9 @@ case "$*" in
       exit 0
     fi
     printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)' 'rustc-dev-x86_64-unknown-linux-gnu (installed)'
+    if [ -n "${DYLINT_TEST_LARGE_COMPONENT_LIST:-}" ]; then
+      cat "$DYLINT_TEST_LARGE_COMPONENT_LIST"
+    fi
     ;;
   'toolchain install nightly-2026-08-20 --component llvm-tools-preview,rustc-dev')
     if [ "${DYLINT_TEST_RUSTUP_FAIL:-0}" = 1 ]; then
@@ -224,6 +230,25 @@ fi
 run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES=''
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 
+# Listings larger than a pipe buffer, with the wanted entries first. If a
+# listing is piped into a reader that stops at the first match, the stub is
+# killed by SIGPIPE before it finishes and pipefail reports exit 141.
+large_listing="$fixture/large-listing"
+awk 'BEGIN { for (i = 0; i < 20000; i++) printf "    filler-entry-%05d (available)\n", i }' >"$large_listing"
+[ "$(wc -c <"$large_listing")" -gt 262144 ] || fail 'large listing fixture is smaller than intended'
+large_state="$fixture/large-listing-toolchain"
+touch "$large_state"
+run_dylint "$fixture/external" \
+  DYLINT_TEST_TOOLCHAIN_STATE="$large_state" DYLINT_TEST_LARGE_COMPONENT_LIST="$large_listing" \
+  || fail "large rustup component listing failed dylint (exit $?)"
+grep -Fq 'toolchain-nightly-2026-08-20: already-present' "$stdout_file" \
+  || fail 'large rustup component listing hid installed components'
+[ ! -s "$large_state" ] || fail 'large rustup component listing reinstalled a complete nightly'
+rm -f "$install_capture"
+run_dylint "$fixture/external" DYLINT_TEST_LARGE_CARGO_LIST="$large_listing" \
+  || fail "large cargo install listing failed dylint (exit $?)"
+[ ! -f "$install_capture" ] || fail 'large cargo install listing reinstalled matching tools'
+
 prefix="$fixture/opt"
 pinned_root="$prefix/dylint-6.1.0"
 mkdir -p "$pinned_root/bin"
@@ -238,6 +263,11 @@ if [ -f "$install_capture" ]; then
 fi
 grep -Fq 'dylint: using pinned tools at' "$stdout_file" || fail 'missing pinned tools message'
 grep -Fq 'dylint-libs absent' "$stdout_file" || fail 'missing dylint-libs absent message'
+run_dylint "$fixture/external" DYLINT_TEST_LARGE_CARGO_LIST="$large_listing" \
+  || fail "large pinned cargo install listing failed dylint (exit $?)"
+grep -Fq 'dylint: using pinned tools at' "$stdout_file" \
+  || fail 'large pinned cargo install listing hid the pinned tools'
+[ ! -f "$install_capture" ] || fail 'large pinned cargo install listing ran cargo install'
 path_prefix="$(value "$capture" PATH)"
 case "$path_prefix" in
   "$pinned_root/bin:"*) ;;

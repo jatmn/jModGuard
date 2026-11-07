@@ -75,16 +75,20 @@ dylint_lib_names=(
   wrong_serialize_struct_arg
 )
 
+# Capture a command's whole listing before matching it. Piping the command into
+# a reader that exits at the first match can kill the writer with SIGPIPE, and
+# pipefail then turns a found entry into a failure (exit 141).
 toolchain_components_installed() {
   local channel="$1"
   shift
-  local comp needle missing=0
+  local comp needle components missing=0
+  components="$(rustup component list --toolchain "$channel")" || return 1
   for comp in "$@"; do
     needle=$comp
     if [ "$comp" = llvm-tools-preview ]; then
       needle=llvm-tools
     fi
-    if ! rustup component list --toolchain "$channel" | awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
+    if ! awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }' <<<"$components"; then
       missing=1
     fi
   done
@@ -174,21 +178,20 @@ esac
 # `cargo dylint -V`. `dylint-link` is a linker wrapper and has no version
 # flag, so read both versions from `cargo install --list`.
 installed_version() {
-  local crate="$1"
-  cargo install --list 2>/dev/null | awk -v crate="$crate" '
-    $1 == crate {
-      ver = $2
-      sub(/^v/, "", ver)
-      sub(/:$/, "", ver)
-      print ver
-      exit
-    }
-  '
+  local list
+  list="$(cargo install --list 2>/dev/null)" || return
+  listed_crate_version "$1" "$list"
 }
 
 installed_version_root() {
-  local crate="$1" install_root="$2"
-  cargo install --list --root "$install_root" 2>/dev/null | awk -v crate="$crate" '
+  local list
+  list="$(cargo install --list --root "$2" 2>/dev/null)" || return
+  listed_crate_version "$1" "$list"
+}
+
+# Reads the captured listing; see toolchain_components_installed.
+listed_crate_version() {
+  awk -v crate="$1" '
     $1 == crate {
       ver = $2
       sub(/^v/, "", ver)
@@ -196,7 +199,7 @@ installed_version_root() {
       print ver
       exit
     }
-  '
+  ' <<<"$2"
 }
 
 dylint_lib_key_digest() {

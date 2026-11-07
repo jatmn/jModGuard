@@ -188,6 +188,23 @@ contains_arg() {
   return 1
 }
 
+# grep the elements of the array named by $1, one per line. Capture the text
+# first: piping a multi-argument printf into grep -q can kill printf with
+# SIGPIPE when grep exits at an early match, and pipefail then reports 141.
+grep_array() {
+  local -n grep_array_items="$1"
+  local text
+  shift
+  text="$(printf '%s\n' "${grep_array_items[@]}")"
+  grep "$@" <<<"$text"
+}
+# More than a pipe buffer of lines with the match first: a pipe into grep -q
+# would end in SIGPIPE here.
+grep_array_probe=(match)
+for ((i = 0; i < 20000; i++)); do grep_array_probe+=("filler line $i"); done
+grep_array grep_array_probe -qx match || fail 'grep_array must match an early line in a large array'
+unset grep_array_probe
+
 readarray -d '' -t nightly_args < <(build_args bot "$HEAD_SHA" "nightly-20260915-${HEAD_SHA:0:12}" . nightly current "$(staging_ref bot)")
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${nightly_args[@]}" \
   && fail 'nightly must not move latest'
@@ -548,11 +565,11 @@ exercise_publish() {
 
 reload_publisher
 exercise_publish 0
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' && fail 'unchanged main must not build'
-printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree' && fail 'unchanged main must not use a worktree'
-printf '%s\n' "${CALLS[@]}" | grep -q 'secret get' && fail 'unchanged main must not read secrets'
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker login' && fail 'unchanged main must not log in'
-printf '%s\n' "${CALLS[@]}" | grep -q 'mask tokens' && fail 'unchanged main must not redact'
+grep_array CALLS -q 'docker buildx build' && fail 'unchanged main must not build'
+grep_array CALLS -q 'git worktree' && fail 'unchanged main must not use a worktree'
+grep_array CALLS -q 'secret get' && fail 'unchanged main must not read secrets'
+grep_array CALLS -q 'docker login' && fail 'unchanged main must not log in'
+grep_array CALLS -q 'mask tokens' && fail 'unchanged main must not redact'
 
 with_main
 unset GHCR_USERNAME GHCR_TOKEN || true
@@ -565,9 +582,9 @@ mock_publish_helpers
 changed_since_publication() { return 1; }
 ( publish_component api ) >/dev/null 2>&1 || true
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q 'plan get' \
+grep_array CALLS -q 'plan get' \
   || fail 'skip without credentials must still read the plan'
-printf '%s\n' "${CALLS[@]}" | grep -qE 'docker |secret get|mask tokens' \
+grep_array CALLS -qE 'docker |secret get|mask tokens' \
   && fail "skip without credentials must not touch docker or secrets: ${CALLS[*]}"
 
 exercise_publish 1 || fail "main publication exercise failed: ${PUBLISH_LAST_ERROR:-unknown}"
@@ -582,16 +599,16 @@ grep -Fq 'digest_from_build_metadata' "$root/scripts/publish-image.sh" \
   || fail 'publisher must read the build output digest from metadata'
 [[ "$BUILD_LINE" != *'--tag ghcr.io/jatmn/jmodguard-api:latest'* ]] \
   || fail 'main build must not move latest before verification'
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' \
+grep_array CALLS -q 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' \
   || fail 'verified main image must move latest by digest'
-verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify api ' | head -1 | cut -d: -f1)"
-sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^sign api ' | head -1 | cut -d: -f1)"
-promote_line="$(printf '%s\n' "${CALLS[@]}" | grep -n 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' | head -1 | cut -d: -f1)"
+verify_line="$(grep_array CALLS -n '^verify api ' | head -1 | cut -d: -f1)"
+sign_line="$(grep_array CALLS -n '^sign api ' | head -1 | cut -d: -f1)"
+promote_line="$(grep_array CALLS -n 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' | head -1 | cut -d: -f1)"
 [[ -n "$verify_line" && -n "$sign_line" && -n "$promote_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$promote_line" ]] \
   || fail 'latest must move only after verification and signing'
 [[ "$GITHUB_TOKEN_SEEN" == test-secret ]] || fail "build secret must fall back to GHCR token, got '$GITHUB_TOKEN_SEEN'"
-printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'publish must remove the worktree'
-printf '%s\n' "${CALLS[@]}" | grep -q 'test-secret' && fail 'secret must not appear on argv'
+grep_array CALLS -q 'git worktree remove' || fail 'publish must remove the worktree'
+grep_array CALLS -q 'test-secret' && fail 'secret must not appear on argv'
 [[ "$LOGIN_INPUT" == test-secret ]] || fail 'login must read the token from stdin'
 [[ "$(REDACTOR_INPUT="$REDACTOR_INPUT" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.REDACTOR_INPUT);
@@ -610,27 +627,27 @@ JS
 )" == "$SIGNING_PASSWORD_VALUE" ]] || fail 'redactor must receive the signing password'
 
 exercise_publish 1 1
-printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'failed build must still remove the worktree'
+grep_array CALLS -q 'git worktree remove' || fail 'failed build must still remove the worktree'
 
 for component in bot api webui; do
   exercise_publish 1 0 main '' '' "$component" 1
   [[ "$BUILD_LINE" != *"--tag ghcr.io/jatmn/jmodguard-${component}:latest"* ]] \
     || fail "$component failed verification moved latest during build"
-  printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
+  grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
     && fail "$component failed verification promoted latest"
 done
 
 stable_plan="$(plan_json manual refs/tags/v1 "$HEAD_SHA" "$BASE_SHA" v1.2.3)"
 exercise_publish 1 0 manual '' "$stable_plan" bot 1
-printf '%s\n' "${CALLS[@]}" | grep -q -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' \
+grep_array CALLS -q -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' \
   && fail 'failed Stable verification promoted stable'
-printf '%s\n' "${CALLS[@]}" | grep -q -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' \
+grep_array CALLS -q -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' \
   && fail 'failed Stable verification promoted latest'
 exercise_publish 1 0 manual '' "$stable_plan" bot
-verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify bot ' | head -1 | cut -d: -f1)"
-sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^sign bot ' | head -1 | cut -d: -f1)"
-latest_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' | head -1 | cut -d: -f1)"
-stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' | head -1 | cut -d: -f1)"
+verify_line="$(grep_array CALLS -n '^verify bot ' | head -1 | cut -d: -f1)"
+sign_line="$(grep_array CALLS -n '^sign bot ' | head -1 | cut -d: -f1)"
+latest_line="$(grep_array CALLS -n -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' | head -1 | cut -d: -f1)"
+stable_line="$(grep_array CALLS -n -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' | head -1 | cut -d: -f1)"
 [[ -n "$verify_line" && -n "$sign_line" && -n "$latest_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$latest_line" && "$sign_line" -lt "$stable_line" ]] \
   || fail 'Stable publication must sign before promoting moving pointers'
 
@@ -642,10 +659,10 @@ for component in bot api webui; do
     || fail "$component release must build the selected release SHA to staging"
   [[ "$BUILD_LINE" != *"--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3"* ]] \
     || fail "$component release must not push the version tag before signing"
-  verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^verify $component " | cut -d: -f1)"
-  sign_line="$(printf '%s\n' "${CALLS[@]}" | grep -n "^sign $component " | cut -d: -f1)"
-  version_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3" | cut -d: -f1)"
-  stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:stable" | cut -d: -f1)"
+  verify_line="$(grep_array CALLS -n "^verify $component " | cut -d: -f1)"
+  sign_line="$(grep_array CALLS -n "^sign $component " | cut -d: -f1)"
+  version_line="$(grep_array CALLS -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:v1.2.3" | cut -d: -f1)"
+  stable_line="$(grep_array CALLS -n -- "--tag ghcr.io/jatmn/jmodguard-${component}:stable" | cut -d: -f1)"
   [[ -n "$verify_line" && -n "$sign_line" && -n "$version_line" && -n "$stable_line" && "$verify_line" -lt "$sign_line" && "$sign_line" -lt "$version_line" && "$sign_line" -lt "$stable_line" ]] \
     || fail "$component release must sign before promoting version and Stable tags"
 
@@ -738,7 +755,7 @@ for component in bot api webui; do
   exercise_publish 0 0 manual '' '' "$component" 0 current "$BASE_SHA"
   printf '%s\n' "$BUILD_LINE" | grep -q "$(staging_ref "$component" "$BASE_SHA")" \
     || fail "manual SHA publication must still build ${component} to staging"
-  printf '%s\n' "${CALLS[@]}" | grep -q "^verify ${component} " \
+  grep_array CALLS -q "^verify ${component} " \
     || fail "manual SHA publication must verify ${component} before promotion"
 done
 
@@ -747,7 +764,7 @@ done
 # labels cannot claim owner-updater compatibility.
 for component in bot api; do
   exercise_publish 0 0 manual '' '' "$component" 0 legacy
-  printf '%s\n' "${CALLS[@]}" | grep -q "^verify ${component} .* legacy$" \
+  grep_array CALLS -q "^verify ${component} .* legacy$" \
     || fail "historical ${component} must receive the legacy final-image check"
   [[ "$BUILD_LINE" != *'io.jmodguard.launcher-protocol'* ]] \
     || fail "historical ${component} must not claim updater compatibility"
@@ -756,14 +773,14 @@ for component in bot api; do
 fi
 printf '%s\n' "$BUILD_LINE" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
     || fail "historical ${component} must label a valid publication timestamp for signing"
-  printf '%s\n' "${CALLS[@]}" | grep -q "^sign ${component} " \
+  grep_array CALLS -q "^sign ${component} " \
     || fail "historical ${component} must sign before promoting latest"
-  printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
+  grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
     || fail "verified historical ${component} may still move latest for dashboard rollback"
 done
 exercise_publish 0 0 manual '' '' webui 0 legacy
 [[ -z "$BUILD_LINE" ]] || fail 'historical source must skip the nonexistent WebUI package'
-printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' \
+grep_array CALLS -q 'git worktree remove' \
   || fail 'historical WebUI skip must remove the selected source worktree'
 
 reload_publisher
@@ -1226,7 +1243,7 @@ JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing key must fail publication'
 fi
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+grep_array CALLS -q 'docker buildx imagetools create' \
   && fail 'missing signing key must not promote tags'
 
 reload_publisher
@@ -1235,7 +1252,7 @@ JMODGUARD_UPDATE_SIGNING_PASSWORD=""
 if exercise_publish 1 >/dev/null 2>&1; then
   fail 'missing signing password must fail publication'
 fi
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+grep_array CALLS -q 'docker buildx imagetools create' \
   && fail 'missing signing password must not promote tags'
 
 FAIL_SIGN=1
@@ -1244,7 +1261,7 @@ JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 if exercise_publish 1 >/dev/null 2>&1; then
   fail 'failed signing must fail publication'
 fi
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+grep_array CALLS -q 'docker buildx imagetools create' \
   && fail 'failed signing must not promote tags'
 FAIL_SIGN=0
 unset JMODGUARD_UPDATE_SIGNING_KEY JMODGUARD_UPDATE_SIGNING_PASSWORD
@@ -1273,7 +1290,7 @@ if ( publish_component api ) >/dev/null 2>&1; then
 fi
 [[ -f "$phase_state_dir/api.json" ]] && fail 'build phase must not write publish state after runtime verification failure'
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+grep_array CALLS -q 'docker buildx imagetools create' \
   && fail 'build phase must not promote tags when verification fails'
 rm -rf "$phase_state_dir"
 unset JMODGUARD_PUBLISH_PHASE FAIL_RUNTIME
@@ -1306,7 +1323,7 @@ if ( publish_component api ) >/dev/null 2>&1; then
   fail 'sign phase must fail when cosign sign fails'
 fi
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create' \
+grep_array CALLS -q 'docker buildx imagetools create' \
   && fail 'sign phase must not promote tags when signing fails'
 rm -rf "$phase_state_dir"
 unset JMODGUARD_PUBLISH_PHASE FAIL_SIGN
@@ -1368,13 +1385,13 @@ rm -f "$trusted_sign_dir/api.json"
 : >"$TRACE_FILE"
 ( publish_component api ) >/dev/null 2>&1 || fail 'sign phase must succeed from trusted plan and registry without build state'
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
+grep_array CALLS -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
   || fail 'sign phase must sign the registry digest for the trusted staging reference'
-printf '%s\n' "${CALLS[@]}" | grep -q "@${MOCK_BUILD_DIGEST}" \
+grep_array CALLS -q "@${MOCK_BUILD_DIGEST}" \
   || fail 'sign phase must promote the trusted registry digest, not forged build state'
-printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" \
+grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" \
   || fail 'sign phase must promote tags derived from the publication plan SHA'
-printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
+grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
   && fail 'sign phase must not promote tags from forged build state'
 rm -rf "$trusted_sign_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
@@ -1424,9 +1441,9 @@ export GITHUB_RUN_ATTEMPT
   finish_deferred_promotions
 ) >/dev/null 2>&1 || fail 'sign retry must succeed using the staged registry digest'
 load_trace
-printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build' \
+grep_array CALLS -q 'docker buildx build' \
   && fail 'sign retry must not rebuild the image'
-printf '%s\n' "${CALLS[@]}" | grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
+grep_array CALLS -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" \
   || fail 'sign retry must sign the staged registry digest'
 for tag in "$HEAD_SHA" latest; do
   grep '^docker buildx imagetools create ' "$TRACE_FILE" | grep -Fq -- ":${tag} " \
@@ -1567,7 +1584,7 @@ if exercise_publish 1 >/dev/null 2>&1; then
 else
   :
 fi
-if printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx build'; then
+if grep_array CALLS -q 'docker buildx build'; then
   fail 'mismatched signing key must not build images'
 fi
 rm -rf "$WRONG_SIGNING_DIR"
@@ -1590,10 +1607,11 @@ got="$(image_published_at "ghcr.io/jatmn/jmodguard-bot@sha256:$(printf 'a%.0s' {
 assert_eq "$got" "2026-10-27T17:00:00Z"
 
 reload_publisher
+# shellcheck disable=SC2034 # read through grep_array's nameref
 readarray -d '' -t legacy_sign_args < <(build_args bot "$HEAD_SHA" "" . stable legacy "$(staging_ref bot)")
-printf '%s\n' "${legacy_sign_args[@]}" | grep -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+grep_array legacy_sign_args -Eq 'io\.jmodguard\.published-at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
   || fail 'legacy builds must carry a valid publication timestamp for signing'
-printf '%s\n' "${legacy_sign_args[@]}" | grep -q 'io.jmodguard.launcher-protocol=1' \
+grep_array legacy_sign_args -q 'io.jmodguard.launcher-protocol=1' \
   && fail 'legacy builds must not claim updater compatibility'
 
 grep -q 'BEGIN PUBLIC KEY' "$root/deploy/update-signing.pub" \
