@@ -598,22 +598,50 @@ async fn expire_bans(
     // unavailable guilds cannot spend every pass and starve later guilds.
     // `now` selects due bans; checks run one after another and can each take
     // up to the request timeout, so retry times count from each check's end.
+    // Guilds whose retry time has arrived come after every other due ban,
+    // earliest retry time first. Enough failing guilds to fill every poll
+    // therefore cannot starve guilds that have not failed, or a retry that has
+    // waited longer. Each read, found or not, counts against the batch, and
+    // one read passes over every earlier retry guild that has no due ban.
     let started = tokio::time::Instant::now();
     let mut deferred = Vec::new();
     let mut deferred_guilds = app
         .map(|app| app.expiry_check_retries.waiting(now))
+        .unwrap_or_default();
+    let mut retries = app
+        .map(|app| app.expiry_check_retries.due(now))
         .unwrap_or_default();
     let mut exhausted = false;
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
         }
-        let Some(due) =
-            db::next_expired_ban(db, now, deferred.clone(), deferred_guilds.clone()).await?
+        #[cfg(test)]
+        tests::EXPIRY_SELECTIONS.with(|count| count.set(count.get() + 1));
+        let Some(due) = db::next_expired_ban(
+            db,
+            now,
+            deferred.clone(),
+            deferred_guilds.clone(),
+            retries.clone(),
+        )
+        .await?
         else {
             exhausted = true;
             break;
         };
+        // Reaching a retry guild releases it; the retry guilds before it had
+        // no due ban at `now`, so their entries are dropped as stale.
+        if let Some(position) = retries
+            .iter()
+            .position(|guild| *guild == due.enrollment.guild_id)
+        {
+            if let Some(app) = app {
+                app.expiry_check_retries
+                    .forget_stale(&retries[..position], now);
+            }
+            retries.drain(..=position);
+        }
         let membership = expiry_membership(db, app, discord, &due, limits).await?;
         if let Some(app) = app {
             // Only an unavailable check waits for a retry time. A check that
@@ -674,10 +702,11 @@ struct ExpiryCheckRetry {
 
 /// Per-guild retry time after a failed expiry membership check. In-process
 /// only: a restart checks each guild once more. One entry per failing guild;
-/// a success removes it. An entry is dropped only after a pass checked every
-/// due ban outside waiting guilds without using it: that guild then had no due
-/// ban. A full batch never drops one, so a slow pass cannot reset the backoff
-/// of guilds that still block later guilds.
+/// a success removes it. An entry is otherwise dropped only once a pass shows
+/// that guild had no due ban: the pass checked every due ban outside waiting
+/// guilds without using it, or a read reached a later retry guild past it. A
+/// full batch drops no other entry, so a slow pass cannot reset the backoff of
+/// guilds that still block later guilds.
 #[derive(Default)]
 pub(crate) struct ExpiryCheckRetries(
     parking_lot::Mutex<std::collections::HashMap<i64, ExpiryCheckRetry>>,
@@ -692,6 +721,19 @@ impl ExpiryCheckRetries {
             .filter(|(_, retry)| now < retry.retry_at)
             .map(|(guild, _)| *guild)
             .collect()
+    }
+
+    /// Guilds whose retry time has arrived, earliest retry time first.
+    fn due(&self, now: i64) -> Vec<i64> {
+        let mut due: Vec<_> = self
+            .0
+            .lock()
+            .iter()
+            .filter(|(_, retry)| retry.retry_at <= now)
+            .map(|(guild, retry)| (retry.retry_at, *guild))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, guild)| guild).collect()
     }
 
     fn failed(&self, guild: i64, now: i64) {
@@ -713,6 +755,20 @@ impl ExpiryCheckRetries {
 
     fn succeeded(&self, guild: i64) {
         self.0.lock().remove(&guild);
+    }
+
+    /// Drop entries still due at `now` for guilds a read at `now` passed over
+    /// because they had no due ban.
+    fn forget_stale(&self, guilds: &[i64], now: i64) {
+        let mut retries = self.0.lock();
+        for guild in guilds {
+            if retries
+                .get(guild)
+                .is_some_and(|retry| retry.retry_at <= now)
+            {
+                retries.remove(guild);
+            }
+        }
     }
 
     /// After a pass that checked every due ban selected at `now`: an entry

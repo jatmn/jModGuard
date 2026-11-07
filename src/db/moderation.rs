@@ -2076,48 +2076,93 @@ pub struct ExpiredBan {
     pub expires_at: i64,
 }
 
-/// Find the oldest due expiry under an active, unfenced membership without
-/// consuming it, so the caller can verify live membership first. `skip_bans`
-/// and `skip_guilds` hold ban and guild IDs already deferred in this pass.
-pub async fn next_expired_ban(
-    db: &Db,
-    now: i64,
-    skip_bans: Vec<i64>,
-    skip_guilds: Vec<i64>,
-) -> Result<Option<ExpiredBan>> {
-    let skip_bans = serde_json::to_string(&skip_bans)?;
-    let skip_guilds = serde_json::to_string(&skip_guilds)?;
-    db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
-        let due = tx
-            .query_row(
-                "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
+/// Oldest due expiry under an active, unfenced membership, outside deferred
+/// bans (?2) and skipped guilds (?3). Walks `idx_bans_expiry` in deadline
+/// order and stops at the first match; the skip lists are each built once.
+const DUE_EXPIRY_SQL: &str = "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
              FROM bans b JOIN guild_enrollments e
              ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
              WHERE b.active=1 AND b.expires_at<=?1
              AND b.id NOT IN (SELECT value FROM json_each(?2))
              AND b.guild_id NOT IN (SELECT value FROM json_each(?3))
              AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
-             ORDER BY b.expires_at,b.id LIMIT 1",
-                params![now, skip_bans, skip_guilds],
-                |r| {
-                    Ok(ExpiredBan {
-                        id: r.get(0)?,
-                        enrollment: GuildEnrollment {
-                            guild_id: r.get(1)?,
-                            id: r.get(3)?,
-                            joined_at_ns: r.get(4)?,
-                        },
-                        user: r.get(2)?,
-                        expires_at: r.get(5)?,
-                    })
-                },
+             ORDER BY b.expires_at,b.id LIMIT 1";
+
+/// Same filters for the listed retry guilds (?4) only: the first listed guild
+/// with a due expiry, then its oldest. The list drives the join (CROSS JOIN
+/// keeps it outermost) and each guild's active bans are searched by guild, so
+/// the work is one index search per listed guild plus their active bans, not
+/// a pass over the list for every due ban.
+const RETRY_EXPIRY_SQL: &str = "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
+             FROM json_each(?4) l CROSS JOIN bans b INDEXED BY idx_bans_one_active
+             JOIN guild_enrollments e
+             ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
+             WHERE b.guild_id=l.value AND b.active=1 AND b.expires_at<=?1
+             AND b.id NOT IN (SELECT value FROM json_each(?2))
+             AND b.guild_id NOT IN (SELECT value FROM json_each(?3))
+             AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
+             ORDER BY l.key,b.expires_at,b.id LIMIT 1";
+
+/// Find the oldest due expiry under an active, unfenced membership without
+/// consuming it, so the caller can verify live membership first. `skip_bans`
+/// and `skip_guilds` hold ban and guild IDs already deferred in this pass.
+/// Expiries in `last_guilds` come after every other due expiry, guild by guild
+/// in that order, so one read passes over listed guilds without one. Both
+/// queries share one read transaction; the second runs only when the list is
+/// not empty and the first found nothing.
+pub async fn next_expired_ban(
+    db: &Db,
+    now: i64,
+    skip_bans: Vec<i64>,
+    mut skip_guilds: Vec<i64>,
+    last_guilds: Vec<i64>,
+) -> Result<Option<ExpiredBan>> {
+    let skip_bans = serde_json::to_string(&skip_bans)?;
+    let retries = (!last_guilds.is_empty())
+        .then(|| {
+            let deferred = serde_json::to_string(&skip_guilds)?;
+            skip_guilds.extend_from_slice(&last_guilds);
+            Ok::<_, anyhow::Error>((deferred, serde_json::to_string(&last_guilds)?))
+        })
+        .transpose()?;
+    let skip_guilds = serde_json::to_string(&skip_guilds)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let mut due = tx
+            .query_row(
+                DUE_EXPIRY_SQL,
+                params![now, skip_bans.clone(), skip_guilds],
+                expired_ban_row,
             )
             .optional()?;
+        if due.is_none()
+            && let Some((deferred, last_guilds)) = retries
+        {
+            due = tx
+                .query_row(
+                    RETRY_EXPIRY_SQL,
+                    params![now, skip_bans, deferred, last_guilds],
+                    expired_ban_row,
+                )
+                .optional()?;
+        }
         tx.finish_read()?;
         Ok(due)
     })
     .await
+}
+
+fn expired_ban_row(r: &Row) -> Result<ExpiredBan> {
+    Ok(ExpiredBan {
+        id: r.get(0)?,
+        enrollment: GuildEnrollment {
+            guild_id: r.get(1)?,
+            id: r.get(3)?,
+            joined_at_ns: r.get(4)?,
+        },
+        user: r.get(2)?,
+        expires_at: r.get(5)?,
+    })
 }
 
 /// Consume one found deadline before a single dispatch attempt. Returns false,
@@ -2243,6 +2288,131 @@ mod query_plan_tests {
                 }
             }
             crate::db::tests::assert_index_plan(conn, BAN_PAGE_SQL, params![42, 50], true);
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// (id, parent, detail) rows of the production query plan.
+    fn query_plan(conn: &impl SqlExecutor, sql: &str) -> Vec<(i64, i64, String)> {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        statement
+            .query_map(params![100, "[1]", "[2]", "[3,4]"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Loops of the outer query, outermost first. A JSON skip or retry list
+    /// that is not one of them is built once as a `LIST SUBQUERY`.
+    fn outer_loops(plan: &[(i64, i64, String)]) -> Vec<&str> {
+        plan.iter()
+            .filter(|(_, parent, detail)| {
+                *parent == 0 && (detail.starts_with("SCAN ") || detail.starts_with("SEARCH "))
+            })
+            .map(|(_, _, detail)| detail.as_str())
+            .collect()
+    }
+
+    /// Any data-table scan, or a JSON list scanned outside a list subquery.
+    fn unbounded_scans(plan: &[(i64, i64, String)]) -> Vec<&str> {
+        plan.iter()
+            .filter(|(_, parent, detail)| {
+                detail.starts_with("SCAN ")
+                    && !plan
+                        .iter()
+                        .any(|(id, _, list)| id == parent && list.starts_with("LIST SUBQUERY"))
+            })
+            .map(|(_, _, detail)| detail.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn expiry_selection_plans_stay_indexed_without_per_ban_retry_scans() {
+        let path =
+            std::env::temp_dir().join(format!("expiry_plans_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn_sync(|conn| {
+            // Every read starts here, and an empty retry list reads only this:
+            // the deadline index in order, so LIMIT 1 stops at the first due
+            // ban, with no sort and the skip lists built once.
+            let plan = query_plan(conn, DUE_EXPIRY_SQL);
+            assert_eq!(
+                outer_loops(&plan),
+                [
+                    "SEARCH b USING INDEX idx_bans_expiry (expires_at<?)",
+                    "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)",
+                ],
+                "{plan:?}"
+            );
+            assert!(unbounded_scans(&plan).is_empty(), "{plan:?}");
+            assert!(
+                !plan
+                    .iter()
+                    .any(|(_, _, detail)| detail.contains("TEMP B-TREE")),
+                "due expiry read must not sort: {plan:?}"
+            );
+
+            // Retry guilds: the list is the outer loop and each guild's active
+            // bans are an index search, never the deadline index once per guild
+            // or the list once per due ban. Only these candidates are sorted.
+            let plan = query_plan(conn, RETRY_EXPIRY_SQL);
+            let loops = outer_loops(&plan);
+            assert_eq!(
+                loops.first(),
+                Some(&"SCAN l VIRTUAL TABLE INDEX 1:"),
+                "{plan:?}"
+            );
+            assert!(
+                loops.contains(&"SEARCH b USING INDEX idx_bans_one_active (guild_id=?)"),
+                "{plan:?}"
+            );
+            assert_eq!(
+                unbounded_scans(&plan),
+                ["SCAN l VIRTUAL TABLE INDEX 1:"],
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|(_, _, detail)| detail.contains("idx_bans_expiry")),
+                "{plan:?}"
+            );
+
+            // The single query this replaced scanned the retry list inside the
+            // deadline-index loop, once per due ban, then sorted every due ban.
+            // The checks above reject both.
+            let plan = query_plan(
+                conn,
+                "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
+                 FROM bans b JOIN guild_enrollments e
+                 ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
+                 LEFT JOIN json_each(?4) l ON l.value=b.guild_id
+                 WHERE b.active=1 AND b.expires_at<=?1
+                 AND b.id NOT IN (SELECT value FROM json_each(?2))
+                 AND b.guild_id NOT IN (SELECT value FROM json_each(?3))
+                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
+                 ORDER BY l.key IS NOT NULL,l.key,b.expires_at,b.id LIMIT 1",
+            );
+            assert_eq!(
+                outer_loops(&plan).first(),
+                Some(&"SEARCH b USING INDEX idx_bans_expiry (expires_at<?)"),
+                "{plan:?}"
+            );
+            assert_eq!(
+                unbounded_scans(&plan),
+                ["SCAN l VIRTUAL TABLE INDEX 1: LEFT-JOIN"],
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|(_, _, detail)| detail == "USE TEMP B-TREE FOR ORDER BY"),
+                "{plan:?}"
+            );
             Ok(())
         })
         .unwrap();
