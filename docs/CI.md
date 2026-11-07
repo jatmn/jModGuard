@@ -61,7 +61,9 @@ The workflow has no top-level path filters that leave required checks pending.
 
 Rust follows `rust-toolchain.toml` (1.96.0), with clippy and rustfmt. Dylint uses
 6.1.0 and nightly-2026-08-20 from `dylint.toml`; the script installs source tools
-and their driver in a dedicated cache. Node 24 satisfies both npm projects.
+and their driver in a dedicated cache. A cold 6.1.0 driver build wants rust-clippy
+`master`, so the script maps upstream `main` to it for `cargo dylint` only.
+Node 24 satisfies both npm projects.
 Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned. The local complete gate is:
 
 ```bash

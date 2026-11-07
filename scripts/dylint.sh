@@ -282,6 +282,24 @@ fi
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
+# A cold dylint 6.1.0 driver build runs `git clone` on rust-lang/rust-clippy
+# and checks out `master`, which upstream renamed to `main`. Give only the
+# `cargo dylint` process an extra fetch refspec that also stores `main` as tag
+# `master`. Append it after caller entries such as the CI credential helper.
+# The pattern matches nothing in a clone without `main`, so other clones
+# still succeed, and Cargo fetches lint libraries by URL, not via `origin`.
+# Remove when the dylint pin moves to 6.3.0 or later, which uses `main`.
+git_config_count="${GIT_CONFIG_COUNT:-0}"
+case "$git_config_count" in
+  *[!0-9]*) echo "dylint: GIT_CONFIG_COUNT is not a number: $git_config_count" >&2; exit 2 ;;
+esac
+git_config_count=$((10#$git_config_count))
+clippy_master_env=(
+  "GIT_CONFIG_COUNT=$((git_config_count + 1))"
+  "GIT_CONFIG_KEY_${git_config_count}=remote.origin.fetch"
+  "GIT_CONFIG_VALUE_${git_config_count}=+refs/heads/main*:refs/tags/master*"
+)
+
 ensure_dylint_toolchain
 
 use_prebuilt=0
@@ -315,13 +333,13 @@ if [ "$use_prebuilt" -eq 1 ]; then
   echo "dylint: using prebuilt libs at $lib_dir"
   echo "dylint: DYLINT_LIBRARY_PATH=$lib_dir"
   echo "dylint: cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
     DYLINT_LIBRARY_PATH="$lib_dir" \
     cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
 else
   echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
     cargo dylint --all --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
 fi

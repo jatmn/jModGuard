@@ -18,9 +18,23 @@ fail() {
   exit 1
 }
 
+# Every stub logs the git config entries it inherits, so a test can tell
+# which commands saw an entry.
+cat > "$fixture/record-git-config.sh" <<'SH'
+if [ -n "${DYLINT_TEST_GIT_CONFIG_LOG:-}" ]; then
+  {
+    printf '%s %s:' "${0##*/}" "$*"
+    env | awk '/^GIT_CONFIG_/' | sort | tr '\n' ' '
+    echo
+  } >>"$DYLINT_TEST_GIT_CONFIG_LOG"
+fi
+SH
+
 cat > "$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
+[ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
 field() {
   local name="$1"
   if [ -n "${!name+x}" ]; then
@@ -63,6 +77,9 @@ elif [ "${1:-}" = dylint ]; then
     field CARGO_TARGET_DIR
     field PATH
     field DYLINT_LIBRARY_PATH
+    for name in GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_CONFIG_KEY_2; do
+      field "$name"
+    done
     printf 'argv=%s\n' "$*"
   } > "$DYLINT_TEST_CAPTURE"
 else
@@ -75,6 +92,8 @@ chmod +x "$fixture/bin/cargo"
 cat > "$fixture/bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
+[ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
 if [ "${1:-}" = ls-remote ]; then
   printf '%s refs/tags/v6.1.0\n' '8aeea4b0c27722d46fcc8288330401418328e8fa'
   exit 0
@@ -86,6 +105,8 @@ chmod +x "$fixture/bin/git"
 cat > "$fixture/bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
+[ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
 if [ "${DYLINT_TEST_CURL_FAIL:-0}" = 1 ]; then
   echo "dylint test curl: network down" >&2
   exit 1
@@ -97,6 +118,8 @@ chmod +x "$fixture/bin/curl"
 cat > "$fixture/bin/rustc" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
+[ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
 if [ "${DYLINT_TEST_RUSTC_FAIL:-0}" = 1 ]; then
   exit 1
 fi
@@ -116,6 +139,8 @@ chmod +x "$fixture/bin/rustc"
 cat > "$fixture/bin/rustup" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
+[ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
 case "$*" in
   'component list --toolchain nightly-2026-08-20')
     state="${DYLINT_TEST_TOOLCHAIN_STATE:-}"
@@ -145,6 +170,7 @@ touch "$fixture/toolchain-ready"
 capture="$fixture/capture"
 install_capture="$fixture/install-capture"
 stdout_file="$fixture/stdout"
+git_config_log="$fixture/git-config-log"
 
 value() {
   local file="$1" key="$2" line
@@ -174,8 +200,12 @@ run_dylint() {
       DYLINT_TEST_CAPTURE="$capture" \
       DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
       DYLINT_TEST_TOOLCHAIN_STATE="${DYLINT_TEST_TOOLCHAIN_STATE:-$fixture/toolchain-ready}" \
+      DYLINT_TEST_RECORDER="$fixture/record-git-config.sh" \
+      DYLINT_TEST_GIT_CONFIG_LOG="$git_config_log" \
       TMPDIR="$tmpdir" \
-      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES -u DYLINT_CARGO_HOME "$@" bash scripts/dylint.sh >"$stdout_file" 2>&1
+      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES -u DYLINT_CARGO_HOME \
+        -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+        "$@" bash scripts/dylint.sh >"$stdout_file" 2>&1
   )
 }
 
@@ -248,6 +278,60 @@ rm -f "$install_capture"
 run_dylint "$fixture/external" DYLINT_TEST_LARGE_CARGO_LIST="$large_listing" \
   || fail "large cargo install listing failed dylint (exit $?)"
 [ ! -f "$install_capture" ] || fail 'large cargo install listing reinstalled matching tools'
+
+# A cold dylint 6.1.0 driver build clones rust-lang/rust-clippy and checks out
+# `master`, which upstream renamed to `main`. Only `cargo dylint` gets the
+# refspec that stores `main` as tag `master`, after the caller's entries.
+clippy_refspec='+refs/heads/main*:refs/tags/master*'
+run_dylint "$fixture/external"
+expect "$capture" GIT_CONFIG_COUNT 1
+expect "$capture" GIT_CONFIG_KEY_0 remote.origin.fetch
+expect "$capture" GIT_CONFIG_VALUE_0 "$clippy_refspec"
+expect "$capture" GIT_CONFIG_KEY_1 unset
+rm -f "$git_config_log"
+caller_helper='!f() { echo username=x; }; f'
+run_dylint "$fixture/external" \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0="$caller_helper"
+expect "$capture" GIT_CONFIG_COUNT 2
+expect "$capture" GIT_CONFIG_KEY_0 credential.helper
+expect "$capture" GIT_CONFIG_VALUE_0 "$caller_helper"
+expect "$capture" GIT_CONFIG_KEY_1 remote.origin.fetch
+expect "$capture" GIT_CONFIG_VALUE_1 "$clippy_refspec"
+expect "$capture" GIT_CONFIG_KEY_2 unset
+grep -q '^cargo dylint --all' "$git_config_log" || fail 'cargo dylint run was not logged'
+other_commands="$(grep -v '^cargo dylint --all' "$git_config_log")"
+[ -n "$other_commands" ] || fail 'no other command was logged'
+if grep -Fq -- 'refs/tags/master' <<<"$other_commands"; then
+  fail "clippy refspec leaked to another command: $(grep -F -- 'refs/tags/master' <<<"$other_commands" | head -n 1)"
+fi
+if grep -Fvq -- 'GIT_CONFIG_COUNT=1 ' <<<"$other_commands"; then
+  fail "caller git config changed for another command: $(grep -Fv -- 'GIT_CONFIG_COUNT=1 ' <<<"$other_commands" | head -n 1)"
+fi
+if run_dylint "$fixture/external" GIT_CONFIG_COUNT=one >/dev/null 2>&1; then
+  fail 'non-numeric GIT_CONFIG_COUNT must abort'
+fi
+
+# Real git with that environment: `master` names upstream `main`, and a
+# repository without `main` still clones.
+git_env=(
+  "GIT_CONFIG_COUNT=$(value "$capture" GIT_CONFIG_COUNT)"
+  "GIT_CONFIG_KEY_0=$(value "$capture" GIT_CONFIG_KEY_0)"
+  "GIT_CONFIG_VALUE_0=$(value "$capture" GIT_CONFIG_VALUE_0)"
+  "GIT_CONFIG_KEY_1=$(value "$capture" GIT_CONFIG_KEY_1)"
+  "GIT_CONFIG_VALUE_1=$(value "$capture" GIT_CONFIG_VALUE_1)"
+)
+for branch in main trunk; do
+  /usr/bin/git init -q -b "$branch" "$fixture/upstream-$branch"
+  /usr/bin/git -C "$fixture/upstream-$branch" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false \
+    commit -q --allow-empty -m "$branch"
+  env "${git_env[@]}" /usr/bin/git clone -q "file://$fixture/upstream-$branch" "$fixture/clone-$branch" \
+    || fail "clone of a repository with only $branch failed"
+done
+[ "$(/usr/bin/git -C "$fixture/clone-main" rev-parse master)" = \
+  "$(/usr/bin/git -C "$fixture/upstream-main" rev-parse main)" ] \
+  || fail 'master does not resolve to upstream main'
+/usr/bin/git -C "$fixture/clone-main" rev-parse -q --verify refs/remotes/origin/main >/dev/null \
+  || fail 'default fetch refspec was replaced'
 
 prefix="$fixture/opt"
 pinned_root="$prefix/dylint-6.1.0"
@@ -329,6 +413,7 @@ done
 run_dylint "$fixture/external"
 expect "$capture" argv 'dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets --workspace'
 expect "$capture" DYLINT_LIBRARY_PATH "$lib_dir"
+expect "$capture" GIT_CONFIG_VALUE_0 "$clippy_refspec"
 grep -Fq 'using prebuilt libs at' "$stdout_file" || fail 'missing prebuilt libs message'
 
 printf 'x' >"$lib_dir/libextra@${tc}.so"
