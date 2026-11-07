@@ -724,6 +724,34 @@ pub async fn record_webui_installed_verified(
     }).await
 }
 
+/// Unresolved Pull Zone purge after a managed WebUI publish. Storage
+/// reconciliation never clears it; only a later successful purge does.
+pub const WEBUI_PURGE_PENDING_META: &str = "webui_purge_pending_v1";
+
+/// Bot-owned write; the API forwards it over the control link. `None` clears it.
+pub async fn set_webui_purge_pending(db: &Db, error: Option<String>) -> Result<()> {
+    let error = error.map(|error| error.chars().take(300).collect::<String>());
+    db.with_conn(move |conn| {
+        match error {
+            Some(error) => write_meta_string_conn(conn, WEBUI_PURGE_PENDING_META, &error)?,
+            None => {
+                conn.execute_rows(
+                    "DELETE FROM meta WHERE key=?1",
+                    params![WEBUI_PURGE_PENDING_META],
+                    1,
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn webui_purge_pending(db: &Db) -> Result<Option<String>> {
+    db.with_conn(|conn| meta_string_conn(conn, WEBUI_PURGE_PENDING_META))
+        .await
+}
+
 pub async fn track_webui_assets(db: &Db, sha: &str, now: i64) -> Result<()> {
     anyhow::ensure!(
         sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -2441,6 +2469,31 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn webui_purge_pending_round_trips_over_the_control_link() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_webui_purge_pending_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        assert_eq!(webui_purge_pending(&db).await.unwrap(), None);
+        for error in [Some("purge failed".to_owned()), None] {
+            let op: ControlOp = serde_json::from_value(
+                serde_json::to_value(ControlOp::SetWebuiPurgePending {
+                    error: error.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            apply_control(&db, None, op, None).await.unwrap();
+            assert_eq!(webui_purge_pending(&db).await.unwrap(), error);
+        }
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

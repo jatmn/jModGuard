@@ -133,12 +133,8 @@ serves them at `http://localhost:8080`.
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
 
-For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. GitHub Actions publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
-[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
-`BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
-`BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
-[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
- selects a non-default built frontend directory. A private ops repo is **not required** to install.
+For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
+[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.
 
 **Another host or CDN.** Copy the five generated files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only

@@ -124,39 +124,35 @@ redirect, and the login bookmark):
 On the admin Pull Zone, Caching → General, **Strip Response Cookies** must
 be **off** (`DisableCookies=false`) or login cannot keep a session.
 
-**First time (manual, public source).** In the Storage Zone, **Browse Files**,
+**First time (manual bootstrap, public source).** In the Storage Zone, **Browse Files**,
 and upload those five files from the source commit selected for the deployed
 API image to the **root** so they are `/` (or `/index.html`),
 `/app.js`, `/style.css`, `/administration/index.html`, and
 `/administration.js`. A trusted `main` image published under its full source
-SHA is sufficient; no Stable or Nightly release tag is required. After that,
-CSS/layout-only revisions can
-publish without a new image; match the container revision again only when
-the page needs new API endpoints. daisyUI and Headless UI are bundled into the existing CSS/JS assets.
+SHA is sufficient; no Stable or Nightly release tag is required. This manual
+upload is only the bootstrap that makes the Administration page reachable.
+daisyUI and Headless UI are bundled into the existing CSS/JS assets.
 
-**Later updates.** The owner Administration page can install a WebUI package
-from GHCR using the Storage Zone password after the rollout gates in
-[BUNNY-UPDATES.md](BUNNY-UPDATES.md). The older
-[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
-only handles the three legacy root files and still requires the account API key
-for cache purge; it is not part of the managed update path. CSS/layout-only revisions can
-publish without a new image; match the container revision again only when the
-page needs new API endpoints. That script backs up existing Storage objects,
-restores them if an upload fails, and records completion only after a
-successful Pull Zone purge. Uploads are not atomic at the CDN; verify the public
-site afterward. A failed purge leaves the new origin files for a retry.
+**Later updates.** GitHub Actions **Publish** builds the WebUI package to GHCR.
+The owner installs it from **Administration → Updates**; the API writes it to
+Storage with the Storage Zone password and then purges the Pull Zone with a
+scoped purge key. See the rollout gates in [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
+Match the API image revision when the page needs new API endpoints. Uploads are
+not atomic at the CDN; verify the public site afterward.
+
+Set these on the **API container** (Bunny's container environment, never git):
 
 | Variable | What it is |
 |---|---|
 | `BUNNY_STORAGE_ZONE` | Storage zone name |
 | `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
 | `BUNNY_STORAGE_ENDPOINT` | Regional host; default `storage.bunnycdn.com` |
-| `BUNNY_PULL_ZONE_ID` | Pull Zone id for the publication receipt and purge target |
-| `BUNNY_API_KEY` | Account API key used to purge the Pull Zone after upload |
+| `BUNNY_PULL_ZONE_ID` | Admin Pull Zone id purged after a WebUI install |
+| `BUNNY_PURGE_API_KEY` | API key scoped to PullZone.Purge, where the account offers scoped keys (never the account API key) |
 
-Optional `JMODGUARD_FRONTEND_ROOT` points at a directory containing
-`index.html`, `app.js`, and `style.css` (defaults to this repository's
-`frontend/`).
+Set both purge values or neither. Neither skips the purge with a warning;
+exactly one fails the install. Without a scoped purge key, leave both unset
+and purge the Pull Zone from the dashboard after each WebUI install.
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 5),
