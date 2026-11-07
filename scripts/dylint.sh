@@ -75,16 +75,20 @@ dylint_lib_names=(
   wrong_serialize_struct_arg
 )
 
+# Capture a command's whole listing before matching it. Piping the command into
+# a reader that exits at the first match can kill the writer with SIGPIPE, and
+# pipefail then turns a found entry into a failure (exit 141).
 toolchain_components_installed() {
   local channel="$1"
   shift
-  local comp needle missing=0
+  local comp needle components missing=0
+  components="$(rustup component list --toolchain "$channel")" || return 1
   for comp in "$@"; do
     needle=$comp
     if [ "$comp" = llvm-tools-preview ]; then
       needle=llvm-tools
     fi
-    if ! rustup component list --toolchain "$channel" | awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }'; then
+    if ! awk -v c="$needle" '$1 ~ "^" c "-" && /\(installed\)/ { found=1; exit } END { exit !found }' <<<"$components"; then
       missing=1
     fi
   done
@@ -174,21 +178,20 @@ esac
 # `cargo dylint -V`. `dylint-link` is a linker wrapper and has no version
 # flag, so read both versions from `cargo install --list`.
 installed_version() {
-  local crate="$1"
-  cargo install --list 2>/dev/null | awk -v crate="$crate" '
-    $1 == crate {
-      ver = $2
-      sub(/^v/, "", ver)
-      sub(/:$/, "", ver)
-      print ver
-      exit
-    }
-  '
+  local list
+  list="$(cargo install --list 2>/dev/null)" || return
+  listed_crate_version "$1" "$list"
 }
 
 installed_version_root() {
-  local crate="$1" install_root="$2"
-  cargo install --list --root "$install_root" 2>/dev/null | awk -v crate="$crate" '
+  local list
+  list="$(cargo install --list --root "$2" 2>/dev/null)" || return
+  listed_crate_version "$1" "$list"
+}
+
+# Reads the captured listing; see toolchain_components_installed.
+listed_crate_version() {
+  awk -v crate="$1" '
     $1 == crate {
       ver = $2
       sub(/^v/, "", ver)
@@ -196,7 +199,7 @@ installed_version_root() {
       print ver
       exit
     }
-  '
+  ' <<<"$2"
 }
 
 dylint_lib_key_digest() {
@@ -279,6 +282,24 @@ fi
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
+# A cold dylint 6.1.0 driver build runs `git clone` on rust-lang/rust-clippy
+# and checks out `master`, which upstream renamed to `main`. Give only the
+# `cargo dylint` process an extra fetch refspec that also stores `main` as tag
+# `master`. Append it after caller entries such as the CI credential helper.
+# The pattern matches nothing in a clone without `main`, so other clones
+# still succeed, and Cargo fetches lint libraries by URL, not via `origin`.
+# Remove when the dylint pin moves to 6.3.0 or later, which uses `main`.
+git_config_count="${GIT_CONFIG_COUNT:-0}"
+case "$git_config_count" in
+  *[!0-9]*) echo "dylint: GIT_CONFIG_COUNT is not a number: $git_config_count" >&2; exit 2 ;;
+esac
+git_config_count=$((10#$git_config_count))
+clippy_master_env=(
+  "GIT_CONFIG_COUNT=$((git_config_count + 1))"
+  "GIT_CONFIG_KEY_${git_config_count}=remote.origin.fetch"
+  "GIT_CONFIG_VALUE_${git_config_count}=+refs/heads/main*:refs/tags/master*"
+)
+
 ensure_dylint_toolchain
 
 use_prebuilt=0
@@ -312,13 +333,13 @@ if [ "$use_prebuilt" -eq 1 ]; then
   echo "dylint: using prebuilt libs at $lib_dir"
   echo "dylint: DYLINT_LIBRARY_PATH=$lib_dir"
   echo "dylint: cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
     DYLINT_LIBRARY_PATH="$lib_dir" \
     cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
 else
   echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
     cargo dylint --all --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
 fi
