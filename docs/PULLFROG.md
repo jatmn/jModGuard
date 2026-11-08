@@ -35,9 +35,9 @@ with the dashboard's generated workflow. The agent action has feature-branch-onl
 push permission and a restricted shell; default-branch pushes are not allowed.
 ## PR checks and run diagnostics
 
-The workflow pins the Pullfrog v0.1.97 action bootstrap and explicitly enables
+The workflow pins the Pullfrog v0.1.122 action bootstrap and explicitly enables
 its native `pullfrog` run-status and `pullfrog-approval` verdict checks. The
-bootstrap installs the compatible `pullfrog@^0.1.97` CLI from npm, so the runtime
+bootstrap installs the compatible `pullfrog@^0.1.122` CLI from npm, so the runtime
 can receive later 0.1.x updates. The `status_checks` input is
 deprecated upstream but remains supported on v0; it enables
 reporting even if the console's check toggles are off and emits a deprecation
