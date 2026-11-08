@@ -5,7 +5,7 @@ const OWNER_ID = 12479882;
 const REPOSITORY = 'jatmn/jModGuard';
 // Matches the pinned action in .github/workflows/pullfrog.yml. Pullfrog's
 // structured prompt is version-specific; verify its schema when updating both.
-export const PULLFROG_VERSION = '0.1.97';
+export const PULLFROG_VERSION = '0.1.122';
 // Action inputs become individual environment strings. Stay comfortably below
 // Linux's per-string exec limit, including JSON escaping and multibyte text.
 const MAX_PAYLOAD_BYTES = 64 * 1024;
