@@ -259,7 +259,7 @@ async fn bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Result<Optio
     let guild = scope.guild;
     let id = id.to_owned();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         scope.verify_conn(&tx)?;
         let job = tx
             .query_row(
@@ -288,7 +288,7 @@ pub async fn recent_enrolled_bot_actions(
 async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<BotAction>> {
     let guild = scope.guild;
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         scope.verify_conn(&tx)?;
         let mut stmt = tx.prepare(&format!(
             "SELECT {COLS} FROM bot_actions WHERE guild_id=?1
