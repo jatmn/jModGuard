@@ -1914,6 +1914,61 @@ async fn actions_require_page_membership_and_reject_rebinding_saved_requests() {
 }
 
 #[tokio::test]
+async fn read_only_api_lists_bot_actions() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let body =
+        serde_json::json!({"request_id":action_key("readonly-list"),"user_id":"99"}).to_string();
+    let (status, queued) = f.request("POST", "/api/guilds/10/unban", &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    // Open the API pool with its production read-only options.
+    f.use_writer_link("127.0.0.1:1".parse().unwrap());
+    assert!(f.app.db.is_read_only());
+    for method in ["GET", "POST"] {
+        let (status, history) = f.request(method, "/api/guilds/10/actions", "").await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["id"], queued["id"]);
+        assert_eq!(history[0]["state"], "pending");
+    }
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    assert_eq!(
+        db::enrolled_bot_action(&f.app.db, &enrollment, queued["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        queued["id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn read_only_api_cancels_bot_actions_through_writer() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let body =
+        serde_json::json!({"request_id":action_key("readonly-cancel"),"user_id":"99"}).to_string();
+    let (status, queued) = f.request("POST", "/api/guilds/10/unban", &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    let bot = f.attach_save_writer().await;
+    assert!(f.app.db.is_read_only());
+    let id = queued["id"].as_str().unwrap();
+    let (status, cancelled) = f
+        .request("DELETE", &format!("/api/guilds/10/actions/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["ok"], true);
+    assert_eq!(
+        db::bot_action(&bot.db, 10, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
 async fn action_visibility_cancellation_and_admission_follow_current_action_permissions() {
     let f = Fixture::new(true).await;
     f.enroll(10).await;
