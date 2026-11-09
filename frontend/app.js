@@ -1976,6 +1976,7 @@ function CustomRuleEditor({ record: r, creating }) {
               action,
               duration_minutes: duration,
               delete_days: action === "ban" ? prev.delete_days || 0 : 0,
+              purge_last_hour: action === "ban" && prev.purge_last_hour === true,
               reason: prev.reason || "",
             }];
             markDirty();
@@ -1989,7 +1990,7 @@ function CustomRuleEditor({ record: r, creating }) {
       ? field("Timeout (minutes)", h(Input, { type: "number", className: "input", defaultValue: rule.actions[0].duration_minutes || 60, onInput: (e) => (rule.actions[0].duration_minutes = Number(e.target.value)) }))
       : null,
     rule.actions?.[0]?.action === "ban"
-      ? field("Delete history (days)", h(Input, { type: "number", min: 0, max: 7, className: "input", defaultValue: rule.actions[0].delete_days || 0, onInput: (e) => (rule.actions[0].delete_days = Number(e.target.value)) }))
+      ? h(BanOptions, { action: rule.actions[0] })
       : null,
     field("Reason template", h(Input, { type: "text", className: "input", defaultValue: rule.actions?.[0]?.reason || "", onInput: (e) => (rule.actions[0].reason = e.target.value) })),
     h(
@@ -2095,6 +2096,9 @@ function RuleEditor({ record: r }) {
     defaultValue: rule.params?.min_length ?? 20,
     className: "input",
   });
+  const [spamBan] = useState(() => ({
+    ...(rule.actions.find((action) => action.action === "ban") || rule.actions[0] || {}),
+  }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const dryRunRef = useRef(null);
   const dryRun = h(Input, {
@@ -2218,6 +2222,7 @@ function RuleEditor({ record: r }) {
             ? field("Minimum length (Unicode scalars after trim)", textLength)
             : null,
           field("Window (seconds)", imageWindow),
+          h(BanOptions, { action: spamBan }),
         )
       : field("Parameters (JSON)", paramsText),
     spam
@@ -2227,7 +2232,7 @@ function RuleEditor({ record: r }) {
           h(
             "p",
             { className: "field-help" },
-            "Strike count is the threshold for an action. Timeout minutes apply to timeout; delete-history days apply to ban.",
+            "Strike count is the threshold for an action. Timeout minutes apply to timeout. Choose Ban or Ban and purge for each ban action.",
           ),
           actionsRows,
           h(
@@ -2293,7 +2298,7 @@ function RuleEditor({ record: r }) {
                 rule.actions = punish
                   ? [
                       { at: 1, action: "delete", reason: "spam match", duration_minutes: 0, delete_days: 0 },
-                      { at: 1, action: "ban", reason: "spam match", duration_minutes: 0, delete_days: 0 },
+                      { at: 1, action: "ban", reason: "spam match", duration_minutes: 0, delete_days: spamBan.delete_days || 0, purge_last_hour: spamBan.purge_last_hour === true },
                     ]
                   : [
                       {
@@ -2301,7 +2306,8 @@ function RuleEditor({ record: r }) {
                         action: "log",
                         reason: textRule ? "Repeated text test" : "Exact image spam test",
                         duration_minutes: 0,
-                        delete_days: 0,
+                        delete_days: spamBan.delete_days || 0,
+                        purge_last_hour: spamBan.purge_last_hour === true,
                       },
                     ];
                 if (!spamConfigured(r.rule_id, rule))
@@ -4929,6 +4935,30 @@ function scopeSelect(
     allowGlobal && isBotOwner() && h("option", { value: "global" }, globalLabel),
   );
 }
+function BanOptions({ action }) {
+  const legacyDays = action.delete_days || 0;
+  const selected = action.purge_last_hour ? "purge" : legacyDays ? "legacy" : "ban";
+  return field(
+    "Ban behavior",
+    h(
+      Select,
+      {
+        className: "select",
+        defaultValue: selected,
+        onChange: (event) => {
+          const mode = event.target.value;
+          action.purge_last_hour = mode === "purge";
+          action.delete_days = mode === "legacy" ? legacyDays : 0;
+        },
+      },
+      h("option", { value: "ban" }, "Ban"),
+      h("option", { value: "purge" }, "Ban and purge (previous hour)"),
+      legacyDays > 0 && h("option", { value: "legacy" }, `Keep existing: delete ${legacyDays} day(s)`),
+    ),
+    h("p", { className: "field-help" }, "Ban keeps earlier messages. Ban and purge asks Discord to delete this member’s messages across the server from the previous hour. Applies only to ban actions; dry-run never bans or purges."),
+  );
+}
+
 function RuleAction({ action, index, remove }) {
   return h(
     "div",
@@ -4987,20 +5017,7 @@ function RuleAction({ action, index, remove }) {
           },
         }),
       ),
-      field(
-        "Delete history (days)",
-        h(Input, {
-          className: "input",
-          type: "number",
-          min: 0,
-          max: 7,
-          defaultValue: action.delete_days ?? 0,
-          title: "days of messages deleted (ban)",
-          onChange: (event) => {
-            action.delete_days = Math.min(7, Math.max(0, parseInt(event.target.value) || 0));
-          },
-        }),
-      ),
+      h(BanOptions, { action }),
     ),
     field(
       "Reason template",

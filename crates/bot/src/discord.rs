@@ -8,6 +8,43 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Ban Member with a seconds window, which Serenity's day-only helper cannot express.
+/// Reuses its authentication, routing, rate limiter and error handling. No history reads.
+pub(crate) async fn automod_ban(
+    http: &serenity::http::Http,
+    guild_id: serenity::model::id::GuildId,
+    user_id: serenity::model::id::UserId,
+    action: &crate::types::ActionDef,
+    reason: &str,
+) -> serenity::Result<()> {
+    // Match Serenity's audit reason encoding (percent-encoded UTF-8).
+    let mut encoded = String::new();
+    for byte in reason.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("writing to a string");
+        }
+    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "X-Audit-Log-Reason",
+        reqwest::header::HeaderValue::from_str(&encoded)
+            .map_err(serenity::http::HttpError::InvalidHeader)?,
+    );
+    let request = serenity::http::Request::new(
+        serenity::http::Route::GuildBan { guild_id, user_id },
+        serenity::http::LightMethod::Put,
+    )
+    .headers(Some(headers))
+    .params(Some(vec![(
+        "delete_message_seconds",
+        action.ban_delete_message_seconds().to_string(),
+    )]));
+    http.request(request).await.map(|_| ())
+}
+
 pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) + Send + Sync;
 
 #[cfg(test)]

@@ -1169,10 +1169,11 @@ pub(crate) async fn execute_pending_with(
                                     recovery,
                                     crate::discord::race_discord_call(
                                         &app.activation,
-                                        guild_id.ban_with_reason(
+                                        crate::discord::automod_ban(
                                             http,
+                                            guild_id,
                                             target.id,
-                                            rule.delete_days,
+                                            rule,
                                             &discord_reason,
                                         ),
                                     )
@@ -1354,6 +1355,7 @@ mod tests {
                     action: "ban".into(),
                     duration_minutes: 0,
                     delete_days: 0,
+                    purge_last_hour: false,
                     reason: "invite".into(),
                 }],
                 whitelist_roles: Vec::new(),
@@ -1438,6 +1440,7 @@ mod tests {
                 action: action.into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "r".into(),
             }],
             whitelist_roles: vec![],
@@ -1941,6 +1944,7 @@ mod tests {
                     action: "ban".into(),
                     duration_minutes: 0,
                     delete_days: 0,
+                    purge_last_hour: false,
                     reason: "r".into(),
                 }],
                 whitelist_roles: vec![],
@@ -2112,6 +2116,7 @@ mod tests {
                 action: "ban".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "r".into(),
             }],
             whitelist_roles: vec![],
@@ -2398,6 +2403,7 @@ mod tests {
                 action: "ban".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "r".into(),
             }],
             whitelist_roles: vec![],
@@ -2427,6 +2433,138 @@ mod tests {
             is_moderator: false,
             can_mention_everyone: true,
             mention_permission_unknown: false,
+        }
+    }
+
+    // Exercise persisted action JSON -> matcher -> executor -> actual HTTP request.
+    #[tokio::test]
+    async fn ban_purge_generic_and_custom_requests_preserve_legacy_and_dry_run() {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        for id in ["mention_spam", "custom:0123456789abcdef"] {
+            for (stored_purge, days, dry, seconds) in [
+                (None, 0, false, 0),
+                (Some(false), 0, false, 0),
+                (Some(true), 0, false, 3600),
+                (None, 1, false, 86400),
+                (None, 7, false, 604800),
+                (Some(true), 1, false, 3600),
+                (Some(true), 0, true, 3600),
+            ] {
+                let path = std::env::temp_dir()
+                    .join(format!("ban_purge_{:032x}.db", rand::random::<u128>()));
+                let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap())
+                    .unwrap();
+                assert!(
+                    crate::db::claim_active_bot(
+                        &app.db,
+                        app.activation.instance(),
+                        jmodguard::control::now_ms(),
+                        Arc::new(AtomicBool::new(false))
+                    )
+                    .await
+                    .unwrap()
+                );
+                app.activation.mark_lock_held(true);
+                let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                app.tenant.activate(enrollment).await.unwrap();
+                let mut rule = if id == "mention_spam" {
+                    let rule = crate::defaults::default_rules().remove(0);
+                    assert_eq!(
+                        rule.actions[0].delete_days, 1,
+                        "shipped default remains one day"
+                    );
+                    rule
+                } else {
+                    dry_run_word_ban()
+                };
+                rule.dry_run = dry;
+                rule.actions[0].delete_days = days;
+                // Insert the actual legacy JSON without the additive field, rather
+                // than relying only on a newly serialized false value.
+                let mut json = serde_json::to_value(&rule).unwrap();
+                json["actions"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("purge_last_hour");
+                if let Some(value) = stored_purge {
+                    json["actions"][0]["purge_last_hour"] = value.into();
+                }
+                let data = json.to_string();
+                let rule_id = id.to_owned();
+                app.db
+                    .with_conn(move |conn| {
+                        use crate::db::SqlExecutor;
+                        conn.execute_bounded(
+                            "INSERT OR REPLACE INTO rules(guild_id,rule_id,data) VALUES (10,?1,?2)",
+                            crate::db::params![rule_id, data],
+                            1,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                let cfg = app.configs.get(&app.db, 10).await.unwrap();
+                let mut message = word_message(&[]);
+                message.everyone_mentions = if id == "mention_spam" { 6 } else { 0 };
+                let pending = AutomodEngine::new()
+                    .evaluate(&cfg, &message)
+                    .expect("real rule match");
+                assert_eq!(pending.rule_id, id);
+                let mut user = User::default();
+                user.id = UserId::new(99);
+                user.name = "member".into();
+                let stub = DiscordStub::start();
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    GuildId::new(10),
+                    &user,
+                    None,
+                    "member",
+                    Some(42),
+                    Some(70),
+                    &pending,
+                )
+                .await;
+                let seen = stub.finish();
+                let bans: Vec<_> = seen
+                    .iter()
+                    .filter(|line| line.starts_with("PUT ") && line.contains("/bans/99"))
+                    .collect();
+                if dry {
+                    assert!(
+                        seen.is_empty(),
+                        "dry-run must not ban, purge or fetch history: {seen:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        bans.len(),
+                        1,
+                        "{id} purge={stored_purge:?}, days={days}: {seen:?}"
+                    );
+                    assert!(
+                        bans[0].ends_with(&format!("delete_message_seconds={seconds} HTTP/1.1"))
+                            || bans[0].ends_with(&format!("delete_message_seconds={seconds}")),
+                        "{seen:?}"
+                    );
+                }
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|line| line.starts_with("GET ") && line.contains("/messages")),
+                    "no history scan: {seen:?}"
+                );
+                drop(app);
+                let _ = std::fs::remove_file(&path);
+                crate::tenant::remove_sidecars(&path);
+            }
         }
     }
 
@@ -3354,6 +3492,7 @@ mod tests {
                 action: "delete".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "Banned word".into(),
             },
             strikes: 1,

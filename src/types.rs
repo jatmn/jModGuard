@@ -253,9 +253,23 @@ pub struct ActionDef {
     /// Message deletion window in days for bans (0-7).
     #[serde(default)]
     pub delete_days: u8,
+    /// Opt in to Discord Previous Hour deletion on ban; overrides legacy delete_days.
+    #[serde(default)]
+    pub purge_last_hour: bool,
     /// Reason template; supports the same {variables} as event templates.
     #[serde(default)]
     pub reason: String,
+}
+
+impl ActionDef {
+    /// Preserve legacy whole-day bans unless the operator selects the hour sweep.
+    pub fn ban_delete_message_seconds(&self) -> u32 {
+        if self.purge_last_hour {
+            3600
+        } else {
+            u32::from(self.delete_days) * 86400
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
