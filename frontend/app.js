@@ -5716,14 +5716,18 @@ function previewInline(text, depth = 0) {
     }
     return codeSpans.get(start);
   };
+  // Like Discord, italics skip a nested bold or underline pair, and an emphasis
+  // closer must end its delimiter run, so `*a **b** c*` and `**a *b***` nest.
   const closing = (marker, start, skipCode = false) => {
+    const emphasis = skipCode && ["*", "_", "**", "__"].includes(marker);
     for (let i = start; i < text.length; i++) {
       if (text[i] === "\\") { i++; continue; }
       if (skipCode && text[i] === "`") {
         const [ticks, end] = codeSpan(i);
         if (end >= 0) { i = end + ticks - 1; continue; }
       }
-      if (text.startsWith(marker, i)) return i;
+      if (i > start && emphasis && marker.length === 1 && text.startsWith(marker + marker, i)) { i++; continue; }
+      if (text.startsWith(marker, i) && (i === start || !emphasis || text[i + marker.length] !== marker[0])) return i;
     }
     return -1;
   };
