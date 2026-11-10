@@ -82,8 +82,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
         return;
     }
     let link = ready.link.clone();
-    let audit_token = ready.audit_token;
-    let application_token = ready.application_token;
+    let origin = ready.origin;
     let entry_id = ready.entry_id;
     match app
         .tenant
@@ -98,7 +97,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
         .await
     {
         Ok(Some(_)) => {
-            app.finalize_pending_audit_link(audit_token, application_token);
+            app.finalize_pending_audit_link(origin);
             app.clear_deferred_audit_link(&link.case_id, entry_id);
         }
         Ok(None) => {
@@ -118,7 +117,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
                 "selected discord audit not linked: {error:#}"
             );
             if durable_audit_link_conflict(&error) {
-                app.finalize_pending_audit_link(audit_token, application_token);
+                app.finalize_pending_audit_link(origin);
                 app.clear_deferred_audit_link(&link.case_id, entry_id);
             } else {
                 tracing::warn!(
