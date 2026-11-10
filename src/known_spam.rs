@@ -222,7 +222,8 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
             let bare = token
                 .as_str()
                 .trim_start_matches(crate::normalize::is_zero_width);
-            let head = bare.split(['/', '?', '#']).next().unwrap_or_default();
+            // HTTP(S) parsing also treats backslashes as path separators.
+            let head = bare.split(['/', '\\', '?', '#']).next().unwrap_or_default();
             // Invisibles before `@` are a username; keep them for the exclusion.
             start = if head.contains('@') {
                 token.start()
@@ -885,6 +886,23 @@ mod tests {
         assert!(false_positives.is_empty(), "{false_positives:?}");
         assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
         assert!(compiled.matches("tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_distinguish_path_at_from_userinfo() {
+        let compiled = list("url", "tinyurl.com/*");
+        for padding in ["\u{200e}", "\u{202e}"] {
+            for before in ["", "word "] {
+                for path in ["\\@someone", "/@someone", "?user=@someone", "#@someone"] {
+                    let text = format!("{before}{padding}tinyurl.com{path}");
+                    assert!(compiled.matches(&text), "{text:?}");
+                }
+                let text = format!("{before}{padding}@tinyurl.com\\@someone");
+                assert!(!compiled.matches(&text), "{text:?}");
+            }
+            let text = format!("safe.example\\{padding}tinyurl.com/@someone");
+            assert!(!compiled.matches(&text), "{text:?}");
+        }
+        assert!(compiled.matches("tinyurl.com\\@someone"));
     }
     #[test]
     fn known_spam_bare_urls_reject_invisible_only_usernames() {
