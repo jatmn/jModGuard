@@ -1,5 +1,39 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BootstrapWork {
+    Required,
+    Complete,
+    DeferredAtCapacity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ApiBootstrapFence {
+    Required,
+    PreserveReady,
+}
+
+enum CoreBaseline {
+    Fresh,
+    Behind(i64),
+    Current,
+}
+
+impl CoreBaseline {
+    fn version(&self) -> i64 {
+        match self {
+            Self::Fresh => 0,
+            Self::Behind(version) => *version,
+            Self::Current => MIGRATIONS.len() as i64,
+        }
+    }
+}
+
+enum SettingsHeal {
+    Current,
+    Required,
+}
+
 pub(super) fn configure_connection(
     connection: &Connection,
     remote: bool,
@@ -33,7 +67,7 @@ pub(super) fn configure_connection(
 
 /// Accept an empty database or this lineage, never an unrelated/previous install.
 /// Caller supplies a primary transaction so all checks share an authoritative snapshot.
-fn ensure_schema_family(conn: &impl SqlExecutor) -> Result<()> {
+fn read_core_baseline(conn: &impl SqlExecutor) -> Result<CoreBaseline> {
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let objects: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
@@ -41,7 +75,7 @@ fn ensure_schema_family(conn: &impl SqlExecutor) -> Result<()> {
         |r| Ok(r.get(0)?),
     )?;
     if version == 0 && objects == 0 {
-        return Ok(());
+        return Ok(CoreBaseline::Fresh);
     }
     let has_meta: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
@@ -70,7 +104,11 @@ fn ensure_schema_family(conn: &impl SqlExecutor) -> Result<()> {
         )
         .into());
     }
-    Ok(())
+    Ok(if version < MIGRATIONS.len() as i64 {
+        CoreBaseline::Behind(version)
+    } else {
+        CoreBaseline::Current
+    })
 }
 
 pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
@@ -81,9 +119,8 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // TRANSACTION_TIMEOUT.
     {
         let tx = conn.transaction_primary_write()?;
-        ensure_schema_family(&tx)?;
-        let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
-        let current = version >= MIGRATIONS.len() as i64;
+        let baseline = read_core_baseline(&tx)?;
+        let current = matches!(baseline, CoreBaseline::Current);
         tx.finish_read()?;
         if current {
             return Ok(());
@@ -95,11 +132,10 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         let tx = conn.transaction_primary_write()?;
-        ensure_schema_family(&tx)?;
         // Recheck while holding the primary write lock. Separate bot
         // processes can otherwise both decide to replay a non-idempotent
         // migration from the same stale pre-lock user_version.
-        let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+        let version = read_core_baseline(&tx)?.version();
         if version < target {
             // Historical migrations can copy existing rows and build indexes.
             // Reserve their complete conservative rebuild allowance under the
@@ -151,8 +187,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
 }
 
 pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
-    ensure_schema_family(conn)?;
-    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    let version = read_core_baseline(conn)?.version();
     let required = MIGRATIONS.len() as i64;
     if version < required {
         return Err(SchemaNotReady(format!(
@@ -719,7 +754,7 @@ pub(crate) fn terminal_defaults_from_json(raw: &str) -> Result<GuildSettings> {
     })
 }
 
-/// True when a migrate-open must hide `bootstrap_complete` from the API.
+/// Whether a migrate-open must hide `bootstrap_complete` from the API.
 ///
 /// An already-bootstrapped reconnect must not clear the marker: a later
 /// retryable pool failure would otherwise block API start for the whole
@@ -730,15 +765,15 @@ pub(crate) fn terminal_defaults_from_json(raw: &str) -> Result<GuildSettings> {
 /// primary already published; clearing from that stale view would fence a
 /// ready database. Writes (`clear_bootstrap_complete`) already go to the
 /// primary — the read that authorizes them must too.
-pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
+pub(super) fn migrate_open_fence(conn: &Connection) -> Result<ApiBootstrapFence> {
     let tx = conn.transaction_primary_write()?;
     let needed = match ensure_schema_current(&tx) {
         Ok(()) => match ensure_bootstrap_complete(&tx) {
-            Ok(()) => Ok(false),
-            Err(error) if is_schema_not_ready(&error) => Ok(true),
+            Ok(()) => Ok(ApiBootstrapFence::PreserveReady),
+            Err(error) if is_schema_not_ready(&error) => Ok(ApiBootstrapFence::Required),
             Err(error) => Err(error),
         },
-        Err(error) if is_schema_not_ready(&error) => Ok(true),
+        Err(error) if is_schema_not_ready(&error) => Ok(ApiBootstrapFence::Required),
         Err(error) => Err(error),
     };
     match tx.finish_read() {
@@ -1464,8 +1499,14 @@ pub(super) fn heal_default_guild_settings_conn(
     let stored_gen = meta_string_conn(conn, META_SETTINGS_HEAL_GENERATION)?;
     let stored_checksum =
         meta_string_conn(conn, META_SETTINGS_HEAL_CHECKSUM)?.and_then(|s| s.parse::<u64>().ok());
-    if stored_gen.as_deref() == Some(SETTINGS_HEAL_GENERATION) && stored_checksum == Some(checksum)
+    let heal = if stored_gen.as_deref() == Some(SETTINGS_HEAL_GENERATION)
+        && stored_checksum == Some(checksum)
     {
+        SettingsHeal::Current
+    } else {
+        SettingsHeal::Required
+    };
+    if matches!(heal, SettingsHeal::Current) {
         return Ok(());
     }
 

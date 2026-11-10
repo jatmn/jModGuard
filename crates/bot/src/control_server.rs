@@ -34,6 +34,28 @@ struct StoredReply {
 
 type Results = Arc<Mutex<HashMap<String, StoredReply>>>;
 
+enum RequestLookup {
+    Ready(ControlReply),
+    Pending,
+    Foreign,
+    Unknown,
+}
+
+fn lookup_cached(
+    entries: &HashMap<String, StoredReply>,
+    request_id: &str,
+    actor_user_id: i64,
+) -> RequestLookup {
+    match entries.get(request_id) {
+        Some(entry) if entry.actor_user_id == actor_user_id => match &entry.state {
+            ReplyState::Ready(done) => RequestLookup::Ready(done.clone()),
+            ReplyState::Pending => RequestLookup::Pending,
+        },
+        Some(_) => RequestLookup::Foreign,
+        None => RequestLookup::Unknown,
+    }
+}
+
 fn result_ttl() -> Duration {
     Duration::from_millis(
         u64::try_from(control::MAX_AGE_MS)
@@ -116,17 +138,13 @@ fn lookup_reply(results: &Results, request_id: &str, actor_user_id: i64) -> Cont
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     evict_results(&mut guard, Instant::now());
-    if let Some(entry) = guard.get(request_id)
-        && entry.actor_user_id == actor_user_id
-    {
-        return match &entry.state {
-            ReplyState::Ready(done) => done.clone(),
-            ReplyState::Pending => ControlReply::StillWaiting,
-        };
-    }
-    ControlReply::Failed {
-        code: Some("save_unknown".into()),
-        message: control::OUTCOME_UNKNOWN.into(),
+    match lookup_cached(&guard, request_id, actor_user_id) {
+        RequestLookup::Ready(done) => done,
+        RequestLookup::Pending => ControlReply::StillWaiting,
+        RequestLookup::Foreign | RequestLookup::Unknown => ControlReply::Failed {
+            code: Some("save_unknown".into()),
+            message: control::OUTCOME_UNKNOWN.into(),
+        },
     }
 }
 
@@ -315,36 +333,25 @@ fn handle(
         );
         return;
     }
-    enum Replay {
-        Ready(ControlReply),
-        Pending,
-        Foreign,
-        New,
-    }
     {
         let mut guard = results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cached = match guard.get(&request_id) {
-            Some(entry) if entry.actor_user_id == actor_user_id => match &entry.state {
-                ReplyState::Ready(done) => Replay::Ready(done.clone()),
-                ReplyState::Pending => Replay::Pending,
-            },
-            Some(_) => Replay::Foreign,
-            None => Replay::New,
-        };
+        // Preserve mutation replay lookup before eviction. Lookup-only requests
+        // evict first, and never reserve or enqueue missing work.
+        let cached = lookup_cached(&guard, &request_id, actor_user_id);
         match cached {
-            Replay::Ready(done) => {
+            RequestLookup::Ready(done) => {
                 drop(guard);
                 let _ = reply(stream, &done);
                 return;
             }
-            Replay::Pending => {
+            RequestLookup::Pending => {
                 drop(guard);
                 let _ = reply(stream, &ControlReply::StillWaiting);
                 return;
             }
-            Replay::Foreign => {
+            RequestLookup::Foreign => {
                 drop(guard);
                 let _ = reply(
                     stream,
@@ -355,7 +362,7 @@ fn handle(
                 );
                 return;
             }
-            Replay::New => evict_and_insert(
+            RequestLookup::Unknown => evict_and_insert(
                 &mut guard,
                 request_id.clone(),
                 actor_user_id,

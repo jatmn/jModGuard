@@ -65,12 +65,73 @@ struct Inner {
     evidence: Arc<parking_lot::RwLock<EvidenceBackend>>,
     erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
-    epoch_retry: AtomicI64,
+    epoch_retry: EpochRetryGeneration,
 }
 
 struct HandleCache {
     order: VecDeque<String>,
     map: HashMap<String, GuildDataStore>,
+}
+
+enum EpochRetryAdmission {
+    Schedule,
+    AlreadyScheduled,
+}
+
+#[derive(Default)]
+struct EpochRetryGeneration(AtomicI64);
+
+impl EpochRetryGeneration {
+    // This is a generation admission marker, not proof that a task is still running.
+    fn admit(&self, generation: i64) -> EpochRetryAdmission {
+        if self.0.swap(generation, Ordering::AcqRel) == generation {
+            EpochRetryAdmission::AlreadyScheduled
+        } else {
+            EpochRetryAdmission::Schedule
+        }
+    }
+}
+
+enum HandleLookup<'a> {
+    Missing,
+    Cached(&'a GuildDataStore),
+}
+
+impl HandleCache {
+    fn lookup(&self, id: &str) -> HandleLookup<'_> {
+        match self.map.get(id) {
+            Some(handle) => HandleLookup::Cached(handle),
+            None => HandleLookup::Missing,
+        }
+    }
+
+    fn touch(&mut self, id: &str) {
+        self.order.retain(|stored| stored != id);
+        self.order.push_back(id.to_owned());
+    }
+
+    fn publish(&mut self, id: &str, handle: GuildDataStore, max_handles: usize) {
+        self.touch(id);
+        self.map.insert(id.to_owned(), handle);
+        while self.map.len() > max_handles {
+            if let Some(old) = self.order.pop_front()
+                && old != id
+            {
+                self.map.remove(&old);
+            } else if self.order.front().map(String::as_str) == Some(id) {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum EvidenceUnavailable {
+    Disabled,
+    #[cfg(unix)]
+    WaitingForIdentity,
+    #[cfg(not(unix))]
+    UnsupportedPlatform,
 }
 
 struct ResolvedStore {
@@ -80,7 +141,7 @@ struct ResolvedStore {
 
 #[derive(Clone)]
 enum EvidenceBackend {
-    None,
+    Unavailable(EvidenceUnavailable),
     #[cfg(unix)]
     Local(crate::evidence_transfer::LocalEvidenceStore),
     #[cfg(unix)]
@@ -373,7 +434,10 @@ impl TenantRuntime {
                     #[cfg(unix)]
                     if evidence.backend == "local"
                         && core.is_read_only()
-                        && matches!(*slot.read(), EvidenceBackend::None)
+                        && matches!(
+                            *slot.read(),
+                            EvidenceBackend::Unavailable(EvidenceUnavailable::WaitingForIdentity)
+                        )
                     {
                         start_evidence_id_retry(core.clone(), evidence.clone(), Arc::clone(&slot));
                     }
@@ -381,7 +445,7 @@ impl TenantRuntime {
                 },
                 erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
-                epoch_retry: AtomicI64::new(0),
+                epoch_retry: EpochRetryGeneration::default(),
             }),
         })
     }
@@ -609,7 +673,10 @@ impl TenantRuntime {
     }
 
     fn schedule_epoch_retry(&self, generation: i64) {
-        if self.inner.epoch_retry.swap(generation, Ordering::AcqRel) == generation {
+        if matches!(
+            self.inner.epoch_retry.admit(generation),
+            EpochRetryAdmission::AlreadyScheduled
+        ) {
             return;
         }
         let runtime = self.clone();
@@ -684,7 +751,7 @@ impl TenantRuntime {
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<EvidenceState> {
         match self.evidence_backend() {
-            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Unavailable(_) => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => backend.reconcile(store, target).await,
             EvidenceBackend::Bunny(backend) => backend.reconcile(store, target).await,
         }
@@ -697,7 +764,7 @@ impl TenantRuntime {
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<()> {
         match self.evidence_backend() {
-            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Unavailable(_) => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => {
                 backend.cleanup(store, target).await?;
             }
@@ -785,7 +852,7 @@ impl TenantRuntime {
         }
         #[cfg(unix)]
         {
-            if matches!(self.evidence_backend(), EvidenceBackend::None) {
+            if matches!(self.evidence_backend(), EvidenceBackend::Unavailable(_)) {
                 return Ok(None);
             }
             let guild_id = enrollment.guild_id;
@@ -823,7 +890,7 @@ impl TenantRuntime {
                 limits: evidence_limits(),
             };
             let state = match self.evidence_backend() {
-                EvidenceBackend::None => return Ok(None),
+                EvidenceBackend::Unavailable(_) => return Ok(None),
                 EvidenceBackend::Local(backend) => {
                     let file = std::fs::File::open(&source)
                         .context("attachment capture source is missing")?;
@@ -843,7 +910,7 @@ impl TenantRuntime {
     #[cfg(unix)]
     fn evidence_storage_id(&self) -> Option<CaseId> {
         match self.evidence_backend() {
-            EvidenceBackend::None => None,
+            EvidenceBackend::Unavailable(_) => None,
             EvidenceBackend::Local(store) => Some(store.storage_id().clone()),
             EvidenceBackend::Bunny(store) => Some(store.storage_id().clone()),
         }
@@ -947,7 +1014,7 @@ impl TenantRuntime {
             }
             for job in &jobs {
                 match self.evidence_backend() {
-                    EvidenceBackend::None => {
+                    EvidenceBackend::Unavailable(_) => {
                         anyhow::bail!("private evidence cleanup requires its configured backend");
                     }
                     #[cfg(unix)]
@@ -999,10 +1066,9 @@ impl TenantRuntime {
 
     async fn handle(&self, id: &StoreId) -> Result<GuildDataStore> {
         let mut cache = self.inner.handles.lock().await;
-        if let Some(handle) = cache.map.get(id.as_str()) {
+        if let HandleLookup::Cached(handle) = cache.lookup(id.as_str()) {
             let handle = handle.clone();
-            cache.order.retain(|stored| stored != id.as_str());
-            cache.order.push_back(id.as_str().to_owned());
+            cache.touch(id.as_str());
             return Ok(handle);
         }
         drop(cache);
@@ -1015,8 +1081,8 @@ impl TenantRuntime {
             .clone();
         let _opening = open_lock.lock().await;
         let cache = self.inner.handles.lock().await;
-        if let Some(handle) = cache.map.get(id.as_str()).cloned() {
-            return Ok(handle);
+        if let HandleLookup::Cached(handle) = cache.lookup(id.as_str()) {
+            return Ok(handle.clone());
         }
         drop(cache);
         let resolved = self
@@ -1028,21 +1094,10 @@ impl TenantRuntime {
         let handle = open_runtime_store(&self.core, resolved).await?;
         self.ensure_writer_epoch(&handle).await?;
         let mut cache = self.inner.handles.lock().await;
-        if let Some(existing) = cache.map.get(id.as_str()).cloned() {
-            return Ok(existing);
+        if let HandleLookup::Cached(existing) = cache.lookup(id.as_str()) {
+            return Ok(existing.clone());
         }
-        cache.order.retain(|stored| stored != id.as_str());
-        cache.order.push_back(id.as_str().to_owned());
-        cache.map.insert(id.as_str().to_owned(), handle.clone());
-        while cache.map.len() > self.inner.max_handles {
-            if let Some(old) = cache.order.pop_front()
-                && old != id.as_str()
-            {
-                cache.map.remove(&old);
-            } else if cache.order.front().map(String::as_str) == Some(id.as_str()) {
-                break;
-            }
-        }
+        cache.publish(id.as_str(), handle.clone(), self.inner.max_handles);
         Ok(handle)
     }
 
@@ -1052,7 +1107,7 @@ impl TenantRuntime {
     }
 
     pub fn evidence_enabled(&self) -> bool {
-        !matches!(self.evidence_backend(), EvidenceBackend::None)
+        !matches!(self.evidence_backend(), EvidenceBackend::Unavailable(_))
     }
 
     fn evidence_backend(&self) -> EvidenceBackend {
@@ -1092,7 +1147,7 @@ impl TenantRuntime {
             return Ok(None);
         };
         let bytes = match self.evidence_backend() {
-            EvidenceBackend::None => {
+            EvidenceBackend::Unavailable(_) => {
                 anyhow::bail!("evidence backend is not configured")
             }
             #[cfg(unix)]
@@ -1281,7 +1336,7 @@ fn evidence_root(core: &Db, evidence: &EvidenceConfig) -> Result<PathBuf> {
 
 async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceBackend> {
     match evidence.backend.as_str() {
-        "none" => Ok(EvidenceBackend::None),
+        "none" => Ok(EvidenceBackend::Unavailable(EvidenceUnavailable::Disabled)),
         "local" => {
             #[cfg(unix)]
             {
@@ -1291,7 +1346,9 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
                         .await?
                         .is_none()
                 {
-                    return Ok(EvidenceBackend::None);
+                    return Ok(EvidenceBackend::Unavailable(
+                        EvidenceUnavailable::WaitingForIdentity,
+                    ));
                 }
                 let first_install = db::existing_evidence_storage_id(core, &evidence.storage_id)
                     .await?
@@ -1320,7 +1377,9 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
             #[cfg(not(unix))]
             {
                 let _ = core;
-                Ok(EvidenceBackend::None)
+                Ok(EvidenceBackend::Unavailable(
+                    EvidenceUnavailable::UnsupportedPlatform,
+                ))
             }
         }
         "bunny" => {

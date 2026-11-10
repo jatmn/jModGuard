@@ -455,7 +455,7 @@ pub struct Db {
     /// Renewal `block_on` does not share the pool workers or the 75s startup
     /// deadline. The CAS still uses the caller authority window.
     lease_runtime: DbRuntime,
-    startup_deferred: bool,
+    bootstrap_work: BootstrapWork,
     connections: Arc<ConnectionPool>,
     /// Renewal never waits for a core pool permit. Errors discard this stream.
     lease_connection: Arc<Mutex<Option<Connection>>>,
@@ -524,10 +524,10 @@ impl Db {
         let growth_paused = self.runtime.growth_paused();
         CapacityRuntimeStatus {
             growth_paused,
-            startup_deferred: self.startup_deferred,
+            startup_deferred: self.bootstrap_work == BootstrapWork::DeferredAtCapacity,
             reason: if growth_paused {
                 Some("write_bound_exceeded")
-            } else if self.startup_deferred {
+            } else if self.bootstrap_work == BootstrapWork::DeferredAtCapacity {
                 Some("startup_deferred")
             } else {
                 None
@@ -862,7 +862,7 @@ impl Db {
         if !opts.read_only {
             note_writable_open();
         }
-        let startup_deferred = std::cell::Cell::new(false);
+        let bootstrap_work = std::cell::Cell::new(BootstrapWork::Required);
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
             bot_name: GuildSettings::default().bot_name,
@@ -877,14 +877,14 @@ impl Db {
                     // terminal defaults remain authoritative until a later restart
                     // can safely finish ordinary seed/heal work.
                     if bootstrap_at_capacity(bootstrap)? {
-                        startup_deferred.set(true);
+                        bootstrap_work.set(BootstrapWork::DeferredAtCapacity);
                         return Ok(());
                     }
                     // Hide readiness only when this open will actually rebuild
                     // schema/defaults. Clearing on every reconnect made a
                     // retryable pool failure look like an incomplete first boot
                     // and blocked the API for the whole remote retry window.
-                    if migrate_open_needs_api_fence(bootstrap)? {
+                    if migrate_open_fence(bootstrap)? == ApiBootstrapFence::Required {
                         clear_bootstrap_complete(bootstrap)?;
                     }
                     migrate_conn(bootstrap).context("migrate")?;
@@ -911,10 +911,11 @@ impl Db {
                     // token fails on the first real WebUI write instead of here.
                     let _ = read_bootstrap_defaults_primary(bootstrap)?;
                 }
+                bootstrap_work.set(BootstrapWork::Complete);
                 Ok(())
             },
             |bootstrap| {
-                if opts.migrate && !startup_deferred.get() {
+                if opts.migrate && bootstrap_work.get() == BootstrapWork::Complete {
                     write_meta_string_conn(
                         bootstrap,
                         META_BOOTSTRAP_COMPLETE,
@@ -924,7 +925,7 @@ impl Db {
                 Ok(())
             },
         )?;
-        db.startup_deferred = startup_deferred.get();
+        db.bootstrap_work = bootstrap_work.get();
         Ok(db)
     }
 
@@ -1065,7 +1066,7 @@ impl Db {
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
                 lease_runtime,
-                startup_deferred: false,
+                bootstrap_work: BootstrapWork::Complete,
                 connections: Arc::new(ConnectionPool {
                     idle: Mutex::new(connections),
                     database,

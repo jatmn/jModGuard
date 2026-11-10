@@ -251,6 +251,29 @@ pub fn enter_startup_probe(probe: Option<Arc<StartupProbe>>) -> StartupProbeGuar
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrowthAdmission {
+    Open,
+    Paused,
+}
+
+#[derive(Default)]
+struct GrowthGuard(AtomicBool);
+
+impl GrowthGuard {
+    fn state(&self) -> GrowthAdmission {
+        if self.0.load(Ordering::Acquire) {
+            GrowthAdmission::Paused
+        } else {
+            GrowthAdmission::Open
+        }
+    }
+
+    fn pause(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub struct DbRuntime {
     handle: tokio::runtime::Handle,
@@ -258,7 +281,7 @@ pub struct DbRuntime {
     operation_timeout: Option<Duration>,
     // Shared by all connections for one physical Db pool. A discovered bound
     // violation pauses growth until that runtime is restarted and repaired.
-    growth_paused: Arc<AtomicBool>,
+    growth_guard: Arc<GrowthGuard>,
     startup_probe: Option<Arc<StartupProbe>>,
     /// Test-only stand-in for `tokio::time::timeout`. The database runtime is
     /// multi-thread, and `tokio::time::pause` refuses that flavor.
@@ -273,7 +296,7 @@ pub struct DbRuntime {
 
 impl DbRuntime {
     pub(crate) fn growth_paused(&self) -> bool {
-        self.growth_paused.load(Ordering::Acquire)
+        self.growth_guard.state() == GrowthAdmission::Paused
     }
     pub fn new() -> Result<Self> {
         Self::with_operation_timeout(None)
@@ -284,7 +307,7 @@ impl DbRuntime {
             handle: self.handle.clone(),
             _thread: Arc::clone(&self._thread),
             operation_timeout,
-            growth_paused: Arc::clone(&self.growth_paused),
+            growth_guard: Arc::clone(&self.growth_guard),
             startup_probe: self.startup_probe.clone(),
             #[cfg(test)]
             manual_clock: Arc::clone(&self.manual_clock),
@@ -330,7 +353,7 @@ impl DbRuntime {
                 join: Mutex::new(Some(join)),
             }),
             operation_timeout,
-            growth_paused: Arc::new(AtomicBool::new(false)),
+            growth_guard: Arc::new(GrowthGuard::default()),
             startup_probe: current_startup_probe(),
             #[cfg(test)]
             manual_clock: Arc::new(Mutex::new(None)),
@@ -1455,8 +1478,7 @@ impl Connection {
             write_state,
             read_deadline,
             mutation_receipt: None,
-            capacity_dirty: AtomicBool::new(false),
-            capacity_poisoned: AtomicBool::new(false),
+            capacity_tracking: CapacityTracking::default(),
             stream: Arc::new(TransactionStream::new()),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
@@ -1836,8 +1858,7 @@ pub struct Transaction {
     /// a write; member write transactions never set it.
     read_deadline: Option<tokio::time::Instant>,
     mutation_receipt: Option<String>,
-    capacity_dirty: AtomicBool,
-    capacity_poisoned: AtomicBool,
+    capacity_tracking: CapacityTracking,
     stream: Arc<TransactionStream>,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
@@ -1848,13 +1869,88 @@ pub struct Transaction {
     schema_verification: Arc<Mutex<Option<SchemaVerification>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapacityCheck {
+    NotRequired,
+    Required,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapacityHealth {
+    Valid,
+    Poisoned,
+}
+
+// Independent monotonic observations; poisoning must not erase a pending check.
+#[derive(Default)]
+struct CapacityTracking {
+    dirty: AtomicBool,
+    poisoned: AtomicBool,
+}
+
+impl CapacityTracking {
+    fn check(&self) -> CapacityCheck {
+        if self.dirty.load(Ordering::Acquire) {
+            CapacityCheck::Required
+        } else {
+            CapacityCheck::NotRequired
+        }
+    }
+
+    fn require_check(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn health(&self) -> CapacityHealth {
+        if self.poisoned.load(Ordering::Acquire) {
+            CapacityHealth::Poisoned
+        } else {
+            CapacityHealth::Valid
+        }
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReservationLimit {
+    Unselected,
+    Selected(std::num::NonZeroU64),
+}
+
+impl ReservationLimit {
+    fn from_bytes(bytes: u64) -> Self {
+        match std::num::NonZeroU64::new(bytes) {
+            Some(limit) => Self::Selected(limit),
+            None => Self::Unselected,
+        }
+    }
+
+    fn selected(self) -> Option<u64> {
+        match self {
+            Self::Unselected => None,
+            Self::Selected(limit) => Some(limit.get()),
+        }
+    }
+
+    fn bytes(self) -> u64 {
+        self.selected().unwrap_or(0)
+    }
+
+    fn accepts(self, bytes: u64) -> bool {
+        self.selected().is_none_or(|current| current == bytes)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CapacityReservation {
     start_bytes: u64,
     initial_bytes: u64,
     reserved_bytes: u64,
     page_size: u64,
-    limit_bytes: u64,
+    limit: ReservationLimit,
 }
 
 impl Transaction {
@@ -1897,12 +1993,12 @@ impl Transaction {
 
     fn reserve_growth_limit(&self, additional_bytes: u64, limit_bytes: u64) -> Result<()> {
         anyhow::ensure!(
-            !self.capacity_poisoned.load(Ordering::Acquire),
+            self.capacity_tracking.health() == CapacityHealth::Valid,
             "database growth exceeded the reserved bound; transaction is poisoned"
         );
         anyhow::ensure!(
             limit_bytes != self.capacity_limits.growth
-                || !self.runtime.growth_paused.load(Ordering::Acquire),
+                || self.runtime.growth_guard.state() == GrowthAdmission::Open,
             "database growth paused after an underestimated write bound"
         );
         let mut reservation = self
@@ -1918,16 +2014,16 @@ impl Transaction {
                     initial_bytes: sample.allocated_bytes,
                     reserved_bytes: 0,
                     page_size: sample.page_size,
-                    limit_bytes,
+                    limit: ReservationLimit::from_bytes(limit_bytes),
                 }
             }
         };
         let mut next = current;
         anyhow::ensure!(
-            current.limit_bytes == 0 || current.limit_bytes == limit_bytes,
+            current.limit.accepts(limit_bytes),
             "mixed database capacity policies in one transaction"
         );
-        next.limit_bytes = limit_bytes;
+        next.limit = ReservationLimit::from_bytes(limit_bytes);
         let cumulative = current
             .reserved_bytes
             .checked_add(additional_bytes)
@@ -1942,8 +2038,8 @@ impl Transaction {
             );
             if actual.allocated_bytes > current.initial_bytes.saturating_add(current.reserved_bytes)
             {
-                self.capacity_poisoned.store(true, Ordering::Release);
-                self.runtime.growth_paused.store(true, Ordering::Release);
+                self.capacity_tracking.poison();
+                self.runtime.growth_guard.pause();
                 anyhow::bail!(
                     "database growth exceeded the reserved bound; transaction is poisoned"
                 );
@@ -1957,7 +2053,7 @@ impl Transaction {
             .ok_or_else(|| anyhow::anyhow!("database capacity reservation overflow"))?;
         crate::capacity::admit_to(next.initial_bytes, next.reserved_bytes, limit_bytes)?;
         *reservation = Some(next);
-        self.capacity_dirty.store(true, Ordering::Release);
+        self.capacity_tracking.require_check();
         Ok(())
     }
 
@@ -1975,7 +2071,7 @@ impl Transaction {
             initial_bytes: sample.allocated_bytes,
             reserved_bytes: 0,
             page_size: sample.page_size,
-            limit_bytes: 0,
+            limit: ReservationLimit::Unselected,
         });
         Ok(sample.page_size)
     }
@@ -2226,8 +2322,7 @@ impl Transaction {
             .lock()
             .map_err(|_| anyhow::anyhow!("capacity reservation lock poisoned"))?
             .as_ref()
-            .map(|r| r.limit_bytes)
-            .filter(|n| *n != 0)
+            .and_then(|r| r.limit.selected())
             .unwrap_or(self.capacity_limits.growth);
         self.reserve_growth_limit(max_growth_bytes, limit)?;
         self.execute_unchecked(sql, params)
@@ -2307,7 +2402,7 @@ impl Transaction {
 
     pub fn commit(mut self) -> Result<()> {
         anyhow::ensure!(
-            !self.capacity_poisoned.load(Ordering::Acquire),
+            self.capacity_tracking.health() == CapacityHealth::Valid,
             "database growth exceeded the reserved bound; transaction is poisoned"
         );
         if let Some(receipt) = self.mutation_receipt.as_deref() {
@@ -2316,15 +2411,14 @@ impl Transaction {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("capacity reservation lock poisoned"))?
                 .as_ref()
-                .map(|r| r.limit_bytes)
-                .filter(|n| *n != 0)
+                .and_then(|r| r.limit.selected())
                 .unwrap_or(self.capacity_limits.growth);
             self.reserve_growth_limit(RECEIPT_GROWTH_ALLOWANCE, limit)?;
             self.execute_unchecked(
                 "UPDATE mutation_receipts SET created_at=unixepoch() WHERE receipt_id=?1",
                 params![receipt],
             )?;
-            self.capacity_dirty.store(true, Ordering::Release);
+            self.capacity_tracking.require_check();
         }
         if let Some(expected) = self.expected_lease_owner.as_deref() {
             self.reject_unless_active_lease(expected)?;
@@ -2347,7 +2441,7 @@ impl Transaction {
         if let Some(generation) = self.expected_writer_generation {
             self.reject_unless_writer_epoch(generation)?;
         }
-        if self.capacity_dirty.load(Ordering::Acquire) {
+        if self.capacity_tracking.check() == CapacityCheck::Required {
             let actual = crate::capacity::sample(&*self)?;
             let expected = self
                 .capacity_reservation
@@ -2363,13 +2457,13 @@ impl Transaction {
                     .initial_bytes
                     .saturating_add(expected.reserved_bytes)
             {
-                self.runtime.growth_paused.store(true, Ordering::Release);
+                self.runtime.growth_guard.pause();
                 anyhow::bail!(
                     "database growth exceeded the reserved bound; database growth is paused"
                 );
             }
-            crate::capacity::admit_to(actual.allocated_bytes, 0, expected.limit_bytes)?;
-            if expected.limit_bytes == self.capacity_limits.reclaim {
+            crate::capacity::admit_to(actual.allocated_bytes, 0, expected.limit.bytes())?;
+            if expected.limit.bytes() == self.capacity_limits.reclaim {
                 anyhow::ensure!(
                     actual.allocated_bytes <= expected.start_bytes.max(self.capacity_limits.growth),
                     "maintenance transaction increased allocation above growth stop"
@@ -2772,8 +2866,7 @@ impl SqlExecutor for Transaction {
             .lock()
             .map_err(|_| anyhow::anyhow!("capacity reservation lock poisoned"))?
             .as_ref()
-            .map(|r| r.limit_bytes)
-            .filter(|n| *n != 0)
+            .and_then(|r| r.limit.selected())
             .unwrap_or(self.capacity_limits.growth);
         self.reserve_growth_limit(max_growth_bytes, limit)?;
         self.execute_unchecked(sql, params)

@@ -991,7 +991,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     let tmp = tmp_db_path("migrate_fence");
     let empty = Connection::open(&tmp).unwrap();
     assert!(
-        migrate_open_needs_api_fence(&empty).unwrap(),
+        migrate_open_fence(&empty).unwrap() == ApiBootstrapFence::Required,
         "an empty database must fence the API until the bot finishes bootstrap"
     );
     drop(empty);
@@ -1009,7 +1009,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     .expect("bot migrate-open");
     bot.with_conn_sync(|conn| {
         assert!(
-            !migrate_open_needs_api_fence(conn)?,
+            migrate_open_fence(conn)? == ApiBootstrapFence::PreserveReady,
             "a finished bootstrap must not hide readiness on reconnect"
         );
         Ok(())
@@ -1031,7 +1031,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     bot.with_conn_sync(|conn| {
         clear_bootstrap_complete(conn)?;
         assert!(
-            migrate_open_needs_api_fence(conn)?,
+            migrate_open_fence(conn)? == ApiBootstrapFence::Required,
             "a missing marker must fence the API during a real bootstrap"
         );
         Ok(())
