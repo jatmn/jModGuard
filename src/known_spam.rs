@@ -228,6 +228,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
             if let Some(i) = head.find(crate::normalize::is_zero_width)
                 && !head.contains('@')
             {
+                let prefix = &head[..i];
                 let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
                 let text = url_token_text(candidate);
                 if ["http://", "https://"].iter().any(|scheme| {
@@ -235,7 +236,16 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
                 }) {
                     start = token.end() - candidate.len();
-                } else if (!head[..i].contains(['.', ':']) || head[..i].chars().all(|c| c == ':'))
+                } else if ((!prefix.contains(['.', ':', '\u{3002}', '\u{ff0e}', '\u{ff61}'])
+                    && !["%2e", "%e3%80%82", "%ef%bc%8e", "%ef%bd%a1"]
+                        .iter()
+                        .any(|separator| {
+                            prefix
+                                .as_bytes()
+                                .windows(separator.len())
+                                .any(|part| part.eq_ignore_ascii_case(separator.as_bytes()))
+                        }))
+                    || prefix.chars().all(|c| c == ':'))
                     && text
                         .split(['/', '?', '#'])
                         .next()
