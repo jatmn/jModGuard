@@ -4481,7 +4481,7 @@ mod tests {
                 1,
                 "partial and completed enforcement must report its outcome"
             );
-            let report = reports[0]["content"].as_str().unwrap();
+            let report = crate::logging::tests::log_text(&reports[0]);
             if expected_bans == 0 {
                 assert!(report.contains("remaining actions skipped"), "{report}");
                 assert!(

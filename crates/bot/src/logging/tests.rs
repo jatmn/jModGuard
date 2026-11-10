@@ -1,7 +1,7 @@
 use super::*;
 
 // Inspect the real builder payload while retaining the existing evidence assertions.
-fn log_text(message: &serde_json::Value) -> String {
+pub(crate) fn log_text(message: &serde_json::Value) -> String {
     assert!(
         message.get("content").is_none(),
         "log content must be an embed"
@@ -3011,6 +3011,22 @@ async fn write_proxy_reply(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
+fn request_log_payload(request: &str) -> serde_json::Value {
+    let body = request.split_once("\r\n\r\n").unwrap().1;
+    if let Some((_, json_part)) = body.split_once("name=\"payload_json\"") {
+        let json = json_part
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .split("\r\n--")
+            .next()
+            .unwrap();
+        serde_json::from_str(json).unwrap()
+    } else {
+        serde_json::from_str(body).unwrap()
+    }
+}
+
 fn request_names_transcript(request: &[u8]) -> bool {
     request
         .windows("deleted-messages.txt".len())
@@ -3206,6 +3222,42 @@ async fn replayed_bulk_attachment_forbidden_delivers_plain_text() {
         before,
         "a delivered text fallback is not a failed log"
     );
+    for (index, request) in seen.iter().enumerate() {
+        let payload = request_log_payload(request);
+        let embed = &payload["embeds"][0];
+        assert_eq!(embed["title"], "Messages deleted");
+        assert_eq!(embed["color"], jmodguard::log_embeds::RED);
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert!(payload.get("content").is_none());
+        assert!(payload.get("flags").is_none());
+        if index == 0 {
+            assert_eq!(embed["fields"][0]["name"], "Channel");
+            assert_eq!(embed["fields"][0]["value"], "<#456>");
+            assert!(
+                embed["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["name"] == "Details"
+                        && f["value"].as_str().unwrap() == "last observed: bulk fallback body")
+            );
+        } else {
+            assert!(
+                embed["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bulk fallback body")
+            );
+            assert!(
+                embed["description"]
+                    .as_str()
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+                    <= 4096
+            );
+        }
+    }
     server.abort();
 }
 
@@ -5184,4 +5236,81 @@ async fn queued_bulk_transcript_expires_before_attachment_and_text_fallback() {
         assert!(request.contains("still-valid-bulk-text"), "{request}");
         assert!(!request.contains("expired-bulk-secret"), "{request}");
     }
+}
+
+#[tokio::test]
+async fn delivery_renders_custom_template_as_description_with_event_accent_and_components() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app.db.with_conn(|conn| {
+        conn.execute_bounded("INSERT INTO templates(guild_id,event_type,template) VALUES(789,'message_delete','My custom log: {mention} | {content}')", (), 65_536)?;
+        Ok(())
+    }).await.unwrap();
+    f.app.invalidate_configs();
+    let sink = Sink::default();
+    let vars = BTreeMap::from([
+        ("mention".into(), "<@42>".into()),
+        ("content".into(), "kept wording".into()),
+    ]);
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_delete",
+            vars.clone()
+        )
+        .await,
+        Delivery::Sent
+    );
+    let messages = sink.messages.lock().unwrap();
+    let payload = &messages[0].1;
+    assert_eq!(payload["embeds"][0]["title"], "Message deleted");
+    assert_eq!(
+        payload["embeds"][0]["description"],
+        "My custom log: <@42> | kept wording"
+    );
+    assert!(payload["embeds"][0].get("fields").is_none());
+    assert_eq!(payload["embeds"][0]["color"], jmodguard::log_embeds::RED);
+    assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    assert!(payload.get("content").is_none());
+    let rows = [CreateActionRow::Buttons(vec![
+        serenity::builder::CreateButton::new("review").label("Review"),
+    ])];
+    let component_payload = serde_json::to_value(log_message_with(
+        "message_delete",
+        "My custom log: {mention} | {content}",
+        &vars,
+        &rows,
+    ))
+    .unwrap();
+    assert_eq!(component_payload["embeds"], payload["embeds"]);
+    assert_eq!(
+        component_payload["components"][0]["components"][0]["custom_id"],
+        "review"
+    );
+}
+
+#[test]
+fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
+    let mut vars = BTreeMap::from([(
+        "content".into(),
+        format!("sha256 {}", proving_digests(40).join(",")),
+    )]);
+    let template = default_template("automod");
+    let _ = render_log_template("automod", template, &mut vars);
+    let payload = serde_json::to_value(log_message("automod", template, &vars)).unwrap();
+    let field = payload["embeds"][0]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "Evidence")
+        .unwrap();
+    let content = field["value"].as_str().unwrap();
+    assert!(content.encode_utf16().count() <= 1024);
+    assert_whole_digests(content);
+    assert!(content.contains(" and "));
+    assert!(!content.contains('…'));
 }

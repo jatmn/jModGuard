@@ -3205,12 +3205,12 @@ function TemplateCard({ record: t }) {
   const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
   const preview = templateEmbedPreview(t, template, {
     user: "Alice", user_id: "123456789012345678", mention: "@alice", channel: "#general",
-    actor: "Bob (mod)", reason: "spam", rule: "mention_spam", action: "ban",
+    actor: "Bob (mod)", reason: "spam", rule: "mention_spam", action: t.event === "role_change" ? "updated" : "ban",
     content: "FREE NITRO https://example.test", count: "3", removed: "none", added: "@Member",
     before: "Previous text", after: "Updated text", attachments: "none", coverage: "retained snapshot",
     message_url: "https://discord.com/channels/1/2/3", time: "Nov 09, 2026 • 22:35:54 UTC",
     account_created: "Nov 01, 2026 • 10:00:00 UTC", account_age: "1w 1d", duration: "1d",
-    joined: "Nov 08, 2026 • 22:35:54 UTC", cases: "Case #1: warning", notice: "Prior moderation",
+    joined: "Nov 08, 2026 • 22:35:54 UTC", cases: "Case #1: warning", notice: t.event === "thread_create" ? "created" : "Prior moderation",
     retained: "2", unavailable: "1", unknown: "0", filtered: "0", omitted: "0",
     details: "transcript attached", rule_id: "mention_spam", command: "example",
     role: "@Member", role_id: "123456789012345679", role_name: "Member", detail: "Permissions updated",

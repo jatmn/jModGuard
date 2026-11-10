@@ -705,7 +705,7 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "automod",
-            "Automod\n\n**Rule:** {rule}\n**User:** {user} · {mention}\n**Action:** {action}\n**Reason:** {reason}\n**Channel:** {channel}\n**Time:** `{time}`\n**Evidence:** {content}",
+            "Automod\n\n**Rule:** {rule}\n**User:** {mention}\n**Action:** {action}\n**Reason:** {reason}\n**Channel:** {channel}\n**Time:** `{time}`\n**Evidence:** {content}",
         ),
         (
             "mod_action",

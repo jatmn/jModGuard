@@ -33,7 +33,8 @@ and persistence contracts below are unchanged.
   flags), including full objects that repeat the original content, a
   `message_reference`, or an empty attachment list, are not reports. The bot does
   not report Gateway updates of its own messages, so a log post cannot stack prior
-  reports as current text. Each report is one observed edit. Reports use the short title "Message edited"; they do not claim a verified complete revision diff. A bounded
+  reports as current text. Each report is one observed edit. Reports use the short
+  title "Message edited"; they do not claim a verified complete revision diff. A bounded
   10-second fingerprint merges partial content/attachment updates
   that share an edit timestamp for the same message in one bot process. The
   stored snapshot does the same: a field inherited from an earlier observation
@@ -61,7 +62,8 @@ and persistence contracts below are unchanged.
   including when a pending automod delete falls back through `message_bulk_delete`.
   A user filter still sends the summary and filtered count without that author's
   content. A definite
-  attachment-permission failure uses at most three bounded text chunks in embed descriptions with the
+  attachment-permission failure uses at most three bounded text chunks in embed
+  descriptions with the
   exact number of entries omitted from that fallback; an
   ambiguous timeout or cancellation is never resent, and it does not release a
   deferred replay of the same deletion. That in-flight, deferred, or ambiguous

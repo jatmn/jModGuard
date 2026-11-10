@@ -3839,7 +3839,7 @@ fn default_template(event: &str) -> &'static str {
 mod automod_delete_log;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Preserve the optional persistence result while making failed writes visible.
 pub(crate) fn log_persistence_result<T>(
