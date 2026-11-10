@@ -1990,7 +1990,7 @@ impl BotState {
             revision: revision.to_owned(),
             retry: Default::default(),
         });
-        if class == RetryClass::Permanent && !retry.retry.stopped {
+        if class == RetryClass::Permanent && !retry.retry.is_stopped() {
             tracing::warn!(
                 guild_id = guild,
                 status = response.map(|(status, _)| status),

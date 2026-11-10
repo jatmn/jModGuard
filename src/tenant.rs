@@ -1,8 +1,9 @@
 //! Shared/dedicated guild-store routing, case/evidence handles and live erasure.
 use crate::config::{EvidenceConfig, GuildStoreConfig, GuildStoresConfig};
 use crate::db::guild_data::{
-    CaseError, CaseId, CaseLimits, CaseSource, EvidenceLimits, EvidenceOrigin, EvidenceRequest,
-    EvidenceState, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions, LinkCaseSource,
+    CaseError, CaseId, CaseLimits, CaseSource, ErasureProgress, EvidenceLimits, EvidenceOrigin,
+    EvidenceRequest, EvidenceState, EvidenceWork, GuildDataScope, GuildDataStore,
+    GuildStoreOptions, LinkCaseSource,
 };
 use crate::db::guild_stores::{
     GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
@@ -56,6 +57,33 @@ pub struct UsageStore {
     pub handle: Option<GuildDataStore>,
 }
 
+enum ErasureCursor {
+    Beginning,
+    After(i64),
+}
+
+impl ErasureCursor {
+    fn after(&self) -> Option<i64> {
+        match self {
+            Self::Beginning => None,
+            Self::After(guild) => Some(*guild),
+        }
+    }
+}
+
+// Process-local progress only. On failure/cancellation the durable job is replayed
+// from its captured identities; each operation rechecks its own prerequisites.
+enum ErasurePhase {
+    CloseMembership,
+    CancelEvidence,
+    CleanupEvidence,
+    PurgeCases,
+    EraseScope,
+    Directory,
+    Placement,
+    FinishJob,
+}
+
 struct Inner {
     credentials: Vec<ResolvedStore>,
     default_shared: StoreId,
@@ -63,7 +91,7 @@ struct Inner {
     handles: Mutex<HandleCache>,
     handle_open_locks: parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     evidence: Arc<parking_lot::RwLock<EvidenceBackend>>,
-    erasure_cursor: Mutex<Option<i64>>,
+    erasure_cursor: Mutex<ErasureCursor>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     epoch_retry: EpochRetryGeneration,
 }
@@ -443,7 +471,7 @@ impl TenantRuntime {
                     }
                     slot
                 },
-                erasure_cursor: Mutex::new(None),
+                erasure_cursor: Mutex::new(ErasureCursor::Beginning),
                 locks: parking_lot::Mutex::new(HashMap::new()),
                 epoch_retry: EpochRetryGeneration::default(),
             }),
@@ -927,9 +955,11 @@ impl TenantRuntime {
     pub async fn drive_erasure(&self) -> Result<bool> {
         let job = {
             let mut cursor = self.inner.erasure_cursor.lock().await;
-            let job = next_guild_erasure_after(&self.core, *cursor).await?;
+            let job = next_guild_erasure_after(&self.core, cursor.after()).await?;
             // Advance before I/O so a failed guild cannot monopolize future ticks.
-            *cursor = job.as_ref().map(|job| job.guild_id);
+            *cursor = job.as_ref().map_or(ErasureCursor::Beginning, |job| {
+                ErasureCursor::After(job.guild_id)
+            });
             job
         };
         let Some(job) = job else {
@@ -957,31 +987,70 @@ impl TenantRuntime {
         }
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
-        if !handle.finish_empty_erasure(scope.clone()).await? {
-            handle.close_membership(scope.clone()).await?;
-            let limits = evidence_limits();
-            while handle
-                .cancel_closed_evidence(scope.clone(), limits.max_page_size, limits)
-                .await?
-                > 0
-            {}
-            self.cleanup_evidence(&handle, &scope).await?;
-            while handle
-                .purge_closed_cases(scope.clone(), case_limits().max_page_size, case_limits())
-                .await?
-                > 0
-            {}
-            while !handle.erase_closed_scope(scope.clone()).await? {}
+        let mut phase = match handle.finish_empty_erasure_progress(scope.clone()).await? {
+            ErasureProgress::Complete => ErasurePhase::Directory,
+            ErasureProgress::Remaining => ErasurePhase::CloseMembership,
+        };
+        loop {
+            phase = match phase {
+                ErasurePhase::CloseMembership => {
+                    handle.close_membership(scope.clone()).await?;
+                    ErasurePhase::CancelEvidence
+                }
+                ErasurePhase::CancelEvidence => {
+                    let limits = evidence_limits();
+                    if handle
+                        .cancel_closed_evidence(scope.clone(), limits.max_page_size, limits)
+                        .await?
+                        > 0
+                    {
+                        ErasurePhase::CancelEvidence
+                    } else {
+                        ErasurePhase::CleanupEvidence
+                    }
+                }
+                ErasurePhase::CleanupEvidence => {
+                    self.cleanup_evidence(&handle, &scope).await?;
+                    ErasurePhase::PurgeCases
+                }
+                ErasurePhase::PurgeCases => {
+                    if handle
+                        .purge_closed_cases(
+                            scope.clone(),
+                            case_limits().max_page_size,
+                            case_limits(),
+                        )
+                        .await?
+                        > 0
+                    {
+                        ErasurePhase::PurgeCases
+                    } else {
+                        ErasurePhase::EraseScope
+                    }
+                }
+                ErasurePhase::EraseScope => {
+                    match handle.erase_closed_scope_progress(scope.clone()).await? {
+                        ErasureProgress::Remaining => ErasurePhase::EraseScope,
+                        ErasureProgress::Complete => ErasurePhase::Directory,
+                    }
+                }
+                ErasurePhase::Directory => {
+                    if !wipe_departed_directory_guild_data(&self.core, job.guild_id).await? {
+                        tracing::info!(
+                            guild_id = job.guild_id,
+                            departed_enrollment = %job.enrollment.id,
+                            "preserved directory data for a newer active guild enrollment"
+                        );
+                    }
+                    ErasurePhase::Placement
+                }
+                ErasurePhase::Placement => {
+                    clear_erased_placement(&self.core, job.guild_id, &job.placement).await?;
+                    ErasurePhase::FinishJob
+                }
+                ErasurePhase::FinishJob => return finish_guild_erasure(&self.core, job).await,
+            };
         }
-        if !wipe_departed_directory_guild_data(&self.core, job.guild_id).await? {
-            tracing::info!(
-                guild_id = job.guild_id,
-                departed_enrollment = %job.enrollment.id,
-                "preserved directory data for a newer active guild enrollment"
-            );
-        }
-        clear_erased_placement(&self.core, job.guild_id, &job.placement).await?;
-        finish_guild_erasure(&self.core, job).await
     }
 
     pub async fn cleanup_owned_evidence(

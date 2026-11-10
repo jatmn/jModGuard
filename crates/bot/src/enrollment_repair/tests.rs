@@ -92,7 +92,7 @@ async fn bounded_pages_repair_missing_joins_and_wait_between_sweeps() {
     assert!(!report.sweep_complete);
     assert_eq!(*source.calls.lock().unwrap(), vec![(None, 2)]);
     assert_eq!(*source.member_calls.lock().unwrap(), vec![10, 20]);
-    assert_eq!(repair.after, Some(20));
+    assert_eq!(repair.cursor, SweepCursor::After(20));
     assert!(
         repair
             .step(&f.db, &f.tenant, &source)
@@ -105,7 +105,7 @@ async fn bounded_pages_repair_missing_joins_and_wait_between_sweeps() {
     let report = repair.step(&f.db, &f.tenant, &last).await.unwrap().unwrap();
     assert_eq!(*last.calls.lock().unwrap(), vec![(Some(20), 2)]);
     assert!(report.sweep_complete);
-    assert_eq!(repair.after, None);
+    assert_eq!(repair.cursor, SweepCursor::Beginning);
     assert!(repair.next > Instant::now() + Duration::from_secs(3500));
     for guild in [10, 20, 30] {
         assert!(db::guild_enrollment(&f.db, guild).await.unwrap().is_some());
@@ -152,11 +152,11 @@ async fn invalid_pages_fail_before_any_observation_and_back_off() {
         vec![5],
     ] {
         let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
-        repair.after = Some(5);
+        repair.cursor = SweepCursor::After(5);
         let source = Source::new(page);
         assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
         assert!(source.member_calls.lock().unwrap().is_empty());
-        assert_eq!(repair.after, Some(5));
+        assert_eq!(repair.cursor, SweepCursor::After(5));
         assert!(
             repair
                 .step(&f.db, &f.tenant, &source)
@@ -236,7 +236,7 @@ async fn timeouts_and_listing_failures_are_bounded_and_non_destructive() {
     let mut source = Source::new(vec![10]);
     source.fail_page = true;
     assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
-    assert_eq!(repair.after, None);
+    assert_eq!(repair.cursor, SweepCursor::Beginning);
     assert!(source.member_calls.lock().unwrap().is_empty());
     source.fail_page = false;
     source.stall_member = true;
@@ -268,7 +268,7 @@ async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() 
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     let source = Source::new(vec![10, 20]);
     assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
-    assert_eq!(repair.after, None);
+    assert_eq!(repair.cursor, SweepCursor::Beginning);
     assert_eq!(source.member_calls.lock().unwrap().as_slice(), &[10]);
     assert!(repair.next > Instant::now() + Duration::from_secs(50));
     f.db.with_conn(|conn| conn.execute_batch_bounded("DROP TRIGGER fail_insert", 65_536))
@@ -409,7 +409,10 @@ async fn bot_cache_invalidation_tracks_committed_membership_changes() {
 // Shared with the local HTTP regression in commands: inspect the production
 // scheduler state and make its time deadline eligible without sleeping.
 pub(crate) fn assert_auth_stopped_after_deadline(repair: &mut EnrollmentRepair) {
-    assert!(repair.retry.stopped, "401 must stop, not merely back off");
+    assert!(
+        repair.retry.is_stopped(),
+        "401 must stop, not merely back off"
+    );
     assert!(
         !repair
             .retry

@@ -895,23 +895,48 @@ pub(crate) fn should_remember_rest_rejection(
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum RetryAdmission {
+    #[default]
+    Open,
+    Stopped,
+}
+
+#[derive(Default)]
+enum RetryWait {
+    #[default]
+    Ready,
+    Until(std::time::Instant),
+}
+
 /// Process-local REST retry deadline. Permanent errors wait for an explicit
 /// reset; unauthorized errors must never be reset by registry/config changes.
 #[derive(Default)]
 pub struct RestRetry {
     failures: u32,
-    pub(crate) next: Option<std::time::Instant>,
-    pub(crate) stopped: bool,
+    wait: RetryWait,
+    admission: RetryAdmission,
 }
 
 impl RestRetry {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.admission == RetryAdmission::Stopped
+    }
+
+    pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
+        match self.wait {
+            RetryWait::Ready => None,
+            RetryWait::Until(next) => Some(next),
+        }
+    }
+
     pub fn due(&self, now: std::time::Instant) -> bool {
-        !self.stopped && self.next.is_none_or(|next| now >= next)
+        !self.is_stopped() && self.deadline().is_none_or(|next| now >= next)
     }
 
     pub fn fail(&mut self, class: RetryClass, now: std::time::Instant, base_secs: u64) {
         if class != RetryClass::Transient {
-            self.stopped = true;
+            self.admission = RetryAdmission::Stopped;
             return;
         }
         let base = base_secs
@@ -924,7 +949,8 @@ impl RestRetry {
             .unwrap_or_default()
             .subsec_nanos() as u64
             % (base / 4 + 1);
-        self.next = Some(now + std::time::Duration::from_secs((base + jitter).min(3600)));
+        self.wait =
+            RetryWait::Until(now + std::time::Duration::from_secs((base + jitter).min(3600)));
     }
 }
 
@@ -1823,7 +1849,7 @@ mod tests {
         let mut previous = 0;
         for _ in 0..16 {
             retry.fail(super::RetryClass::Transient, now, 30);
-            let wait = retry.next.unwrap().duration_since(now).as_secs();
+            let wait = retry.deadline().unwrap().duration_since(now).as_secs();
             assert!((30..=3600).contains(&wait));
             assert!(wait >= previous);
             previous = wait;

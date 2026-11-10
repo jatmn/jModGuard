@@ -1,6 +1,12 @@
 //! Coordinated removal of a departed guild's owned store rows. Not a move.
-use super::tenant_logs::verify_scope;
+use super::tenant_logs::{MembershipState, ScopeRequirement, verify_membership};
 use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErasureProgress {
+    Remaining,
+    Complete,
+}
 
 impl GuildDataStore {
     /// Only for continuation of a durable directory erasure job. An absent binding
@@ -8,6 +14,13 @@ impl GuildDataStore {
     /// must match the captured placement. Finish an empty binding left by interrupted
     /// activation; populated bindings must match the full scope. Never authorizes data access.
     pub async fn finish_empty_erasure(&self, scope: GuildDataScope) -> Result<bool> {
+        Ok(self.finish_empty_erasure_progress(scope).await? == ErasureProgress::Complete)
+    }
+
+    pub(crate) async fn finish_empty_erasure_progress(
+        &self,
+        scope: GuildDataScope,
+    ) -> Result<ErasureProgress> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
@@ -22,7 +35,7 @@ impl GuildDataStore {
                 )?;
                 if !bound {
                     tx.finish_read()?;
-                    return Ok(true);
+                    return Ok(ErasureProgress::Complete);
                 }
                 verify_bound_placement(&tx, &expected, &scope.placement)?;
                 let membership: bool = tx.query_row(
@@ -39,11 +52,11 @@ impl GuildDataStore {
                         params![scope.guild_id()],
                     )?;
                     tx.commit()?;
-                    return Ok(true);
+                    return Ok(ErasureProgress::Complete);
                 }
-                verify_scope(&tx, &expected, &scope, false)?;
+                verify_membership(&tx, &expected, &scope, ScopeRequirement::IncludingClosed)?;
                 tx.finish_read()?;
-                Ok(false)
+                Ok(ErasureProgress::Remaining)
             })
             .await
     }
@@ -52,14 +65,21 @@ impl GuildDataStore {
     /// Refuses an active membership. The coordinator uses `finish_empty_erasure`
     /// to resume its core suffix after this transaction has removed the binding.
     pub async fn erase_closed_scope(&self, scope: GuildDataScope) -> Result<bool> {
+        Ok(self.erase_closed_scope_progress(scope).await? == ErasureProgress::Complete)
+    }
+
+    pub(crate) async fn erase_closed_scope_progress(
+        &self,
+        scope: GuildDataScope,
+    ) -> Result<ErasureProgress> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_write()?;
-                let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
-                anyhow::ensure!(!active, CaseError::Active);
+                let stored = verify_membership(&tx, &expected, &scope, ScopeRequirement::IncludingClosed)?;
+                anyhow::ensure!(stored.state == MembershipState::Closed, CaseError::Active);
                 let snapshots: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
@@ -78,7 +98,7 @@ impl GuildDataStore {
                         super::snapshots::growth_reserve(&tx)?,
                     )?;
                     tx.commit()?;
-                    return Ok(false);
+                    return Ok(ErasureProgress::Remaining);
                 }
                 tx.prepare_reclaim()?;
                 tx.execute_reclaim(
@@ -97,7 +117,7 @@ impl GuildDataStore {
                     params![scope.guild_id()],
                 )?;
                 tx.commit()?;
-                Ok(true)
+                Ok(ErasureProgress::Complete)
             })
             .await
     }

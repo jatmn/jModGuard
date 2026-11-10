@@ -79,10 +79,31 @@ pub struct RepairReport {
     pub failed: usize,
     pub sweep_complete: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepCursor {
+    Beginning,
+    After(u64),
+}
+
+impl SweepCursor {
+    fn after(self) -> Option<u64> {
+        match self {
+            Self::Beginning => None,
+            Self::After(id) => Some(id),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageExtent {
+    Complete,
+    More,
+}
+
 /// O(1) state between ticks; a page is discarded after use. Restart starts a new sweep.
 pub struct EnrollmentRepair {
     config: EnrollmentConfig,
-    after: Option<u64>,
+    cursor: SweepCursor,
     next: Instant,
     retry: crate::discord::RestRetry,
 }
@@ -91,7 +112,7 @@ impl EnrollmentRepair {
         config.validate()?;
         Ok(Self {
             config,
-            after: None,
+            cursor: SweepCursor::Beginning,
             next: now,
             retry: Default::default(),
         })
@@ -129,7 +150,7 @@ impl EnrollmentRepair {
         source: &impl MembershipSource,
         membership_changed: &mut bool,
     ) -> Result<Option<RepairReport>> {
-        if Instant::now() < self.next || self.retry.stopped {
+        if Instant::now() < self.next || self.retry.is_stopped() {
             return Ok(None);
         }
         match self.page(db, tenant, source, membership_changed).await {
@@ -152,7 +173,7 @@ impl EnrollmentRepair {
                     Instant::now(),
                     u64::from(self.config.retry_secs),
                 );
-                self.next = self.retry.next.unwrap_or(self.next);
+                self.next = self.retry.deadline().unwrap_or(self.next);
                 Err(error)
             }
         }
@@ -167,7 +188,7 @@ impl EnrollmentRepair {
         let timeout = Duration::from_secs(u64::from(self.config.request_timeout_secs));
         let mut guilds = tokio::time::timeout(
             timeout,
-            source.guilds_after(self.after, self.config.batch_size),
+            source.guilds_after(self.cursor.after(), self.config.batch_size),
         )
         .await
         .context("membership listing timed out")??;
@@ -179,14 +200,18 @@ impl EnrollmentRepair {
         anyhow::ensure!(
             guilds
                 .iter()
-                .all(|id| *id > self.after.unwrap_or(0) && i64::try_from(*id).is_ok())
+                .all(|id| *id > self.cursor.after().unwrap_or(0) && i64::try_from(*id).is_ok())
                 && guilds.windows(2).all(|pair| pair[0] != pair[1]),
             "invalid membership pagination"
         );
-        let complete = guilds.len() < self.config.batch_size as usize;
+        let extent = if guilds.len() < self.config.batch_size as usize {
+            PageExtent::Complete
+        } else {
+            PageExtent::More
+        };
         let mut report = RepairReport {
             checked: guilds.len(),
-            sweep_complete: complete,
+            sweep_complete: extent == PageExtent::Complete,
             ..RepairReport::default()
         };
         for guild in &guilds {
@@ -234,13 +259,16 @@ impl EnrollmentRepair {
                 }
             }
         }
-        self.after = if complete {
-            None
+        self.cursor = if extent == PageExtent::Complete {
+            SweepCursor::Beginning
         } else {
-            guilds.last().copied()
+            guilds
+                .last()
+                .copied()
+                .map_or(SweepCursor::Beginning, SweepCursor::After)
         };
         self.next = Instant::now()
-            + Duration::from_secs(u64::from(if complete {
+            + Duration::from_secs(u64::from(if extent == PageExtent::Complete {
                 self.config.sweep_pause_secs
             } else {
                 self.config.poll_secs

@@ -41,6 +41,7 @@ pub use case_history::*;
 mod cases;
 pub use cases::*;
 mod erasure;
+pub(crate) use erasure::ErasureProgress;
 mod snapshots;
 pub use snapshots::*;
 mod member_directory;
