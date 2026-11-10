@@ -255,6 +255,21 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .template-input { min-height: 14rem; line-height: 1.6; resize: vertical; }
 .template-preview { min-width: 0; }
 .template-preview > strong { display: block; font-size: .75rem; margin-bottom: 8px; }
+.template-preview .discord-markdown { background: var(--panel2); border: 1px solid var(--shell-border); border-radius: 8px; padding: 16px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.template-preview .discord-markdown :is(h1, h2, h3) { font-weight: bold; margin: 0; }
+.template-preview .discord-markdown h1 { font-size: 1.5em; }
+.template-preview .discord-markdown h2 { font-size: 1.25em; }
+.template-preview .discord-markdown h3 { font-size: 1.1em; }
+.template-preview .discord-markdown small { display: block; opacity: .75; }
+.template-preview .discord-markdown blockquote { border-left: 3px solid var(--shell-border); padding-left: 12px; margin: 0; }
+.template-preview .discord-markdown :is(ul, ol) { padding-left: 24px; margin: 0; }
+.template-preview .discord-markdown ul { list-style: disc; }
+.template-preview .discord-markdown ol { list-style: decimal; }
+.template-preview .discord-markdown pre { overflow-x: auto; white-space: pre-wrap; }
+.template-preview .discord-markdown code { background: var(--color-base-300); font-family: monospace; }
+.template-preview .discord-markdown a { color: var(--color-info); text-decoration: underline; }
+.preview-spoiler { display: inline-block; }
+.preview-spoiler summary { cursor: pointer; }
 .template-preview .code { min-height: 14rem; margin: 0; line-height: 1.65; }
 .editor-footer { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 16px; padding-top: 18px; border-top: 1px solid var(--shell-border); }
 .editor-footer .field { flex: 0 1 250px; margin: 0; }
