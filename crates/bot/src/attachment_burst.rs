@@ -4817,16 +4817,18 @@ mod tests {
                     .unwrap();
             let embed = &payload["embeds"][0];
             assert_eq!(embed["title"], title, "{payload}");
-            assert_eq!(
-                embed["description"],
-                format!(
-                    "{description}
-
-**Review:** {label} by user 7"
-                ),
-                "{payload}"
+            // A bare title uses the decision footer's separator for promotion.
+            let expected = if template == "Automod" {
+                format!("**Review:** {label} by user 7")
+            } else {
+                format!("{description}\n\n**Review:** {label} by user 7")
+            };
+            assert_eq!(embed["description"], expected, "{payload}");
+            let visible = format!(
+                "{}{}",
+                embed["title"].as_str().unwrap_or_default(),
+                embed["description"].as_str().unwrap()
             );
-            let visible = format!("{title}{description}");
             assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
             assert_eq!(payload["content"], "");
             assert_eq!(payload["embeds"].as_array().unwrap().len(), 1);
@@ -4840,40 +4842,20 @@ mod tests {
     #[tokio::test]
     async fn attachment_burst_guild_heading_crlf() {
         assert_attachment_burst_guild_heading(
-            "Automod
-
-**Rule:** {rule}
-**Reason:** fixture
-",
+            "Automod\r\n\r\n**Rule:** {rule}\r\n**Reason:** fixture\r\n",
             "Automod",
-            "**Rule:** Attachment burst
-**Reason:** fixture
-",
+            "**Rule:** Attachment burst\r\n**Reason:** fixture\r\n",
         )
         .await;
     }
 
     #[tokio::test]
     async fn attachment_burst_guild_heading_mixed() {
-        for separator in [
-            "
-
-", "
-
-",
-        ] {
+        for separator in ["\r\n\n", "\n\r\n"] {
             assert_attachment_burst_guild_heading(
-                &format!(
-                    "Automod{separator}**Rule:** {{rule}}
-body
-end
-"
-                ),
+                &format!("Automod{separator}**Rule:** {{rule}}\r\nbody\nend\r"),
                 "Automod",
-                "**Rule:** Attachment burst
-body
-end
-",
+                "**Rule:** Attachment burst\r\nbody\nend\r",
             )
             .await;
         }
@@ -4882,15 +4864,9 @@ end
     #[tokio::test]
     async fn attachment_burst_guild_heading_custom_crlf() {
         assert_attachment_burst_guild_heading(
-            "Custom log
-
-Automod: {rule}
-unchanged",
+            "Custom log\r\n\r\nAutomod: {rule}\r\nunchanged",
             "",
-            "Custom log
-
-Automod: Attachment burst
-unchanged",
+            "Custom log\r\n\r\nAutomod: Attachment burst\r\nunchanged",
         )
         .await;
     }
@@ -4898,27 +4874,16 @@ unchanged",
     #[tokio::test]
     async fn attachment_burst_guild_heading_lf() {
         assert_attachment_burst_guild_heading(
-            "Automod
-
-**Rule:** {rule}
-**Reason:** fixture",
+            "Automod\n\n**Rule:** {rule}\n**Reason:** fixture",
             "Automod",
-            "**Rule:** Attachment burst
-**Reason:** fixture",
+            "**Rule:** Attachment burst\n**Reason:** fixture",
         )
         .await;
     }
 
     #[tokio::test]
     async fn attachment_burst_guild_heading_bare_cr() {
-        for separator in [
-            "
-
-", "
-
-", "
-",
-        ] {
+        for separator in ["\r\r", "\r\n\r", "\r\n"] {
             let template = format!("Automod{separator}**Rule:** {{rule}}");
             let expected = format!("Automod{separator}**Rule:** Attachment burst");
             assert_attachment_burst_guild_heading(&template, "", &expected).await;
@@ -4927,19 +4892,11 @@ unchanged",
 
     #[tokio::test]
     async fn attachment_burst_guild_heading_trailing_whitespace() {
-        for heading in ["Automod ", "Automod	"] {
+        for heading in ["Automod ", "Automod\t"] {
             assert_attachment_burst_guild_heading(
-                &format!(
-                    "{heading}
-
-**Rule:** {{rule}}"
-                ),
+                &format!("{heading}\r\n\r\n**Rule:** {{rule}}"),
                 "",
-                &format!(
-                    "{heading}
-
-**Rule:** Attachment burst"
-                ),
+                &format!("{heading}\r\n\r\n**Rule:** Attachment burst"),
             )
             .await;
         }
@@ -4947,15 +4904,10 @@ unchanged",
 
     #[tokio::test]
     async fn attachment_burst_guild_heading_no_body() {
-        // A bare title already promotes via the decision footer's LF separator.
-        for template in [
-            "Automod",
-            "Automod
-
-",
-        ] {
+        for template in ["Automod", "Automod\r\n\r\n"] {
             assert_attachment_burst_guild_heading(template, "Automod", "").await;
         }
+        assert_attachment_burst_guild_heading("Automod\r\n", "", "Automod\r\n").await;
     }
 
     #[tokio::test]
