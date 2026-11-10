@@ -4328,3 +4328,96 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     drop(db);
     cleanup_db(&tmp);
 }
+
+
+#[test]
+fn builtin_form_params_validate_through_rule_saves() {
+    let tmp = tmp_db_path("builtin_form_params");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope = ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global).unwrap();
+        for id in ["mention_spam", "velocity", "invite"] {
+            let mut rule = get_rule(&db, 0, id).await.unwrap().unwrap();
+            let original = serde_json::to_value(&rule).unwrap();
+            let invalid = if id == "invite" {
+                vec![serde_json::json!("bad"), serde_json::json!(true),
+                     serde_json::json!({}), serde_json::json!(["ok", 42]),
+                     serde_json::json!(["ok", null])]
+            } else {
+                vec![serde_json::json!(0), serde_json::json!(601),
+                     serde_json::json!(u64::MAX), serde_json::json!(-1),
+                     serde_json::json!(1.5), serde_json::json!("10")]
+            };
+            let key = if id == "invite" { "allowlist_codes" } else { "window_secs" };
+            for value in invalid {
+                rule.params[key] = value;
+                let error = upsert_enrolled_rule(&db, scope.clone(), id, &rule).await.unwrap_err();
+                assert!(error.to_string().contains(if id == "invite" { "array of strings" } else { "1–600 seconds" }), "{error}");
+                assert!(upsert_rule(&db, 0, id, &rule).await.is_err());
+                assert_eq!(serde_json::to_value(get_rule(&db, 0, id).await.unwrap().unwrap()).unwrap(), original);
+            }
+            let valid = if id == "invite" {
+                vec![serde_json::json!([]), serde_json::json!(["code"])]
+            } else {
+                vec![serde_json::json!(1), serde_json::json!(600)]
+            };
+            for value in valid {
+                rule.params[key] = value;
+                upsert_enrolled_rule(&db, scope.clone(), id, &rule).await.unwrap();
+                assert_eq!(get_rule(&db, 0, id).await.unwrap().unwrap().params, rule.params);
+            }
+            // Missing legacy keys retain the runtime defaults (or empty invite list).
+            rule.params = serde_json::json!({});
+            upsert_enrolled_rule(&db, scope.clone(), id, &rule).await.unwrap();
+        }
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_upgrade_is_exact_and_once() {
+    const OLD: &str = "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    let tmp = tmp_db_path("invite_description_upgrade");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded("DELETE FROM meta WHERE key = 'invite_description_v1'", (), 64 * 1024 * 1024)?;
+        let mut rule = crate::defaults::default_rules().into_iter().find(|r| r.name == "Invite links").unwrap();
+        rule.enabled = false;
+        rule.params = serde_json::json!({"allowlist_guilds": ["123"], "operator_key": true});
+        for guild in [0, 123, 456] {
+            rule.description = if guild == 456 { "My custom invite guidance" } else { OLD }.into();
+            conn.execute_bounded(
+                "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                params![guild, serde_json::to_string(&rule)?], 64 * 1024 * 1024)?;
+        }
+        Ok(())
+    })).unwrap();
+    let before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let current = crate::defaults::default_rules().into_iter().find(|r| r.name == "Invite links").unwrap();
+    for guild in [0, 123, 456] {
+        let rule = tokio_test_block_on(get_rule(&db, guild, "invite")).unwrap().unwrap();
+        assert_eq!(rule.description, if guild == 456 { "My custom invite guidance" } else { &current.description });
+        assert!(!rule.enabled);
+        assert_eq!(rule.params, serde_json::json!({"allowlist_guilds": ["123"], "operator_key": true}));
+        assert_eq!(serde_json::to_value(rule.actions).unwrap(), serde_json::to_value(&current.actions).unwrap());
+    }
+    assert_eq!(tokio_test_block_on(get_config_version(&db)).unwrap(), before + 1);
+    assert_eq!(tokio_test_block_on(get_slash_registry_version(&db)).unwrap(), slash_before);
+    // An operator deliberately restoring the previous wording after migration owns it.
+    tokio_test_block_on(async {
+        let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        rule.description = OLD.into();
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+    });
+    let after = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(tokio_test_block_on(get_rule(&db, 0, "invite")).unwrap().unwrap().description, OLD);
+    assert_eq!(tokio_test_block_on(get_config_version(&db)).unwrap(), after);
+    drop(db);
+    cleanup_db(&tmp);
+}

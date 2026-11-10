@@ -1330,6 +1330,42 @@ mod tests {
     use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
 
     #[test]
+    fn builtin_legacy_windows_clamp_to_retained_history() {
+        use super::{RuleState, WindowEvent};
+        use std::time::Duration;
+        for id in ["mention_spam", "velocity"] {
+            for (window, age_ms, expected) in [(0, 500, true), (0, 2000, false),
+                (601, 599_000, true), (601, 600_500, false),
+                (u64::MAX, 599_000, true), (u64::MAX, 601_000, false)] {
+                let engine = AutomodEngine::new();
+                let now = Instant::now();
+                let mut rule = crate::defaults::default_rules()[if id == "mention_spam" { 0 } else { 6 }].clone();
+                rule.params = serde_json::json!({"window_secs": window, "max_mentions_in_window": 1, "max_messages": 1});
+                let at = now - Duration::from_millis(age_ms);
+                engine.state.insert((1, 42), HashMap::from([(id, RuleState {
+                    events: std::collections::VecDeque::from([WindowEvent { at }]),
+                    last_event: Some(at), ..Default::default()
+                })]));
+                let mut ctx = msg(1, "", 0, false, false);
+                ctx.role_mentions = 1;
+                let triggered = if id == "mention_spam" {
+                    engine.trigger_mention_spam(&rule, &ctx, now)
+                } else {
+                    engine.trigger_velocity(&rule, &ctx, now)
+                };
+                assert_eq!(triggered, expected, "{id}: window {window}, age {age_ms}");
+                engine.prune();
+                let after = if id == "mention_spam" {
+                    engine.trigger_mention_spam(&rule, &ctx, now)
+                } else {
+                    engine.trigger_velocity(&rule, &ctx, now)
+                };
+                assert_eq!(after, expected, "pruning must agree with the effective window");
+            }
+        }
+    }
+
+    #[test]
     fn invite_code_form_params_match_without_reinterpreting_legacy_guild_ids() {
         let engine = AutomodEngine::new();
         let mut rule = crate::defaults::default_rules()
