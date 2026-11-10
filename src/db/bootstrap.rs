@@ -1051,6 +1051,17 @@ fn globals_seed_satisfied_tx(conn: &impl SqlExecutor) -> Result<bool> {
             return Ok(false);
         }
     }
+    // An old binary can restore the obsolete wording after the marker was set.
+    // Re-enter the existing seed transaction to repair it and bump config once.
+    let obsolete_invite: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rules WHERE rule_id = 'invite' AND
+         CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = ?1)",
+        params![crate::defaults::OLD_INVITE_DESCRIPTION],
+        |row| Ok(row.get(0)?),
+    )?;
+    if obsolete_invite {
+        return Ok(false);
+    }
     // Counts are not enough. The pre-batch seed ran INSERT OR IGNORE for every
     // shipped key on each boot, so a deleted default came back and a customized
     // row did not. An extra custom row must not hide a missing shipped key.
@@ -1218,16 +1229,17 @@ fn seed_globals_sql(
             sql_text(&serde_json::to_string(rule)?)
         ));
     }
+    // Re-apply on every seed, including after an old writer restores OLD with
+    // the marker already set. The exact-match UPDATE is idempotent and shares
+    // the existing writer transaction and change-based version accounting.
+    body.push_str(&format!(
+        "UPDATE rules SET data = json_set(data, '$.description', {}) \
+         WHERE rule_id = 'invite' AND \
+         CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = {};\n",
+        sql_text(crate::defaults::INVITE_DESCRIPTION),
+        sql_text(crate::defaults::OLD_INVITE_DESCRIPTION)
+    ));
     if meta_string_conn(conn, "invite_description_v1")?.is_none() {
-        // Refresh only the old shipped description, across global and guild
-        // rows. Preserve every operator setting and custom description.
-        body.push_str(&format!(
-            "UPDATE rules SET data = json_set(data, '$.description', {}) \
-             WHERE rule_id = 'invite' AND \
-             CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = {};\n",
-            sql_text(crate::defaults::INVITE_DESCRIPTION),
-            sql_text(crate::defaults::OLD_INVITE_DESCRIPTION)
-        ));
         markers.push("invite_description_v1");
     }
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
