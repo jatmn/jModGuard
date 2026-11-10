@@ -1,4 +1,40 @@
 use super::*;
+
+// Inspect the real builder payload while retaining the existing evidence assertions.
+fn log_text(message: &serde_json::Value) -> String {
+    assert!(
+        message.get("content").is_none(),
+        "log content must be an embed"
+    );
+    assert!(
+        message.get("flags").is_none(),
+        "the log embed must remain visible"
+    );
+    assert_eq!(message["embeds"].as_array().unwrap().len(), 1);
+    let embed = &message["embeds"][0];
+    assert!(embed["color"].as_u64().is_some());
+    let mut text = embed["title"].as_str().unwrap().to_string();
+    if let Some(description) = embed["description"].as_str() {
+        text.push_str("\n\n");
+        text.push_str(description);
+    }
+    for (index, field) in embed["fields"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        text.push_str(if index == 0 { "\n\n" } else { "\n" });
+        text.push_str(&format!(
+            "**{}:** {}",
+            field["name"].as_str().unwrap(),
+            field["value"].as_str().unwrap()
+        ));
+    }
+    text
+}
+
 use crate::config::BotProcessConfig;
 use crate::db::Db;
 use crate::db::SqlExecutor;
@@ -452,11 +488,11 @@ async fn committed_snapshot_transition_reaches_edit_and_delete_delivery() {
         Delivery::Sent
     );
     let messages = sink.messages.lock().unwrap();
-    let edit_text = messages[0].1["content"].as_str().unwrap();
+    let edit_text = log_text(&messages[0].1);
     assert!(edit_text.contains("before text") && edit_text.contains("after text"));
-    let second_text = messages[1].1["content"].as_str().unwrap();
+    let second_text = log_text(&messages[1].1);
     assert!(second_text.contains("after text") && second_text.contains("final text"));
-    let delete_text = messages[2].1["content"].as_str().unwrap();
+    let delete_text = log_text(&messages[2].1);
     assert!(delete_text.contains("final text") && delete_text.contains("<@42>"));
 }
 
@@ -948,20 +984,25 @@ fn unattributed_update_does_not_create_a_snippet() {
 }
 
 #[test]
-fn delivery_disables_mentions_and_embeds_and_bounds_unicode() {
-    let payload = serde_json::to_value(log_message(&format!(
-        "@everyone <@123> <@&456> {}",
-        "🦀".repeat(3000)
-    )))
+fn delivery_uses_visible_embed_suppresses_mentions_and_bounds_unicode() {
+    let payload = serde_json::to_value(log_message(
+        "system",
+        "{content}",
+        &BTreeMap::from([(
+            "content".into(),
+            format!("@everyone <@123> <@&456> {}", "🦀".repeat(3000)),
+        )]),
+    ))
     .unwrap();
     assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
     assert_eq!(payload["allowed_mentions"]["replied_user"], false);
-    assert_eq!(
-        payload["flags"].as_u64().unwrap() & MessageFlags::SUPPRESS_EMBEDS.bits(),
-        MessageFlags::SUPPRESS_EMBEDS.bits()
-    );
-    let text = payload["content"].as_str().unwrap();
-    assert!(text.encode_utf16().count() <= 2000);
+    assert!(payload.get("flags").is_none());
+    assert!(payload.get("content").is_none());
+    assert_eq!(payload["embeds"][0]["title"], "System notice");
+    assert_eq!(payload["embeds"][0]["color"], jmodguard::log_embeds::YELLOW);
+    let text = payload["embeds"][0]["description"].as_str().unwrap();
+    assert!(text.encode_utf16().count() <= 4096);
+    assert!(text.starts_with("@everyone <@123> <@&456>"));
     assert!(text.ends_with('…'));
 }
 
@@ -1173,7 +1214,7 @@ async fn member_rejoin_delivers_when_indexed_case_exceeds_read_budget() {
     assert_eq!(delivery, Delivery::Sent);
     let messages = sink.messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    let content = messages[0].1["content"].as_str().unwrap();
+    let content = log_text(&messages[0].1);
     assert!(
         content.contains("read budget"),
         "rejoin note omitted the budget notice: {content}"
@@ -1225,8 +1266,8 @@ async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
     let messages = sink.messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].0, ChannelId::new(456));
-    let rendered = messages[0].1["content"].as_str().unwrap();
-    assert!(rendered.starts_with("**:gear: System notice**\n\n**Time:** `"));
+    let rendered = log_text(&messages[0].1);
+    assert!(rendered.starts_with("System notice\n\n**Time:** `"));
     assert!(rendered.ends_with(&format!(
         "Bot shutting down (v{}). Uptime: 1h 1m 1s",
         env!("CARGO_PKG_VERSION")
@@ -1307,15 +1348,10 @@ async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
     let messages = sink.messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].0, ChannelId::new(456));
-    assert!(
-        messages[0].1["content"]
-            .as_str()
-            .unwrap()
-            .contains(&format!(
-                "Bot shutting down (v{}). Uptime: 1m 1s",
-                env!("CARGO_PKG_VERSION")
-            ))
-    );
+    assert!(log_text(&messages[0].1).contains(&format!(
+        "Bot shutting down (v{}). Uptime: 1m 1s",
+        env!("CARGO_PKG_VERSION")
+    )));
 }
 
 #[tokio::test]
@@ -1420,12 +1456,7 @@ async fn shutdown_stops_pending_start_notices_before_sending_stop() {
 
     let messages = sink.messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0].1["content"]
-            .as_str()
-            .unwrap()
-            .contains("Bot shutting down")
-    );
+    assert!(log_text(&messages[0].1).contains("Bot shutting down"));
 }
 
 #[tokio::test]
@@ -1683,7 +1714,7 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
         );
     }
     for (_, message) in sink.sink.messages.lock().unwrap().iter() {
-        let text = message["content"].as_str().unwrap();
+        let text = log_text(&message);
         assert!(text.contains("moderator (<@777>)"));
         assert!(text.contains("**Reason:** spam"));
         assert!(!text.contains("{actor}"));
@@ -1755,12 +1786,7 @@ async fn gateway_ban_reuses_claimed_audit_for_report() {
         Delivery::Sent
     );
     assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert!(
-        sink.sink.messages.lock().unwrap()[0].1["content"]
-            .as_str()
-            .unwrap()
-            .contains("moderator (<@777>)")
-    );
+    assert!(log_text(&sink.sink.messages.lock().unwrap()[0].1).contains("moderator (<@777>)"));
 }
 
 #[tokio::test]
@@ -1827,7 +1853,7 @@ async fn inaccessible_audit_renders_explicit_fallback_for_both_events() {
         );
     }
     for (_, message) in sink.messages.lock().unwrap().iter() {
-        let text = message["content"].as_str().unwrap();
+        let text = log_text(&message);
         assert!(text.contains("**Moderator:** unavailable"));
         assert!(text.contains("**Reason:** unavailable"));
         assert!(!text.contains("{actor}"));
@@ -1963,12 +1989,7 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
         Delivery::Sent
     );
     assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
-    assert!(
-        sink.sink.messages.lock().unwrap()[0].1["content"]
-            .as_str()
-            .unwrap()
-            .contains("**Reason:** spam")
-    );
+    assert!(log_text(&sink.sink.messages.lock().unwrap()[0].1).contains("**Reason:** spam"));
 }
 
 fn unclaimed_audit_vars(
@@ -2053,7 +2074,7 @@ async fn repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report
                 Delivery::Sent
             );
             let messages = sink.sink.messages.lock().unwrap();
-            let last = messages.last().unwrap().1["content"].as_str().unwrap();
+            let last = log_text(&messages.last().unwrap().1);
             assert!(last.contains("**Moderator:** <@888>"), "{last}");
             assert!(last.contains("**Reason:** current action"), "{last}");
             assert!(!last.contains("previous action"));
@@ -2213,7 +2234,7 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
                 Delivery::Sent
             );
             let messages = sink.sink.messages.lock().unwrap();
-            let text = messages[0].1["content"].as_str().unwrap();
+            let text = log_text(&messages[0].1);
             assert!(
                 text.contains("**Moderator:** <@888>"),
                 "{event}/{mode}: {text}"
@@ -2330,15 +2351,10 @@ async fn readable_leave_preview_and_supplied_edit_timestamp_reach_discord() {
     let cfg = f.app.configs.get(&f.app.db, 789).await.unwrap();
     let messages = sink.messages.lock().unwrap();
     assert_eq!(
-        messages[0].1["content"].as_str().unwrap(),
-        "**:outbox_tray: elgringo1092 left the server**\n\n**User ID:** `553144871846805504`\n**Time in server:** `Unavailable`\n**Joined at:** `Unavailable`\n**Left at:** `Sep 22, 2026 • 18:02:22 UTC`"
+        log_text(&messages[0].1),
+        "Member left\n\n**User:** elgringo1092 · <@553144871846805504> (`553144871846805504`)\n**User ID:** `553144871846805504`\n**Time in server:** `Unavailable`\n**Joined at:** `Unavailable`\n**Left at:** `Sep 22, 2026 • 18:02:22 UTC`"
     );
-    assert!(
-        messages[1].1["content"]
-            .as_str()
-            .unwrap()
-            .contains("**Time:** `Sep 22, 2026 • 18:02:22 UTC`")
-    );
+    assert!(log_text(&messages[1].1).contains("**Time:** `Sep 22, 2026 • 18:02:22 UTC`"));
     assert_eq!(cfg.find_command("status").unwrap().name, "stats");
     assert!(std::ptr::eq(
         cfg.find_command("stats").unwrap(),

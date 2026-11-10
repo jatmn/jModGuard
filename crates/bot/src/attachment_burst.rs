@@ -1728,9 +1728,10 @@ fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionRes
         ("decision".to_string(), label.to_string()),
         ("actor".to_string(), format!("user {actor}")),
     ]);
-    let content = templates::render_bounded(ATTACHMENT_BURST_DECISION, &vars, 2000);
+    let embed = jmodguard::log_embeds::render("automod", ATTACHMENT_BURST_DECISION, &vars);
     EditInteractionResponse::new()
-        .content(content)
+        .content("")
+        .embed(crate::logging::discord_embed(embed))
         .allowed_mentions(
             serenity::builder::CreateAllowedMentions::new()
                 .all_users(false)
@@ -4179,8 +4180,20 @@ mod tests {
             let value =
                 serde_json::to_value(decision_edit(review.body.clone(), label, UserId::new(7)))
                     .unwrap();
-            assert!(value["content"].as_str().unwrap().encode_utf16().count() <= 2000);
-            assert!(value["content"].as_str().unwrap().contains(label));
+            assert!(
+                value["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+                    <= 4096
+            );
+            assert!(
+                value["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(label)
+            );
             assert_eq!(value["allowed_mentions"]["parse"], serde_json::json!([]));
             assert_eq!(value["allowed_mentions"]["replied_user"], false);
             assert_eq!(value["components"], serde_json::json!([]));
@@ -4654,7 +4667,10 @@ mod tests {
                 let rendered =
                     serde_json::to_value(decision_edit(preview.clone(), label, UserId::new(7)))
                         .unwrap();
-                rendered["content"].as_str().unwrap().to_string()
+                rendered["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
             })
             .collect();
         assert_eq!(

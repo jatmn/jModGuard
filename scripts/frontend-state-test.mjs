@@ -2974,10 +2974,10 @@ test('activity-log events from the config payload render template and log-channe
   assert.equal(cards.length, 2);
   assert.match(cards[0].textContent, /Voice join/);
   assert.match(cards[0].textContent, /voice_join/);
-  assert.match(cards[0].querySelector('pre').textContent, /Alice/);
-  assert.match(cards[0].querySelector('pre').textContent, /#general/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /Alice/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /#general/);
   assert.match(cards[1].textContent, /Member role update/);
-  assert.match(cards[1].querySelector('pre').textContent, /\{added\}/);
+  assert.match(cards[1].querySelector('.log-embed-description').textContent, /@Member/);
   h.app.navigate('logchannels');
   await settle();
   const logs = [...h.document.querySelectorAll('.log-channel-card')];
@@ -4617,4 +4617,56 @@ test('known spam inherited globals are visible and removal is owner only', async
   assert.match(panel.textContent,/tinyurl.com/);
   assert.match(panel.textContent,/Owner only/);
   assert.equal([...panel.querySelectorAll('button')].some(b=>b.textContent === 'Remove'),false);
+});
+
+test('template preview shows embed color, title and fields, then live custom description', async () => {
+  const h = harness();
+  const shipped = 'Message deleted\n\n**Channel:** {channel}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}';
+  h.app.state.config = { templates: [{
+    event: 'message_delete', effective: shipped, shipped,
+    embed_style: {title: 'Message deleted', color: 0xff6666, action_colors: {}, removal_color: null},
+  }] };
+  h.app.navigate('templates');
+  let embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  assert.equal(embed.querySelector('.log-embed-title').textContent, 'Message deleted');
+  assert.deepEqual([...embed.querySelectorAll('.log-embed-field > strong')].map(el => el.textContent), ['Channel', 'Author', 'Time', 'Last observed text']);
+  assert.match(embed.textContent, /#general/);
+  assert.match(embed.textContent, /@alice/);
+  assert.equal(embed.querySelector('code').textContent, 'Nov 09, 2026 • 22:35:54 UTC');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = 'My custom wording: {user} {reason} <script>alert(1)</script>';
+  await fire(input, 'input');
+  embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.querySelectorAll('.log-embed-field').length, 0);
+  assert.equal(embed.querySelector('.log-embed-description').textContent, 'My custom wording: Alice spam <script>alert(1)</script>');
+  assert.equal(embed.querySelector('script'), null);
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  input.value = '🦀'.repeat(3000);
+  await fire(input, 'input');
+  const description = h.document.querySelector('.log-embed-description').textContent;
+  assert.equal(description.length, 4095);
+  assert.ok(description.endsWith('…'));
+});
+
+test('embed preview applies dynamic action/removal accents and aggregate field limits', () => {
+  const previewSource = source.slice(source.indexOf('function clipEmbedText('), source.indexOf('function logPreviewText('));
+  const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
+  const record = {
+    shipped: 'Role changed\n\n**Action:** {action}',
+    embed_style: {title: 'Role changed', color: 0xffb347, action_colors: {created: 0x77dd77, deleted: 0xff6666}},
+  };
+  assert.equal(preview(record, record.shipped, {action: 'created'}).color, 0x77dd77);
+  assert.equal(preview(record, record.shipped, {action: 'deleted'}).color, 0xff6666);
+  assert.equal(preview(record, record.shipped, {action: 'updated'}).color, 0xffb347);
+  record.embed_style.removal_color = 0xff6666;
+  assert.equal(preview(record, record.shipped, {removed: '<@&123>'}).color, 0xff6666);
+  record.shipped = 'Role changed\n\n' + Array.from({length: 30}, (_, i) => `**Field ${i}:** {content}`).join('\n');
+  const embed = preview(record, record.shipped, {content: '🦀'.repeat(1000)});
+  const total = embed.title.length + embed.description.length + embed.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+  assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every(f => f.name.length <= 256 && f.value.length <= 1024));
+  assert.ok(total <= 6000);
+  assert.equal(embed.fields[0].value.length, 1023);
+  assert.equal(embed.fields[0].value.at(-1), '…');
 });
