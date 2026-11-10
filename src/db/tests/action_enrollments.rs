@@ -584,7 +584,7 @@ fn version_seven_actions_are_not_adopted_by_an_existing_membership() {
     let path = tmp_db_path("action_enrollment_upgrade");
     let conn = Connection::open(&path).unwrap();
     for (index, sql) in MIGRATIONS[..7].iter().enumerate() {
-        let tx = conn.transaction_primary_read().unwrap();
+        let tx = conn.transaction_primary_write().unwrap();
         tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();

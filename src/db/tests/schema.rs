@@ -149,7 +149,7 @@ fn first_schema_and_family_marker_rollback_together() {
     let path = tmp_db_path("schema_atomic");
     let conn = Connection::open(&path).unwrap();
     {
-        let tx = conn.transaction_primary_read().unwrap();
+        let tx = conn.transaction_primary_write().unwrap();
         tx.execute_batch_bounded(MIGRATIONS[0], 64 * 1024 * 1024)
             .unwrap();
         tx.pragma_update(None, "user_version", 1).unwrap();
@@ -181,7 +181,7 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
         let path = tmp_db_path("partial_schema_bootstrap");
         let conn = Connection::open(&path).unwrap();
         for (index, sql) in MIGRATIONS[..completed].iter().enumerate() {
-            let tx = conn.transaction_primary_read().unwrap();
+            let tx = conn.transaction_primary_write().unwrap();
             tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
             tx.pragma_update(None, "user_version", (index + 1) as i64)
                 .unwrap();
@@ -207,7 +207,7 @@ fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     let path = tmp_db_path("queue_upgrade");
     let conn = Connection::open(&path).unwrap();
     for (index, sql) in MIGRATIONS[..5].iter().enumerate() {
-        let tx = conn.transaction_primary_read().unwrap();
+        let tx = conn.transaction_primary_write().unwrap();
         tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
@@ -246,7 +246,7 @@ fn one_active_ban_migration_collapses_existing_duplicates() {
     let mut conn = Connection::open(&path).unwrap();
     let prior = 17; // Test 0018 even after later migrations are added.
     for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
-        let tx = conn.transaction_primary_read().unwrap();
+        let tx = conn.transaction_primary_write().unwrap();
         tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
@@ -312,7 +312,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     let mut conn = Connection::open(&path).unwrap();
     let prior = 20; // 0021 deletes built-in and reserved-alias command rows.
     for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
-        let tx = conn.transaction_primary_read().unwrap();
+        let tx = conn.transaction_primary_write().unwrap();
         tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();

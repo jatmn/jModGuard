@@ -1284,7 +1284,7 @@ impl Connection {
             self.inner.is_autocommit(),
             "bounded batch needs its own transaction"
         );
-        let tx = self.transaction_primary_read()?;
+        let tx = self.transaction_primary_write()?;
         tx.execute_batch_bounded(sql, max_growth_bytes)?;
         tx.commit()
     }
@@ -1387,18 +1387,21 @@ impl Connection {
     /// Maintenance-only DELETE transaction. It preserves a 16 MB hard-limit
     /// reserve and may commit above 900 MB only when allocation did not grow.
     pub fn transaction_reclaim(&self) -> Result<Transaction> {
-        let mut transaction = self.transaction_primary_read()?;
+        let mut transaction = self.transaction_primary_write()?;
         transaction.prepare_reclaim()?;
         Ok(transaction)
     }
 
-    /// Starts an IMMEDIATE transaction routed to the primary without creating
-    /// a mutation receipt. Before non-migration writes, enable a mutation receipt
-    /// on the returned transaction so lost COMMIT responses remain recoverable.
-    pub fn transaction_primary_read(&self) -> Result<Transaction> {
+    /// Starts an IMMEDIATE write transaction routed to the primary without
+    /// creating a mutation receipt. Refused on read-only connections, because
+    /// it reserves the writer lock; primary reads that a read-only token can
+    /// open use [`Self::transaction_primary_snapshot`]. Before non-migration
+    /// writes, enable a mutation receipt on the returned transaction so lost
+    /// COMMIT responses remain recoverable.
+    pub fn transaction_primary_write(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
         let (inner, _) = self.open_remote_transaction(
-            "begin primary read transaction",
+            "begin primary write transaction",
             libsql::TransactionBehavior::Immediate,
             None,
         )?;
@@ -2780,6 +2783,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_only_connection_opens_primary_snapshot_and_refuses_primary_write() {
+        let mut connection = Connection::open(":memory:").unwrap();
+        connection.set_read_only(true);
+        // Regression for #469/#478: the primary read path behind WebUI/API
+        // lookups must open on a read-only connection instead of failing with
+        // "read-only connection cannot start a write transaction".
+        let tx = connection
+            .transaction_primary_snapshot()
+            .expect("primary snapshot must open on a read-only connection");
+        assert!(!SqlExecutor::is_write_transaction(&tx));
+        let value: i64 = tx.query_row("SELECT 1", (), |r| Ok(r.get(0)?)).unwrap();
+        assert_eq!(value, 1);
+        tx.finish_read().unwrap();
+        // The clearly named write helper keeps the writer-lock refusal, so a
+        // read-only token fails closed on writes with an explicit error.
+        let error = match connection.transaction_primary_write() {
+            Ok(_) => panic!("write helper must refuse a read-only connection"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("read-only connection cannot start a write transaction"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn manual_deadline_starts_before_the_operation_is_polled() {
         let timeout = Duration::from_millis(300);
         let runtime = DbRuntime::with_operation_timeout(Some(timeout)).unwrap();
@@ -3047,7 +3076,7 @@ mod tests {
             )
             .unwrap();
 
-        let tx = connection.transaction_primary_read().unwrap();
+        let tx = connection.transaction_primary_write().unwrap();
         let inserted = tx
             .query_row_unchecked(INSERT_MUTATION_RECEIPT_SQL, params!["receipt"], |row| {
                 Ok(row.get::<String>(0)?)
@@ -3062,7 +3091,7 @@ mod tests {
                 4_000_000,
             )
             .unwrap();
-        let tx = connection.transaction_primary_read().unwrap();
+        let tx = connection.transaction_primary_write().unwrap();
         let error = tx
             .query_row_unchecked(INSERT_MUTATION_RECEIPT_SQL, params!["blocked"], |row| {
                 Ok(row.get::<String>(0)?)
@@ -3074,7 +3103,7 @@ mod tests {
         connection
             .execute_batch_bounded("DROP TABLE meta", 4_000_000)
             .unwrap();
-        let mut tx = connection.transaction_primary_read().unwrap();
+        let mut tx = connection.transaction_primary_write().unwrap();
         assert_eq!(
             tx.insert_remote_mutation_receipt("guild-receipt").unwrap(),
             "guild-receipt"

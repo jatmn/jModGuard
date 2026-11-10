@@ -111,7 +111,7 @@ pub async fn remove_enrolled_known_bad_image(
     anyhow::ensure!(scope.guild_id() > 0, "known-bad images are guild-only");
     let hash = canonical_image_hash(hash)?;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         scope.verify_conn(&tx)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM known_bad_images WHERE guild_id=?1 AND hash=?2)",

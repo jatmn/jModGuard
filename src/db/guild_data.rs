@@ -361,7 +361,7 @@ fn initialize_store(
         }
         tx.finish_read()?;
     }
-    let mut tx = conn.transaction_primary_read()?;
+    let mut tx = conn.transaction_primary_write()?;
     let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let objects: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
@@ -458,7 +458,7 @@ fn initialize_store(
     match tx.commit() {
         Ok(()) => Ok(()),
         Err(error) if is_database_commit_indeterminate(&error) => {
-            let check = conn.transaction_primary_read()?;
+            let check = conn.transaction_primary_write()?;
             verify_identity(&check, expected)?;
             check.finish_read()?;
             Ok(())
@@ -639,7 +639,7 @@ impl GuildDataStore {
         anyhow::ensure!(generation > 0, "active bot generation is corrupt");
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 let stored: Option<i64> = tx
                     .query_row(
                         "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
@@ -748,7 +748,7 @@ impl GuildDataStore {
         let core = self.core.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_write()?;
                 if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
                     tx.finish_read()?;
                     return Err(error);
@@ -776,7 +776,7 @@ impl GuildDataStore {
         let destination_store_id = destination_store_id.to_owned();
         let destination_revision = destination_revision.to_owned();
         core.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "INSERT INTO guild_write_fences(
@@ -824,7 +824,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 verify_identity(&tx, &expected)?;
                 let current = binding_revision(&tx, placement.guild_id())?;
                 if let Some(current) = current {

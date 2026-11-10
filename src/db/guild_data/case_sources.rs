@@ -72,7 +72,7 @@ impl GuildDataStore {
         let kind = source.kind();
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let parent = source_match(&tx, &scope, &anchor)?.ok_or(CaseError::Conflict)?;
             anyhow::ensure!(parent.id == id, CaseError::Conflict);

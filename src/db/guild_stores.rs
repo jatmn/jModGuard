@@ -238,7 +238,7 @@ pub async fn register_store(
             }
             tx.finish_read()?;
         }
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         if let Some(existing) = registration_conn(&tx, &id)? {
             anyhow::ensure!(existing.policy == policy, CatalogConflict::Registration);
             tx.finish_read()?;
@@ -276,7 +276,7 @@ pub async fn assign_initial_placement(
 ) -> Result<GuildPlacement> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        assign_initial_placement_transaction(conn.transaction_primary_read()?, guild, store_id)
+        assign_initial_placement_transaction(conn.transaction_primary_write()?, guild, store_id)
     })
     .await
 }
@@ -290,7 +290,7 @@ pub(crate) async fn admit_tenant_placement(
 ) -> Result<Option<GuildPlacement>> {
     anyhow::ensure!(enrollment.guild_id > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let current = super::enrollments::active_enrollment_conn(&tx, enrollment.guild_id)?;
         let queued: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
@@ -346,7 +346,7 @@ pub async fn clear_erased_placement(
     let store_id = expected.store_id().as_str().to_owned();
     let revision = expected.revision().to_owned();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         match placement_conn(&tx, guild)? {
             Some(current)
                 if current.store_id.as_str() == store_id && current.revision == revision =>
