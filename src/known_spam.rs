@@ -185,7 +185,11 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         let token = URL_TOKENS.find_at(content, offset)?;
         let mut end = token.end();
-        if content[..token.start()].ends_with("](") {
+        // Allow destination whitespace without splitting raw URL components.
+        if content[..token.start()]
+            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .ends_with("](")
+        {
             let mut depth = 0;
             let mut escaped = false;
             for (i, byte) in token.as_str().bytes().enumerate() {
