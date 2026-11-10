@@ -6,6 +6,9 @@ use std::marker::PhantomData;
 /// Global scope marker: config rows with this guild_id apply to all servers.
 pub const GLOBAL_SCOPE: i64 = 0;
 
+/// Mention/velocity history retention and maximum configurable window.
+pub const AUTOMOD_WINDOW_MAX_SECS: u64 = 600;
+
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
 pub const RULE_IDS: [&str; 8] = [
     "mention_spam",

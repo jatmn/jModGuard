@@ -124,7 +124,7 @@ impl AutomodEngine {
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
         let now = Instant::now();
-        let keep = Duration::from_secs(60 * 10);
+        let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
         self.state.retain(|_, rules| {
             rules.retain(|_, s| {
                 s.events.retain(|e| now.duration_since(e.at) < keep);
@@ -312,7 +312,9 @@ impl AutomodEngine {
 
     /// Counts this message's mentions plus recent mentions in the window.
     fn trigger_mention_spam(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
-        let window = Duration::from_secs(param_u64(rule, "window_secs", 10));
+        let window = Duration::from_secs(
+            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
+        );
         let max_total = param_u64(rule, "max_mentions_in_window", 5) as usize;
 
         let mut total = ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions;
@@ -332,7 +334,9 @@ impl AutomodEngine {
 
     fn trigger_velocity(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
         let max = param_u64(rule, "max_messages", 8) as usize;
-        let window = Duration::from_secs(param_u64(rule, "window_secs", 10));
+        let window = Duration::from_secs(
+            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
+        );
         let mut count = 1usize;
         if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
             for s in bucket.values() {
@@ -1331,21 +1335,42 @@ mod tests {
 
     #[test]
     fn builtin_legacy_windows_clamp_to_retained_history() {
+        assert_legacy_windows(&[(0, 500, true), (0, 2000, false)]);
+    }
+
+    #[test]
+    fn builtin_legacy_long_windows_clamp_to_retained_history() {
+        assert_legacy_windows(&[
+            (601, 599_000, true),
+            (601, 600_500, false),
+            (u64::MAX, 599_000, true),
+            (u64::MAX, 601_000, false),
+        ]);
+    }
+
+    fn assert_legacy_windows(cases: &[(u64, u64, bool)]) {
         use super::{RuleState, WindowEvent};
         use std::time::Duration;
         for id in ["mention_spam", "velocity"] {
-            for (window, age_ms, expected) in [(0, 500, true), (0, 2000, false),
-                (601, 599_000, true), (601, 600_500, false),
-                (u64::MAX, 599_000, true), (u64::MAX, 601_000, false)] {
+            for &(window, age_ms, expected) in cases {
                 let engine = AutomodEngine::new();
                 let now = Instant::now();
-                let mut rule = crate::defaults::default_rules()[if id == "mention_spam" { 0 } else { 6 }].clone();
+                let mut rule = crate::defaults::default_rules()
+                    [if id == "mention_spam" { 0 } else { 6 }]
+                .clone();
                 rule.params = serde_json::json!({"window_secs": window, "max_mentions_in_window": 1, "max_messages": 1});
                 let at = now - Duration::from_millis(age_ms);
-                engine.state.insert((1, 42), HashMap::from([(id, RuleState {
-                    events: std::collections::VecDeque::from([WindowEvent { at }]),
-                    last_event: Some(at), ..Default::default()
-                })]));
+                engine.state.insert(
+                    (1, 42),
+                    HashMap::from([(
+                        id,
+                        RuleState {
+                            events: std::collections::VecDeque::from([WindowEvent { at }]),
+                            last_event: Some(at),
+                            ..Default::default()
+                        },
+                    )]),
+                );
                 let mut ctx = msg(1, "", 0, false, false);
                 ctx.role_mentions = 1;
                 let triggered = if id == "mention_spam" {
@@ -1360,7 +1385,10 @@ mod tests {
                 } else {
                     engine.trigger_velocity(&rule, &ctx, now)
                 };
-                assert_eq!(after, expected, "pruning must agree with the effective window");
+                assert_eq!(
+                    after, expected,
+                    "pruning must agree with the effective window"
+                );
             }
         }
     }
