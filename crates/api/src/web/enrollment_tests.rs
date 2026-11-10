@@ -5735,7 +5735,13 @@ async fn put_rule_normalized_input_matches_database_and_get() {
         "whitelist_roles": [99, " 00123 "], "unknown_field": "discarded"
     });
     let path = "/api/guilds/10/rules/mention_spam";
-    let (status, reply) = f.request("PUT", path, &serde_json::json!({"data": submitted}).to_string()).await;
+    let (status, reply) = f
+        .request(
+            "PUT",
+            path,
+            &serde_json::json!({"data": submitted}).to_string(),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let stored = stored_rule_json(&bot.db, 10, "mention_spam").await;
     let (status, get) = f.request("GET", path, "").await;
@@ -5758,25 +5764,54 @@ async fn put_rule_canonical_body_preserves_value_and_target_layer() {
     let canonical = serde_json::to_value(&rule).unwrap();
     // Global saves from a guild must return the saved global layer even when
     // a different guild override remains effective. Also cover override clear.
-    for (guild, scope, clear) in [(10, "guild", false), (10, "global", false), (10, "global", true), (0, "global", false)] {
+    for (guild, scope, clear) in [
+        (10, "guild", false),
+        (10, "global", false),
+        (10, "global", true),
+        (0, "global", false),
+    ] {
         let mut override_rule = rule.clone();
         override_rule.name = "Different guild override".into();
-        db::upsert_rule(&bot.db, 10, "mention_spam", &override_rule).await.unwrap();
+        db::upsert_rule(&bot.db, 10, "mention_spam", &override_rule)
+            .await
+            .unwrap();
         let path = format!("/api/guilds/{guild}/rules/mention_spam");
-        let (status, reply) = f.request("PUT", &path, &serde_json::json!({
-            "scope": scope, "data": canonical, "clear_guild_override": clear
-        }).to_string()).await;
+        let (status, reply) = f
+            .request(
+                "PUT",
+                &path,
+                &serde_json::json!({
+                    "scope": scope, "data": canonical, "clear_guild_override": clear
+                })
+                .to_string(),
+            )
+            .await;
         assert_eq!(status, StatusCode::OK, "{reply}");
-        assert_eq!(reply, serde_json::json!({"ok":true, "config_patch": {
-            "kind":"rule", "id":"mention_spam", "scope":scope,
-            "value":canonical, "cleared_guild_override":clear
-        }}));
+        assert_eq!(
+            reply,
+            serde_json::json!({"ok":true, "config_patch": {
+                "kind":"rule", "id":"mention_spam", "scope":scope,
+                "value":canonical, "cleared_guild_override":clear
+            }})
+        );
         let target = if scope == "global" { 0 } else { guild };
-        assert_eq!(canonical, stored_rule_json(&bot.db, target, "mention_spam").await);
+        assert_eq!(
+            canonical,
+            stored_rule_json(&bot.db, target, "mention_spam").await
+        );
         let (status, get) = f.request("GET", &path, "").await;
         assert_eq!(status, StatusCode::OK, "{get}");
-        assert_eq!(canonical, get[if scope == "global" { "global" } else { "guild_override" }]);
-        if clear { assert!(get["guild_override"].is_null()); }
+        assert_eq!(
+            canonical,
+            get[if scope == "global" {
+                "global"
+            } else {
+                "guild_override"
+            }]
+        );
+        if clear {
+            assert!(get["guild_override"].is_null());
+        }
     }
 }
 
@@ -5787,15 +5822,95 @@ async fn put_rule_errors_preserve_status_and_database() {
     let bot = f.attach_save_writer().await;
     let canonical = serde_json::to_value(crate::defaults::default_rules().remove(0)).unwrap();
     let before = stored_rule_json(&bot.db, 0, "mention_spam").await;
-    let (status, reply) = f.request("PUT", "/api/guilds/10/rules/not-a-rule", &serde_json::json!({"data":canonical}).to_string()).await;
+    let (status, reply) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/rules/not-a-rule",
+            &serde_json::json!({"data":canonical}).to_string(),
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(reply["error"], "unknown rule `not-a-rule`");
     let path = "/api/guilds/10/rules/mention_spam";
-    let (status, _) = f.request("PUT", path, r#"{"data":{"name":"missing description"}}"#).await;
+    let (status, _) = f
+        .request("PUT", path, r#"{"data":{"name":"missing description"}}"#)
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let (status, reply) = f.request("PUT", path, &serde_json::json!({"data":canonical,"clear_guild_override":true}).to_string()).await;
+    let (status, reply) = f
+        .request(
+            "PUT",
+            path,
+            &serde_json::json!({"data":canonical,"clear_guild_override":true}).to_string(),
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(reply["error"], "override clearing requires a global rule save from a server");
-    assert!(db::get_rule(&bot.db, 10, "mention_spam").await.unwrap().is_none());
+    assert_eq!(
+        reply["error"],
+        "override clearing requires a global rule save from a server"
+    );
+    assert!(
+        db::get_rule(&bot.db, 10, "mention_spam")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(before, stored_rule_json(&bot.db, 0, "mention_spam").await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_rule_recovered_save_reflects_existing_bootstrap_normalization() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    // Main's real one-time bootstrap upgrade predates #494. Model a save
+    // acknowledged before that upgrade, with its response lost by the client.
+    bot.db
+        .with_conn(|conn| {
+            db::SqlExecutor::execute_bounded(
+                conn,
+                "DELETE FROM meta WHERE key = 'invite_description_v1'",
+                (),
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut rule = db::get_rule(&bot.db, 0, "invite").await.unwrap().unwrap();
+    let current_description = rule.description.clone();
+    rule.description =
+        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds)."
+            .into();
+    rule.enabled = false;
+    let submitted = serde_json::to_value(rule).unwrap();
+    let body = serde_json::json!({"scope":"guild", "data":submitted});
+    let path = "/api/guilds/10/rules/invite";
+    let save = "d".repeat(64);
+    let (status, reply) = f
+        .request_save("PUT", path, &body, (&save, false), &enrollment.id)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(stored_rule_json(&bot.db, 10, "invite").await, submitted);
+    // A bot migrate-open performs the actual shipped upgrade; no trigger,
+    // substitute writer, or invented save-time normalization supplies it.
+    let reopened = db::Db::open(&f.path, 2).unwrap();
+    let stored = stored_rule_json(&reopened, 10, "invite").await;
+    assert_eq!(stored["description"], current_description);
+    assert_eq!(stored["enabled"], false);
+    assert_ne!(stored["description"], submitted["description"]);
+    let (status, get) = f.request("GET", path, "").await;
+    assert_eq!(status, StatusCode::OK, "{get}");
+    assert_eq!(get["effective"], stored);
+    assert_eq!(get["guild_override"], stored);
+    let (status, recovered) = f
+        .request_save("PUT", path, &body, (&save, true), &enrollment.id)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{recovered}");
+    assert_eq!(
+        recovered["config_patch"]["value"], stored,
+        "PUT must re-read stored JSON even when recovering a committed save"
+    );
+    assert_eq!(stored, stored_rule_json(&bot.db, 10, "invite").await);
+    assert_ne!(recovered["config_patch"]["value"], submitted);
 }
