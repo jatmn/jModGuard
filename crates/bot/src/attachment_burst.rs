@@ -1728,7 +1728,13 @@ fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionRes
         ("decision".to_string(), label.to_string()),
         ("actor".to_string(), format!("user {actor}")),
     ]);
-    let embed = jmodguard::log_embeds::render("automod", ATTACHMENT_BURST_DECISION, &vars);
+    let mut embed = jmodguard::log_embeds::render("automod", ATTACHMENT_BURST_DECISION, &vars);
+    // The saved flat preview already carries the shipped heading; the edit
+    // presents it in the embed title instead.
+    let heading = format!("{}\n\n", embed.title);
+    if let Some(body) = embed.description.strip_prefix(&heading) {
+        embed.description = body.to_string();
+    }
     EditInteractionResponse::new()
         .content("")
         .embed(crate::logging::discord_embed(embed))
@@ -4645,6 +4651,64 @@ mod tests {
             "a read error permanently consumed the visible review without an action"
         );
     }
+    async fn attachment_burst_decision_title_once(label: Option<&str>) {
+        let (app, path) = open_app();
+        let mut vars = BTreeMap::from([
+            ("rule".into(), "Attachment burst".into()),
+            ("mention".into(), "user 99".into()),
+            ("action".into(), "timeout 10m".into()),
+            ("reason".into(), "fixture".into()),
+            ("content".into(), "fixture".into()),
+            ("channel".into(), "channel 1".into()),
+            ("time".into(), "2026-10-26T02:03:04Z".into()),
+        ]);
+        let original = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
+        let mut visible = original.clone();
+        if let Some(label) = label {
+            let payload =
+                serde_json::to_value(decision_edit(original.clone(), label, UserId::new(7)))
+                    .unwrap();
+            visible = payload["content"].as_str().unwrap_or_default().to_string();
+            for embed in payload["embeds"].as_array().unwrap() {
+                for key in ["title", "description"] {
+                    visible.push_str(embed[key].as_str().unwrap_or_default());
+                }
+                for field in embed["fields"].as_array().into_iter().flatten() {
+                    visible.push_str(field["name"].as_str().unwrap());
+                    visible.push_str(field["value"].as_str().unwrap());
+                }
+            }
+            assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
+            assert_eq!(payload["embeds"][0]["title"], "Automod");
+            assert!(visible.contains(&format!("**Review:** {label} by user 7")));
+            assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(payload["components"], serde_json::json!([]));
+        }
+        assert_eq!(visible.matches("Automod").count(), 1, "{visible}");
+        assert!(visible.contains("Attachment burst"));
+        assert_eq!(
+            logging::preview_automod(&app, GuildId::new(10), &mut vars).await,
+            original
+        );
+        drop(app);
+        close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_release() {
+        attachment_burst_decision_title_once(Some(ATTACHMENT_BURST_RELEASED)).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_ban() {
+        attachment_burst_decision_title_once(Some(ATTACHMENT_BURST_BANNED)).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_preview() {
+        attachment_burst_decision_title_once(None).await;
+    }
+
     #[tokio::test]
     async fn decision_edits_preserve_log_date_formatting() {
         let (app, path) = open_app();
