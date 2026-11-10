@@ -7,6 +7,11 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
+pub(crate) const OLD_INVITE_DESCRIPTION: &str =
+    "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+pub(crate) const INVITE_DESCRIPTION: &str =
+    "Discord invite links, except invite codes configured in allowlist_codes.";
+
 pub fn default_rules() -> Vec<RuleDef> {
     let mut out = Vec::with_capacity(RULE_IDS.len());
     for id in RULE_IDS {
@@ -59,7 +64,7 @@ fn rule(id: &str) -> RuleDef {
         ),
         "invite" => (
             "Invite links",
-            "Discord invite links, except invite codes configured in allowlist_codes.",
+            INVITE_DESCRIPTION,
             json!({"allowlist_codes": []}),
             vec![
                 action(1, "delete", "Invite link", 0, 0),

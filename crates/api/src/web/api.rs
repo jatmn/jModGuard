@@ -316,24 +316,30 @@ pub async fn put_rule(
     }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json_actor(
-        dashboard_actor(&auth),
-        db::ControlOp::UpsertRule {
-            request,
-            target,
-            id: rule_id.clone(),
-            rule: body.data.clone(),
-            clear_guild_override: body.clear_guild_override,
-        },
-    )
-    .await?;
+    let (_, saved) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::UpsertRule {
+                request,
+                target,
+                id: rule_id.clone(),
+                rule: body.data.clone(),
+                clear_guild_override: body.clear_guild_override,
+            },
+        )
+        .await?;
+    // Legacy bots acknowledge saves without a rule body. Let the dashboard
+    // reload authoritative configuration instead of applying a reset/delete.
+    if saved.is_null() {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "config_patch": {
             "kind": "rule",
             "id": rule_id,
             "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": body.data,
+            "value": saved,
             "cleared_guild_override": body.clear_guild_override,
         }
     })))
