@@ -633,41 +633,82 @@ pub async fn add_enrolled_badwords(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, Some(&scope), guild_id)?;
-        let mut rows = Vec::new();
-        let mut changed = false;
-        for pattern in patterns {
-            let existing = tx
-                .query_row(
-                    "SELECT id, note FROM badwords WHERE guild_id=?1 AND pattern=?2 ORDER BY id LIMIT 1",
-                    params![guild_id, pattern.as_str()],
-                    |row| Ok((row.get::<i64>(0)?, row.get::<Option<String>>(1)?)),
-                )
-                .optional()?;
-            let (id, saved_note) = if let Some(existing) = existing {
-                existing
-            } else {
-                tx.execute_rows(
-                    "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
-                    params![guild_id, pattern.as_str(), note.as_deref()],
-                    1,
-                )?;
-                changed = true;
-                (tx.last_insert_rowid(), note.clone())
-            };
-            rows.push(Badword {
-                id,
-                guild_id,
-                pattern,
-                note: saved_note,
-            });
-        }
-        if changed {
+        // Remote interactive transactions have a short lifetime, so the whole
+        // batch uses set-based lookup and insertion instead of per-entry requests.
+        let mut saved = canonical_badwords_conn(&tx, guild_id, &patterns)?;
+        let missing = patterns
+            .iter()
+            .filter(|pattern| !saved.contains_key(*pattern))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let values = (0..missing.len())
+                .map(|i| {
+                    let n = i * 3 + 1;
+                    format!("(?{n}, ?{}, ?{})", n + 1, n + 2)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut args = Vec::with_capacity(missing.len() * 3);
+            for pattern in &missing {
+                args.push(Value::Integer(guild_id));
+                args.push(Value::Text((*pattern).clone()));
+                args.push(note.clone().map(Value::Text).unwrap_or(Value::Null));
+            }
+            tx.execute_insert_batch(
+                &format!("INSERT INTO badwords (guild_id, pattern, note) VALUES {values}"),
+                params_from_iter(args),
+                missing.len() as u64,
+            )?;
+            let inserted = missing.into_iter().cloned().collect::<Vec<_>>();
+            saved.extend(canonical_badwords_conn(&tx, guild_id, &inserted)?);
             bump_config_version_conn(&tx)?;
         }
+        let rows = patterns
+            .into_iter()
+            .map(|pattern| {
+                let (id, note) = saved
+                    .remove(&pattern)
+                    .ok_or_else(|| anyhow::anyhow!("badword batch row missing after insert"))?;
+                Ok(Badword {
+                    id,
+                    guild_id,
+                    pattern,
+                    note,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
         Ok(rows)
     })
     .await
+}
+
+/// Lowest-id exact-scope row for each pattern, read in one statement.
+fn canonical_badwords_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    patterns: &[String],
+) -> Result<std::collections::HashMap<String, (i64, Option<String>)>> {
+    let placeholders = (0..patterns.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT b.pattern, b.id, b.note FROM badwords b
+         WHERE b.guild_id = ?1 AND b.pattern IN ({placeholders})
+           AND b.id = (SELECT MIN(id) FROM badwords
+                       WHERE guild_id = ?1 AND pattern = b.pattern)"
+    ))?;
+    let mut args = Vec::with_capacity(patterns.len() + 1);
+    args.push(Value::Integer(guild_id));
+    args.extend(patterns.iter().cloned().map(Value::Text));
+    let rows = stmt.query_map(params_from_iter(args), |row| {
+        Ok((
+            row.get::<String>(0)?,
+            (row.get::<i64>(1)?, row.get::<Option<String>>(2)?),
+        ))
+    })?;
+    rows.collect()
 }
 
 /// Authoritative lookup used to authorize a following mutation. Ordinary
