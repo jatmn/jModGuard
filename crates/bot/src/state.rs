@@ -352,7 +352,7 @@ struct GatewayCaseSuppressions {
 pub(crate) struct PendingMemberGap {
     pub(crate) guild_id: u64,
     pub(crate) enrollment_id: Option<String>,
-    pub(crate) users: Vec<(i64, bool)>,
+    pub(crate) users: Vec<(i64, db::guild_data::MemberVerifyKind)>,
     pub(crate) reason: String,
     generation: u64,
 }
@@ -386,11 +386,16 @@ impl PendingMemberGaps {
             });
         gap.generation = self.generation;
         gap.reason = reason.to_owned();
+        let kind = if reason.contains("ban") {
+            db::guild_data::MemberVerifyKind::Ban
+        } else {
+            db::guild_data::MemberVerifyKind::Member
+        };
         if let Some(user_id) = user_id.filter(|id| *id > 0)
-            && !gap.users.contains(&(user_id, reason.contains("ban")))
+            && !gap.users.contains(&(user_id, kind))
             && gap.users.len() < MAX_AFFECTED_USERS
         {
-            gap.users.push((user_id, reason.contains("ban")));
+            gap.users.push((user_id, kind));
         }
     }
 
@@ -3237,7 +3242,13 @@ mod tests {
         );
         gaps.acknowledge(&first);
         let current = gaps.snapshot(42).pop().expect("newer failure retained");
-        assert_eq!(current.users, vec![(7, false), (8, false)]);
+        assert_eq!(
+            current.users,
+            vec![
+                (7, db::guild_data::MemberVerifyKind::Member),
+                (8, db::guild_data::MemberVerifyKind::Member)
+            ]
+        );
         gaps.acknowledge(&current);
         assert!(gaps.snapshot(42).is_empty());
     }

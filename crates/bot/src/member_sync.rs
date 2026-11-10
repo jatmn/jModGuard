@@ -33,12 +33,17 @@ fn request_lease_ms(timeout_secs: u32) -> i64 {
     (i64::from(timeout_secs) * 1_000 + 30_000).max(90_000)
 }
 
-fn coverage_gap_for_session(
-    newly_initialized: bool,
-    session_replaced: bool,
-    had_progress: bool,
-) -> bool {
-    had_progress && (newly_initialized || session_replaced)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyObservation {
+    First,
+    Unchanged,
+    Replaced,
+}
+
+impl ReadyObservation {
+    fn coverage_gap(self, had_progress: bool) -> bool {
+        had_progress && matches!(self, Self::First | Self::Replaced)
+    }
 }
 
 #[derive(Default)]
@@ -47,12 +52,12 @@ struct ReadyCoverage {
 }
 
 impl ReadyCoverage {
-    fn pending(&self, key: &(i64, String), generation: u64) -> (bool, bool) {
-        let previous = self.acknowledged.get(key).copied();
-        (
-            previous.is_none(),
-            previous.is_some_and(|value| value != generation),
-        )
+    fn pending(&self, key: &(i64, String), generation: u64) -> ReadyObservation {
+        match self.acknowledged.get(key) {
+            None => ReadyObservation::First,
+            Some(previous) if *previous != generation => ReadyObservation::Replaced,
+            Some(_) => ReadyObservation::Unchanged,
+        }
     }
 
     fn acknowledge(&mut self, key: (i64, String), generation: u64) {
@@ -66,7 +71,7 @@ fn due_work(
     pace_ms: i64,
 ) -> Vec<ReadyWork> {
     let mut work = Vec::with_capacity(2);
-    let import = matches!(status.status.as_str(), "queued" | "running" | "waiting")
+    let import = status.import_scheduled()
         && status
             .next_attempt_at
             .is_none_or(|next| next <= now_ms.saturating_add(pace_ms));
@@ -985,8 +990,7 @@ async fn run_loop(
             };
             member_directory::flush_pending_gaps(&app, &store, &scope).await;
             let key = (gid, scope.enrollment().id.clone());
-            let (newly_initialized, session_replaced) =
-                ready_coverage.pending(&key, ready_generation);
+            let observation = ready_coverage.pending(&key, ready_generation);
             probe.status_read();
             match db::guild_stores::guild_is_write_fenced(&app.db, gid).await {
                 Ok(true) => {
@@ -1007,7 +1011,7 @@ async fn run_loop(
                     continue;
                 }
             }
-            let status = if newly_initialized {
+            let status = if observation == ReadyObservation::First {
                 match store
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
                     .await
@@ -1040,9 +1044,7 @@ async fn run_loop(
             earliest_attempt_ms = earlier_attempt(earliest_attempt_ms, status.next_attempt_at);
             earliest_attempt_ms =
                 earlier_attempt(earliest_attempt_ms, status.audit_recovery_next_attempt_at);
-            if coverage_gap_for_session(
-                newly_initialized,
-                session_replaced,
+            if observation.coverage_gap(
                 status.initial_completed_at.is_some() || status.last_progress_at.is_some(),
             ) && let Err(error) = store
                 .mark_member_reconciliation_needed(
@@ -1085,12 +1087,8 @@ async fn run_loop(
             ) {
                 ready.push((guild_id, store.clone(), scope.clone(), work));
             }
-            if newly_initialized
-                && status.run_kind.as_deref() == Some("initial")
-                && status.phase.as_deref() == Some("members")
-                && status.status == "queued"
-                && status.processed == 0
-                && status.initial_completed_at.is_none()
+            if observation == ReadyObservation::First
+                && status.awaiting_initial_member_page()
                 && let Some(member_count) = cache
                     .guild(guild_id)
                     .map(|guild| guild.member_count as i64)
@@ -1987,11 +1985,11 @@ mod tests {
 
     #[test]
     fn replaced_ready_marks_a_gap_without_treating_resume_as_a_new_session() {
-        assert!(!coverage_gap_for_session(false, false, true));
-        assert!(coverage_gap_for_session(true, false, true));
-        assert!(coverage_gap_for_session(false, true, true));
-        assert!(!coverage_gap_for_session(false, true, false));
-        assert!(!coverage_gap_for_session(true, true, false));
+        assert!(!ReadyObservation::Unchanged.coverage_gap(true));
+        assert!(ReadyObservation::First.coverage_gap(true));
+        assert!(ReadyObservation::Replaced.coverage_gap(true));
+        assert!(!ReadyObservation::Replaced.coverage_gap(false));
+        assert!(!ReadyObservation::First.coverage_gap(false));
     }
 
     #[test]
@@ -1999,22 +1997,22 @@ mod tests {
         let mut coverage = ReadyCoverage::default();
         let first = (10, "first".to_owned());
         let second = (11, "second".to_owned());
-        assert_eq!(coverage.pending(&first, 1), (true, false));
+        assert_eq!(coverage.pending(&first, 1), ReadyObservation::First);
         coverage.acknowledge(first.clone(), 1);
         coverage.acknowledge(second.clone(), 1);
 
-        assert_eq!(coverage.pending(&first, 2), (false, true));
+        assert_eq!(coverage.pending(&first, 2), ReadyObservation::Replaced);
         // A failed enrollment/status read must leave this generation pending.
-        assert_eq!(coverage.pending(&first, 2), (false, true));
+        assert_eq!(coverage.pending(&first, 2), ReadyObservation::Replaced);
         coverage.acknowledge(second.clone(), 2);
-        assert_eq!(coverage.pending(&second, 2), (false, false));
-        assert_eq!(coverage.pending(&first, 2), (false, true));
+        assert_eq!(coverage.pending(&second, 2), ReadyObservation::Unchanged);
+        assert_eq!(coverage.pending(&first, 2), ReadyObservation::Replaced);
 
         coverage.acknowledge(first.clone(), 2);
-        assert_eq!(coverage.pending(&first, 2), (false, false));
+        assert_eq!(coverage.pending(&first, 2), ReadyObservation::Unchanged);
         assert_eq!(
             coverage.pending(&(10, "new-enrollment".to_owned()), 2),
-            (true, false)
+            ReadyObservation::First
         );
     }
 

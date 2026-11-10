@@ -147,6 +147,12 @@ pub async fn mark_user_gap(app: &BotState, guild_id: u64, user_id: i64, reason: 
     mark_gap(app, &store, scope, Some(user_id), reason).await;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GapDelivery {
+    Complete,
+    Retry,
+}
+
 pub async fn flush_pending_gaps(
     app: &BotState,
     store: &db::guild_data::GuildDataStore,
@@ -173,15 +179,10 @@ pub async fn flush_pending_gaps(
             );
             continue;
         }
-        let mut queued = true;
-        for (user_id, is_ban) in &gap.users {
-            let kind = if *is_ban {
-                MemberVerifyKind::Ban
-            } else {
-                MemberVerifyKind::Member
-            };
+        let mut delivery = GapDelivery::Complete;
+        for (user_id, kind) in &gap.users {
             if let Err(error) = store
-                .queue_member_target_check(scope.clone(), *user_id, kind, &gap.reason, now_ms)
+                .queue_member_target_check(scope.clone(), *user_id, *kind, &gap.reason, now_ms)
                 .await
             {
                 tracing::warn!(
@@ -189,11 +190,11 @@ pub async fn flush_pending_gaps(
                     user_id,
                     "member target check retry failed: {error:#}"
                 );
-                queued = false;
+                delivery = GapDelivery::Retry;
                 break;
             }
         }
-        if queued {
+        if delivery == GapDelivery::Complete {
             app.acknowledge_member_gap(&gap);
         }
     }
@@ -1303,8 +1304,11 @@ mod tests {
         assert_eq!(discord_bans, 1);
         let gaps = app.pending_member_gaps(GUILD as u64);
         assert!(
-            gaps.iter()
-                .any(|gap| gap.users.iter().any(|(user, ban)| *user == USER && *ban)),
+            gaps.iter().any(|gap| gap
+                .users
+                .iter()
+                .any(|(user, ban)| *user == USER
+                    && *ban == crate::db::guild_data::MemberVerifyKind::Ban)),
             "refused marker save must keep an in-memory repair"
         );
         let _ = enrollment;

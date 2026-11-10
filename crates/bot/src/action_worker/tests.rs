@@ -2575,7 +2575,10 @@ async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
             assert!(gaps.is_empty(), "{code}");
         } else {
             assert_eq!(gaps.len(), 1);
-            assert_eq!(gaps[0].users, vec![(20, true)]);
+            assert_eq!(
+                gaps[0].users,
+                vec![(20, crate::db::guild_data::MemberVerifyKind::Ban)]
+            );
             assert_eq!(gaps[0].reason, "confirmed unban persistence unavailable");
         }
     }
