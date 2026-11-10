@@ -612,6 +612,8 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
                 r#"{"request_id":"1000_clear"}"#,
             ),
             ("POST", "testregex", r#"{"pattern":"a","sample":"a"}"#),
+            ("POST", "testbadwords", r#"{"sample":"a"}"#),
+            ("POST", "badwords", r#"{"words":"a,b"}"#),
             (
                 "POST",
                 "unban",
@@ -1367,6 +1369,12 @@ async fn configuration_edits_reject_missing_and_replaced_page_memberships() {
                 "badwords",
                 serde_json::json!({"scope":scope,"pattern":"stale"}).to_string(),
             ),
+            (
+                "POST",
+                "badwords",
+                serde_json::json!({"scope":scope,"words":"stale, other"}).to_string(),
+            ),
+            ("POST", "testbadwords", r#"{"sample":"a"}"#.to_owned()),
             ("DELETE", "badwords/1", String::new()),
             (
                 "POST",
@@ -5385,4 +5393,215 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
     let (status, body) = f.request("POST", "/api/guilds/10/cases", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cases"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn badword_setup_saves_atomically_and_tests_saved_and_draft_lists() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    db::add_badword(&bot.db, 0, r"^LEGACY$", None)
+        .await
+        .unwrap();
+    let body = serde_json::json!({"scope":"guild", "words":"scam, pump and dump\nc++, scam"});
+    let save = "e".repeat(64);
+    let (status, reply) = f
+        .request_save(
+            "POST",
+            "/api/guilds/10/badwords",
+            &body,
+            (&save, false),
+            &enrollment.id,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, replay) = f
+        .request_save(
+            "POST",
+            "/api/guilds/10/badwords",
+            &body,
+            (&save, true),
+            &enrollment.id,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply, replay);
+    let (_, listed) = f.request("GET", "/api/guilds/10/badwords", "").await;
+    assert_eq!(listed.as_array().unwrap().len(), 4);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["word"] == "pump and dump")
+    );
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["pattern"] == "^LEGACY$" && row["word"].is_null())
+    );
+    let (status, _) = f
+        .request_save(
+            "POST",
+            "/api/guilds/10/badwords",
+            &body,
+            (&"f".repeat(64), false),
+            &enrollment.id,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (sample, matched) in [
+        ("5c@m", true),
+        ("a s c a m here", true),
+        ("pump  and dump", true),
+        ("scammer", false),
+        ("LEGACY", true),
+        ("legacy", false),
+    ] {
+        let (status, tested) = f
+            .request(
+                "POST",
+                "/api/guilds/10/testbadwords",
+                &serde_json::json!({"sample":sample}).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{tested}");
+        assert_eq!(tested["matched"], matched, "{sample}");
+    }
+    for body in [
+        r#"{"sample":"d r a f t","words":"draft"}"#,
+        r#"{"sample":"ADVANCED","pattern":"^ADVANCED$"}"#,
+    ] {
+        let (status, draft) = f.request("POST", "/api/guilds/10/testbadwords", body).await;
+        assert_eq!(status, StatusCode::OK, "{draft}");
+        assert_eq!(draft["matched"], true);
+    }
+    for words in [" ".to_owned(), format!("good,{}", "x".repeat(201))] {
+        let (status, _) = f
+            .request_save(
+                "POST",
+                "/api/guilds/10/badwords",
+                &serde_json::json!({"words":words}),
+                (&"a".repeat(64), false),
+                &enrollment.id,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(db::list_badwords(&bot.db, 10).await.unwrap().len(), 4);
+    for input in [
+        serde_json::json!({"sample":"x".repeat(4097)}),
+        serde_json::json!({"sample":"x", "pattern":"x".repeat(513)}),
+        serde_json::json!({"sample":"x", "words":"x", "pattern":"x"}),
+    ] {
+        let (status, _) = f
+            .request("POST", "/api/guilds/10/testbadwords", &input.to_string())
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    bot.db
+        .with_conn(|conn| {
+            db::SqlExecutor::execute_bounded(
+                conn,
+                "INSERT INTO badwords(guild_id, pattern) VALUES (10, '[')",
+                (),
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, tested) = f
+        .request(
+            "POST",
+            "/api/guilds/10/testbadwords",
+            r#"{"sample":"safe"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tested["matched"], false);
+    assert_eq!(tested["invalid_patterns"], 1);
+    let (status, _) = f
+        .request_token(
+            "POST",
+            "/api/guilds/10/testbadwords",
+            r#"{"sample":"scam"}"#,
+            Some("stale"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = f
+        .request(
+            "POST",
+            "/api/guilds/0/testbadwords",
+            r#"{"sample":"LEGACY"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn maximal_badword_batch_http_ack_is_compact_and_recovers_saved_ids() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let bot = f.attach_save_writer().await;
+    let words = (0..32)
+        .map(|index| format!("entry{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = serde_json::json!({"words": words, "note": "n".repeat(16 * 1024)});
+    let save = "d".repeat(64);
+    let (status, reply) = f
+        .request_save(
+            "POST",
+            "/api/guilds/10/badwords",
+            &body,
+            (&save, false),
+            &enrollment.id,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let rows = db::list_badwords(&bot.db, 10).await.unwrap();
+    let ids: Vec<_> = rows.iter().map(|row| row.id).collect();
+    assert_eq!(ids.len(), 32);
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "ok": true,
+            "config_patch": {"kind": "badword", "operation": "add_many", "ids": ids}
+        })
+    );
+    for lookup in [true, false] {
+        let (status, recovered) = f
+            .request_save(
+                "POST",
+                "/api/guilds/10/badwords",
+                &body,
+                (&save, lookup),
+                &enrollment.id,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{recovered}");
+        assert_eq!(recovered, reply);
+    }
+    // A fresh paste reuses the rows and their original notes, while the HTTP
+    // acknowledgement stays compact even when the new request has no note.
+    let (status, repeated) = f
+        .request_save(
+            "POST",
+            "/api/guilds/10/badwords",
+            &serde_json::json!({"words": words}),
+            (&"c".repeat(64), false),
+            &enrollment.id,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated, reply);
+    for row in db::list_badwords(&bot.db, 10).await.unwrap() {
+        assert_eq!(row.note.as_deref(), body["note"].as_str());
+    }
 }

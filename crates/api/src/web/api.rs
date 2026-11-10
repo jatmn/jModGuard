@@ -406,7 +406,8 @@ pub(crate) fn scope_from(
 #[derive(Deserialize)]
 pub struct BadwordBody {
     scope: Option<String>,
-    pattern: String,
+    pattern: Option<String>,
+    words: Option<String>,
     note: Option<String>,
 }
 
@@ -436,33 +437,54 @@ pub async fn add_badword(
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    let (_, id_body) = app
-        .commit_json_actor(
-            dashboard_actor(&auth),
-            db::ControlOp::AddBadword {
-                request,
-                target,
-                pattern: body.pattern.clone(),
-                note: body.note.clone(),
-            },
-        )
-        .await?;
-    let id: i64 = serde_json::from_value(id_body)?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "id": id,
-        "config_patch": {
-            "kind": "badword",
-            "operation": "add",
-            "value": {
-                "id": id,
-                "guild_id": scope.to_string(),
-                "pattern": body.pattern,
-                "note": body.note,
-                "valid": true,
-            }
+    match (body.pattern, body.words) {
+        (Some(pattern), None) => {
+            let (_, id_body) = app
+                .commit_json_actor(
+                    dashboard_actor(&auth),
+                    db::ControlOp::AddBadword {
+                        request,
+                        target,
+                        pattern: pattern.clone(),
+                        note: body.note.clone(),
+                    },
+                )
+                .await?;
+            let id: i64 = serde_json::from_value(id_body)?;
+            let word = db::Badword {
+                id,
+                guild_id: scope,
+                pattern,
+                note: body.note,
+            };
+            Ok(Json(serde_json::json!({
+                "ok": true, "id": id,
+                "config_patch": { "kind": "badword", "operation": "add", "value": word.with_status() }
+            })))
         }
-    })))
+        (None, Some(words)) => {
+            crate::normalize::badword_patterns(&words).map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+            let (_, ids) = app
+                .commit_json_actor(
+                    dashboard_actor(&auth),
+                    db::ControlOp::AddBadwords {
+                        request,
+                        target,
+                        words,
+                        note: body.note,
+                    },
+                )
+                .await?;
+            let ids: Vec<i64> = serde_json::from_value(ids)?;
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "config_patch": { "kind": "badword", "operation": "add_many", "ids": ids }
+            })))
+        }
+        _ => Err(ApiError(anyhow::anyhow!(
+            "provide either words or one advanced regex pattern"
+        ))),
+    }
 }
 
 pub async fn delete_badword(
@@ -1088,6 +1110,72 @@ pub async fn copy_config(
 // ---------------------------------------------------------------------------
 // tools / lookups
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TestBadwordsBody {
+    sample: String,
+    words: Option<String>,
+    pattern: Option<String>,
+}
+
+/// Detection preview uses the same saved patterns and raw/normalized/compact
+/// predicate as automod. Rule actions and exemptions are configured separately.
+pub async fn test_badwords(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<TestBadwordsBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    if body.sample.len() > crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES {
+        return Err(ApiError(anyhow::anyhow!(
+            "sample too long (max 4096 bytes)"
+        )));
+    }
+    let draft = match (body.words, body.pattern) {
+        (Some(words), None) => {
+            crate::normalize::badword_patterns(&words).map_err(|e| ApiError(anyhow::anyhow!(e)))?
+        }
+        (None, Some(pattern)) => {
+            crate::normalize::compile_user_regex(&pattern)
+                .map_err(|e| ApiError(anyhow::anyhow!(e)))?;
+            vec![pattern]
+        }
+        (None, None) => Vec::new(),
+        _ => {
+            return Err(ApiError(anyhow::anyhow!(
+                "provide either words or one advanced regex pattern"
+            )));
+        }
+    };
+    let saved = db::list_enrolled_badwords(&app.db, scope).await?;
+    let normalized = crate::normalize::normalize_lenient(&body.sample);
+    let mut matches = Vec::new();
+    let mut invalid_patterns = 0;
+    for (pattern, source) in saved
+        .iter()
+        .map(|row| (&row.pattern, "saved"))
+        .chain(draft.iter().map(|pattern| (pattern, "draft")))
+    {
+        match crate::normalize::compile_user_regex(pattern) {
+            Ok(re) => {
+                if crate::normalize::matches_badword(&body.sample, &normalized, &re) {
+                    matches.push(serde_json::json!({
+                        "label": crate::normalize::badword_literal(pattern).unwrap_or_else(|| format!("Regex · {pattern}")),
+                        "source": source,
+                    }));
+                }
+            }
+            Err(_) => invalid_patterns += 1,
+        }
+    }
+    Ok(Json(
+        serde_json::json!({ "matched": !matches.is_empty(), "matches": matches, "invalid_patterns": invalid_patterns }),
+    ))
+}
 
 #[derive(Deserialize)]
 pub struct TestRegexBody {

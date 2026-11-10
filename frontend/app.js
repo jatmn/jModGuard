@@ -786,7 +786,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -1457,6 +1457,8 @@ function applyConfigPatch(res) {
   if (patch.kind === "badword") {
     if (!Array.isArray(config.badwords)) return false;
     if (patch.operation === "add" && patch.value) config.badwords.push(patch.value);
+    // Batch acknowledgements contain only IDs. Reload authoritative rows/notes.
+    else if (patch.operation === "add_many") return false;
     else if (patch.operation === "delete")
       config.badwords = config.badwords.filter((word) => word.id !== patch.id);
     else return false;
@@ -2224,7 +2226,9 @@ function RuleEditor({ record: r }) {
           field("Window (seconds)", imageWindow),
           h(BanOptions, { action: spamBan }),
         )
-      : field("Parameters (JSON)", paramsText),
+      : r.rule_id === "badword"
+        ? h("p", { className: "field-help" }, "Manage words and advanced regex in Badwords. These settings apply to that saved list.")
+        : field("Parameters (JSON)", paramsText),
     spam
       ? null
       : field(
@@ -2314,7 +2318,7 @@ function RuleEditor({ record: r }) {
                   throw new Error(
                     "Channels must be 2–10 and window 1–600 seconds, all whole numbers. Images 1–10. Text length 1–2000.",
                   );
-              } else {
+              } else if (r.rule_id !== "badword") {
                 rule.params = JSON.parse(paramsTextRef.current.value || "{}");
               }
             } catch (e) {
@@ -2416,15 +2420,19 @@ function applyPlanStepInput(step, type, raw) {
 
 function tabBadwords() {
   const words = state.config.badwords;
-  const testPatternRef = useRef(null);
+  const { drafts } = useStore(ui);
+  const mode = drafts["badwords:mode"]?.value || "words";
+  const badwordRule = state.config.rules.find((rule) => rule.rule_id === "badword");
   const patternRef = useRef(null);
-  const pattern = h(Input, {
+  const pattern = h(Textarea, {
     ref: patternRef,
     draftKey: "badwords:pattern",
-    type: "text",
-    placeholder: "regex pattern, e.g. (scam|pump and dump)",
+    rows: 3,
+    maxLength: mode === "regex" ? 512 : 4096,
+    "aria-label": mode === "regex" ? "Advanced regex pattern" : "Words or phrases",
+    placeholder: mode === "regex" ? "Advanced regex, e.g. (scam|pump and dump)" : "Words or phrases, separated by commas or newlines",
     style: { flex: "2" },
-    className: "input",
+    className: "textarea",
   });
   const noteRef = useRef(null);
   const note = h(Input, {
@@ -2455,12 +2463,33 @@ function tabBadwords() {
     h(
       "p",
       { className: "muted", style: { marginBottom: "12px" } },
-      "Patterns are matched against both the raw message and a normalized form " +
-        "(lowercase, unicode-decomposed, zero-width chars stripped, leetspeak mapped: 4/@→a, 3→e, 0→o, 1→i, 5→s, 7→t, $→s…). " +
+      "Add ordinary words or phrases. Whole-word matching and bypass resistance are automatic, including case, accents, zero-width characters, spacing and supported leetspeak. " +
+        "Add up to 32 entries at once, up to 200 bytes each (compiled pattern limit 512 bytes). Advanced regex keeps its own matching semantics. " +
         (isBotOwner()
           ? "Global patterns apply to every server."
           : "Global patterns (shown below) are enforced for all servers; only the bot owner can edit them."),
     ),
+    badwordRule
+      ? h(
+          "div",
+          { className: "card bg-base-100 card-border" },
+          h(
+            "div",
+            { className: "card-body" },
+            h("h3", { className: "card-title" }, "What happens on match"),
+            h(
+              "p",
+              {},
+              `${badwordRule.effective.enabled ? "Enabled" : "Disabled"} · ${badwordRule.effective.dry_run ? "Dry-run (log only)" : "Enforcing"}`,
+            ),
+            h(
+              ActionButton,
+              { className: "btn", onClick: () => editRule(badwordRule) },
+              "Actions and exemptions",
+            ),
+          ),
+        )
+      : null,
     h(
       DraftCard,
       { group: "badwords", className: "card bg-base-100 card-border" },
@@ -2470,6 +2499,15 @@ function tabBadwords() {
         h(
           "div",
           { className: "row" },
+          field(
+            "Entry type",
+            h(
+              Select,
+              { draftKey: "badwords:mode", defaultValue: "words", className: "select" },
+              h("option", { value: "words" }, "Words or phrases"),
+              h("option", { value: "regex" }, "Advanced regex"),
+            ),
+          ),
           pattern,
           note,
           scope,
@@ -2478,14 +2516,14 @@ function tabBadwords() {
             {
               className: "btn btn-primary",
               onClick: async () => {
-                if (!patternRef.current.value.trim()) return toast("Enter a pattern", "error");
+                if (!patternRef.current.value.trim()) return toast("Enter words, phrases or an advanced regex", "error");
                 await reloadAfter(
                   () => api(`/api/guilds/${state.guildId}/badwords`, "POST", {
                     scope: scopeRef.current.value,
-                    pattern: patternRef.current.value.trim(),
+                    [mode === "regex" ? "pattern" : "words"]: patternRef.current.value.trim(),
                     note: noteRef.current.value || null,
                   }),
-                  () => toast("Badword added", "success"),
+                  () => toast("Badwords saved", "success"),
                 );
               },
             },
@@ -2501,33 +2539,26 @@ function tabBadwords() {
         "div",
         { className: "card-body" },
         h("h3", { className: "card-title" }, "Live tester"),
+        h("p", { className: "field-help" }, "Tests the saved server and global list plus the draft above. Detection only. Enable, dry-run and exemptions determine enforcement."),
         h(
           "div",
           { className: "row" },
-          h(Input, {
-            type: "text",
-            id: "test-pattern",
-            ref: testPatternRef,
-            draftKey: "badwords:test-pattern",
-            placeholder: "regex",
-            style: { flex: "1" },
-            className: "input",
-          }),
           sample,
           h(
             ActionButton,
             {
               className: "btn",
               onClick: async () => {
-                const p = testPatternRef.current.value;
-                if (!p || !sampleRef.current.value) return toast("Enter pattern and sample", "error");
-                const res = await api(`/api/guilds/${state.guildId}/testregex`, "POST", {
-                  pattern: p,
+                if (!sampleRef.current.value) return toast("Enter sample text", "error");
+                const draft = patternRef.current.value.trim();
+                const res = await api(`/api/guilds/${state.guildId}/testbadwords`, "POST", {
                   sample: sampleRef.current.value,
+                  ...(draft ? { [mode === "regex" ? "pattern" : "words"]: draft } : {}),
                 });
-                setResult(
-                  `raw match: ${res.raw_match}\nnormalized match: ${res.normalized_match}\nnormalized: ${res.normalized_sample}`,
-                );
+                const summary = res.matched
+                  ? `Matched ${res.matches.map((match) => `${match.label} (${match.source})`).join(", ")}`
+                  : "No match in the saved list or draft.";
+                setResult(summary + (res.invalid_patterns ? `\nSkipped ${res.invalid_patterns} invalid saved patterns.` : ""));
               },
             },
             "Test",
@@ -2542,12 +2573,12 @@ function tabBadwords() {
       h(
         "div",
         { className: "card-body" },
-        h("h3", { className: "card-title" }, `Patterns (${words.length})`),
+        h("h3", { className: "card-title" }, `Words and patterns (${words.length})`),
         words.length === 0
-          ? h("p", { className: "muted" }, "No patterns yet.")
+          ? h("p", { className: "muted" }, "No words or patterns yet.")
           : h(
               DataTable,
-              { headings: ["Scope", "Pattern", "Note", "Status", ""] },
+              { headings: ["Scope", "Word, phrase or advanced regex", "Note", "Status", ""] },
               words.map((w) => {
                 const isGlobal = String(w.guild_id) === "0";
                 const canDelete = !isGlobal || isBotOwner();
@@ -2556,7 +2587,7 @@ function tabBadwords() {
                   "tr",
                   { key: w.id },
                   h("td", {}, isGlobal ? "global" : "server"),
-                  h("td", { className: "mono" }, w.pattern),
+                  h("td", { className: "mono" }, w.word || `Regex · ${w.pattern}`),
                   h("td", { className: "muted" }, w.note || ""),
                   h(
                     "td",
@@ -2570,7 +2601,7 @@ function tabBadwords() {
                           },
                           "not enforced",
                         )
-                      : h("span", { className: "badge badge-soft badge-sm badge-success" }, "active"),
+                      : h("span", { className: "badge badge-soft badge-sm badge-success" }, "valid"),
                   ),
                   h(
                     "td",

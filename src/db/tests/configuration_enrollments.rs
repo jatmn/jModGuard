@@ -313,6 +313,9 @@ async fn stale_configuration_writes_preserve_rows_and_both_version_markers() {
                 add_enrolled_badword(&f.db, scope.clone(), "changed", None)
                     .await
                     .map(|_| ()),
+                add_enrolled_badwords(&f.db, scope.clone(), "changed, more", None)
+                    .await
+                    .map(|_| ()),
                 delete_enrolled_badword(&f.db, scope, word).await,
             ];
             for result in results {
@@ -1029,4 +1032,54 @@ async fn identical_command_saves_preserve_versions_across_concurrency_and_restar
         .unwrap_err();
     assert!(error.is::<EnrollmentChanged>(), "{error:#}");
     assert_eq!(get_primary_versions(&f.db).await.unwrap(), retired);
+}
+
+#[tokio::test]
+async fn badword_setup_batches_are_atomic_deduplicated_and_revisioned() {
+    let f = Fixture::new();
+    let request = f.scope(10).await;
+    let scope = edit_scope(&request, false);
+    let before = get_primary_versions(&f.db).await.unwrap();
+    let (first, second) = tokio::join!(
+        add_enrolled_badwords(
+            &f.db,
+            scope.clone(),
+            "scam, pump and dump",
+            Some("original")
+        ),
+        add_enrolled_badwords(
+            &f.db,
+            scope.clone(),
+            "scam, pump and dump",
+            Some("original")
+        )
+    );
+    let first = first.unwrap();
+    assert_eq!(
+        first.iter().map(|w| w.id).collect::<Vec<_>>(),
+        second.unwrap().iter().map(|w| w.id).collect::<Vec<_>>()
+    );
+    assert_eq!(list_badwords(&f.db, 10).await.unwrap().len(), 2);
+    let after = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(after.config, before.config + 1);
+    let repeated = add_enrolled_badwords(&f.db, scope.clone(), "SCAM", Some("replacement"))
+        .await
+        .unwrap();
+    assert_eq!(repeated[0].note.as_deref(), Some("original"));
+    assert_eq!(
+        after.config_revision,
+        get_primary_versions(&f.db).await.unwrap().config_revision
+    );
+    for input in [" ".to_owned(), format!("new,{}", "x".repeat(201))] {
+        assert!(
+            add_enrolled_badwords(&f.db, scope.clone(), &input, None)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(list_badwords(&f.db, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        after.config_revision,
+        get_primary_versions(&f.db).await.unwrap().config_revision
+    );
 }

@@ -531,6 +531,7 @@ pub struct BadwordView {
     pub guild_id: i64,
     pub pattern: String,
     pub note: Option<String>,
+    pub word: Option<String>,
     /// False when the pattern fails `compile_user_regex` — not enforced by the bot.
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -546,6 +547,7 @@ impl Badword {
                 guild_id: self.guild_id,
                 pattern: self.pattern.clone(),
                 note: self.note.clone(),
+                word: crate::normalize::badword_literal(&self.pattern),
                 valid: true,
                 error: None,
             },
@@ -554,6 +556,7 @@ impl Badword {
                 guild_id: self.guild_id,
                 pattern: self.pattern.clone(),
                 note: self.note.clone(),
+                word: crate::normalize::badword_literal(&self.pattern),
                 valid: false,
                 error: Some(e),
             },
@@ -612,6 +615,57 @@ async fn add_badword_inner(
         bump_config_version_conn(&tx)?;
         tx.commit()?;
         Ok(id)
+    })
+    .await
+}
+
+/// Ordinary entry batches share one captured write and revision bump. Repeated
+/// pastes reuse exact-scope canonical rows, including concurrent requests.
+pub async fn add_enrolled_badwords(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    words: &str,
+    note: Option<&str>,
+) -> Result<Vec<Badword>> {
+    let patterns = crate::normalize::badword_patterns(words).map_err(|e| anyhow::anyhow!(e))?;
+    let guild_id = scope.guild_id();
+    let note = note.map(str::to_owned);
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, Some(&scope), guild_id)?;
+        let mut rows = Vec::new();
+        let mut changed = false;
+        for pattern in patterns {
+            let existing = tx
+                .query_row(
+                    "SELECT id, note FROM badwords WHERE guild_id=?1 AND pattern=?2 ORDER BY id LIMIT 1",
+                    params![guild_id, pattern.as_str()],
+                    |row| Ok((row.get::<i64>(0)?, row.get::<Option<String>>(1)?)),
+                )
+                .optional()?;
+            let (id, saved_note) = if let Some(existing) = existing {
+                existing
+            } else {
+                tx.execute_rows(
+                    "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
+                    params![guild_id, pattern.as_str(), note.as_deref()],
+                    1,
+                )?;
+                changed = true;
+                (tx.last_insert_rowid(), note.clone())
+            };
+            rows.push(Badword {
+                id,
+                guild_id,
+                pattern,
+                note: saved_note,
+            });
+        }
+        if changed {
+            bump_config_version_conn(&tx)?;
+        }
+        tx.commit()?;
+        Ok(rows)
     })
     .await
 }
