@@ -4,7 +4,7 @@ use crate::state::BotState;
 use parking_lot::Mutex;
 use serenity::client::Context;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,22 +128,46 @@ fn fetched_matches_proving(
     fetched == proving
 }
 
+/// A reservation suppresses overlapping dispatch; only success completes it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum EffectProgress {
+    #[default]
+    Ready,
+    InFlight,
+    Completed,
+}
+
+impl EffectProgress {
+    fn claim(&mut self) -> bool {
+        if *self != Self::Ready {
+            return false;
+        }
+        *self = Self::InFlight;
+        true
+    }
+
+    fn finish(&mut self, success: bool) {
+        // A late failure must not erase an already observed success.
+        if success {
+            *self = Self::Completed;
+        } else if *self != Self::Completed {
+            *self = Self::Ready;
+        }
+    }
+}
+
 struct Applied {
     until: Instant,
-    banned: bool,
-    banning: bool,
-    deleted: BTreeSet<(u64, u64)>,
-    deleting: BTreeSet<(u64, u64)>,
+    ban: EffectProgress,
+    deletes: BTreeMap<(u64, u64), EffectProgress>,
 }
 
 impl Applied {
     fn new(now: Instant) -> Self {
         Self {
             until: now + KEEP,
-            banned: false,
-            banning: false,
-            deleted: BTreeSet::new(),
-            deleting: BTreeSet::new(),
+            ban: EffectProgress::Ready,
+            deletes: BTreeMap::new(),
         }
     }
 }
@@ -173,11 +197,7 @@ impl Gate {
             .or_insert_with(|| Applied::new(now));
         applied.until = now + KEEP;
         let key = (channel, message);
-        if applied.deleted.contains(&key) || applied.deleting.contains(&key) {
-            return false;
-        }
-        applied.deleting.insert(key);
-        true
+        applied.deletes.entry(key).or_default().claim()
     }
 
     fn finish_delete(
@@ -193,9 +213,14 @@ impl Gate {
         let Some(applied) = inner.get_mut(&(guild, author)) else {
             return;
         };
-        applied.deleting.remove(&(channel, message));
-        if success {
-            applied.deleted.insert((channel, message));
+        let key = (channel, message);
+        if let Some(progress) = applied.deletes.get_mut(&key) {
+            progress.finish(success);
+            if *progress == EffectProgress::Ready {
+                applied.deletes.remove(&key);
+            }
+        } else if success {
+            applied.deletes.insert(key, EffectProgress::Completed);
         }
         applied.until = now + KEEP;
     }
@@ -207,11 +232,7 @@ impl Gate {
             .entry((guild, author))
             .or_insert_with(|| Applied::new(now));
         applied.until = now + KEEP;
-        if applied.banned || applied.banning {
-            return false;
-        }
-        applied.banning = true;
-        true
+        applied.ban.claim()
     }
 
     fn finish_ban(&self, guild: u64, author: u64, now: Instant, success: bool) {
@@ -219,10 +240,7 @@ impl Gate {
         let Some(applied) = inner.get_mut(&(guild, author)) else {
             return;
         };
-        applied.banning = false;
-        if success {
-            applied.banned = true;
-        }
+        applied.ban.finish(success);
         applied.until = now + KEEP;
     }
 }

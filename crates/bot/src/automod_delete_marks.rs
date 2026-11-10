@@ -131,22 +131,61 @@ pub(crate) struct AutomodDeleteAttempt(pub(crate) u64);
 type MarkKey = (u64, u64, u64, u64);
 type MessageTarget = (u64, u64, u64);
 
+#[derive(Clone, Copy, Default)]
+enum RestConfirmation {
+    #[default]
+    Pending,
+    Confirmed,
+}
+
+impl RestConfirmation {
+    fn is_confirmed(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum GatewayReceipt {
+    #[default]
+    Unseen,
+    Observed,
+}
+
+impl GatewayReceipt {
+    fn is_observed(self) -> bool {
+        matches!(self, Self::Observed)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum ReportProgress {
+    #[default]
+    Pending,
+    Settled,
+}
+
+impl ReportProgress {
+    fn is_settled(self) -> bool {
+        matches!(self, Self::Settled)
+    }
+}
+
 #[derive(Clone)]
 struct AutomodDeleteMark {
     rule_id: String,
     rule_name: String,
     reason: String,
-    confirmed: bool,
+    confirmation: RestConfirmation,
     expires: Instant,
     retained: Option<MessageSnapshot>,
 }
 
 #[derive(Clone, Default)]
 struct MessageGatewayState {
-    observed: bool,
+    receipt: GatewayReceipt,
     retained: Option<MessageSnapshot>,
     /// Gateway delete already produced or reserved a report class for this message.
-    settled: bool,
+    report: ReportProgress,
     /// First bulk-placement decision for this message. Not replaced by a reload.
     report_owner: Option<ReportOwner>,
 }
@@ -185,11 +224,11 @@ struct UnmarkedDelete {
     rule_name: String,
     reason: String,
     expires: Instant,
-    gateway_observed: bool,
-    emitted: bool,
+    receipt: GatewayReceipt,
+    report: ReportProgress,
     /// REST already succeeded and no individual route existed yet. The next
     /// gateway observation classifies as `automod_delete` instead of a plain delete.
-    rest_succeeded: bool,
+    confirmation: RestConfirmation,
 }
 
 impl UnmarkedDelete {
@@ -386,7 +425,7 @@ impl AutomodDeleteMarks {
             == Some(ReportOwner::Individual);
         self.remove_key(key, now);
         if let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
+            state.report = ReportProgress::Settled;
         }
         AutomodSettlement {
             rule_id,
@@ -491,9 +530,9 @@ impl AutomodDeleteMarks {
                 rule_name: rule_name.to_owned(),
                 reason: reason.to_owned(),
                 expires,
-                gateway_observed: false,
-                emitted: false,
-                rest_succeeded: false,
+                receipt: GatewayReceipt::Unseen,
+                report: ReportProgress::Pending,
+                confirmation: RestConfirmation::Pending,
             },
         );
         if self
@@ -584,18 +623,18 @@ impl AutomodDeleteMarks {
         retained: Option<MessageSnapshot>,
     ) -> Option<GatewayDeleteObservation> {
         let row = self.unmarked.get(&target)?;
-        if row.emitted {
+        if row.report.is_settled() {
             return Some(GatewayDeleteObservation::Suppressed);
         }
-        if row.rest_succeeded {
+        if row.confirmation.is_confirmed() {
             let rule_id = row.rule_id.clone();
             let rule_name = row.rule_name.clone();
             let reason = row.reason.clone();
             if let Some(row) = self.unmarked.get_mut(&target) {
-                row.emitted = true;
+                row.report = ReportProgress::Settled;
             }
             if let Some(state) = self.gateway.get_mut(&target) {
-                state.settled = true;
+                state.report = ReportProgress::Settled;
             }
             return Some(GatewayDeleteObservation::Automod {
                 rule_id,
@@ -604,11 +643,11 @@ impl AutomodDeleteMarks {
             });
         }
         if let Some(row) = self.unmarked.get_mut(&target) {
-            row.gateway_observed = true;
+            row.receipt = GatewayReceipt::Observed;
         }
         let gateway = self.gateway.entry(target).or_default();
-        if !gateway.observed {
-            gateway.observed = true;
+        if !gateway.receipt.is_observed() {
+            gateway.receipt = GatewayReceipt::Observed;
         }
         if let Some(row) = retained {
             self.store_gateway_retained(target, row, now_ms());
@@ -636,7 +675,7 @@ impl AutomodDeleteMarks {
         if !row.owns_attempt(attempt.0) {
             return None;
         }
-        if row.emitted {
+        if row.report.is_settled() {
             if let Some(row) = self.unmarked.get_mut(&target) {
                 row.claim_attempt(attempt.0);
             }
@@ -697,7 +736,7 @@ impl AutomodDeleteMarks {
                         Some(settlement)
                     } else if owner.is_none() {
                         if let Some(row) = self.unmarked.get_mut(&target) {
-                            row.rest_succeeded = true;
+                            row.confirmation = RestConfirmation::Confirmed;
                             row.claim_attempt(attempt.0);
                         }
                         None
@@ -712,11 +751,11 @@ impl AutomodDeleteMarks {
 
     fn mark_unmarked_emitted(&mut self, target: MessageTarget, attempt: u64) {
         if let Some(row) = self.unmarked.get_mut(&target) {
-            row.emitted = true;
+            row.report = ReportProgress::Settled;
             row.claim_attempt(attempt);
         }
         if let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
+            state.report = ReportProgress::Settled;
         }
     }
 
@@ -741,7 +780,7 @@ impl AutomodDeleteMarks {
         if !row.owns_attempt(attempt.0) {
             return None;
         }
-        if row.emitted || row.rest_succeeded {
+        if row.report.is_settled() || row.confirmation.is_confirmed() {
             if let Some(row) = self.unmarked.get_mut(&target) {
                 row.claim_attempt(attempt.0);
             }
@@ -753,7 +792,7 @@ impl AutomodDeleteMarks {
                 bulk_inflight: false,
             });
         }
-        let observed = row.gateway_observed;
+        let observed = row.receipt.is_observed();
         let retained = self
             .gateway
             .get(&target)
@@ -798,7 +837,7 @@ impl AutomodDeleteMarks {
             });
         }
         if let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
+            state.report = ReportProgress::Settled;
         }
         self.reclaim_overflow_gateway(target);
         Some(UnconfirmedRemoval {
@@ -830,12 +869,16 @@ impl AutomodDeleteMarks {
         now: Instant,
     ) -> Option<AutomodSettlement> {
         let gateway = self.gateway.get(&target)?.clone();
-        if !gateway.observed || gateway.settled {
+        if !gateway.receipt.is_observed() || gateway.report.is_settled() {
             return None;
         }
         let keys = self.by_message.get(&target)?.clone();
         for key in keys {
-            if !self.entries.get(&key).is_some_and(|entry| entry.confirmed) {
+            if !self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.confirmation.is_confirmed())
+            {
                 continue;
             }
             if self.has_older_unconfirmed(target, key) {
@@ -857,7 +900,7 @@ impl AutomodDeleteMarks {
                     && self
                         .entries
                         .get(candidate)
-                        .is_some_and(|entry| !entry.confirmed)
+                        .is_some_and(|entry| !entry.confirmation.is_confirmed())
             })
         })
     }
@@ -899,7 +942,10 @@ impl AutomodDeleteMarks {
                 if entry.expires > now {
                     return None;
                 }
-                if gateway.observed && !gateway.settled && !entry.confirmed {
+                if gateway.receipt.is_observed()
+                    && !gateway.report.is_settled()
+                    && !entry.confirmation.is_confirmed()
+                {
                     Some(true)
                 } else {
                     Some(false)
@@ -973,7 +1019,7 @@ impl AutomodDeleteMarks {
                 rule_id: rule_id.to_owned(),
                 rule_name: rule_name.to_owned(),
                 reason: reason.to_owned(),
-                confirmed: false,
+                confirmation: RestConfirmation::Pending,
                 expires,
                 retained: None,
             },
@@ -1011,19 +1057,25 @@ impl AutomodDeleteMarks {
                 return observation;
             }
             if self.bulk_row_owns(target)
-                || self.gateway.get(&target).is_some_and(|state| state.settled)
+                || self
+                    .gateway
+                    .get(&target)
+                    .is_some_and(|state| state.report.is_settled())
             {
                 return GatewayDeleteObservation::Suppressed;
             }
             return GatewayDeleteObservation::Plain;
         }
-        let already_settled = self.gateway.get(&target).is_some_and(|state| state.settled);
+        let already_settled = self
+            .gateway
+            .get(&target)
+            .is_some_and(|state| state.report.is_settled());
         if !already_settled {
             for key in &keys {
                 let Some(entry) = self.entries.get(key) else {
                     continue;
                 };
-                if entry.confirmed {
+                if entry.confirmation.is_confirmed() {
                     let rule_id = entry.rule_id.clone();
                     let rule_name = entry.rule_name.clone();
                     let reason = entry.reason.clone();
@@ -1034,8 +1086,8 @@ impl AutomodDeleteMarks {
                     self.remove_key(*key, now);
                     if siblings_remain {
                         let state = self.gateway.entry(target).or_default();
-                        state.observed = true;
-                        state.settled = true;
+                        state.receipt = GatewayReceipt::Observed;
+                        state.report = ReportProgress::Settled;
                     }
                     return GatewayDeleteObservation::Automod {
                         rule_id,
@@ -1046,11 +1098,11 @@ impl AutomodDeleteMarks {
             }
         }
         let gateway = self.gateway.entry(target).or_default();
-        if gateway.settled {
+        if gateway.report.is_settled() {
             return GatewayDeleteObservation::PendingAutomod;
         }
-        if !gateway.observed {
-            gateway.observed = true;
+        if !gateway.receipt.is_observed() {
+            gateway.receipt = GatewayReceipt::Observed;
         }
         if let Some(row) = retained {
             self.store_gateway_retained(target, row, now_ms());
@@ -1073,11 +1125,12 @@ impl AutomodDeleteMarks {
         let key = Self::mark_key(guild, channel, message, attempt);
         let target = Self::message_target(guild, channel, message);
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
-        let defer_settlement =
-            gateway.observed && !gateway.settled && self.has_older_unconfirmed(target, key);
+        let defer_settlement = gateway.receipt.is_observed()
+            && !gateway.report.is_settled()
+            && self.has_older_unconfirmed(target, key);
         let entry = self.entries.get_mut(&key)?;
-        entry.confirmed = true;
-        if !gateway.observed || gateway.settled || defer_settlement {
+        entry.confirmation = RestConfirmation::Confirmed;
+        if !gateway.receipt.is_observed() || gateway.report.is_settled() || defer_settlement {
             return None;
         }
         if self.consume_if_bulk_owns(target, key, &gateway, now) {
@@ -1109,7 +1162,7 @@ impl AutomodDeleteMarks {
                 bulk_inflight: false,
             };
         };
-        if entry.confirmed {
+        if entry.confirmation.is_confirmed() {
             return UnconfirmedRemoval {
                 action: UnconfirmedMarkRemoval::Removed,
                 retained: None,
@@ -1128,12 +1181,12 @@ impl AutomodDeleteMarks {
             .count();
         self.remove_key(key, now);
         let released_settlement = self.try_release_deferred_settlement(target, now);
-        let replay = gateway.observed
-            && !gateway.settled
+        let replay = gateway.receipt.is_observed()
+            && !gateway.report.is_settled()
             && remaining_attempts == 0
             && released_settlement.is_none();
         if replay && let Some(state) = self.gateway.get_mut(&target) {
-            state.settled = true;
+            state.report = ReportProgress::Settled;
         }
         UnconfirmedRemoval {
             action: if replay {
@@ -1254,7 +1307,7 @@ impl AutomodDeleteMarks {
         let pending = self
             .gateway
             .get(&target)
-            .is_some_and(|state| state.observed && !state.settled);
+            .is_some_and(|state| state.receipt.is_observed() && !state.report.is_settled());
         if !pending {
             return false;
         }
@@ -1404,7 +1457,10 @@ impl AutomodDeleteMarks {
         let Some(entry) = self.entries.get(&key) else {
             return self.take_unmarked_uncertain(target, attempt);
         };
-        if entry.confirmed || !gateway.observed || gateway.settled {
+        if entry.confirmation.is_confirmed()
+            || !gateway.receipt.is_observed()
+            || gateway.report.is_settled()
+        {
             return None;
         }
         if self.by_message.get(&target).is_some_and(|keys| {
@@ -1413,7 +1469,7 @@ impl AutomodDeleteMarks {
                     && self
                         .entries
                         .get(candidate)
-                        .is_some_and(|sibling| sibling.confirmed)
+                        .is_some_and(|sibling| sibling.confirmation.is_confirmed())
             })
         }) {
             self.remove_key(key, now);
@@ -1534,7 +1590,7 @@ impl AutomodDeleteMarks {
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
-            if !entry.confirmed {
+            if !entry.confirmation.is_confirmed() {
                 continue;
             }
             let rule_id = entry.rule_id.clone();
@@ -1807,7 +1863,7 @@ impl AutomodDeleteMarkAccess {
             .lock()
             .gateway
             .get(&(guild, channel, message))
-            .is_some_and(|state| state.observed && !state.settled)
+            .is_some_and(|state| state.receipt.is_observed() && !state.report.is_settled())
     }
 
     #[cfg(test)]

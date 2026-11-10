@@ -76,13 +76,19 @@ pub(crate) struct FileMeta {
     pub content_type: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StageProgress {
+    AwaitingHash,
+    FallbackRecorded,
+}
+
 struct Staged {
     generation: u64,
     sighting: Sighting,
     size: u64,
     filename: String,
     content_type: String,
-    fallback: bool,
+    progress: StageProgress,
 }
 
 struct ChannelSight {
@@ -114,6 +120,20 @@ struct Review {
     body: String,
     at: Instant,
     enrollment: Option<crate::db::GuildEnrollment>,
+}
+
+/// Removed atomically from the pending map; restoring consumes this claim.
+struct ClaimedReview {
+    review_id: u64,
+    data: Review,
+}
+
+impl std::ops::Deref for ClaimedReview {
+    type Target = Review;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 struct MessageNote {
@@ -226,7 +246,7 @@ impl Tracker {
             .lock()
             .staged
             .get(&attachment_id)
-            .filter(|stage| !stage.fallback)
+            .filter(|stage| stage.progress == StageProgress::AwaitingHash)
             .map(|staged| staged.generation)
     }
 
@@ -270,7 +290,7 @@ impl Tracker {
                 size: file.size,
                 filename: bound_chars(&file.filename, NAME_CHARS),
                 content_type: media_type(&file.content_type),
-                fallback: false,
+                progress: StageProgress::AwaitingHash,
             },
         );
         generation
@@ -301,12 +321,12 @@ impl Tracker {
     pub(crate) fn resolve_incomplete_at(&self, attachment_id: u64, generation: u64) -> Option<Hit> {
         let mut state = self.state.lock();
         let staged = state.staged.get_mut(&attachment_id)?;
-        if staged.generation != generation || staged.fallback {
+        if staged.generation != generation || staged.progress == StageProgress::FallbackRecorded {
             return None;
         }
         // Retain the exact observation for a later job that hashes this post.
         // The existing stage cap and message invalidation still own its lifetime.
-        staged.fallback = true;
+        staged.progress = StageProgress::FallbackRecorded;
         let sighting = staged.sighting;
         let key = fallback_key(staged);
         self.record_locked(&mut state, sighting, key, false)
@@ -542,7 +562,7 @@ impl Tracker {
         );
     }
 
-    fn claim_review(&self, review_id: u64, guild: u64, nonce: u64) -> Option<Review> {
+    fn claim_review(&self, review_id: u64, guild: u64, nonce: u64) -> Option<ClaimedReview> {
         if nonce != self.process_nonce {
             return None;
         }
@@ -551,15 +571,18 @@ impl Tracker {
         if review.guild != guild {
             return None;
         }
-        state.reviews.remove(&review_id)
+        state
+            .reviews
+            .remove(&review_id)
+            .map(|data| ClaimedReview { review_id, data })
     }
 
-    fn restore_review(&self, review_id: u64, review: Review) {
+    fn restore_review(&self, claim: ClaimedReview) {
         let mut state = self.state.lock();
         if state.reviews.len() >= MAX_REVIEWS {
             state.drop_oldest_review();
         }
-        state.reviews.insert(review_id, review);
+        state.reviews.insert(claim.review_id, claim.data);
     }
 
     fn usable(&self) -> bool {
@@ -761,7 +784,7 @@ impl State {
     // Remove only this physical observation's obsolete metadata contribution.
     // Another file in the same message may still own the same fallback key.
     fn retract_fallback(&mut self, staged: &Staged) -> bool {
-        if !staged.fallback {
+        if staged.progress == StageProgress::AwaitingHash {
             return false;
         }
         let sight = staged.sighting;
@@ -771,9 +794,10 @@ impl State {
             .get(&(sight.guild, sight.channel, sight.message))
             .is_some_and(|note| {
                 note.attachments.iter().any(|id| {
-                    self.staged
-                        .get(id)
-                        .is_some_and(|other| other.fallback && fallback_key(other) == key)
+                    self.staged.get(id).is_some_and(|other| {
+                        other.progress == StageProgress::FallbackRecorded
+                            && fallback_key(other) == key
+                    })
                 })
             });
         let Some(author) = self
@@ -1115,12 +1139,20 @@ fn fallback_key(staged: &Staged) -> Key {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandoffProgress {
+    Inert,
+    Staged,
+    HandedToJob,
+    ResolvedIncomplete,
+}
+
 /// Holds image identities until a hash job accepts them or this value is dropped.
 pub(crate) struct Handoff {
     app: Option<Arc<BotState>>,
     ctx: Option<Context>,
     ids: Vec<(u64, u64)>,
-    armed: bool,
+    progress: HandoffProgress,
 }
 
 impl Handoff {
@@ -1129,7 +1161,7 @@ impl Handoff {
             app: None,
             ctx: None,
             ids: Vec::new(),
-            armed: false,
+            progress: HandoffProgress::Inert,
         }
     }
 
@@ -1164,17 +1196,21 @@ impl Handoff {
         let ids = app
             .attachment_burst
             .stage_sighting(sighting, files, admission);
-        let armed = !ids.is_empty();
+        let progress = if ids.is_empty() {
+            HandoffProgress::Inert
+        } else {
+            HandoffProgress::Staged
+        };
         Self {
             app: Some(Arc::clone(app)),
             ctx: Some(ctx.clone()),
             ids,
-            armed,
+            progress,
         }
     }
 
     pub(crate) fn hand_to_job(&mut self) -> Vec<(u64, u64)> {
-        self.armed = false;
+        self.progress = HandoffProgress::HandedToJob;
         std::mem::take(&mut self.ids)
     }
 
@@ -1183,7 +1219,7 @@ impl Handoff {
     }
 
     pub(crate) fn finish_incomplete(&mut self) {
-        self.armed = false;
+        self.progress = HandoffProgress::ResolvedIncomplete;
         let (Some(app), Some(ctx)) = (self.app.as_ref(), self.ctx.as_ref()) else {
             return;
         };
@@ -1200,7 +1236,7 @@ impl Handoff {
 
 impl Drop for Handoff {
     fn drop(&mut self) {
-        if self.armed {
+        if self.progress == HandoffProgress::Staged {
             self.finish_incomplete();
         }
     }
@@ -1676,8 +1712,8 @@ pub(crate) async fn handle_component(
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_HANDLED).await;
         return;
     };
-    if press.user_id.get() == review.user {
-        app.attachment_burst.restore_review(press.review_id, review);
+    if press.user_id.get() == review.data.user {
+        app.attachment_burst.restore_review(review);
         let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
         return;
     }
@@ -1686,27 +1722,27 @@ pub(crate) async fn handle_component(
         .await
         .is_ok();
     if !acked {
-        app.attachment_burst.restore_review(press.review_id, review);
+        app.attachment_burst.restore_review(review);
         return;
     }
     // A read failure says nothing about the original enrollment. Keep the
     // claim retryable, but never rebind it to a replacement membership.
-    match crate::db::guild_enrollment(&app.db, review.guild as i64).await {
-        Ok(current) if current == review.enrollment => {}
+    match crate::db::guild_enrollment(&app.db, review.data.guild as i64).await {
+        Ok(current) if current == review.data.enrollment => {}
         Ok(_) => {
             let _ = review_read_failed(ctx, &press).await;
             return;
         }
         Err(error) => {
             tracing::warn!("attachment burst review enrollment read failed: {error:#}");
-            app.attachment_burst.restore_review(press.review_id, review);
+            app.attachment_burst.restore_review(review);
             let _ = review_read_failed(ctx, &press).await;
             return;
         }
     }
     let decision = match press.action {
-        ButtonAction::Release => release_member(app, ctx, &review, press.user_id).await,
-        ButtonAction::Ban => ban_member(app, ctx, &review, press.user_id).await,
+        ButtonAction::Release => release_member(app, ctx, &review.data, press.user_id).await,
+        ButtonAction::Ban => ban_member(app, ctx, &review.data, press.user_id).await,
     };
     let (label, ok) = match decision {
         ReviewDecision::Released => (ATTACHMENT_BURST_RELEASED, true),
@@ -1714,10 +1750,10 @@ pub(crate) async fn handle_component(
         ReviewDecision::Failed => (ATTACHMENT_BURST_FAILED, false),
     };
     if !ok {
-        app.attachment_burst.restore_review(press.review_id, review);
+        app.attachment_burst.restore_review(review);
         return;
     }
-    let _ = decision_edit(review.body, label, press.user_id)
+    let _ = decision_edit(review.data.body, label, press.user_id)
         .execute(&ctx.http, press.token.as_str())
         .await;
 }
@@ -3223,7 +3259,7 @@ mod tests {
                 .claim_review(hit.review_id, 1, tracker.process_nonce)
                 .is_none()
         );
-        tracker.restore_review(hit.review_id, review);
+        tracker.restore_review(review);
         assert!(
             tracker
                 .claim_review(hit.review_id, 1, tracker.process_nonce)

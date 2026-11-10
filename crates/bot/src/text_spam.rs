@@ -53,8 +53,28 @@ struct Bucket {
     last_seen: Instant,
     token: (u64, u64),
     posts: Vec<Post>,
-    reported_until: Instant,
+    report: ReportCooldown,
 }
+/// Retains the exact deadline even after release, so an older completion
+/// cannot release a replacement reservation.
+#[derive(Clone, Copy, Debug)]
+enum ReportCooldown {
+    ReadyAt(Instant),
+    ReservedUntil(Instant),
+}
+
+impl ReportCooldown {
+    fn until(self) -> Instant {
+        match self {
+            Self::ReadyAt(at) | Self::ReservedUntil(at) => at,
+        }
+    }
+
+    fn blocks(self, now: Instant) -> bool {
+        now < self.until()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ReportWindow {
     token: (u64, u64),
@@ -201,14 +221,14 @@ impl Detector {
             .guilds
             .get_mut(&guild)
             .and_then(|g| g.authors.get_mut(&author))?;
-        if now < b.reported_until {
+        if b.report.blocks(now) {
             return None;
         }
         let reservation = ReportWindow {
             token: b.token,
             until: now + Duration::from_secs(window_secs),
         };
-        b.reported_until = reservation.until;
+        b.report = ReportCooldown::ReservedUntil(reservation.until);
         Some(reservation)
     }
 
@@ -225,9 +245,9 @@ impl Detector {
             .get_mut(&guild)
             .and_then(|g| g.authors.get_mut(&author))
             && b.token == reservation.token
-            && b.reported_until == reservation.until
+            && b.report.until() == reservation.until
         {
-            b.reported_until = now;
+            b.report = ReportCooldown::ReadyAt(now);
         }
     }
 
@@ -403,7 +423,7 @@ impl Detector {
             last_seen: now,
             token,
             posts: vec![],
-            reported_until: now,
+            report: ReportCooldown::ReadyAt(now),
         });
         if b.posts.len() >= MAX_POSTS {
             return AdmitOutcome::Rejected;
@@ -465,7 +485,7 @@ impl Detector {
 }
 
 fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
-    if now < b.reported_until {
+    if b.report.blocks(now) {
         return None;
     }
     match_posts(b, policy, now)
@@ -1038,7 +1058,7 @@ mod tests {
             .authors
             .get_mut(&2)
             .unwrap()
-            .reported_until = newer_until;
+            .report = ReportCooldown::ReservedUntil(newer_until);
 
         finish_report_window(
             &d,
@@ -1050,7 +1070,7 @@ mod tests {
         );
 
         assert_eq!(
-            d.state.lock().guilds[&1].authors[&2].reported_until,
+            d.state.lock().guilds[&1].authors[&2].report.until(),
             newer_until
         );
     }
