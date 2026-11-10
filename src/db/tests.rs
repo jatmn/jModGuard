@@ -5215,12 +5215,10 @@ fn invite_description_first_override_copy_inherits_global_like_save() {
                 expected,
                 "{mode}"
             );
-            assert_eq!(
-                serde_json::to_value(get_rule(&db, 10, "invite").await.unwrap().unwrap()).unwrap(),
-                source_json
-            );
+            assert_eq!(stored_rule_json(&db, 10, "invite").await, source_json);
             // Direct saves and copies must resolve the same inherited description.
-            let stale = get_rule(&db, 10, "invite").await.unwrap().unwrap();
+            // Submit the stored stale rule, rather than its normalized read view.
+            let stale = serde_json::from_value(source_json).unwrap();
             upsert_rule(&db, 30, "invite", &stale).await.unwrap();
             assert_eq!(
                 serde_json::to_value(get_rule(&db, 30, "invite").await.unwrap().unwrap()).unwrap(),
