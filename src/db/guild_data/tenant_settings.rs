@@ -67,7 +67,7 @@ impl GuildDataStore {
         let core = self.core.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
                     tx.finish_read()?;
                     return Err(error);

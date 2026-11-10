@@ -411,7 +411,7 @@ fn capture_busy(error: &anyhow::Error) -> bool {
 
 fn capture_transaction(conn: &Connection, immediate: bool) -> Result<Transaction> {
     if immediate {
-        conn.transaction_primary_read()
+        conn.transaction_primary_write()
     } else {
         conn.transaction_capture()
     }
@@ -465,7 +465,7 @@ impl GuildDataStore {
             // Inspect on a primary read first. If a write is needed, re-check
             // identity and health after taking the writer lock.
             for writable in [false, true] {
-            let mut tx = if writable { conn.transaction_primary_read()? } else { conn.transaction_primary_snapshot()? };
+            let mut tx = if writable { conn.transaction_primary_write()? } else { conn.transaction_primary_snapshot()? };
             verify_identity(&tx, &expected)?;
             let (old_epoch, old_state, old_reason, old_updated, old_observed): (i64,String,Option<String>,Option<i64>,Option<i64>) = tx.query_row("SELECT epoch,state,reason,updated_at_ms,last_observed_at_ms FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
             if old_epoch == update.epoch as i64 && old_state == update.state.as_str() && old_reason.as_deref() == update.reason && update.lost_delta == 0 && update.observed_at_ms.is_none_or(|at| Some(at) == old_observed) && old_updated.is_some_and(|at| update.now_ms >= at && update.now_ms - at < 120_000) {
@@ -810,7 +810,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             for writable in [false, true] {
-            let mut tx = if writable { conn.transaction_primary_read()? } else { conn.transaction_primary_snapshot()? };
+            let mut tx = if writable { conn.transaction_primary_write()? } else { conn.transaction_primary_snapshot()? };
             verify_identity(&tx, &expected)?;
             let (subquery, args): (&str, Vec<Value>) = if expired_only {
                 ("SELECT guild_id,enrollment_id,channel_id,message_id FROM guild_message_snapshots WHERE expires_at_ms<=?1 ORDER BY expires_at_ms LIMIT ?2",

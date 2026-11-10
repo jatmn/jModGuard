@@ -592,7 +592,7 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
         if due == 0 {
             return Ok(0);
         }
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         let primary_due: i64 =
             tx.query_row(&format!("SELECT EXISTS({DUE})"), params![cutoff, 1], |r| {
                 Ok(r.get(0)?)
@@ -649,7 +649,7 @@ fn claimed_identity_matches(
 pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDispatch> {
     let job = job.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let status = if !claimed_identity_matches(&tx, &job, Some("running"))? {
             BotActionDispatch::EnrollmentEnded
         } else if super::guild_stores::guild_write_fenced(&tx, job.guild_id)? {

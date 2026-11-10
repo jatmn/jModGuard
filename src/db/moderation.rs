@@ -464,7 +464,7 @@ pub async fn insert_enrolled_event(
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -492,7 +492,7 @@ pub async fn add_enrolled_warn(
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -623,7 +623,7 @@ pub async fn record_ban_if_absent_binding(
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let keeps_capture = match captured {
@@ -751,7 +751,7 @@ pub async fn record_enrolled_ban_with_identity(
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -1303,7 +1303,7 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
     if audit_entry_id <= 0 {
         return Ok(false);
     }
-    let mut tx = conn.transaction_primary_read()?;
+    let mut tx = conn.transaction_primary_write()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
     let pending: bool = tx.query_row(
@@ -1533,7 +1533,7 @@ pub async fn gateway_ban_split_for_observation(
 ) -> Result<Option<i64>> {
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let matches = {
@@ -1584,7 +1584,7 @@ pub async fn gateway_manual_ban_audit_entry_is_known(
         return Err(EnrollmentChanged.into());
     }
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let known = gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, audit_entry_id)?;
@@ -1612,7 +1612,7 @@ pub(super) fn record_gateway_ban_conn(
     audit_after_ms: i64,
     delivery_id: Option<&str>,
 ) -> Result<GatewayBanWrite> {
-    let mut tx = conn.transaction_primary_read()?;
+    let mut tx = conn.transaction_primary_write()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
     if let Some(id) = delivery_id
@@ -1881,7 +1881,7 @@ fn existing_active_ban(
     guild_id: i64,
     user_id: i64,
 ) -> Result<GatewayBanWrite> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_write()?;
     super::enrollments::verify_enrollment_conn(&tx, enrollment)?;
     super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
     let row_id = active_ban_id(&tx, guild_id, user_id)?.ok_or_else(|| {
@@ -1917,7 +1917,7 @@ pub async fn attribute_enrolled_ban(
     let moderator_name = moderator_name.map(str::to_owned);
     let reason = reason.to_owned();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -1959,7 +1959,7 @@ pub async fn record_gateway_unban_event(
     }))
     .to_string();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -1988,7 +1988,7 @@ pub async fn mark_enrolled_unbanned(
     let guild_id = enrollment.guild_id;
     let observed_at = now_str();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
@@ -2016,7 +2016,7 @@ pub async fn clear_enrolled_warns(
 ) -> Result<usize> {
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.prepare_reclaim()?;
@@ -2034,7 +2034,7 @@ pub async fn clear_enrolled_warns(
 /// command observes Discord so [`set_ban_expiry`] can refuse a replacement.
 pub async fn active_ban_row(db: &Db, guild_id: i64, user_id: i64) -> Result<Option<i64>> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let row = active_ban_id(&tx, guild_id, user_id)?;
         tx.finish_read()?;
         Ok(row)
@@ -2127,7 +2127,7 @@ pub async fn next_expired_ban(
         .transpose()?;
     let skip_guilds = serde_json::to_string(&skip_guilds)?;
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let mut due = tx
             .query_row(
                 DUE_EXPIRY_SQL,
@@ -2171,7 +2171,7 @@ fn expired_ban_row(r: &Row) -> Result<ExpiredBan> {
 pub async fn claim_expired_ban(db: &Db, due: &ExpiredBan) -> Result<bool> {
     let due = due.clone();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         let current = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM bans b JOIN guild_enrollments e
@@ -2221,7 +2221,7 @@ pub enum ExpiredBanState {
 pub async fn expired_ban_state(db: &Db, claimed: &ExpiredBan) -> Result<ExpiredBanState> {
     let claimed = claimed.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let (ban_current, membership_current) = tx.query_row(
             "SELECT
                 EXISTS(SELECT 1 FROM bans b

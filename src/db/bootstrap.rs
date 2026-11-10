@@ -80,7 +80,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // kind of per-statement loop. Bunny closes that stream with
     // TRANSACTION_TIMEOUT.
     {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         ensure_schema_family(&tx)?;
         let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
         let current = version >= MIGRATIONS.len() as i64;
@@ -94,7 +94,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // non-idempotent CREATE/ALTER migration against the primary.
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         ensure_schema_family(&tx)?;
         // Recheck while holding the primary write lock. Separate bot
         // processes can otherwise both decide to replay a non-idempotent
@@ -120,7 +120,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
             match tx.commit() {
                 Ok(()) => {}
                 Err(error) if is_database_commit_indeterminate(&error) => {
-                    let verify = conn.transaction_primary_read().and_then(|check| {
+                    let verify = conn.transaction_primary_write().and_then(|check| {
                         let applied = check
                             .query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))?
                             >= target;
@@ -183,7 +183,7 @@ pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
 /// An incomplete schema or missing persisted defaults still takes the normal
 /// migration path, which must refuse unsafe growth.
 pub(super) fn bootstrap_at_capacity(conn: &Connection) -> Result<bool> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_write()?;
     let allocated = crate::capacity::allocated_bytes(&tx)?;
     if allocated < conn.capacity_growth_limit() {
         tx.finish_read()?;
@@ -508,7 +508,7 @@ pub async fn claim_active_bot(
             // This transaction writes the lease row. It must commit even when a
             // previous owner is still armed on the pool.
             conn.set_expected_lease_owner(None);
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             if refuse.load(std::sync::atomic::Ordering::Acquire) {
                 tx.finish_read()?;
                 return Ok(None);
@@ -620,7 +620,7 @@ pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
         // The delete removes the row this commit would re-read. Ownership is
         // checked below; the pool stays armed so later commits fail.
         conn.set_expected_lease_owner(None);
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
         let owned = current
             .as_deref()
@@ -731,7 +731,7 @@ pub(crate) fn terminal_defaults_from_json(raw: &str) -> Result<GuildSettings> {
 /// ready database. Writes (`clear_bootstrap_complete`) already go to the
 /// primary — the read that authorizes them must too.
 pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_write()?;
     let needed = match ensure_schema_current(&tx) {
         Ok(()) => match ensure_bootstrap_complete(&tx) {
             Ok(()) => Ok(false),
@@ -752,7 +752,7 @@ pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
 #[cfg(test)]
 pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
     let tx = conn
-        .transaction_primary_read()
+        .transaction_primary_write()
         .map_err(annotate_readonly_token)?;
     tx.probe_write_permission()
         .map_err(annotate_readonly_token)?;
@@ -780,7 +780,7 @@ pub(super) fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
 }
 
 pub(super) fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_write()?;
     let has_meta: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
         (),
@@ -803,7 +803,7 @@ pub(super) fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
             // bootstrap. Re-read it through a new primary snapshot: absent
             // establishes that a lost response did not leave an API-visible
             // stale-ready marker behind.
-            let verify = conn.transaction_primary_read().and_then(|check| {
+            let verify = conn.transaction_primary_write().and_then(|check| {
                 let cleared = if has_meta == 0 {
                     true
                 } else {
@@ -1037,7 +1037,7 @@ pub(super) fn upgrade_legacy_kick_ban_usage_conn(conn: &mut Connection) -> Resul
 /// primary read. The previous seed held BEGIN IMMEDIATE across every default
 /// row, and each statement was its own Hrana round trip.
 pub(crate) fn globals_seed_satisfied(conn: &Connection) -> Result<bool> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_write()?;
     let satisfied = globals_seed_satisfied_tx(&tx)?;
     tx.finish_read()?;
     Ok(satisfied)
@@ -1357,7 +1357,7 @@ fn seed_globals_sql(
 
 pub async fn gateway_last_identify_ms(db: &Db) -> Result<Option<i64>> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let value = meta_string_conn(&tx, META_GATEWAY_IDENTIFY_MS)?
             .and_then(|raw| raw.parse::<i64>().ok());
         tx.finish_read()?;

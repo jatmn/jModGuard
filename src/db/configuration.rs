@@ -222,7 +222,7 @@ async fn delete_row(
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let exists: bool = tx.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE ({key_cols}) = ({keys}))"),
@@ -750,7 +750,7 @@ async fn delete_badword_inner(
     expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM badwords WHERE id=?1 AND guild_id=?2)",

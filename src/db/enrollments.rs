@@ -96,7 +96,7 @@ async fn observe_membership(
         "invalid guild membership observation"
     );
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         let current = tx
             .query_row(
                 "SELECT id,joined_at_ns,active FROM guild_enrollments WHERE guild_id=?1",

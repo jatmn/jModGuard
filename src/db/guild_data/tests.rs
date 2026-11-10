@@ -777,7 +777,7 @@ async fn guild_commit_does_not_land_when_the_lease_moves_before_the_final_reread
         catalog
             .with_conn_sync(|conn| {
                 conn.set_expected_lease_owner(None);
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 tx.ensure_mutation_receipt()?;
                 let moved = format!(
                     "{} {}",
@@ -982,7 +982,7 @@ async fn guild_commit_does_not_wait_for_the_core_writer() {
             .expect("guild operation must reach its final lease check")
             .unwrap();
         core.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_write()?;
             held_tx.send(()).unwrap();
             release_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1064,7 +1064,7 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
         let mut writer = tokio::spawn(async move {
             write_core
                 .with_conn(move |conn| {
-                    let mut tx = conn.transaction_primary_read()?;
+                    let mut tx = conn.transaction_primary_write()?;
                     tx.ensure_mutation_receipt()?;
                     tx.execute_rows(
                         "INSERT INTO meta(key,value) VALUES('guild_commit_probe',?1)
@@ -1342,7 +1342,7 @@ async fn stored_generation(db: &Db) -> i64 {
 async fn write_core_lease(db: &Db, value: Option<String>) {
     db.with_conn(move |conn| {
         conn.set_expected_lease_owner(None);
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         if let Some(value) = value {
             tx.execute_bounded(

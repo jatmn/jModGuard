@@ -301,7 +301,7 @@ async fn patch_settings_inner(
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         if let Some(scope) = &expected {
             scope.verify_conn(&tx)?;
         } else if guild_id > 0 {

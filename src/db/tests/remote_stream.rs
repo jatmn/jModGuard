@@ -1136,7 +1136,7 @@ async fn remote_commit_timeout_does_not_roll_back_the_closed_stream() {
     let started = std::time::Instant::now();
     let error = db
         .with_conn(|conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_write()?;
             tx.commit()
         })
         .await
@@ -1218,7 +1218,7 @@ async fn api_deadline_mid_write_releases_the_lock_for_the_next_writer() {
     let clock = install_clock(&db);
     fixture.hang_next_commit();
     let first = spawn_write(db.clone(), |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         tx.commit()
     });
     fixture.wait_until(|state| state.commit_hung).await;
@@ -1246,7 +1246,7 @@ async fn api_deadline_mid_write_releases_the_lock_for_the_next_writer() {
     );
 
     let next = spawn_write(db, |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         tx.commit()
     });
     next.recv_timeout(Duration::from_secs(2))
@@ -1263,7 +1263,7 @@ async fn hung_rollback_cannot_outlive_the_short_release_deadline() {
     fixture.hang_next_statement();
     fixture.hang_rollback();
     let call = spawn_write(db, |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         tx.execute("SELECT 1", ())?;
         tx.commit()
     });
@@ -1303,7 +1303,7 @@ async fn abandoned_write_releases_the_connection_for_the_next_writer() {
     let writer = db.clone();
     let first = tokio::spawn(async move {
         let call = writer.with_conn(|conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_write()?;
             tx.commit()
         });
         tokio::pin!(call);
@@ -1326,7 +1326,7 @@ async fn abandoned_write_releases_the_connection_for_the_next_writer() {
     let next = db.clone();
     let next = tokio::spawn(async move {
         next.with_conn(|conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_write()?;
             tx.commit()
         })
         .await
@@ -1391,7 +1391,7 @@ async fn timed_out_begin_releases_the_lock_for_the_next_writer() {
     );
 
     let next = spawn_write(db, |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         tx.commit()
     });
     next.recv_timeout(Duration::from_secs(2))
@@ -1416,7 +1416,7 @@ async fn startup_connection_close_lets_the_next_writer_take_the_lock() {
     let database = Arc::new(database);
     let connection = Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap();
     {
-        let tx = connection.transaction_primary_read().unwrap();
+        let tx = connection.transaction_primary_write().unwrap();
         tx.commit().unwrap();
     }
     runtime.close_connection(connection);
@@ -1425,7 +1425,7 @@ async fn startup_connection_close_lets_the_next_writer_take_the_lock() {
         "startup close must be sent on the database runtime"
     );
     let next = Connection::from_database(database, runtime).unwrap();
-    let tx = next.transaction_primary_read().unwrap();
+    let tx = next.transaction_primary_write().unwrap();
     tx.commit().unwrap();
     assert!(!fixture.write_locked());
 }
@@ -1465,7 +1465,7 @@ async fn lease_renewal_survives_provider_bulk_writer() {
             for _ in 0..6 {
                 // Real interactive core write transactions holding the provider
                 // writer ~440 ms (0.8 of its scaled lifetime).
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_write()?;
                 signal.add_permits(1);
                 std::thread::sleep(Duration::from_millis(380));
                 tx.finish_read()?;
@@ -1642,7 +1642,7 @@ async fn lease_claim_admission_cases(use_remote: bool, pause_growth: bool) {
             // Rollback must leave only the shared runtime pause behind.
             let error = db
                 .with_conn(|conn| {
-                    let mut tx = conn.transaction_primary_read()?;
+                    let mut tx = conn.transaction_primary_write()?;
                     tx.ensure_mutation_receipt()?;
                     tx.execute_bounded(
                         "INSERT INTO meta(key,value) VALUES('underestimated',zeroblob(12582912))",
@@ -2370,7 +2370,7 @@ async fn lease_window_provider_case(writer_wait: bool) {
         let began = Arc::clone(&began);
         Some(tokio::task::spawn_blocking(move || {
             bulk.with_conn_sync(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_write()?;
                 began.add_permits(1);
                 // 4.5s hold + 0.3s COMMIT request = about 4.8s owning the writer.
                 std::thread::sleep(Duration::from_millis(4_500));
