@@ -328,6 +328,11 @@ pub async fn put_rule(
             },
         )
         .await?;
+    // Legacy bots acknowledge saves without a rule body. Let the dashboard
+    // reload authoritative configuration instead of applying a reset/delete.
+    if saved.is_null() {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "config_patch": {

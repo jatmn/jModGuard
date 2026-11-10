@@ -1738,7 +1738,7 @@ for (const kind of ['rule', 'command']) {
   }
 }
 
-async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
+async function ruleSaveHarness({ scope = 'global', override = false, legacyAck = false } = {}) {
   const calls = [];
   const failures = { put: false, lost: false, refresh: false };
   let receipt;
@@ -1757,7 +1757,7 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
       if (body.scope === 'global') globalRule = body.data;
       else guildRule = body.data;
       if (body.clear_guild_override) guildRule = null;
-      receipt = { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
+      receipt = legacyAck ? { ok: true } : { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
       if (failures.lost) throw new Error('lost acknowledgement');
       return response(receipt);
     } else if (options.method === 'DELETE') {
@@ -1842,6 +1842,18 @@ test('a successful global rule save acknowledges both atomic effects without a c
   assert.equal(h.calls[0].body.scope, 'global');
   assert.equal(h.calls[0].body.clear_guild_override, true);
   assert.equal(h.app.state.config.rules[0].guild_override, null);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.equal(h.modal.isConnected, false);
+  assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');
+});
+
+test('a rule save without config_patch reloads authoritative configuration', async () => {
+  const h = await ruleSaveHarness({ scope: 'guild', legacyAck: true });
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'POST']);
+  assert.ok(h.calls[1].url.endsWith('/config'));
+  assert.equal(h.app.state.config.rules[0].guild_override.enabled, false);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.equal(h.modal.isConnected, false);
   assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');

@@ -2264,6 +2264,75 @@ async fn action_key_errors_survive_the_bot_control_link() {
     );
 }
 
+// A previous bot commits the write but returns no canonical rule body.
+async fn assert_legacy_rule_save_omits_patch(rule_id: &str, rule: serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.use_writer_link(listener.local_addr().unwrap());
+    let expected_id = rule_id.to_owned();
+    let expected_rule = rule.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32().await.unwrap();
+        let mut request = vec![0; length as usize];
+        stream.read_exact(&mut request).await.unwrap();
+        let (op, _, _, _) = jmodguard::control::open_frame(
+            &"x".repeat(32).into_bytes(),
+            &request,
+            &std::sync::Mutex::new(jmodguard::control::NonceWindow::new()),
+        )
+        .unwrap();
+        let db::ControlOp::UpsertRule { id, rule, .. } = op else {
+            panic!("expected UpsertRule, got {op:?}");
+        };
+        assert_eq!(id, expected_id);
+        assert_eq!(serde_json::to_value(rule).unwrap(), expected_rule);
+        let bytes = serde_json::to_vec(&db::ControlReply::Saved {
+            body: serde_json::Value::Null,
+        })
+        .unwrap();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let (status, body) = f
+        .request(
+            "PUT",
+            &format!("/api/guilds/10/rules/{rule_id}"),
+            &serde_json::json!({"scope":"guild", "data":rule}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    assert!(
+        body.get("config_patch").is_none(),
+        "legacy acknowledgement must trigger an authoritative reload: {body}"
+    );
+    peer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_save_legacy_ack_omits_builtin_guild_patch() {
+    let rule: crate::types::RuleDef = serde_json::from_value(serde_json::json!({
+        "name":"Invite fixture", "description":"Operator guidance", "enabled":true,
+    }))
+    .unwrap();
+    assert_legacy_rule_save_omits_patch("invite", serde_json::to_value(rule).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_save_legacy_ack_omits_custom_patch() {
+    let rule: crate::types::RuleDef = serde_json::from_value(serde_json::json!({
+        "name":"Custom fixture", "description":"Operator guidance", "enabled":true,
+        "params":{"kind":"pattern", "pattern":"fixture"},
+        "actions":[{"at":1, "action":"warn"}],
+    }))
+    .unwrap();
+    assert_legacy_rule_save_omits_patch("custom:01234567", serde_json::to_value(rule).unwrap())
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_description_save_patch_uses_canonical_rule() {
     use db::SqlExecutor;
