@@ -89,7 +89,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -99,7 +99,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -4488,3 +4488,42 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(h.app.state.tab, 'badwords');
   assert.equal(h.document.querySelector('.modal-overlay'), null);
 });
+
+ test('known spam dedicated page adds samples and URL wildcards, displays and removes scoped rows', async () => {
+  let rows = [];
+  const requests = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: rows, rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    requests.push({url, options});
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body);
+      rows.push({ id: String(rows.length + 1), guild_id: h.app.state.guildId, ...body });
+    } else if (options.method === 'DELETE') rows = rows.filter(row => !url.endsWith('/' + row.id));
+    return response({ok: true});
+  });
+  h.app.state.config = config();
+  h.app.state.tab = 'known-spam';
+  let panel = h.app.tabKnownSpam();
+  await settle();
+  assert.match(panel.textContent, /lightly rewritten/i);
+  const sample = panel.querySelector('textarea');
+  sample.value = 'I used to work as Full Stack AI developer'; await fire(sample, 'input');
+  const note = panel.querySelector('input[data-note]');
+  note.value = 'Owner sample'; await fire(note, 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(requests[0].options.method, 'POST');
+  assert.equal(JSON.parse(requests[0].options.body).kind, 'sample');
+  assert.equal(JSON.parse(requests[0].options.body).note, 'Owner sample');
+  panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent, /Full Stack AI developer/);
+  const url = panel.querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
+  assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
+  panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent, /tinyurl.com/);
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  assert.equal(requests[2].options.method, 'DELETE');
+  assert.equal(h.app.state.config.known_spam.length, 1);
+ });

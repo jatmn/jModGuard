@@ -1076,6 +1076,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_store_catalog"
                     | "log_filters"
                     | "known_bad_images"
+                    | "known_spam"
                     | "gateway_ban_deliveries"
                     | "guild_case_evidence"
                     | "guild_case_history"

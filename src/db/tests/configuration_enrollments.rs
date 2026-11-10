@@ -1083,3 +1083,148 @@ async fn badword_setup_batches_are_atomic_deduplicated_and_revisioned() {
         get_primary_versions(&f.db).await.unwrap().config_revision
     );
 }
+
+#[tokio::test]
+async fn known_spam_storage_validates_inherits_and_fences_membership() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    let write = edit_scope(&scope, false);
+    let before = get_config_version(&f.db).await.unwrap();
+    for (kind, value) in [
+        ("sample", " "),
+        ("sample", ""),
+        ("url", "*"),
+        ("url", "example.*/*"),
+    ] {
+        assert!(
+            add_enrolled_known_spam(&f.db, write.clone(), kind, value, None)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        add_enrolled_known_spam(&f.db, write.clone(), "sample", &"a".repeat(4097), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        add_enrolled_known_spam(
+            &f.db,
+            write.clone(),
+            "sample",
+            "sample",
+            Some(&"n".repeat(513))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(get_config_version(&f.db).await.unwrap(), before);
+    let id = add_enrolled_known_spam(
+        &f.db,
+        write.clone(),
+        "sample",
+        "Full Stack AI developer pitch",
+        Some(" owner note "),
+    )
+    .await
+    .unwrap();
+    assert!(get_config_version(&f.db).await.unwrap() > before);
+    assert_eq!(
+        get_known_spam_primary(&f.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .note
+            .as_deref(),
+        Some("owner note")
+    );
+    assert!(
+        add_enrolled_known_spam(
+            &f.db,
+            write.clone(),
+            "sample",
+            "FULL ST@CK AI d3v3lop3r pitch",
+            None
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("already exists")
+    );
+    let global = add_enrolled_known_spam(
+        &f.db,
+        edit_scope(&scope, true),
+        "url",
+        "HTTPS://TinyURL.com/*",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        add_enrolled_known_spam(&f.db, edit_scope(&scope, true), "url", "tinyurl.com", None)
+            .await
+            .is_err()
+    );
+    let snapshot = load_web_config_snapshot(&f.db, 10).await.unwrap();
+    assert_eq!(snapshot.known_spam.len(), 2);
+    let parts = load_config_parts(&f.db, 10).await.unwrap();
+    assert!(crate::known_spam::CompiledList::new(&parts.known_spam).matches("tinyurl.com/a"));
+    assert!(
+        crate::known_spam::CompiledList::new(&parts.known_spam)
+            .matches("fullstackaideveloperpitch")
+    );
+    let other = f.scope(20).await;
+    assert!(
+        delete_enrolled_known_spam(&f.db, edit_scope(&other, false), id)
+            .await
+            .is_err()
+    );
+    assert!(
+        delete_enrolled_known_spam(&f.db, write.clone(), global)
+            .await
+            .is_err()
+    );
+    delete_enrolled_known_spam(&f.db, write.clone(), id)
+        .await
+        .unwrap();
+    assert!(get_known_spam_primary(&f.db, id).await.unwrap().is_none());
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.scope(10).await;
+    assert!(
+        add_enrolled_known_spam(&f.db, write.clone(), "sample", "stale sample", None)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        delete_enrolled_known_spam(&f.db, write, global)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+}
+
+#[tokio::test]
+async fn known_spam_storage_list_capacity_is_atomic() {
+    let f = Fixture::new();
+    let scope = f.scope(10).await;
+    f.db.with_conn(|conn| {
+        conn.execute_bounded("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1024) INSERT INTO known_spam(guild_id,kind,value,match_key) SELECT 10,'sample','sample '||x,'sample'||x FROM n", (), 16 * 1024 * 1024)?;
+        Ok(())
+    }).await.unwrap();
+    let before = get_config_version(&f.db).await.unwrap();
+    assert!(
+        add_enrolled_known_spam(
+            &f.db,
+            edit_scope(&scope, false),
+            "sample",
+            "another sample",
+            None
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("full")
+    );
+    assert_eq!(get_config_version(&f.db).await.unwrap(), before);
+}

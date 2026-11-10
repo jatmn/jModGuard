@@ -153,3 +153,11 @@ a real reason, otherwise the earliest id. Inactive history stays. A unique index
 then rejects a second active row. Upgrade the bot and API together through the
 existing paired schema protocol; their exact core runtime schema is now 20. Migration 0020 adds the gateway ban delivery inbox: full received ban/unban/audit facts and stable retry results, scoped to the captured guild membership.
 Migration 0015 adds `guild_local_write_fence` so a member-sync status read can see a fence inside the guild transaction, and `guild_writer_epoch` so a leased guild commit must match the holder's generation before it lands. Core fences remain in the other database. A newer holder raises that epoch in the guild store before it acts. The core writer lock is not held across the guild commit.
+
+## Known spam configuration extension
+
+Migration0024 adds the empty scoped known-spam sample/URL collection. The core
+schema is 24 and the guild schema remains 17. Deploy matching bot/API builds using
+the existing paired update protocol; older binaries reject schema24. Rollback
+requires the pre-upgrade database backup. Existing Badwords and repeated-text
+configuration is preserved. See [Known spam](KNOWN-SPAM.md).

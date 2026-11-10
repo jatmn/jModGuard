@@ -154,6 +154,7 @@ pub(super) fn wipe_directory_guild_data_conn(
         "DELETE FROM log_filters WHERE guild_id=?1",
         "DELETE FROM badwords WHERE guild_id=?1",
         "DELETE FROM known_bad_images WHERE guild_id=?1",
+        "DELETE FROM known_spam WHERE guild_id=?1",
         "DELETE FROM guild_settings WHERE guild_id=?1",
         "DELETE FROM events WHERE guild_id=?1",
         "DELETE FROM warns WHERE guild_id=?1",

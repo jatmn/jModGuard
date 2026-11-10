@@ -160,3 +160,6 @@ frontend/                  static dashboard (Bunny Storage/CDN or local API embe
 migrations/                jmodguard-core-1, steps 0001–0009
 Dockerfile.bot / Dockerfile.api
 ```
+
+Known full-message samples and URL wildcards are managed on the dedicated
+[Known spam page](docs/KNOWN-SPAM.md), with first-hit Ban and purge (previous hour).

@@ -71,6 +71,18 @@ pub enum ControlOp {
         scope: ScopeWire,
         hash: String,
     },
+    AddKnownSpam {
+        request: ScopeWire,
+        target: ScopeWire,
+        kind: String,
+        value: String,
+        note: Option<String>,
+    },
+    DeleteKnownSpam {
+        request: ScopeWire,
+        target: ScopeWire,
+        id: i64,
+    },
     AddBadword {
         request: ScopeWire,
         target: ScopeWire,
@@ -372,6 +384,8 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::RemoveKnownBadImage { scope, .. } => scope_actor_need(scope),
         ControlOp::UpsertRule { target, .. }
         | ControlOp::DeleteRule { target, .. }
+        | ControlOp::AddKnownSpam { target, .. }
+        | ControlOp::DeleteKnownSpam { target, .. }
         | ControlOp::AddBadword { target, .. }
         | ControlOp::AddBadwords { target, .. }
         | ControlOp::DeleteBadword { target, .. }
@@ -442,6 +456,12 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
             request, target, ..
         }
         | ControlOp::DeleteRule {
+            request, target, ..
+        }
+        | ControlOp::AddKnownSpam {
+            request, target, ..
+        }
+        | ControlOp::DeleteKnownSpam {
             request, target, ..
         }
         | ControlOp::AddBadword {
@@ -653,6 +673,31 @@ async fn apply_control_inner(
             } else {
                 ControlReply::Unchanged { body }
             })
+        }
+        ControlOp::AddKnownSpam {
+            request,
+            target,
+            kind,
+            value,
+            note,
+        } => {
+            let id = add_enrolled_known_spam(
+                db,
+                write_scope(request, target)?,
+                &kind,
+                &value,
+                note.as_deref(),
+            )
+            .await?;
+            saved_value(id)
+        }
+        ControlOp::DeleteKnownSpam {
+            request,
+            target,
+            id,
+        } => {
+            delete_enrolled_known_spam(db, write_scope(request, target)?, id).await?;
+            saved_null()
         }
         ControlOp::AddBadword {
             request,

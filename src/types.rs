@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 pub const GLOBAL_SCOPE: i64 = 0;
 
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
-pub const RULE_IDS: [&str; 8] = [
+pub const RULE_IDS: [&str; 9] = [
     "mention_spam",
     "attachment_flood",
     "repeat_text",
@@ -16,6 +16,7 @@ pub const RULE_IDS: [&str; 8] = [
     "invite",
     "velocity",
     "account_age",
+    "known_spam",
 ];
 
 /// Log event types emitted to per-event log channels.

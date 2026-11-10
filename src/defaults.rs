@@ -51,6 +51,12 @@ fn rule(id: &str) -> RuleDef {
                 action(4, "timeout", "Repeated banned words", 60, 0),
             ],
         ),
+        "known_spam" => (
+            "Known spam",
+            "Saved full messages and URL wildcards. First match bans and purges the previous hour; dry-run logs only.",
+            json!({}),
+            vec![crate::known_spam::action()],
+        ),
         "invite" => (
             "Invite links",
             "Discord invite links, except invite codes configured in allowlist_codes.",
