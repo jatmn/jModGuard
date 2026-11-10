@@ -182,9 +182,13 @@ static URL_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
 // there so an adjacent link is checked too, without splitting raw URL contents.
 fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     let mut offset = 0;
+    let mut pending = None;
     std::iter::from_fn(move || {
+        if let Some(token) = pending.take() {
+            return Some(token);
+        }
         let token = URL_TOKENS.find_at(content, offset)?;
-        let mut start = token.start();
+        let mut start;
         let mut end = token.end();
         // Detect visible URLs despite invisible destination padding, even when
         // the markup is not a valid rendered link. Reuse Badwords' format set.
@@ -215,18 +219,30 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                 }
             }
         } else {
-            // Invisibles delimit bare prefixes, but must not split path/query/
-            // fragment components into independent URLs.
-            let head = token
+            let bare = token
                 .as_str()
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or_default();
-            if let Some((i, c)) = head
-                .char_indices()
-                .rfind(|&(_, c)| crate::normalize::is_zero_width(c))
-            {
-                start += i + c.len_utf8();
+                .trim_start_matches(crate::normalize::is_zero_width);
+            start = token.end() - bare.len();
+            let head = bare.split(['/', '?', '#']).next().unwrap_or_default();
+            if let Some(i) = head.find(crate::normalize::is_zero_width) {
+                let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
+                let text = url_token_text(candidate);
+                if ["http://", "https://"].iter().any(|scheme| {
+                    text.get(..scheme.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                }) {
+                    start = token.end() - candidate.len();
+                } else if !head[..i].contains('.')
+                    && text
+                        .split(['/', '?', '#'])
+                        .next()
+                        .is_some_and(|host| host.contains('.'))
+                {
+                    // Prose and host fragments can look alike. Try the complete
+                    // host first so URL parsing retains its normalization; only
+                    // then try a new host after glued prose, never a URL path.
+                    pending = Some(candidate);
+                }
             }
         }
         offset = end;
@@ -775,6 +791,56 @@ mod tests {
             assert!(url_tokens(&padding).count() <= padding.chars().count());
         }
         assert!(!compiled.matches("\u{200b}\u{2060}\u{feff}\u{034f}"));
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_normalized_schemeless_hosts() {
+        let compiled = list("url", "tinyurl.com/*");
+        for text in [
+            "tiny\u{200b}url.com/a",
+            "tinyurl.com\u{200b}/a",
+            "tinyurl.com\u{200b}?q=1",
+        ] {
+            assert!(compiled.matches(text), "{text:?}");
+            assert!(url_tokens(text).any(|token| token == text), "{text:?}");
+        }
+        assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_host_ending_invisibles() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for invisible in ['\u{200b}', '\u{00ad}', '\u{feff}'] {
+            for suffix in ["", "/a", "?q=1", "#frag"] {
+                let text = format!("tinyurl.com{invisible}{suffix}");
+                if !compiled.matches(&text) {
+                    missed.push(text.clone());
+                }
+                assert_eq!(url_tokens(&text).collect::<Vec<_>>(), [text.as_str()]);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "missed host-ending invisibles: {missed:?}"
+        );
+    }
+    #[test]
+    fn known_spam_bare_urls_keep_paths_after_host_ending_invisibles() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for invisible in ['\u{200b}', '\u{00ad}', '\u{feff}'] {
+            let safe = format!("safe.example{invisible}/tinyurl.com/a");
+            for text in [safe.clone(), format!("https://safe.example/ {safe}")] {
+                if compiled.matches(&text) {
+                    false_positives.push(text);
+                }
+            }
+            assert_eq!(url_tokens(&safe).collect::<Vec<_>>(), [safe.as_str()]);
+            assert!(compiled.matches(&format!("{safe} \u{200b}https://tinyurl.com/a")));
+        }
+        assert!(
+            false_positives.is_empty(),
+            "promoted paths: {false_positives:?}"
+        );
     }
     #[test]
     fn known_spam_urls_match_next_to_punctuation() {
