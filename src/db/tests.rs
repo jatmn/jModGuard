@@ -3761,6 +3761,7 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
                 action: "delete".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "spam match".into(),
             },
             crate::types::ActionDef {
@@ -3768,6 +3769,7 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
                 action: "ban".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "spam match".into(),
             },
         ];

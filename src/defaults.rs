@@ -114,6 +114,7 @@ fn action(
         action: action.into(),
         duration_minutes,
         delete_days,
+        purge_last_hour: false,
         reason: reason.into(),
     }
 }

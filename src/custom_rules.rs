@@ -134,6 +134,10 @@ fn validate_action(action: &ActionDef) -> Result<()> {
         action.reason.len() <= MAX_REASON_LEN,
         "action reason must be at most {MAX_REASON_LEN} characters"
     );
+    ensure!(
+        action.action == "ban" || !action.purge_last_hour,
+        "purge_last_hour is only valid for ban"
+    );
     match action.action.as_str() {
         "delete" | "warn" | "kick" => {
             ensure!(
@@ -416,6 +420,7 @@ mod tests {
                 action: "kick".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "r".into(),
             }],
             whitelist_roles: vec![],

@@ -2755,7 +2755,7 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
   });
   const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
   await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
-  for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Delete history (days)', '2'], ['Reason template', 'Updated reason']]) {
+  for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Reason template', 'Updated reason']]) {
     const wrapper = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(label));
     assert.ok(wrapper, label);
     const input = wrapper.control;
@@ -2767,7 +2767,7 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
   assert.equal(submitted.data.actions[0].at, 3);
   assert.equal(submitted.data.actions[0].action, 'ban');
   assert.equal(submitted.data.actions[0].duration_minutes, 15);
-  assert.equal(submitted.data.actions[0].delete_days, 2);
+  assert.equal(submitted.data.actions[0].delete_days, 1, 'editing other fields preserves legacy days');
   assert.equal(submitted.data.actions[0].reason, 'Updated reason');
 });
 
@@ -4198,3 +4198,65 @@ test('Members refreshes on visibility after a rejected control leaves an idle st
   assert.equal(reads, 3, 'an inactive status must not retain an obsolete poll deadline');
   assert.match(textOf(panel), /running/);
 });
+
+
+for (const id of ['mention_spam', 'custom:0123456789abcdef', 'attachment_flood', 'repeat_text']) {
+  test(`${id} ban editor defaults safely, persists purge and preserves legacy days`, async () => {
+    const calls = [];
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    const spam = ['attachment_flood', 'repeat_text'].includes(id);
+    const effective = {
+      name: 'Spam', enabled: true, dry_run: false,
+      params: id.startsWith('custom:') ? {kind:'word', words:['scam']} :
+        id === 'attachment_flood' ? {mode:'exact_image', min_channels:3, min_attachments:2, window_secs:60} :
+        id === 'repeat_text' ? {mode:'exact_text', min_channels:3, min_length:20, window_secs:60} : {},
+      actions: [...(spam ? [{at:1, action:'delete'}] : []), {at:1, action:'ban', delete_days:0}],
+    };
+    const edit = data => h.app.editRule({name:'Spam', rule_id:id, effective:data});
+    const banSelect = modal => [...modal.querySelectorAll('select')].find(select => [...select.options].some(o => o.textContent === 'Ban and purge (previous hour)'));
+    const save = modal => fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+    let modal = await edit(effective);
+    assert.equal(banSelect(modal).value, 'ban', 'missing option stays Ban');
+    await save(modal);
+    let action = calls.at(-1).data.actions.find(a=>a.action === 'ban');
+    assert.equal(action.delete_days, 0);
+    assert.ok(!action.purge_last_hour);
+    modal = await edit(calls.at(-1).data);
+    await chooseOption(banSelect(modal), 'Ban and purge (previous hour)');
+    await save(modal);
+    action = calls.at(-1).data.actions.find(a=>a.action === 'ban');
+    assert.equal(action.purge_last_hour, true);
+    assert.equal(action.delete_days, 0);
+    modal = await edit(calls.at(-1).data);
+    assert.equal(banSelect(modal).value, 'purge');
+    await chooseOption(banSelect(modal), 'Ban');
+    await save(modal);
+    action = calls.at(-1).data.actions.find(a=>a.action === 'ban');
+    assert.equal(action.purge_last_hour, false);
+    assert.equal(action.delete_days, 0);
+    const legacy = structuredClone(effective);
+    legacy.actions.at(-1).delete_days = 1;
+    modal = await edit(legacy);
+    assert.equal(banSelect(modal).value, 'legacy');
+    await save(modal);
+    assert.equal(calls.at(-1).data.actions.at(-1).delete_days, 1, 'unchanged save keeps one day');
+    modal = await edit(calls.at(-1).data);
+    await chooseOption(banSelect(modal), 'Ban and purge (previous hour)');
+    await save(modal);
+    assert.equal(calls.at(-1).data.actions.at(-1).delete_days, 0);
+    assert.equal(calls.at(-1).data.actions.at(-1).purge_last_hour, true);
+    if (spam) {
+      modal = await edit(calls.at(-1).data);
+      const toggle = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Dry-run (log only)'));
+      findNode(toggle,n=>n.localName === 'input').checked = true;
+      await save(modal);
+      assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action), ['log']);
+      assert.equal(calls.at(-1).data.actions[0].purge_last_hour, true, 'dry-run retains inert preference');
+      modal = await edit(calls.at(-1).data);
+      assert.equal(banSelect(modal).value, 'purge');
+    }
+  });
+}

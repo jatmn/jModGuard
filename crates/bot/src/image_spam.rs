@@ -3792,6 +3792,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum DispatchChange {
         None,
+        PurgeLastHour,
+        DryRunPurge,
         RemoveHash,
         Invalidate,
         Expire,
@@ -4124,6 +4126,19 @@ mod tests {
             {"action": "delete"}, {"action": "ban"}
         ]))
         .unwrap();
+        if matches!(
+            change,
+            DispatchChange::PurgeLastHour | DispatchChange::DryRunPurge
+        ) {
+            rule.actions[1].purge_last_hour = true;
+        }
+        if matches!(change, DispatchChange::DryRunPurge) {
+            rule.dry_run = true;
+            rule.actions = vec![
+                serde_json::from_value(serde_json::json!({"action":"log", "purge_last_hour":true}))
+                    .unwrap(),
+            ];
+        }
         crate::db::upsert_rule(&app.db, 1, "attachment_flood", &rule)
             .await
             .unwrap();
@@ -4152,7 +4167,10 @@ mod tests {
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
-        assert!(policy.enforce);
+        assert_eq!(
+            policy.enforce,
+            !matches!(change, DispatchChange::DryRunPurge)
+        );
         let token = (cfg.version, cfg.durable_version);
         let now = Instant::now();
         let mut matched = None;
@@ -4277,6 +4295,8 @@ mod tests {
                         }
                         match change {
                             DispatchChange::None
+                            | DispatchChange::PurgeLastHour
+                            | DispatchChange::DryRunPurge
                             | DispatchChange::OwnDeleteEcho
                             | DispatchChange::ExternalDeleteDuringRequest => {}
                             DispatchChange::OwnEchoAndWhitelistRole => {
@@ -4385,11 +4405,36 @@ mod tests {
         .await;
         drop(server);
         assert_eq!(disposition, ReportDisposition::Consumed);
-        assert!(
+        assert_eq!(
             changed.load(Ordering::SeqCst),
-            "race trigger must be reached"
+            !matches!(change, DispatchChange::DryRunPurge),
+            "live enforcement reaches the request boundary; dry-run never dispatches"
         );
         let seen = lines.lock().clone();
+        let seconds = if matches!(change, DispatchChange::PurgeLastHour) {
+            3600
+        } else {
+            0
+        };
+        for ban in seen
+            .iter()
+            .filter(|line| line.starts_with("PUT ") && line.contains("/bans/"))
+        {
+            assert!(
+                ban.ends_with(&format!("delete_message_seconds={seconds}")),
+                "{seen:?}"
+            );
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|line| line.starts_with("GET ") && line.contains("/messages")),
+            "no history scan: {seen:?}"
+        );
+        if matches!(change, DispatchChange::DryRunPurge) {
+            assert!(seen.is_empty(), "{seen:?}");
+        }
+
         assert_eq!(
             seen.iter()
                 .filter(|line| line.starts_with("DELETE "))
@@ -4478,6 +4523,29 @@ mod tests {
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn ban_purge_exact_image_sends_previous_hour_and_dry_run_sends_nothing() {
+        image_dispatch_race(false, DispatchChange::None, "GET", "/members/99", 3, 1).await;
+        image_dispatch_race(
+            false,
+            DispatchChange::PurgeLastHour,
+            "GET",
+            "/members/99",
+            3,
+            1,
+        )
+        .await;
+        image_dispatch_race(
+            false,
+            DispatchChange::DryRunPurge,
+            "GET",
+            "/members/99",
+            0,
+            0,
+        )
+        .await;
     }
 
     #[tokio::test]

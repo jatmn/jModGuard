@@ -40,6 +40,7 @@ fn custom_rule(dry_run: bool, pattern: &str) -> RuleDef {
             action: "delete".into(),
             duration_minutes: 0,
             delete_days: 0,
+            purge_last_hour: false,
             reason: "match".into(),
         }],
         whitelist_roles: vec![],
@@ -341,5 +342,35 @@ async fn full_custom_rule_copy_batches_inserts_and_preserves_replacement() {
     assert_eq!(
         count, 1,
         "32 custom rules plus built-in overrides fit one insert batch"
+    );
+}
+
+#[tokio::test]
+async fn ban_purge_round_trips_through_captured_configuration_writer() {
+    let f = Fixture::new();
+    let scope = write_scope(&f.scope(10).await);
+    let id = "custom:0123456789abcdef";
+    let mut rule = custom_rule(true, "scam");
+    rule.actions[0].action = "ban".into();
+    for purge in [false, true, false] {
+        rule.actions[0].purge_last_hour = purge;
+        upsert_enrolled_rule(&f.db, scope.clone(), id, &rule)
+            .await
+            .unwrap();
+        let loaded = get_rule(&f.db, 10, id).await.unwrap().unwrap();
+        assert_eq!(loaded.actions[0].purge_last_hour, purge);
+        assert_eq!(
+            loaded.actions[0].ban_delete_message_seconds(),
+            if purge { 3600 } else { 0 }
+        );
+    }
+    rule.actions[0].purge_last_hour = true;
+    rule.actions[0].action = "delete".into();
+    assert!(
+        upsert_enrolled_rule(&f.db, scope, id, &rule)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("purge_last_hour")
     );
 }

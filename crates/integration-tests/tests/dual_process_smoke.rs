@@ -157,6 +157,7 @@ async fn smoke_dual_process_config_sync() {
                 action: "delete".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "match".into(),
             }],
             whitelist_roles: vec![],

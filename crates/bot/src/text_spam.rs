@@ -1370,6 +1370,7 @@ mod tests {
                 action: "delete".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "Repeated text".into(),
             },
             ActionDef {
@@ -1377,6 +1378,7 @@ mod tests {
                 action: "ban".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "Repeated text".into(),
             },
         ];

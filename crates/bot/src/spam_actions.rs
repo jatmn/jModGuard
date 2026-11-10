@@ -784,10 +784,15 @@ async fn punish_proven_match(
                                 now,
                                 pending_ban,
                                 attempted,
-                                GuildId::new(found.guild).ban_with_reason(
+                                crate::discord::automod_ban(
                                     http.as_ref(),
+                                    GuildId::new(found.guild),
                                     UserId::new(found.author),
-                                    0,
+                                    rule_def
+                                        .actions
+                                        .iter()
+                                        .find(|a| a.action == "ban")
+                                        .expect("validated spam policy requires a ban action"),
                                     &discord_reason,
                                 ),
                             )
@@ -1556,6 +1561,141 @@ pub(crate) mod tests {
                 }
                 Err(_) => break,
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn ban_purge_repeated_text_uses_saved_selection_and_keeps_matched_deletes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (purge, dry, expected) in [(false, false, 0), (true, false, 3600), (true, true, 3600)] {
+            let path = std::env::temp_dir()
+                .join(format!("text_ban_purge_{:032x}.db", rand::random::<u128>()));
+            let app =
+                BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            app.tenant.activate(enrollment).await.unwrap();
+            let mut rule = crate::defaults::default_rules().remove(2);
+            rule.skip_moderators = false;
+            rule.dry_run = dry;
+            rule.actions = serde_json::from_value(if dry {
+                serde_json::json!([{"action":"log", "purge_last_hour":purge}])
+            } else {
+                serde_json::json!([{"action":"delete"}, {"action":"ban", "purge_last_hour":purge}])
+            })
+            .unwrap();
+            crate::db::upsert_rule(&app.db, 10, "repeat_text", &rule)
+                .await
+                .unwrap();
+            app.poll_config_version().await.unwrap();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let policy =
+                jmodguard::text_spam::Policy::parse(cfg.rules.get("repeat_text").unwrap()).unwrap();
+            let token = (cfg.version, cfg.durable_version);
+            let text = "abcdefghijklmnopqrst";
+            let messages = app
+                .text_spam
+                .seed_exact_text(
+                    10,
+                    99,
+                    token,
+                    &policy,
+                    Instant::now(),
+                    &[(42, 11, text), (43, 12, text), (44, 13, text)],
+                )
+                .expect("real text detector match");
+            let found = Match {
+                kind: Kind::Text,
+                guild: 10,
+                author: 99,
+                channel: 11,
+                policy: MatchPolicy::Text(policy),
+                token,
+                messages,
+                excerpts: Vec::new(),
+                proving_hashes: Vec::new(),
+                attachments: Vec::new(),
+                reason: "repeated text".into(),
+            };
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_lines = Arc::clone(&lines);
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                serve_discord_stub(listener, server_lines, server_stop, |_, _, _| None)
+            });
+            let http = Arc::new(
+                serenity::http::HttpBuilder::new("token")
+                    .proxy(format!("http://{addr}"))
+                    .ratelimiter_disabled(true)
+                    .build(),
+            );
+            let disposition = enforce(
+                &app,
+                http,
+                &serenity::cache::Cache::new(),
+                found,
+                "repeat_text",
+                "Repeated text",
+            )
+            .await;
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap();
+            assert_eq!(disposition, ReportDisposition::Consumed);
+            let seen = lines.lock().clone();
+            if dry {
+                assert!(
+                    seen.is_empty(),
+                    "dry-run must not delete, ban, purge or fetch history: {seen:?}"
+                );
+            } else {
+                let bans: Vec<_> = seen
+                    .iter()
+                    .filter(|line| line.starts_with("PUT ") && line.contains("/bans/99"))
+                    .collect();
+                assert_eq!(bans.len(), 1, "{seen:?}");
+                assert!(
+                    bans[0].ends_with(&format!("delete_message_seconds={expected}")),
+                    "{seen:?}"
+                );
+                let deletes: Vec<_> = seen
+                    .iter()
+                    .filter(|line| line.starts_with("DELETE "))
+                    .collect();
+                assert_eq!(deletes.len(), 3, "{seen:?}");
+                for (channel, message) in [(11, 42), (12, 43), (13, 44)] {
+                    assert!(
+                        deletes.contains(&&format!(
+                            "DELETE /api/v10/channels/{channel}/messages/{message}"
+                        )),
+                        "matched deletes stay intact: {seen:?}"
+                    );
+                }
+            }
+            assert!(
+                !seen
+                    .iter()
+                    .any(|line| line.starts_with("GET ") && line.contains("/messages")),
+                "no history scan: {seen:?}"
+            );
+            drop(app);
+            let _ = std::fs::remove_file(&path);
+            crate::tenant::remove_sidecars(&path);
         }
     }
 

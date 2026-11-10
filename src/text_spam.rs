@@ -101,6 +101,7 @@ mod tests {
                 action: "delete".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "text spam".into(),
             },
             crate::types::ActionDef {
@@ -108,6 +109,7 @@ mod tests {
                 action: "ban".into(),
                 duration_minutes: 0,
                 delete_days: 0,
+                purge_last_hour: false,
                 reason: "text spam".into(),
             },
         ];

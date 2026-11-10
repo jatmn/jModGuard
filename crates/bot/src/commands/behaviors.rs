@@ -1686,13 +1686,21 @@ fn set_rule_dry_run(rule_id: &str, rule: &mut crate::types::RuleDef, on: bool) -
     } else {
         &["delete", "ban"][..]
     };
+    let preference = rule
+        .actions
+        .iter()
+        .find(|a| a.action == "ban")
+        .or_else(|| rule.actions.iter().find(|a| a.action == "log"));
+    let delete_days = preference.map_or(0, |a| a.delete_days);
+    let purge_last_hour = preference.is_some_and(|a| a.purge_last_hour);
     rule.actions = actions
         .iter()
         .map(|action| crate::types::ActionDef {
             at: 1,
             action: (*action).into(),
             duration_minutes: 0,
-            delete_days: 0,
+            delete_days: if *action == "delete" { 0 } else { delete_days },
+            purge_last_hour: *action != "delete" && purge_last_hour,
             reason: "spam match".into(),
         })
         .collect();
@@ -2267,6 +2275,27 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["log"]
             );
+        }
+    }
+
+    #[test]
+    fn ban_purge_dry_run_command_preserves_spam_ban_preferences() {
+        for (id, index) in [("attachment_flood", 1), ("repeat_text", 2)] {
+            for (purge, days) in [(false, 0), (true, 0), (false, 1)] {
+                let mut rule = crate::defaults::default_rules().remove(index);
+                set_rule_dry_run(id, &mut rule, false).unwrap();
+                rule.actions[1].purge_last_hour = purge;
+                rule.actions[1].delete_days = days;
+                set_rule_dry_run(id, &mut rule, true).unwrap();
+                jmodguard::image_spam::validate_rule(id, &rule).unwrap();
+                assert_eq!(rule.actions[0].action, "log");
+                set_rule_dry_run(id, &mut rule, false).unwrap();
+                jmodguard::image_spam::validate_rule(id, &rule).unwrap();
+                assert_eq!(rule.actions[0].delete_days, 0);
+                assert!(!rule.actions[0].purge_last_hour);
+                assert_eq!(rule.actions[1].purge_last_hour, purge);
+                assert_eq!(rule.actions[1].delete_days, days);
+            }
         }
     }
 

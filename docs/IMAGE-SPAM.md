@@ -19,6 +19,15 @@ as `ok`/`thanks` do not match while a typical paste does.
 {"mode":"exact_text","min_channels":3,"window_secs":60,"min_length":20}
 ```
 
+An enforcement rule stores its choice on the ban action, for example:
+
+```json
+{"dry_run":false,"actions":[{"at":1,"action":"delete"},{"at":1,"action":"ban","delete_days":0,"purge_last_hour":true}]}
+```
+
+Use `purge_last_hour: false` (or omit it) for Ban without a sweep. The example
+shows the action portion; keep the matching `params` object above on the rule.
+
 The defaults and WebUI store `exact_image_test` for image dry-run. An
 `exact_image` rule with `dry_run` true and only `log` actions is also valid and
 remains log-only; the mode string alone does not enable enforcement.
@@ -74,7 +83,14 @@ not retried.
 
 A verified match in delete-and-ban mode rechecks current configuration, enrollment
 and exemptions, then deletes each matched message and bans the author. Deletion and
-ban outcomes are recorded separately. A 404 on delete is treated as already gone.
+ban outcomes are recorded separately. Each rule exposes **Ban** (default, no
+history deletion) or **Ban and purge (previous hour)**. Purge sends
+`delete_message_seconds=3600` on the Ban Member request for a server-wide sweep
+of that member’s messages. Ban sends `0`; the bot does not fetch or scan channel
+history. Matched-message deletes still happen in either mode. Dry-run never
+bans or purges. Existing configurations stay unchanged until an operator selects
+purge. Legacy whole-day ban values remain supported as described in
+[AUTOMOD.md](AUTOMOD.md). A 404 on delete is treated as already gone.
 If both rules match the same author in a short window, only one ban is attempted;
 remaining matched messages can still be deleted. Cases store proving message IDs,
 hashes or trimmed text. Test reports stay Discord logs only, with no SQL cases and no

@@ -75,11 +75,37 @@ escalation accurate without false positives.
 
 ## Actions
 
-`log` · `delete` · `warn` · `timeout` (minutes) · `kick` · `ban` (delete_days
-0–7). When several generic rules fire on one message, the **most severe** action
+`log` · `delete` · `warn` · `timeout` (minutes) · `kick` · `ban`. When several generic rules fire on one message, the **most severe** action
 wins (ban > kick > timeout > warn > delete > log). Exact-image and repeated-text
 matches never use that generic executor; they log or delete-and-ban through their
 own path.
+
+Every ban action offers **Ban** (no history deletion) or **Ban and purge
+(previous hour)** in the WebUI. Purge asks Discord's Ban Member API to delete
+that member's messages across the server from the previous hour, using
+`delete_message_seconds=3600`. Ban sends `0`. The bot never scans channel history.
+This applies to built-in generic rules, custom rules, Exact image spam and
+Repeated text. Matched spam-message deletes still run separately.
+
+Actions store `purge_last_hour` (default `false`). Existing JSON without the field
+keeps its behavior: `delete_days: 0` is Ban; `delete_days: 1` still sends `86400`
+seconds, through `delete_days: 7` for seven days. The shipped Mention spam default
+stays one day. The WebUI shows **Keep existing: delete N day(s)** for these legacy
+values and preserves them on an unchanged save. Explicitly selecting Ban or
+Ban and purge clears the old days value. `purge_last_hour: true` takes precedence
+if a stored action includes both fields. No purge is enabled automatically.
+
+Example stored ban actions (inside a rule's `actions` array):
+
+```json
+{"at":1,"action":"ban","delete_days":0,"purge_last_hour":false,"reason":"Spam"}
+{"at":1,"action":"ban","delete_days":0,"purge_last_hour":true,"reason":"Spam"}
+```
+
+Dry-run never bans or purges. Spam test-mode log actions retain the editor's
+ban preference so switching back to enforcement preserves the choice; it has no
+effect while the rule is in dry-run. Rules live in stored configuration, not
+`config.toml`.
 
 ## Custom rules (per server)
 
@@ -91,7 +117,7 @@ refused for the global scope. Saves go through the bot `UpsertRule` control
 operation (the API does not write the row directly).
 
 Each custom rule has exactly **one** action (`delete`, `warn`, `timeout`, `kick`,
-or `ban` with `delete_days` 0–7). Types:
+or `ban` with the Ban / Ban and purge choice above). Types:
 
 - **pattern** — `params.pattern` compiled with the same linear-time regex engine
   as badwords (length cap 512; look-around and backreferences rejected).
