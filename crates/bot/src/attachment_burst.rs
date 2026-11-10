@@ -4791,6 +4791,173 @@ mod tests {
         assert_attachment_burst_decision_body_title_once(&body);
     }
 
+    // Real guild-template storage, config resolution, preview and saved review;
+    // only the final Discord request is inspected as a serialized builder.
+    async fn assert_attachment_burst_guild_heading(template: &str, title: &str, description: &str) {
+        let (app, path) = open_app();
+        crate::db::upsert_template(&app.db, 10, "automod", template)
+            .await
+            .unwrap();
+        let mut vars = BTreeMap::from([("rule".into(), "Attachment burst".into())]);
+        let preview = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
+        let hit = test_hit(&app, 99);
+        app.attachment_burst.open_review(&hit, None, preview);
+        let review = app
+            .attachment_burst
+            .claim_review(hit.review_id, 10, app.attachment_burst.process_nonce)
+            .unwrap();
+        // Presentation must not rewrite the persisted or cached template.
+        assert_eq!(
+            app.configs.get(&app.db, 10).await.unwrap().templates["automod"],
+            template
+        );
+        for label in [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED] {
+            let payload =
+                serde_json::to_value(decision_edit(review.body.clone(), label, UserId::new(7)))
+                    .unwrap();
+            let embed = &payload["embeds"][0];
+            assert_eq!(embed["title"], title, "{payload}");
+            assert_eq!(
+                embed["description"],
+                format!(
+                    "{description}
+
+**Review:** {label} by user 7"
+                ),
+                "{payload}"
+            );
+            let visible = format!("{title}{description}");
+            assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
+            assert_eq!(payload["content"], "");
+            assert_eq!(payload["embeds"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(payload["components"], serde_json::json!([]));
+        }
+        drop(app);
+        close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_crlf() {
+        assert_attachment_burst_guild_heading(
+            "Automod
+
+**Rule:** {rule}
+**Reason:** fixture
+",
+            "Automod",
+            "**Rule:** Attachment burst
+**Reason:** fixture
+",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_mixed() {
+        for separator in [
+            "
+
+", "
+
+",
+        ] {
+            assert_attachment_burst_guild_heading(
+                &format!(
+                    "Automod{separator}**Rule:** {{rule}}
+body
+end
+"
+                ),
+                "Automod",
+                "**Rule:** Attachment burst
+body
+end
+",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_custom_crlf() {
+        assert_attachment_burst_guild_heading(
+            "Custom log
+
+Automod: {rule}
+unchanged",
+            "",
+            "Custom log
+
+Automod: Attachment burst
+unchanged",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_lf() {
+        assert_attachment_burst_guild_heading(
+            "Automod
+
+**Rule:** {rule}
+**Reason:** fixture",
+            "Automod",
+            "**Rule:** Attachment burst
+**Reason:** fixture",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_bare_cr() {
+        for separator in [
+            "
+
+", "
+
+", "
+",
+        ] {
+            let template = format!("Automod{separator}**Rule:** {{rule}}");
+            let expected = format!("Automod{separator}**Rule:** Attachment burst");
+            assert_attachment_burst_guild_heading(&template, "", &expected).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_trailing_whitespace() {
+        for heading in ["Automod ", "Automod	"] {
+            assert_attachment_burst_guild_heading(
+                &format!(
+                    "{heading}
+
+**Rule:** {{rule}}"
+                ),
+                "",
+                &format!(
+                    "{heading}
+
+**Rule:** Attachment burst"
+                ),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_guild_heading_no_body() {
+        // A bare title already promotes via the decision footer's LF separator.
+        for template in [
+            "Automod",
+            "Automod
+
+",
+        ] {
+            assert_attachment_burst_guild_heading(template, "Automod", "").await;
+        }
+    }
+
     #[tokio::test]
     async fn decision_edits_preserve_log_date_formatting() {
         let (app, path) = open_app();
