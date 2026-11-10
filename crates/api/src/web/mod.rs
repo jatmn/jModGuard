@@ -1530,6 +1530,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             axum::routing::post(api::copy_config),
         )
         .route(
+            "/api/guilds/{guild_id}/testbadwords",
+            axum::routing::post(api::test_badwords),
+        )
+        .route(
             "/api/guilds/{guild_id}/testregex",
             axum::routing::post(api::test_regex),
         )

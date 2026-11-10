@@ -986,6 +986,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn maximal_badword_batch_ack_survives_writer_link_lookup_and_replay() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let words = (0..32)
+            .map(|index| format!("entry{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_pattern = crate::normalize::badword_patterns("entry0")
+            .unwrap()
+            .remove(0);
+        let reused_id = db::add_badword(&bot.db, 10, &first_pattern, Some("existing note"))
+            .await
+            .unwrap();
+        // The request fits the real frame limit, but repeating this note across
+        // the saved rows used to make the committed reply undeliverable.
+        let note = "n".repeat(16 * 1024);
+        let scope = scope(&enrollment);
+        let op = db::ControlOp::AddBadwords {
+            request: scope.clone(),
+            target: scope,
+            words,
+            note: Some(note.clone()),
+        };
+        let request_id = control::random_request_id().unwrap();
+        let mut stream = TcpStream::connect(bound).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        stream
+            .write_all(&seal_request(&op, 7, &request_id))
+            .unwrap();
+        let delivered = control::read_frame(&mut stream);
+        let rows = db::list_badwords(&bot.db, 10).await.unwrap();
+        assert_eq!(rows.len(), 32, "the batch committed before acknowledgement");
+        for row in &rows {
+            let expected = if row.id == reused_id {
+                "existing note"
+            } else {
+                &note
+            };
+            assert_eq!(row.note.as_deref(), Some(expected));
+        }
+        let body =
+            delivered.expect("a committed maximal batch must have a deliverable acknowledgement");
+        let saved: ControlReply = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(saved, ControlReply::Saved { .. }), "{saved:?}");
+        let version = db::get_config_version(&bot.db).await.unwrap();
+        for lookup_op in [&db::ControlOp::LookupResult, &op] {
+            let recovered = submit(bound, seal_request(lookup_op, 7, &request_id));
+            assert_eq!(
+                serde_json::to_value(recovered).unwrap(),
+                serde_json::to_value(&saved).unwrap()
+            );
+        }
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), version);
+        assert_eq!(db::list_badwords(&bot.db, 10).await.unwrap().len(), 32);
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn two_identical_requests_both_apply() {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();

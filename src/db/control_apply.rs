@@ -77,6 +77,12 @@ pub enum ControlOp {
         pattern: String,
         note: Option<String>,
     },
+    AddBadwords {
+        request: ScopeWire,
+        target: ScopeWire,
+        words: String,
+        note: Option<String>,
+    },
     DeleteBadword {
         request: ScopeWire,
         target: ScopeWire,
@@ -367,6 +373,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         ControlOp::UpsertRule { target, .. }
         | ControlOp::DeleteRule { target, .. }
         | ControlOp::AddBadword { target, .. }
+        | ControlOp::AddBadwords { target, .. }
         | ControlOp::DeleteBadword { target, .. }
         | ControlOp::UpsertCommand { target, .. }
         | ControlOp::DeleteCommand { target, .. }
@@ -438,6 +445,9 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
             request, target, ..
         }
         | ControlOp::AddBadword {
+            request, target, ..
+        }
+        | ControlOp::AddBadwords {
             request, target, ..
         }
         | ControlOp::DeleteBadword {
@@ -654,6 +664,19 @@ async fn apply_control_inner(
                 add_enrolled_badword(db, write_scope(request, target)?, &pattern, note.as_deref())
                     .await?;
             saved_value(id)
+        }
+        ControlOp::AddBadwords {
+            request,
+            target,
+            words,
+            note,
+        } => {
+            let rows =
+                add_enrolled_badwords(db, write_scope(request, target)?, &words, note.as_deref())
+                    .await?;
+            // Bound the acknowledgement independently of patterns and notes,
+            // including notes retained by reused rows. The dashboard reloads them.
+            saved_value(rows.into_iter().map(|row| row.id).collect::<Vec<_>>())
         }
         ControlOp::DeleteBadword {
             request,

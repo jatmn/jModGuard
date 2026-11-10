@@ -1541,6 +1541,37 @@ mod tests {
     }
 
     #[test]
+    fn badword_setup_literals_use_builtin_rule_and_preserve_regex_behavior() {
+        let rule = custom_rule(serde_json::json!({}), "delete");
+        let rules = HashMap::from([("badword".to_owned(), rule)]);
+        let mut cfg = test_cfg(&rules, &HashMap::new());
+        cfg.regexes = jmodguard::normalize::badword_patterns("scam, pump and dump, c++")
+            .unwrap()
+            .iter()
+            .map(|p| jmodguard::normalize::compile_user_regex(p).unwrap())
+            .collect();
+        cfg.regexes
+            .push(jmodguard::normalize::compile_user_regex("^LEGACY$").unwrap());
+        for (content, expected) in [
+            ("5c@m", true),
+            ("a s c a m here", true),
+            ("pump  and dump", true),
+            ("c++", true),
+            ("scammer", false),
+            ("LEGACY", true),
+            ("legacy", false),
+        ] {
+            assert_eq!(
+                AutomodEngine::new()
+                    .evaluate(&cfg, &msg(1, content, 0, false, false))
+                    .is_some(),
+                expected,
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
     fn custom_scope_include_and_skip_lists() {
         let id = "custom:0123456789abcdef".to_string();
         let mut rule = custom_rule(

@@ -2006,11 +2006,11 @@ test('pending save preserves the draft and retry queries the result', async () =
   h.app.state.config = config;
   h.app.state.tab = 'badwords';
   h.app.renderTab();
-  const pattern = h.document.querySelector('input');
+  const pattern = h.document.querySelector('textarea');
   pattern.value = 'pending'; await fire(pattern, 'input');
   const add = () => [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
   await fire(add(), 'click');
-  assert.equal(h.document.querySelector('input').value, 'pending');
+  assert.equal(h.document.querySelector('textarea').value, 'pending');
   assert.equal(h.app.isDirty(), true);
   assert.match(h.nodes.get('#toast').textContent, /accepted and still pending/);
   assert.doesNotMatch(h.nodes.get('#toast').textContent, /added|failed/i);
@@ -2025,7 +2025,7 @@ test('retrieved save refreshes configuration instead of appending its old patch 
   const session = new Map(), path = '/api/guilds/987654321098765432/badwords';
   const first = harness(async () => {throw new Error('lost');}, new Map(), session);
   first.app.state.config = {enrollment_id: 'membership'};
-  await assert.rejects(first.app.api(path, 'POST', {pattern: 'once', scope: 'guild', note: null}));
+  await assert.rejects(first.app.api(path, 'POST', {words: 'once', scope: 'guild', note: null}));
   const word = {id: 7, guild_id: '987654321098765432', pattern: 'once', note: null};
   const config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], log_channels: [], badwords: [word]};
   let reads = 0;
@@ -2036,7 +2036,7 @@ test('retrieved save refreshes configuration instead of appending its old patch 
   h.app.state.config = structuredClone(config);
   h.app.state.tab = 'badwords';
   h.app.renderTab();
-  const pattern = h.document.querySelector('input');
+  const pattern = h.document.querySelector('textarea');
   pattern.value = 'once'; await fire(pattern, 'input');
   const add = [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Add');
   await fire(add, 'click');
@@ -4306,4 +4306,80 @@ test('Cases cancels the superseded list on refresh and displays server errors', 
   await settle();
   assert.match(panel.querySelector('[role="alert"]').textContent, /Could not load cases: guild store is unavailable/);
   assert.equal(panel.querySelector('[role="status"]'), null);
+});
+
+test('Badwords setup adds literal lists, displays entries and tests saved plus draft words', async () => {
+  const calls = [];
+  const word = {id: 7, guild_id: '987654321098765432', pattern: 'compiled', word: 'pump and dump', note: 'retained note', valid: true};
+  const h = harness(async (url, options) => {
+    const body = options.body && JSON.parse(options.body); calls.push({url, body, headers: options.headers});
+    if (url.endsWith('/testbadwords')) return response({matched: true, matches: [{label: 'pump and dump', source: 'saved'}]});
+    if (url.endsWith('/config')) return response({enrollment_id: 'membership', badwords: [word], rules: []});
+    if (body.pattern) return response({ok: true, config_patch: {kind: 'badword', operation: 'add', value: {...word, id: 8, pattern: body.pattern, word: null}}});
+    return response({ok: true, config_patch: {kind: 'badword', operation: 'add_many', ids: [word.id]}});
+  });
+  h.app.state.config = {enrollment_id: 'membership', badwords: [], rules: []};
+  h.app.state.tab = 'badwords'; h.app.renderTab();
+  const words = h.document.querySelector('textarea'); assert.ok(words);
+  words.value = 'scam, pump and dump\nc++'; await fire(words, 'input');
+  const button = text => [...h.document.querySelectorAll('button')].find(n => n.textContent === text);
+  await fire(button('Add'), 'click');
+  assert.equal(calls[0].body.words, 'scam, pump and dump\nc++');
+  assert.equal(calls[0].body.pattern, undefined);
+  assert.ok(calls[1].url.endsWith('/config'), 'compact batch acknowledgement reloads configuration');
+  assert.equal(calls[1].headers['x-jmodguard-save'], undefined);
+  assert.match(h.document.body.textContent, /retained note/);
+  assert.equal(h.app.state.config.badwords.length, 1);
+  assert.match(h.document.body.textContent, /pump and dump/);
+  const draft = h.document.querySelector('textarea'); draft.value = 'draft'; await fire(draft, 'input');
+  const sample = h.document.querySelector('input[placeholder*="sample"]'); sample.value = 'pump and dump'; await fire(sample, 'input');
+  await fire(button('Test'), 'click');
+  assert.equal(calls.at(-1).body.words, 'draft');
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'membership');
+  assert.equal(calls.at(-1).headers['x-jmodguard-save'], undefined);
+  assert.match(h.document.body.textContent, /Matched/);
+  assert.equal(h.document.querySelector('#test-pattern'), null);
+  const advanced = [...h.document.querySelectorAll('select')].find(n => [...n.options].some(o => /Advanced regex/.test(o.textContent)));
+  assert.ok(advanced); advanced.value = 'regex'; await fire(advanced, 'change');
+  const pattern = h.document.querySelector('textarea'); pattern.value = '^ADVANCED$'; await fire(pattern, 'input');
+  await fire(button('Add'), 'click');
+  assert.equal(calls.at(-1).body.pattern, '^ADVANCED$');
+});
+
+test('Badwords setup reaches existing rule enable escalation exemptions without empty JSON', async () => {
+  const h = harness();
+  const rule = {rule_id: 'badword', name: 'Badwords', effective: {enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}};
+  h.app.state.config = {badwords: [], rules: [rule]}; h.app.state.tab = 'badwords'; h.app.renderTab();
+  const settings = [...h.document.querySelectorAll('button')].find(n => /Actions and exemptions/.test(n.textContent));
+  assert.ok(settings); await fire(settings, 'click');
+  const modal = h.document.querySelector('.modal-overlay');
+  for (const text of ['Enabled', 'Dry-run', 'Action escalation', 'Whitelist roles', 'Skip moderators']) assert.ok(modal.textContent.includes(text));
+  assert.doesNotMatch(modal.textContent, /Parameters \(JSON\)/);
+  const other = await h.app.editRule({...rule, rule_id: 'mention_spam'});
+  assert.match(other.textContent, /Parameters \(JSON\)/);
+});
+
+test('Badwords rule saves enable actions and exemptions through the setup path', async () => {
+  let submitted;
+  const h = harness(async (url, options) => {
+    submitted = JSON.parse(options.body);
+    return response({config_patch: {kind: 'rule', id: 'badword', scope: 'guild', value: submitted.data}});
+  });
+  const rule = {rule_id: 'badword', name: 'Badwords', effective: {enabled: false, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}};
+  h.app.state.config = {enrollment_id: 'membership', badwords: [], rules: [rule]};
+  h.app.state.tab = 'badwords'; h.app.renderTab();
+  await fire([...h.document.querySelectorAll('button')].find(n => n.textContent === 'Actions and exemptions'), 'click');
+  const modal = h.document.querySelector('.modal-overlay');
+  await fire(modal.querySelector('input[type="checkbox"]'), 'change', {target: {checked: true}});
+  await chooseOption(modal.querySelector('.escalation-step select'), 'timeout');
+  const roles = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith('Whitelist roles')).control;
+  roles.value = '9007199254740993'; await fire(roles, 'input');
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(submitted.data.enabled, true);
+  assert.equal(submitted.data.dry_run, true);
+  assert.equal(submitted.data.actions[0].action, 'timeout');
+  assert.deepEqual(submitted.data.whitelist_roles, ['9007199254740993']);
+  assert.deepEqual(submitted.data.params, {});
+  assert.equal(h.app.state.tab, 'badwords');
+  assert.equal(h.document.querySelector('.modal-overlay'), null);
 });
