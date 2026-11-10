@@ -107,6 +107,33 @@ fn require_progress(current: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum LauncherAuthority {
+    Unconfirmed,
+    ConfirmedUntil(std::time::Instant),
+}
+
+impl LauncherAuthority {
+    fn deadline(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Unconfirmed => None,
+            Self::ConfirmedUntil(deadline) => Some(deadline),
+        }
+    }
+}
+
+enum FenceCas {
+    Renewed,
+    Missing,
+    Contended,
+}
+
+enum FenceRenewal {
+    NotRenewed,
+    Renewed,
+    Reacquired,
+}
+
 /// This handle exposes only update operations. It never runs application
 /// migrations or returns an unchecked application database to its caller.
 #[derive(Clone)]
@@ -115,7 +142,7 @@ pub struct UpdateControl {
     writer: Option<crate::control::WriterLink>,
     /// API launcher only: the bot launcher link for paired-upgrade steps.
     launcher: Option<crate::control::WriterLink>,
-    confirmed_fence_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    launcher_authority: Arc<Mutex<LauncherAuthority>>,
 }
 
 /// Immutable application compatibility of this container's baked image. A
@@ -589,7 +616,7 @@ impl UpdateControl {
             db,
             writer: None,
             launcher: None,
-            confirmed_fence_deadline: Arc::new(Mutex::new(None)),
+            launcher_authority: Arc::new(Mutex::new(LauncherAuthority::Unconfirmed)),
         }))
     }
 
@@ -598,7 +625,7 @@ impl UpdateControl {
             db: db.clone(),
             writer: None,
             launcher: None,
-            confirmed_fence_deadline: Arc::new(Mutex::new(None)),
+            launcher_authority: Arc::new(Mutex::new(LauncherAuthority::Unconfirmed)),
         }
     }
 
@@ -700,12 +727,12 @@ impl UpdateControl {
     /// Bot-launcher fence. The API launcher never calls this and never writes.
     pub fn arm_launcher_fence(&self, instance: &str) {
         self.db.arm_launcher_fence(instance);
-        *self.confirmed_fence_deadline.lock().unwrap() = None;
+        *self.launcher_authority.lock().unwrap() = LauncherAuthority::Unconfirmed;
     }
 
     /// Local monotonic horizon from the last successful acquisition or renewal.
     pub fn launcher_fence_deadline(&self) -> Option<std::time::Instant> {
-        *self.confirmed_fence_deadline.lock().unwrap()
+        self.launcher_authority.lock().unwrap().deadline()
     }
 
     fn confirm_launcher_fence(&self, requested_at: std::time::Instant) -> Result<()> {
@@ -714,7 +741,7 @@ impl UpdateControl {
             std::time::Instant::now() < next,
             "launcher fence acquisition completed too late"
         );
-        *self.confirmed_fence_deadline.lock().unwrap() = Some(next);
+        *self.launcher_authority.lock().unwrap() = LauncherAuthority::ConfirmedUntil(next);
         Ok(())
     }
 
@@ -741,7 +768,7 @@ impl UpdateControl {
             "launcher fence authority window expired"
         );
         let renewal = async {
-            let (renewed, missing) = self
+            let result = self
                 .db
                 .with_lease_conn(move |conn| {
                     let now = crate::control::now_ms();
@@ -752,7 +779,7 @@ impl UpdateControl {
                         deadline.saturating_duration_since(std::time::Instant::now()),
                     )? == 1
                     {
-                        return Ok((true, false));
+                        return Ok(FenceCas::Renewed);
                     }
                     // One bounded read on this lease connection distinguishes a
                     // missing row from contention. Acquisition rechecks both fences
@@ -763,35 +790,47 @@ impl UpdateControl {
                         (),
                         |row| Ok(row.get::<i64>(0)? != 0),
                     )?;
-                    Ok((false, missing))
+                    Ok(if missing {
+                        FenceCas::Missing
+                    } else {
+                        FenceCas::Contended
+                    })
                 })
                 .await?;
-            if missing {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "launcher fence renewal completed too late"
-                );
-                Ok::<_, anyhow::Error>((self.acquire_launcher_fence().await?, true))
-            } else {
-                Ok((renewed, false))
+            match result {
+                FenceCas::Renewed => Ok::<_, anyhow::Error>(FenceRenewal::Renewed),
+                FenceCas::Contended => Ok(FenceRenewal::NotRenewed),
+                FenceCas::Missing => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "launcher fence renewal completed too late"
+                    );
+                    Ok(if self.acquire_launcher_fence().await? {
+                        FenceRenewal::Reacquired
+                    } else {
+                        FenceRenewal::NotRenewed
+                    })
+                }
             }
         };
-        let (renewed, recovered) =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renewal)
-                .await
-                .context("launcher fence renewal timed out")??;
+        let renewal = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renewal)
+            .await
+            .context("launcher fence renewal timed out")??;
         // timeout_at can poll a ready response before its timer on a busy executor.
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "launcher fence renewal completed too late"
         );
-        if renewed {
-            self.confirm_launcher_fence(requested_at)?;
-            if recovered {
-                tracing::info!("missing bot launcher fence recreated");
+        match renewal {
+            FenceRenewal::NotRenewed => Ok(false),
+            FenceRenewal::Renewed | FenceRenewal::Reacquired => {
+                self.confirm_launcher_fence(requested_at)?;
+                if matches!(renewal, FenceRenewal::Reacquired) {
+                    tracing::info!("missing bot launcher fence recreated");
+                }
+                Ok(true)
             }
         }
-        Ok(renewed)
     }
 
     /// Extend this process's launcher fence. The transaction writes that fence
@@ -1803,7 +1842,7 @@ mod tests {
         // CAS commits while the single-thread caller dispatcher is blocked;
         // its already-ready successful response is accepted only after expiry.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        *control.confirmed_fence_deadline.lock().unwrap() = Some(deadline);
+        *control.launcher_authority.lock().unwrap() = LauncherAuthority::ConfirmedUntil(deadline);
         let renewing = control.clone();
         let cas = tokio::spawn(async move { renewing.renew_launcher_fence_cas().await });
         let started = tokio::time::timeout(Duration::from_secs(5), async {

@@ -553,7 +553,7 @@ async fn main() -> Result<()> {
             }
             result => result?,
         };
-    if !may_identify {
+    if may_identify == jmodguard_bot::gateway_budget::GatewayStartup::Shutdown {
         tracing::info!("shutdown before gateway identify");
         activation.begin_shutdown();
         activation.note_lease_lost();

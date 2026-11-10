@@ -791,7 +791,7 @@ pub struct BotState {
     /// Timed-ban expiry: per-guild retry time after a failed membership check.
     pub(crate) expiry_check_retries: crate::action_worker::ExpiryCheckRetries,
     /// Shards that have already delivered READY in this process.
-    ready_shards: Mutex<HashSet<u32>>,
+    ready_shards: Mutex<ShardSessions>,
     /// Test seam. Production reads [`Self::discord_cache`] instead.
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
@@ -904,7 +904,7 @@ impl BotState {
             rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
             expiry_check_retries: Default::default(),
-            ready_shards: Mutex::new(HashSet::new()),
+            ready_shards: Mutex::new(ShardSessions::default()),
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
@@ -1700,7 +1700,7 @@ impl BotState {
     /// A shard's first READY is startup. A later READY from that same shard is
     /// a replaced session and advances the coverage-gap generation.
     pub(crate) fn note_shard_ready(&self, shard_id: u32) {
-        if !self.ready_shards.lock().insert(shard_id) {
+        if self.ready_shards.lock().observe_ready(shard_id) == ShardReady::Replaced {
             self.gateway_ready_generation
                 .fetch_add(1, Ordering::Relaxed);
             self.invalidate_member_sync_scope();
@@ -2185,6 +2185,33 @@ impl CachedGuildConfig {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShardReady {
+    First,
+    Replaced,
+}
+
+#[derive(Default)]
+struct ShardSessions {
+    ready: HashSet<u32>,
+}
+
+impl ShardSessions {
+    fn observe_ready(&mut self, shard_id: u32) -> ShardReady {
+        if self.ready.insert(shard_id) {
+            ShardReady::First
+        } else {
+            ShardReady::Replaced
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigReadRoute {
+    Replica,
+    Primary,
+}
+
 #[derive(Clone)]
 pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
@@ -2260,12 +2287,12 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
-        let mut primary = false;
+        let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
         let mut last_required = required;
         for _ in 0..3 {
             let version = self.version.load(Ordering::Relaxed);
-            let (durable_version, revision, parts) = if primary {
+            let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
                 db::load_config_parts_with_version_primary(db, guild_id as i64).await?
             } else {
                 db::load_config_parts_with_version(db, guild_id as i64).await?
@@ -2278,7 +2305,7 @@ impl ConfigCache {
             last_required = required_after;
             let accepted_revision = self.accepted_revision.lock().clone();
 
-            if primary && revision != accepted_revision {
+            if route == ConfigReadRoute::Primary && revision != accepted_revision {
                 self.require_primary_revision(durable_version, revision);
                 continue;
             }
@@ -2286,7 +2313,7 @@ impl ConfigCache {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
-                primary = true;
+                route = ConfigReadRoute::Primary;
                 continue;
             }
             let cfg = Arc::new(CachedGuildConfig::from_parts(
@@ -2308,7 +2335,7 @@ impl ConfigCache {
                     || durable_version < required_now
                     || revision != accepted_revision
                 {
-                    primary = true;
+                    route = ConfigReadRoute::Primary;
                     continue;
                 }
                 self.map.insert(guild_id as i64, Arc::clone(&cfg));

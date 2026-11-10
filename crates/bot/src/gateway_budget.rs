@@ -30,14 +30,36 @@ impl SessionStartSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentifyAdmission {
+    Ready,
+    Wait(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayStartup {
+    IdentifyRecorded,
+    Shutdown,
+}
+
 /// How long to wait before the next process-start IDENTIFY.
 ///
 /// `since_last` is the age of the previous identify recorded by this bot.
 /// `None` means this process has no record, so a positive remaining budget
 /// may identify now. A crash loop has a record and must wait.
 pub fn identify_delay(limit: &SessionStartSnapshot, since_last: Option<Duration>) -> Duration {
+    match identify_admission(limit, since_last) {
+        IdentifyAdmission::Ready => Duration::ZERO,
+        IdentifyAdmission::Wait(wait) => wait,
+    }
+}
+
+fn identify_admission(
+    limit: &SessionStartSnapshot,
+    since_last: Option<Duration>,
+) -> IdentifyAdmission {
     if limit.remaining == 0 {
-        return Duration::from_millis(limit.reset_after_ms.max(1_000));
+        return IdentifyAdmission::Wait(Duration::from_millis(limit.reset_after_ms.max(1_000)));
     }
     let concurrency = limit.max_concurrency.max(1);
     // Discord allows `max_concurrency` identifies per 5 seconds.
@@ -51,8 +73,10 @@ pub fn identify_delay(limit: &SessionStartSnapshot, since_last: Option<Duration>
         gap
     };
     match since_last {
-        Some(elapsed) if elapsed < needed => needed.saturating_sub(elapsed),
-        _ => Duration::ZERO,
+        Some(elapsed) if elapsed < needed => {
+            IdentifyAdmission::Wait(needed.saturating_sub(elapsed))
+        }
+        _ => IdentifyAdmission::Ready,
     }
 }
 
@@ -75,8 +99,11 @@ async fn sleep_or_shutdown(wait: Duration) -> bool {
 }
 
 /// Wait until an IDENTIFY is allowed, record it, and return whether startup
-/// should continue. `false` means the process was asked to shut down.
-pub async fn wait_for_gateway_identify(http: &serenity::http::Http, db: &db::Db) -> Result<bool> {
+/// should continue. Recording is admission to identify, not a ready session.
+pub async fn wait_for_gateway_identify(
+    http: &serenity::http::Http,
+    db: &db::Db,
+) -> Result<GatewayStartup> {
     let mut failure_backoff = Duration::from_secs(2);
     loop {
         match http.get_bot_gateway().await {
@@ -85,20 +112,22 @@ pub async fn wait_for_gateway_identify(http: &serenity::http::Http, db: &db::Db)
                 let now = chrono::Utc::now().timestamp_millis();
                 let since = identify_age(stored, now);
                 let snapshot = SessionStartSnapshot::from_discord(&info.session_start_limit);
-                let wait = identify_delay(&snapshot, since);
-                if wait.is_zero() {
-                    db::record_gateway_identify_ms(db, now)
-                        .await
-                        .context("record gateway identify")?;
-                    return Ok(true);
-                }
+                let wait = match identify_admission(&snapshot, since) {
+                    IdentifyAdmission::Ready => {
+                        db::record_gateway_identify_ms(db, now)
+                            .await
+                            .context("record gateway identify")?;
+                        return Ok(GatewayStartup::IdentifyRecorded);
+                    }
+                    IdentifyAdmission::Wait(wait) => wait,
+                };
                 tracing::warn!(
                     remaining = snapshot.remaining,
                     wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     "delaying gateway identify to stay inside the session start limit"
                 );
                 if !sleep_or_shutdown(wait).await {
-                    return Ok(false);
+                    return Ok(GatewayStartup::Shutdown);
                 }
             }
             Err(error) => {
@@ -112,7 +141,7 @@ pub async fn wait_for_gateway_identify(http: &serenity::http::Http, db: &db::Db)
                     "gateway session start limit unavailable; not identifying yet: {error}"
                 );
                 if !sleep_or_shutdown(failure_backoff).await {
-                    return Ok(false);
+                    return Ok(GatewayStartup::Shutdown);
                 }
                 failure_backoff = (failure_backoff * 2).min(Duration::from_secs(30));
             }

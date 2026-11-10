@@ -8,6 +8,28 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigObservation {
+    version: u64,
+    revision: String,
+}
+
+impl ConfigObservation {
+    fn from_primary(primary: db::VersionState) -> Self {
+        Self {
+            version: primary.config,
+            revision: primary.config_revision,
+        }
+    }
+
+    fn observe_primary(&mut self, primary: db::VersionState) -> bool {
+        let next = Self::from_primary(primary);
+        let changed = *self != next;
+        *self = next;
+        changed
+    }
+}
+
 /// Dashboard state cannot run the moderation engine.
 /// ```compile_fail
 /// fn moderation(state: &jmodguard_api::web::state::ApiState) {
@@ -32,7 +54,7 @@ pub struct ApiState {
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
-    config_observation: tokio::sync::Mutex<(u64, String)>,
+    config_observation: tokio::sync::Mutex<ConfigObservation>,
     /// Replaces the in-memory session store for one `web::router` build.
     session_store: std::sync::Mutex<Option<tower_sessions::MemoryStore>>,
 }
@@ -80,7 +102,7 @@ impl ApiState {
             user_cache: DashMap::new(),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
-            config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
+            config_observation: tokio::sync::Mutex::new(ConfigObservation::from_primary(primed)),
             session_store: std::sync::Mutex::new(None),
         }))
     }
@@ -176,13 +198,13 @@ impl ApiState {
     pub async fn poll_config_version(&self) -> Result<bool> {
         let mut previous = self.config_observation.lock().await;
         let remote = db::get_version_state(&self.db).await?;
-        if remote.config == previous.0
-            && remote.config_revision == previous.1
+        if remote.config == previous.version
+            && remote.config_revision == previous.revision
             && remote.config >= self.db.required_config_version()
         {
             return Ok(false);
         }
-        let floor = previous.0.max(self.db.required_config_version());
+        let floor = previous.version.max(self.db.required_config_version());
         let generation = self.db.config_write_generation();
         let primary = db::get_primary_versions(&self.db).await?;
         Ok(self.reconcile_primary(&mut previous, primary, floor, generation))
@@ -190,7 +212,7 @@ impl ApiState {
 
     fn reconcile_primary(
         &self,
-        previous: &mut (u64, String),
+        previous: &mut ConfigObservation,
         primary: db::VersionState,
         floor: u64,
         generation: u64,
@@ -202,9 +224,7 @@ impl ApiState {
             return false;
         }
         self.db.require_config_version(primary.config);
-        let changed = primary.config != previous.0 || primary.config_revision != previous.1;
-        *previous = (primary.config, primary.config_revision);
-        changed
+        previous.observe_primary(primary)
     }
 
     pub async fn commit(&self, op: db::ControlOp) -> Result<db::ControlReply> {
@@ -356,7 +376,10 @@ mod tests {
         }).await.unwrap();
         assert!(f.api.poll_config_version().await.unwrap());
         assert_eq!(f.api.db.required_config_version(), baseline);
-        assert_eq!(f.api.config_observation.lock().await.1, "restored-revision");
+        assert_eq!(
+            f.api.config_observation.lock().await.revision,
+            "restored-revision"
+        );
     }
 
     #[tokio::test]
