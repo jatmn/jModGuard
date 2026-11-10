@@ -17,7 +17,69 @@ pub struct Outcome {
     pub state: &'static str,
     pub code: &'static str,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutcomeState {
+    Succeeded,
+    Failed,
+    Uncertain,
+    Other,
+}
+
+impl OutcomeState {
+    fn from_reported(value: &str) -> Self {
+        match value {
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "uncertain" => Self::Uncertain,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutationPhase {
+    Validating,
+    Started,
+}
+
+#[derive(Default)]
+struct MutationProgress(std::sync::atomic::AtomicBool);
+
+impl MutationProgress {
+    fn start(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn phase(&self) -> MutationPhase {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            MutationPhase::Started
+        } else {
+            MutationPhase::Validating
+        }
+    }
+}
+
+enum ActionMembership {
+    Matches,
+    Mismatch { observed_joined_at_ns: Option<i64> },
+}
+
+impl ActionMembership {
+    fn from_check(matches: bool, observed_joined_at_ns: Option<i64>) -> Self {
+        if matches {
+            Self::Matches
+        } else {
+            Self::Mismatch {
+                observed_joined_at_ns,
+            }
+        }
+    }
+}
+
 impl Outcome {
+    fn phase(&self) -> OutcomeState {
+        OutcomeState::from_reported(self.state)
+    }
     fn failed(code: &'static str) -> Self {
         Self {
             state: "failed",
@@ -172,10 +234,10 @@ fn unban_case_outcome(outcome: &Outcome) -> crate::db::guild_data::CaseOutcome {
         // an idempotent request, but its case is not evidence of a ban cycle.
         CaseOutcome::Attempted
     } else {
-        match outcome.state {
-            "succeeded" => CaseOutcome::Succeeded,
-            "failed" => CaseOutcome::Failed,
-            _ => CaseOutcome::Uncertain,
+        match outcome.phase() {
+            OutcomeState::Succeeded => CaseOutcome::Succeeded,
+            OutcomeState::Failed => CaseOutcome::Failed,
+            OutcomeState::Uncertain | OutcomeState::Other => CaseOutcome::Uncertain,
         }
     }
 }
@@ -206,18 +268,23 @@ async fn execute_inner(
     }
     let membership = async {
         match discord.membership_joined_at_ns(job).await? {
-            Some(joined_at_ns) => Ok::<_, anyhow::Error>((
+            Some(joined_at_ns) => Ok::<_, anyhow::Error>(ActionMembership::from_check(
                 job.joined_at_ns.is_some_and(|expected| {
                     crate::enrollment_repair::membership_joined_at_matches(expected, joined_at_ns)
                 }),
                 Some(joined_at_ns),
             )),
-            None => Ok::<_, anyhow::Error>((discord.membership_matches(job).await?, None)),
+            None => Ok::<_, anyhow::Error>(ActionMembership::from_check(
+                discord.membership_matches(job).await?,
+                None,
+            )),
         }
     };
     match tokio::time::timeout(timeout, membership).await {
-        Ok(Ok((true, _))) => {}
-        Ok(Ok((false, observed_joined_at_ns))) => {
+        Ok(Ok(ActionMembership::Matches)) => {}
+        Ok(Ok(ActionMembership::Mismatch {
+            observed_joined_at_ns,
+        })) => {
             tracing::warn!(
                 action_id = %job.id,
                 guild_id = job.guild_id,
@@ -275,7 +342,7 @@ async fn execute_inner(
     if !db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
         return Ok(());
     }
-    let mutation_started = std::sync::atomic::AtomicBool::new(false);
+    let mutation = MutationProgress::default();
     let work = async {
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
@@ -331,7 +398,7 @@ async fn execute_inner(
                 if app.is_some_and(|app| !app.activation.may_record()) {
                     return Outcome::failed("writer_lease_not_held");
                 }
-                mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
+                mutation.start();
                 let Some(bot_id) = discord.bot_user_id() else {
                     return Outcome::failed("bot_identity_unavailable");
                 };
@@ -382,7 +449,7 @@ async fn execute_inner(
                         }
                     }
                 };
-                if outcome.state == "succeeded"
+                if outcome.phase() == OutcomeState::Succeeded
                     && let Some(app) = app
                 {
                     app.wake_member_sync();
@@ -404,9 +471,9 @@ async fn execute_inner(
                         None,
                     )
                 });
-                mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
+                mutation.start();
                 let outcome = discord.unban(job.guild_id, *user_id, reason).await;
-                if outcome.state == "succeeded"
+                if outcome.phase() == OutcomeState::Succeeded
                     && let (Some(id), Some(joined_at_ns)) = (&job.enrollment_id, job.joined_at_ns)
                 {
                     crate::gateway_ban_persistence::retain_confirmed_unban(
@@ -420,7 +487,7 @@ async fn execute_inner(
                     );
                 }
 
-                if (outcome.state == "failed" || outcome.code == "already_unbanned")
+                if (outcome.phase() == OutcomeState::Failed || outcome.code == "already_unbanned")
                     && let (Some(app), Some(suppression)) = (app, suppression)
                 {
                     app.release_gateway_case_suppression(suppression);
@@ -447,7 +514,7 @@ async fn execute_inner(
     let outcome = tokio::time::timeout(remaining, work)
         .await
         .unwrap_or_else(|_| {
-            if mutation_started.load(std::sync::atomic::Ordering::Relaxed) {
+            if mutation.phase() == MutationPhase::Started {
                 Outcome::uncertain("request_timed_out")
             } else {
                 Outcome::failed("validation_timed_out")
@@ -456,7 +523,7 @@ async fn execute_inner(
     if app.is_some_and(|app| !app.activation.may_record()) {
         return Err(anyhow::anyhow!("writer lease is not held"));
     }
-    if mutation_started.load(std::sync::atomic::Ordering::Relaxed)
+    if mutation.phase() == MutationPhase::Started
         && let Some(tenant) = tenant
         && let Action::Unban { user_id, reason } = &job.action
     {
@@ -483,7 +550,7 @@ async fn execute_inner(
                 evidence: crate::db::guild_data::CaseEvidence::Unavailable,
             };
             let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
-            if outcome.state == "succeeded" && outcome.code != "already_unbanned" {
+            if outcome.phase() == OutcomeState::Succeeded && outcome.code != "already_unbanned" {
                 // A successful Discord unban proves the target was banned;
                 // the idempotent 10026 response does not. Persist that state
                 // directly because old application unban cases cannot safely
@@ -536,7 +603,7 @@ async fn execute_inner(
             action_id = %job.id,
             reported_state = outcome.state,
             reported_outcome = outcome.code,
-            mutation_started = mutation_started.load(std::sync::atomic::Ordering::Relaxed),
+            mutation_started = (mutation.phase() == MutationPhase::Started),
             "bot action completion rejected; recorded state preserved; action will not be resent"
         );
     }
@@ -585,6 +652,26 @@ pub async fn drain_with_state(
     .await
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpiryScan {
+    Incomplete,
+    Exhausted,
+}
+
+// Only a confirmed deadline consumption can construct the dispatch input.
+// This carries no proof that Discord has performed an unban.
+struct ConsumedExpiry(db::ExpiredBan);
+
+impl ConsumedExpiry {
+    async fn claim(db: &Db, due: db::ExpiredBan) -> Result<Option<Self>> {
+        if db::claim_expired_ban(db, &due).await? {
+            Ok(Some(Self(due)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 async fn expire_bans(
     db: &Db,
     app: Option<&crate::state::BotState>,
@@ -611,7 +698,7 @@ async fn expire_bans(
     let mut retries = app
         .map(|app| app.expiry_check_retries.due(now))
         .unwrap_or_default();
-    let mut exhausted = false;
+    let mut scan = ExpiryScan::Incomplete;
     for _ in 0..limits.batch_size {
         if app.is_some_and(|app| !app.activation.may_record()) {
             break;
@@ -627,7 +714,7 @@ async fn expire_bans(
         )
         .await?
         else {
-            exhausted = true;
+            scan = ExpiryScan::Exhausted;
             break;
         };
         // Reaching a retry guild releases it; the retry guilds before it had
@@ -676,14 +763,17 @@ async fn expire_bans(
             }
             in_progress => in_progress,
         };
-        if !db::claim_expired_ban(db, &due).await? {
-            deferred.push(due.id);
+        let due_id = due.id;
+        let Some(claimed) = ConsumedExpiry::claim(db, due).await? else {
+            deferred.push(due_id);
             continue;
-        }
-        dispatch_expired_ban(db, app, discord, due, limits).await?;
+        };
+        dispatch_expired_ban(db, app, discord, claimed, limits).await?;
         drop(in_progress);
     }
-    if exhausted && let Some(app) = app {
+    if scan == ExpiryScan::Exhausted
+        && let Some(app) = app
+    {
         app.expiry_check_retries.forget_idle(now);
     }
     Ok(())
@@ -698,6 +788,22 @@ const EXPIRY_CHECK_RETRY_MAX_SECS: i64 = 15 * 60;
 struct ExpiryCheckRetry {
     failures: u32,
     retry_at: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpiryRetryState {
+    Waiting,
+    Due,
+}
+
+impl ExpiryCheckRetry {
+    fn state(&self, now: i64) -> ExpiryRetryState {
+        if now < self.retry_at {
+            ExpiryRetryState::Waiting
+        } else {
+            ExpiryRetryState::Due
+        }
+    }
 }
 
 /// Per-guild retry time after a failed expiry membership check. In-process
@@ -718,7 +824,7 @@ impl ExpiryCheckRetries {
         self.0
             .lock()
             .iter()
-            .filter(|(_, retry)| now < retry.retry_at)
+            .filter(|(_, retry)| retry.state(now) == ExpiryRetryState::Waiting)
             .map(|(guild, _)| *guild)
             .collect()
     }
@@ -729,7 +835,7 @@ impl ExpiryCheckRetries {
             .0
             .lock()
             .iter()
-            .filter(|(_, retry)| retry.retry_at <= now)
+            .filter(|(_, retry)| retry.state(now) == ExpiryRetryState::Due)
             .map(|(guild, retry)| (retry.retry_at, *guild))
             .collect();
         due.sort_unstable();
@@ -764,7 +870,7 @@ impl ExpiryCheckRetries {
         for guild in guilds {
             if retries
                 .get(guild)
-                .is_some_and(|retry| retry.retry_at <= now)
+                .is_some_and(|retry| retry.state(now) == ExpiryRetryState::Due)
             {
                 retries.remove(guild);
             }
@@ -774,7 +880,9 @@ impl ExpiryCheckRetries {
     /// After a pass that checked every due ban selected at `now`: an entry
     /// already due at `now` and not checked again had no due ban.
     fn forget_idle(&self, now: i64) {
-        self.0.lock().retain(|_, retry| now < retry.retry_at);
+        self.0
+            .lock()
+            .retain(|_, retry| retry.state(now) == ExpiryRetryState::Waiting);
     }
 }
 
@@ -849,9 +957,10 @@ async fn dispatch_expired_ban(
     db: &Db,
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
-    claimed: db::ExpiredBan,
+    claimed: ConsumedExpiry,
     limits: &WorkerLimits,
 ) -> Result<()> {
+    let ConsumedExpiry(claimed) = claimed;
     // Claiming clears the old deadline; the ban may have been re-armed,
     // cancelled or replaced, or its membership ended, since it was claimed.
     match db::expired_ban_state(db, &claimed).await? {
@@ -889,12 +998,12 @@ async fn dispatch_expired_ban(
         Ok(outcome) => outcome,
         Err(_) => Outcome::uncertain("request_timed_out"),
     };
-    if (outcome.state == "failed" || outcome.code == "already_unbanned")
+    if (outcome.phase() == OutcomeState::Failed || outcome.code == "already_unbanned")
         && let (Some(app), Some(suppression)) = (app, suppression)
     {
         app.release_gateway_case_suppression(suppression);
     }
-    if outcome.state == "succeeded"
+    if outcome.phase() == OutcomeState::Succeeded
         && let Err(error) = db::mark_enrolled_unbanned(db, Some(enrollment.clone()), user).await
     {
         tracing::warn!(user, "expired ban mirror not saved: {error:#}");
@@ -904,7 +1013,7 @@ async fn dispatch_expired_ban(
     // cannot leave the user shown as banned. It is observed at the request
     // time: a re-ban the directory saw during the request, including one whose
     // contested check already settled, is newer and is kept and rechecked.
-    if outcome.state == "succeeded"
+    if outcome.phase() == OutcomeState::Succeeded
         && outcome.code != "already_unbanned"
         && let Some(app) = app
     {
@@ -939,7 +1048,7 @@ async fn dispatch_expired_ban(
         )
         .await;
     }
-    if outcome.state != "succeeded" {
+    if outcome.phase() != OutcomeState::Succeeded {
         tracing::warn!(
             guild = enrollment.guild_id,
             user,

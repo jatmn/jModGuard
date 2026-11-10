@@ -2103,6 +2103,23 @@ const RETRY_EXPIRY_SQL: &str = "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_a
              AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
              ORDER BY l.key,b.expires_at,b.id LIMIT 1";
 
+enum ExpiryRetrySelection {
+    None,
+    AfterPrimary { deferred: String, guilds: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpiryDeadlineMatch {
+    Current,
+    Stale,
+}
+
+impl From<bool> for ExpiryDeadlineMatch {
+    fn from(current: bool) -> Self {
+        if current { Self::Current } else { Self::Stale }
+    }
+}
+
 /// Find the oldest due expiry under an active, unfenced membership without
 /// consuming it, so the caller can verify live membership first. `skip_bans`
 /// and `skip_guilds` hold ban and guild IDs already deferred in this pass.
@@ -2118,13 +2135,16 @@ pub async fn next_expired_ban(
     last_guilds: Vec<i64>,
 ) -> Result<Option<ExpiredBan>> {
     let skip_bans = serde_json::to_string(&skip_bans)?;
-    let retries = (!last_guilds.is_empty())
-        .then(|| {
-            let deferred = serde_json::to_string(&skip_guilds)?;
-            skip_guilds.extend_from_slice(&last_guilds);
-            Ok::<_, anyhow::Error>((deferred, serde_json::to_string(&last_guilds)?))
-        })
-        .transpose()?;
+    let retries = if last_guilds.is_empty() {
+        ExpiryRetrySelection::None
+    } else {
+        let deferred = serde_json::to_string(&skip_guilds)?;
+        skip_guilds.extend_from_slice(&last_guilds);
+        ExpiryRetrySelection::AfterPrimary {
+            deferred,
+            guilds: serde_json::to_string(&last_guilds)?,
+        }
+    };
     let skip_guilds = serde_json::to_string(&skip_guilds)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_write()?;
@@ -2136,7 +2156,10 @@ pub async fn next_expired_ban(
             )
             .optional()?;
         if due.is_none()
-            && let Some((deferred, last_guilds)) = retries
+            && let ExpiryRetrySelection::AfterPrimary {
+                deferred,
+                guilds: last_guilds,
+            } = retries
         {
             due = tx
                 .query_row(
@@ -2188,9 +2211,9 @@ pub async fn claim_expired_ban(db: &Db, due: &ExpiredBan) -> Result<bool> {
                 due.enrollment.id,
                 due.enrollment.joined_at_ns,
             ],
-            |row| Ok(row.get::<bool>(0)?),
+            |row| Ok(ExpiryDeadlineMatch::from(row.get::<bool>(0)?)),
         )?;
-        if !current {
+        if current == ExpiryDeadlineMatch::Stale {
             tx.finish_read()?;
             return Ok(false);
         }

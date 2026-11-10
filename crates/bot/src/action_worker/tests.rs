@@ -2006,7 +2006,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
         );
         let discord = MockDiscord::default();
         let limits = WorkerLimits::default();
-        dispatch_expired_ban(&f.db, None, &discord, claimed, &limits)
+        dispatch_expired_ban(&f.db, None, &discord, ConsumedExpiry(claimed), &limits)
             .await
             .unwrap();
         assert_eq!(discord.calls.load(Ordering::SeqCst), 0, "{change}");
