@@ -224,7 +224,10 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                 .trim_start_matches(crate::normalize::is_zero_width);
             start = token.end() - bare.len();
             let head = bare.split(['/', '?', '#']).next().unwrap_or_default();
-            if let Some(i) = head.find(crate::normalize::is_zero_width) {
+            // Keep structural userinfo on the complete candidate for exclusion.
+            if let Some(i) = head.find(crate::normalize::is_zero_width)
+                && !head.contains('@')
+            {
                 let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
                 let text = url_token_text(candidate);
                 if ["http://", "https://"].iter().any(|scheme| {
@@ -232,7 +235,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
                 }) {
                     start = token.end() - candidate.len();
-                } else if !head[..i].contains('.')
+                } else if (!head[..i].contains(['.', ':']) || head[..i].chars().all(|c| c == ':'))
                     && text
                         .split(['/', '?', '#'])
                         .next()
@@ -841,6 +844,51 @@ mod tests {
             false_positives.is_empty(),
             "promoted paths: {false_positives:?}"
         );
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_email_userinfo_exclusions() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for text in [
+            "user@tinyurl.com",
+            "user@tinyurl.com/a",
+            "user@\u{200b}tinyurl.com",
+            "user@\u{200b}tinyurl.com/a",
+            "user\u{200b}@tinyurl.com/a",
+            "user@\u{00ad}tinyurl.com/a",
+            "user@\u{feff}tinyurl.com/a",
+            "a\u{200b}user@tinyurl.com/a",
+            "user:pw@\u{200b}tinyurl.com/a",
+            "\u{200b}user@tinyurl.com/a",
+            "http://user@tinyurl.com/a",
+            "https://user@\u{200b}tinyurl.com/a",
+        ] {
+            if compiled.matches(text) {
+                false_positives.push(text);
+            }
+        }
+        assert!(false_positives.is_empty(), "{false_positives:?}");
+        assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
+        assert!(compiled.matches("tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_do_not_discard_credential_prefixes() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for text in [
+            "user@\u{200b}https://tinyurl.com/a",
+            "user:pw@\u{200b}https://tinyurl.com/a",
+            "user:pw\u{200b}tinyurl.com/a",
+        ] {
+            if compiled.matches(text) {
+                false_positives.push(text);
+            }
+        }
+        assert!(false_positives.is_empty(), "{false_positives:?}");
+        // A port on the suffix and prose punctuation before an explicit scheme
+        // are not discarded credential prefixes.
+        assert!(compiled.matches("foo\u{200b}tinyurl.com:443/a"));
+        assert!(compiled.matches("word:\u{200b}https://tinyurl.com/a"));
     }
     #[test]
     fn known_spam_urls_match_next_to_punctuation() {
