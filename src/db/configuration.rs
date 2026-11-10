@@ -268,14 +268,62 @@ fn verify_configuration_write(
 // rules
 // ---------------------------------------------------------------------------
 
+/// Old writers cannot run the new save guard. Until the next bot bootstrap
+/// repairs storage, readers expose the same replacement as that repair.
+/// This does not write, inherit global guidance, or change pre-marker reads.
+fn normalize_invite_description_for_read(id: &str, rule: &mut RuleDef, upgraded: bool) {
+    if upgraded && id == "invite" && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION {
+        rule.description = crate::defaults::INVITE_DESCRIPTION.into();
+    }
+}
+
+fn load_rule_rows_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    id: Option<&str>,
+) -> Result<Vec<(String, RuleDef)>> {
+    // Read the marker and rows in one statement, also on remote connections.
+    let mut sql = String::from(
+        "SELECT rule_id, data, EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
+         FROM rules WHERE guild_id = ?1",
+    );
+    let mut args: Vec<Value> = vec![guild_id.into()];
+    if let Some(id) = id {
+        sql.push_str(" AND rule_id = ?2");
+        args.push(id.to_owned().into());
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args), |row| {
+        Ok((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<bool>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json, upgraded) = row?;
+        let mut rule = read_json(&json, "rules")?;
+        normalize_invite_description_for_read(&id, &mut rule, upgraded);
+        out.push((id, rule));
+    }
+    Ok(out)
+}
+
 pub async fn list_rules(db: &Db, guild_id: i64) -> Result<Vec<(String, RuleDef)>> {
-    load_rows(db, guild_id, "rules", "rule_id", None).await
+    db.with_conn(move |conn| load_rule_rows_conn(conn, guild_id, None))
+        .await
 }
 
 pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<RuleDef>> {
-    let rows: Vec<(String, RuleDef)> =
-        load_rows(db, guild_id, "rules", "rule_id", Some(rule_id)).await?;
-    Ok(rows.into_iter().next().map(|(_, r)| r))
+    let id = rule_id.to_owned();
+    db.with_conn(move |conn| {
+        Ok(load_rule_rows_conn(conn, guild_id, Some(&id))?
+            .into_iter()
+            .next()
+            .map(|(_, rule)| rule))
+    })
+    .await
 }
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
@@ -1048,6 +1096,8 @@ async fn copy_guild_config_inner(
         }
 
         if wants("rules") {
+            // Copy stored source text so OLD still reaches the destination save
+            // guard, which may need to preserve the destination's custom guidance.
             let rows = load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)?;
             if src != dst {
                 let mut replacement = prepare_copied_rules(dst, rows)?;
@@ -1288,6 +1338,7 @@ SELECT
   ,(SELECT json_group_array(json_object('id',id,'guild_id',guild_id,'kind',kind,'value',value,'note',note))
      FROM (SELECT id,guild_id,kind,value,note FROM known_spam
            WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
+  ,EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1389,6 +1440,14 @@ fn load_configuration_snapshot_conn(
                 }),
                 _ => None,
             };
+            let upgraded = row.get::<bool>(24)?;
+            let mut guild_rules = parse_json_encoded_map(row.get(7)?, "rules")?;
+            let mut global_rules = parse_json_encoded_map(row.get(8)?, "rules")?;
+            for rules in [&mut guild_rules, &mut global_rules] {
+                if let Some(invite) = rules.get_mut("invite") {
+                    normalize_invite_description_for_read("invite", invite, upgraded);
+                }
+            }
             Ok(ConfigurationSnapshotRows {
                 versions: VersionState {
                     config,
@@ -1399,8 +1458,8 @@ fn load_configuration_snapshot_conn(
                 defaults,
                 guild_settings_raw,
                 global_settings_raw,
-                guild_rules: parse_json_encoded_map(row.get(7)?, "rules")?,
-                global_rules: parse_json_encoded_map(row.get(8)?, "rules")?,
+                guild_rules,
+                global_rules,
                 guild_commands: parse_json_encoded_map(row.get(9)?, "commands")?,
                 global_commands: parse_json_encoded_map(row.get(10)?, "commands")?,
                 guild_templates: parse_json_map(row.get(11)?, "templates")?,
@@ -1924,12 +1983,10 @@ pub async fn get_enrolled_rule(
     let id = id.to_owned();
     configuration_read(db, scope, move |tx, guild| {
         read_layers(guild, |g| {
-            Ok(
-                load_rows_conn::<RuleDef>(tx, g, "rules", "rule_id", Some(&id))?
-                    .into_iter()
-                    .next()
-                    .map(|(_, row)| row),
-            )
+            Ok(load_rule_rows_conn(tx, g, Some(&id))?
+                .into_iter()
+                .next()
+                .map(|(_, row)| row))
         })
     })
     .await

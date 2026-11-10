@@ -5709,6 +5709,25 @@ function previewInline(text, depth = 0) {
     }
     return -1;
   };
+  // Bracket queries advance monotonically. Reuse the next label closer,
+  // including a failed search, until the caller passes it.
+  let labelEnd;
+  let linkEnds;
+  const linkEnd = start => {
+    if (!linkEnds) {
+      linkEnds = new Map();
+      const open = [];
+      // Match destination parentheses once, with the same escape and balance
+      // rules as the forward scan. An unmatched outer '(' can contain a
+      // matched inner link, so a failed outer search cannot skip the suffix.
+      for (let i = start; i < text.length; i++) {
+        if (text[i] === "\\") { i++; continue; }
+        if (text[i] === "(") open.push(i);
+        if (text[i] === ")" && open.length) linkEnds.set(open.pop(), i);
+      }
+    }
+    return linkEnds.get(start) ?? -1;
+  };
   for (let i = 0; i < text.length;) {
     const key = i;
     if (text[i] === "\\" && /[\\`*_{}[\]()#+\-.!>~|]/.test(text[i + 1] || "")) {
@@ -5723,15 +5742,10 @@ function previewInline(text, depth = 0) {
       }
     }
     if (text[i] === "[") {
-      const labelEnd = closing("](", i + 1);
+      if (labelEnd === undefined || (labelEnd >= 0 && labelEnd < i + 1)) labelEnd = closing("](", i + 1);
       if (labelEnd >= 0) {
-        let end = labelEnd + 2, balance = 1;
-        for (; end < text.length; end++) {
-          if (text[end] === "\\") { end++; continue; }
-          if (text[end] === "(") balance++;
-          if (text[end] === ")" && --balance === 0) break;
-        }
-        if (balance === 0) {
+        const end = linkEnd(labelEnd + 1);
+        if (end >= 0) {
           const url = text.slice(labelEnd + 2, end).replace(/\\([()])/g, "$1");
           if (/^https?:\/\/[^\s<>\\]+$/i.test(url)) {
             out.push(h("a", { key, href: url, target: "_blank", rel: "noreferrer noopener" },
