@@ -2774,12 +2774,30 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 app.tenant.activate(enrollment.clone()).await.unwrap();
-                let scope = crate::db::ConfigurationScope::Guild(enrollment);
-                let write = crate::db::ConfigurationWriteScope::new(scope.clone(), scope).unwrap();
-                let id =
-                    crate::db::add_enrolled_known_spam(&app.db, write.clone(), kind, value, None)
-                        .await
-                        .unwrap();
+                let scope = crate::db::ScopeWire {
+                    global: false,
+                    guild_id: enrollment.guild_id,
+                    enrollment_id: enrollment.id,
+                    joined_at_ns: enrollment.joined_at_ns,
+                };
+                let added = crate::db::apply_control(
+                    &app.db,
+                    None,
+                    crate::db::ControlOp::AddKnownSpam {
+                        request: scope.clone(),
+                        target: scope.clone(),
+                        kind: kind.into(),
+                        value: value.into(),
+                        note: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let crate::db::ControlReply::Saved { body } = added else {
+                    panic!("known spam control write was not saved");
+                };
+                let id = body.as_i64().unwrap();
                 let mut rule = crate::defaults::default_rules().pop().unwrap();
                 assert_eq!(rule.name, "Known spam");
                 rule.dry_run = dry;
@@ -2825,9 +2843,18 @@ mod tests {
                     );
                 }
                 // Removal after evaluation must withhold the saved pending ban.
-                crate::db::delete_enrolled_known_spam(&app.db, write, id)
-                    .await
-                    .unwrap();
+                crate::db::apply_control(
+                    &app.db,
+                    None,
+                    crate::db::ControlOp::DeleteKnownSpam {
+                        request: scope.clone(),
+                        target: scope,
+                        id,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
                 app.invalidate_configs();
                 let stub = DiscordStub::start();
                 execute_pending_with(

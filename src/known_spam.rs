@@ -175,6 +175,20 @@ static URL_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"[^\s<>()\[\]{}\"'`]+"#).expect("static URL token expression")
 });
 
+// Emphasis markers belong to Discord message formatting, not the URL path.
+// Remove only paired outer markers so a literal trailing path * stays literal.
+fn url_token_text(mut token: &str) -> &str {
+    token = token.trim_end_matches(['.', ',', ';', '!', '?', ':']);
+    while let Some(inner) = ["**", "__", "~~", "*", "_", "~"].iter().find_map(|marker| {
+        token
+            .strip_prefix(marker)
+            .and_then(|inner| inner.strip_suffix(marker))
+    }) {
+        token = inner;
+    }
+    token.trim_end_matches(['.', ',', ';', '!', '?', ':'])
+}
+
 #[derive(Default)]
 pub struct CompiledList {
     raw: HashSet<String>,
@@ -220,9 +234,7 @@ impl CompiledList {
             return false;
         }
         URL_TOKENS.find_iter(raw).any(|token| {
-            let token = token
-                .as_str()
-                .trim_end_matches(['.', ',', ';', '!', '?', ':']);
+            let token = url_token_text(token.as_str());
             let parsed = if token
                 .get(..7)
                 .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
@@ -290,6 +302,9 @@ mod tests {
             "tinyurl.com/xyz",
             "go <http://TINYURL.COM/a?x=2#here>",
             "[join](https://tinyurl.com/a)",
+            "**https://tinyurl.com/a**",
+            "__tinyurl.com/a__",
+            "__**https://tinyurl.com/a**__.",
             "tinyurl.com",
             "https://tinyurl.com/",
         ] {
@@ -310,6 +325,9 @@ mod tests {
         assert!(paths.matches("example.com/Promo/abc"));
         assert!(!paths.matches("example.com/promo/abc"));
         assert!(!paths.matches("example.com/other/abc"));
+        let exact = list("url", "example.com/Promo");
+        assert!(!exact.matches("https://example.com/Promo*"));
+        assert!(exact.matches("**https://example.com/Promo**"));
         let subs = list("url", "*.example.com/*");
         assert!(subs.matches("https://one.two.example.com/a"));
         assert!(!subs.matches("https://example.com/a"));

@@ -40,8 +40,10 @@ avoided so quoting a small portion of a pitch does not trigger a ban.
   queries, fragments, credentials, ports, whitespace, dot path segments or regexes.
   Only ASCII DNS hosts with at least two labels are accepted. Message link ports
   do not change the host/path match. Credential-bearing links are excluded.
-- Links are parsed from whitespace/Markdown-delimited tokens; trailing sentence
-  punctuation (`.,;!?:`) is removed. No network lookups or redirects occur.
+- Links are parsed from whitespace/Markdown-delimited tokens. Paired outer
+  emphasis markers and trailing sentence punctuation (`.,;!?:`) are removed.
+  A literal trailing path `*` is retained when there is no paired opening marker.
+  Matching runs locally without network lookups or redirects.
 
 A URL hit anywhere in a message has the same action as a saved full-message hit.
 Nonmatching hosts and paths do not trigger the list.

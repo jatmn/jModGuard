@@ -259,7 +259,7 @@ rm -rf "$launcher_source"
 # Publishing an older source must keep its schema, not the publisher's schema.
 schema_source="$(mktemp -d)"
 mkdir -p "$schema_source/src"
-sed -e '/include_str!("..\/migrations\/001[6789]_/d' -e '/include_str!("..\/migrations\/002[0-3]_/d' src/db.rs >"$schema_source/src/db.rs"
+sed -e '/include_str!("..\/migrations\/001[6789]_/d' -e '/include_str!("..\/migrations\/002[0-4]_/d' src/db.rs >"$schema_source/src/db.rs"
 readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source" "" current "$(staging_ref bot "$BASE_SHA")")
 contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
 
@@ -269,7 +269,7 @@ for field in min-schema max-schema result-schema; do
 done
 # The pre-fix schema16 source had literal schema15 launcher observations.
 # Republishing it may produce a dashboard image, never an eligible launcher.
-sed -e '/include_str!("..\/migrations\/001[789]_/d' -e '/include_str!("..\/migrations\/002[0-3]_/d' src/db.rs >"$schema_source/src/db.rs"
+sed -e '/include_str!("..\/migrations\/001[789]_/d' -e '/include_str!("..\/migrations\/002[0-4]_/d' src/db.rs >"$schema_source/src/db.rs"
 mkdir -p "$schema_source/crates/updater/src"
 printf 'min_schema: 15,\nmax_schema: 15,\n' >"$schema_source/crates/updater/src/main.rs"
 for component in bot api; do
