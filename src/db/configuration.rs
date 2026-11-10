@@ -1299,7 +1299,7 @@ fn load_configuration_snapshot_conn(
             let nick_state: Option<String> = row.get(15)?;
             let nickname_reconcile = match nick_state {
                 Some(state) if guild_id != GLOBAL_SCOPE => Some(NicknameReconcileStatus {
-                    state,
+                    state: NicknameReconcileState::from_storage(state),
                     attempt_count: row.get::<Option<i64>>(16)?.unwrap_or(0) as u32,
                     next_attempt_at: row.get::<Option<i64>>(17)?.unwrap_or(0),
                     last_error_code: row.get(18)?,

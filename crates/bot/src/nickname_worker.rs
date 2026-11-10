@@ -28,7 +28,7 @@ async fn dispatch_ready(
         db::finish_nickname_reconcile(
             db,
             job,
-            "dormant",
+            db::NicknameReconcileStop::Dormant,
             "membership_changed",
             "bot membership changed; fresh nickname request required",
             chrono::Utc::now().timestamp(),
@@ -258,7 +258,7 @@ async fn record_nickname_failure(
                 })
         }
         NicknameFailureClass::Dormant => {
-            db::finish_nickname_reconcile(&app.db, job, "dormant", &code, &message, now)
+            db::finish_nickname_reconcile(&app.db, job, db::NicknameReconcileStop::Dormant, &code, &message, now)
                 .await
                 .map(|()| tracing::warn!(
                     guild_id = job.guild_id,
@@ -266,7 +266,7 @@ async fn record_nickname_failure(
                 ))
         }
         NicknameFailureClass::Terminal => {
-            db::finish_nickname_reconcile(&app.db, job, "terminal", &code, &message, now)
+            db::finish_nickname_reconcile(&app.db, job, db::NicknameReconcileStop::Terminal, &code, &message, now)
                 .await
                 .map(|()| tracing::error!(
                     guild_id = job.guild_id,
@@ -285,7 +285,7 @@ async fn record_nickname_failure(
 async fn nickname_outcome_unknown(db: &db::Db, guild_id: i64) -> bool {
     matches!(
         db::nickname_reconcile_status(db, guild_id).await,
-        Ok(Some(status)) if status.last_error_code.as_deref() == Some("outcome_unknown")
+        Ok(Some(status)) if status.confirmation() == db::NicknameConfirmation::Required
     )
 }
 

@@ -1,6 +1,63 @@
 use super::enrollments::active_enrollment_conn;
 use super::*;
 
+/// Scheduling is independent of whether an earlier Discord edit may have
+/// taken effect. Dormant work can still have an unknown remote outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NicknameReconcileState {
+    Pending,
+    Dormant,
+    Terminal,
+    /// Preserve unknown stored values for diagnostics; dispatch only admits
+    /// the exact `pending` state.
+    #[serde(untagged)]
+    Unrecognized(String),
+}
+
+impl NicknameReconcileState {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Pending => "pending",
+            Self::Dormant => "dormant",
+            Self::Terminal => "terminal",
+            Self::Unrecognized(value) => value,
+        }
+    }
+
+    pub(super) fn from_storage(value: String) -> Self {
+        match value.as_str() {
+            "pending" => Self::Pending,
+            "dormant" => Self::Dormant,
+            "terminal" => Self::Terminal,
+            _ => Self::Unrecognized(value),
+        }
+    }
+}
+
+/// Only these transitions may stop a pending attempt. Successful reconciliation
+/// removes the exact job through acknowledge_nickname_reconcile instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NicknameReconcileStop {
+    Dormant,
+    Terminal,
+}
+
+impl NicknameReconcileStop {
+    fn state(self) -> NicknameReconcileState {
+        match self {
+            Self::Dormant => NicknameReconcileState::Dormant,
+            Self::Terminal => NicknameReconcileState::Terminal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NicknameConfirmation {
+    NotRequired,
+    Required,
+}
+
 pub(super) fn enqueue_nickname_reconcile_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
@@ -23,9 +80,9 @@ pub(super) fn enqueue_nickname_reconcile_conn(
         params![
             guild_id,
             if enrollment.is_some() {
-                "pending"
+                NicknameReconcileState::Pending.as_str()
             } else {
-                "dormant"
+                NicknameReconcileState::Dormant.as_str()
             },
             if enrollment.is_some() {
                 None
@@ -67,12 +124,24 @@ pub struct NicknameReconcileJob {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NicknameReconcileStatus {
-    pub state: String,
+    pub state: NicknameReconcileState,
     pub attempt_count: u32,
     pub next_attempt_at: i64,
     pub last_error_code: Option<String>,
     pub last_error: Option<String>,
     pub last_error_at: Option<i64>,
+}
+
+impl NicknameReconcileStatus {
+    /// Preserve the durable representation used by existing installations and
+    /// API clients, but make the dispatch guard an explicit state dimension.
+    /// An absent marker is not proof that no earlier remote effect occurred.
+    pub fn confirmation(&self) -> NicknameConfirmation {
+        match self.last_error_code.as_deref() {
+            Some("outcome_unknown") => NicknameConfirmation::Required,
+            _ => NicknameConfirmation::NotRequired,
+        }
+    }
 }
 
 pub const MAX_NICKNAME_RECONCILE_ATTEMPTS: u32 = 8;
@@ -139,7 +208,7 @@ pub(super) fn nickname_reconcile_status_conn(
         params![guild_id],
         |row| {
             Ok(NicknameReconcileStatus {
-                state: row.get(0)?,
+                state: NicknameReconcileState::from_storage(row.get(0)?),
                 attempt_count: row.get::<i64>(1)? as u32,
                 next_attempt_at: row.get(2)?,
                 last_error_code: row.get(3)?,
@@ -256,7 +325,11 @@ pub async fn schedule_nickname_reconcile_retry(
                  last_error_code = ?4, last_error = ?5, last_error_at = ?6
              WHERE guild_id = ?7 AND generation = ?8 AND state = 'pending'",
             params![
-                if exhausted { "terminal" } else { "pending" },
+                if exhausted {
+                    NicknameReconcileState::Terminal.as_str()
+                } else {
+                    NicknameReconcileState::Pending.as_str()
+                },
                 i64::from(attempts),
                 next_attempt_at,
                 code,
@@ -276,15 +349,14 @@ pub async fn schedule_nickname_reconcile_retry(
 pub async fn finish_nickname_reconcile(
     db: &Db,
     job: &NicknameReconcileJob,
-    state: &str,
+    stop: NicknameReconcileStop,
     code: &str,
     error: &str,
     now: i64,
 ) -> Result<()> {
-    anyhow::ensure!(matches!(state, "terminal" | "dormant"));
     let (guild_id, generation) = (job.guild_id, job.generation);
     let job = job.clone();
-    let (state, code, error) = (state.to_string(), code.to_string(), error.to_string());
+    let (state, code, error) = (stop.state(), code.to_string(), error.to_string());
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if !nickname_job_matches_conn(&tx, &job)? {
@@ -296,7 +368,7 @@ pub async fn finish_nickname_reconcile(
                  next_attempt_at = 0, last_error_code = ?2,
                  last_error = ?3, last_error_at = ?4
              WHERE guild_id = ?5 AND generation = ?6 AND state = 'pending'",
-            params![state, code, error, now, guild_id, generation],
+            params![state.as_str(), code, error, now, guild_id, generation],
             1,
         )?;
         tx.commit()?;

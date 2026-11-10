@@ -24,10 +24,18 @@ use crate::types::{CommandDef, GuildSettings, RuleDef};
 /// while still refusing to commit the observed version until nothing remains.
 struct SlashSyncProgress {
     target: u64,
-    /// `None` = first pass (sync every cached guild). `Some` = retry set.
-    remaining: Option<HashSet<u64>>,
-    /// Config cache already invalidated once for this target.
-    invalidated: bool,
+    pass: SlashSyncPass,
+    cache: SlashCacheState,
+}
+
+enum SlashSyncPass {
+    FirstPass,
+    RetryFailed(HashSet<u64>),
+}
+
+enum SlashCacheState {
+    NeedsInvalidation,
+    Invalidated,
 }
 
 struct SlashRetry {
@@ -2025,17 +2033,17 @@ impl BotState {
         if guard.as_ref().map(|p| p.target) != Some(remote) {
             *guard = Some(SlashSyncProgress {
                 target: remote,
-                remaining: None,
-                invalidated: false,
+                pass: SlashSyncPass::FirstPass,
+                cache: SlashCacheState::NeedsInvalidation,
             });
         }
         if cached.is_empty() {
             return SlashResyncPlan::Defer;
         }
         let progress = guard.as_mut().expect("progress set above");
-        let guilds = match &progress.remaining {
-            None => cached.to_vec(),
-            Some(rem) => {
+        let guilds = match &progress.pass {
+            SlashSyncPass::FirstPass => cached.to_vec(),
+            SlashSyncPass::RetryFailed(rem) => {
                 let pending: Vec<u64> =
                     cached.iter().copied().filter(|g| rem.contains(g)).collect();
                 if pending.len() != rem.len() {
@@ -2047,9 +2055,9 @@ impl BotState {
                 pending
             }
         };
-        let invalidate = !progress.invalidated;
+        let invalidate = matches!(progress.cache, SlashCacheState::NeedsInvalidation);
         if invalidate {
-            progress.invalidated = true;
+            progress.cache = SlashCacheState::Invalidated;
         }
         SlashResyncPlan::Sync { guilds, invalidate }
     }
@@ -2076,7 +2084,7 @@ impl BotState {
                 .store(false, Ordering::SeqCst);
             true
         } else {
-            progress.remaining = Some(failed);
+            progress.pass = SlashSyncPass::RetryFailed(failed);
             false
         }
     }

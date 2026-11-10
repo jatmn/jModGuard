@@ -7,7 +7,7 @@
 
 use crate::db::{self, Db};
 use crate::{set_process_ready, shutdown_signal};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,19 +21,79 @@ pub const HANDOFF_DEADLINE: Duration = Duration::from_secs(8);
 /// wait for TTL expiry.
 const LEASE_RELEASE_BEFORE_EXIT: Duration = Duration::from_secs(2);
 
+/// Ownership and its confirmed time horizon are distinct. The unbounded
+/// horizon supports callers that explicitly mark ownership without a DB claim.
+#[derive(Clone, Copy, Debug)]
+enum AuthorityHorizon {
+    Unbounded,
+    ConfirmedUntil(Instant),
+}
+
+impl AuthorityHorizon {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Unbounded => None,
+            Self::ConfirmedUntil(deadline) => Some(deadline),
+        }
+    }
+
+    fn is_current(self) -> bool {
+        self.deadline()
+            .is_none_or(|deadline| Instant::now() < deadline)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseOwnership {
+    Waiting,
+    Held,
+}
+
+struct WriterAuthority {
+    ownership: LeaseOwnership,
+    horizon: AuthorityHorizon,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RecordingState {
+    Open,
+    CutOff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum GatewayState {
+    AwaitingReady,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RecoveryState {
+    Idle,
+    Running,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntakeState {
+    Accepting,
+    Draining,
+}
+
 pub struct Activation {
     instance: String,
-    lock_held: AtomicBool,
-    discord_connected: AtomicBool,
+    authority: Mutex<WriterAuthority>,
+    gateway: AtomicU8,
+    // Shared with the database claim's cancellation boundary. Interpret this
+    // transport flag through intake_state(), rather than as lease loss.
     shutting_down: Arc<AtomicBool>,
     shutdown_wait: tokio::sync::Notify,
-    cut_off: AtomicBool,
+    recording: AtomicU8,
     cutoff_wait: tokio::sync::Notify,
     in_flight: std::sync::atomic::AtomicUsize,
     moderation_depth: std::sync::atomic::AtomicUsize,
-    recovery: AtomicBool,
-    /// `None` until a claim succeeds. Callers that only mark the flag stay open.
-    authority_deadline: Mutex<Option<Instant>>,
+    recovery: AtomicU8,
     exit_hook: fn(i32),
     #[cfg(test)]
     startup_delay: Mutex<Duration>,
@@ -89,16 +149,18 @@ impl Activation {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             instance: fresh_instance(),
-            lock_held: AtomicBool::new(false),
-            discord_connected: AtomicBool::new(false),
+            authority: Mutex::new(WriterAuthority {
+                ownership: LeaseOwnership::Waiting,
+                horizon: AuthorityHorizon::Unbounded,
+            }),
+            gateway: AtomicU8::new(GatewayState::AwaitingReady as u8),
             shutting_down: Arc::new(AtomicBool::new(false)),
             shutdown_wait: tokio::sync::Notify::new(),
-            cut_off: AtomicBool::new(false),
+            recording: AtomicU8::new(RecordingState::Open as u8),
             cutoff_wait: tokio::sync::Notify::new(),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             moderation_depth: std::sync::atomic::AtomicUsize::new(0),
-            recovery: AtomicBool::new(false),
-            authority_deadline: Mutex::new(None),
+            recovery: AtomicU8::new(RecoveryState::Idle as u8),
             #[cfg(not(test))]
             exit_hook: |code| std::process::exit(code),
             #[cfg(test)]
@@ -127,11 +189,16 @@ impl Activation {
     }
 
     pub fn recovery_in_progress(&self) -> bool {
-        self.recovery.load(Ordering::Acquire)
+        self.recovery.load(Ordering::Acquire) == RecoveryState::Running as u8
     }
 
     pub fn set_recovery_in_progress(&self, active: bool) {
-        self.recovery.store(active, Ordering::Release);
+        let state = if active {
+            RecoveryState::Running
+        } else {
+            RecoveryState::Idle
+        };
+        self.recovery.store(state as u8, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -174,9 +241,9 @@ impl Activation {
     }
 
     pub fn allows_discord_connect(&self) -> bool {
-        self.lock_held.load(Ordering::Acquire)
+        self.lease_held()
             && !self.is_shutting_down()
-            && !self.cut_off.load(Ordering::Acquire)
+            && !self.recording_cut_off()
             && self.authority_current()
     }
 
@@ -185,8 +252,8 @@ impl Activation {
     }
 
     pub fn allows_rule_trigger(&self) -> bool {
-        self.lock_held.load(Ordering::Acquire)
-            && self.discord_connected.load(Ordering::Acquire)
+        self.lease_held()
+            && self.gateway.load(Ordering::Acquire) == GatewayState::Ready as u8
             && !self.is_shutting_down()
             && self.authority_current()
     }
@@ -195,9 +262,7 @@ impl Activation {
     /// confirmed authority deadline.
     /// New intake uses [`Self::allows_rule_trigger`] and stops at shutdown.
     pub fn may_record(&self) -> bool {
-        self.lock_held.load(Ordering::Acquire)
-            && !self.cut_off.load(Ordering::Acquire)
-            && self.authority_current()
+        self.lease_held() && !self.recording_cut_off() && self.authority_current()
     }
 
     pub fn hold_rule(self: &Arc<Self>) -> RuleHold {
@@ -233,7 +298,8 @@ impl Activation {
     }
 
     pub fn cut_off(&self) {
-        self.cut_off.store(true, Ordering::Release);
+        self.recording
+            .store(RecordingState::CutOff as u8, Ordering::Release);
         self.cutoff_wait.notify_waiters();
     }
 
@@ -244,22 +310,50 @@ impl Activation {
         let notified = self.cutoff_wait.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if self.cut_off.load(Ordering::Acquire) {
+        if self.recording_cut_off() {
             return;
         }
         notified.await;
     }
 
     pub fn note_discord_connected(&self) {
-        self.discord_connected.store(true, Ordering::Release);
+        self.gateway
+            .store(GatewayState::Ready as u8, Ordering::Release);
     }
 
     pub fn mark_lock_held(&self, held: bool) {
-        self.lock_held.store(held, Ordering::Release);
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ownership = if held {
+            LeaseOwnership::Held
+        } else {
+            LeaseOwnership::Waiting
+        };
+    }
+
+    fn lease_held(&self) -> bool {
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ownership
+            == LeaseOwnership::Held
+    }
+
+    fn recording_cut_off(&self) -> bool {
+        self.recording.load(Ordering::Acquire) == RecordingState::CutOff as u8
+    }
+
+    fn intake_state(&self) -> IntakeState {
+        if self.shutting_down.load(Ordering::Acquire) {
+            IntakeState::Draining
+        } else {
+            IntakeState::Accepting
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::Acquire)
+        self.intake_state() == IntakeState::Draining
     }
 
     /// Stop new intake. In-flight work may finish until [`Self::cut_off`].
@@ -312,31 +406,33 @@ impl Activation {
     }
 
     fn authority_deadline(&self) -> Option<Instant> {
-        *self
-            .authority_deadline
+        self.authority
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .horizon
+            .deadline()
     }
 
     /// A successful claim starts at `requested_at`, which is captured before the
     /// request. A process that has already cut off does not extend that horizon.
     fn note_authority(&self, requested_at: Instant) {
-        if self.cut_off.load(Ordering::Acquire) {
+        if self.recording_cut_off() {
             return;
         }
         let window = self.lease_ttl().saturating_sub(self.lease_margin());
         let deadline = requested_at.checked_add(window).unwrap_or(requested_at);
-        *self
-            .authority_deadline
+        self.authority
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadline);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .horizon = AuthorityHorizon::ConfirmedUntil(deadline);
     }
 
     fn authority_current(&self) -> bool {
-        match self.authority_deadline() {
-            None => true,
-            Some(deadline) => Instant::now() < deadline,
-        }
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .horizon
+            .is_current()
     }
 }
 
@@ -649,7 +745,7 @@ async fn release_held_active_bot_before_exit(db: &Db, instance: &str) {
 /// Shutdown leaves cutoff to the notice drain so those notices still send.
 fn settle_renewal(activation: &Activation, result: &anyhow::Result<bool>) -> bool {
     if matches!(result, Ok(true)) {
-        if activation.cut_off.load(Ordering::Acquire) {
+        if activation.recording_cut_off() {
             return false;
         }
         activation.mark_lock_held(true);
@@ -870,7 +966,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(activation.lock_held.load(Ordering::Acquire));
+        assert!(activation.lease_held());
         assert!(activation.may_record());
         let enrollment = db::enroll_guild(&db, 10, 100).await.unwrap().unwrap();
         let id = db::record_enrolled_ban_if_absent(
@@ -967,8 +1063,7 @@ mod tests {
             Duration::from_millis(500),
         );
         tokio::time::timeout(Duration::from_millis(950), async {
-            while activation.authority_deadline() == Some(before)
-                && !activation.cut_off.load(Ordering::Acquire)
+            while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1080,7 +1175,7 @@ mod tests {
             );
             let observed = tokio::time::timeout_at(tokio::time::Instant::from_std(before), async {
                 while activation.authority_deadline() == Some(before)
-                    && !activation.cut_off.load(Ordering::Acquire)
+                    && !activation.recording_cut_off()
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1093,7 +1188,7 @@ mod tests {
             assert!(activation.renewal_attempts.load(Ordering::Acquire) >= 2);
             assert!(activation.authority_deadline().unwrap() > before);
             assert!(activation.may_record());
-            assert!(!activation.cut_off.load(Ordering::Acquire));
+            assert!(!activation.recording_cut_off());
             let after_row = read_lease();
             let expires = |row: &str| row.rsplit_once(' ').unwrap().1.parse::<i64>().unwrap();
             assert!(expires(&after_row) > expires(&before_row));
@@ -1125,8 +1220,7 @@ mod tests {
         let began = Instant::now();
         let renewal = spawn_renewal(db.clone(), Arc::clone(&activation), None);
         let observed = tokio::time::timeout(Duration::from_secs(12), async {
-            while activation.authority_deadline() == Some(before)
-                && !activation.cut_off.load(Ordering::Acquire)
+            while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1162,7 +1256,7 @@ mod tests {
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let window = Duration::from_secs(10);
         let deadline = Instant::now() + window;
-        *activation.authority_deadline.lock().unwrap() = Some(deadline);
+        activation.authority.lock().unwrap().horizon = AuthorityHorizon::ConfirmedUntil(deadline);
         activation.fail_next_renewal();
         let retrying = Arc::clone(&activation);
         let faults = tokio::spawn(async move {
@@ -1432,7 +1526,7 @@ mod tests {
         let deadline = activation.authority_deadline().unwrap();
         tokio::time::sleep(RENEW_EVERY + Duration::from_millis(100)).await;
         assert!(activation.authority_deadline().unwrap() > deadline);
-        assert!(!activation.cut_off.load(Ordering::Acquire));
+        assert!(!activation.recording_cut_off());
         activation.begin_shutdown();
         drop(tenant);
         drop(db);
@@ -1455,7 +1549,7 @@ mod tests {
             "a slow claim must renew before its remaining authority expires"
         );
         assert!(activation.authority_deadline().unwrap() > deadline);
-        assert!(!activation.cut_off.load(Ordering::Acquire));
+        assert!(!activation.recording_cut_off());
         activation.begin_shutdown();
         renewal.abort();
         drop(db);
@@ -1517,7 +1611,7 @@ mod tests {
                 1,
                 "zero rows must not retry"
             );
-            assert!(activation.cut_off.load(Ordering::Acquire));
+            assert!(activation.recording_cut_off());
             assert!(!activation.may_record());
             assert_eq!(EXIT_CODE.load(Ordering::Acquire), 1);
             let text = log.text();
@@ -1683,8 +1777,7 @@ mod tests {
         });
         writer.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while activation.authority_deadline() == Some(before)
-                && !activation.cut_off.load(Ordering::Acquire)
+            while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1769,7 +1862,7 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(activation.authority_deadline(), Some(before));
         assert!(!activation.may_record());
-        assert!(activation.cut_off.load(Ordering::Acquire));
+        assert!(activation.recording_cut_off());
         assert_eq!(EXIT.load(Ordering::Acquire), 1);
         assert_eq!(
             activation.renewal_attempts.load(Ordering::Acquire),
@@ -1882,13 +1975,13 @@ mod tests {
         );
         assert_cancelled(task).await;
         assert!(!activation.may_record());
-        assert!(!activation.lock_held.load(Ordering::Acquire));
-        assert!(activation.cut_off.load(Ordering::Acquire));
+        assert!(!activation.lease_held());
+        assert!(activation.recording_cut_off());
         activation.note_authority(Instant::now());
         assert_eq!(activation.authority_deadline(), Some(horizon));
         assert!(!super::settle_renewal(&activation, &Ok(true)));
         assert!(!activation.may_record());
-        assert!(!activation.lock_held.load(Ordering::Acquire));
+        assert!(!activation.lease_held());
         assert_eq!(
             activation.authority_deadline(),
             Some(horizon),

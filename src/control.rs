@@ -272,6 +272,17 @@ pub struct NonceWindow {
     order: VecDeque<(String, i64)>,
 }
 
+/// Frame admission is separate from logical request admission. An accepted
+/// nonce becomes replay-protected until expiry or bounded-window eviction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonceAdmission {
+    Accepted,
+    Malformed,
+    Expired,
+    TooFarAhead,
+    Replay,
+}
+
 impl Default for NonceWindow {
     fn default() -> Self {
         Self::new()
@@ -287,20 +298,25 @@ impl NonceWindow {
     }
 
     pub fn accept(&mut self, nonce: &str, expires_ms: i64, now_ms: i64) -> bool {
+        self.admit(nonce, expires_ms, now_ms) == NonceAdmission::Accepted
+    }
+
+    pub fn admit(&mut self, nonce: &str, expires_ms: i64, now_ms: i64) -> NonceAdmission {
         if nonce.len() != 32 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return false;
+            return NonceAdmission::Malformed;
         }
-        if expires_ms < now_ms.saturating_sub(SKEW_MS)
-            || expires_ms > now_ms.saturating_add(MAX_AGE_MS + SKEW_MS)
-        {
-            return false;
+        if expires_ms < now_ms.saturating_sub(SKEW_MS) {
+            return NonceAdmission::Expired;
+        }
+        if expires_ms > now_ms.saturating_add(MAX_AGE_MS + SKEW_MS) {
+            return NonceAdmission::TooFarAhead;
         }
         self.order
             .retain(|(_, exp)| *exp >= now_ms.saturating_sub(SKEW_MS));
         self.seen
             .retain(|item| self.order.iter().any(|(n, _)| n == item));
         if !self.seen.insert(nonce.to_owned()) {
-            return false;
+            return NonceAdmission::Replay;
         }
         self.order.push_back((nonce.to_owned(), expires_ms));
         while self.order.len() > SEEN_LIMIT {
@@ -308,7 +324,7 @@ impl NonceWindow {
                 self.seen.remove(&old);
             }
         }
-        true
+        NonceAdmission::Accepted
     }
 }
 

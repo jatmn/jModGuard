@@ -131,7 +131,7 @@ async fn later_same_second_timestamp_blocks_old_nickname_work() {
             .unwrap()
             .unwrap()
             .state,
-        "dormant"
+        db::NicknameReconcileState::Dormant
     );
 }
 
@@ -214,7 +214,7 @@ async fn changed_membership_blocks_work_without_retiring_or_rebinding() {
             .unwrap()
             .unwrap()
             .state,
-        "dormant"
+        db::NicknameReconcileState::Dormant
     );
     db::enroll_guild(&f.db, 10, REJOINED_AT_NS).await.unwrap();
     assert!(
@@ -349,7 +349,7 @@ async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_ed
         .await
         .unwrap()
         .expect("a cancelled edit must not acknowledge the job");
-    assert_eq!(status.state, "pending");
+    assert_eq!(status.state, db::NicknameReconcileState::Pending);
     assert_eq!(status.last_error_code.as_deref(), Some("outcome_unknown"));
 
     let next_job = db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
@@ -510,7 +510,7 @@ async fn unknown_nickname_read_failures_back_off_and_exhaust_the_budget() {
             .unwrap();
         assert_eq!(status.attempt_count, attempt);
         if attempt < 8 {
-            assert_eq!(status.state, "pending");
+            assert_eq!(status.state, db::NicknameReconcileState::Pending);
             assert_eq!(status.last_error_code.as_deref(), Some("outcome_unknown"));
             let wait = status.next_attempt_at - now;
             assert!(wait > previous_wait);
@@ -526,7 +526,7 @@ async fn unknown_nickname_read_failures_back_off_and_exhaust_the_budget() {
                 .unwrap()
                 .remove(0);
         } else {
-            assert_eq!(status.state, "terminal");
+            assert_eq!(status.state, db::NicknameReconcileState::Terminal);
             assert!(
                 db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
                     .await
@@ -563,7 +563,7 @@ async fn permanent_nickname_read_failure_stops_the_job() {
             .unwrap()
             .unwrap()
             .state,
-        "terminal"
+        db::NicknameReconcileState::Terminal
     );
     assert!(
         db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
@@ -649,7 +649,7 @@ async fn unknown_nickname_dormant_read_resumes_with_confirmation(membership_read
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(dormant.state, "dormant");
+        assert_eq!(dormant.state, db::NicknameReconcileState::Dormant);
         assert_eq!(dormant.attempt_count, 1);
         assert!(
             db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
