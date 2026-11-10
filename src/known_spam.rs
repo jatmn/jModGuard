@@ -238,13 +238,10 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                 let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
                 let text = url_token_text(candidate);
                 if starts_with_url_scheme(text) {
-                    // Keep a paired outer opener with the extraction so its
-                    // closer is not glued into the path (#521), but only while
-                    // the markers still strip as a pair around the scheme.
-                    let markers = trailing_format_markers(prefix);
-                    let retained = &bare[i - markers..];
-                    start = if starts_with_url_scheme(url_token_text(retained)) {
-                        token.end() - retained.len()
+                    // Keep paired openers belonging to this URL token (#521).
+                    // A marker after prose may close that prose instead.
+                    start = if starts_with_url_scheme(url_token_text(bare)) {
+                        token.end() - bare.len()
                     } else {
                         token.end() - candidate.len()
                     };
@@ -285,20 +282,6 @@ fn starts_with_url_scheme(text: &str) -> bool {
     })
 }
 
-// Byte length of the trailing run of emphasis markers: `***` -> 3, `word**`
-// -> 2, `word` -> 0.
-fn trailing_format_markers(mut text: &str) -> usize {
-    let mut run = 0;
-    while let Some(marker) = FORMAT_MARKERS
-        .iter()
-        .find(|marker| text.ends_with(**marker))
-    {
-        run += marker.len();
-        text = &text[..text.len() - marker.len()];
-    }
-    run
-}
-
 // Emphasis markers belong to Discord message formatting, not the URL path.
 // Remove only paired outer markers so a literal trailing path * stays literal.
 fn url_token_text(mut token: &str) -> &str {
@@ -315,8 +298,19 @@ fn url_token_text(mut token: &str) -> &str {
         token
             .strip_prefix(marker)
             .and_then(|inner| inner.strip_suffix(marker))
-            // An invisible prefix can hide directly inside the opener (#521).
-            .map(|inner| inner.trim_start_matches(crate::normalize::is_zero_width))
+            .map(|inner| {
+                let head = inner
+                    .split(['/', '\\', '?', '#'])
+                    .next()
+                    .unwrap_or_default();
+                if head.contains('@') {
+                    // Preserve invisible-only usernames for credential exclusion.
+                    inner
+                } else {
+                    // An invisible prefix can hide inside the opener (#521).
+                    inner.trim_start_matches(crate::normalize::is_zero_width)
+                }
+            })
     }) {
         token = inner;
     }
@@ -952,6 +946,12 @@ mod tests {
                     if compiled.matches(&text) {
                         false_positives.push(text);
                     }
+                    for marker in FORMAT_MARKERS {
+                        let text = format!("{before}{marker}{username}{rest}{marker}");
+                        if compiled.matches(&text) {
+                            false_positives.push(text);
+                        }
+                    }
                 }
             }
         }
@@ -960,6 +960,9 @@ mod tests {
         assert!(compiled.matches("@tinyurl.com/a"));
         assert!(compiled.matches("\u{200b} @tinyurl.com/a"));
         assert!(compiled.matches("\u{200b}https://tinyurl.com/a"));
+        for marker in FORMAT_MARKERS {
+            assert!(compiled.matches(&format!("{marker}@tinyurl.com/a{marker}")));
+        }
     }
     #[test]
     fn known_spam_bare_urls_do_not_discard_credential_prefixes() {
@@ -1030,6 +1033,23 @@ mod tests {
             }
         }
         assert!(!exact.matches("https://example.com/Promo*"));
+    }
+    #[test]
+    fn known_spam_urls_preserve_literal_markers_after_emphasized_prose() {
+        let exact = list("url", "example.com/Promo");
+        for padding in unicode_destination_prefixes()
+            .filter(|padding| !padding.chars().any(char::is_whitespace))
+        {
+            for marker in FORMAT_MARKERS {
+                for scheme in ["http://", "https://"] {
+                    let text =
+                        format!("{marker}word{marker}{padding}{scheme}example.com/Promo{marker}");
+                    assert!(!exact.matches(&text), "{text:?}");
+                    let text = format!("{marker}word{marker}{padding}{scheme}example.com/Promo");
+                    assert!(exact.matches(&text), "{text:?}");
+                }
+            }
+        }
     }
     fn assert_bare_host_separator_boundary(separator: &str) {
         let compiled = list("url", "tinyurl.com/*");
