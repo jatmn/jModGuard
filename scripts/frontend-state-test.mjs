@@ -4652,6 +4652,7 @@ test('template preview shows embed color, title and fields, then live custom des
 test('embed preview applies dynamic action/removal accents and aggregate field limits', () => {
   const previewSource = source.slice(source.indexOf('function clipEmbedText('), source.indexOf('function logPreviewText('));
   const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
+  assert.equal(preview({embed_style: {title: 'Log event', color: 0xffb347}}, 'Unknown {constructor} {__proto__} {missing}', {}).description, 'Unknown {constructor} {__proto__} {missing}');
   const record = {
     shipped: 'Role changed\n\n**Action:** {action}',
     embed_style: {title: 'Role changed', color: 0xffb347, action_colors: {created: 0x77dd77, deleted: 0xff6666}},

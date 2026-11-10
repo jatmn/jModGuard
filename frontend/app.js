@@ -3131,7 +3131,8 @@ function renderEmbedText(template, vars, limit) {
   let out = "";
   for (const chunk of template.match(/[^}]*}|[^}]+$/g) || []) {
     const start = chunk.endsWith("}") ? chunk.lastIndexOf("{") : -1;
-    const value = start >= 0 ? vars[chunk.slice(start + 1, -1)] : undefined;
+    const key = start >= 0 ? chunk.slice(start + 1, -1) : "";
+    const value = Object.hasOwn(vars, key) ? vars[key] : undefined;
     for (const text of value === undefined ? [chunk] : [chunk.slice(0, start), value]) {
       for (const ch of text) {
         if (out.length + ch.length > limit) {
