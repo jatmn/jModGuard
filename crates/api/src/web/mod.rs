@@ -281,7 +281,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
     {
         let mut auth = auth.lock().await;
         reject_retired_session(app, session).await?;
-        if auth.dead {
+        if auth.lifecycle.is_retired() {
             session
                 .flush()
                 .await
@@ -364,22 +364,79 @@ const REFRESH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(5)
 const REFRESH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Default)]
+enum SessionLifecycle {
+    #[default]
+    Active,
+    Retired {
+        since: std::time::Instant,
+    },
+}
+
+impl SessionLifecycle {
+    fn is_retired(&self) -> bool {
+        matches!(self, Self::Retired { .. })
+    }
+
+    fn retire(&mut self) {
+        if !self.is_retired() {
+            *self = Self::Retired {
+                since: std::time::Instant::now(),
+            };
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshFailure {
+    Unavailable,
+    RateLimited,
+}
+
+#[derive(Clone, Copy)]
+struct RefreshHold {
+    deadline: oauth::Cooldown,
+    cause: RefreshFailure,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuildSnapshotAge {
+    Fresh,
+    RateLimitFallback,
+    Expired,
+}
+
+impl GuildSnapshotAge {
+    fn from_age(age: std::time::Duration) -> Self {
+        if age < GUILD_AUTH_CACHE_TTL {
+            Self::Fresh
+        } else if age < GUILD_AUTH_MAX_STALE {
+            Self::RateLimitFallback
+        } else {
+            Self::Expired
+        }
+    }
+
+    fn permits(self, cause: RefreshFailure) -> bool {
+        self == Self::Fresh
+            || (self == Self::RateLimitFallback && cause == RefreshFailure::RateLimited)
+    }
+}
+
+#[derive(Default)]
 pub(super) struct SessionAuth {
     token: Option<String>,
     refresh: Option<String>,
     guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
-    dead: bool,
-    dead_since: Option<std::time::Instant>,
+    lifecycle: SessionLifecycle,
     last_used: Option<std::time::Instant>,
-    refresh_hold: Option<(oauth::Cooldown, bool)>,
+    refresh_hold: Option<RefreshHold>,
     refresh_backoff: std::time::Duration,
 }
 
 impl SessionAuth {
     /// Clear payloads even when a loaded request still owns this coordinator.
     fn retire(&mut self) {
-        self.dead = true;
-        self.dead_since.get_or_insert_with(std::time::Instant::now);
+        self.lifecycle.retire();
         self.token = None;
         self.refresh = None;
         self.guilds = None;
@@ -387,8 +444,24 @@ impl SessionAuth {
         self.refresh_backoff = std::time::Duration::ZERO;
     }
 
-    fn refresh_wait(&self) -> Option<(std::time::Duration, bool)> {
-        let (deadline, rate_limited) = self.refresh_hold?;
+    fn expired(&self, now: std::time::Instant) -> bool {
+        match self.lifecycle {
+            SessionLifecycle::Retired { since } => {
+                now.saturating_duration_since(since) >= AUTH_SESSION_DEAD_TTL
+            }
+            SessionLifecycle::Active => self
+                .last_used
+                .is_some_and(|at| now.saturating_duration_since(at) >= AUTH_SESSION_IDLE_TTL),
+        }
+    }
+
+    fn release_refresh_hold(&mut self) {
+        self.refresh_hold = None;
+        self.refresh_backoff = std::time::Duration::ZERO;
+    }
+
+    fn refresh_wait(&self) -> Option<(std::time::Duration, RefreshFailure)> {
+        let RefreshHold { deadline, cause } = self.refresh_hold?;
         let remaining = match deadline {
             oauth::Cooldown::Until(until) => {
                 until.checked_duration_since(std::time::Instant::now())?
@@ -397,7 +470,7 @@ impl SessionAuth {
                 std::time::Duration::MAX
             }
         };
-        Some((remaining, rate_limited))
+        Some((remaining, cause))
     }
 
     fn hold_refresh(&mut self, error: &anyhow::Error) {
@@ -415,10 +488,17 @@ impl SessionAuth {
             },
             |limit| limit.retry_after,
         );
-        self.refresh_hold = Some((
-            oauth::cooldown_deadline(std::time::Instant::now(), wait.min(REFRESH_RETRY_MAX)),
-            limit.is_some(),
-        ));
+        self.refresh_hold = Some(RefreshHold {
+            deadline: oauth::cooldown_deadline(
+                std::time::Instant::now(),
+                wait.min(REFRESH_RETRY_MAX),
+            ),
+            cause: if limit.is_some() {
+                RefreshFailure::RateLimited
+            } else {
+                RefreshFailure::Unavailable
+            },
+        });
     }
 }
 
@@ -502,7 +582,7 @@ async fn require_auth_with(
     };
     let mut state = state.lock().await;
     reject_retired_session(app, session).await?;
-    if state.dead {
+    if state.lifecycle.is_retired() {
         session
             .flush()
             .await
@@ -539,24 +619,27 @@ async fn require_auth_with(
         // A refresh 429 may outlive the capped session hold. Do not spend
         // another guild/profile request on the rejected access token while
         // the shared token route still prevents recovery.
-        let (_, true) = state.refresh_hold? else {
+        let RefreshHold {
+            cause: RefreshFailure::RateLimited,
+            ..
+        } = state.refresh_hold?
+        else {
             return None;
         };
-        app.oauth.route_remaining("token").map(|wait| (wait, true))
+        app.oauth
+            .route_remaining("token")
+            .map(|wait| (wait, RefreshFailure::RateLimited))
     });
-    if let Some((retry_after, rate_limited)) = refresh_wait {
+    if let Some((retry_after, cause)) = refresh_wait {
         // A hold never renews a successful snapshot, and permission checks
         // cannot borrow the longer display cache while refresh is unavailable.
         let guilds = if guild_list_cache_allowed(guild_mode) {
             take_cached_guilds(guild_mode, app, user_id)
         } else {
             state.guilds.as_ref().and_then(|(at, guilds)| {
-                let max_age = if rate_limited {
-                    GUILD_AUTH_MAX_STALE
-                } else {
-                    GUILD_AUTH_CACHE_TTL
-                };
-                (at.elapsed() < max_age).then(|| guilds.clone())
+                GuildSnapshotAge::from_age(at.elapsed())
+                    .permits(cause)
+                    .then(|| guilds.clone())
             })
         };
         if let Some(guilds) = guilds
@@ -570,7 +653,7 @@ async fn require_auth_with(
             preview::apply_overlay(&mut auth)?;
             return Ok(auth);
         }
-        return Err(if rate_limited {
+        return Err(if cause == RefreshFailure::RateLimited {
             oauth::DiscordRateLimit { retry_after }.into()
         } else {
             ApiError(anyhow::anyhow!(
@@ -584,8 +667,7 @@ async fn require_auth_with(
         .is_err_and(|error| error.0.is::<oauth::DiscordUnauthorized>())
     {
         if first.is_ok() {
-            state.refresh_hold = None;
-            state.refresh_backoff = std::time::Duration::ZERO;
+            state.release_refresh_hold();
         }
         return first;
     }
@@ -602,8 +684,7 @@ async fn require_auth_with(
         return Err(ApiError(refreshed.unwrap_err()));
     }
     if let Ok(refreshed) = refreshed {
-        state.refresh_hold = None;
-        state.refresh_backoff = std::time::Duration::ZERO;
+        state.release_refresh_hold();
         state.token = Some(refreshed.access_token.clone());
         state.guilds = None;
         session
@@ -663,8 +744,8 @@ async fn load_auth(
     // Discord is still cooling down. Authorization never takes this branch.
     // A rate-limited profile lookup must not drop that list.
     if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        let (user, live) = display_identity(app, user_id, token, cached_user).await?;
-        if live {
+        let (user, source) = display_identity(app, user_id, token, cached_user).await?;
+        if source == DisplayIdentitySource::Live {
             app.user_cache
                 .insert(user_id, (std::time::Instant::now(), user.clone()));
         }
@@ -678,7 +759,7 @@ async fn load_auth(
     }
 
     let guilds = if let Some((at, guilds)) = &state.guilds
-        && at.elapsed() < GUILD_AUTH_CACHE_TTL
+        && GuildSnapshotAge::from_age(at.elapsed()) == GuildSnapshotAge::Fresh
     {
         guilds.clone()
     } else {
@@ -688,10 +769,9 @@ async fn load_auth(
                 guilds
             }
             Err(oauth::GuildListError::RateLimited { .. })
-                if state
-                    .guilds
-                    .as_ref()
-                    .is_some_and(|(at, _)| at.elapsed() < GUILD_AUTH_MAX_STALE) =>
+                if state.guilds.as_ref().is_some_and(|(at, _)| {
+                    GuildSnapshotAge::from_age(at.elapsed()).permits(RefreshFailure::RateLimited)
+                }) =>
             {
                 state.guilds.as_ref().unwrap().1.clone()
             }
@@ -757,8 +837,8 @@ async fn cached_display_during_limit(
     } else {
         tracing::debug!("webui auth: discord guild-list cooldown still active for user {user_id}");
     }
-    let (user, live) = display_identity(app, user_id, token, cached_user).await?;
-    if live {
+    let (user, source) = display_identity(app, user_id, token, cached_user).await?;
+    if source == DisplayIdentitySource::Live {
         app.user_cache
             .insert(user_id, (std::time::Instant::now(), user.clone()));
     }
@@ -804,6 +884,12 @@ fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayIdentitySource {
+    CachedOrFallback,
+    Live,
+}
+
 /// Identity for a display response that is already returning cached guilds.
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
@@ -817,15 +903,16 @@ async fn display_identity(
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-) -> ApiResult<(DiscordUser, bool)> {
+) -> ApiResult<(DiscordUser, DisplayIdentitySource)> {
     if let Some(user) = cached_user {
-        return Ok((user, false));
+        return Ok((user, DisplayIdentitySource::CachedOrFallback));
     }
     match app.oauth.me(user_id, token).await {
-        Ok(user) => Ok((user, true)),
-        Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => {
-            Ok((display_user_during_limit(app, user_id), false))
-        }
+        Ok(user) => Ok((user, DisplayIdentitySource::Live)),
+        Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => Ok((
+            display_user_during_limit(app, user_id),
+            DisplayIdentitySource::CachedOrFallback,
+        )),
         Err(error) => Err(ApiError(error)),
     }
 }
@@ -926,19 +1013,32 @@ async fn login(
     login_response(&state.cfg, &state.oauth, query)
 }
 
+struct OAuthHandshake {
+    state_token: String,
+    return_to: String,
+}
+
+impl OAuthHandshake {
+    fn issue(cfg: &crate::config::ApiProcessConfig, query: ReturnToQuery) -> Self {
+        Self {
+            state_token: random_oauth_state(),
+            return_to: return_to_or_root(cfg, query.return_to.as_deref()),
+        }
+    }
+}
+
 fn login_response(
     cfg: &crate::config::ApiProcessConfig,
     oauth: &oauth::OAuthClient,
     query: ReturnToQuery,
 ) -> Response {
-    let state_token = random_oauth_state();
-    let return_to = return_to_or_root(cfg, query.return_to.as_deref());
-    let url = oauth.authorize_url(&state_token);
+    let handshake = OAuthHandshake::issue(cfg, query);
+    let url = oauth.authorize_url(&handshake.state_token);
     let (secure, same_site) = public_cookie_policy(cfg);
     append_oauth_cookies(
         axum::response::Redirect::to(&url).into_response(),
-        &state_token,
-        &return_to,
+        &handshake.state_token,
+        &handshake.return_to,
         secure,
         same_site,
     )
@@ -1111,6 +1211,20 @@ async fn callback(
     .await
 }
 
+struct ValidatedOAuthCallback<'a> {
+    code: &'a str,
+}
+
+impl<'a> ValidatedOAuthCallback<'a> {
+    fn validate(headers: &HeaderMap, query: &'a CallbackQuery) -> Result<Self, &'static str> {
+        if !oauth_csrf_ok(headers, query.state.as_deref()) {
+            return Err("OAuth state mismatch");
+        }
+        let code = query.code.as_deref().ok_or("missing authorization code")?;
+        Ok(Self { code })
+    }
+}
+
 async fn callback_response(
     session: Session,
     cfg: &crate::config::ApiProcessConfig,
@@ -1127,13 +1241,11 @@ async fn callback_response(
     // Reject missing/empty CSRF cookie — skipping the check enables CSRF.
     // The secret lives on the client so an API restart between /login and
     // Discord's redirect does not invent a state mismatch.
-    if !oauth_csrf_ok(&headers, query.state.as_deref()) {
-        return finish(error_page("OAuth state mismatch"));
-    }
-    let Some(code) = &query.code else {
-        return finish(error_page("missing authorization code"));
+    let validated = match ValidatedOAuthCallback::validate(&headers, &query) {
+        Ok(validated) => validated,
+        Err(error) => return finish(error_page(error)),
     };
-    let tok = match oauth.exchange_code(code).await {
+    let tok = match oauth.exchange_code(validated.code).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("oauth callback: token exchange failed: {e:#}");
@@ -1178,25 +1290,45 @@ async fn store_login_session(
     access_token: &str,
     refresh_token: Option<&str>,
 ) -> Result<(), String> {
-    session
-        .cycle_id()
+    RotatedLoginSession::rotate(session)
+        .await?
+        .store(uid, access_token, refresh_token)
         .await
-        .map_err(|error| format!("failed to rotate session id: {error}"))?;
-    session
-        .insert(SESSION_USER, uid)
-        .await
-        .map_err(|error| format!("failed to persist login session: {error}"))?;
-    session
-        .insert(SESSION_TOKEN, access_token)
-        .await
-        .map_err(|error| format!("failed to persist login session: {error}"))?;
-    if let Some(refresh) = refresh_token {
+}
+
+struct RotatedLoginSession<'a>(&'a Session);
+
+impl<'a> RotatedLoginSession<'a> {
+    async fn rotate(session: &'a Session) -> Result<Self, String> {
         session
-            .insert(SESSION_REFRESH, refresh)
+            .cycle_id()
+            .await
+            .map_err(|error| format!("failed to rotate session id: {error}"))?;
+        Ok(Self(session))
+    }
+
+    async fn store(
+        self,
+        uid: u64,
+        access_token: &str,
+        refresh_token: Option<&str>,
+    ) -> Result<(), String> {
+        self.0
+            .insert(SESSION_USER, uid)
             .await
             .map_err(|error| format!("failed to persist login session: {error}"))?;
+        self.0
+            .insert(SESSION_TOKEN, access_token)
+            .await
+            .map_err(|error| format!("failed to persist login session: {error}"))?;
+        if let Some(refresh) = refresh_token {
+            self.0
+                .insert(SESSION_REFRESH, refresh)
+                .await
+                .map_err(|error| format!("failed to persist login session: {error}"))?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[derive(serde::Deserialize)]

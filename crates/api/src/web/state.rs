@@ -130,15 +130,7 @@ impl ApiState {
             let Ok(mut auth) = entry.try_lock() else {
                 return true;
             };
-            let expired = if auth.dead {
-                auth.dead_since.is_some_and(|at| {
-                    now.saturating_duration_since(at) >= super::AUTH_SESSION_DEAD_TTL
-                })
-            } else {
-                auth.last_used.is_some_and(|at| {
-                    now.saturating_duration_since(at) >= super::AUTH_SESSION_IDLE_TTL
-                })
-            };
+            let expired = auth.expired(now);
             if expired {
                 auth.retire();
             }

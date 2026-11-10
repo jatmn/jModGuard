@@ -574,7 +574,9 @@ mod tests {
                             app.auth_sessions.insert(
                                 id,
                                 Arc::new(tokio::sync::Mutex::new(SessionAuth {
-                                    dead: true,
+                                    lifecycle: crate::web::SessionLifecycle::Retired {
+                                        since: std::time::Instant::now(),
+                                    },
                                     ..Default::default()
                                 })),
                             );
@@ -685,7 +687,9 @@ mod tests {
                     app.auth_sessions.insert(
                         id,
                         Arc::new(tokio::sync::Mutex::new(SessionAuth {
-                            dead: true,
+                            lifecycle: crate::web::SessionLifecycle::Retired {
+                                since: std::time::Instant::now(),
+                            },
                             ..Default::default()
                         })),
                     );

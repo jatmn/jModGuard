@@ -60,6 +60,40 @@ pub struct PreviewGrant {
     pub expires: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrantLifetime {
+    Active,
+    Expired,
+}
+
+impl PreviewGrant {
+    fn lifetime(&self, now: Instant) -> GrantLifetime {
+        if self.expires > now {
+            GrantLifetime::Active
+        } else {
+            GrantLifetime::Expired
+        }
+    }
+}
+
+enum PresentedPreview {
+    Absent,
+    Active(PreviewGrant),
+    Expired,
+}
+
+impl PresentedPreview {
+    fn resolve(app: &ApiState, token: Option<&str>) -> Self {
+        match token {
+            None => Self::Absent,
+            Some(token) => match active_grant(app, token) {
+                Some(grant) => Self::Active(grant),
+                None => Self::Expired,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreviewDenied;
 impl std::fmt::Display for PreviewDenied {
@@ -142,19 +176,20 @@ pub async fn middleware(
         .get(PREVIEW_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let grant = presented
-        .as_ref()
-        .and_then(|token| active_grant(&app, token));
-    if presented.is_some() && grant.is_none() {
-        return (
-            StatusCode::GONE,
-            Json(serde_json::json!({
-                "error": "preview expired",
-                "code": "preview_expired",
-            })),
-        )
-            .into_response();
-    }
+    let grant = match PresentedPreview::resolve(&app, presented.as_deref()) {
+        PresentedPreview::Absent => None,
+        PresentedPreview::Active(grant) => Some(grant),
+        PresentedPreview::Expired => {
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "error": "preview expired",
+                    "code": "preview_expired",
+                })),
+            )
+                .into_response();
+        }
+    };
     if grant.is_some() && is_preview_write(&request) && request.uri().path() != "/api/preview" {
         return (
             StatusCode::FORBIDDEN,
@@ -170,7 +205,7 @@ pub async fn middleware(
 
 fn active_grant(app: &ApiState, token: &str) -> Option<PreviewGrant> {
     let grant = app.preview.get(token).map(|entry| entry.clone())?;
-    if grant.expires > Instant::now() {
+    if grant.lifetime(Instant::now()) == GrantLifetime::Active {
         return Some(grant);
     }
     app.preview.remove(token);
@@ -179,7 +214,8 @@ fn active_grant(app: &ApiState, token: &str) -> Option<PreviewGrant> {
 
 fn prune_expired(app: &ApiState) {
     let now = Instant::now();
-    app.preview.retain(|_, grant| grant.expires > now);
+    app.preview
+        .retain(|_, grant| grant.lifetime(now) == GrantLifetime::Active);
 }
 
 fn schedule_expiration(app: &Arc<ApiState>, token: String) {
@@ -192,7 +228,7 @@ fn schedule_expiration(app: &Arc<ApiState>, token: String) {
         let expired = app
             .preview
             .get(&token)
-            .is_some_and(|grant| grant.expires <= Instant::now());
+            .is_some_and(|grant| grant.lifetime(Instant::now()) == GrantLifetime::Expired);
         if expired {
             app.preview.remove(&token);
         }

@@ -17,7 +17,7 @@ const BusyContext = createContext(false);
 const ui = createState({
   view: "startup-view",
   startupStatus: "Waiting for the API to finish starting…",
-  previewUnavailable: false,
+  previewAvailability: "unchecked",
   contentRevision: 0,
   editor: null,
   notification: null,
@@ -330,7 +330,7 @@ function App() {
                     null,
                     h("h1", null, "Getting things ready."),
                     h("p", { id: "startup-status", role: "status" }, display.startupStatus),
-                    display.previewUnavailable &&
+                    display.previewAvailability === "unavailable" &&
                       h(
                         "a",
                         {
@@ -449,7 +449,7 @@ function setStartupStatus(text) {
   ui.set({ startupStatus: text });
 }
 function showPreviewUnavailable() {
-  ui.set({ view: "startup-view", previewUnavailable: true, startupStatus: "This preview is no longer signed in. Return to the owner dashboard and launch a new preview." });
+  ui.set({ view: "startup-view", previewAvailability: "unavailable", startupStatus: "This preview is no longer signed in. Return to the owner dashboard and launch a new preview." });
 }
 function toast(message, kind = "info") {
   ui.set({ notification: { message, kind } });
@@ -627,7 +627,11 @@ function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
 }
 
-let previewTokenFallback = null;
+let previewCapability = { kind: "absent" };
+
+function capturedPreviewToken() {
+  return previewCapability.kind === "captured" ? previewCapability.token : null;
+}
 
 function capturePreviewToken() {
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -635,7 +639,7 @@ function capturePreviewToken() {
   if (!token) return;
   // Keep an in-memory source of truth before touching browser storage. A
   // blocked sessionStorage must never silently restore the owner's write access.
-  previewTokenFallback = token;
+  previewCapability = { kind: "captured", token };
   try {
     window.sessionStorage.setItem("jmodguard_preview", token);
   } catch (_) {
@@ -647,14 +651,14 @@ function capturePreviewToken() {
 
 function currentPreviewToken() {
   try {
-    return window.sessionStorage.getItem("jmodguard_preview") || previewTokenFallback;
+    return window.sessionStorage.getItem("jmodguard_preview") || capturedPreviewToken();
   } catch (_) {
-    return previewTokenFallback;
+    return capturedPreviewToken();
   }
 }
 
 function clearPreviewToken() {
-  previewTokenFallback = null;
+  previewCapability = { kind: "absent" };
   try {
     window.sessionStorage.removeItem("jmodguard_preview");
   } catch (_) {}
