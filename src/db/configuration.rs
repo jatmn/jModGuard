@@ -1040,7 +1040,15 @@ async fn copy_guild_config_inner(
         if wants("rules") {
             let rows = load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)?;
             if src != dst {
-                let replacement = prepare_copied_rules(dst, rows)?;
+                let mut replacement = prepare_copied_rules(dst, rows)?;
+                // Normalize before deletion so the save guard can retain the
+                // target's stored description, under this same writer lock.
+                for (id, rule) in &mut replacement {
+                    if id == "invite" {
+                        *rule =
+                            serde_json::from_str(&rule_json_for_save_conn(&tx, dst, id, rule)?)?;
+                    }
+                }
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 insert_copied_rules(dst, &replacement, |sql, args, rows| {
                     tx.execute_insert_batch(sql, params_from_iter(args), rows)

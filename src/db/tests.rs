@@ -4790,3 +4790,225 @@ fn invite_description_save_guard_is_exact_and_checks_stored_text_without_marker(
     drop(db);
     cleanup_db(&tmp);
 }
+
+// Exercise both public copy APIs and the dashboard's control dispatch, including
+// global sources/targets. Expected text is supplied independently of the guard.
+async fn assert_invite_copy_case(
+    mode: &str,
+    src: i64,
+    dst: i64,
+    description: &str,
+    stored: Option<&str>,
+    marker: bool,
+    expected_description: &str,
+) {
+    let tmp = tmp_db_path("invite_copy");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut scopes = Vec::new();
+    for guild in [src, dst] {
+        scopes.push(if guild == 0 {
+            ConfigurationScope::Global
+        } else {
+            ConfigurationScope::Guild(enroll_guild(&db, guild, 100).await.unwrap().unwrap())
+        });
+    }
+    let mut invite = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+    invite.description = description.into();
+    invite.enabled = false;
+    invite.params = serde_json::json!({"allowlist_codes": ["source-code"]});
+    invite.actions[0].reason = "Copied action reason".into();
+    invite.whitelist_users = vec![12345];
+    let mut other = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+    // Exact obsolete text on another built-in must not trigger normalization.
+    other.description = crate::defaults::OLD_INVITE_DESCRIPTION.into();
+    let mut rows = vec![
+        ("invite".to_owned(), invite.clone()),
+        ("velocity".into(), other),
+    ];
+    if src != 0 && dst != 0 {
+        let mut custom = invite.clone();
+        custom.name = "Custom pattern".into();
+        custom.description = crate::defaults::OLD_INVITE_DESCRIPTION.into();
+        custom.dry_run = true; // Existing create admission also requires dry-run.
+        custom.actions.truncate(1);
+        custom.params = serde_json::json!({"kind": "pattern", "pattern": "scam"});
+        rows.push(("custom:0123456789abcdef".into(), custom));
+    }
+    let source_rows = rows.clone();
+    let stored = stored.map(|description| {
+        let mut rule = invite.clone();
+        rule.description = description.into();
+        rule
+    });
+    db.with_conn(move |conn| {
+        conn.execute_reclaim(
+            "DELETE FROM rules WHERE guild_id IN (?1, ?2)",
+            params![src, dst],
+        )?;
+        conn.execute_reclaim("DELETE FROM meta WHERE key = 'invite_description_v1'", ())?;
+        if marker {
+            write_meta_string_conn(conn, "invite_description_v1", "1")?;
+        }
+        for (id, rule) in source_rows {
+            conn.execute_rows(
+                "INSERT INTO rules(guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+                params![src, id, serde_json::to_string(&rule)?],
+                1,
+            )?;
+        }
+        if let Some(rule) = stored {
+            conn.execute_rows(
+                "INSERT INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                params![dst, serde_json::to_string(&rule)?],
+                1,
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let before = get_primary_versions(&db).await.unwrap();
+    let sections = vec!["rules".into()];
+    let ack = match mode {
+        "direct" => {
+            serde_json::to_value(copy_guild_config(&db, src, dst, sections).await.unwrap()).unwrap()
+        }
+        "enrolled" => serde_json::to_value(
+            copy_enrolled_guild_config(&db, scopes[0].clone(), scopes[1].clone(), sections)
+                .await
+                .unwrap(),
+        )
+        .unwrap(),
+        "control" => match apply_control(
+            &db,
+            None,
+            ControlOp::CopyGuildConfig {
+                source: scopes[0].to_wire(),
+                destination: scopes[1].to_wire(),
+                sections,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        {
+            ControlReply::Saved { body } => body,
+            reply => panic!("unexpected copy reply: {reply:?}"),
+        },
+        _ => panic!("unknown copy fixture"),
+    };
+    assert_eq!(
+        ack,
+        serde_json::json!({
+            "copied": ["rules"], "skipped_badwords": 0, "skipped_logchannels": false,
+        })
+    );
+    let after = get_primary_versions(&db).await.unwrap();
+    assert_eq!(after.config, before.config + 1);
+    assert_ne!(after.config_revision, before.config_revision);
+    assert_eq!(after.slash, before.slash);
+    assert_eq!(after.slash_revision, before.slash_revision);
+    assert_eq!(list_rules(&db, dst).await.unwrap().len(), rows.len());
+    for (id, source) in rows {
+        let saved = get_rule(&db, dst, &id).await.unwrap().unwrap();
+        let mut expected = source.clone();
+        if id == "invite" {
+            expected.description = expected_description.into();
+        }
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "{mode} {src}->{dst} {id}, marker={marker}, source={description}"
+        );
+        assert_eq!(
+            serde_json::to_value(get_rule(&db, src, &id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(source).unwrap(),
+            "copy must not rewrite the source"
+        );
+    }
+    db.with_conn(move |conn| {
+        assert_eq!(
+            meta_string_conn(conn, "invite_description_v1")?.is_some(),
+            marker
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_copy_guards_old_text_using_target_row() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                for (stored, expected) in [
+                    (None, CURRENT),
+                    (Some(OLD), CURRENT),
+                    (Some(CURRENT), CURRENT),
+                    (Some("Target custom guidance"), "Target custom guidance"),
+                ] {
+                    assert_invite_copy_case(mode, src, dst, OLD, stored, true, expected).await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_preserves_custom_current_and_near_match() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                for description in ["Source custom guidance", CURRENT, &format!("{OLD} ")] {
+                    assert_invite_copy_case(
+                        mode,
+                        src,
+                        dst,
+                        description,
+                        Some("Target custom guidance"),
+                        true,
+                        description,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_without_marker_matches_save_semantics() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                // Fresh/current target is protected without a migration marker;
+                // missing, old and custom pre-upgrade targets still accept OLD.
+                for (stored, expected) in [
+                    (Some(CURRENT), CURRENT),
+                    (None, OLD),
+                    (Some(OLD), OLD),
+                    (Some("Pre-upgrade custom guidance"), OLD),
+                ] {
+                    assert_invite_copy_case(mode, src, dst, OLD, stored, false, expected).await;
+                }
+                assert_invite_copy_case(mode, src, dst, CURRENT, None, false, CURRENT).await;
+                assert_invite_copy_case(
+                    mode,
+                    src,
+                    dst,
+                    "Source custom guidance",
+                    None,
+                    false,
+                    "Source custom guidance",
+                )
+                .await;
+            }
+        }
+    });
+}
