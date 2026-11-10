@@ -280,15 +280,57 @@ pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<Ru
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
     crate::image_spam::validate_rule(rule_id, rule)?;
-    upsert_row(
-        db,
-        "rules",
-        "guild_id, rule_id",
-        vec![guild_id.into(), rule_id.to_string().into()],
-        rule.clone(),
-        false,
-        None,
-    )
+    upsert_rule_row(db, guild_id, rule_id, rule, None).await
+}
+
+/// Normalize only the obsolete shipped text, while holding the same writer
+/// transaction as bootstrap/save. Custom descriptions remain operator-owned.
+fn rule_json_for_save_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<String> {
+    if id == "invite"
+        && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION
+        && (meta_string_conn(conn, "invite_description_v1")?.is_some()
+            || conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'
+                 AND CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = ?2)",
+                params![guild_id, crate::defaults::INVITE_DESCRIPTION],
+                |r| Ok(r.get::<bool>(0)?),
+            )?)
+    {
+        let mut rule = rule.clone();
+        rule.description = crate::defaults::INVITE_DESCRIPTION.into();
+        return Ok(serde_json::to_string(&rule)?);
+    }
+    Ok(serde_json::to_string(rule)?)
+}
+
+async fn upsert_rule_row(
+    db: &Db,
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+    expected: Option<ConfigurationWriteScope>,
+) -> Result<()> {
+    let id = id.to_owned();
+    let rule = rule.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![guild_id, id, json],
+            1,
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
     .await
 }
 
@@ -1610,16 +1652,7 @@ pub async fn upsert_enrolled_rule(
     if crate::custom_rules::is_custom_id(id) {
         return upsert_enrolled_custom_rule(db, scope, id, rule).await;
     }
-    upsert_row(
-        db,
-        "rules",
-        "guild_id, rule_id",
-        vec![scope.guild_id().into(), id.to_owned().into()],
-        rule.clone(),
-        false,
-        Some(scope),
-    )
-    .await
+    upsert_rule_row(db, scope.guild_id(), id, rule, Some(scope)).await
 }
 
 /// The global rule editor's save and override clear are one captured mutation.
@@ -1641,12 +1674,13 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     let global = ConfigurationWriteScope::new(request.clone(), ConfigurationScope::Global)?;
     let guild = ConfigurationWriteScope::new(request.clone(), request)?;
     let id = id.to_owned();
-    let json = serde_json::to_string(rule)?;
+    let rule = rule.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         global.verify_conn(&tx)?;
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
+        let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         tx.execute_rows(
             "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, ?1, ?2)
              ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",

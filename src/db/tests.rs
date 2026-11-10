@@ -4410,8 +4410,7 @@ fn builtin_form_params_validate_through_rule_saves() {
 
 #[test]
 fn invite_description_upgrade_is_exact_and_once() {
-    const OLD: &str =
-        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
     let tmp = tmp_db_path("invite_description_upgrade");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
@@ -4480,10 +4479,10 @@ fn invite_description_upgrade_is_exact_and_once() {
         tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
         slash_before
     );
-    // An operator deliberately restoring the previous wording after migration owns it.
+    // A custom description saved after migration stays operator-owned.
     tokio_test_block_on(async {
         let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
-        rule.description = OLD.into();
+        rule.description = "My post-upgrade custom wording".into();
         upsert_rule(&db, 0, "invite", &rule).await.unwrap();
     });
     let after = tokio_test_block_on(get_config_version(&db)).unwrap();
@@ -4494,7 +4493,7 @@ fn invite_description_upgrade_is_exact_and_once() {
             .unwrap()
             .unwrap()
             .description,
-        OLD
+        "My post-upgrade custom wording"
     );
     assert_eq!(tokio_test_block_on(get_config_version(&db)).unwrap(), after);
     drop(db);
@@ -4542,8 +4541,7 @@ const INVITE_SAVE_MODES: [&str; 6] = [
 
 #[test]
 fn invite_description_stale_save_survives_upgrade_and_reopen() {
-    const OLD: &str =
-        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
     for mode in INVITE_SAVE_MODES {
         let tmp = tmp_db_path("invite_stale_save");
         let db = Db::open(&tmp, 2).unwrap();
@@ -4665,4 +4663,71 @@ fn invite_description_save_preserves_custom_and_current_on_fresh_install() {
         drop(db);
         cleanup_db(&tmp);
     }
+}
+
+#[test]
+fn invite_description_save_guard_is_exact_and_checks_stored_text_without_marker() {
+    use crate::defaults::{INVITE_DESCRIPTION, OLD_INVITE_DESCRIPTION};
+    let tmp = tmp_db_path("invite_description_guard");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM meta WHERE key = 'invite_description_v1'",
+                (),
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // A row already holding the upgraded text is protected even without the marker.
+        rule.description = OLD_INVITE_DESCRIPTION.into();
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            INVITE_DESCRIPTION
+        );
+        // A pre-upgrade/new row without the marker is not silently migrated by saves.
+        upsert_rule(&db, 123, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 123, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            OLD_INVITE_DESCRIPTION
+        );
+        db.with_conn(|conn| write_meta_string_conn(conn, "invite_description_v1", "1"))
+            .await
+            .unwrap();
+        // Neither a near-match string nor another rule ID is the obsolete shipped default.
+        rule.description = format!("{OLD_INVITE_DESCRIPTION} ");
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            rule.description
+        );
+        rule.description = OLD_INVITE_DESCRIPTION.into();
+        upsert_rule(&db, 0, "velocity", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "velocity")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            OLD_INVITE_DESCRIPTION
+        );
+    });
+    drop(db);
+    cleanup_db(&tmp);
 }
