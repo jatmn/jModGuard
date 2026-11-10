@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 40;
+pub const LAUNCHER_REVISION: u32 = 41;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -215,13 +215,38 @@ impl UpgradePhase {
     }
 }
 
+/// Independent evidence for one action by this launcher incarnation.
+/// The durable protocol remains boolean; a phase alone never supplies proof.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "bool", into = "bool")]
+pub enum UpgradeProof {
+    Missing,
+    Confirmed,
+}
+
+impl From<bool> for UpgradeProof {
+    fn from(confirmed: bool) -> Self {
+        if confirmed {
+            Self::Confirmed
+        } else {
+            Self::Missing
+        }
+    }
+}
+
+impl From<UpgradeProof> for bool {
+    fn from(proof: UpgradeProof) -> Self {
+        proof == UpgradeProof::Confirmed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeService {
     pub release: ComponentRelease,
     pub instance: String,
-    pub prepared: bool,
-    pub stopped: bool,
-    pub ready: bool,
+    pub prepared: UpgradeProof,
+    pub stopped: UpgradeProof,
+    pub ready: UpgradeProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1000,12 +1025,17 @@ impl UpdateControl {
             anyhow::bail!("read-only database cannot acquire an update lease");
         }
         let owner = format!("{:032x}", rand::random::<u128>());
-        if !claim_update_lease(&self.db, "bot", &owner, now, 240).await? {
+        if UpdateLeaseStatus::from(claim_update_lease(&self.db, "bot", &owner, now, 240).await?)
+            == UpdateLeaseStatus::Unavailable
+        {
             anyhow::bail!("another update operation is running");
         }
-        match claim_update_lease(&self.db, "api", &owner, now, 240).await {
-            Ok(true) => Ok(owner),
-            Ok(false) => {
+        match claim_update_lease(&self.db, "api", &owner, now, 240)
+            .await
+            .map(UpdateLeaseStatus::from)
+        {
+            Ok(UpdateLeaseStatus::Held) => Ok(owner),
+            Ok(UpdateLeaseStatus::Unavailable) => {
                 release_update_lease(&self.db, "bot", &owner).await?;
                 anyhow::bail!("another update operation is running")
             }
@@ -1068,7 +1098,7 @@ impl UpdateControl {
                         params![component, owner.clone(), now + 240, now],
                         1,
                     )?;
-                    anyhow::ensure!(renewed == 1, "update lease expired or changed");
+                    anyhow::ensure!(UpdateLeaseStatus::from(renewed == 1) == UpdateLeaseStatus::Held, "update lease expired or changed");
                     let channel_rows = tx.execute_rows(
                         "UPDATE component_updates SET channel=?2,cadence='off',candidate=CASE WHEN channel=?2 THEN candidate ELSE NULL END,checked_at=CASE WHEN channel=?2 THEN checked_at ELSE NULL END,check_error=CASE WHEN channel=?2 THEN check_error ELSE NULL END WHERE component=?1",
                         params![component, channel.clone()],
@@ -1359,7 +1389,7 @@ impl UpdateControl {
                     tx.commit()?;
                     return Ok(active.clone());
                 }
-                anyhow::ensure!(recover && active.error.is_some() && active.bot.stopped && active.api.stopped, "wait until both services have stopped before recovering the upgrade");
+                anyhow::ensure!(recover && active.error.is_some() && active.bot.stopped == UpgradeProof::Confirmed && active.api.stopped == UpgradeProof::Confirmed, "wait until both services have stopped before recovering the upgrade");
             }
             let bot = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component='bot'", updates::COLS), (), updates::row_update)?;
             let api = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component='api'", updates::COLS), (), updates::row_update)?;
@@ -1459,7 +1489,7 @@ impl UpdateControl {
             let api_seen = api.observed.as_ref().context("API has not been observed")?;
             anyhow::ensure!(recovering.is_some() || api_seen.baked_launcher_revision >= PAIRED_LAUNCHER_REVISION,
                 PAIRED_RECOVERY_REQUIRED);
-            let service = |release| UpgradeService { release, instance: String::new(), prepared: false, stopped: false, ready: false };
+            let service = |release| UpgradeService { release, instance: String::new(), prepared: UpgradeProof::Missing, stopped: UpgradeProof::Missing, ready: UpgradeProof::Missing };
             let upgrade = ServiceUpgrade {
                 id: format!("{:032x}", rand::random::<u128>()), phase: UpgradePhase::Preparing,
                 bot: service(target_bot), api: service(target_api), from_core: schema, from_guild,
@@ -1541,16 +1571,16 @@ impl UpdateControl {
                 let service = upgrade.service_mut(&role)?;
                 if service.instance != instance {
                     service.instance = instance;
-                    service.prepared = false;
-                    service.stopped = false;
-                    service.ready = false;
+                    service.prepared = UpgradeProof::Missing;
+                    service.stopped = UpgradeProof::Missing;
+                    service.ready = UpgradeProof::Missing;
                     // A restarted launcher has lost its local staging and child
                     // evidence. Re-quiesce both roles; retain the forward-only fence.
                     upgrade.phase = UpgradePhase::Preparing;
-                    upgrade.bot.ready = false;
-                    upgrade.api.ready = false;
-                    upgrade.bot.stopped = false;
-                    upgrade.api.stopped = false;
+                    upgrade.bot.ready = UpgradeProof::Missing;
+                    upgrade.api.ready = UpgradeProof::Missing;
+                    upgrade.bot.stopped = UpgradeProof::Missing;
+                    upgrade.api.stopped = UpgradeProof::Missing;
                     write_upgrade(&tx, &upgrade)?;
                 }
                 tx.commit()?;
@@ -1586,7 +1616,9 @@ impl UpdateControl {
                 require_progress(upgrade.id == id && upgrade.phase.active())?;
                 require_progress(upgrade.service(&role)?.instance == instance)?;
                 match action {
-                    UpgradeAcknowledgement::Prepared => upgrade.service_mut(&role)?.prepared = true,
+                    UpgradeAcknowledgement::Prepared => {
+                        upgrade.service_mut(&role)?.prepared = UpgradeProof::Confirmed
+                    }
                     UpgradeAcknowledgement::Stopped => {
                         require_progress(
                             upgrade.error.is_some()
@@ -1597,21 +1629,21 @@ impl UpdateControl {
                                         UpgradePhase::Preparing | UpgradePhase::StoppingApi
                                     )),
                         )?;
-                        upgrade.service_mut(&role)?.stopped = true;
-                        upgrade.service_mut(&role)?.ready = false;
+                        upgrade.service_mut(&role)?.stopped = UpgradeProof::Confirmed;
+                        upgrade.service_mut(&role)?.ready = UpgradeProof::Missing;
                     }
                     UpgradeAcknowledgement::Starting => {
                         require_progress(
                             upgrade.error.is_none()
-                                && upgrade.service(&role)?.prepared
+                                && (upgrade.service(&role)?.prepared == UpgradeProof::Confirmed)
                                 && ((role == "bot"
                                     && upgrade.phase.forward_only()
-                                    && upgrade.api.stopped)
+                                    && upgrade.api.stopped == UpgradeProof::Confirmed)
                                     || (role == "api"
                                         && upgrade.phase == UpgradePhase::StartingApi
-                                        && upgrade.bot.ready)),
+                                        && upgrade.bot.ready == UpgradeProof::Confirmed)),
                         )?;
-                        upgrade.service_mut(&role)?.stopped = false;
+                        upgrade.service_mut(&role)?.stopped = UpgradeProof::Missing;
                         upgrade.irreversible = true;
                     }
                     UpgradeAcknowledgement::Ready => {
@@ -1620,31 +1652,42 @@ impl UpdateControl {
                             (role == "bot" && upgrade.phase.forward_only())
                                 || (role == "api" && upgrade.phase == UpgradePhase::StartingApi),
                         )?;
-                        upgrade.service_mut(&role)?.ready = true;
+                        upgrade.service_mut(&role)?.ready = UpgradeProof::Confirmed;
                     }
                 }
                 upgrade.phase = match upgrade.phase {
                     phase if upgrade.error.is_some() => phase,
-                    UpgradePhase::Preparing if upgrade.bot.prepared && upgrade.api.prepared => {
+                    UpgradePhase::Preparing
+                        if upgrade.bot.prepared == UpgradeProof::Confirmed
+                            && upgrade.api.prepared == UpgradeProof::Confirmed =>
+                    {
                         UpgradePhase::StoppingApi
                     }
-                    UpgradePhase::StoppingApi if upgrade.api.stopped && upgrade.bot.prepared => {
+                    UpgradePhase::StoppingApi
+                        if upgrade.api.stopped == UpgradeProof::Confirmed
+                            && upgrade.bot.prepared == UpgradeProof::Confirmed =>
+                    {
                         UpgradePhase::StoppingBot
                     }
                     UpgradePhase::StoppingBot
-                        if upgrade.api.stopped
-                            && upgrade.bot.stopped
-                            && upgrade.api.prepared
-                            && upgrade.bot.prepared =>
+                        if upgrade.api.stopped == UpgradeProof::Confirmed
+                            && upgrade.bot.stopped == UpgradeProof::Confirmed
+                            && upgrade.api.prepared == UpgradeProof::Confirmed
+                            && upgrade.bot.prepared == UpgradeProof::Confirmed =>
                     {
                         UpgradePhase::StartingBot
                     }
                     UpgradePhase::StartingBot
-                        if upgrade.bot.ready && upgrade.api.stopped && upgrade.api.prepared =>
+                        if upgrade.bot.ready == UpgradeProof::Confirmed
+                            && upgrade.api.stopped == UpgradeProof::Confirmed
+                            && upgrade.api.prepared == UpgradeProof::Confirmed =>
                     {
                         UpgradePhase::StartingApi
                     }
-                    UpgradePhase::StartingApi if upgrade.bot.ready && upgrade.api.ready => {
+                    UpgradePhase::StartingApi
+                        if upgrade.bot.ready == UpgradeProof::Confirmed
+                            && upgrade.api.ready == UpgradeProof::Confirmed =>
+                    {
                         UpgradePhase::Complete
                     }
                     phase => phase,
@@ -2114,7 +2157,11 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.phase, UpgradePhase::Preparing);
         assert!(resumed.irreversible);
-        assert!(!resumed.bot.prepared && !resumed.bot.stopped && !resumed.api.stopped);
+        assert!(
+            resumed.bot.prepared == UpgradeProof::Missing
+                && resumed.bot.stopped == UpgradeProof::Missing
+                && resumed.api.stopped == UpgradeProof::Missing
+        );
         assert!(
             reopened
                 .acknowledge(&op.id, "bot", "bot", UpgradeAcknowledgement::Ready)
@@ -2675,7 +2722,10 @@ mod tests {
                 .unwrap();
         }
         let prepared = f.control.upgrade().await.unwrap().unwrap();
-        assert!(prepared.api.prepared, "the API prepared step is stored");
+        assert!(
+            prepared.api.prepared == UpgradeProof::Confirmed,
+            "the API prepared step is stored"
+        );
         assert_eq!(prepared.phase, UpgradePhase::StoppingApi);
         let stale = api
             .acknowledge(&upgrade.id, "api", "old", UpgradeAcknowledgement::Stopped)
@@ -2690,7 +2740,10 @@ mod tests {
             .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
             .await
             .unwrap();
-        assert!(stopped.bot.stopped, "the bot process is stopped");
+        assert!(
+            stopped.bot.stopped == UpgradeProof::Confirmed,
+            "the bot process is stopped"
+        );
         assert!(matches!(stopped.phase, UpgradePhase::StartingBot));
         assert!(
             active_bot_lease(&f.control).await.is_none(),
@@ -2736,7 +2789,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(failed.error.as_deref(), Some("api: staged binary failed"));
-        assert!(failed.bot.stopped && failed.api.stopped);
+        assert!(
+            failed.bot.stopped == UpgradeProof::Confirmed
+                && failed.api.stopped == UpgradeProof::Confirmed
+        );
         assert!(active_bot_lease(&f.control).await.is_none());
         let reply = link
             .submit(
@@ -2777,7 +2833,7 @@ mod tests {
             );
         }
         let current = f.control.upgrade().await.unwrap().unwrap();
-        assert!(!current.bot.prepared);
+        assert!(current.bot.prepared == UpgradeProof::Missing);
         assert_eq!(
             f.control
                 .component("api")

@@ -1830,7 +1830,9 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
                     params![guild],
                     |row| Ok(row.get(0)?),
                 )?;
-                if fenced == 1 {
+                if crate::db::guild_stores::GuildWriteFence::from_presence(fenced == 1)
+                    == crate::db::guild_stores::GuildWriteFence::Held
+                {
                     tx.finish_read()?;
                     return Err(crate::db::guild_stores::GuildWriteFenced.into());
                 }

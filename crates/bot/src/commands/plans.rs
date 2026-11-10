@@ -11,6 +11,52 @@ use super::{BehaviorOutcome, CmdEnv, PermLevel, refuse_fenced_discord_mutation};
 use crate::types::PlanStep;
 use crate::{db, logging};
 
+enum PlanCursor {
+    Step(usize),
+    Complete,
+}
+
+struct PlanExecution<'a> {
+    steps: &'a [PlanStep],
+    cursor: PlanCursor,
+    responses: Vec<String>,
+    emitted_log_events: Vec<String>,
+}
+
+impl<'a> PlanExecution<'a> {
+    fn new(steps: &'a [PlanStep]) -> Self {
+        Self {
+            steps,
+            cursor: if steps.is_empty() {
+                PlanCursor::Complete
+            } else {
+                PlanCursor::Step(0)
+            },
+            responses: Vec::new(),
+            emitted_log_events: Vec::new(),
+        }
+    }
+
+    fn current(&self) -> Option<(usize, &'a PlanStep)> {
+        match self.cursor {
+            PlanCursor::Step(index) => Some((index, &self.steps[index])),
+            PlanCursor::Complete => None,
+        }
+    }
+
+    // Both success and failure finish this invocation-local step. Prior remote
+    // effects remain committed; the caller logs failure and continues.
+    fn advance(&mut self) {
+        if let PlanCursor::Step(index) = self.cursor {
+            self.cursor = if index + 1 < self.steps.len() {
+                PlanCursor::Step(index + 1)
+            } else {
+                PlanCursor::Complete
+            };
+        }
+    }
+}
+
 pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome> {
     let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
     let mut vars = super::behaviors::behaviors_base_vars(env);
@@ -46,24 +92,29 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
                 .unwrap_or_else(|| target.to_string()),
         );
     }
-    let mut responses: Vec<String> = Vec::new();
-    let mut emitted_log_events = Vec::new();
+    let mut execution = PlanExecution::new(steps);
 
-    for (idx, step) in steps.iter().enumerate() {
+    while let Some((idx, step)) = execution.current() {
         let res = run_step(
             env,
             enrollment.clone(),
             step,
             target,
             &mut vars,
-            &mut responses,
-            &mut emitted_log_events,
+            &mut execution.responses,
+            &mut execution.emitted_log_events,
         )
         .await;
         if let Err(e) = res {
             tracing::warn!("plan step {idx} of `{}` failed: {e:#}", env.cmd.name);
         }
+        execution.advance();
     }
+    let PlanExecution {
+        responses,
+        mut emitted_log_events,
+        ..
+    } = execution;
 
     let content = if responses.is_empty() {
         String::new()

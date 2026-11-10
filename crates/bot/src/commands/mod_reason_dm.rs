@@ -104,11 +104,25 @@ pub(crate) fn moderation_failure_error(
     anyhow::Error::msg(text)
 }
 
+#[derive(PartialEq, Eq)]
+enum FailureFollowup {
+    Suppressed,
+    Eligible,
+}
+
+impl FailureFollowup {
+    fn after(dm: Option<ModReasonDmOutcome>) -> Self {
+        match dm {
+            Some(ModReasonDmOutcome::Sent | ModReasonDmOutcome::Uncertain) => Self::Eligible,
+            None | Some(ModReasonDmOutcome::NotSent | ModReasonDmOutcome::Cancelled) => {
+                Self::Suppressed
+            }
+        }
+    }
+}
+
 pub(crate) fn dm_outcome_may_have_delivered(dm_outcome: Option<ModReasonDmOutcome>) -> bool {
-    matches!(
-        dm_outcome,
-        Some(ModReasonDmOutcome::Sent) | Some(ModReasonDmOutcome::Uncertain)
-    )
+    FailureFollowup::after(dm_outcome) == FailureFollowup::Eligible
 }
 
 pub(crate) async fn send_mod_reason_dm_moderation_failed_followup(

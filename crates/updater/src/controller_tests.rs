@@ -278,8 +278,8 @@ fn controller(
         running: None,
         restart: RestartPolicy::default(),
         restart_target: None,
-        exited_for_restart: false,
-        exit_accounted: false,
+        restart_intent: RestartIntent::Stopped,
+        exit_accounting: ExitAccounting::Unaccounted,
         maintenance: None,
         health: None,
         health_bind: None,
@@ -293,19 +293,17 @@ fn controller(
         standby: None,
         rejected_candidate: None,
         persisted_candidate_digest: None,
-        rejected_loaded: false,
+        rejection_lookup: RejectionLookup::Unread,
         fail_rejected_lookups: 0,
         fail_rejected_candidate_write: false,
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: std::collections::VecDeque::new(),
-        boot_receipt_attempt: 0,
-        boot_receipt_not_before: None,
+        boot_receipts: ReceiptBackoff::default(),
         baked_fallback_installed: None,
         pending_startup: Vec::new(),
-        receipt_attempt: 0,
-        receipt_not_before: None,
-        reported: false,
+        activation_receipts: ReceiptBackoff::default(),
+        readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
     }
 }
@@ -324,9 +322,9 @@ async fn restart(service: &mut Supervisor) {
     service.clear_pending_boot_mismatch();
     service.baked_fallback_installed = None;
     service.pending_startup.clear();
-    service.receipt_attempt = 0;
-    service.receipt_not_before = None;
-    service.exited_for_restart = false;
+    service.activation_receipts.attempt = 0;
+    service.activation_receipts.schedule = ReceiptSchedule::Ready;
+    service.restart_intent = RestartIntent::Stopped;
     service.restart_target = None;
 }
 
@@ -440,7 +438,9 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     );
     tokio::fs::remove_file(delayed_baked).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !bot.reported || !api.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending
+        || api.readiness_receipt == ReadinessReceipt::Pending
+    {
         assert!(Instant::now() < deadline);
         bot.tick().await.unwrap();
         api.tick().await.unwrap();
@@ -493,7 +493,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     assert!(bot.running.is_none());
     let waiting = control.upgrade().await.unwrap().unwrap();
     assert_eq!(waiting.phase, Phase::Preparing);
-    assert!(!waiting.bot.prepared && !waiting.irreversible);
+    assert!(waiting.bot.prepared == db::UpgradeProof::Missing && !waiting.irreversible);
     let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
         .await
         .unwrap();
@@ -687,8 +687,8 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             );
             if failed.error.is_some()
                 && failed.irreversible
-                && failed.bot.stopped
-                && failed.api.stopped
+                && failed.bot.stopped == db::UpgradeProof::Confirmed
+                && failed.api.stopped == db::UpgradeProof::Confirmed
             {
                 break failed;
             }
@@ -762,7 +762,7 @@ async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_do
     let control = UpdateControl::from_application(&db);
     let mut bot = controller("bot", baked, registry.clone(), control.clone(), &root);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !bot.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending {
         assert!(Instant::now() < deadline);
         bot.tick().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -970,7 +970,9 @@ async fn independent_spawn_failure_settles_once() {
     let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
     let mut api = controller("api", old_api, registry, control.clone(), &root);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !bot.reported || !api.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending
+        || api.readiness_receipt == ReadinessReceipt::Pending
+    {
         assert!(Instant::now() < deadline);
         bot.tick().await.unwrap();
         api.tick().await.unwrap();
@@ -1001,7 +1003,9 @@ async fn independent_spawn_failure_settles_once() {
         .unwrap();
     // Spawn errors are tolerated so the durable-settlement oracle can run.
     let _ = api.tick().await;
-    while !api.reported || control.component("api").await.unwrap().desired.is_some() {
+    while api.readiness_receipt == ReadinessReceipt::Pending
+        || control.component("api").await.unwrap().desired.is_some()
+    {
         assert!(
             Instant::now() < deadline,
             "failed request kept retrying instead of settling"
@@ -1104,7 +1108,7 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
     );
     bot.baked_compatibility = contract;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !bot.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending {
         assert!(Instant::now() < deadline);
         bot.tick().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1386,7 +1390,10 @@ async fn complete_upgrade_restore_during_rollback_is_not_rewritten() {
     let (db, control, coordinated) = completed_coordinated_upgrade(&root).await;
     let before = control.upgrade().await.unwrap().unwrap();
     let mut bot = offline_controller("bot", control.clone(), &root);
-    bot.rollback = Some((coordinated, "previous start failed".into()));
+    bot.rollback = Some(PendingRollback {
+        failed: coordinated,
+        error: "previous start failed".into(),
+    });
     let error = bot.tick().await.unwrap_err();
     assert!(
         error.to_string().contains("rollback artifact missing"),
@@ -1754,7 +1761,7 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     let child = launch(&script, &"b".repeat(40), None).await.unwrap();
     tokio::fs::write(&child.ready_file, "ready").await.unwrap();
     service.running = Some(child);
-    service.reported = true;
+    service.readiness_receipt = ReadinessReceipt::Recorded;
     assert!(!service.tick().await.unwrap());
     let pending = service.pending_failure.as_ref().unwrap();
     assert_eq!(
@@ -2892,7 +2899,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !bot.reported {
+        while bot.readiness_receipt == ReadinessReceipt::Pending {
             assert!(Instant::now() < deadline);
             bot.report_ready().await.unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3048,7 +3055,9 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !bot.reported || !api.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending
+        || api.readiness_receipt == ReadinessReceipt::Pending
+    {
         assert!(Instant::now() < deadline);
         bot.report_ready().await.unwrap();
         api.report_ready().await.unwrap();
@@ -3585,7 +3594,7 @@ async fn rejected_token_exit_during_stalled_tick_keeps_hold_reason() {
     }
     let (mut bot, result) = tokio::time::timeout(POLL, tick).await.unwrap().unwrap();
     assert!(!result.unwrap());
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert_eq!(child_start_count(&root, "health-token"), 1);
     assert!(!bot.tick().await.unwrap());
@@ -3721,9 +3730,9 @@ async fn token_exit_before_idle_keeps_health_during_stalled_control() {
         !stalled.is_finished(),
         "binding health must not wait for the stalled control read"
     );
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
-    assert!(!bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Stopped);
     assert_eq!(child_start_count(&root, name), 1);
     assert!(!bot.tick().await.unwrap());
     assert!(
@@ -3871,7 +3880,7 @@ async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
             .contains("application exited")
     );
     assert_launcher_health(addr, "not ready").await;
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     assert!(bot.restart.waiting(Instant::now()));
     assert_eq!(bot.restart.failures, 1);
     assert!(bot.running.is_none());
@@ -3983,7 +3992,7 @@ async fn ordinary_exit_during_blocked_pool_restores_health() {
             .contains("application exited")
     );
     assert_launcher_health(addr, "not ready").await;
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     assert!(bot.restart.waiting(Instant::now()));
     assert_eq!(bot.restart.failures, 1);
     assert!(bot.running.is_none());
@@ -4043,7 +4052,7 @@ async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
         error.to_string().contains("application exited"),
         "{error:#}"
     );
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     assert!(bot.running.is_none());
     assert_launcher_health(addr, "not ready").await;
     bot.pending_failure = Some(PendingFailure {
@@ -4053,7 +4062,8 @@ async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
         )),
         launcher: None,
     });
-    bot.receipt_not_before = Some(Instant::now() + Duration::from_secs(60));
+    bot.activation_receipts.schedule =
+        ReceiptSchedule::After(Instant::now() + Duration::from_secs(60));
     assert!(
         !bot.tick().await.unwrap(),
         "crash backoff still holds the restart"
@@ -4120,7 +4130,10 @@ async fn unsaved_failure_receipt_restarts_child_while_database_is_stalled() {
         bot.pending_failure.is_some(),
         "the unsaved receipt stays pending for a later retry"
     );
-    assert!(bot.receipt_not_before.is_some());
+    assert!(matches!(
+        bot.activation_receipts.schedule,
+        ReceiptSchedule::After(_)
+    ));
     assert!(!bot.tick().await.unwrap());
     assert_eq!(child_start_count(&root, "health-receipt"), 2);
     bot.stop_application().await.unwrap();
@@ -4162,7 +4175,7 @@ async fn control_link_unavailable_receipt_restarts_without_waiting() {
         source_sha: "b".repeat(40),
         release: None,
     });
-    bot.exited_for_restart = true;
+    bot.restart_intent = RestartIntent::Retry;
     bot.pending_failure = Some(PendingFailure {
         component: Some((
             release_at("bot", 'e', db::CORE_SCHEMA_VERSION),
@@ -4325,7 +4338,7 @@ async fn control_error_after_exit_during_stall_still_restarts() {
     let name = "health-ctrl";
     let (mut bot, db, root, addr) = exit_during_invalid_upgrade(name, "1").await;
     assert!(bot.running.is_none());
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     assert!(bot.restart.waiting(Instant::now()));
     assert_launcher_health(addr, "not ready").await;
     // Backoff has elapsed. The same control error must not block the restart.
@@ -4378,8 +4391,8 @@ async fn control_error_after_token_rejection_does_not_restart() {
         &jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE.to_string(),
     )
     .await;
-    assert!(bot.restart.held);
-    assert!(!bot.exited_for_restart);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
+    assert!(bot.restart_intent == RestartIntent::Stopped);
     assert!(bot.running.is_none());
     assert_launcher_health(addr, "discord token rejected").await;
     assert!(!bot.tick().await.unwrap());
@@ -4422,7 +4435,11 @@ async fn standby_child_is_not_restarted_when_control_fails() {
     tokio::fs::write(&bind_request, addr.to_string())
         .await
         .unwrap();
-    bot.standby = Some((child, "b".repeat(40), None));
+    bot.standby = Some(RestartTarget {
+        path: child,
+        source_sha: "b".repeat(40),
+        release: None,
+    });
     bot.disarm_child_health_watch().await;
     publish_exit_code(root.join(format!("exit-code-{name}")), 1).await;
     tokio::time::timeout(POLL, bot.running.as_mut().unwrap().child.wait())
@@ -4435,7 +4452,7 @@ async fn standby_child_is_not_restarted_when_control_fails() {
         bot.running.is_some(),
         "standby child stays recorded for rollback"
     );
-    assert!(!bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Stopped);
     assert_eq!(child_start_count(&root, name), 1);
     assert_launcher_health(addr, "not ready").await;
     assert!(bot.tick().await.is_err());
@@ -4472,11 +4489,14 @@ async fn failed_restart_keeps_launcher_health() {
         source_sha: "b".repeat(40),
         release: None,
     });
-    bot.exited_for_restart = true;
+    bot.restart_intent = RestartIntent::Retry;
     let error = bot.tick().await.unwrap_err();
     assert!(error.to_string().contains("os error 2"), "{error:#}");
     assert!(bot.running.is_none());
-    assert!(bot.exited_for_restart, "a failed spawn can be retried");
+    assert!(
+        bot.restart_intent == RestartIntent::Retry,
+        "a failed spawn can be retried"
+    );
     assert_launcher_health(addr, "not ready").await;
     bot.restart_target.as_mut().unwrap().path = child;
     assert!(!bot.tick().await.unwrap());
@@ -4660,7 +4680,7 @@ async fn supervisor_reap_binds_health_before_stalled_exit_control_read() {
     );
     assert_launcher_health(addr, "not ready").await;
     assert!(bot.running.is_none());
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
@@ -4881,7 +4901,7 @@ async fn readiness_recovery_holds_token_exit_between_status_checks() {
         tokio::time::timeout(POLL, recovery).await.unwrap().unwrap();
     }
     assert!(
-        bot.restart.held,
+        bot.restart.auth_admission == AuthAdmission::Held,
         "second status check must establish the token hold"
     );
     assert!(bot.running.is_none());
@@ -4938,7 +4958,7 @@ async fn readiness_recovery_keeps_unsaved_candidate_through_auth_retry() {
     .unwrap();
     release.send(()).unwrap();
     let (mut bot, result) = tokio::time::timeout(POLL, normal).await.unwrap().unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(
         bot.standby.is_some(),
         "token hold must not consume the standby"
@@ -5027,7 +5047,7 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first
             .unwrap()
             .is_none()
     );
-    assert!(!bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Allowed);
 
     // Reproduce the handoff in normal(): readiness has failed, then exit 78
     // arrives before health recovery and the following control read.
@@ -5046,7 +5066,11 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first
     bot.health_bind = Some(addr.to_string());
     let mut first_retry_at = None;
     if block_candidate_write {
-        bot.standby = Some((child, bot.base_sha.clone(), None));
+        bot.standby = Some(RestartTarget {
+            path: child,
+            source_sha: bot.base_sha.clone(),
+            release: None,
+        });
         let (releases, blockers) = block_sqlite_pool(&db).await;
         if fail_first_bind {
             // Keep the port occupied and the database blocked. Failed health
@@ -5063,7 +5087,7 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
                 "{error:#}"
             );
-            assert!(bot.restart.held);
+            assert!(bot.restart.auth_admission == AuthAdmission::Held);
             assert!(bot.health.is_none());
             assert_eq!(
                 bot.running.as_ref().unwrap().release.as_ref(),
@@ -5110,7 +5134,10 @@ async fn readiness_error_then_token_exit(block_candidate_write: bool, fail_first
     }
 
     // Inspect the boundary before allowing any control read to run.
-    assert!(bot.restart.held, "token hold must precede the control read");
+    assert!(
+        bot.restart.auth_admission == AuthAdmission::Held,
+        "token hold must precede the control read"
+    );
     assert_eq!(
         bot.restart.auth_failures, 1,
         "count each rejected child once"
@@ -5167,7 +5194,7 @@ async fn settled_exit_keeps_the_backoff_report_ready_already_recorded() {
         "{error:#}"
     );
     assert_eq!(bot.restart.failures, 1);
-    assert!(bot.exit_accounted);
+    assert!(bot.exit_accounting == ExitAccounting::Accounted);
     let not_before = bot.restart.not_before;
     bot.settle_exited_child().await.unwrap();
     assert_eq!(
@@ -5175,9 +5202,9 @@ async fn settled_exit_keeps_the_backoff_report_ready_already_recorded() {
         "settle must not count the exit again"
     );
     assert_eq!(bot.restart.not_before, not_before);
-    assert!(!bot.exit_accounted);
+    assert!(bot.exit_accounting == ExitAccounting::Unaccounted);
     assert!(bot.running.is_none());
-    assert!(bot.exited_for_restart);
+    assert!(bot.restart_intent == RestartIntent::Retry);
     bot.end_idle().await.unwrap();
     drop((bot, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
@@ -6442,7 +6469,7 @@ async fn failed_auth_retry_tick_refreshes_ready_reason_before_control_error() {
     .unwrap();
     let error = bot.tick().await.unwrap_err();
     assert!(error.to_string().contains("expected value"), "{error:#}");
-    assert!(!bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Allowed);
     assert!(bot.running.is_none());
     assert_launcher_health(addr, "not ready").await;
     // Later failed polls must not restore the stale reason, either.
@@ -6524,7 +6551,7 @@ async fn failed_auth_retry_boot_open_keeps_current_ready_reason() {
         error.to_string().contains("unsupported update-control"),
         "{error:#}"
     );
-    assert!(!restart.held);
+    assert!(restart.auth_admission == AuthAdmission::Allowed);
     assert_launcher_health(addr, "not ready").await;
     let task = health.take().unwrap();
     task.abort();
@@ -6662,7 +6689,7 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         child.child.wait().await.unwrap();
         assert!(!bot.report_ready().await.unwrap());
     }
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert_eq!(bot.restart.auth_failures, 2);
     assert_launcher_health(addr, "discord token rejected").await;
     let next = bot
@@ -6691,7 +6718,7 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
         assert!(Instant::now() < deadline, "retry child never ready");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Allowed);
     assert_eq!(bot.restart.auth_failures, 0);
     assert!(bot.health.is_none(), "start must release the idle listener");
     let released = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -6858,8 +6885,8 @@ async fn selected_exiting_bot(
             code,
             jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE
         );
-        assert!(bot.restart.held);
-        assert!(!bot.exited_for_restart);
+        assert!(bot.restart.auth_admission == AuthAdmission::Held);
+        assert!(bot.restart_intent == RestartIntent::Stopped);
         let recorded = bot.rejected_candidate.clone().or_else(|| {
             bot.restart_target
                 .as_ref()
@@ -6882,7 +6909,7 @@ async fn selected_exiting_bot(
 
 async fn wait_for_bot_ready(bot: &mut Supervisor) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !bot.reported {
+    while bot.readiness_receipt == ReadinessReceipt::Pending {
         assert!(
             Instant::now() < deadline,
             "fixture bot did not become ready"
@@ -6907,7 +6934,7 @@ async fn independent_rejected_token_retries_desired_before_installed_and_doubles
     let (root, db, mut bot, candidate, server) =
         independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert_eq!(bot.restart.auth_failures, 1);
     let first = bot
@@ -6944,8 +6971,8 @@ async fn independent_rejected_token_retries_desired_before_installed_and_doubles
     } else {
         // settle_exited_child already reaped this immediate token rejection.
         // The hold, not a still-running child, is the record of that exit.
-        assert!(bot.restart.held);
-        assert!(!bot.exited_for_restart);
+        assert!(bot.restart.auth_admission == AuthAdmission::Held);
+        assert!(bot.restart_intent == RestartIntent::Stopped);
         let recorded = bot.rejected_candidate.clone().or_else(|| {
             bot.restart_target
                 .as_ref()
@@ -6962,7 +6989,7 @@ async fn independent_rejected_token_retries_desired_before_installed_and_doubles
         ["desired-bot.start", "desired-bot.start"]
     );
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert_eq!(bot.restart.auth_failures, 2);
     let second = bot
@@ -6998,7 +7025,7 @@ async fn independent_non_auth_exit_before_readiness_still_rolls_back() {
         .installed
         .unwrap();
     bot.tick().await.unwrap();
-    assert!(!bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Allowed);
     assert_eq!(
         bot.running
             .as_ref()
@@ -7204,7 +7231,7 @@ async fn rejected_token_marker_survives_launcher_restart_during_hold() {
         independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
     bot.tick().await.unwrap();
     assert!(
-        bot.restart.held,
+        bot.restart.auth_admission == AuthAdmission::Held,
         "desired candidate must be inside the hold"
     );
     assert!(bot.running.is_none());
@@ -7218,7 +7245,7 @@ async fn rejected_token_marker_survives_launcher_restart_during_hold() {
     );
     // The hold clock is process-local. Reopening during the hold is the restart.
     let mut bot = reopen_supervisor(bot).await;
-    if bot.restart.held {
+    if bot.restart.auth_admission == AuthAdmission::Held {
         bot.restart.auth_retry_at = Some(Instant::now());
     }
     tokio::fs::remove_file(root.join("exit-code-desired-bot"))
@@ -7262,7 +7289,7 @@ async fn cleared_rejected_token_selection_is_not_revived_after_restart() {
     let (root, db, mut bot, candidate, server) =
         independent_exiting_bot(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE).await;
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     bot.control
         .failed("bot", &candidate, "selection cleared")
         .await
@@ -7283,7 +7310,7 @@ async fn cleared_rejected_token_selection_is_not_revived_after_restart() {
         .installed
         .unwrap();
     let mut bot = reopen_supervisor(bot).await;
-    if bot.restart.held {
+    if bot.restart.auth_admission == AuthAdmission::Held {
         bot.restart.auth_retry_at = Some(Instant::now());
     }
     bot.tick().await.unwrap();
@@ -7364,7 +7391,7 @@ async fn transient_rejected_candidate_lookup_is_retried() {
         "{error:#}"
     );
     assert!(
-        !bot.rejected_loaded,
+        bot.rejection_lookup == RejectionLookup::Unread,
         "a failed lookup must be retried on the next tick"
     );
     assert_eq!(
@@ -7413,7 +7440,7 @@ async fn second_token_rejection_after_restart_keeps_candidate() {
         bot.running.as_mut().unwrap().child.wait().await.unwrap();
         bot.tick().await.unwrap();
     }
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert_eq!(
         bot.control
@@ -7617,7 +7644,7 @@ async fn failed_rejected_marker_write_is_retried_before_restart() {
     )
     .await;
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert!(
         bot.control
@@ -7629,7 +7656,7 @@ async fn failed_rejected_marker_write_is_retried_before_restart() {
     );
     bot.fail_rejected_candidate_write = false;
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert!(bot.running.is_none());
     assert_eq!(
         bot.control
@@ -7892,10 +7919,10 @@ async fn exiting_bot_with_alternate() -> (
         child.child.wait().await.unwrap();
     } else {
         assert!(
-            bot.restart.held,
+            bot.restart.auth_admission == AuthAdmission::Held,
             "a settled token exit must be inside the rejected-token hold"
         );
-        assert!(!bot.exited_for_restart);
+        assert!(bot.restart_intent == RestartIntent::Stopped);
         let recorded = bot.rejected_candidate.clone().or_else(|| {
             bot.restart_target
                 .as_ref()
@@ -7990,7 +8017,7 @@ async fn rejected_marker_tracks_the_candidate_digest() {
         .unwrap();
     bot.running.as_mut().unwrap().child.wait().await.unwrap();
     bot.tick().await.unwrap();
-    assert!(bot.restart.held);
+    assert!(bot.restart.auth_admission == AuthAdmission::Held);
     assert_eq!(
         bot.control
             .rejected_candidate_digest("bot")
@@ -8054,12 +8081,12 @@ async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
                 child.started = Instant::now() - elapsed;
             } else {
                 assert!(
-                    bot.restart.held,
+                    bot.restart.auth_admission == AuthAdmission::Held,
                     "an already settled token exit must be held"
                 );
             }
             assert!(!bot.tick().await.unwrap());
-            assert!(bot.restart.held);
+            assert!(bot.restart.auth_admission == AuthAdmission::Held);
             // Advance the hold clock by the same interval, still before fallback retry.
             if ready_file.is_some() {
                 bot.restart.auth_retry_at = bot.restart.auth_retry_at.map(|at| at - elapsed);
@@ -8067,7 +8094,7 @@ async fn selected_auth_rejection_survives_legacy_readiness_deadline() {
             for _ in 0..3 {
                 assert!(!bot.tick().await.unwrap());
                 assert!(bot.running.is_none());
-                assert!(bot.restart.held);
+                assert!(bot.restart.auth_admission == AuthAdmission::Held);
             }
             let after = bot.control.component("bot").await.unwrap();
             assert_eq!(after.installed, before.installed);
@@ -8145,7 +8172,7 @@ async fn baked_auth_rejection_after_ready_is_held() {
     bot.running.as_mut().unwrap().child.wait().await.unwrap();
     for _ in 0..3 {
         assert!(!bot.tick().await.unwrap());
-        assert!(bot.restart.held);
+        assert!(bot.restart.auth_admission == AuthAdmission::Held);
         assert!(bot.running.is_none());
     }
     assert!(!ready_file.exists());
@@ -9019,7 +9046,7 @@ async fn outage_diagnostic_recovers_after_write_failure(failed_retries: usize) {
         let mut retry_errors = Vec::new();
         for _ in 0..failed_retries {
             // Advance the existing retry deadline without slowing the test.
-            service.boot_receipt_not_before = None;
+            service.boot_receipts.schedule = ReceiptSchedule::Ready;
             retry_errors.push(service.tick().await.err());
         }
         db.with_conn(|conn| {
@@ -9028,14 +9055,14 @@ async fn outage_diagnostic_recovers_after_write_failure(failed_retries: usize) {
         })
         .await
         .unwrap();
-        service.boot_receipt_not_before = None;
+        service.boot_receipts.schedule = ReceiptSchedule::Ready;
         for _ in 0..3 {
             service.tick().await.unwrap();
         }
         let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
         let kept = control.component(role).await.unwrap();
         let same_child = service.running.as_ref().unwrap().child.id() == pid;
-        let reported = service.reported;
+        let reported = service.readiness_receipt == ReadinessReceipt::Recorded;
         service.stop_application().await.unwrap();
         service.end_idle().await.unwrap();
         drop((service, control, db, reserved));
@@ -9086,7 +9113,10 @@ async fn outage_fallback_rollback_keeps_the_installed_release() {
     service.restore(&state).await.unwrap();
     wait_for_ready_file(&service).await;
     let failed = release_at("bot", 'd', schema);
-    service.rollback = Some((failed, "spawn: replacement failed".into()));
+    service.rollback = Some(PendingRollback {
+        failed,
+        error: "spawn: replacement failed".into(),
+    });
     assert!(service.report_ready().await.unwrap());
     let kept = control.component("bot").await.unwrap();
     assert_eq!(kept.installed.unwrap().digest, release.digest);
@@ -9284,7 +9314,7 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
                     for _ in 0..3 {
                         let error = service.tick().await.unwrap_err();
                         assert!(format!("{error:#}").contains("injected rollback receipt failure"));
-                        assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                        assert_eq!(service.rollback.as_ref().unwrap().failed, candidate);
                         assert_eq!(service.running.as_ref().unwrap().child.id(), fallback_pid);
                         assert_eq!(
                             control.component("bot").await.unwrap().desired,
@@ -9311,11 +9341,11 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
                         service.running.is_none(),
                         "exited fallback must be released for restore"
                     );
-                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    assert_eq!(service.rollback.as_ref().unwrap().failed, candidate);
                     service.restart.not_before = None;
                     assert!(!service.tick().await.unwrap());
                     assert_ne!(service.running.as_ref().unwrap().child.id(), fallback_pid);
-                    assert_eq!(service.rollback.as_ref().unwrap().0, candidate);
+                    assert_eq!(service.rollback.as_ref().unwrap().failed, candidate);
                     tokio::fs::remove_file(hold).await.unwrap();
                 }
                 db.with_conn(|conn| {
@@ -9523,13 +9553,16 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
     // Exercise the production ordering: retry diagnostics before readiness.
     // Make each poll retry-eligible without waiting for the backoff in real time.
     for _ in 0..3 {
-        service.receipt_not_before = None;
-        service.boot_receipt_not_before = None;
+        service.activation_receipts.schedule = ReceiptSchedule::Ready;
+        service.boot_receipts.schedule = ReceiptSchedule::Ready;
         let before = peer
             .diagnostic_requests
             .load(std::sync::atomic::Ordering::Relaxed);
         service.tick_control().await.unwrap();
-        assert!(service.reported, "pending Record must not starve readiness");
+        assert!(
+            service.readiness_receipt == ReadinessReceipt::Recorded,
+            "pending Record must not starve readiness"
+        );
         assert!(matches!(
             service.pending_boot_mismatch.front(),
             Some(PendingBootMismatch::Record { .. })
@@ -9555,8 +9588,9 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         .unwrap();
     wait_for_ready_file(&service).await;
     // Recovery must not inherit the maximum delay of an unsaved Record.
-    service.boot_receipt_attempt = 6;
-    service.boot_receipt_not_before = Some(Instant::now() + Duration::from_secs(60));
+    service.boot_receipts.attempt = 6;
+    service.boot_receipts.schedule =
+        ReceiptSchedule::After(Instant::now() + Duration::from_secs(60));
     // Managed readiness must proceed while the outage record is still deferred.
     let ready = service.tick_control().await;
     assert!(
@@ -9580,8 +9614,10 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         Some(PendingBootMismatch::Clear)
     ));
 
-    assert!(service.reported);
-    assert!(service.boot_receipt_not_before.unwrap() <= Instant::now() + Duration::from_secs(1));
+    assert!(service.readiness_receipt == ReadinessReceipt::Recorded);
+    assert!(
+        matches!(service.boot_receipts.schedule, ReceiptSchedule::After(at) if at <= Instant::now() + Duration::from_secs(1))
+    );
     // A later managed child must also report readiness when Clear is retried first.
     service.stop_application().await.unwrap();
     service
@@ -9590,13 +9626,16 @@ async fn older_writer_boot_receipt_does_not_block_api_startup() {
         .unwrap();
     wait_for_ready_file(&service).await;
     for _ in 0..3 {
-        service.receipt_not_before = None;
-        service.boot_receipt_not_before = None;
+        service.activation_receipts.schedule = ReceiptSchedule::Ready;
+        service.boot_receipts.schedule = ReceiptSchedule::Ready;
         let before = peer
             .diagnostic_requests
             .load(std::sync::atomic::Ordering::Relaxed);
         service.tick_control().await.unwrap();
-        assert!(service.reported, "pending Clear must not starve readiness");
+        assert!(
+            service.readiness_receipt == ReadinessReceipt::Recorded,
+            "pending Clear must not starve readiness"
+        );
         assert!(matches!(
             service.pending_boot_mismatch.front(),
             Some(PendingBootMismatch::Clear)
@@ -9692,7 +9731,11 @@ async fn built_in_spawn_rereads_schemas(start_path: &str) {
                 service.restore(&state).await.unwrap();
                 service.stop_child(true).await.unwrap();
             } else if start_path == "rollback" {
-                service.standby = Some((baked.clone(), service.base_sha.clone(), None));
+                service.standby = Some(RestartTarget {
+                    path: baked.clone(),
+                    source_sha: service.base_sha.clone(),
+                    release: None,
+                });
             }
             let (reached, at_spawn) = tokio::sync::oneshot::channel();
             let (resume, resumed) = tokio::sync::oneshot::channel();
@@ -9928,7 +9971,7 @@ async fn runtime_outage_recovers_without_a_child_and_preserves_a_live_child() {
         } else {
             // The persisted rejection is the real runtime path that retries a
             // candidate without first restoring an installed child.
-            service.rejected_loaded = true;
+            service.rejection_lookup = RejectionLookup::Loaded;
             service.rejected_candidate = Some(candidate.clone());
             service.persisted_candidate_digest = Some(candidate.digest.clone());
             None
@@ -10001,11 +10044,20 @@ async fn installed_outage_fallback_uses_the_existing_schema_and_registry_gates()
             allowed,
             "status={status}, core={core_offset}, guild={guild_offset}: {fallback:?}"
         );
-        if let Ok((path, sha, release)) = fallback {
+        if let Ok(RestartTarget {
+            path,
+            source_sha: sha,
+            release,
+        }) = fallback
+        {
             assert_eq!(path, baked);
             assert_eq!(sha, service.base_sha);
             assert!(release.is_none());
-            service.standby = Some((path, sha, release));
+            service.standby = Some(RestartTarget {
+                path,
+                source_sha: sha,
+                release,
+            });
             service
                 .rollback_independent(
                     &state,
@@ -10235,7 +10287,7 @@ async fn boot_mismatch_receipts_replay_after_handoff_and_reach_the_bot_writer() 
     let launcher = image(&mut objects, "api", &tokio::fs::read(&baked).await.unwrap());
     let (registry, server) = serve_objects(objects).await;
     service.registry = registry.clone();
-    service.receipt_not_before = None;
+    service.activation_receipts.schedule = ReceiptSchedule::Ready;
     assert!(matches!(
         service.handoff(&launcher, None, false).await.unwrap(),
         ControlStep::Reexec
@@ -10266,10 +10318,10 @@ async fn boot_mismatch_receipts_replay_after_handoff_and_reach_the_bot_writer() 
         .await
         .unwrap()
     );
-    service.boot_receipt_not_before = None;
-    service.receipt_not_before = None;
+    service.boot_receipts.schedule = ReceiptSchedule::Ready;
+    service.activation_receipts.schedule = ReceiptSchedule::Ready;
     service.tick_control().await.unwrap();
-    assert!(service.reported);
+    assert!(service.readiness_receipt == ReadinessReceipt::Recorded);
     assert!(service.pending_boot_mismatch.is_empty());
     let mismatch = db::read_boot_mismatch_map(&db).await.unwrap();
     assert_eq!(mismatch["api"].expected.release_id, installed.release_id);
@@ -10317,7 +10369,7 @@ async fn boot_mismatch_receipts_replay_after_handoff_and_reach_the_bot_writer() 
         matches!(service.pending_boot_mismatch.front(), Some(PendingBootMismatch::Record { running, .. }) if running.is_empty())
     );
     bot.activation.mark_lock_held(true);
-    service.boot_receipt_not_before = None;
+    service.boot_receipts.schedule = ReceiptSchedule::Ready;
     service.flush_pending_boot_mismatch().await.unwrap();
     let stopped = db::read_boot_mismatch_map(&db).await.unwrap();
     assert!(stopped["api"].running.is_empty());

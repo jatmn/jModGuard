@@ -6,8 +6,7 @@ operation does not mean its remote effect is known. Storage encodings and wire
 strings remain compatible; these types do not add a state-machine framework.
 
 The inventory identifiers below refer to the source audit of main
-`ba1245fe43f15fffd81ebdaf0ab3ce58a293d077`. The table records the implemented families; the complete inventory is still
-in progress.
+`ba1245fe43f15fffd81ebdaf0ab3ce58a293d077`. The table records all 78 implemented families.
 
 | Family | Production owner | States and guarded transitions |
 |---|---|---|
@@ -79,6 +78,16 @@ in progress.
 | SM75: REST retry and cancellation | `crates/bot/src/discord.rs` | Retry admission is `Open` or `Stopped`, independently of the `Ready`/`Until` deadline and failure count. Transient failures keep the existing capped jitter; they never reopen a stopped owner. Caller-owned resets and the existing `DiscordCall::Finished`/`Cancelled` distinction remain unchanged. Cancellation or timeout never grants permission to resend a mutation. |
 | SM76: appearance | `frontend/appearance.js` | `AppearanceSelection` distinguishes system-following from a fixed preference. `resolvedAppearance` computes light/dark without replacing the stored choice. Preference persistence, React setter identity, media listener replacement and storage-failure behavior are unchanged. |
 | SM78: CPU sampling | `crates/runtime/src/cgroup.rs` | `AwaitingBaseline` becomes `Tracking` after one observation. Missing counters reset the baseline; decreasing counters establish a new baseline. A zero elapsed interval preserves the previous sample. Only a positive elapsed interval with a nondecreasing counter yields a percentage. |
+| SM66: release selection and cadence | `src/db/updates.rs` | Checks are `Unchecked`, `Fresh`, or `Stale`; desired/installed identity is independently `Unselected`, `Pending`, or `Installed`. Automatic cadence is `Off`, `Daily`, `Weekly`, or `Monthly`; the existing transaction retains the successful-check, window, digest and pending-selection fences. Display strings and stored release JSON remain unchanged. |
+| SM67: component and pair-check leases | `src/db/updates.rs`, `src/db/update_control.rs`, and `crates/api/src/web/updates.rs` | Claim/renewal results are `Held` or `Unavailable`, encoded as the original booleans. Work requires renewal before, during, and after execution. Pair discovery still claims both roles, releases the first on second-claim failure, and atomically renews both exact owners before recording candidates. A previous `Held` result is not continuing authority. |
+| SM68: application supervisor | `crates/updater/src/main.rs` | Auth admission is `Allowed` or `Held`, restart intent is `Stopped` or `Retry`, exit accounting is `Unaccounted` or `Accounted`, and readiness receipts are `Pending` or `Recorded`. These remain independent of child liveness, retry clocks, maintenance and rollback. Only actual exit/reap and readiness evidence advance the existing guarded paths. |
+| SM69: staging and launcher handoff | `crates/updater/src/main.rs` | Prepared application identity/path, standby restart target and pending rollback are named payloads. Durable rejection lookup is `Unread` or `Loaded`, independently of rejected and persisted digests. Existing `StageTrust`, startup receipts and `ControlStep` retain verification, capability checks and handoff ordering; executing launcher capability remains authoritative. |
+| SM70: paired upgrade | `src/db/update_control.rs` and `crates/updater/src/main.rs` | Each role separately carries `Missing`/`Confirmed` preparation, stop and readiness proofs. They retain boolean JSON encoding. Existing guarded acknowledgements advance `UpgradePhase`; a new incarnation invalidates local proofs without removing the irreversible fence. Recovery after that fence remains forward-only. |
+| SM71: WebUI publication and purge | `crates/api/src/web/updates.rs` and `crates/updater/src/storage.rs` | Publication tracks an `Unchanged` or newly `Created` purge marker, clearing only its own provisional marker after failed publication. Storage verification returns `Mismatch` or `Verified` with both entry hashes. Existing asset-first publication, HTML restoration and desired/installed reconciliation retain their order. Accepted purge alone clears pending purge; publication and purge remain separate commits. |
+| SM72: runtime identity and alerts | `crates/updater/src/main.rs` and `src/db/updates.rs` | Activation and boot-diagnostic receipts have independent `Ready`/`After` schedules and backoff counters. Existing mismatch `Record`/`Clear` ordering and retained baked fallback identity stay intact. Alert consumption is `LoggedOnly` or `ChannelClaimed`, preserving boolean storage and deduplication; claimed delivery is not Discord acceptance. |
+| SM73: usage snapshots | `crates/api/src/web/usage.rs` and `frontend/administration.js` | Cached usage is `Missing`, `Fresh`, or `Expired`; each retained snapshot owns its cache timestamp and payload. Measurement staleness is a separate payload fact even when a fallback was freshly cached. Authorization still precedes cache access; overview/detail gates, bounded probe permits, revision guards and existing fallback rules remain. |
+| SM74: invocation workflows | `crates/bot/src/commands/plans.rs`, `behaviors.rs`, and `mod_reason_dm.rs` | Plan execution owns a `Step`/`Complete` cursor and accumulated outputs; success and failure both advance. Softban runs named `Ban` then `Unban` steps with separate effect recording. Failure followup is `Suppressed` or `Eligible` from the existing DM outcome. No durable jobs, rollback of earlier effects, or new remote retries are introduced. |
+| SM77: persisted guild-move fences | `src/db/guild_stores.rs` and `src/db/guild_data/member_directory.rs` | Persisted fence presence is `Clear` or `Held`; all stored move phases continue blocking writes and erasure. Core transaction guards and local scheduling snapshots use the named state. This remains dormant protocol support, with no new move orchestrator or schema. |
 
 The process shutdown transition fixes a lost-signal case: Tokio watch `send`
 does not retain a value when there are no receivers. The latch uses
@@ -215,3 +224,12 @@ responses, log-channel admission and reconciliation, causal Members controls,
 case note retries and cleanup, stale owner snapshots and appearance behavior.
 Private fixture access follows the named states; all assertions and deadlines
 remain unchanged. Browser-VM tests use a simulated DOM, not a live browser.
+
+Updater and operational coverage retains real child-exit/readiness fixtures,
+restart and rollback recovery, paired incarnation and irreversible-fence tests,
+lease expiry/owner replacement, publication restoration and purge failure,
+alert deduplication, stale usage fallback, command partial effects and persisted
+write-fence assertions. Fixture adapters preserve expected behavior. Serialized
+proofs and lease/alert states remain booleans; launcher capability is 41 while
+the application minimum remains 7. Provider fixtures do not prove live Bunny or
+Discord behavior.

@@ -8,6 +8,32 @@ use serenity::model::prelude::{ChannelId, Timestamp};
 
 use super::{Args, BehaviorOutcome, CmdEnv, mod_reason_dm, refuse_fenced_discord_mutation};
 
+#[derive(Clone, Copy)]
+enum SoftbanStep {
+    Ban,
+    Unban,
+}
+
+impl SoftbanStep {
+    fn actions(
+        self,
+    ) -> (
+        crate::db::guild_data::CaseAction,
+        crate::state::GatewayCaseAction,
+    ) {
+        match self {
+            Self::Ban => (
+                crate::db::guild_data::CaseAction::Ban,
+                crate::state::GatewayCaseAction::Ban,
+            ),
+            Self::Unban => (
+                crate::db::guild_data::CaseAction::Unban,
+                crate::state::GatewayCaseAction::Unban,
+            ),
+        }
+    }
+}
+
 fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
     if env.app.activation.may_record() {
         Ok(())
@@ -383,16 +409,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
             refuse_bot_target(env, target)?;
-            for (action, gateway_action) in [
-                (
-                    crate::db::guild_data::CaseAction::Ban,
-                    crate::state::GatewayCaseAction::Ban,
-                ),
-                (
-                    crate::db::guild_data::CaseAction::Unban,
-                    crate::state::GatewayCaseAction::Unban,
-                ),
-            ] {
+            for step in [SoftbanStep::Ban, SoftbanStep::Unban] {
+                let (action, gateway_action) = step.actions();
                 refuse_fenced_discord_mutation(env).await?;
                 lease_held(env)?;
                 let suppression = env.app.suppress_next_gateway_case(
@@ -402,7 +420,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     None,
                 );
                 let discord = async {
-                    if action == crate::db::guild_data::CaseAction::Ban {
+                    if matches!(step, SoftbanStep::Ban) {
                         // Discord deletes recent messages as part of the ban.
                         env.guild_id
                             .ban_with_reason(&env.ctx.http, target, 1, &reason)

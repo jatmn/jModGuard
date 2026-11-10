@@ -6,6 +6,14 @@ use jmodguard::db::ComponentRelease;
 use reqwest::StatusCode;
 use std::time::Duration;
 
+pub enum ReleaseVerification {
+    Mismatch,
+    Verified {
+        root_hash: String,
+        admin_hash: String,
+    },
+}
+
 pub struct Storage {
     http: reqwest::Client,
     root: String,
@@ -209,7 +217,7 @@ impl Storage {
         &self,
         registry: &Registry,
         release: &ComponentRelease,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<ReleaseVerification> {
         ensure!(release.component == "webui", "not a WebUI release");
         let prefix = format!("assets/releases/{}/", release.source_sha);
         let destinations = [
@@ -227,16 +235,16 @@ impl Storage {
         let expected = registry.files(release, &request).await?;
         for (destination, source) in destinations.iter().zip(package.iter()) {
             let Some(actual) = self.get(destination).await? else {
-                return Ok(None);
+                return Ok(ReleaseVerification::Mismatch);
             };
             if expected.get(source).is_none_or(|bytes| bytes != &actual) {
-                return Ok(None);
+                return Ok(ReleaseVerification::Mismatch);
             }
         }
-        Ok(Some((
-            sha256_hex(expected.get(&package[0]).unwrap()),
-            sha256_hex(expected.get(&package[1]).unwrap()),
-        )))
+        Ok(ReleaseVerification::Verified {
+            root_hash: sha256_hex(expected.get(&package[0]).unwrap()),
+            admin_hash: sha256_hex(expected.get(&package[1]).unwrap()),
+        })
     }
 
     async fn restore_html(&self, path: &str, previous: Option<Vec<u8>>) -> Result<()> {
