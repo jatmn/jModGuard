@@ -4527,3 +4527,32 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(requests[2].options.method, 'DELETE');
   assert.equal(h.app.state.config.known_spam.length, 1);
  });
+
+test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
+  const calls = [];
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: [], known_spam: []});
+  });
+  const rule = {name:'Known spam', enabled:true, dry_run:false, params:{}, actions:[{at:1,action:'ban',delete_days:0,purge_last_hour:true}], whitelist_users:[],whitelist_roles:[],whitelist_channels:[],include_channels:[],skip_moderators:false};
+  const modal = await h.app.editRule({name:'Known spam',rule_id:'known_spam',effective:rule});
+  assert.match(modal.textContent,/3600 seconds/);
+  assert.doesNotMatch(modal.textContent,/Action escalation/);
+  const dryLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Dry-run (log only)'));
+  await fire(findNode(dryLabel,n=>n.localName === 'input'),'change',{target:{checked:true}});
+  const skipLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Skip moderators'));
+  await fire(findNode(skipLabel,n=>n.localName === 'input'),'change',{target:{checked:true}});
+  await fire(findNode(modal,n=>n.localName === 'button' && n.textContent === 'Save'),'click');
+  assert.equal(calls[0].data.dry_run,true);
+  assert.equal(calls[0].data.skip_moderators,true);
+  assert.equal(calls[0].data.actions[0].purge_last_hour,true);
+});
+
+test('known spam inherited globals are visible and removal is owner only', async () => {
+  const h = harness();
+  h.app.state.config = {rules: [], known_spam: [{id:'7',guild_id:'0',kind:'url',value:'tinyurl.com/*',note:null}]};
+  const panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent,/tinyurl.com/);
+  assert.match(panel.textContent,/Owner only/);
+  assert.equal([...panel.querySelectorAll('button')].some(b=>b.textContent === 'Remove'),false);
+});

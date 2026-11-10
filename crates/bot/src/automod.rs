@@ -2743,7 +2743,8 @@ mod tests {
 
     #[tokio::test]
     async fn known_spam_saved_entries_reach_existing_hour_ban_helper_and_dry_run() {
-        use std::sync::atomic::AtomicBool;
+        use serenity::model::id::{GuildId, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
         for dry in [false, true] {
             for (kind, value, content) in [
                 (

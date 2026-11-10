@@ -167,9 +167,9 @@ pub(super) fn wipe_directory_guild_data_conn(
     .enumerate()
     {
         let changed = tx.execute_reclaim(sql, params![guild])? > 0;
-        config_changed |= index < 8 && changed;
+        config_changed |= index < 9 && changed;
         commands_changed |= index == 1 && changed;
-        settings_changed |= index == 7 && changed;
+        settings_changed |= index == 8 && changed;
     }
     if config_changed {
         if reclaim {

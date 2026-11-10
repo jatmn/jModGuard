@@ -5619,6 +5619,16 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
         let (status, _) = f.request("POST", "/api/guilds/10/known-spam", body).await;
         assert!(status.is_client_error());
     }
+    for (kind, value, note) in [
+        ("sample", "a".repeat(4097), None),
+        ("url", format!("example.com/{}", "a".repeat(512)), None),
+        ("sample", "sample".into(), Some("n".repeat(513))),
+        ("sample", "sample".into(), Some("bad\nnote".into())),
+    ] {
+        let body = serde_json::json!({"kind":kind,"value":value,"note":note}).to_string();
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     for (scope, kind, value, note) in [
         (
             "guild",
@@ -5637,7 +5647,11 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (_, cfg) = f.request("POST", "/api/guilds/10/config", "").await;
         let rows = cfg["known_spam"].as_array().unwrap();
-        let row = rows.iter().find(|r| r["id"] == id.to_string()).unwrap();
+        let wire_id = id.to_string();
+        let row = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(wire_id.as_str()))
+            .unwrap();
         assert_eq!(row["value"], value);
         assert_eq!(row["note"], serde_json::json!(note));
         let (status, body) = f
@@ -5669,9 +5683,8 @@ async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
     let global = db::add_enrolled_known_spam(&f.app.db, global_write, "url", "tinyurl.com/*", None)
         .await
         .unwrap();
-    let other = db::capture_configuration_scope(&f.app.db, 20)
-        .await
-        .unwrap();
+    let other =
+        db::ConfigurationScope::Guild(db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap());
     let other = db::ConfigurationWriteScope::new(other.clone(), other).unwrap();
     let foreign = db::add_enrolled_known_spam(&f.app.db, other, "sample", "foreign sample", None)
         .await

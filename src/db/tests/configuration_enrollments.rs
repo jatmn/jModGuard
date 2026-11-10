@@ -1189,7 +1189,7 @@ async fn known_spam_storage_validates_inherits_and_fences_membership() {
         .unwrap();
     assert!(get_known_spam_primary(&f.db, id).await.unwrap().is_none());
     retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
-    f.scope(10).await;
+    enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
     assert!(
         add_enrolled_known_spam(&f.db, write.clone(), "sample", "stale sample", None)
             .await
@@ -1227,4 +1227,38 @@ async fn known_spam_storage_list_capacity_is_atomic() {
         .contains("full")
     );
     assert_eq!(get_config_version(&f.db).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn known_spam_departure_erasure_keeps_globals_and_invalidates_configuration() {
+    let f = Fixture::new();
+    // A placed guild is erased by the deferred lifecycle path, not inline at retirement.
+    placed_before_erasure(&f.db, 10).await;
+    let scope = f.scope(10).await;
+    add_enrolled_known_spam(
+        &f.db,
+        edit_scope(&scope, false),
+        "sample",
+        "server sample",
+        None,
+    )
+    .await
+    .unwrap();
+    let global = add_enrolled_known_spam(
+        &f.db,
+        edit_scope(&scope, true),
+        "url",
+        "tinyurl.com/*",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!wipe_departed_directory_guild_data(&f.db, 10).await.unwrap());
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let before = get_config_version(&f.db).await.unwrap();
+    assert!(wipe_departed_directory_guild_data(&f.db, 10).await.unwrap());
+    assert!(get_config_version(&f.db).await.unwrap() > before);
+    let rows = load_config_parts(&f.db, 10).await.unwrap().known_spam;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, global);
 }
