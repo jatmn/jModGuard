@@ -171,14 +171,25 @@ fn path_glob(pattern: &str, path: &str) -> bool {
     pi == p.len()
 }
 
+// Once a path, query or fragment starts, keep its delimiters inside the span.
+// Otherwise a foreign URL's components could become independent bare links.
 static URL_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"[^\s<>()\[\]{}\"'`]+"#).expect("static URL token expression")
+    regex::Regex::new(r#"[^\s<>()\[\]{}\"'`/?#]+(?:[/?#][^\s<>]*)?"#)
+        .expect("static URL token expression")
 });
 
 // Emphasis markers belong to Discord message formatting, not the URL path.
 // Remove only paired outer markers so a literal trailing path * stays literal.
 fn url_token_text(mut token: &str) -> &str {
     token = token.trim_end_matches(['.', ',', ';', '!', '?', ':']);
+    // Keep balanced parentheses in the URL, removing only prose/Markdown closers.
+    let opens = token.bytes().filter(|&c| c == b'(').count();
+    let closes = token.bytes().filter(|&c| c == b')').count();
+    let mut unmatched = closes.saturating_sub(opens);
+    while unmatched > 0 && token.ends_with(')') {
+        token = token[..token.len() - 1].trim_end_matches(['.', ',', ';', '!', '?', ':']);
+        unmatched -= 1;
+    }
     while let Some(inner) = ["**", "__", "~~", "*", "_", "~"].iter().find_map(|marker| {
         token
             .strip_prefix(marker)
@@ -331,6 +342,47 @@ mod tests {
         let subs = list("url", "*.example.com/*");
         assert!(subs.matches("https://one.two.example.com/a"));
         assert!(!subs.matches("https://example.com/a"));
+    }
+    #[test]
+    fn known_spam_urls_do_not_promote_url_components() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for text in [
+            "https://safe.example/?q=(tinyurl.com/a)",
+            "https://safe.example/(tinyurl.com/a)",
+            "https://safe.example/#(tinyurl.com/a)",
+            "https://safe.example/?u=[tinyurl.com/a]",
+            "https://safe.example/?u=\"tinyurl.com/a\"",
+            "https://safe.example/?u='tinyurl.com/a'",
+            "https://safe.example/?u={tinyurl.com/a}",
+            "https://safe.example/tinyurl.com/a",
+            "https://safe.example/?u=(https://tinyurl.com/a)",
+            "safe.example/?q=(tinyurl.com/a)",
+        ] {
+            if compiled.matches(text) {
+                false_positives.push(text);
+            }
+        }
+        assert!(
+            false_positives.is_empty(),
+            "false positives: {false_positives:?}"
+        );
+        for text in [
+            "https://tinyurl.com/a",
+            "tinyurl.com/a",
+            "[join](https://tinyurl.com/a)",
+            "<https://tinyurl.com/a>",
+            "see (https://tinyurl.com/a)",
+            "see (tinyurl.com/a)",
+            "https://safe.example/?q=(other.example/a) tinyurl.com/a",
+            "tinyurl.com/a https://safe.example/?q=(other.example/a)",
+        ] {
+            assert!(compiled.matches(text), "{text}");
+        }
+        let exact = list("url", "example.com/a(b)");
+        assert!(exact.matches("https://example.com/a(b)"));
+        assert!(exact.matches("[join](https://example.com/a(b))"));
+        assert!(exact.matches("see (example.com/a(b))."));
     }
     #[test]
     fn known_spam_validation_bounds_and_notes() {
