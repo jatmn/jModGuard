@@ -5697,13 +5697,31 @@ function tabActions() {
 function previewInline(text, depth = 0) {
   if (depth >= 20) return [text];
   const out = [];
+  // A code opener runs to the end of its backtick run, and its closer is the
+  // next run with at least that many ticks. Index every run once, right to
+  // left, so unmatched ticks do not rescan the rest of the text.
+  let codeSpans;
+  const codeSpan = start => {
+    if (!codeSpans) {
+      codeSpans = new Map();
+      const next = [];
+      for (let end = text.length; end > 0;) {
+        if (text[end - 1] !== "`") { end--; continue; }
+        let run = end - 1;
+        while (run > 0 && text[run - 1] === "`") run--;
+        for (let i = run; i < end; i++) codeSpans.set(i, [end - i, next[end - i] ?? -1]);
+        for (let ticks = 1; ticks <= end - run; ticks++) next[ticks] = run;
+        end = run;
+      }
+    }
+    return codeSpans.get(start);
+  };
   const closing = (marker, start, skipCode = false) => {
     for (let i = start; i < text.length; i++) {
       if (text[i] === "\\") { i++; continue; }
       if (skipCode && text[i] === "`") {
-        const ticks = text.slice(i).match(/^`+/)[0];
-        const end = text.indexOf(ticks, i + ticks.length);
-        if (end >= 0) { i = end + ticks.length - 1; continue; }
+        const [ticks, end] = codeSpan(i);
+        if (end >= 0) { i = end + ticks - 1; continue; }
       }
       if (text.startsWith(marker, i)) return i;
     }
@@ -5734,11 +5752,10 @@ function previewInline(text, depth = 0) {
       out.push(text[i + 1]); i += 2; continue;
     }
     if (text[i] === "`") {
-      const marker = text.slice(i).match(/^`+/)[0];
-      const end = text.indexOf(marker, i + marker.length);
+      const [ticks, end] = codeSpan(i);
       if (end >= 0) {
-        out.push(h("code", { key }, text.slice(i + marker.length, end)));
-        i = end + marker.length; continue;
+        out.push(h("code", { key }, text.slice(i + ticks, end)));
+        i = end + ticks; continue;
       }
     }
     if (text[i] === "[") {

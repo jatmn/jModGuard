@@ -2700,6 +2700,7 @@ function previewParser(maxWork = Infinity) {
         const result = value.apply(text, args);
         if (key === 'startsWith') charge(args[0].length);
         if (key === 'indexOf') charge((result < 0 ? text.length : result + args[0].length) - (args[1] || 0));
+        if (key === 'slice') charge(result.length);
         return result;
       };
     },
@@ -2712,7 +2713,7 @@ function previewParser(maxWork = Infinity) {
   return {render, plain, work: () => work};
 }
 
-for (const [name, input] of [
+for (const [name, input, literal = true] of [
   ['unmatched brackets', '['.repeat(64000)],
   ['unmatched link destinations', '[a]('.repeat(16000)],
   ['labels without destinations', '[a]'.repeat(21333)],
@@ -2721,6 +2722,14 @@ for (const [name, input] of [
   ['one late bracket', '['.repeat(63999) + ']'],
   ['one late link marker', '['.repeat(63998) + ']('],
   ['inner balanced destination after unmatched openers', '[a]('.repeat(15999) + '[b](x)'],
+  ['unmatched backticks', 'a' + '`'.repeat(63999)],
+  ['emphasis across unmatched backticks', '*' + '`'.repeat(63998) + 'a'],
+  ['unmatched stars', '*'.repeat(64000)],
+  ['unmatched underscores', '_'.repeat(64000)],
+  ['unmatched tildes', '~'.repeat(64000)],
+  ['unmatched pipes', '|'.repeat(64000)],
+  // Each run is one tick longer than every later run, so it has no closer.
+  ['shrinking backtick runs', Array.from({length: 357}, (_, i) => '`'.repeat(357 - i)).join('a'), false],
 ]) {
   test(`Markdown preview bounds scan work for ${name}`, t => {
     const parser = previewParser(input.length * 64);
@@ -2731,8 +2740,14 @@ for (const [name, input] of [
     t.diagnostic(`${input.length} characters: ${parser.work()} string operations; uninstrumented parser ${elapsed.toFixed(3)} ms`);
     assert.equal(result.length, 1);
     assert.ok(parser.work() > 0);
-    assert.equal(result[0].props.children.join(''), input);
-    assert.equal(plain[0].props.children.join(''), input);
+    if (literal) {
+      assert.equal(result[0].props.children.join(''), input);
+      assert.equal(plain[0].props.children.join(''), input);
+    } else {
+      const markup = renderToStaticMarkup(React.createElement(React.Fragment, null, plain));
+      assert.equal(renderToStaticMarkup(React.createElement(React.Fragment, null, result)), markup);
+      assert.match(markup, /<code>/);
+    }
   });
 }
 
@@ -2891,6 +2906,36 @@ const previewBaseline = [
   [
     "\\# literal\n\\> literal\n\\- literal\n<script>alert(1)</script>&lt;b&gt;\n[bad](https:\n//example.test)",
     "<div># literal</div><div>&gt; literal</div><div>- literal</div><div>&lt;script&gt;alert(1)&lt;/script&gt;&amp;lt;b&amp;gt;</div><div>[bad](https:</div><div>//example.test)</div>"
+  ],
+  // Code-span closers, captured from main 4c406d8ed6b3067bbb47a81410fc445122f7d5ae
+  // before indexing backtick runs.
+  [
+    "a ``code` with tick`` b",
+    "<div>a <code>code` with tick</code> b</div>"
+  ],
+  [
+    "a ```x`` y````z",
+    "<div>a <code>x`` y</code>`z</div>"
+  ],
+  [
+    "a ```x`y`",
+    "<div>a ``<code>x</code>y`</div>"
+  ],
+  [
+    "a `x\\` y` z",
+    "<div>a <code>x\\</code> y` z</div>"
+  ],
+  [
+    "*a `*` b* _c ``_`` d_",
+    "<div><em>a <code>*</code> b</em> <em>c <code>_</code> d</em></div>"
+  ],
+  [
+    "**a ``**`` b `c**",
+    "<div><strong>a <code>**</code> b `c</strong></div>"
+  ],
+  [
+    "~~a `~~` ~~ ||b ```||``` c||",
+    "<div><s>a <code>~~</code> </s> <details class=\"preview-spoiler\"><summary>Spoiler</summary>b <code>||</code> c</details></div>"
   ]
 ];
 
