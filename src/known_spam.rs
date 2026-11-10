@@ -214,6 +214,20 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                     _ => {}
                 }
             }
+        } else {
+            // Invisibles delimit bare prefixes, but must not split path/query/
+            // fragment components into independent URLs.
+            let head = token
+                .as_str()
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default();
+            if let Some((i, c)) = head
+                .char_indices()
+                .rfind(|&(_, c)| crate::normalize::is_zero_width(c))
+            {
+                start += i + c.len_utf8();
+            }
         }
         offset = end;
         Some(&content[start..end])
