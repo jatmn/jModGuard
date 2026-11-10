@@ -184,15 +184,21 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     let mut offset = 0;
     std::iter::from_fn(move || {
         let token = URL_TOKENS.find_at(content, offset)?;
+        let mut start = token.start();
         let mut end = token.end();
-        // Allow destination whitespace without splitting raw URL components.
+        // Detect visible URLs despite invisible destination padding, even when
+        // the markup is not a valid rendered link. Reuse Badwords' format set.
+        let is_padding = |c: char| c.is_whitespace() || crate::normalize::is_zero_width(c);
         if content[..token.start()]
-            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .trim_end_matches(is_padding)
             .ends_with("](")
         {
+            // Non-whitespace format characters can be inside the regex token.
+            let destination = token.as_str().trim_start_matches(is_padding);
+            start = token.end() - destination.len();
             let mut depth = 0;
             let mut escaped = false;
-            for (i, byte) in token.as_str().bytes().enumerate() {
+            for (i, byte) in destination.bytes().enumerate() {
                 if escaped {
                     escaped = false;
                     continue;
@@ -201,7 +207,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                     b'\\' => escaped = true,
                     b'(' => depth += 1,
                     b')' if depth == 0 => {
-                        end = token.start() + i;
+                        end = start + i;
                         break;
                     }
                     b')' => depth -= 1,
@@ -210,7 +216,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
             }
         }
         offset = end;
-        Some(&content[token.start()..end])
+        Some(&content[start..end])
     })
 }
 
@@ -513,6 +519,109 @@ mod tests {
             "[a](\r\n\r\nhttps://safe.example)[b](https://spam.example)",
         ] {
             assert!(compiled.matches(text), "{text:?}");
+        }
+    }
+    // Explicit fixtures independent of the production padding predicate.
+    fn unicode_destination_prefixes() -> impl Iterator<Item = String> {
+        [
+            "\u{0085}", "\u{00a0}", "\u{1680}", "\u{2000}", "\u{2001}", "\u{2002}", "\u{2003}",
+            "\u{2004}", "\u{2005}", "\u{2006}", "\u{2007}", "\u{2008}", "\u{2009}", "\u{200a}",
+            "\u{2028}", "\u{2029}", "\u{202f}", "\u{205f}", "\u{3000}", "\u{200b}", "\u{200c}",
+            "\u{200d}", "\u{200e}", "\u{200f}", "\u{202a}", "\u{202b}", "\u{202c}", "\u{202d}",
+            "\u{202e}", "\u{2060}", "\u{feff}", "\u{00ad}", "\u{034f}", "\u{180e}",
+        ]
+        .into_iter()
+        .flat_map(|padding| {
+            [
+                padding.to_owned(),
+                format!(" \t{padding}\r\n "),
+                format!("{padding}\n \u{200b}\t\u{00a0}{padding}"),
+            ]
+        })
+    }
+    #[test]
+    fn known_spam_urls_match_unicode_destination_padding() {
+        let compiled = list("url", "spam.example/*");
+        let exact = list("url", "spam.example/a(b)");
+        let mut missed = Vec::new();
+        for padding in unicode_destination_prefixes() {
+            for text in [
+                format!("[a]({padding}https://spam.example)"),
+                format!("[a]({padding}https://spam.example)[b](https://safe.example)"),
+                format!("[a](https://safe.example)[b]({padding}https://spam.example)"),
+                format!("[a]({padding}https://safe.example)[b](https://spam.example)"),
+                format!(
+                    "[a](https://safe.example)[b]({padding}https://spam.example)[c](https://safe.example)"
+                ),
+                format!("[a]({padding}spam.example/a)[b](safe.example/x)"),
+                format!(r"[a]({padding}https://safe.example/a\)b)[b](https://spam.example)"),
+            ] {
+                if !compiled.matches(&text) {
+                    missed.push(text);
+                }
+            }
+            let text = format!("[a]({padding}https://spam.example/a(b))[b](https://safe.example)");
+            if !exact.matches(&text) {
+                missed.push(text);
+            }
+        }
+        assert!(missed.is_empty(), "missed destinations: {missed:?}");
+    }
+    #[test]
+    fn known_spam_urls_preserve_safe_boundaries_with_unicode_padding() {
+        let compiled = list("url", "tinyurl.com/*");
+        for padding in unicode_destination_prefixes() {
+            for destination in [
+                "https://safe.example/",
+                "https://safe.example/?q=(tinyurl.com/a)",
+                "https://safe.example/(tinyurl.com/a)",
+                "https://safe.example/#(tinyurl.com/a)",
+                "https://safe.example/?u=[tinyurl.com/a]",
+                "https://safe.example/?u=\"tinyurl.com/a\"",
+                "https://safe.example/?u='tinyurl.com/a'",
+                "https://safe.example/?u={tinyurl.com/a}",
+                "https://safe.example/tinyurl.com/a",
+                "https://safe.example/?u=(https://tinyurl.com/a)",
+                "https://safe.example/?q=[b](https://tinyurl.com/a)",
+                "safe.example/?q=(tinyurl.com/a)",
+            ] {
+                let safe = format!("[a]({padding}{destination})[b](https://other.example)");
+                assert!(!compiled.matches(&safe), "{safe:?}");
+                let spam = format!("{safe}[c]({padding}https://tinyurl.com/a)");
+                assert!(compiled.matches(&spam), "{spam:?}");
+            }
+        }
+    }
+    #[test]
+    fn known_spam_urls_handle_unicode_padding_only_destinations() {
+        let compiled = list("url", "spam.example/*");
+        for padding in unicode_destination_prefixes() {
+            let empty = format!("[a]({padding})[b](https://safe.example)");
+            assert!(!compiled.matches(&empty), "{empty:?}");
+            for text in [
+                format!("{empty}[c](https://spam.example)"),
+                format!("{empty}[c]({padding}https://spam.example)[d](https://safe.example)"),
+            ] {
+                assert!(compiled.matches(&text), "{text:?}");
+            }
+            // Padding at EOF must also make forward progress.
+            assert!(!compiled.matches(&format!("[a]({padding}")));
+        }
+    }
+    #[test]
+    fn known_spam_urls_keep_utf8_boundaries_with_unicode_padding() {
+        let compiled = list("url", "spam.example/a(b)");
+        for padding in unicode_destination_prefixes() {
+            for text in [
+                format!("é🦀[🦀]({padding}https://spam.example/a(b))[é](https://safe.example/🦀)"),
+                format!(
+                    "[é]({padding}https://safe.example/🦀)[🦀]({padding}https://spam.example/a(b))"
+                ),
+            ] {
+                assert!(compiled.matches(&text), "{text:?}");
+                let tokens: Vec<_> = url_tokens(&text).collect();
+                assert!(tokens.contains(&"https://spam.example/a(b)"), "{tokens:?}");
+            }
         }
     }
     #[test]
