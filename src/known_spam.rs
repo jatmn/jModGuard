@@ -222,8 +222,13 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
             let bare = token
                 .as_str()
                 .trim_start_matches(crate::normalize::is_zero_width);
-            start = token.end() - bare.len();
             let head = bare.split(['/', '?', '#']).next().unwrap_or_default();
+            // Invisibles before `@` are a username; keep them for the exclusion.
+            start = if head.contains('@') {
+                token.start()
+            } else {
+                token.end() - bare.len()
+            };
             // Keep structural userinfo on the complete candidate for exclusion.
             if let Some(i) = head.find(crate::normalize::is_zero_width)
                 && !head.contains('@')
@@ -880,6 +885,31 @@ mod tests {
         assert!(false_positives.is_empty(), "{false_positives:?}");
         assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
         assert!(compiled.matches("tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_reject_invisible_only_usernames() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for username in [
+            "\u{200b}",
+            "\u{00ad}",
+            "\u{feff}",
+            "\u{200b}\u{2060}\u{034f}",
+        ] {
+            for before in ["", "word ", "word"] {
+                for rest in ["@tinyurl.com", "@tinyurl.com/a", ":@tinyurl.com/a"] {
+                    let text = format!("{before}{username}{rest}");
+                    if compiled.matches(&text) {
+                        false_positives.push(text);
+                    }
+                }
+            }
+        }
+        assert!(false_positives.is_empty(), "{false_positives:?}");
+        // A plain empty username has no userinfo to exclude.
+        assert!(compiled.matches("@tinyurl.com/a"));
+        assert!(compiled.matches("\u{200b} @tinyurl.com/a"));
+        assert!(compiled.matches("\u{200b}https://tinyurl.com/a"));
     }
     #[test]
     fn known_spam_bare_urls_do_not_discard_credential_prefixes() {
