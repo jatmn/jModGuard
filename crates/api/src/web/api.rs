@@ -111,6 +111,8 @@ pub async fn guild_config(
         let global_row = snapshot.global_templates.get(event).cloned();
         templates.push(serde_json::json!({
             "event": event,
+            "shipped": def,
+            "embed_style": jmodguard::log_embeds::style(event),
             "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
             "guild_override": guild_row,
             "global": global_row.unwrap_or_else(|| def.to_string()),

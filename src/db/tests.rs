@@ -5246,3 +5246,65 @@ fn invite_description_copy_without_marker_matches_save_semantics() {
         }
     });
 }
+
+#[test]
+fn embed_defaults_upgrade_only_exact_untouched_rows_once() {
+    let tmp = tmp_db_path("embed_defaults");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded("DELETE FROM meta WHERE key='embed_log_defaults_v1'", (), 65_536)?;
+        for (event, old) in crate::defaults::pre_embed_log_templates() {
+            for guild in [0, 123, 456] {
+                let text = if guild == 456 { format!("custom {old}") } else { old.into() };
+                conn.execute_bounded(
+                    "INSERT OR REPLACE INTO templates(guild_id,event_type,template) VALUES(?1,?2,?3)",
+                    params![guild, event, text], 65_536,
+                )?;
+            }
+        }
+        Ok(())
+    })).unwrap();
+    let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
+    for guild in [0, 123, 456] {
+        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
+        for (event, new) in crate::defaults::rendered_log_templates() {
+            if guild == 456 {
+                let old = crate::defaults::pre_embed_log_templates()
+                    .into_iter()
+                    .find(|(e, _)| *e == event)
+                    .unwrap()
+                    .1;
+                assert_eq!(parts.templates[event], format!("custom {old}"));
+            } else {
+                assert_eq!(parts.templates[event], new);
+            }
+        }
+    }
+    tokio_test_block_on(db.with_conn(|conn| {
+        let (event, old) = crate::defaults::pre_embed_log_templates()[0];
+        conn.execute_bounded(
+            "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type=?2",
+            params![old, event],
+            65_536,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
+    let (event, old) = crate::defaults::pre_embed_log_templates()[0];
+    assert_eq!(parts.templates[event], old);
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}

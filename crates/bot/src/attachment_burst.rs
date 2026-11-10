@@ -1728,9 +1728,18 @@ fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionRes
         ("decision".to_string(), label.to_string()),
         ("actor".to_string(), format!("user {actor}")),
     ]);
-    let content = templates::render_bounded(ATTACHMENT_BURST_DECISION, &vars, 2000);
+    let mut embed = jmodguard::log_embeds::render("automod", ATTACHMENT_BURST_DECISION, &vars);
+    // Promote only the exact shipped heading. Other saved previews may carry
+    // legacy or custom headings, so keep their body intact without adding a title.
+    let heading = format!("{}\n\n", embed.title);
+    if let Some(body) = embed.description.strip_prefix(&heading) {
+        embed.description = body.to_string();
+    } else {
+        embed.title.clear();
+    }
     EditInteractionResponse::new()
-        .content(content)
+        .content("")
+        .embed(crate::logging::discord_embed(embed))
         .allowed_mentions(
             serenity::builder::CreateAllowedMentions::new()
                 .all_users(false)
@@ -4179,8 +4188,20 @@ mod tests {
             let value =
                 serde_json::to_value(decision_edit(review.body.clone(), label, UserId::new(7)))
                     .unwrap();
-            assert!(value["content"].as_str().unwrap().encode_utf16().count() <= 2000);
-            assert!(value["content"].as_str().unwrap().contains(label));
+            assert!(
+                value["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+                    <= 4096
+            );
+            assert!(
+                value["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(label)
+            );
             assert_eq!(value["allowed_mentions"]["parse"], serde_json::json!([]));
             assert_eq!(value["allowed_mentions"]["replied_user"], false);
             assert_eq!(value["components"], serde_json::json!([]));
@@ -4632,6 +4653,144 @@ mod tests {
             "a read error permanently consumed the visible review without an action"
         );
     }
+    async fn attachment_burst_decision_title_once(label: Option<&str>) {
+        let (app, path) = open_app();
+        let mut vars = BTreeMap::from([
+            ("rule".into(), "Attachment burst".into()),
+            ("mention".into(), "user 99".into()),
+            ("action".into(), "timeout 10m".into()),
+            ("reason".into(), "fixture".into()),
+            ("content".into(), "fixture".into()),
+            ("channel".into(), "channel 1".into()),
+            ("time".into(), "2026-10-26T02:03:04Z".into()),
+        ]);
+        let original = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
+        let mut visible = original.clone();
+        if let Some(label) = label {
+            let payload =
+                serde_json::to_value(decision_edit(original.clone(), label, UserId::new(7)))
+                    .unwrap();
+            visible = payload["content"].as_str().unwrap_or_default().to_string();
+            for embed in payload["embeds"].as_array().unwrap() {
+                for key in ["title", "description"] {
+                    visible.push_str(embed[key].as_str().unwrap_or_default());
+                }
+                for field in embed["fields"].as_array().into_iter().flatten() {
+                    visible.push_str(field["name"].as_str().unwrap());
+                    visible.push_str(field["value"].as_str().unwrap());
+                }
+            }
+            assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
+            assert_eq!(payload["embeds"][0]["title"], "Automod");
+            assert!(visible.contains(&format!("**Review:** {label} by user 7")));
+            assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(payload["components"], serde_json::json!([]));
+        }
+        assert_eq!(visible.matches("Automod").count(), 1, "{visible}");
+        assert!(visible.contains("Attachment burst"));
+        assert_eq!(
+            logging::preview_automod(&app, GuildId::new(10), &mut vars).await,
+            original
+        );
+        drop(app);
+        close_app(&path);
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_release() {
+        attachment_burst_decision_title_once(Some(ATTACHMENT_BURST_RELEASED)).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_ban() {
+        attachment_burst_decision_title_once(Some(ATTACHMENT_BURST_BANNED)).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_burst_decision_title_once_preview() {
+        attachment_burst_decision_title_once(None).await;
+    }
+
+    fn assert_attachment_burst_decision_body_title_once(body: &str) {
+        for label in [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED] {
+            let payload =
+                serde_json::to_value(decision_edit(body.to_string(), label, UserId::new(7)))
+                    .unwrap();
+            let mut visible = payload["content"].as_str().unwrap_or_default().to_string();
+            for embed in payload["embeds"].as_array().unwrap() {
+                for key in ["title", "description"] {
+                    visible.push_str(embed[key].as_str().unwrap_or_default());
+                }
+                for field in embed["fields"].as_array().into_iter().flatten() {
+                    visible.push_str(field["name"].as_str().unwrap());
+                    visible.push_str(field["value"].as_str().unwrap());
+                }
+            }
+            assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
+            assert_eq!(payload["content"], "");
+            assert_eq!(payload["embeds"].as_array().unwrap().len(), 1);
+            assert!(
+                payload["embeds"][0]["title"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+            assert_eq!(
+                payload["embeds"][0]["description"],
+                format!("{body}\n\n**Review:** {label} by user 7")
+            );
+            assert!(
+                payload["embeds"][0]["fields"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(payload["components"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn attachment_burst_decision_title_once_pre_embed() {
+        assert_attachment_burst_decision_body_title_once(
+            "**:shield: Automod: Attachment burst**\n\n**User:** user 99\n**Reason:** fixture",
+        );
+    }
+
+    #[test]
+    fn attachment_burst_decision_title_once_single_newline() {
+        assert_attachment_burst_decision_body_title_once(
+            "Automod\n**Rule:** Attachment burst\n**Reason:** fixture",
+        );
+    }
+
+    #[test]
+    fn attachment_burst_decision_title_once_crlf() {
+        assert_attachment_burst_decision_body_title_once(
+            "Automod\r\n\r\n**Rule:** Attachment burst\r\n**Reason:** fixture",
+        );
+    }
+
+    #[test]
+    fn attachment_burst_decision_title_once_custom_unmigrated() {
+        // Pre-embed default with custom prefix/suffix, which the exact-only
+        // defaults migration deliberately leaves untouched (guild 456 fixture).
+        let old = "**:shield: Automod: {rule}**\n\n**User:** {mention}\n**Action:** {action}\n**Reason:** {reason}\n**Channel:** {channel}\n**Time:** `{time}`\n**Evidence:** {content}";
+        let vars = BTreeMap::from([
+            ("rule".into(), "Attachment burst".into()),
+            ("mention".into(), "user 99".into()),
+            ("action".into(), "timeout 10m".into()),
+            ("reason".into(), "fixture".into()),
+            ("content".into(), "fixture evidence".into()),
+            ("channel".into(), "channel 1".into()),
+            ("time".into(), "2026-10-26T02:03:04Z".into()),
+        ]);
+        let body = jmodguard::templates::render(&format!("custom {old}\ncustom suffix"), &vars);
+        assert_attachment_burst_decision_body_title_once(&body);
+    }
+
     #[tokio::test]
     async fn decision_edits_preserve_log_date_formatting() {
         let (app, path) = open_app();
@@ -4654,7 +4813,10 @@ mod tests {
                 let rendered =
                     serde_json::to_value(decision_edit(preview.clone(), label, UserId::new(7)))
                         .unwrap();
-                rendered["content"].as_str().unwrap().to_string()
+                rendered["embeds"][0]["description"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
             })
             .collect();
         assert_eq!(

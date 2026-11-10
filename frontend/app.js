@@ -3108,11 +3108,89 @@ function tabTemplates() {
       h(
         "p",
         { className: "muted" },
-        "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Activity reports also supply {added}, {removed}, {role}, {role_id}, {role_name}, {detail}, {before_global}, {after_global}, {thread}, {thread_id}, {thread_name}, {notice}, {archived}, {locked}, {auto_archive}, and {invitable} when that event has them. They do not supply message text. Custom templates keep their wording. The readable-log upgrade updates exact previous defaults once; dates include whole seconds and UTC. Add fields to custom templates where needed.",
+        "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Activity reports also supply {added}, {removed}, {role}, {role_id}, {role_name}, {detail}, {before_global}, {after_global}, {thread}, {thread_id}, {thread_name}, {notice}, {archived}, {locked}, {auto_archive}, and {invitable} when that event has them. They do not supply message text. Custom templates keep their wording. Log posts use colored embeds. Shipped defaults become fields; customized text fills the description. The embed upgrade updates exact previous defaults once; dates include whole seconds and UTC. The preview uses sample data and the same embed limits.",
       ),
     ),
     ...state.config.templates.map((t) => h(TemplateCard, { key: t.event, record: t })),
   );
+}
+
+// Same UTF-16 budget and substitution order as the shared log renderer.
+function clipEmbedText(text, limit) {
+  if (text.length <= limit) return text;
+  if (!limit) return "";
+  let out = "";
+  for (const ch of text) {
+    if (out.length + ch.length > limit - 1) break;
+    out += ch;
+  }
+  return out + "…";
+}
+
+function renderEmbedText(template, vars, limit) {
+  let out = "";
+  for (const chunk of template.match(/[^}]*}|[^}]+$/g) || []) {
+    const start = chunk.endsWith("}") ? chunk.lastIndexOf("{") : -1;
+    const key = start >= 0 ? chunk.slice(start + 1, -1) : "";
+    const value = Object.hasOwn(vars, key) ? vars[key] : undefined;
+    for (const text of value === undefined ? [chunk] : [chunk.slice(0, start), value]) {
+      for (const ch of text) {
+        if (out.length + ch.length > limit) {
+          if (!limit) return "";
+          // Rust pops the last scalar only when the budget is exhausted.
+          if (out.length === limit) out = Array.from(out).slice(0, -1).join("");
+          return out + "…";
+        }
+        out += ch;
+      }
+    }
+  }
+  return out;
+}
+
+function templateEmbedPreview(record, template, vars) {
+  const style = record.embed_style || { title: "Log event", color: 0xffb347 };
+  const action = (vars.action || "").trim().toLowerCase();
+  const color = style.removal_color && vars.removed && vars.removed !== "none"
+    ? style.removal_color : style.action_colors?.[action] ?? style.color;
+  const title = clipEmbedText(style.title, 256);
+  let left = 6000 - title.length;
+  const fields = [];
+  let description = "";
+  if (template === record.shipped) {
+    for (const line of template.split("\n").slice(1)) {
+      const match = line.match(/^\*\*(.*?):\*\* (.*)$/);
+      if (!match || fields.length === 25 || left < 2) continue;
+      const name = clipEmbedText(match[1], Math.min(256, left - 1));
+      left -= name.length;
+      const value = clipEmbedText(renderEmbedText(match[2], vars, 1024) || "—", Math.min(1024, left));
+      left -= value.length;
+      fields.push({ name, value });
+    }
+  } else {
+    description = renderEmbedText(template, vars, Math.min(4096, left));
+  }
+  return { title, color, description, fields };
+}
+
+function logPreviewText(text) {
+  // React escapes text; a small Markdown subset makes labels/code readable.
+  return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, key) =>
+    part.startsWith("**") ? h("strong", { key }, part.slice(2, -2)) :
+    part.startsWith("`") ? h("code", { key }, part.slice(1, -1)) : part,
+  );
+}
+
+function LogEmbedPreview({ embed }) {
+  return h("div", {
+    className: "log-embed",
+    style: { borderLeftColor: `#${embed.color.toString(16).padStart(6, "0")}` },
+  },
+  h("strong", { className: "log-embed-title" }, embed.title),
+  embed.description ? h("div", { className: "log-embed-description" }, logPreviewText(embed.description)) : null,
+  ...embed.fields.map((field, key) => h("div", { className: "log-embed-field", key },
+    h("strong", {}, field.name), h("div", {}, logPreviewText(field.value)),
+  )));
 }
 
 function TemplateCard({ record: t }) {
@@ -3125,19 +3203,22 @@ function TemplateCard({ record: t }) {
     spellCheck: false,
     defaultValue: t.effective,
   });
-  const preview = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? (
-    t.effective
-      .replaceAll("{user}", "Alice")
-      .replaceAll("{mention}", "@alice")
-      .replaceAll("{channel}", "#general")
-      .replaceAll("{actor}", "Bob (mod)")
-      .replaceAll("{reason}", "spam")
-      .replaceAll("{rule}", "mention_spam")
-      .replaceAll("{action}", "ban")
-      .replaceAll("{content}", "FREE NITRO http://scam.link")
-      .replaceAll("{count}", "3")
-      .replaceAll("{time}", new Date().toISOString())
-  );
+  const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
+  const preview = templateEmbedPreview(t, template, {
+    user: "Alice", user_id: "123456789012345678", mention: "@alice", channel: "#general",
+    actor: "Bob (mod)", reason: "spam", rule: "mention_spam", action: t.event === "role_change" ? "updated" : "ban",
+    content: "FREE NITRO https://example.test", count: "3", removed: "none", added: "@Member",
+    before: "Previous text", after: "Updated text", attachments: "none", coverage: "retained snapshot",
+    message_url: "https://discord.com/channels/1/2/3", time: "Nov 09, 2026 • 22:35:54 UTC",
+    account_created: "Nov 01, 2026 • 10:00:00 UTC", account_age: "1w 1d", duration: "1d",
+    joined: "Nov 08, 2026 • 22:35:54 UTC", cases: "Case #1: warning", notice: t.event === "thread_create" ? "created" : "Prior moderation",
+    retained: "2", unavailable: "1", unknown: "0", filtered: "0", omitted: "0",
+    details: "transcript attached", rule_id: "mention_spam", command: "example",
+    role: "@Member", role_id: "123456789012345679", role_name: "Member", detail: "Permissions updated",
+    before_global: "Alice", after_global: "Alice Example", thread: "#discussion",
+    thread_id: "123456789012345680", thread_name: "Discussion", archived: "false", locked: "false",
+    auto_archive: "1d", invitable: "true",
+  });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
   return h(
@@ -3155,7 +3236,7 @@ function TemplateCard({ record: t }) {
           "div",
           { className: "template-preview" },
           h("strong", {}, "Preview"),
-          h("pre", { className: "code" }, preview),
+          h(LogEmbedPreview, { embed: preview }),
         ),
       ),
       h(

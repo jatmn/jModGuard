@@ -44,14 +44,14 @@ Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{ro
 
 - **member_join** — joined the server, account created/age
 - **member_leave** — left, elapsed time and join date from cached member or recently received message member details; no historical join count
-- **member_ban** / **member_unban** — hammer/unlock with recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
-- **member_kick** — boot with actor + reason
+- **member_ban** / **member_unban** — recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
+- **member_kick** — actor + reason
 - **message_edit** — one Discord-identified edit (`edited_timestamp`), last observed before and updated text with coverage label. Embed/GIF unfurls, chat replies and the bot's own log posts do not create edit reports.
 - **message_delete** — message ID and last observed author, text and attachment metadata when available, plus `{coverage}` for continuous observation, a gap or restart, or an unavailable snapshot
-- **message_bulk_delete** — unique count, retained/known-missing/storage-unknown/filtered counts, omitted transcript entries, and a transient bounded transcript attachment; a definite attachment-permission failure uses plain-message chunks with an exact omitted count
-- **automod** — shield: rule, action, reason, evidence, channel
+- **message_bulk_delete** — unique count, retained/known-missing/storage-unknown/filtered counts, omitted transcript entries, and a transient bounded transcript attachment; a definite attachment-permission failure uses embed text chunks with an exact omitted count
+- **automod** — rule, action, reason, evidence, channel
 - **automod_delete** — automod rule that removed a message (distinct from a plain human delete). Last observed text, attachments, and `{coverage}` use the same semantics as `message_delete`. Uses the `automod_delete` log channel when set, otherwise the `message_delete` channel. After a bot restart, a gateway delete that arrives before the mark was recorded still logs as **message_delete**
-- **mod_action** — judge: action, user, moderator, reason
+- **mod_action** — action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
 - **plan_executed** — custom command runs
 - **system** — general notices, including one start notice per process and a
@@ -66,6 +66,18 @@ Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{ro
 These activity events follow the same opt-in rule: no log channel means no post.
 Their default wording lives in the bot until an operator saves a template. They
 are not new guild-store event types.
+
+## Accent mapping
+
+| Accent | Events |
+| --- | --- |
+| Red `0xff6666` | `member_ban`, `timeout_add`, `message_delete`, `message_bulk_delete`, `automod_delete`, `member_leave`, `thread_delete`, `voice_leave`; `role_change` deleted; `member_role_update` with any removal (including mixed additions/removals) |
+| Yellow `0xfdfd96` | `member_rejoin` (prior cases), `system`; `automod` and `mod_action` when action is `warn` or `warning` |
+| Orange `0xffb347` | `member_kick`, `message_edit`, other `automod` / `mod_action`, `nickname_change`, `username_change`, `voice_move`, `thread_update`, `plan_executed`; role updates and additions |
+| Green `0x77dd77` | `member_join`, `member_unban`, `timeout_remove`, `voice_join`, `thread_create`; `role_change` created |
+
+`thread_create` uses the title “Thread available” and a Notice field to distinguish
+newly created threads from existing threads the bot just joined or can now see.
 
 ## Log channel routing
 
@@ -93,9 +105,26 @@ automod_delete→  ⛔ {rule} deleted `{message_id}` in {channel}; text: {conten
 message_delete→  🗑 Message `{message_id}` deleted in {channel}; text: {content}; attachments: {attachments}; coverage: {coverage}.
 ```
 
-Discord reports are bounded to 2000 UTF-16 units, including truncation markers.
-Mentions and automatic link previews are suppressed. Individual supplied text fields
-may be clipped earlier. Unknown variables remain visible; availability depends on
+Log-channel reports use one Discord embed with a short title and left accent.
+Exact shipped defaults become named fields (User, Moderator, Reason, Channel,
+Time and event evidence); the template is parsed before values are substituted,
+so observed text cannot introduce fields. A custom template fills the description
+with its wording and substitutions intact, using the same event accent. No custom
+emoji server or additional per-log avatar lookup is used. The Templates live preview
+shows the layout with sample data, including unsaved edits.
+
+Limits count UTF-16 units: title 256, description 4096, at most 25 fields, field
+names 256 and values 1024, total 6000. No author or footer is emitted (their Discord
+limits are 256 and 2048). Truncation preserves Unicode scalar boundaries and adds
+an ellipsis; the aggregate budget goes to the title, description, then fields in
+order. Existing evidence bounds can clip supplied text earlier. Automod proving
+hashes are shortened as whole digests with an omitted count before field clipping.
+Mentions are disabled with allowed_mentions; visible mentions inside embeds do not
+ping. Links remain clickable inside the explicit embed, without generating extra
+content link previews. Attachments remain files; if Attach Files permission fails,
+at most three bounded transcript chunks appear as embed descriptions with the
+existing omission counts and delivery semantics. The bot needs **Embed Links** in
+log channels. Unknown variables remain visible; availability depends on
 the event. See [logging/data behavior](LOGGING-DATA.md).
 
 ## Existing saved templates
@@ -140,3 +169,10 @@ are not rewritten, and no missing history is recovered.
 The attachment detail upgrade replaces only exact copies of the previous shipped
 single-delete template. Custom templates remain unchanged; add `{attachments}`
 to one if you want its deletion reports to show observed URLs.
+
+The `embed_log_defaults_v1` startup upgrade follows the previous shipped-default
+migrations: it replaces only byte-for-byte previous shipped strings, at global
+and guild scope, once. Custom strings remain unchanged. A deliberate restoration
+of old wording after that upgrade remains a custom description. Code-only activity
+defaults stay code-only; the upgrade does not seed extra global activity rows.
+Historical posts, channel routing, filtering and recorded event data are unchanged.
