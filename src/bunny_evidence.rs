@@ -32,6 +32,10 @@ pub struct BunnyEvidenceStore {
     client: Client<HttpsConnector<HttpConnector>>,
     admission: Arc<Semaphore>,
 }
+
+/// Freshly checked original binding and durable provider acceptance.
+struct AcceptedTransfer(BunnyTransfer);
+
 fn digest_hex(digest: ring::digest::Digest) -> String {
     let mut out = String::with_capacity(64);
     for byte in digest.as_ref() {
@@ -209,7 +213,11 @@ impl BunnyEvidenceStore {
         );
         Ok(job)
     }
-    async fn progress(&self, store: &GuildDataStore, t: &EvidenceTarget) -> Result<BunnyTransfer> {
+    async fn accepted_transfer(
+        &self,
+        store: &GuildDataStore,
+        t: &EvidenceTarget,
+    ) -> Result<AcceptedTransfer> {
         let progress = store
             .bunny_transfer(t.scope.clone(), t.case_id.clone(), t.evidence_id.clone())
             .await?;
@@ -218,10 +226,10 @@ impl BunnyEvidenceStore {
             "evidence storage binding changed"
         );
         ensure!(
-            progress.accepted,
+            progress.acceptance == BunnyAcceptance::Accepted,
             "Bunny PUT outcome unresolved; provider confirmation required"
         );
-        Ok(progress)
+        Ok(AcceptedTransfer(progress))
     }
     async fn verify_object(&self, job: &EvidenceJob, sha256: &str) -> Result<()> {
         self.timed(async {
@@ -270,7 +278,7 @@ impl BunnyEvidenceStore {
                 && job.cancellation == EvidenceCancellation::NotCancelled,
             "evidence is not available in this scope"
         );
-        self.progress(store, target).await?;
+        self.accepted_transfer(store, target).await?;
         self.verify_resource().await?;
         self.timed(async {
             let mut response = self
@@ -420,7 +428,7 @@ impl BunnyEvidenceStore {
     }
     async fn finish(&self, store: &GuildDataStore, t: &EvidenceTarget) -> Result<EvidenceState> {
         let job = self.job(store, t).await?;
-        let progress = self.progress(store, t).await?;
+        let AcceptedTransfer(progress) = self.accepted_transfer(store, t).await?;
         if job.state != EvidenceState::Capturing {
             return Ok(job.state);
         }
@@ -455,7 +463,7 @@ impl BunnyEvidenceStore {
         self.run(move |this| {
             Box::pin(async move {
                 this.job(&store, &t).await?;
-                this.progress(&store, &t).await?;
+                this.accepted_transfer(&store, &t).await?;
                 this.verify_resource().await?;
                 this.finish(&store, &t).await
             })
@@ -466,7 +474,7 @@ impl BunnyEvidenceStore {
         self.run(move |this| {
             Box::pin(async move {
                 let mut job = this.job(&store, &t).await?;
-                this.progress(&store, &t).await?;
+                this.accepted_transfer(&store, &t).await?;
                 this.verify_resource().await?;
                 if job.state == EvidenceState::Capturing
                     && job.cancellation == EvidenceCancellation::Cancelled
