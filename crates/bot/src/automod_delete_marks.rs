@@ -190,21 +190,62 @@ struct MessageGatewayState {
     report_owner: Option<ReportOwner>,
 }
 
-/// Delivery of one message that stayed in a bulk transcript.
-/// `covered` is set only after that transcript is actually delivered.
-/// `ambiguous` means a timeout or partial send may already have reached Discord.
-/// `terminal_at` starts the suppression window once every REST attempt for the
-/// message has settled. Until then the row is not eligible for expiry.
+/// Delivery and REST settlement are independent: ambiguous delivery keeps
+/// suppressing replay until every REST attempt settles and its window expires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BulkSendState {
+    InFlight,
+    Delivered,
+    Ambiguous,
+}
+
+impl BulkSendState {
+    fn retains_report(self) -> bool {
+        matches!(self, Self::Delivered | Self::Ambiguous)
+    }
+}
+
+enum DeferredPlainReport {
+    None,
+    Requested,
+}
+
 struct BulkLogState {
-    inflight: bool,
-    covered: bool,
-    ambiguous: bool,
-    deferred: bool,
+    delivery: BulkSendState,
+    plain: DeferredPlainReport,
     deferred_retained: Option<MessageSnapshot>,
     /// Success report held back while this transcript send is still in flight.
     deferred_automod: Option<AutomodSettlement>,
     started: Instant,
     terminal_at: Option<Instant>,
+}
+
+impl BulkLogState {
+    fn sending(now: Instant) -> Self {
+        Self {
+            delivery: BulkSendState::InFlight,
+            plain: DeferredPlainReport::None,
+            deferred_retained: None,
+            deferred_automod: None,
+            started: now,
+            terminal_at: None,
+        }
+    }
+
+    fn begin(&mut self, now: Instant) -> bool {
+        if self.delivery.retains_report() {
+            return false;
+        }
+        self.started = now;
+        true
+    }
+
+    fn retain(&mut self, outcome: BulkSendState) {
+        self.delivery = outcome;
+        self.plain = DeferredPlainReport::None;
+        self.deferred_retained = None;
+        self.deferred_automod = None;
+    }
 }
 
 /// Outstanding attempt ids remembered on one overflow row. Further overlapping
@@ -446,9 +487,9 @@ impl AutomodDeleteMarks {
             return None;
         }
         let state = self.bulk_logs.get(&target)?;
-        if state.covered || state.ambiguous {
+        if state.delivery.retains_report() {
             Some(BulkHold::Retained)
-        } else if state.inflight {
+        } else if state.delivery == BulkSendState::InFlight {
             Some(BulkHold::Inflight)
         } else {
             None
@@ -612,9 +653,7 @@ impl AutomodDeleteMarks {
     }
 
     fn bulk_row_owns(&self, target: MessageTarget) -> bool {
-        self.bulk_logs
-            .get(&target)
-            .is_some_and(|state| state.inflight || state.covered || state.ambiguous)
+        self.bulk_logs.contains_key(&target)
     }
 
     fn observe_unmarked(
@@ -1032,7 +1071,7 @@ impl AutomodDeleteMarks {
         self.push_mark_expiry(key, expires);
         if let Some(state) = self.bulk_logs.get_mut(&target) {
             // A new attempt can still fail and needs the ambiguous row.
-            if state.ambiguous {
+            if state.delivery == BulkSendState::Ambiguous {
                 state.terminal_at = None;
             }
         }
@@ -1202,10 +1241,12 @@ impl AutomodDeleteMarks {
     }
 
     fn bulk_log_deadline(state: &BulkLogState) -> Option<Instant> {
-        if state.inflight || state.deferred {
+        if state.delivery == BulkSendState::InFlight
+            || matches!(state.plain, DeferredPlainReport::Requested)
+        {
             return None;
         }
-        if state.ambiguous {
+        if state.delivery == BulkSendState::Ambiguous {
             return state
                 .terminal_at
                 .and_then(|at| at.checked_add(AUTOMOD_DELETE_MARK_TTL));
@@ -1226,7 +1267,9 @@ impl AutomodDeleteMarks {
             return;
         }
         let ready = self.bulk_logs.get(&target).is_some_and(|state| {
-            state.ambiguous && !state.inflight && !state.deferred && state.terminal_at.is_none()
+            state.delivery == BulkSendState::Ambiguous
+                && matches!(state.plain, DeferredPlainReport::None)
+                && state.terminal_at.is_none()
         });
         if !ready {
             return;
@@ -1289,7 +1332,10 @@ impl AutomodDeleteMarks {
 
     fn bulk_coverage(&self, target: MessageTarget) -> (bool, bool) {
         match self.bulk_logs.get(&target) {
-            Some(state) => (state.covered || state.ambiguous, state.inflight),
+            Some(state) => (
+                state.delivery.retains_report(),
+                state.delivery == BulkSendState::InFlight,
+            ),
             None => (false, false),
         }
     }
@@ -1315,22 +1361,10 @@ impl AutomodDeleteMarks {
         {
             return false;
         }
-        let state = self.bulk_logs.entry(target).or_insert(BulkLogState {
-            inflight: false,
-            covered: false,
-            ambiguous: false,
-            deferred: false,
-            deferred_retained: None,
-            deferred_automod: None,
-            started: now,
-            terminal_at: None,
-        });
-        if state.covered || state.ambiguous {
-            return false;
-        }
-        state.inflight = true;
-        state.started = now;
-        true
+        self.bulk_logs
+            .entry(target)
+            .or_insert_with(|| BulkLogState::sending(now))
+            .begin(now)
     }
 
     pub(crate) fn begin_bulk_delivery(
@@ -1359,12 +1393,7 @@ impl AutomodDeleteMarks {
             match outcome {
                 BulkDeliveryOutcome::Delivered => {
                     if let Some(state) = self.bulk_logs.get_mut(&target) {
-                        state.inflight = false;
-                        state.covered = true;
-                        state.ambiguous = false;
-                        state.deferred = false;
-                        state.deferred_retained = None;
-                        state.deferred_automod = None;
+                        state.retain(BulkSendState::Delivered);
                     }
                     self.schedule_bulk_expiry(target);
                 }
@@ -1372,14 +1401,10 @@ impl AutomodDeleteMarks {
                     // Keep the entry so a later REST failure cannot emit a second report.
                     // Drop any deferred replay: Discord may already have the transcript.
                     if let Some(state) = self.bulk_logs.get_mut(&target) {
-                        if state.covered {
+                        if state.delivery == BulkSendState::Delivered {
                             continue;
                         }
-                        state.inflight = false;
-                        state.ambiguous = true;
-                        state.deferred = false;
-                        state.deferred_retained = None;
-                        state.deferred_automod = None;
+                        state.retain(BulkSendState::Ambiguous);
                     }
                     self.note_ambiguous_settled(target, Instant::now());
                 }
@@ -1387,7 +1412,7 @@ impl AutomodDeleteMarks {
                     if self
                         .bulk_logs
                         .get(&target)
-                        .is_some_and(|state| state.covered || state.ambiguous)
+                        .is_some_and(|state| state.delivery.retains_report())
                     {
                         continue;
                     }
@@ -1400,7 +1425,7 @@ impl AutomodDeleteMarks {
                             retained: automod.retained.clone(),
                             automod: Some(automod),
                         });
-                    } else if state.deferred {
+                    } else if matches!(state.plain, DeferredPlainReport::Requested) {
                         replay.push(DeferredBulkReplay {
                             message: *message,
                             retained: settlement_retained(state.deferred_retained),
@@ -1429,11 +1454,11 @@ impl AutomodDeleteMarks {
         else {
             return BulkPlainReplay::Emit;
         };
-        if state.covered || state.ambiguous {
+        if state.delivery.retains_report() {
             return BulkPlainReplay::Covered;
         }
-        if state.inflight {
-            state.deferred = true;
+        if state.delivery == BulkSendState::InFlight {
+            state.plain = DeferredPlainReport::Requested;
             state.deferred_retained = settlement_retained(retained);
             return BulkPlainReplay::Deferred;
         }

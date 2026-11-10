@@ -835,6 +835,36 @@ pub(crate) enum ControlMemberFetch {
 type MemberLookup =
     dyn Fn(u64, u64) -> Pin<Box<dyn Future<Output = ControlMemberFetch> + Send>> + Send + Sync;
 
+#[derive(Default)]
+pub struct CommandCooldowns {
+    admitted: DashMap<(u64, u64, String), Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandAdmission {
+    Allowed,
+    CoolingDown,
+}
+
+impl CommandCooldowns {
+    pub(crate) fn admit(
+        &self,
+        key: (u64, u64, String),
+        now: Instant,
+        interval: Duration,
+    ) -> CommandAdmission {
+        if let Some(previous) = self.admitted.get(&key)
+            && now.duration_since(*previous.value()) < interval
+        {
+            return CommandAdmission::CoolingDown;
+        }
+        // Admission precedes execution; command failure does not release it.
+        // Preserve the existing map read/insert boundaries.
+        self.admitted.insert(key, now);
+        CommandAdmission::Allowed
+    }
+}
+
 enum GuildActorCache {
     Known(db::CachedGuildActor),
     MemberMissing,
@@ -866,7 +896,7 @@ pub struct BotState {
     pub member_joins: crate::logging::MemberJoinContext,
     pub rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries,
     pub member_audits: crate::logging::MemberAuditClaims,
-    pub cooldowns: DashMap<(u64, u64, String), Instant>,
+    pub cooldowns: CommandCooldowns,
     pub log_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) log_delivery_waiters: std::sync::Arc<tokio::sync::Semaphore>,
     pub log_delivery_failures: AtomicU64,
@@ -986,7 +1016,7 @@ impl BotState {
             member_joins: crate::logging::MemberJoinContext::default(),
             rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries::default(),
             member_audits: crate::logging::MemberAuditClaims::default(),
-            cooldowns: DashMap::new(),
+            cooldowns: CommandCooldowns::default(),
             log_delivery_slots,
             log_delivery_waiters: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
             log_delivery_failures: AtomicU64::new(0),

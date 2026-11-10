@@ -270,7 +270,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
         &app.activation,
         http.as_ref(),
         &slash,
-        true,
+        super::super::SlashResponseState::DeferredPublic,
         &userinfo,
         &outcome,
     )
@@ -279,7 +279,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
         &app.activation,
         http.as_ref(),
         &slash,
-        false,
+        super::super::SlashResponseState::Initial,
         &userinfo,
         &outcome,
     )

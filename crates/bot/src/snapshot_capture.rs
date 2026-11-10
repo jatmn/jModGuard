@@ -119,6 +119,63 @@ impl Default for DeletedIdentities {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeletionKnowledge {
+    Unseen,
+    Exact,
+    Possible,
+}
+
+impl DeletionKnowledge {
+    fn blocks_capture(self) -> bool {
+        !matches!(self, Self::Unseen)
+    }
+}
+
+impl DeletedIdentities {
+    fn knowledge(&self, key: Key) -> DeletionKnowledge {
+        if self.exact.contains_key(&key) {
+            DeletionKnowledge::Exact
+        } else if self.bloom.contains(key) {
+            DeletionKnowledge::Possible
+        } else {
+            DeletionKnowledge::Unseen
+        }
+    }
+}
+
+struct CoverageEpoch(AtomicU64);
+
+impl CoverageEpoch {
+    fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark_gap(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ByteAdmission {
+    Reserved,
+    Refused,
+}
+
+enum CaptureWorker {
+    Ready(mpsc::Receiver<Work>),
+    Started,
+}
+
+impl CaptureWorker {
+    fn start(&mut self) -> Option<mpsc::Receiver<Work>> {
+        match std::mem::replace(self, Self::Started) {
+            Self::Ready(receiver) => Some(receiver),
+            Self::Started => None,
+        }
+    }
+}
+
 struct Work {
     scope: GuildDataScope,
     context: Context,
@@ -162,9 +219,9 @@ impl Body {
 
 pub struct SnapshotIngress {
     sender: mpsc::Sender<Work>,
-    receiver: Mutex<Option<mpsc::Receiver<Work>>>,
+    receiver: Mutex<CaptureWorker>,
     bytes: AtomicUsize,
-    epoch: AtomicU64,
+    epoch: CoverageEpoch,
     started_at_ms: i64,
     /// Loss is charged only to the physical store whose scoped work failed.
     /// Unknown gateway/catalog gaps still advance the observation epoch.
@@ -186,9 +243,9 @@ impl Default for SnapshotIngress {
         let (sender, receiver) = mpsc::channel(MAX_PENDING);
         Self {
             sender,
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Mutex::new(CaptureWorker::Ready(receiver)),
             bytes: AtomicUsize::new(0),
-            epoch: AtomicU64::new(chrono::Utc::now().timestamp_micros() as u64),
+            epoch: CoverageEpoch(AtomicU64::new(chrono::Utc::now().timestamp_micros() as u64)),
             started_at_ms: chrono::Utc::now().timestamp_millis(),
             lost_pending: Mutex::new(HashMap::new()),
             scopes: Mutex::new(HashMap::new()),
@@ -372,7 +429,7 @@ impl SnapshotIngress {
                     let lost = self.take_loss(store_id);
                     let initialized = store
                         .update_snapshot_health(SnapshotHealthUpdate {
-                            epoch: self.epoch.load(Ordering::Acquire),
+                            epoch: self.epoch.current(),
                             state: SnapshotHealthState::Paused,
                             reason: Some("gateway_gap"),
                             observed_at_ms: None,
@@ -475,7 +532,7 @@ impl SnapshotIngress {
                 let lost = self.take_loss(store_id);
                 if store
                     .update_snapshot_health(SnapshotHealthUpdate {
-                        epoch: self.epoch.load(Ordering::Acquire),
+                        epoch: self.epoch.current(),
                         state,
                         reason,
                         observed_at_ms: None,
@@ -504,7 +561,7 @@ impl SnapshotIngress {
         let lost = self.take_loss(store_id);
         if store
             .update_snapshot_health(SnapshotHealthUpdate {
-                epoch: self.epoch.load(Ordering::Acquire),
+                epoch: self.epoch.current(),
                 state: SnapshotHealthState::Paused,
                 reason: Some(reason),
                 observed_at_ms: None,
@@ -563,7 +620,7 @@ impl SnapshotIngress {
     }
 
     pub fn gap(&self) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch.mark_gap();
     }
 
     fn gap_scope(&self, scope: &GuildDataScope) {
@@ -646,7 +703,7 @@ impl SnapshotIngress {
 
     fn deleted(&self, key: Key) -> bool {
         let deleted = self.deleted.lock();
-        deleted.exact.contains_key(&key) || deleted.bloom.contains(key)
+        deleted.knowledge(key).blocks_capture()
     }
 
     pub(crate) fn deletion_recorded(
@@ -706,7 +763,7 @@ impl SnapshotIngress {
             self.gap_scope(&scope);
             return false;
         }
-        if !self.reserve_bytes(bytes) {
+        if self.reserve_bytes(bytes) == ByteAdmission::Refused {
             self.gap_scope(&scope);
             return false;
         }
@@ -716,7 +773,7 @@ impl SnapshotIngress {
             context,
             body,
             bytes,
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch: self.epoch.current(),
         };
         if self.sender.try_send(item).is_err() {
             self.bytes.fetch_sub(bytes, Ordering::AcqRel);
@@ -726,17 +783,23 @@ impl SnapshotIngress {
         true
     }
 
-    fn reserve_bytes(&self, bytes: usize) -> bool {
-        self.bytes
+    fn reserve_bytes(&self, bytes: usize) -> ByteAdmission {
+        if self
+            .bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 old.checked_add(bytes)
                     .filter(|next| *next <= MAX_PENDING_BYTES)
             })
             .is_ok()
+        {
+            ByteAdmission::Reserved
+        } else {
+            ByteAdmission::Refused
+        }
     }
 
     fn start_worker(&self, app: &Arc<BotState>) {
-        let receiver = self.receiver.lock().take();
+        let receiver = self.receiver.lock().start();
         if let Some(receiver) = receiver {
             let app = Arc::clone(app);
             tokio::spawn(async move { run(app, receiver).await });
@@ -1488,7 +1551,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             channel.get() as i64,
                             values,
                             now,
-                            app.snapshots.epoch.load(Ordering::Acquire),
+                            app.snapshots.epoch.current(),
                         )
                         .await
                     {
@@ -1630,7 +1693,7 @@ async fn update_health(
     let now = chrono::Utc::now().timestamp_millis();
     let lost = app.snapshots.take_loss(&key);
     let update = SnapshotHealthUpdate {
-        epoch: app.snapshots.epoch.load(Ordering::Acquire),
+        epoch: app.snapshots.epoch.current(),
         state,
         reason,
         observed_at_ms: (state == SnapshotHealthState::Active).then_some(now),
@@ -2327,7 +2390,7 @@ mod tests {
             .confirm(789, 456, 10, delete_attempt);
         store.close_membership(scope.clone()).await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        let epoch = app.snapshots.epoch.load(Ordering::Acquire);
+        let epoch = app.snapshots.epoch.current();
         assert!(
             store
                 .take_snapshots_at_epoch(scope.clone(), 456, vec![10, 11], now, epoch)
@@ -2476,7 +2539,7 @@ mod tests {
             },
         };
         store.close_membership(scope.clone()).await.unwrap();
-        let before = app.snapshots.epoch.load(Ordering::Relaxed);
+        let before = app.snapshots.epoch.current();
         let error =
             observe_configured_creates(&app, &store, &scope, vec![observation(1), observation(2)])
                 .await
@@ -2489,7 +2552,7 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(
-            app.snapshots.epoch.load(Ordering::Relaxed),
+            app.snapshots.epoch.current(),
             before + 1,
             "one failed batch write is one coverage gap"
         );
@@ -3181,14 +3244,14 @@ mod tests {
     #[test]
     fn author_provenance_is_bounded_and_eviction_marks_a_gap() {
         let ingress = SnapshotIngress::default();
-        let start_epoch = ingress.epoch.load(Ordering::Relaxed);
+        let start_epoch = ingress.epoch.current();
         for id in 1..=(MAX_KNOWN as u64 + 1) {
             ingress.remember_human((1, 2, id));
         }
         assert!(!ingress.known_human((1, 2, 1)));
         assert!(ingress.known_human((1, 2, MAX_KNOWN as u64 + 1)));
         assert_eq!(ingress.known_humans.lock().entries.len(), MAX_KNOWN);
-        assert!(ingress.epoch.load(Ordering::Relaxed) > start_epoch);
+        assert!(ingress.epoch.current() > start_epoch);
     }
 
     #[test]
@@ -3416,11 +3479,14 @@ mod tests {
             .collect();
         assert!(ingress.sender.try_reserve().is_err());
         drop(permits);
-        assert!(ingress.reserve_bytes(MAX_PENDING_BYTES));
-        assert!(!ingress.reserve_bytes(1));
+        assert_eq!(
+            ingress.reserve_bytes(MAX_PENDING_BYTES),
+            ByteAdmission::Reserved
+        );
+        assert_eq!(ingress.reserve_bytes(1), ByteAdmission::Refused);
         assert_eq!(ingress.bytes.load(Ordering::Acquire), MAX_PENDING_BYTES);
         ingress.bytes.fetch_sub(MAX_PENDING_BYTES, Ordering::AcqRel);
-        assert!(ingress.reserve_bytes(1));
+        assert_eq!(ingress.reserve_bytes(1), ByteAdmission::Reserved);
     }
 
     #[test]

@@ -14,7 +14,6 @@ use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
@@ -102,11 +101,17 @@ struct MemberAuditState {
     saturated_until: Option<Instant>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditAttribution {
+    Unresolved,
+    Claimed,
+}
+
 struct MemberAuditSubject {
     generation: u64,
     observed_ms: i64,
     uncertain_through: Option<i64>,
-    matched: bool,
+    attribution: AuditAttribution,
     at: Instant,
 }
 
@@ -161,7 +166,8 @@ impl MemberAuditClaims {
             return observation;
         }
         let uncertain_through = state.subjects.get(&key).and_then(|previous| {
-            let unresolved = (!previous.matched).then_some(previous.observed_ms + 3_000);
+            let unresolved = (previous.attribution == AuditAttribution::Unresolved)
+                .then_some(previous.observed_ms + 3_000);
             previous.uncertain_through.max(unresolved)
         });
         state.next_generation = state.next_generation.wrapping_add(1);
@@ -172,7 +178,7 @@ impl MemberAuditClaims {
                 generation,
                 observed_ms,
                 uncertain_through,
-                matched: false,
+                attribution: AuditAttribution::Unresolved,
                 at: Instant::now(),
             },
         );
@@ -200,7 +206,7 @@ impl MemberAuditClaims {
             observation.action.num(),
         );
         let subject = state.subjects.get(&key)?;
-        if subject.generation != generation || subject.matched {
+        if subject.generation != generation || subject.attribution == AuditAttribution::Claimed {
             return None;
         }
         let uncertain_through = subject.uncertain_through;
@@ -226,7 +232,7 @@ impl MemberAuditClaims {
         state
             .claimed
             .insert((observation.guild, entry), Instant::now());
-        state.subjects.get_mut(&key)?.matched = true;
+        state.subjects.get_mut(&key)?.attribution = AuditAttribution::Claimed;
         Some(vars)
     }
 }
@@ -771,12 +777,37 @@ pub(crate) fn member_join_vars_ms(
 }
 type EditKey = (u64, u64, u64);
 struct EditObservation {
-    edited_at_ms: Option<i64>,
+    edited_at_ms: i64,
     reported_timestamps: Vec<i64>,
-    pending_without_timestamp: Option<(Option<u64>, Option<u64>)>,
-    content: Option<u64>,
-    attachments: Option<u64>,
     at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditIdentity {
+    Current,
+    PreviouslyReported,
+    New,
+}
+
+impl EditObservation {
+    fn observe(&mut self, timestamp: i64) -> EditIdentity {
+        let identity = if self.edited_at_ms == timestamp {
+            EditIdentity::Current
+        } else if self.reported_timestamps.contains(&timestamp) {
+            EditIdentity::PreviouslyReported
+        } else {
+            EditIdentity::New
+        };
+        if identity == EditIdentity::New {
+            self.edited_at_ms = timestamp;
+            if self.reported_timestamps.len() >= 64 {
+                self.reported_timestamps.remove(0);
+            }
+            self.reported_timestamps.push(timestamp);
+        }
+        self.at = Instant::now();
+        identity
+    }
 }
 
 #[derive(Default)]
@@ -785,143 +816,23 @@ pub struct EditReportDedup {
 }
 
 impl EditReportDedup {
-    /// A Gateway update may repeat the same content/attachment observation.
-    /// Keep only a bounded fingerprint, never a second copy of message text.
+    /// Timestamp identity coalesces partial Gateway updates without storing text.
     pub fn should_report(&self, event: &MessageUpdateEvent) -> bool {
         let Some(guild) = event.guild_id else {
             return false;
         };
-        // Discord sets edited_timestamp only for an actual edit. Embed, GIF/link
-        // unfurl, reply-preview, pin, and flag refreshes omit it. Do not store
-        // those as a reported observation, or a later timestamped edit of the
-        // same text would be coalesced away.
+        // Unfurls and other refreshes cannot enter the reported-edit state.
+        // Every stored observation therefore has an authoritative timestamp;
+        // field fingerprints never decide a transition after this guard.
         let Some(edited_at) = event.edited_timestamp else {
             return false;
         };
-        let content = event.content.as_ref().map(fingerprint);
-        let edited_at_ms = Some(edited_at.timestamp_millis());
-        let attachments = event.attachments.as_ref().map(|items| {
-            fingerprint(
-                &items
-                    .iter()
-                    .map(|a| (a.id.get(), a.filename.as_str(), a.description.as_deref()))
-                    .collect::<Vec<_>>(),
-            )
-        });
+        let edited_at_ms = edited_at.timestamp_millis();
         let key = (guild.get(), event.channel_id.get(), event.id.get());
         let mut entries = self.inner.lock();
         entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
         if let Some(seen) = entries.get_mut(&key) {
-            if let (Some(previous), Some(current)) = (seen.edited_at_ms, edited_at_ms) {
-                if previous != current && seen.reported_timestamps.contains(&current) {
-                    seen.at = Instant::now();
-                    return false;
-                }
-                let distinct_edit = previous != current;
-                if !distinct_edit && seen.pending_without_timestamp.is_some() {
-                    // This is an older timestamp replay while a newer edit has
-                    // only been observed without its timestamp. Keep the newer
-                    // field fingerprints until its timestamp arrives.
-                    seen.at = Instant::now();
-                    return false;
-                }
-                if distinct_edit
-                    && let Some((pending_content, pending_attachments)) =
-                        seen.pending_without_timestamp
-                    && content.is_none_or(|value| pending_content.is_none_or(|old| old == value))
-                    && attachments
-                        .is_none_or(|value| pending_attachments.is_none_or(|old| old == value))
-                {
-                    // The changed fields were already reported without a
-                    // timestamp. This update supplies their edit identity.
-                    seen.edited_at_ms = Some(current);
-                    remember_edit_timestamp(seen, current);
-                    seen.pending_without_timestamp = None;
-                    if content.is_some() {
-                        seen.content = content;
-                    }
-                    if attachments.is_some() {
-                        seen.attachments = attachments;
-                    }
-                    seen.at = Instant::now();
-                    return false;
-                }
-                // Discord's supplied edit timestamp groups partial updates.
-                // A new timestamp starts a new observation even when its first
-                // payload field was absent from the preceding edit.
-                seen.edited_at_ms = edited_at_ms;
-                if distinct_edit {
-                    remember_edit_timestamp(seen, current);
-                    seen.pending_without_timestamp = None;
-                    seen.content = content;
-                    seen.attachments = attachments;
-                } else {
-                    if content.is_some() {
-                        seen.content = content;
-                    }
-                    if attachments.is_some() {
-                        seen.attachments = attachments;
-                    }
-                }
-                seen.at = Instant::now();
-                return distinct_edit;
-            }
-            // Gateway updates may supply only one field at a time. A newly
-            // supplied field completes this observation; it is not a new edit.
-            let changed_content =
-                content.is_some_and(|value| seen.content.is_some_and(|old| old != value));
-            let changed_attachments =
-                attachments.is_some_and(|value| seen.attachments.is_some_and(|old| old != value));
-            let changed = changed_content || changed_attachments;
-            let continuation = if edited_at_ms.is_none()
-                && let Some((pending_content, pending_attachments)) =
-                    seen.pending_without_timestamp.as_mut()
-            {
-                let continuation = if changed_content
-                    && !changed_attachments
-                    && pending_content.is_none()
-                {
-                    *pending_content = content;
-                    true
-                } else if changed_attachments && !changed_content && pending_attachments.is_none() {
-                    *pending_attachments = attachments;
-                    true
-                } else {
-                    false
-                };
-                // A field first supplied by a partial update is part of this
-                // edit even when there was no earlier value to compare with.
-                if pending_content.is_none() {
-                    *pending_content = content;
-                }
-                if pending_attachments.is_none() {
-                    *pending_attachments = attachments;
-                }
-                continuation
-            } else {
-                false
-            };
-            if changed && !continuation {
-                seen.pending_without_timestamp =
-                    edited_at_ms.is_none().then_some((content, attachments));
-            }
-            if content.is_some() {
-                seen.content = content;
-            }
-            if attachments.is_some() {
-                seen.attachments = attachments;
-            }
-            if edited_at_ms.is_some() {
-                seen.edited_at_ms = edited_at_ms;
-                seen.pending_without_timestamp = None;
-                if let Some(current) = edited_at_ms
-                    && !seen.reported_timestamps.contains(&current)
-                {
-                    remember_edit_timestamp(seen, current);
-                }
-            }
-            seen.at = Instant::now();
-            return changed && !continuation;
+            return seen.observe(edited_at_ms) == EditIdentity::New;
         }
         if entries.len() >= EDIT_REPORT_LIMIT
             && !entries.contains_key(&key)
@@ -936,10 +847,7 @@ impl EditReportDedup {
             key,
             EditObservation {
                 edited_at_ms,
-                reported_timestamps: edited_at_ms.into_iter().collect(),
-                pending_without_timestamp: edited_at_ms.is_none().then_some((content, attachments)),
-                content,
-                attachments,
+                reported_timestamps: vec![edited_at_ms],
                 at: Instant::now(),
             },
         );
@@ -947,29 +855,28 @@ impl EditReportDedup {
     }
 }
 
-fn remember_edit_timestamp(seen: &mut EditObservation, timestamp: i64) {
-    if seen.reported_timestamps.len() >= 64 {
-        seen.reported_timestamps.remove(0);
-    }
-    seen.reported_timestamps.push(timestamp);
-}
-
-fn fingerprint<T: Hash>(value: &T) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
 #[derive(Default)]
 pub struct SnippetCache {
     inner: Mutex<HashMap<(u64, u64, u64), Snippet>>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageOrigin {
+    Unmarked,
+    Webhook,
+}
+
+impl MessageOrigin {
+    fn observe(self, webhook: bool) -> Self {
+        if webhook { Self::Webhook } else { self }
+    }
+}
+
 #[derive(Clone)]
 struct Snippet {
     at: Instant,
     guild: u64,
     author: u64,
-    webhook: bool,
+    origin: MessageOrigin,
 }
 
 pub fn remember_message(
@@ -1023,14 +930,17 @@ pub(crate) fn remember_message_create(
     {
         cache.remove(&oldest);
     }
-    let webhook = webhook || cache.get(&key).is_some_and(|old| old.webhook);
+    let origin = cache
+        .get(&key)
+        .map_or(MessageOrigin::Unmarked, |old| old.origin)
+        .observe(webhook);
     cache.insert(
         key,
         Snippet {
             at: Instant::now(),
             guild,
             author,
-            webhook,
+            origin,
         },
     );
 }
@@ -1069,7 +979,7 @@ pub(crate) fn known_message_webhook(
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
     cache
         .get(&(guild, channel, message))
-        .is_some_and(|snippet| snippet.webhook)
+        .is_some_and(|snippet| snippet.origin == MessageOrigin::Webhook)
 }
 
 pub(crate) fn known_message_author(
