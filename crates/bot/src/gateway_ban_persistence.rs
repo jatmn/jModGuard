@@ -79,20 +79,29 @@ async fn capture(
     }
 }
 
-async fn save(db: &db::Db, delivery: db::GatewayBanDelivery) -> Result<db::GatewayBanDelivery> {
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        match db::save_gateway_ban_delivery(db, delivery.clone()).await {
-            Ok(saved) => return Ok(saved),
-            Err(error) if error.downcast_ref::<db::EnrollmentChanged>().is_some() => {
-                return Err(error);
+/// Keeps the original payload alive until storage confirms its canonical copy.
+struct RetainedDelivery(db::GatewayBanDelivery);
+
+/// Constructed only from a confirmed save or a durable inbox snapshot.
+struct SavedDelivery(db::GatewayBanDelivery);
+
+impl RetainedDelivery {
+    async fn save(self, db: &db::Db) -> Result<SavedDelivery> {
+        let delivery = self.0;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match db::save_gateway_ban_delivery(db, delivery.clone()).await {
+                Ok(saved) => return Ok(SavedDelivery(saved)),
+                Err(error) if error.downcast_ref::<db::EnrollmentChanged>().is_some() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    tracing::warn!(delivery_id=%delivery.id,"gateway ban delivery retained; save will retry: {error:#}")
+                }
             }
-            Err(error) => {
-                tracing::warn!(delivery_id=%delivery.id,"gateway ban delivery retained; save will retry: {error:#}")
-            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -149,7 +158,8 @@ pub(crate) fn receive_ban(
             ),
         };
         drop(user);
-        let delivery = save(&app.db, delivery).await?;
+        let delivery = RetainedDelivery(delivery).save(&app.db).await?;
+        let SavedDelivery(delivery) = delivery;
         let write_app = Arc::clone(&app);
         let delivery_id = delivery.id.clone();
         let owned_by_bot = matches!(
@@ -221,8 +231,14 @@ pub(crate) fn receive_unban(
                 )
             }),
         };
-        let delivery = save(&app.db, delivery).await?;
-        apply(&app, delivery, false, false).await?;
+        let delivery = RetainedDelivery(delivery).save(&app.db).await?;
+        apply(
+            &app,
+            delivery,
+            db::GatewayProjection::Pending,
+            db::GatewayCaseProgress::Pending,
+        )
+        .await?;
         Ok(())
     })
 }
@@ -268,20 +284,26 @@ pub(crate) fn receive_audit(
             },
             case: Some(case),
         };
-        let delivery = save(&app.db, delivery).await?;
-        apply(&app, delivery, false, false).await?;
+        let delivery = RetainedDelivery(delivery).save(&app.db).await?;
+        apply(
+            &app,
+            delivery,
+            db::GatewayProjection::Pending,
+            db::GatewayCaseProgress::Pending,
+        )
+        .await?;
         Ok(())
     })
 }
 
 async fn apply(
     app: &Arc<BotState>,
-    delivery: db::GatewayBanDelivery,
-    applied: bool,
-    case_saved: bool,
+    SavedDelivery(delivery): SavedDelivery,
+    projection: db::GatewayProjection,
+    case: db::GatewayCaseProgress,
 ) -> Result<Option<db::GatewayBanWrite>> {
     let result = if matches!(delivery.payload, db::GatewayBanPayload::Audit { .. }) {
-        if !applied
+        if projection == db::GatewayProjection::Pending
             && let db::GatewayBanPayload::Audit {
                 entry_id,
                 attribution,
@@ -302,7 +324,7 @@ async fn apply(
     } else {
         db::apply_gateway_ban_delivery(&app.db, delivery.id.clone()).await?
     };
-    if !case_saved {
+    if case == db::GatewayCaseProgress::Pending {
         if let Some(case) = delivery.case.clone() {
             // Stable source and immutable original time make retries idempotent,
             // even when the core write succeeded but the guild store did not.
@@ -333,7 +355,7 @@ pub(crate) fn retain_confirmed_unban(db: db::Db, enrollment: db::GuildEnrollment
     };
     tokio::spawn(async move {
         let result = async {
-            let delivery = save(&db, delivery).await?;
+            let SavedDelivery(delivery) = RetainedDelivery(delivery).save(&db).await?;
             let mut backoff = Duration::from_secs(1);
             loop {
                 match db::apply_gateway_ban_delivery(&db, delivery.id.clone()).await {
@@ -364,9 +386,16 @@ pub async fn drain(app: &Arc<BotState>, cursor: &mut i64) -> Result<()> {
         *cursor = 0;
         return Ok(());
     }
-    for (sequence, delivery, applied, case_saved) in pending {
-        *cursor = sequence;
-        if let Err(error) = apply(app, delivery, applied, case_saved).await {
+    for pending in pending {
+        *cursor = pending.sequence;
+        if let Err(error) = apply(
+            app,
+            SavedDelivery(pending.delivery),
+            pending.projection,
+            pending.case,
+        )
+        .await
+        {
             tracing::warn!("saved gateway ban delivery will retry: {error:#}");
         }
     }
@@ -726,7 +755,7 @@ mod tests {
         let at = chrono::Utc::now().timestamp_millis() - 20_000;
         let mut delivery = ban(&scope, at);
         delivery.case = Some(gateway_case(&delivery.id, 55, at, CaseAction::Ban));
-        let delivery = save(&app.db, delivery).await.unwrap();
+        let SavedDelivery(delivery) = RetainedDelivery(delivery).save(&app.db).await.unwrap();
         sql(&app,"CREATE TRIGGER fail_ban_projection BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL,'projection unavailable'); END").await;
         assert!(
             db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())

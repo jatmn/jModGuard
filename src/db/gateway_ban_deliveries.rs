@@ -49,6 +49,43 @@ impl GatewayBanDelivery {
     }
 }
 
+/// Core mirror/event work is independent of selected-case acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayProjection {
+    Pending,
+    Applied,
+}
+
+impl GatewayProjection {
+    fn from_applied(applied: bool) -> Self {
+        if applied {
+            Self::Applied
+        } else {
+            Self::Pending
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayCaseProgress {
+    Pending,
+    Complete,
+}
+
+impl GatewayCaseProgress {
+    fn from_saved(saved: bool) -> Self {
+        if saved { Self::Complete } else { Self::Pending }
+    }
+}
+
+/// Durable recovery snapshot, not authority to bypass later primary checks.
+pub struct PendingGatewayBanDelivery {
+    pub sequence: i64,
+    pub delivery: GatewayBanDelivery,
+    pub projection: GatewayProjection,
+    pub case: GatewayCaseProgress,
+}
+
 /// Save the immutable payload once. In particular a repeated audit callback may
 /// have a different cached actor name; its existing delivery remains canonical.
 pub async fn save_gateway_ban_delivery(
@@ -92,7 +129,7 @@ pub async fn save_gateway_ban_delivery(
 pub async fn pending_gateway_ban_deliveries(
     db: &Db,
     after: i64,
-) -> Result<Vec<(i64, GatewayBanDelivery, bool, bool)>> {
+) -> Result<Vec<PendingGatewayBanDelivery>> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let rows = tx.prepare(
@@ -101,7 +138,12 @@ pub async fn pending_gateway_ban_deliveries(
              WHERE d.rowid>?1 AND (d.applied=0 OR d.case_saved=0) ORDER BY d.rowid LIMIT 32",
         )?.query_map(params![after], |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?, row.get::<bool>(2)?, row.get::<bool>(3)?)))?
           .collect::<Result<Vec<_>>>()?;
-        let rows = rows.into_iter().map(|(id,payload,applied,case_saved)| Ok((id,serde_json::from_str(&payload)?,applied,case_saved))).collect::<Result<_>>()?;
+        let rows = rows.into_iter().map(|(sequence,payload,applied,case_saved)| Ok(PendingGatewayBanDelivery {
+            sequence,
+            delivery: serde_json::from_str(&payload)?,
+            projection: GatewayProjection::from_applied(applied),
+            case: GatewayCaseProgress::from_saved(case_saved),
+        })).collect::<Result<_>>()?;
         tx.finish_read()?;
         Ok(rows)
     }).await
@@ -117,7 +159,8 @@ pub async fn acknowledge_gateway_ban_case(db: &Db, delivery: GatewayBanDelivery)
             params![delivery.id.clone()],
             |row| Ok(row.get(0)?),
         )?;
-        if !pending {
+        let progress = GatewayCaseProgress::from_saved(!pending);
+        if progress == GatewayCaseProgress::Complete {
             tx.finish_read()?;
             return Ok(());
         }
@@ -164,7 +207,7 @@ pub async fn apply_gateway_ban_delivery(db: &Db, id: String) -> Result<Option<Ga
         super::enrollments::verify_enrollment_conn(&tx,&delivery.enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx,delivery.enrollment.guild_id)?;
         tx.finish_read()?;
-        if applied { return result.map(|r|serde_json::from_str(&r).map_err(Into::into)).transpose(); }
+        if GatewayProjection::from_applied(applied) == GatewayProjection::Applied { return result.map(|r|serde_json::from_str(&r).map_err(Into::into)).transpose(); }
         match delivery.payload {
             GatewayBanPayload::Ban {user_name,user_display_name,owned_by_bot,operation_id,member_was_banned,pending_audits,audit_after_ms,..} => {
                 super::moderation::record_gateway_ban_conn(conn,&delivery.enrollment,delivery.enrollment.guild_id,delivery.user_id,Some(user_name),user_display_name,GATEWAY_BAN_REASON.to_owned(),delivery.observed_at,owned_by_bot,operation_id,member_was_banned,None,pending_audits,audit_after_ms,Some(&id)).map(Some)
@@ -174,7 +217,7 @@ pub async fn apply_gateway_ban_delivery(db: &Db, id: String) -> Result<Option<Ga
                 super::enrollments::verify_enrollment_conn(&tx,&delivery.enrollment)?;
                 super::guild_stores::refuse_fenced_write(&tx,delivery.enrollment.guild_id)?;
                 let applied:bool=tx.query_row("SELECT applied FROM gateway_ban_deliveries WHERE id=?1",params![id.clone()],|row|Ok(row.get(0)?))?;
-                if applied {tx.finish_read()?;return Ok(None);}
+                if GatewayProjection::from_applied(applied) == GatewayProjection::Applied {tx.finish_read()?;return Ok(None);}
                 tx.ensure_mutation_receipt()?;
                 // A delayed unban must not clear a newer ban.
                 tx.execute_matching("UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1 AND julianday(created_at)<=julianday(?3)",params![delivery.enrollment.guild_id,delivery.user_id,delivery.observed_at.clone()])?;
@@ -213,7 +256,7 @@ pub async fn acknowledge_gateway_ban_audit(db: &Db, delivery: GatewayBanDelivery
             params![delivery.id.clone()],
             |row| Ok(row.get(0)?),
         )?;
-        if applied {
+        if GatewayProjection::from_applied(applied) == GatewayProjection::Applied {
             tx.finish_read()?;
             return Ok(());
         }
