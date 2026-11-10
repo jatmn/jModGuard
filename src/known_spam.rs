@@ -890,6 +890,44 @@ mod tests {
         assert!(compiled.matches("foo\u{200b}tinyurl.com:443/a"));
         assert!(compiled.matches("word:\u{200b}https://tinyurl.com/a"));
     }
+    fn assert_bare_host_separator_boundary(separator: &str) {
+        let compiled = list("url", "tinyurl.com/*");
+        assert!(!compiled.matches("safe.\u{200b}tinyurl.com/a"));
+        let text = format!("safe{separator}\u{200b}tinyurl.com/a");
+        assert!(!compiled.matches(&text), "{text:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_ideographic_full_stop() {
+        assert_bare_host_separator_boundary("\u{3002}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_fullwidth_full_stop() {
+        assert_bare_host_separator_boundary("\u{ff0e}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_halfwidth_full_stop() {
+        assert_bare_host_separator_boundary("\u{ff61}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_percent_dot_lowercase() {
+        assert_bare_host_separator_boundary("%2e");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_percent_dot_uppercase() {
+        assert_bare_host_separator_boundary("%2E");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_ideographic_full_stop() {
+        assert_bare_host_separator_boundary("%E3%80%82");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_fullwidth_full_stop() {
+        assert_bare_host_separator_boundary("%EF%BC%8E");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_halfwidth_full_stop() {
+        assert_bare_host_separator_boundary("%EF%BD%A1");
+    }
     #[test]
     fn known_spam_urls_match_next_to_punctuation() {
         let compiled = list("url", "tinyurl.com/*");
