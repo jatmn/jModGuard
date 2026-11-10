@@ -890,12 +890,13 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
-const SEED_META_MARKERS: [&str; 5] = [
+const SEED_META_MARKERS: [&str; 6] = [
     "invite_description_v1",
     "readable_log_defaults_v1",
     "attachment_delete_template_v1",
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
+    "embed_log_defaults_v1",
 ];
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
@@ -1304,6 +1305,23 @@ fn seed_globals_sql(
             sql_text(crate::defaults::PRE_BULK_STATUS_TEMPLATE)
         ));
         markers.push("retained_bulk_status_template_v1");
+    }
+    if meta_string_conn(conn, "embed_log_defaults_v1")?.is_none() {
+        let current = crate::defaults::rendered_log_templates();
+        for (event, old) in crate::defaults::pre_embed_log_templates() {
+            let new = current
+                .iter()
+                .find(|(name, _)| *name == event)
+                .context("shipped embed template")?
+                .1;
+            body.push_str(&format!(
+                "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
+                sql_text(new),
+                sql_text(event),
+                sql_text(old)
+            ));
+        }
+        markers.push("embed_log_defaults_v1");
     }
     for mut cmd in crate::defaults::default_global_seed_commands() {
         if cmd.name == "stats" && status_taken {

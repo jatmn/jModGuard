@@ -350,10 +350,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 },
                 None => Ok(()),
             };
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             if log_ban {
                 log_mod(
                     env,
                     enrollment.clone(),
+                    &vars,
                     "ban",
                     target,
                     &target_user.name,
@@ -363,13 +368,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .await;
             }
             expiry?;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
-            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: if log_ban {
+                    vec!["mod_action".into()]
+                } else {
+                    Vec::new()
+                },
                 suppress_response: false,
             })
         }
@@ -432,9 +438,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .await;
                 result?;
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment,
+                &vars,
                 "softban",
                 target,
                 &target_user.name,
@@ -442,12 +452,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name);
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -523,9 +531,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     }
                 }
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "unban",
                 target,
                 &target_user.name,
@@ -533,12 +545,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -591,9 +601,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
                 return Err(mod_reason_dm::moderation_failure_error(error, dm_outcome));
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "kick",
                 target,
                 &target_user.name,
@@ -601,13 +616,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 dm_outcome,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
-            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -686,20 +698,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "duration".into(),
                 crate::templates::format_duration(minutes.saturating_mul(60)),
             );
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("minutes".into(), minutes.to_string());
+            vars.insert("reason".into(), reason.clone());
             if minutes == 0 {
-                let mut v = vars.clone();
-                v.insert("target_id".into(), target.to_string());
-                v.insert("reason".into(), reason.clone());
+                let v = timeout_log_vars(&vars, target, &target_user.name, &reason);
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
-                let mut v = vars.clone();
-                v.insert("target_id".into(), target.to_string());
-                v.insert("reason".into(), reason.clone());
+                let v = timeout_log_vars(&vars, target, &target_user.name, &reason);
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
             }
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "timeout",
                 target,
                 &target_user.name,
@@ -707,13 +720,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("minutes".into(), minutes.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec![
+                    "mod_action".into(),
+                    if minutes == 0 {
+                        "timeout_remove".into()
+                    } else {
+                        "timeout_add".into()
+                    },
+                ],
                 suppress_response: false,
             })
         }
@@ -762,9 +779,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     ));
                 }
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "warn",
                 target,
                 &target_user.name,
@@ -772,12 +793,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -787,6 +806,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
+            vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             let warns =
                 db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
@@ -794,6 +814,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some(format!("**{}** has no warnings.", target_user.name)),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -814,6 +835,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -829,9 +851,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("count".into(), n.to_string());
+            let response = format!("Cleared {n} warnings for {}.", target_user.name);
+            vars.insert("response".into(), response.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "warnclear",
                 target,
                 &target_user.name,
@@ -840,8 +865,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             Ok(BehaviorOutcome {
-                response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
+                response: Some(response),
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -862,6 +888,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                             &vars,
                         )),
                         vars,
+                        emitted_log_events: Vec::new(),
                         suppress_response: false,
                     });
                 }
@@ -912,6 +939,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -922,6 +950,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some("No bans recorded.".into()),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -939,6 +968,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -976,9 +1006,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 )
                 .await;
             }
+            vars.insert("count".into(), n.to_string());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "purge",
                 env.actor,
                 "messages",
@@ -986,10 +1018,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("count".into(), n.to_string());
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -1013,6 +1045,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 // The posted message is already visible in the invocation
                 // channel, so a confirmation reply there would be redundant.
                 suppress_response: target == env.channel_id,
@@ -1048,6 +1081,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "slowmode",
                 env.actor,
                 "channel",
@@ -1058,6 +1092,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -1092,6 +1127,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1116,6 +1152,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1143,6 +1180,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1192,6 +1230,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1205,6 +1244,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1219,6 +1259,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1287,6 +1328,8 @@ async fn stats_response(
 /// Standard variables available to every command's response template.
 pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<String, String> {
     let mut vars = std::collections::BTreeMap::new();
+    vars.insert("command".into(), env.cmd.name.clone());
+    vars.insert("response".into(), String::new());
     vars.insert("user".into(), env.actor_member.display_name().to_string());
     vars.insert(
         "actor".into(),
@@ -1303,6 +1346,23 @@ pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<Strin
     );
     vars.insert("channel".into(), format!("<#{}>", env.channel_id));
     vars.insert("source_channel_id".into(), env.channel_id.to_string());
+    vars
+}
+
+fn timeout_log_vars(
+    vars: &std::collections::BTreeMap<String, String>,
+    target: serenity::model::id::UserId,
+    target_name: &str,
+    reason: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut vars = vars.clone();
+    vars.extend(crate::templates::user_vars(
+        target.get(),
+        target_name,
+        target_name,
+    ));
+    vars.insert("target_id".into(), target.to_string());
+    vars.insert("reason".into(), reason.to_string());
     vars
 }
 
@@ -1463,9 +1523,11 @@ fn say_target_and_text(args: &Args, invocation: ChannelId) -> Result<(ChannelId,
     Ok((target, text.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_mod(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
+    vars: &std::collections::BTreeMap<String, String>,
     action: &str,
     target: serenity::model::id::UserId,
     target_name: &str,
@@ -1485,6 +1547,7 @@ async fn log_mod(
         enrollment,
         env.ctx,
         env.guild_id,
+        vars.clone(),
         action,
         target.get(),
         target_name,
@@ -1526,6 +1589,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("**Event templates:**\n{response}")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1536,6 +1600,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}`:\n```\n{t}\n```")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1550,6 +1615,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` updated for this server.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1560,6 +1626,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` reset to global/default.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1597,6 +1664,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("**Automod rules:**\n{}", lines.join("\n"))),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1619,6 +1687,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                     if rule.enabled { "enabled" } else { "disabled" }
                 )),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1643,6 +1712,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1725,6 +1795,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                             .into(),
                     ),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -1736,6 +1807,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("**Log channels:**\n{response}")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1755,6 +1827,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` now logs to <#{channel}>.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1765,6 +1838,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` logging cleared for this server.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1896,6 +1970,70 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timeout_add_log_uses_target_identity() {
+        assert_timeout_log_identity("timeout_add", 10);
+    }
+
+    #[test]
+    fn timeout_remove_log_uses_target_identity() {
+        assert_timeout_log_identity("timeout_remove", 0);
+    }
+
+    fn assert_timeout_log_identity(event: &str, minutes: u64) {
+        let actor_id = 111111111111111111_u64;
+        let target = serenity::model::id::UserId::new(222222222222222222);
+        let actor = format!("Moderator (<@{actor_id}>)");
+        // behaviors_base_vars supplies the moderator as user; the timeout arm
+        // adds duration before building its event-specific log variables.
+        let base = BTreeMap::from([
+            ("user".into(), "Moderator".into()),
+            ("actor".into(), actor.clone()),
+            ("actor_id".into(), actor_id.to_string()),
+            ("guild".into(), "Test server".into()),
+            ("channel".into(), "<#333333333333333333>".into()),
+            ("source_channel_id".into(), "333333333333333333".into()),
+            (
+                "duration".into(),
+                crate::templates::format_duration(minutes.saturating_mul(60)),
+            ),
+        ]);
+        let template = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(name, _)| *name == event)
+            .unwrap()
+            .1;
+        // user_lookup uses the decimal ID when a cached name is unavailable.
+        for target_name in ["Target".to_string(), target.to_string()] {
+            let mut vars = timeout_log_vars(&base, target, &target_name, "test reason");
+            assert_eq!(vars["actor"], actor);
+            assert_eq!(vars["actor_id"], actor_id.to_string());
+            assert_eq!(vars["target_id"], target.to_string());
+            assert_eq!(vars["duration"], base["duration"]);
+            assert_eq!(vars["reason"], "test reason");
+            // logging::emit supplies time at delivery, after command vars.
+            vars.insert("time".into(), "2026-11-09T12:00:00Z".into());
+            let embed = jmodguard::log_embeds::render(event, template, &vars);
+            let field = |name: &str| &embed.fields.iter().find(|f| f.name == name).unwrap().value;
+            assert_eq!(
+                field("User"),
+                &format!("{target_name} · <@{target}> (`{target}`)"),
+                "{event} must identify the target"
+            );
+            assert_eq!(field("Moderator"), &actor);
+            let rendered = crate::templates::render(template, &vars);
+            for text in std::iter::once(&rendered)
+                .chain([&embed.title, &embed.description])
+                .chain(embed.fields.iter().flat_map(|f| [&f.name, &f.value]))
+            {
+                assert!(!text.contains(['{', '}']), "unresolved placeholder: {text}");
+            }
+        }
+        assert_eq!(base["user"], "Moderator");
+        assert!(!base.contains_key("mention"));
+        assert!(!base.contains_key("user_id"));
+    }
+
     #[test]
     fn timed_ban_prefix_and_slash_parse_the_same_duration_and_reason() {
         let command = crate::defaults::default_commands()

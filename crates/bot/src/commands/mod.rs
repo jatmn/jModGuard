@@ -595,6 +595,9 @@ pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<(
 pub struct BehaviorOutcome {
     pub response: Option<String>,
     pub vars: BTreeMap<String, String>,
+    /// Events already emitted by this invocation, including best-effort sends.
+    /// A matching configured outcome event must not produce a second report.
+    pub emitted_log_events: Vec<String>,
     /// True when the behavior's visible effect already landed in the
     /// invocation channel (e.g. `!say` posting there), so a confirmation
     /// reply would be redundant. Prefix dispatch sends nothing; slash
@@ -1742,19 +1745,67 @@ async fn log_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
-    if cmd.log_event.is_empty() {
+    if cmd.log_event.is_empty() || outcome.emitted_log_events.contains(&cmd.log_event) {
         return;
     }
-    let mut vars = outcome.vars.clone();
-    vars.insert("command".into(), cmd.name.clone());
+    let vars = command_log_vars(
+        &cmd.name,
+        &cmd.log_event,
+        &outcome.vars,
+        cache,
+        actor_id,
+        source_channel_id,
+    );
+    logging::emit_to(app, http, guild_id, &cmd.log_event, vars).await;
+}
+
+/// Log identity is independent of reply identity: reply `{user}` remains the
+/// caller, while a log's user is the resolved target (or caller without one).
+fn command_log_vars(
+    command: &str,
+    event: &str,
+    response_vars: &BTreeMap<String, String>,
+    cache: &serenity::cache::Cache,
+    actor_id: UserId,
+    source_channel_id: ChannelId,
+) -> BTreeMap<String, String> {
+    let mut vars = response_vars.clone();
     let actor_name = cache
         .user(actor_id)
         .map(|u| u.name.clone())
         .unwrap_or_else(|| actor_id.to_string());
-    vars.insert("actor".into(), format!("{actor_name} (<@{actor_id}>)"));
+    // Behaviors already know the moderator's display name, even on a cold cache.
+    vars.entry("actor".into())
+        .or_insert_with(|| format!("{actor_name} (<@{actor_id}>)"));
     vars.insert("actor_id".into(), actor_id.to_string());
+    let target = vars
+        .get("target_id")
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id != 0);
+    let (user_id, user_name) = match target {
+        Some(id) => {
+            let name = vars
+                .get("target")
+                .cloned()
+                .or_else(|| cache.user(UserId::new(id)).map(|user| user.name.clone()))
+                .unwrap_or_else(|| id.to_string());
+            (id, name)
+        }
+        None => (
+            actor_id.get(),
+            vars.get("user").cloned().unwrap_or(actor_name),
+        ),
+    };
+    vars.extend(templates::user_vars(user_id, &user_name, &user_name));
+    vars.insert("command".into(), command.to_string());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
-    logging::emit_to(app, http, guild_id, &cmd.log_event, vars).await;
+    if event == "mod_action" {
+        vars.entry("action".into())
+            .or_insert_with(|| command.to_string());
+        vars.entry("reason".into())
+            .or_insert_with(|| "-".to_string());
+    }
+    vars
 }
 
 fn cooldown_check(
@@ -2401,10 +2452,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn command_mod_action_log_vars_preserve_response_and_custom_keys() {
+        let response = BTreeMap::from([
+            ("user".into(), "Moderator".into()),
+            ("actor".into(), "Moderator (<@7>)".into()),
+            ("actor_id".into(), "7".into()),
+            ("target".into(), "Target".into()),
+            ("target_id".into(), "91".into()),
+            ("reason".into(), "custom reason".into()),
+            ("custom_key".into(), "custom value".into()),
+        ]);
+        let cache = serenity::cache::Cache::default();
+        let vars = command_log_vars(
+            "custom",
+            "mod_action",
+            &response,
+            &cache,
+            UserId::new(7),
+            ChannelId::new(1),
+        );
+        assert_eq!(vars["user"], "Target");
+        assert_eq!(vars["mention"], "<@91>");
+        assert_eq!(vars["user_id"], "91");
+        for key in [
+            "actor",
+            "actor_id",
+            "target",
+            "target_id",
+            "reason",
+            "custom_key",
+        ] {
+            assert_eq!(vars[key], response[key]);
+        }
+        assert_eq!(response["user"], "Moderator");
+        assert!(!response.contains_key("mention"));
+        assert!(!response.contains_key("user_id"));
+        let custom = "{user} {mention} {user_id} {actor} {actor_id} {custom_key}";
+        assert_eq!(
+            templates::render(custom, &vars),
+            "Target <@91> 91 Moderator (<@7>) 7 custom value"
+        );
+        let mut id_only = response.clone();
+        id_only.remove("target");
+        let fallback = command_log_vars(
+            "custom",
+            "mod_action",
+            &id_only,
+            &cache,
+            UserId::new(7),
+            ChannelId::new(1),
+        );
+        assert_eq!(fallback["user"], "91");
+        assert_eq!(fallback["mention"], "<@91>");
+        assert_eq!(fallback["user_id"], "91");
+    }
+
     fn outcome(response: Option<&str>, suppress_response: bool) -> BehaviorOutcome {
         BehaviorOutcome {
             response: response.map(str::to_string),
             vars: BTreeMap::new(),
+            emitted_log_events: Vec::new(),
             suppress_response,
         }
     }
@@ -2467,6 +2575,7 @@ mod tests {
         let outcome = BehaviorOutcome {
             response: Some("Normalized sample: `{user}`".into()),
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         assert_eq!(
@@ -2484,6 +2593,7 @@ mod tests {
                 ("target".into(), "Member".into()),
                 ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
             ]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         assert_eq!(render_outcome(&custom, &outcome), "See Member for details");
@@ -2502,6 +2612,7 @@ mod tests {
                 ("reason".into(), "spam".into()),
                 ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
             ]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         assert_eq!(
@@ -2536,6 +2647,7 @@ mod tests {
                 ("reason".into(), "spam".into()),
                 ("mod_reason_dm_clause".into(), clause),
             ]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         let rendered = render_outcome(&custom, &outcome);
@@ -2567,6 +2679,7 @@ mod tests {
                 &vars,
             )),
             vars: vars.clone(),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         let not_cached_text = render_outcome(&command, &not_cached);
@@ -2586,6 +2699,7 @@ mod tests {
                 &vars,
             )),
             vars: vars.clone(),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         let not_in_text = render_outcome(&command, &not_in_channel);
@@ -2605,6 +2719,7 @@ mod tests {
                 &vars,
             )),
             vars: vars.clone(),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         let unavailable_text = render_outcome(&command, &channel_unavailable);
@@ -2642,6 +2757,7 @@ mod tests {
             let outcome = BehaviorOutcome {
                 response: Some(literal.into()),
                 vars: vars.clone(),
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             };
             assert_eq!(
@@ -2681,6 +2797,7 @@ mod tests {
                     ("reason".into(), "Moderator".into()),
                     ("mod_reason_dm_clause".into(), " | Reason DM sent.".into()),
                 ]),
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             };
             let text = render_outcome(&command, &outcome);
@@ -2706,6 +2823,7 @@ mod tests {
                 ("user".into(), "Moderator".into()),
                 ("response".into(), "should not replace the template".into()),
             ]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         assert_eq!(
@@ -2720,6 +2838,7 @@ mod tests {
         let outcome = BehaviorOutcome {
             response: Some("hello {user}".into()),
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         };
         assert_eq!(render_outcome(&command, &outcome), "hello {user}");
