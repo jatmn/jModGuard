@@ -2110,14 +2110,41 @@ function RuleEditor({ record: r }) {
     onChange: (e) => (rule.dry_run = e.target.checked),
     className: "checkbox",
   });
-  const paramsTextRef = useRef(null);
-  const paramsText = h(Textarea, {
-    ref: paramsTextRef,
-    className: "mono textarea",
-    rows: 7,
-    spellCheck: false,
-    defaultValue: JSON.stringify(rule.params ?? {}, null, 2),
-  });
+  const numberParams = {
+    mention_spam: [
+      ["window_secs", "Window (seconds)", 10],
+      ["max_mentions_in_window", "Maximum mentions in window", 5],
+    ],
+    new_member_url: [["grace_secs", "Seconds after joining", 120]],
+    velocity: [
+      ["window_secs", "Window (seconds)", 10],
+      ["max_messages", "Maximum messages in window", 8],
+    ],
+    account_age: [["min_age_days", "Minimum account age (days)", 3]],
+  }[r.rule_id] || [];
+  const numberParamsRef = useRef({});
+  const inviteCodesRef = useRef(null);
+  const detectionFields = numberParams.map(([key, label, fallback]) =>
+    h(React.Fragment, { key }, field(label, h(Input, {
+      ref: (node) => { numberParamsRef.current[key] = node; },
+      type: "number",
+      min: 0,
+      max: Number.MAX_SAFE_INTEGER,
+      step: 1,
+      required: true,
+      defaultValue: rule.params?.[key] ?? fallback,
+      className: "input",
+    }))),
+  );
+  if (r.rule_id === "invite") {
+    detectionFields.push(h(React.Fragment, { key: "invite_codes" }, field("Allowed invite codes (comma-separated)", h(Input, {
+      ref: inviteCodesRef,
+      type: "text",
+      defaultValue: (rule.params?.allowlist_codes || []).join(", "),
+      placeholder: "code-one, code-two",
+      className: "input",
+    }))));
+  }
 
   const whitelistTextRef = useRef(null);
   const whitelistText = h(Input, {
@@ -2228,7 +2255,7 @@ function RuleEditor({ record: r }) {
         )
       : r.rule_id === "badword"
         ? h("p", { className: "field-help" }, "Manage words and advanced regex in Badwords. These settings apply to that saved list.")
-        : field("Parameters (JSON)", paramsText),
+        : detectionFields,
     spam
       ? null
       : field(
@@ -2319,10 +2346,24 @@ function RuleEditor({ record: r }) {
                     "Channels must be 2–10 and window 1–600 seconds, all whole numbers. Images 1–10. Text length 1–2000.",
                   );
               } else if (r.rule_id !== "badword") {
-                rule.params = JSON.parse(paramsTextRef.current.value || "{}");
+                const params = {};
+                for (const [key, label] of numberParams) {
+                  const input = numberParamsRef.current[key];
+                  const value = Number(input.value);
+                  if (input.value.trim() === "" || !Number.isSafeInteger(value) || value < 0)
+                    throw new Error(`${label} must be a non-negative whole number.`);
+                  params[key] = value;
+                }
+                if (r.rule_id === "invite") {
+                  // Legacy allowlist_guilds was never read by the bot. Do not
+                  // reinterpret those guild IDs as invite codes on edit.
+                  params.allowlist_codes = inviteCodesRef.current.value
+                    .split(",").map((code) => code.trim()).filter(Boolean);
+                }
+                rule.params = params;
               }
             } catch (e) {
-              toast("Invalid params JSON: " + e.message, "error");
+              toast("Invalid detection settings: " + e.message, "error");
               return;
             }
             rule.whitelist_roles = splitIds(whitelistTextRef.current.value);

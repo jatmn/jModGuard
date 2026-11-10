@@ -2249,6 +2249,109 @@ test('log filter saves use the loaded guild enrollment', async () => {
 });
 
 
+// Exercise the mounted production editor and inspect its actual configuration PUT.
+for (const [id, params, fields, expected] of [
+  ['mention_spam', {window_secs: 10, max_mentions_in_window: 5, max_everyone_mentions: 0},
+    [['Window (seconds)', '12'], ['Maximum mentions in window', '7']],
+    {window_secs: 12, max_mentions_in_window: 7}],
+  ['new_member_url', {grace_secs: 120}, [['Seconds after joining', '180']], {grace_secs: 180}],
+  ['badword', {legacy_setting: true}, [], {legacy_setting: true}],
+  ['invite', {allowlist_codes: ['Old-Code'], allowlist_guilds: ['9007199254740993']},
+    [['Allowed invite codes (comma-separated)', ' New-Code, second-code, , ']],
+    {allowlist_codes: ['New-Code', 'second-code']}],
+  ['velocity', {window_secs: 10, max_messages: 8},
+    [['Window (seconds)', '15'], ['Maximum messages in window', '11']],
+    {window_secs: 15, max_messages: 11}],
+  ['account_age', {min_age_days: 3}, [['Minimum account age (days)', '5']], {min_age_days: 5}],
+]) {
+  test(`built-in ${id} saves typed detection fields without a JSON editor`, async () => {
+    const calls = [];
+    const h = harness(async (url, options) => {
+      if (options.method === 'PUT') calls.push({url, body: JSON.parse(options.body)});
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    const action = {at: 1, action: 'warn', duration_minutes: 0, delete_days: 0, reason: 'Keep reason'};
+    const modal = await h.app.editRule({name: id, rule_id: id, effective: {
+      enabled: true, dry_run: true, params, actions: [action], skip_moderators: true,
+      whitelist_roles: ['9007199254740993'], whitelist_channels: ['9007199254740995'],
+      whitelist_users: ['9007199254740997'], include_channels: ['9007199254740999'],
+    }});
+    assert.doesNotMatch(textOf(modal), /Parameters \(JSON\)/);
+    assert.equal(modal.querySelector('textarea'), null);
+    assert.match(textOf(modal), /Action escalation/);
+    for (const [label, value] of fields) {
+      const labelNode = findNode(modal, n => n.localName === 'label' && textOf(n) === label);
+      const input = labelNode?.control;
+      assert.ok(input, label);
+      assert.equal(input.type, id === 'invite' ? 'text' : 'number');
+      input.value = value;
+      await fire(input, 'input');
+    }
+    const enabled = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Enabled').control;
+    await fire(enabled, 'change', {target: {checked: false}});
+    const dryRun = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Dry-run (log only)').control;
+    await fire(dryRun, 'change', {target: {checked: false}});
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, `/api/guilds/${h.app.state.guildId}/rules/${id}`);
+    assert.equal(calls[0].body.scope, 'guild');
+    const saved = calls[0].body.data;
+    assert.deepEqual(saved.params, expected);
+    assert.deepEqual(saved.actions, [action]);
+    assert.equal(saved.enabled, false);
+    assert.equal(saved.dry_run, false);
+    assert.equal(saved.skip_moderators, true);
+    for (const key of ['whitelist_roles', 'whitelist_channels', 'whitelist_users', 'include_channels']) {
+      assert.deepEqual(saved[key], {
+        whitelist_roles: ['9007199254740993'], whitelist_channels: ['9007199254740995'],
+        whitelist_users: ['9007199254740997'], include_channels: ['9007199254740999'],
+      }[key]);
+    }
+  });
+}
+
+for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes: []}]) {
+  test(`invite editor saves an empty code list from ${Object.keys(params)[0]}`, async () => {
+    let saved;
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    const modal = await h.app.editRule({name: 'Invite links', rule_id: 'invite', effective: {
+      enabled: true, dry_run: true, params, actions: [{at: 1, action: 'delete'}],
+    }});
+    const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Allowed invite codes (comma-separated)')?.control;
+    assert.ok(input);
+    assert.equal(input.value, '', 'legacy guild IDs must never become invite codes');
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.deepEqual(saved.params, {allowlist_codes: []});
+  });
+}
+
+test('built-in numeric detection fields reject empty, negative and fractional values', async () => {
+  const calls = [];
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  const modal = await h.app.editRule({name: 'Account age', rule_id: 'account_age', effective: {
+    enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'log'}],
+  }});
+  const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Minimum account age (days)')?.control;
+  assert.ok(input);
+  assert.equal(input.value, '3', 'missing keys use the bot default');
+  for (const value of ['', '-1', '1.5', '9007199254740992']) {
+    input.value = value;
+    await fire(input, 'input');
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.equal(calls.length, 0, `invalid numeric value ${value} must not be sent`);
+  }
+  input.value = '0';
+  await fire(input, 'input');
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.deepEqual(calls[0].data.params, {min_age_days: 0});
+});
+
 test('image rule UI can save test mode or delete-and-ban', async () => {
   const calls=[];
   const h=harness(async (url, options) => {
@@ -3469,8 +3572,8 @@ test('untouched rule reload recovers reordered nested parameters', async () => {
   await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Cancel'),'click');
   await first.app.editRule(initial);
   first.failures.lost = true;
-  const params = first.document.querySelector('.modal-overlay textarea');
-  params.value = '{"z":1,"a":2}'; await fire(params,'input');
+  const params = findNode(first.document.querySelector('.modal-overlay'), n => n.localName === 'label' && textOf(n) === 'Window (seconds)').control;
+  params.value = '12'; await fire(params,'input');
   await fire(first.elements.find(n=>n.localName==='button' && n.textContent==='Save'),'click');
   const original = first.calls.find(c=>c.method==='PUT');
   assert.equal(first.session.size,1);
@@ -3516,20 +3619,20 @@ test('nested command matching preserves array order and changed values as new sa
   assert.notEqual(calls[2].headers['x-jmodguard-save'],calls[3].headers['x-jmodguard-save']);
 });
 
-test('reordered global rule retry preserves a newer guild override', async () => {
+test('global rule retry after detection edits preserves a newer guild override', async () => {
   const h = await ruleSaveHarness({scope:'global', override:true});
   h.app.state.config.enrollment_id = 'abcdef0123456789abcdef0123456789';
   h.failures.lost = true;
-  const params = h.document.querySelector('.modal-overlay textarea');
-  params.value = '{"z":1,"a":2}'; await fire(params,'input'); await fire(h.save,'click');
+  const params = findNode(h.document.querySelector('.modal-overlay'), n => n.localName === 'label' && textOf(n) === 'Window (seconds)').control;
+  params.value = '12'; await fire(params,'input'); await fire(h.save,'click');
   const first = h.calls.find(c=>c.method==='PUT');
   assert.equal(first.body.scope,'global');
   assert.equal(first.body.clear_guild_override,true);
   h.replaceOverride({...h.snapshot().rules[0].global, name:'Newer override'});
   h.failures.lost = false;
-  params.value = '{"a":2,"z":1}'; await fire(params,'input'); await fire(h.save,'click');
+  params.value = '12'; await fire(params,'input'); await fire(h.save,'click');
   const retry = h.calls.filter(c=>c.method==='PUT')[1];
-  assert.deepEqual(retry.body,first.body,'JSON member order preserves complete payload values');
+  assert.deepEqual(retry.body,first.body,'unchanged detection fields preserve complete payload values');
   assert.equal(retry.headers['x-jmodguard-save-lookup'],'1');
   assert.equal(retry.headers['x-jmodguard-save'],first.headers['x-jmodguard-save']);
   assert.equal(h.snapshot().rules[0].guild_override.name,'Newer override');
@@ -4356,7 +4459,9 @@ test('Badwords setup reaches existing rule enable escalation exemptions without 
   for (const text of ['Enabled', 'Dry-run', 'Action escalation', 'Whitelist roles', 'Skip moderators']) assert.ok(modal.textContent.includes(text));
   assert.doesNotMatch(modal.textContent, /Parameters \(JSON\)/);
   const other = await h.app.editRule({...rule, rule_id: 'mention_spam'});
-  assert.match(other.textContent, /Parameters \(JSON\)/);
+  assert.doesNotMatch(other.textContent, /Parameters \(JSON\)/);
+  assert.match(other.textContent, /Window \(seconds\)/);
+  assert.match(other.textContent, /Maximum mentions in window/);
 });
 
 test('Badwords rule saves enable actions and exemptions through the setup path', async () => {

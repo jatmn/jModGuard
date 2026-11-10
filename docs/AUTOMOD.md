@@ -18,10 +18,11 @@ escalation accurate without false positives.
 ## Rules
 
 ### 1. `mention_spam` — @everyone/@here spam
-- Params: `window_secs` (10), `max_everyone_mentions` (0 = any is a trigger),
-  `max_mentions_in_window` (5, cumulative role/channel/everyone pings).
+- Params: `window_secs` (10), `max_mentions_in_window` (5).
+- Triggers when the current message's @everyone/@here and role mentions, plus
+  prior recorded mention-spam events inside the window, exceed the maximum.
+  The old `max_everyone_mentions` key has no effect and is no longer seeded.
 - Default escalation: `1 → ban` (deletes 1 day of messages).
-- The classic spam-bot pattern: message containing @everyone/@here.
 
 ### 2. `attachment_flood` — exact-image spam
 - Detection of a common set of identical image bytes from one author across
@@ -61,7 +62,9 @@ escalation accurate without false positives.
 
 ### 6. `invite` — Discord invite links
 - Params: `allowlist_codes` — invite codes (`discord.gg/<code>`) that are
-  always allowed.
+  always allowed. Enter codes, not invite URLs or server IDs, in the rule editor.
+  Legacy `allowlist_guilds` values were never used by the matcher; saving the
+  editor replaces that ignored key with `allowlist_codes` without converting IDs.
 - Default escalation: `1 → delete`, `2 → warn`, `4 → timeout 60m`.
 
 ### 7. `velocity` — message flood
