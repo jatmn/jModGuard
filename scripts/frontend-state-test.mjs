@@ -2631,6 +2631,9 @@ for (const [name, input, selector, expected] of [
   ['underscore italics', '_italic_', 'em', 'italic'],
   ['bold italics', '***both***', 'strong em', 'both'],
   ['nested emphasis and code', '__**bold `**literal**` end**__', 'u strong code', '**literal**'],
+  ['bold inside italics', '*italic **bold** italic*', 'em > strong', 'bold'],
+  ['italics closing with bold', '**bold *italic***', 'strong > em', 'italic'],
+  ['underline inside underscore italics', '_italic __under__ italic_', 'em > u', 'under'],
   ['multiple-backtick code', '``literal `tick``', 'code', 'literal `tick'],
   ['spoilers', '||secret **bold**||', 'details summary', 'Spoiler'],
   ['inline code', '`**literal** <b>`', 'code', '**literal** <b>'],
@@ -2752,8 +2755,8 @@ for (const [name, input, literal = true] of [
 }
 
 // Captured from main 3d80be82d020ee6c31244377a04abb6afe73f88f before
-// changing the parser. These include #487/#504 fixtures and deliberately retain
-// main's imperfect nested-emphasis result (#515).
+// changing the parser. These include #487/#504 fixtures; the nested-emphasis
+// row uses Discord's result from #515.
 const previewBaseline = [
   [
     "[**Docs**](https://example.test/a?x=1&y=2)",
@@ -2849,7 +2852,7 @@ const previewBaseline = [
   ],
   [
     "*italic **bold** italic*",
-    "<div><em>italic </em><em>bold</em><em> italic</em></div>"
+    "<div><em>italic <strong>bold</strong> italic</em></div>"
   ],
   [
     "__**bold `**literal**` end**__",
