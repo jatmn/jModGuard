@@ -2328,6 +2328,56 @@ for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes
   });
 }
 
+for (const id of ['mention_spam', 'velocity']) {
+  test(`built-in ${id} window bounds reject invalid saves and accept endpoints`, async () => {
+    const calls = [];
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    for (const value of ['0', '601', '1', '600']) {
+      const modal = await h.app.editRule({name: id, rule_id: id, effective: {
+        enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'log'}],
+      }});
+      const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Window (seconds)')?.control;
+      assert.equal(input.min, '1');
+      assert.equal(input.max, '600');
+      input.value = value;
+      await fire(input, 'input');
+      const before = calls.length;
+      await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+      if (['0', '601'].includes(value)) {
+        assert.equal(calls.length, before, 'invalid window must not reach the API');
+        assert.match(textOf(h.document.body), /1–600 seconds/);
+        await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Cancel'), 'click');
+      } else {
+        assert.equal(calls.length, before + 1);
+        assert.equal(calls.at(-1).data.params.window_secs, Number(value));
+      }
+    }
+  });
+}
+
+for (const [stored, expected] of [
+  ['broken', []], [true, []], [{code: 'object'}, []],
+  [['keep', 123, null, false, {}, ['nested'], 'second'], ['keep', 'second']],
+]) {
+  test(`invite editor recovers malformed allowlist ${JSON.stringify(stored)}`, async () => {
+    const calls = [];
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    const modal = await h.app.editRule({name: 'Invite links', rule_id: 'invite', effective: {
+      enabled: true, dry_run: true, params: {allowlist_codes: stored}, actions: [{at: 1, action: 'log'}],
+    }});
+    const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Allowed invite codes (comma-separated)')?.control;
+    assert.equal(input.value, expected.join(', '));
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.deepEqual(calls[0].data.params.allowlist_codes, expected);
+  });
+}
+
 test('built-in numeric detection fields reject empty, negative and fractional values', async () => {
   const calls = [];
   const h = harness(async (_url, options) => {

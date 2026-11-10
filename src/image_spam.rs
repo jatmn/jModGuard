@@ -88,6 +88,27 @@ impl Policy {
 /// Legacy attachment-count configurations stay inert until explicitly converted.
 pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
     match id {
+        "mention_spam" | "velocity" => {
+            if let Some(value) = rule.params.get("window_secs") {
+                ensure!(
+                    value.as_u64().is_some_and(|window| (1
+                        ..=crate::types::AUTOMOD_WINDOW_MAX_SECS)
+                        .contains(&window)),
+                    "window_secs must be 1–{} seconds (a whole number)",
+                    crate::types::AUTOMOD_WINDOW_MAX_SECS
+                );
+            }
+        }
+        "invite" => {
+            if let Some(value) = rule.params.get("allowlist_codes") {
+                ensure!(
+                    value
+                        .as_array()
+                        .is_some_and(|codes| codes.iter().all(|code| code.is_string())),
+                    "allowlist_codes must be an array of strings"
+                );
+            }
+        }
         "attachment_flood" if rule.params.get("mode").is_some() => {
             Policy::parse(rule)?;
         }

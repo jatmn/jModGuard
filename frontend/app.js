@@ -2124,12 +2124,14 @@ function RuleEditor({ record: r }) {
   }[r.rule_id] || [];
   const numberParamsRef = useRef({});
   const inviteCodesRef = useRef(null);
+  const inviteCodes = (value) => Array.isArray(value)
+    ? value.filter((code) => typeof code === "string") : [];
   const detectionFields = numberParams.map(([key, label, fallback]) =>
     h(React.Fragment, { key }, field(label, h(Input, {
       ref: (node) => { numberParamsRef.current[key] = node; },
       type: "number",
-      min: 0,
-      max: Number.MAX_SAFE_INTEGER,
+      min: key === "window_secs" ? 1 : 0,
+      max: key === "window_secs" ? 600 : Number.MAX_SAFE_INTEGER,
       step: 1,
       required: true,
       defaultValue: rule.params?.[key] ?? fallback,
@@ -2140,7 +2142,7 @@ function RuleEditor({ record: r }) {
     detectionFields.push(h(React.Fragment, { key: "invite_codes" }, field("Allowed invite codes (comma-separated)", h(Input, {
       ref: inviteCodesRef,
       type: "text",
-      defaultValue: (rule.params?.allowlist_codes || []).join(", "),
+      defaultValue: inviteCodes(rule.params?.allowlist_codes).join(", "),
       placeholder: "code-one, code-two",
       className: "input",
     }))));
@@ -2352,13 +2354,15 @@ function RuleEditor({ record: r }) {
                   const value = Number(input.value);
                   if (input.value.trim() === "" || !Number.isSafeInteger(value) || value < 0)
                     throw new Error(`${label} must be a non-negative whole number.`);
+                  if (key === "window_secs" && (value < 1 || value > 600))
+                    throw new Error("Window must be 1–600 seconds.");
                   params[key] = value;
                 }
                 if (r.rule_id === "invite") {
                   // Legacy allowlist_guilds was never read by the bot. Do not
                   // reinterpret those guild IDs as invite codes on edit.
-                  params.allowlist_codes = inviteCodesRef.current.value
-                    .split(",").map((code) => code.trim()).filter(Boolean);
+                  params.allowlist_codes = inviteCodes(inviteCodesRef.current.value
+                    .split(",")).map((code) => code.trim()).filter(Boolean);
                 }
                 rule.params = params;
               }
