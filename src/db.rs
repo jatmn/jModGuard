@@ -499,6 +499,25 @@ impl Drop for CallerCancel {
     }
 }
 
+/// Run synchronous database setup with the same caller-abandon signal as pooled
+/// work. Cold guild-store opens must yield so request deadlines can be polled.
+pub(crate) async fn run_cancellable_db_work<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let probe = current_startup_probe();
+    let watch = crate::db_compat::AbandonWatch::new();
+    let _caller = CallerCancel::arm(Arc::clone(&watch));
+    tokio::task::spawn_blocking(move || {
+        let _probe = enter_startup_probe(probe);
+        let _caller = crate::db_compat::enter_caller_abandon(watch);
+        work()
+    })
+    .await
+    .context("db task panicked")?
+}
+
 impl Db {
     /// This pool's known capacity state. Cross-process admission remains unknown.
     pub fn capacity_runtime_status(&self) -> CapacityRuntimeStatus {
@@ -1247,16 +1266,13 @@ impl Db {
         let required_config_version = Arc::clone(&self.required_config_version);
         let config_write_generation = Arc::clone(&self.config_write_generation);
         let config_floor_lock = Arc::clone(&self.config_floor_lock);
-        let watch = crate::db_compat::AbandonWatch::new();
-        let _caller = CallerCancel::arm(Arc::clone(&watch));
-        tokio::task::spawn_blocking(move || {
+        run_cancellable_db_work(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
             // cannot cancel blocking work, so an aborted request must not let
             // another operation exceed the configured pool bound. Dropping the
             // caller signals the in-flight database call so this task can roll
             // back and return the permit instead of keeping both until the
             // operation deadline.
-            let _caller = crate::db_compat::enter_caller_abandon(watch);
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);
@@ -1290,7 +1306,6 @@ impl Db {
             result
         })
         .await
-        .context("db task panicked")?
     }
 
     /// Serialized, dedicated connection for the two narrow lease CAS operations.

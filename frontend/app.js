@@ -4237,6 +4237,7 @@ function tabCases() {
   const guildId = state.guildId;
   const handlers = useRef({});
   const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [detailParts, setDetailParts] = useState([]);
   const [pagination, setPagination] = useState({ first: true, next: true });
   const [canDelete, setCanDelete] = useState(false);
@@ -4249,6 +4250,7 @@ function tabCases() {
   useEffect(() => {
     let disposed = false;
     let request = 0;
+    let listController;
     let detailRequest = 0;
     let after = "";
     let removed = false;
@@ -4382,14 +4384,20 @@ function tabCases() {
     };
     const run = async () => {
       const current = ++request;
+      listController?.abort();
+      const controller = new AbortController();
+      listController = controller;
+      const signal = controller.signal;
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      setLoading(true);
       ++detailRequest;
       setDetailParts([]);
       setPagination((value) => ({ ...value, next: true }));
-      setRows([h("tr", {}, h("td", { colSpan: 5 }, "Loading…"))]);
+      setRows([]);
       try {
         const query = new URLSearchParams({ limit: String(pageSize), removed: String(removed) });
         if (after) query.set("after", after);
-        const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`);
+        const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
         if (disposed || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
         const ids = payload.cases || [];
@@ -4469,9 +4477,18 @@ function tabCases() {
           h(
             "tr",
             {},
-            h("td", { colSpan: 5, className: "err" }, "Could not load cases: " + (e.message || String(e))),
+            h(
+              "td",
+              { colSpan: 5, className: "err", role: "alert" },
+              "Could not load cases: " + (signal.aborted
+                ? "Request timed out. Refresh to verify saved state before trying again."
+                : e.message || String(e)),
+            ),
           ),
         ]);
+      } finally {
+        clearTimeout(timeout);
+        if (!disposed && current === request && state.guildId === guildId) setLoading(false);
       }
     };
     handlers.current = {
@@ -4497,6 +4514,7 @@ function tabCases() {
     if (handoff?.guildId === guildId) openCase(handoff.caseId);
     return () => {
       disposed = true;
+      listController?.abort();
       ++request;
       ++detailRequest;
     };
@@ -4539,7 +4557,13 @@ function tabCases() {
         removedView ? "Back to cases" : "Removed records / retry cleanup",
       ),
     ),
-    h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "When"] }, rows),
+    loading
+      ? h(
+        "div",
+        { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
+        h("div", { className: "card-body" }, "Loading cases…"),
+      )
+      : h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "When"] }, rows),
     h(
       "div",
       { className: "card bg-base-100 card-border", style: { marginTop: "16px" } },

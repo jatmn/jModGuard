@@ -72,8 +72,29 @@ pub async fn list_cases(
     Path(guild_id): Path<u64>,
     Query(page): Query<CasePage>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
-    let (store, scope) = live(&app, enrollment).await?;
+    // Cover authorization, pool checkout and a cold guild-store open as well as
+    // both snapshots. Dropping the inner future signals database cancellation.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        list_cases_inner(&app, &session, &headers, guild_id, page),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(anyhow::anyhow!(
+            "Cases request timed out. Please try again."
+        ))
+    })?
+}
+
+async fn list_cases_inner(
+    app: &Arc<ApiState>,
+    session: &Session,
+    headers: &HeaderMap,
+    guild_id: u64,
+    page: CasePage,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (auth, enrollment) = scoped(app, session, headers, guild_id).await?;
+    let (store, scope) = live(app, enrollment).await?;
     let after = match page.after.as_deref() {
         Some(id) => Some(parse_case_id(id)?),
         None => None,
