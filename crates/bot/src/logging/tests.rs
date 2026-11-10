@@ -114,7 +114,7 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
     let parts = fallback_bulk_parts("{details}", &display, &transcript);
     assert!(parts.len() <= 3);
     assert!(parts.iter().all(|part| part.encode_utf16().count() <= 2000));
-    assert!(parts[0].contains("Attachment unavailable"));
+    assert!(parts[0].contains("Discord rejected the transcript attachment (HTTP 403)"));
     assert!(!parts[0].contains("transcript attached"));
     let shown: usize = parts
         .iter()
@@ -143,6 +143,16 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
             .iter()
             .all(|part| part.encode_utf16().count() <= 2000)
     );
+}
+
+#[test]
+fn bulk_fallback_copy_names_the_attachment_rejection_trigger() {
+    let mut transcript = BulkTranscript::new(1);
+    transcript.push(MessageId::new(123), None);
+    let parts = fallback_bulk_parts("{details}", &BTreeMap::new(), &transcript);
+    assert!(parts[0].contains("Discord rejected the transcript attachment (HTTP 403)"));
+    assert!(parts[0].contains("bounded text fallback"));
+    assert!(!parts[0].contains("plain-message fallback"));
 }
 
 #[test]
@@ -3208,7 +3218,8 @@ async fn replayed_bulk_attachment_forbidden_delivers_plain_text() {
         seen[1]
     );
     assert!(
-        seen[1].contains("Attachment unavailable") && seen[1].contains("bulk fallback body"),
+        seen[1].contains("Discord rejected the transcript attachment (HTTP 403)")
+            && seen[1].contains("bulk fallback body"),
         "plain delivery: {}",
         seen[1]
     );
@@ -3275,7 +3286,8 @@ async fn replayed_filtered_bulk_attachment_fallback_omits_retained_text() {
         "filtered fallback exposed retained text: {seen:?}"
     );
     assert!(
-        seen[1].contains("excluded by user filter") || seen[1].contains("Attachment unavailable"),
+        seen[1].contains("excluded by user filter")
+            || seen[1].contains("Discord rejected the transcript attachment (HTTP 403)"),
         "{seen:?}"
     );
     server.abort();
