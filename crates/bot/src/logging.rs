@@ -268,13 +268,41 @@ pub struct RejoinNoteDeliveries {
     inner: Mutex<RejoinNoteDeliveryState>,
 }
 
+enum RejoinAdmission {
+    Ready,
+    InFlight,
+    Delivered,
+}
+
+#[derive(Clone, Copy)]
+enum RejoinOutcome {
+    Delivered,
+    Undelivered,
+}
+
+impl From<bool> for RejoinOutcome {
+    fn from(sent: bool) -> Self {
+        if sent {
+            Self::Delivered
+        } else {
+            Self::Undelivered
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RejoinAttempt {
+    Active,
+    Finished,
+}
+
 /// Clears an in-flight rejoin attempt when the handler future is canceled.
 pub struct RejoinNoteInFlight<'a> {
     deliveries: &'a RejoinNoteDeliveries,
     guild: u64,
     user: u64,
     stay_id: String,
-    finished: bool,
+    attempt: RejoinAttempt,
 }
 
 impl<'a> RejoinNoteInFlight<'a> {
@@ -284,27 +312,49 @@ impl<'a> RejoinNoteInFlight<'a> {
             guild,
             user,
             stay_id,
-            finished: false,
+            attempt: RejoinAttempt::Active,
         }
     }
 
     pub fn complete(mut self, sent: bool) {
-        self.finished = true;
-        self.deliveries
-            .finish_attempt(self.guild, self.user, &self.stay_id, sent);
+        self.attempt = RejoinAttempt::Finished;
+        self.deliveries.finish_with_outcome(
+            self.guild,
+            self.user,
+            &self.stay_id,
+            RejoinOutcome::from(sent),
+        );
     }
 }
 
 impl Drop for RejoinNoteInFlight<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            self.deliveries
-                .finish_attempt(self.guild, self.user, &self.stay_id, false);
+        if self.attempt == RejoinAttempt::Active {
+            self.deliveries.finish_with_outcome(
+                self.guild,
+                self.user,
+                &self.stay_id,
+                RejoinOutcome::Undelivered,
+            );
         }
     }
 }
 
 impl RejoinNoteDeliveryState {
+    fn admission(&self, key: &RejoinStayKey) -> RejoinAdmission {
+        if self.in_flight.contains(key) {
+            RejoinAdmission::InFlight
+        } else if self
+            .delivered
+            .get(key)
+            .is_some_and(|entry| entry.updated_at.elapsed() < MEMBER_JOINS_KEEP)
+        {
+            RejoinAdmission::Delivered
+        } else {
+            RejoinAdmission::Ready
+        }
+    }
+
     fn alloc_seq(&mut self) -> u64 {
         self.next_seq = self.next_seq.wrapping_add(1);
         if self.next_seq == 0 {
@@ -596,15 +646,9 @@ impl RejoinNoteDeliveries {
         let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
         state.prune_incremental();
-        if state.in_flight.contains(&key) {
-            return false;
-        }
-        if state
-            .delivered
-            .get(&key)
-            .is_some_and(|entry| entry.updated_at.elapsed() < MEMBER_JOINS_KEEP)
-        {
-            return false;
+        match state.admission(&key) {
+            RejoinAdmission::InFlight | RejoinAdmission::Delivered => return false,
+            RejoinAdmission::Ready => {}
         }
         state.in_flight.insert(key.clone());
         state.track_stay(guild, user, stay_id);
@@ -612,16 +656,19 @@ impl RejoinNoteDeliveries {
     }
 
     pub fn finish_attempt(&self, guild: u64, user: u64, stay_id: &str, sent: bool) {
+        self.finish_with_outcome(guild, user, stay_id, RejoinOutcome::from(sent));
+    }
+
+    fn finish_with_outcome(&self, guild: u64, user: u64, stay_id: &str, outcome: RejoinOutcome) {
         if stay_id.is_empty() {
             return;
         }
         let key = rejoin_stay_key(guild, user, stay_id);
         let mut state = self.inner.lock();
         state.in_flight.remove(&key);
-        if sent {
-            state.record_delivered(key);
-        } else {
-            state.record_undelivered(key);
+        match outcome {
+            RejoinOutcome::Delivered => state.record_delivered(key),
+            RejoinOutcome::Undelivered => state.record_undelivered(key),
         }
         state.enforce_limit();
     }
