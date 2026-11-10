@@ -19,8 +19,8 @@ fn rule(id: &str) -> RuleDef {
     let (name, description, params, actions) = match id {
         "mention_spam" => (
             "Mention spam",
-            "Messages pinging @everyone/@here or flooding role/channel mentions.",
-            json!({"window_secs": 10, "max_everyone_mentions": 0, "max_mentions_in_window": 5}),
+            "Too many @everyone/@here or role mentions within the configured window.",
+            json!({"window_secs": 10, "max_mentions_in_window": 5}),
             vec![action(1, "ban", "Ping spam (@everyone/@here)", 0, 1)],
         ),
         "attachment_flood" => (
@@ -53,8 +53,8 @@ fn rule(id: &str) -> RuleDef {
         ),
         "invite" => (
             "Invite links",
-            "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).",
-            json!({"allowlist_guilds": []}),
+            "Discord invite links, except invite codes configured in allowlist_codes.",
+            json!({"allowlist_codes": []}),
             vec![
                 action(1, "delete", "Invite link", 0, 0),
                 action(2, "warn", "Repeated invite links", 0, 0),
@@ -1186,5 +1186,28 @@ mod rolling_upgrade_tests {
             .find(|cmd| cmd.name == "stats")
             .expect("stats");
         assert!(rejects_binary_overlay_command_persist("stats", &shipped));
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::rule;
+    use serde_json::json;
+
+    #[test]
+    fn built_in_detection_defaults_use_matcher_keys() {
+        for (id, expected) in [
+            (
+                "mention_spam",
+                json!({"window_secs": 10, "max_mentions_in_window": 5}),
+            ),
+            ("new_member_url", json!({"grace_secs": 120})),
+            ("badword", json!({})),
+            ("invite", json!({"allowlist_codes": []})),
+            ("velocity", json!({"window_secs": 10, "max_messages": 8})),
+            ("account_age", json!({"min_age_days": 3})),
+        ] {
+            assert_eq!(rule(id).params, expected, "{id}");
+        }
     }
 }

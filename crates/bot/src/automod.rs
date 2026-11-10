@@ -1330,6 +1330,23 @@ mod tests {
     use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
 
     #[test]
+    fn invite_code_form_params_match_without_reinterpreting_legacy_guild_ids() {
+        let engine = AutomodEngine::new();
+        let mut rule = crate::defaults::default_rules()
+            .into_iter()
+            .find(|rule| rule.name == "Invite links")
+            .unwrap();
+        assert_eq!(rule.params, serde_json::json!({"allowlist_codes": []}));
+        assert!(!engine.invite_allowed(&rule, "https://discord.gg/Allowed-Code"));
+        rule.params = serde_json::json!({"allowlist_codes": ["Allowed-Code", "second"]});
+        assert!(engine.invite_allowed(&rule, "https://discord.gg/Allowed-Code"));
+        assert!(engine.invite_allowed(&rule, "https://discord.com/invite/second"));
+        assert!(!engine.invite_allowed(&rule, "https://discord.gg/unlisted"));
+        rule.params = serde_json::json!({"allowlist_guilds": ["9007199254740993"]});
+        assert!(!engine.invite_allowed(&rule, "https://discord.gg/9007199254740993"));
+    }
+
+    #[test]
     fn selected_kick_timeout_cases_require_a_discord_attempt() {
         assert_eq!(discord_attempt_outcome(false, None), None);
         assert_eq!(
