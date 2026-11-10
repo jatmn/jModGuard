@@ -2706,6 +2706,7 @@ function previewParser(maxWork = Infinity) {
   });
   const parserSource = source.slice(source.indexOf('function previewInline('));
   const instrumented = parserSource.replace('  const out = [];', '  text = trackText(text);\n  const out = [];');
+  assert.notEqual(instrumented, parserSource, 'the production parser must be instrumented');
   const render = vm.runInNewContext(instrumented + '\npreviewMarkdown', {h: React.createElement, trackText});
   const plain = vm.runInNewContext(parserSource + '\npreviewMarkdown', {h: React.createElement});
   return {render, plain, work: () => work};
@@ -2725,11 +2726,13 @@ for (const [name, input] of [
     const parser = previewParser(input.length * 64);
     const result = parser.render(input);
     const start = performance.now();
-    parser.plain(input);
+    const plain = parser.plain(input);
     const elapsed = performance.now() - start;
     t.diagnostic(`${input.length} characters: ${parser.work()} string operations; uninstrumented parser ${elapsed.toFixed(3)} ms`);
     assert.equal(result.length, 1);
+    assert.ok(parser.work() > 0);
     assert.equal(result[0].props.children.join(''), input);
+    assert.equal(plain[0].props.children.join(''), input);
   });
 }
 
