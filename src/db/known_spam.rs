@@ -36,7 +36,7 @@ pub async fn delete_enrolled_known_spam(
     id: i64,
 ) -> Result<()> {
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         scope.verify_conn(&tx)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM known_spam WHERE guild_id=?1 AND id=?2)",
