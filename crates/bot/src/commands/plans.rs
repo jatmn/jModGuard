@@ -71,6 +71,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         responses.join("\n")
     };
     vars.insert("content".into(), content.clone());
+    vars.insert("response".into(), content.clone());
 
     let _ = record_moderation_plan(
         &env.app.db,
@@ -80,15 +81,21 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         steps,
     )
     .await;
-    logging::emit(
-        env.app,
-        env.ctx,
-        env.guild_id,
-        "plan_executed",
-        vars.clone(),
-    )
-    .await;
-    emitted_log_events.push("plan_executed".into());
+    if !emitted_log_events
+        .iter()
+        .any(|event| event == "plan_executed")
+    {
+        let log_vars = super::command_log_vars(
+            &env.cmd.name,
+            "plan_executed",
+            &vars,
+            &env.ctx.cache,
+            env.actor,
+            env.channel_id,
+        );
+        logging::emit(env.app, env.ctx, env.guild_id, "plan_executed", log_vars).await;
+        emitted_log_events.push("plan_executed".into());
+    }
 
     Ok(BehaviorOutcome {
         response: if content.is_empty() {
@@ -222,6 +229,7 @@ async fn run_step(
         PlanStep::Reply { template } => {
             let text = crate::templates::render(template, vars);
             responses.push(text);
+            vars.insert("response".into(), responses.join("\n"));
         }
         PlanStep::Dm { template } => {
             refuse_fenced_discord_mutation(env).await?;
@@ -249,6 +257,9 @@ async fn run_step(
             .await;
         }
         PlanStep::Log { event, template } => {
+            if emitted_log_events.contains(event) {
+                return Ok(());
+            }
             let text = crate::templates::render(template, vars);
             let mut v = vars.clone();
             v.insert("content".into(), text);

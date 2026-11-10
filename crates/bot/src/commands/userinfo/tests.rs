@@ -447,6 +447,11 @@ async fn capturing_proxy_for_commands(
                     "200 OK",
                     serde_json::to_string(&target_member(10, 91, None)).unwrap(),
                 )
+            } else if route.starts_with("PATCH ") && route.contains("/channels/") {
+                let mut channel = serenity::model::channel::GuildChannel::default();
+                channel.id = ChannelId::new(1);
+                channel.guild_id = GuildId::new(10);
+                ("200 OK", serde_json::to_string(&channel).unwrap())
             } else if route.starts_with("POST ") && route.contains("/messages") {
                 (
                     "200 OK",
@@ -2174,6 +2179,17 @@ async fn assert_configured_command_mod_action(
     targeted: bool,
     invocations: usize,
 ) {
+    assert_command_report(cmd, args, targeted, invocations, "mod_action", None).await;
+}
+
+async fn assert_command_report(
+    cmd: crate::types::CommandDef,
+    args: &str,
+    targeted: bool,
+    invocations: usize,
+    event: &str,
+    custom: Option<(&str, &str)>,
+) {
     let name = &cmd.name;
     let path = std::env::temp_dir().join(format!("command_log_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
@@ -2183,9 +2199,14 @@ async fn assert_configured_command_mod_action(
         .unwrap()
         .unwrap();
     app.tenant.activate(enrollment).await.unwrap();
-    crate::db::upsert_log_channel(&app.db, 10, "mod_action", 999)
+    crate::db::upsert_log_channel(&app.db, 10, event, 999)
         .await
         .unwrap();
+    if let Some((template, _)) = custom {
+        crate::db::upsert_template(&app.db, 10, event, template)
+            .await
+            .unwrap();
+    }
     let cache = Arc::new(Cache::new());
     remember_guild(&cache, 10, Some(target_member(10, 91, None)), None);
     let (http, requests, server) = capturing_proxy_for_commands(true).await;
@@ -2252,13 +2273,20 @@ async fn assert_configured_command_mod_action(
     );
     for payload in &payloads {
         let embed = &payload["embeds"][0];
+        if let Some((_, expected)) = custom {
+            assert_eq!(embed["description"].as_str().unwrap(), expected, "{name}");
+            assert!(!expected.contains(['{', '}']));
+            continue;
+        }
         let fields = embed["fields"].as_array().unwrap();
         let field = |name: &str| {
             fields.iter().find(|field| field["name"] == name).unwrap()["value"]
                 .as_str()
                 .unwrap()
         };
-        if targeted {
+        if event == "plan_executed" {
+            assert_eq!(field("Command"), format!("`{name}`"));
+        } else if targeted {
             assert_eq!(
                 field("User"),
                 "targetuser · <@91>",
@@ -2268,7 +2296,9 @@ async fn assert_configured_command_mod_action(
         } else {
             assert_eq!(field("User"), "Moderator · <@7>");
         }
-        assert_eq!(field("Moderator"), "Moderator (<@7>)");
+        if event != "plan_executed" {
+            assert_eq!(field("Moderator"), "Moderator (<@7>)");
+        }
         for text in fields.iter().map(|field| field["value"].as_str().unwrap()) {
             assert!(
                 !text.contains(['{', '}']),
@@ -2357,4 +2387,190 @@ async fn command_mod_action_targeted_plan_with_and_without_log_step() {
         cmd.behavior = Behavior::Plan { steps };
         assert_configured_command_mod_action(cmd, "91", true, 1).await;
     }
+}
+
+#[tokio::test]
+async fn command_log_context_reply_plan_shipped_command() {
+    use crate::types::{Behavior, PlanStep};
+    let mut cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "warn")
+        .unwrap();
+    cmd.name = "review-plan".into();
+    cmd.log_event = "plan_executed".into();
+    cmd.behavior = Behavior::Plan {
+        steps: vec![PlanStep::Reply {
+            template: "hello {user}".into(),
+        }],
+    };
+    assert_command_report(cmd, "", false, 1, "plan_executed", None).await;
+}
+
+async fn assert_custom_command_log_context(name: &str, args: &str) {
+    let mut cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == name)
+        .unwrap();
+    // The command alias must not replace the behavior's action.
+    cmd.name = format!("review-{name}");
+    let template = "{command}|{channel}|{target}|{target_id}|{user}|{mention}|{user_id}|{actor}|{actor_id}|{action}|{reason}";
+    let expected = format!(
+        "review-{name}|<#1>|targetuser|91|targetuser|<@91>|91|Moderator (<@7>)|7|{name}|test reason"
+    );
+    assert_command_report(
+        cmd,
+        args,
+        true,
+        1,
+        "mod_action",
+        Some((template, &expected)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn command_log_context_warn_custom() {
+    assert_custom_command_log_context("warn", "91 test reason").await;
+}
+#[tokio::test]
+async fn command_log_context_ban_custom() {
+    assert_custom_command_log_context("ban", "91 test reason").await;
+}
+#[tokio::test]
+async fn command_log_context_timeout_custom() {
+    assert_custom_command_log_context("timeout", "91 5 test reason").await;
+}
+
+#[tokio::test]
+async fn command_log_context_other_moderation_custom() {
+    for name in ["kick", "softban", "unban"] {
+        assert_custom_command_log_context(name, "91 test reason").await;
+    }
+}
+
+#[tokio::test]
+async fn command_log_context_warnclear_response_and_count() {
+    let mut cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "warnclear")
+        .unwrap();
+    cmd.name = "review-clear".into();
+    assert_command_report(
+        cmd, "91", true, 1, "mod_action",
+        Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{action}|{reason}|{count}|{response}",
+        "review-clear|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|warnclear|0|0|Cleared 0 warnings for targetuser.")),
+    ).await;
+}
+
+#[tokio::test]
+async fn command_log_context_timeout_events_and_duration() {
+    for (minutes, duration, event) in [
+        (5, "5m", "timeout_add"),
+        (0, "0s", "timeout_remove"),
+        (5, "5m", "mod_action"),
+        (0, "0s", "mod_action"),
+    ] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "timeout")
+            .unwrap();
+        cmd.name = "review-timeout".into();
+        cmd.log_event = event.into();
+        let expected = format!(
+            "review-timeout|<#1>|targetuser|91|targetuser|<@91>|91|Moderator (<@7>)|7|{minutes}|{duration}|test reason"
+        );
+        assert_command_report(
+            cmd, &format!("91 {minutes} test reason"), true, 1, event,
+            Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{user_id}|{actor}|{actor_id}|{minutes}|{duration}|{reason}", &expected)),
+        ).await;
+    }
+}
+
+#[tokio::test]
+async fn command_log_context_purge_count_and_slowmode_duration() {
+    for (name, args, template, expected) in [
+        (
+            "purge",
+            "2",
+            "{command}|{channel}|{actor}|{action}|{reason}|{count}",
+            "review-purge|<#1>|Moderator (<@7>)|purge|0 deleted|0",
+        ),
+        (
+            "slowmode",
+            "75",
+            "{command}|{channel}|{actor}|{action}|{reason}|{seconds}|{duration}",
+            "review-slowmode|<#1>|Moderator (<@7>)|slowmode|1m 15s|75|1m 15s",
+        ),
+    ] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == name)
+            .unwrap();
+        cmd.name = format!("review-{name}");
+        assert_command_report(
+            cmd,
+            args,
+            false,
+            1,
+            "mod_action",
+            Some((template, expected)),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn command_log_context_plan_explicit_events_once() {
+    use crate::types::{Behavior, PlanStep};
+    for event in ["plan_executed", "mod_action"] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "warn")
+            .unwrap();
+        cmd.name = "review-plan".into();
+        cmd.log_event = event.into();
+        cmd.behavior = Behavior::Plan {
+            steps: vec![
+                PlanStep::AddRole { role_id: 50 },
+                PlanStep::Reply {
+                    template: "hello {user}".into(),
+                },
+                PlanStep::Log {
+                    event: event.into(),
+                    template: "step {command}: {target}".into(),
+                },
+                PlanStep::Log {
+                    event: event.into(),
+                    template: "duplicate".into(),
+                },
+            ],
+        };
+        assert_command_report(cmd, "91", true, 2, event,
+            Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}",
+            "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|step review-plan: targetuser|hello Moderator")),
+        ).await;
+    }
+}
+
+#[tokio::test]
+async fn command_log_context_targeted_plan_automatic() {
+    use crate::types::{Behavior, PlanStep};
+    let mut cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "warn")
+        .unwrap();
+    cmd.name = "review-plan".into();
+    cmd.log_event = "plan_executed".into();
+    cmd.behavior = Behavior::Plan {
+        steps: vec![
+            PlanStep::AddRole { role_id: 50 },
+            PlanStep::Reply {
+                template: "hello {user}".into(),
+            },
+        ],
+    };
+    assert_command_report(cmd, "91", true, 1, "plan_executed",
+        Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}",
+        "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|hello Moderator|hello Moderator")),
+    ).await;
 }

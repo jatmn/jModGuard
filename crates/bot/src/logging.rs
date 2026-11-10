@@ -3695,6 +3695,7 @@ pub async fn emit_mod_action(
     enrollment: Option<db::GuildEnrollment>,
     ctx: &Context,
     guild_id: GuildId,
+    mut vars: BTreeMap<String, String>,
     action: &str,
     target_id: u64,
     target_name: &str,
@@ -3707,7 +3708,8 @@ pub async fn emit_mod_action(
     if !app.activation.may_record() {
         return;
     }
-    let mut vars = templates::user_vars(target_id, target_name, target_display);
+    // Keep command/response context; confirmed behavior facts override defaults.
+    vars.extend(templates::user_vars(target_id, target_name, target_display));
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());

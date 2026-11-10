@@ -350,10 +350,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 },
                 None => Ok(()),
             };
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             if log_ban {
                 log_mod(
                     env,
                     enrollment.clone(),
+                    &vars,
                     "ban",
                     target,
                     &target_user.name,
@@ -363,10 +368,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .await;
             }
             expiry?;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
-            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -437,9 +438,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .await;
                 result?;
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment,
+                &vars,
                 "softban",
                 target,
                 &target_user.name,
@@ -447,9 +452,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name);
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -529,9 +531,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     }
                 }
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "unban",
                 target,
                 &target_user.name,
@@ -539,9 +545,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -598,9 +601,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
                 return Err(mod_reason_dm::moderation_failure_error(error, dm_outcome));
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
+            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "kick",
                 target,
                 &target_user.name,
@@ -608,10 +616,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 dm_outcome,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
-            apply_mod_reason_dm_clause(&mut vars, dm_outcome);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -694,6 +698,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "duration".into(),
                 crate::templates::format_duration(minutes.saturating_mul(60)),
             );
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("minutes".into(), minutes.to_string());
+            vars.insert("reason".into(), reason.clone());
             if minutes == 0 {
                 let v = timeout_log_vars(&vars, target, &target_user.name, &reason);
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
@@ -704,6 +712,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "timeout",
                 target,
                 &target_user.name,
@@ -711,10 +720,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("minutes".into(), minutes.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -774,9 +779,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     ));
                 }
             }
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
+            vars.insert("reason".into(), reason.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "warn",
                 target,
                 &target_user.name,
@@ -784,9 +793,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("target".into(), target_user.name.clone());
-            vars.insert("target_id".into(), target.to_string());
-            vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -845,9 +851,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("count".into(), n.to_string());
+            let response = format!("Cleared {n} warnings for {}.", target_user.name);
+            vars.insert("response".into(), response.clone());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "warnclear",
                 target,
                 &target_user.name,
@@ -856,7 +865,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             Ok(BehaviorOutcome {
-                response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
+                response: Some(response),
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
@@ -997,9 +1006,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 )
                 .await;
             }
+            vars.insert("count".into(), n.to_string());
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "purge",
                 env.actor,
                 "messages",
@@ -1007,7 +1018,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await;
-            vars.insert("count".into(), n.to_string());
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
@@ -1071,6 +1081,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             log_mod(
                 env,
                 enrollment.clone(),
+                &vars,
                 "slowmode",
                 env.actor,
                 "channel",
@@ -1317,6 +1328,8 @@ async fn stats_response(
 /// Standard variables available to every command's response template.
 pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<String, String> {
     let mut vars = std::collections::BTreeMap::new();
+    vars.insert("command".into(), env.cmd.name.clone());
+    vars.insert("response".into(), String::new());
     vars.insert("user".into(), env.actor_member.display_name().to_string());
     vars.insert(
         "actor".into(),
@@ -1510,9 +1523,11 @@ fn say_target_and_text(args: &Args, invocation: ChannelId) -> Result<(ChannelId,
     Ok((target, text.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_mod(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
+    vars: &std::collections::BTreeMap<String, String>,
     action: &str,
     target: serenity::model::id::UserId,
     target_name: &str,
@@ -1532,6 +1547,7 @@ async fn log_mod(
         enrollment,
         env.ctx,
         env.guild_id,
+        vars.clone(),
         action,
         target.get(),
         target_name,
