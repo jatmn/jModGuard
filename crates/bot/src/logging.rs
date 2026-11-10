@@ -2445,13 +2445,13 @@ fn fallback_bulk_parts(
     fallback_display.insert(
         "details".into(),
         format!(
-            "attachment unavailable; {} entries omitted from plain-message fallback",
+            "Discord rejected the transcript attachment (HTTP 403); using bounded text fallback; {} entries omitted",
             omitted
         ),
     );
     let rendered = templates::render_bounded(template, &fallback_display, 2000);
     let summary = format!(
-        "Attachment unavailable. Unique deleted: {}; retained: {}; known missing: {}; storage unknown: {}; filtered: {}; entries omitted: {}; entries clipped: {}.\n",
+        "Discord rejected the transcript attachment (HTTP 403); using bounded text fallback. Unique deleted: {}; retained: {}; known missing: {}; storage unknown: {}; filtered: {}; entries omitted: {}; entries clipped: {}.\n",
         transcript.total,
         transcript.retained,
         transcript.unavailable,

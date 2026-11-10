@@ -4792,6 +4792,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_title_appears_once_and_original_preview_is_unchanged() {
+        let (app, path) = open_app();
+        let mut vars = BTreeMap::from([
+            ("rule".into(), "Attachment burst".into()),
+            ("mention".into(), "user 99".into()),
+            ("action".into(), "timeout 10m".into()),
+            ("reason".into(), "fixture".into()),
+            ("content".into(), "fixture".into()),
+            ("channel".into(), "channel 1".into()),
+            ("time".into(), "2026-10-26T02:03:04Z".into()),
+        ]);
+        let original = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
+        assert!(original.starts_with("**:shield: Automod: Attachment burst**"));
+        assert_eq!(original.matches("Automod").count(), 1);
+        for label in [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED] {
+            let payload =
+                serde_json::to_value(decision_edit(original.clone(), label, UserId::new(7)))
+                    .unwrap();
+            let content = payload["content"].as_str().unwrap();
+            assert_eq!(content.matches("Automod").count(), 1);
+            assert_eq!(
+                content,
+                format!("{original}\n\n**Review:** {label} by user 7")
+            );
+            assert!(payload.get("embeds").is_none());
+            assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+            assert_eq!(payload["components"], serde_json::json!([]));
+        }
+        assert_eq!(
+            logging::preview_automod(&app, GuildId::new(10), &mut vars).await,
+            original
+        );
+        drop(app);
+        close_app(&path);
+    }
+
+    #[tokio::test]
     async fn decision_edits_preserve_log_date_formatting() {
         let (app, path) = open_app();
         let raw = "2026-10-26T02:03:04.123456+00:00";

@@ -3174,11 +3174,7 @@ function templateEmbedPreview(record, template, vars) {
 }
 
 function logPreviewText(text) {
-  // React escapes text; a small Markdown subset makes labels/code readable.
-  return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, key) =>
-    part.startsWith("**") ? h("strong", { key }, part.slice(2, -2)) :
-    part.startsWith("`") ? h("code", { key }, part.slice(1, -1)) : part,
-  );
+  return previewMarkdown(text);
 }
 
 function LogEmbedPreview({ embed }) {
@@ -3187,9 +3183,9 @@ function LogEmbedPreview({ embed }) {
     style: { borderLeftColor: `#${embed.color.toString(16).padStart(6, "0")}` },
   },
   h("strong", { className: "log-embed-title" }, embed.title),
-  embed.description ? h("div", { className: "log-embed-description" }, logPreviewText(embed.description)) : null,
+  embed.description ? h("div", { className: "log-embed-description discord-markdown" }, logPreviewText(embed.description)) : null,
   ...embed.fields.map((field, key) => h("div", { className: "log-embed-field", key },
-    h("strong", {}, field.name), h("div", {}, logPreviewText(field.value)),
+    h("strong", {}, field.name), h("div", { className: "discord-markdown" }, logPreviewText(field.value)),
   )));
 }
 
@@ -5694,6 +5690,113 @@ function tabActions() {
           ),
     ),
   );
+}
+
+// Render only fixed React elements and text children: React escapes HTML before
+// it reaches the DOM. Never parse user text as HTML or use innerHTML here.
+function previewInline(text, depth = 0) {
+  if (depth >= 20) return [text];
+  const out = [];
+  const closing = (marker, start) => {
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === "\\") { i++; continue; }
+      if (text.startsWith(marker, i)) return i;
+    }
+    return -1;
+  };
+  for (let i = 0; i < text.length;) {
+    const key = i;
+    if (text[i] === "\\" && /[\\`*_{}[\]()#+\-.!>~|]/.test(text[i + 1] || "")) {
+      out.push(text[i + 1]); i += 2; continue;
+    }
+    if (text[i] === "`") {
+      const marker = text.slice(i).match(/^`+/)[0];
+      const end = text.indexOf(marker, i + marker.length);
+      if (end >= 0) {
+        out.push(h("code", { key }, text.slice(i + marker.length, end)));
+        i = end + marker.length; continue;
+      }
+    }
+    if (text[i] === "[") {
+      const labelEnd = closing("](", i + 1);
+      if (labelEnd >= 0) {
+        let end = labelEnd + 2, balance = 1;
+        for (; end < text.length; end++) {
+          if (text[end] === "\\") { end++; continue; }
+          if (text[end] === "(") balance++;
+          if (text[end] === ")" && --balance === 0) break;
+        }
+        if (balance === 0) {
+          const url = text.slice(labelEnd + 2, end).replace(/\\([()])/g, "$1");
+          if (/^https?:\/\/[^\s<>\\]+$/i.test(url)) {
+            out.push(h("a", { key, href: url, target: "_blank", rel: "noreferrer noopener" },
+              previewInline(text.slice(i + 1, labelEnd), depth + 1)));
+            i = end + 1; continue;
+          }
+          // An unsafe target stays literal, including any Markdown within it.
+          out.push(text.slice(i, end + 1)); i = end + 1; continue;
+        }
+      }
+    }
+    let matched = false;
+    for (const [marker, tag] of [["***", "strong"], ["**", "strong"], ["__", "u"], ["~~", "s"], ["||", "details"], ["*", "em"], ["_", "em"]]) {
+      if (!text.startsWith(marker, i)) continue;
+      const end = closing(marker, i + marker.length);
+      if (end <= i + marker.length) continue;
+      let children = previewInline(text.slice(i + marker.length, end), depth + 1);
+      if (marker === "***") children = h("em", {}, children);
+      out.push(marker === "||"
+        ? h(tag, { key, className: "preview-spoiler" }, h("summary", {}, "Spoiler"), children)
+        : h(tag, { key }, children));
+      i = end + marker.length; matched = true; break;
+    }
+    if (!matched) out.push(text[i++]);
+  }
+  return out;
+}
+
+function previewMarkdown(text, depth = 0) {
+  if (depth >= 20) return [text];
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  const listItem = line => line.match(/^( *)([-*]|\d+\.) (.*)$/);
+  for (let i = 0; i < lines.length;) {
+    const key = i, line = lines[i];
+    const fence = line.match(/^(`{3,})([^`]*)$/);
+    if (fence) {
+      const code = [];
+      i++;
+      while (i < lines.length && !new RegExp("^`{" + fence[1].length + ",}\\s*$").test(lines[i])) code.push(lines[i++]);
+      if (i < lines.length) i++;
+      out.push(h("pre", { key }, h("code", {}, code.join("\n")))); continue;
+    }
+    if (line.startsWith(">>> ")) {
+      const quoted = [line.slice(4), ...lines.slice(i + 1)].join("\n");
+      out.push(h("blockquote", { key }, previewMarkdown(quoted, depth + 1))); break;
+    }
+    if (line.startsWith("> ")) {
+      const quoted = [];
+      while (i < lines.length && lines[i].startsWith("> ")) quoted.push(lines[i++].slice(2));
+      out.push(h("blockquote", { key }, previewMarkdown(quoted.join("\n"), depth + 1))); continue;
+    }
+    const item = listItem(line);
+    if (item) {
+      const ordered = item[2].endsWith("."), indent = item[1].length, items = [];
+      while (i < lines.length) {
+        const next = listItem(lines[i]);
+        if (!next || next[1].length !== indent || next[2].endsWith(".") !== ordered) break;
+        const body = [next[3]], itemKey = i++;
+        while (i < lines.length && lines[i].startsWith(" ".repeat(indent + 2))) body.push(lines[i++].slice(indent + 2));
+        items.push(h("li", { key: itemKey }, previewMarkdown(body.join("\n"), depth + 1)));
+      }
+      out.push(h(ordered ? "ol" : "ul", { key, ...(ordered ? { start: Number.parseInt(item[2], 10) } : {}) }, items)); continue;
+    }
+    const heading = line.match(/^(#{1,3}|-#) (.*)$/);
+    out.push(h(heading ? heading[1] === "-#" ? "small" : "h" + heading[1].length : "div", { key },
+      line === "" ? h("br") : previewInline(heading ? heading[2] : line)));
+    i++;
+  }
+  return out;
 }
 
 capturePreviewToken();
