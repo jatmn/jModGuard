@@ -2190,6 +2190,27 @@ async fn assert_command_report(
     event: &str,
     custom: Option<(&str, &str)>,
 ) {
+    let expected = custom.map(|(_, expected)| [expected]);
+    assert_command_reports(
+        cmd,
+        args,
+        targeted,
+        invocations,
+        event,
+        custom.map(|(template, _)| (template, expected.as_ref().unwrap().as_slice())),
+    )
+    .await;
+}
+
+async fn assert_command_reports(
+    cmd: crate::types::CommandDef,
+    args: &str,
+    targeted: bool,
+    invocations: usize,
+    event: &str,
+    custom: Option<(&str, &[&str])>,
+) {
+    let reports_per_invocation = custom.map_or(1, |(_, expected)| expected.len());
     let name = &cmd.name;
     let path = std::env::temp_dir().join(format!("command_log_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
@@ -2252,8 +2273,9 @@ async fn assert_command_report(
             })
             .count();
         assert_eq!(
-            count, invocation,
-            "{name}: exactly one mod_action per invocation"
+            count,
+            invocation * reports_per_invocation,
+            "{name}: expected reports without extra outcome/automatic duplicates"
         );
     }
     let payloads: Vec<serde_json::Value> = requests
@@ -2268,14 +2290,19 @@ async fn assert_command_report(
         .collect();
     assert_eq!(
         payloads.len(),
-        invocations,
-        "{name}: exactly one mod_action emit; payloads={payloads:?}"
+        invocations * reports_per_invocation,
+        "{name}: expected reports without extra outcome/automatic duplicates; payloads={payloads:?}"
     );
-    for payload in &payloads {
+    for (index, payload) in payloads.iter().enumerate() {
         let embed = &payload["embeds"][0];
         if let Some((_, expected)) = custom {
-            assert_eq!(embed["description"].as_str().unwrap(), expected, "{name}");
-            assert!(!expected.contains(['{', '}']));
+            let description = embed["description"].as_str().unwrap();
+            assert_eq!(
+                description,
+                expected[index % reports_per_invocation],
+                "{name}"
+            );
+            assert!(!description.contains(['{', '}']));
             continue;
         }
         let fields = embed["fields"].as_array().unwrap();
@@ -2545,10 +2572,55 @@ async fn command_log_context_plan_explicit_events_once() {
                 },
             ],
         };
-        assert_command_report(cmd, "91", true, 2, event,
-            Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}",
-            "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|step review-plan: targetuser|hello Moderator")),
+        assert_command_reports(cmd, "91", true, 2, event,
+            Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}", &[
+                "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|step review-plan: targetuser|hello Moderator",
+                "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|duplicate|hello Moderator",
+            ])),
         ).await;
+    }
+}
+
+#[tokio::test]
+async fn command_log_context_plan_same_event_distinct_templates() {
+    use crate::types::{Behavior, PlanStep};
+    for log_event in ["", "plan_executed"] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "warn")
+            .unwrap();
+        cmd.name = "review-plan".into();
+        cmd.log_event = log_event.into();
+        cmd.behavior = Behavior::Plan {
+            steps: vec![
+                PlanStep::Log {
+                    event: "plan_executed".into(),
+                    template: "FIRST {command}: {user} in {channel}".into(),
+                },
+                PlanStep::Reply {
+                    template: "hello {user}".into(),
+                },
+                PlanStep::Log {
+                    event: "plan_executed".into(),
+                    template: "SECOND {command}: {response}".into(),
+                },
+            ],
+        };
+        assert_command_reports(
+            cmd,
+            "",
+            false,
+            1,
+            "plan_executed",
+            Some((
+                "{content}|{command}|{channel}|{user}|{mention}|{actor}",
+                &[
+                    "FIRST review-plan: Moderator in <#1>|review-plan|<#1>|Moderator|<@7>|Moderator (<@7>)",
+                    "SECOND review-plan: hello Moderator|review-plan|<#1>|Moderator|<@7>|Moderator (<@7>)",
+                ],
+            )),
+        )
+        .await;
     }
 }
 

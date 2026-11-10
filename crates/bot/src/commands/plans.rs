@@ -257,9 +257,6 @@ async fn run_step(
             .await;
         }
         PlanStep::Log { event, template } => {
-            if emitted_log_events.contains(event) {
-                return Ok(());
-            }
             let text = crate::templates::render(template, vars);
             let mut v = vars.clone();
             v.insert("content".into(), text);
@@ -273,6 +270,7 @@ async fn run_step(
                 env.channel_id,
             );
             logging::emit(env.app, env.ctx, guild_id, event, v).await;
+            // Explicit steps always emit; only outcome reports use this tracking to deduplicate.
             emitted_log_events.push(event.clone());
         }
         PlanStep::AddRole { role_id } => {
