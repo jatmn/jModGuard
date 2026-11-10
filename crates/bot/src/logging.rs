@@ -2051,11 +2051,12 @@ pub(crate) fn render_log_template(
         bound_default_message_vars(event, vars);
     }
     if event == "automod" {
-        bound_automod_content_var(template, vars, 2000);
         if template == default_template(event) {
             // The shipped evidence is one field: keep proving digests whole
             // within that field before the generic embed limiter sees it.
             bound_automod_content_var("{content}", vars, 1024);
+        } else {
+            bound_automod_content_var(template, vars, 2000);
         }
     }
     templates::render_bounded(template, vars, 2000)

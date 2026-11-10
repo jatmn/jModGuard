@@ -1714,7 +1714,7 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
         );
     }
     for (_, message) in sink.sink.messages.lock().unwrap().iter() {
-        let text = log_text(&message);
+        let text = log_text(message);
         assert!(text.contains("moderator (<@777>)"));
         assert!(text.contains("**Reason:** spam"));
         assert!(!text.contains("{actor}"));
@@ -1853,7 +1853,7 @@ async fn inaccessible_audit_renders_explicit_fallback_for_both_events() {
         );
     }
     for (_, message) in sink.messages.lock().unwrap().iter() {
-        let text = log_text(&message);
+        let text = log_text(message);
         assert!(text.contains("**Moderator:** unavailable"));
         assert!(text.contains("**Reason:** unavailable"));
         assert!(!text.contains("{actor}"));
@@ -5311,6 +5311,7 @@ fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     let content = field["value"].as_str().unwrap();
     assert!(content.encode_utf16().count() <= 1024);
     assert_whole_digests(content);
-    assert!(content.contains(" and "));
+    assert_eq!(content, whole_hash_notice(&proving_digests(40), 1024));
+    assert!(content.ends_with("and 25 more"));
     assert!(!content.contains('…'));
 }
