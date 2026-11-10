@@ -395,6 +395,11 @@ pub struct MemberCleanupCandidate {
     pub revision: i64,
 }
 
+enum PendingBanState {
+    Missing,
+    Awaiting { started_at_ms: i64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct MemberPendingBanCandidate {
     pub user_id: i64,
@@ -1491,7 +1496,8 @@ impl GuildDataStore {
         let operation_id = operation_id.to_string();
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let started:Option<i64>=tx.query_row("SELECT started_at_ms FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND operation_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,operation_id.as_str()],|r|Ok(r.get(0)?)).optional()?;
-            let Some(started)=started else {tx.finish_read()?;return Ok(())};
+            let pending=started.map_or(PendingBanState::Missing,|started_at_ms|PendingBanState::Awaiting{started_at_ms});
+            let PendingBanState::Awaiting{started_at_ms:started}=pending else {tx.finish_read()?;return Ok(())};
             match outcome {
                 CaseOutcome::Succeeded=>{
                     tx.member_execute("INSERT OR IGNORE INTO guild_member_directory(guild_id,enrollment_id,user_id,observed_at_ms) VALUES(?1,?2,?3,?4)",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,now_ms])?;
@@ -1537,10 +1543,10 @@ impl GuildDataStore {
             anyhow::ensure!(current==candidate.revision,MemberSyncError::Stale);
             let removed=tx.member_execute("DELETE FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND operation_id=?4 AND started_at_ms=?5",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id,candidate.operation_id,candidate.started_at_ms])?;
             anyhow::ensure!(removed==1,MemberSyncError::Stale);
-            if banned {
+            if BanPresence::from(banned) == BanPresence::Banned {
                 tx.member_execute("INSERT OR IGNORE INTO guild_member_directory(guild_id,enrollment_id,user_id,observed_at_ms) VALUES(?1,?2,?3,?4)",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id,now_ms])?;
-                let was_banned:bool=tx.query_row("SELECT is_banned FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id],|r|Ok(r.get(0)?))?;
-                if !was_banned {record_undated_ban_present(&tx,&scope,candidate.user_id,now_ms)?;}
+                let was_banned:BanPresence=tx.query_row("SELECT is_banned FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id],|r|Ok(BanPresence::from(r.get::<bool>(0)?)))?;
+                if was_banned == BanPresence::Unbanned {record_undated_ban_present(&tx,&scope,candidate.user_id,now_ms)?;}
                 tx.member_execute("UPDATE guild_member_directory SET is_banned=1,ever_banned=1,cleanup_after_ms=NULL,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id])?;
                 close_current_for_ban(&tx,&scope,candidate.user_id,now_ms)?;
             }else{

@@ -93,9 +93,65 @@ fn ready_guild_count(guilds: impl Iterator<Item = GuildId>) -> u32 {
 /// This is not a fixed poll; it only bounds a deadline that is hours away.
 const IDLE_RECHECK_CAP: Duration = Duration::from_secs(60);
 
+enum ScanWork {
+    Requests,
+    Backfill,
+    Quiet,
+}
+
+impl ScanWork {
+    fn from_pending(work_due: bool, backfill_pending: bool) -> Self {
+        if work_due {
+            Self::Requests
+        } else if backfill_pending {
+            Self::Backfill
+        } else {
+            Self::Quiet
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerTurn {
+    Import,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupPass {
+    NoWork,
+    Yield,
+}
+
+// Each cursor belongs to its own work list; advance at the original admission point.
+#[derive(Default)]
+struct FairCursor(usize);
+
+impl FairCursor {
+    fn index(&self, step: usize, len: usize) -> usize {
+        (self.0 + step) % len
+    }
+    fn advance(&mut self, count: usize) {
+        self.0 = self.0.wrapping_add(count);
+    }
+}
+
+enum ScanWait {
+    Ready,
+    Until(tokio::time::Instant),
+}
+
+impl ScanWait {
+    fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::Ready)
+    }
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 struct IdleScan {
-    work_due: bool,
-    backfill_pending: bool,
+    work: ScanWork,
     earliest_attempt_ms: Option<i64>,
     next_request: tokio::time::Instant,
     rate_limit_until_ms: i64,
@@ -126,20 +182,22 @@ fn next_idle_scan(
     now_ms: i64,
     scan: &IdleScan,
 ) -> Option<tokio::time::Instant> {
-    let at = if scan.work_due {
-        let mut at = scan.next_request;
-        if scan.rate_limit_until_ms > now_ms {
-            at = at.max(deadline_instant(now, now_ms, scan.rate_limit_until_ms));
+    let at = match scan.work {
+        ScanWork::Requests => {
+            let mut at = scan.next_request;
+            if scan.rate_limit_until_ms > now_ms {
+                at = at.max(deadline_instant(now, now_ms, scan.rate_limit_until_ms));
+            }
+            at
         }
-        at
-    } else if scan.backfill_pending {
-        now + Duration::from_secs(1)
-    } else {
-        let attempt = match scan.earliest_attempt_ms.filter(|ms| *ms > now_ms) {
-            Some(ms) => deadline_instant(now, now_ms, ms),
-            None => now + scan.idle_recheck,
-        };
-        attempt.max(scan.next_request)
+        ScanWork::Backfill => now + Duration::from_secs(1),
+        ScanWork::Quiet => {
+            let attempt = match scan.earliest_attempt_ms.filter(|ms| *ms > now_ms) {
+                Some(ms) => deadline_instant(now, now_ms, ms),
+                None => now + scan.idle_recheck,
+            };
+            attempt.max(scan.next_request)
+        }
     };
     let at = cap_wait(now, at);
     (at > now).then_some(at)
@@ -832,11 +890,13 @@ async fn settle_target_check(
     Ok(())
 }
 
-async fn reserve_request(
-    app: &BotState,
-    bot_id: i64,
-    worker_id: &str,
-) -> Option<db::MemberSyncRequestClaim> {
+enum RequestReservation {
+    Granted(db::MemberSyncRequestClaim),
+    Busy,
+    Unavailable,
+}
+
+async fn reserve_request(app: &BotState, bot_id: i64, worker_id: &str) -> RequestReservation {
     match db::claim_member_sync_request(
         &app.db,
         bot_id,
@@ -847,10 +907,11 @@ async fn reserve_request(
     )
     .await
     {
-        Ok(claim) => claim,
+        Ok(Some(claim)) => RequestReservation::Granted(claim),
+        Ok(None) => RequestReservation::Busy,
         Err(error) => {
             tracing::warn!("member sync global request gate unavailable: {error:#}");
-            None
+            RequestReservation::Unavailable
         }
     }
 }
@@ -885,8 +946,8 @@ async fn run_loop(
     // directory status and any required coverage gap have been recorded.
     let mut ready_coverage = ReadyCoverage::default();
     let mut backfilled = HashSet::<(i64, String)>::new();
-    let mut offset = 0usize;
-    let mut cleanup_offset = 0usize;
+    let mut offset = FairCursor::default();
+    let mut cleanup_offset = FairCursor::default();
     let worker_id = format!(
         "{:032x}{:08x}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(1) as u128,
@@ -898,11 +959,11 @@ async fn run_loop(
             u64::from(app.cfg.member_sync.min_request_interval_secs) + startup_jitter,
         );
     let mut consecutive_failures = 0u32;
-    let mut cleanup_turn = false;
+    let mut turn = WorkerTurn::Import;
     let mut scope_cache = ScopeCache::capture(&app);
-    let mut defer_until: Option<tokio::time::Instant> = None;
+    let mut defer_until = ScanWait::Ready;
     loop {
-        if let Some(until) = defer_until.take() {
+        if let ScanWait::Until(until) = defer_until.take() {
             wait_for_member_sync(&app, until, scope_cache.scope_epoch).await;
         }
         scope_cache.observe(&app);
@@ -910,14 +971,14 @@ async fn run_loop(
             Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs).max(1));
         let bot_id = cache.current_user().id.get() as i64;
         if bot_id <= 1 {
-            defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+            defer_until = ScanWait::Until(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
         app.publish_member_sync_bot_id(bot_id).await;
         let mut guilds = cache.guilds();
         guilds.sort_unstable();
         if guilds.is_empty() {
-            defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+            defer_until = ScanWait::Until(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
         let cached_guilds = guilds
@@ -934,7 +995,7 @@ async fn run_loop(
             Ok(fenced) => fenced,
             Err(error) => {
                 tracing::warn!("member sync fence snapshot unavailable: {error:#}");
-                defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+                defer_until = ScanWait::Until(tokio::time::Instant::now() + idle_recheck);
                 continue;
             }
         };
@@ -1127,8 +1188,7 @@ async fn run_loop(
             tokio::time::Instant::now(),
             decision_ms,
             &IdleScan {
-                work_due,
-                backfill_pending,
+                work: ScanWork::from_pending(work_due, backfill_pending),
                 earliest_attempt_ms,
                 next_request,
                 rate_limit_until_ms: rate_limit_until_ms.load(Ordering::Relaxed),
@@ -1140,17 +1200,17 @@ async fn run_loop(
             // Import work and a closed request gate wait for the saved deadline.
             // An open gate with nothing due still runs cleanup, then sleeps.
             if work_due || gate_closed {
-                defer_until = Some(until);
+                defer_until = ScanWait::Until(until);
                 continue;
             }
-            defer_until = Some(until);
+            defer_until = ScanWait::Until(until);
         }
         if tokio::time::Instant::now() < next_request {
-            defer_until = Some(next_request);
+            defer_until = ScanWait::Until(next_request);
             continue;
         }
         if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
-            defer_until = Some(deadline_instant(
+            defer_until = ScanWait::Until(deadline_instant(
                 tokio::time::Instant::now(),
                 chrono::Utc::now().timestamp_millis(),
                 rate_limit_until_ms.load(Ordering::Relaxed),
@@ -1158,11 +1218,11 @@ async fn run_loop(
             continue;
         }
         let pace = Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs));
-        if cleanup_turn || ready.is_empty() {
-            let mut cleaned = false;
+        if turn == WorkerTurn::Cleanup || ready.is_empty() {
+            let mut cleanup = CleanupPass::NoWork;
             for step in 0..available.len() {
                 let (guild_id, store, scope) =
-                    &available[(cleanup_offset + step) % available.len()];
+                    &available[cleanup_offset.index(step, available.len())];
                 let targeted = match store.next_member_target_check(scope.clone(), now_ms).await {
                     Ok(check) => check,
                     Err(error) => {
@@ -1174,20 +1234,21 @@ async fn run_loop(
                     }
                 };
                 if let Some(check) = targeted {
-                    let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await
+                    let RequestReservation::Granted(request_claim) =
+                        reserve_request(&app, bot_id, &worker_id).await
                     else {
-                        cleaned = true;
+                        cleanup = CleanupPass::Yield;
                         break;
                     };
                     if rate_limit_until_ms.load(Ordering::Relaxed)
                         > chrono::Utc::now().timestamp_millis()
                     {
                         finish_request(&app, request_claim, rate_limit_until_ms).await;
-                        cleaned = true;
+                        cleanup = CleanupPass::Yield;
                         break;
                     }
-                    cleaned = true;
-                    cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                    cleanup = CleanupPass::Yield;
+                    cleanup_offset.advance(step + 1);
                     next_request = tokio::time::Instant::now() + pace;
                     match fetch_target_check(&app, &http, *guild_id, &check).await {
                         Ok(verification) => {
@@ -1267,20 +1328,21 @@ async fn run_loop(
                     }
                 };
                 if let Some(candidate) = pending {
-                    let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await
+                    let RequestReservation::Granted(request_claim) =
+                        reserve_request(&app, bot_id, &worker_id).await
                     else {
-                        cleaned = true;
+                        cleanup = CleanupPass::Yield;
                         break;
                     };
                     if rate_limit_until_ms.load(Ordering::Relaxed)
                         > chrono::Utc::now().timestamp_millis()
                     {
                         finish_request(&app, request_claim, rate_limit_until_ms).await;
-                        cleaned = true;
+                        cleanup = CleanupPass::Yield;
                         break;
                     }
-                    cleaned = true;
-                    cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                    cleanup = CleanupPass::Yield;
+                    cleanup_offset.advance(step + 1);
                     next_request = tokio::time::Instant::now() + pace;
                     let result = tokio::time::timeout(
                         Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs)),
@@ -1350,19 +1412,21 @@ async fn run_loop(
                         continue;
                     }
                 };
-                let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
-                    cleaned = true;
+                let RequestReservation::Granted(request_claim) =
+                    reserve_request(&app, bot_id, &worker_id).await
+                else {
+                    cleanup = CleanupPass::Yield;
                     break;
                 };
                 if rate_limit_until_ms.load(Ordering::Relaxed)
                     > chrono::Utc::now().timestamp_millis()
                 {
                     finish_request(&app, request_claim, rate_limit_until_ms).await;
-                    cleaned = true;
+                    cleanup = CleanupPass::Yield;
                     break;
                 }
-                cleaned = true;
-                cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                cleanup = CleanupPass::Yield;
+                cleanup_offset.advance(step + 1);
                 next_request = tokio::time::Instant::now() + pace;
                 let result = tokio::time::timeout(
                     Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs)),
@@ -1420,27 +1484,29 @@ async fn run_loop(
                 finish_request(&app, request_claim, rate_limit_until_ms).await;
                 break;
             }
-            cleanup_turn = false;
-            if cleaned {
-                if defer_until.is_none() {
-                    defer_until = Some(next_request);
+            turn = WorkerTurn::Import;
+            if cleanup == CleanupPass::Yield {
+                if defer_until.is_ready() {
+                    defer_until = ScanWait::Until(next_request);
                 }
                 continue;
             }
         }
         if ready.is_empty() {
-            if defer_until.is_none() {
-                defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+            if defer_until.is_ready() {
+                defer_until = ScanWait::Until(tokio::time::Instant::now() + idle_recheck);
             }
             continue;
         }
-        let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
-            defer_until = Some(tokio::time::Instant::now() + pace);
+        let RequestReservation::Granted(request_claim) =
+            reserve_request(&app, bot_id, &worker_id).await
+        else {
+            defer_until = ScanWait::Until(tokio::time::Instant::now() + pace);
             continue;
         };
         if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
             finish_request(&app, request_claim, rate_limit_until_ms).await;
-            defer_until = Some(deadline_instant(
+            defer_until = ScanWait::Until(deadline_instant(
                 tokio::time::Instant::now(),
                 chrono::Utc::now().timestamp_millis(),
                 rate_limit_until_ms.load(Ordering::Relaxed),
@@ -1449,8 +1515,8 @@ async fn run_loop(
         }
         next_request = tokio::time::Instant::now() + pace;
         for _ in 0..ready.len() {
-            let (guild_id, store, scope, work) = ready[offset % ready.len()].clone();
-            offset = offset.wrapping_add(1);
+            let (guild_id, store, scope, work) = ready[offset.index(0, ready.len())].clone();
+            offset.advance(1);
             let gid = guild_id.get() as i64;
             let now_ms = chrono::Utc::now().timestamp_millis();
             if work == ReadyWork::AuditRecovery {
@@ -1474,7 +1540,7 @@ async fn run_loop(
                         continue;
                     }
                 };
-                cleanup_turn = true;
+                turn = WorkerTurn::Cleanup;
                 next_request = tokio::time::Instant::now() + pace;
                 let timeout =
                     Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs));
@@ -1582,7 +1648,7 @@ async fn run_loop(
                     continue;
                 }
             };
-            cleanup_turn = true;
+            turn = WorkerTurn::Cleanup;
             // Set the next local slot before HTTP so errors and cancellations
             // cannot cause an immediate second Discord request.
             next_request = tokio::time::Instant::now()
@@ -1699,9 +1765,9 @@ async fn run_loop(
             break;
         }
         finish_request(&app, request_claim, rate_limit_until_ms).await;
-        if defer_until.is_none() {
+        if defer_until.is_ready() {
             let now = tokio::time::Instant::now();
-            defer_until = Some(if next_request > now {
+            defer_until = ScanWait::Until(if next_request > now {
                 next_request
             } else {
                 now + pace
@@ -2308,8 +2374,7 @@ mod tests {
             now,
             now_ms,
             &IdleScan {
-                work_due: false,
-                backfill_pending: false,
+                work: ScanWork::Quiet,
                 earliest_attempt_ms: Some(now_ms + 45_000),
                 next_request: now,
                 rate_limit_until_ms: 0,
@@ -2322,8 +2387,7 @@ mod tests {
             now,
             now_ms,
             &IdleScan {
-                work_due: false,
-                backfill_pending: false,
+                work: ScanWork::Quiet,
                 earliest_attempt_ms: None,
                 next_request: now,
                 rate_limit_until_ms: 0,
@@ -2336,8 +2400,7 @@ mod tests {
             now,
             now_ms,
             &IdleScan {
-                work_due: true,
-                backfill_pending: false,
+                work: ScanWork::Requests,
                 earliest_attempt_ms: Some(now_ms),
                 next_request: now + pace,
                 rate_limit_until_ms: 0,
@@ -2351,8 +2414,7 @@ mod tests {
                 now,
                 now_ms,
                 &IdleScan {
-                    work_due: true,
-                    backfill_pending: false,
+                    work: ScanWork::Requests,
                     earliest_attempt_ms: Some(now_ms),
                     next_request: now,
                     rate_limit_until_ms: 0,
@@ -2365,8 +2427,7 @@ mod tests {
             now,
             now_ms,
             &IdleScan {
-                work_due: false,
-                backfill_pending: false,
+                work: ScanWork::Quiet,
                 earliest_attempt_ms: Some(now_ms + 7_200_000),
                 next_request: now,
                 rate_limit_until_ms: 0,

@@ -670,15 +670,15 @@ impl GuildDataStore {
                         .collect::<Result<Vec<_>>>()?;
                     drop(stmt);
                     tx.finish_read()?;
-                    if ids.len() == 1 {
-                        Ok(Some(CaseId::try_from(ids[0].clone())?))
-                    } else {
-                        Ok(None)
-                    }
+                    Ok(match ids.as_slice() {
+                        [] => TaggedBanMatch::Missing,
+                        [id] => TaggedBanMatch::Unique(CaseId::try_from(id.clone())?),
+                        _ => TaggedBanMatch::Ambiguous,
+                    })
                 }
             })
             .await?;
-        let Some(id) = chosen else {
+        let TaggedBanMatch::Unique(id) = chosen else {
             return Ok(Vec::new());
         };
         let mut settled = Vec::new();
@@ -690,6 +690,12 @@ impl GuildDataStore {
         }
         Ok(settled)
     }
+}
+
+enum TaggedBanMatch {
+    Missing,
+    Unique(CaseId),
+    Ambiguous,
 }
 
 #[cfg(any(test, feature = "test-support"))]
