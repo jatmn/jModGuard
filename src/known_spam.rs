@@ -178,6 +178,42 @@ static URL_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
         .expect("static URL token expression")
 });
 
+// A Markdown destination has an explicit closing boundary. Resume extraction
+// there so an adjacent link is checked too, without splitting raw URL contents.
+fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        let token = URL_TOKENS.find_at(content, offset)?;
+        let mut end = token.end();
+        // Allow destination whitespace without splitting raw URL components.
+        if content[..token.start()]
+            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .ends_with("](")
+        {
+            let mut depth = 0;
+            let mut escaped = false;
+            for (i, byte) in token.as_str().bytes().enumerate() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match byte {
+                    b'\\' => escaped = true,
+                    b'(' => depth += 1,
+                    b')' if depth == 0 => {
+                        end = token.start() + i;
+                        break;
+                    }
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        offset = end;
+        Some(&content[token.start()..end])
+    })
+}
+
 // Emphasis markers belong to Discord message formatting, not the URL path.
 // Remove only paired outer markers so a literal trailing path * stays literal.
 fn url_token_text(mut token: &str) -> &str {
@@ -244,8 +280,8 @@ impl CompiledList {
         if self.urls.is_empty() {
             return false;
         }
-        URL_TOKENS.find_iter(raw).any(|token| {
-            let token = url_token_text(token.as_str());
+        url_tokens(raw).any(|token| {
+            let token = url_token_text(token);
             let parsed = if token
                 .get(..7)
                 .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
@@ -383,6 +419,138 @@ mod tests {
         assert!(exact.matches("https://example.com/a(b)"));
         assert!(exact.matches("[join](https://example.com/a(b))"));
         assert!(exact.matches("see (example.com/a(b))."));
+    }
+    #[test]
+    fn known_spam_urls_match_adjacent_markdown_destinations() {
+        let compiled = list("url", "tinyurl.com/*");
+        for text in [
+            "[a](https://safe.example/x)[b](https://tinyurl.com/a)",
+            "[b](https://tinyurl.com/a)[a](https://safe.example/x)",
+            "[a](safe.example/x)[b](tinyurl.com/a)",
+            "[a](https://safe.example/a(b))[b](https://tinyurl.com/a)",
+            "[a](https://safe.example/?q=(other.example/a))[b](https://tinyurl.com/a)",
+            r"[a](https://safe.example/a\)b)[b](https://tinyurl.com/a)",
+            "[a](https://safe.example/x)[b](https://other.example/y)[c](https://tinyurl.com/a)",
+            "[🦀](https://safe.example/🦀)[b](HTTPS://TINYURL.COM/a)",
+            "[a](<https://safe.example/x>)[b](<https://tinyurl.com/a>)",
+        ] {
+            assert!(compiled.matches(text), "{text}");
+        }
+        let exact = list("url", "tinyurl.com/a(b)");
+        for text in [
+            "[a](https://safe.example/x)[b](https://tinyurl.com/a(b))",
+            "[b](https://tinyurl.com/a(b))[a](https://safe.example/x)",
+        ] {
+            assert!(exact.matches(text), "{text}");
+        }
+        assert!(!compiled.matches("[a](https://safe.example/x)[b](https://other.example/y)"));
+    }
+    #[test]
+    fn known_spam_urls_match_markdown_destinations_with_leading_whitespace() {
+        let compiled = list("url", "spam.example/*");
+        let exact = list("url", "spam.example/a(b)");
+        let mut missed = Vec::new();
+        for whitespace in ["", " ", "\n ", "\n", "\t", "\r\n", "\r\n \t"] {
+            for text in [
+                format!("[a]({whitespace}https://spam.example)"),
+                format!("[a]({whitespace}https://spam.example)[b](https://safe.example)"),
+                format!("[a](https://safe.example)[b]({whitespace}https://spam.example)"),
+                format!(
+                    "[a](https://safe.example)[b]({whitespace}https://spam.example)[c](https://safe.example)"
+                ),
+                format!("[a]({whitespace}spam.example/a)[b](safe.example/x)"),
+            ] {
+                if !compiled.matches(&text) {
+                    missed.push(text);
+                }
+            }
+            let text =
+                format!("[a]({whitespace}https://spam.example/a(b))[b](https://safe.example)");
+            if !exact.matches(&text) {
+                missed.push(text);
+            }
+        }
+        assert!(missed.is_empty(), "missed destinations: {missed:?}");
+    }
+    #[test]
+    fn known_spam_urls_preserve_safe_boundaries_with_leading_whitespace() {
+        let compiled = list("url", "tinyurl.com/*");
+        for whitespace in [" ", "\n ", "\n", "\t", "\r\n \t"] {
+            for destination in [
+                "https://safe.example/",
+                "https://safe.example/?q=(tinyurl.com/a)",
+                "https://safe.example/(tinyurl.com/a)",
+                "https://safe.example/#(tinyurl.com/a)",
+                "https://safe.example/?u=[tinyurl.com/a]",
+                "https://safe.example/?u=\"tinyurl.com/a\"",
+                "https://safe.example/?u='tinyurl.com/a'",
+                "https://safe.example/?u={tinyurl.com/a}",
+                "https://safe.example/tinyurl.com/a",
+                "https://safe.example/?q=[b](https://tinyurl.com/a)",
+                "safe.example/?q=(tinyurl.com/a)",
+            ] {
+                let safe = format!("[a]({whitespace}{destination})[b](https://other.example)");
+                assert!(!compiled.matches(&safe), "{safe:?}");
+                let spam = format!("{safe}[c]({whitespace}https://tinyurl.com/a)");
+                assert!(compiled.matches(&spam), "{spam:?}");
+            }
+        }
+    }
+    #[test]
+    fn known_spam_urls_handle_empty_and_blank_line_destinations() {
+        let compiled = list("url", "spam.example/*");
+        for whitespace in ["", " ", "\t", "\n ", "\r\n", "\n\n", "\r\n\r\n"] {
+            let empty = format!("[a]({whitespace})[b](https://safe.example)");
+            assert!(!compiled.matches(&empty), "{empty:?}");
+            let spam = format!("{empty}[c](https://spam.example)");
+            assert!(compiled.matches(&spam), "{spam:?}");
+        }
+        // A blank line is not a CommonMark link, but a visible blocked URL is
+        // still a detection target. It must not hide the next blocked URL either.
+        for text in [
+            "[a](\n\nhttps://spam.example)",
+            "[a](\n\nhttps://safe.example)[b](https://spam.example)",
+            "[a](\r\n\r\nhttps://safe.example)[b](https://spam.example)",
+        ] {
+            assert!(compiled.matches(text), "{text:?}");
+        }
+    }
+    #[test]
+    fn known_spam_urls_match_next_to_punctuation() {
+        let compiled = list("url", "tinyurl.com/*");
+        for text in [
+            "https://tinyurl.com/a.",
+            "https://tinyurl.com/a,",
+            "(https://tinyurl.com/a)",
+            "[https://tinyurl.com/a]",
+            "<https://tinyurl.com/a>",
+            "\"https://tinyurl.com/a\"",
+            "'https://tinyurl.com/a'",
+            "([a](https://safe.example/x)[b](https://tinyurl.com/a)).",
+            "[a](https://safe.example/x)[b](https://tinyurl.com/a),",
+            "\"[a](https://safe.example/x)[b](https://tinyurl.com/a)\"",
+        ] {
+            assert!(compiled.matches(text), "{text}");
+        }
+    }
+    #[test]
+    fn known_spam_urls_keep_embedded_links_inside_destinations() {
+        let compiled = list("url", "tinyurl.com/*");
+        // Glued raw schemes can be literal path/query contents. Without markup
+        // boundaries, splitting them would restore the component false positive.
+        for text in [
+            "https://safe.example/xhttps://tinyurl.com/a",
+            "https://safe.example/redirect?u=tinyurl.com/a",
+            "https://safe.example/redirect?u=https://tinyurl.com/a",
+            "https://safe.example/#https://tinyurl.com/a",
+            "https://safe.example/?q=[b](https://tinyurl.com/a)",
+            "[a](https://safe.example/?q=(tinyurl.com/a))[b](https://other.example/y)",
+            "[a](https://safe.example/redirect?u=tinyurl.com/a)[b](https://other.example/y)",
+            "[a](https://safe.example/?q=[b](https://tinyurl.com/a))",
+            r"[a](https://safe.example/\)[b](https://tinyurl.com/a))",
+        ] {
+            assert!(!compiled.matches(text), "{text}");
+        }
     }
     #[test]
     fn known_spam_validation_bounds_and_notes() {
