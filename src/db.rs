@@ -689,10 +689,15 @@ struct ConnectionPool {
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
 }
 
+enum LeasedConnection {
+    Reusable(Connection),
+    Retiring(Connection),
+    Returned,
+}
+
 struct ConnectionLease {
-    connection: Option<Connection>,
+    connection: LeasedConnection,
     pool: Arc<ConnectionPool>,
-    reusable: bool,
 }
 
 impl ConnectionLease {
@@ -757,14 +762,19 @@ impl ConnectionLease {
             .clone();
         connection.set_commit_lease_probe(probe);
         Ok(Self {
-            connection: Some(connection),
+            connection: LeasedConnection::Reusable(connection),
             pool,
-            reusable: true,
         })
     }
 
     fn discard(&mut self) {
-        self.reusable = false;
+        self.connection = match std::mem::replace(&mut self.connection, LeasedConnection::Returned)
+        {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                LeasedConnection::Retiring(connection)
+            }
+            LeasedConnection::Returned => LeasedConnection::Returned,
+        };
     }
 }
 
@@ -772,29 +782,36 @@ impl Deref for ConnectionLease {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_ref()
-            .expect("connection lease already returned")
+        match &self.connection {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                connection
+            }
+            LeasedConnection::Returned => panic!("connection lease already returned"),
+        }
     }
 }
 
 impl DerefMut for ConnectionLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.connection
-            .as_mut()
-            .expect("connection lease already returned")
+        match &mut self.connection {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                connection
+            }
+            LeasedConnection::Returned => panic!("connection lease already returned"),
+        }
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        let Some(connection) = self.connection.take() else {
-            return;
+        let connection = match std::mem::replace(&mut self.connection, LeasedConnection::Returned) {
+            LeasedConnection::Reusable(connection) => connection,
+            LeasedConnection::Retiring(connection) => {
+                drop_connection_without_runtime(connection);
+                return;
+            }
+            LeasedConnection::Returned => return,
         };
-        if !self.reusable {
-            drop_connection_without_runtime(connection);
-            return;
-        }
         match self.pool.idle.lock() {
             Ok(mut idle) => idle.push(connection),
             Err(_) => {

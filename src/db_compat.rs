@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -698,8 +698,15 @@ impl ManualClock {
 /// signals the watch so the in-flight database call returns and can release
 /// its connection and any writer lock. Cleanup rollbacks do not honor it.
 pub(crate) struct AbandonWatch {
-    flag: AtomicBool,
+    state: AtomicU8,
     notify: tokio::sync::Notify,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum CallerState {
+    Waiting,
+    Abandoned,
 }
 
 thread_local! {
@@ -709,20 +716,21 @@ thread_local! {
 impl AbandonWatch {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            flag: AtomicBool::new(false),
+            state: AtomicU8::new(CallerState::Waiting as u8),
             notify: tokio::sync::Notify::new(),
         })
     }
 
     pub(crate) fn signal(&self) {
-        self.flag.store(true, Ordering::Release);
+        self.state
+            .store(CallerState::Abandoned as u8, Ordering::Release);
         self.notify.notify_waiters();
     }
 
     async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
-            if self.flag.load(Ordering::Acquire) {
+            if self.state.load(Ordering::Acquire) == CallerState::Abandoned as u8 {
                 return;
             }
             notified.await;
@@ -786,11 +794,35 @@ impl<T> Drop for RuntimeOwned<T> {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ConnectionHealth {
+    Healthy,
+    Tainted,
+}
+
+struct SharedConnectionHealth(AtomicU8);
+
+impl SharedConnectionHealth {
+    fn new() -> Self {
+        Self(AtomicU8::new(ConnectionHealth::Healthy as u8))
+    }
+
+    fn taint(&self) {
+        self.0
+            .store(ConnectionHealth::Tainted as u8, Ordering::Release);
+    }
+
+    fn is_tainted(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ConnectionHealth::Tainted as u8
+    }
+}
+
 pub struct Connection {
     inner: RuntimeOwned<libsql::Connection>,
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
-    tainted: Arc<AtomicBool>,
+    health: Arc<SharedConnectionHealth>,
     config_version: Arc<std::sync::atomic::AtomicU64>,
     capacity_limits: CapacityLimits,
     read_only: bool,
@@ -1186,7 +1218,7 @@ impl Connection {
             inner: RuntimeOwned::new(inner, &runtime),
             database,
             runtime,
-            tainted: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(SharedConnectionHealth::new()),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
             read_only: false,
@@ -1203,7 +1235,7 @@ impl Connection {
             inner: RuntimeOwned::new(runtime.block_on(async { database.connect() })?, &runtime),
             database,
             runtime,
-            tainted: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(SharedConnectionHealth::new()),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
             read_only: false,
@@ -1335,7 +1367,7 @@ impl Connection {
             libsql::TransactionBehavior::Immediate,
             None,
         )?;
-        let mut transaction = self.wrap_transaction(inner, None, true, None);
+        let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None);
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
@@ -1355,7 +1387,7 @@ impl Connection {
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, false, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline))
     }
 
     /// Snapshot capture reads before acquiring the writer lock. A concurrent
@@ -1368,7 +1400,7 @@ impl Connection {
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, true, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Unprepared, deadline))
     }
 
     /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
@@ -1380,7 +1412,7 @@ impl Connection {
             libsql::TransactionBehavior::ReadOnly,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, None, false, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline))
     }
 
     /// Maintenance-only DELETE transaction. It preserves a 16 MB hard-limit
@@ -1404,31 +1436,28 @@ impl Connection {
             libsql::TransactionBehavior::Immediate,
             None,
         )?;
-        Ok(self.wrap_transaction(inner, None, true, None))
+        Ok(self.wrap_transaction(inner, WriteState::Unprepared, None))
     }
 
     fn wrap_transaction(
         &self,
         inner: libsql::Transaction,
-        mutation_receipt: Option<String>,
-        allows_write: bool,
+        write_state: WriteState,
         read_deadline: Option<tokio::time::Instant>,
     ) -> Transaction {
         Transaction {
-            inner: Some(inner),
+            inner: TransactionHandle::Active(inner),
             database: Arc::clone(&self.database),
             runtime: self.runtime.clone(),
-            connection_tainted: Arc::clone(&self.tainted),
+            connection_health: Arc::clone(&self.health),
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
-            allows_write,
+            write_state,
             read_deadline,
-            mutation_receipt,
+            mutation_receipt: None,
             capacity_dirty: AtomicBool::new(false),
             capacity_poisoned: AtomicBool::new(false),
-            write_prepared: AtomicBool::new(false),
-            stream_exhausted: Arc::new(AtomicBool::new(false)),
-            client_deadline: Arc::new(AtomicBool::new(false)),
+            stream: Arc::new(TransactionStream::new()),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
             expected_lease_owner: self.expected_lease_owner.clone(),
@@ -1497,13 +1526,13 @@ impl Connection {
     }
 
     pub fn is_tainted(&self) -> bool {
-        self.tainted.load(Ordering::Acquire)
+        self.health.is_tainted()
     }
 
     /// Stable for one pooled connection, including after it is checked out again.
     #[cfg(test)]
     pub(crate) fn pool_identity(&self) -> usize {
-        Arc::as_ptr(&self.tainted) as usize
+        Arc::as_ptr(&self.health) as usize
     }
 
     pub fn take_config_version(&self) -> u64 {
@@ -1621,8 +1650,7 @@ impl SqlExecutor for Connection {
             inner: RuntimeOwned::new(inner, &self.runtime),
             runtime: self.runtime.clone(),
             read_deadline: None,
-            client_deadline: Arc::new(AtomicBool::new(false)),
-            stream_exhausted: Arc::new(AtomicBool::new(false)),
+            stream: Arc::new(TransactionStream::new()),
         })
     }
 
@@ -1643,8 +1671,7 @@ pub struct Statement {
     /// `query_map` is the only execution method. A new one has to honor
     /// [`Self::query_wait`] instead of the pool deadline.
     read_deadline: Option<tokio::time::Instant>,
-    client_deadline: Arc<AtomicBool>,
-    stream_exhausted: Arc<AtomicBool>,
+    stream: Arc<TransactionStream>,
 }
 
 pub struct MappedRows<T>(std::vec::IntoIter<Result<T>>);
@@ -1666,8 +1693,7 @@ impl Statement {
     {
         let timeout = self.query_wait();
         let runtime = self.runtime.clone();
-        let client_deadline = Arc::clone(&self.client_deadline);
-        let stream_exhausted = Arc::clone(&self.stream_exhausted);
+        let stream = Arc::clone(&self.stream);
         let query = async {
             let mut cursor = self.inner.query(params).await?;
             let mut rows = Vec::new();
@@ -1682,11 +1708,7 @@ impl Statement {
             runtime.block_on_database("query", query)
         };
         if let Err(error) = &mapped {
-            if is_database_operation_timeout(error) {
-                client_deadline.store(true, Ordering::Release);
-            } else if is_remote_stream_lost(error) {
-                stream_exhausted.store(true, Ordering::Release);
-            }
+            stream.note_error(error);
         }
         Ok(MappedRows(mapped?.into_iter()))
     }
@@ -1701,30 +1723,122 @@ impl Statement {
     }
 }
 
+/// Permission and preparation are distinct from receipt presence: local writes
+/// check the restore fence without a receipt, and remote batched writes stage
+/// their receipt SQL before executing it in the same transaction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteState {
+    Snapshot,
+    Unprepared,
+    Prepared,
+}
+
+impl WriteState {
+    fn allows_write(self) -> bool {
+        self != Self::Snapshot
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.allows_write(),
+            "read snapshot cannot take the write lock"
+        );
+        *self = Self::Prepared;
+        Ok(())
+    }
+}
+
+/// Both observations are monotonic and may coexist. A client interruption does
+/// not prove the provider closed its stream; provider closure always forbids
+/// another rollback. Prepared statements share these observations with their tx.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum StreamState {
+    Open = 0,
+    ClientInterrupted = 1,
+    ProviderClosed = 2,
+    InterruptedAndClosed = 3,
+}
+
+struct TransactionStream(AtomicU8);
+
+impl TransactionStream {
+    fn new() -> Self {
+        Self(AtomicU8::new(StreamState::Open as u8))
+    }
+
+    fn state(&self) -> StreamState {
+        match self.0.load(Ordering::Acquire) {
+            0 => StreamState::Open,
+            1 => StreamState::ClientInterrupted,
+            2 => StreamState::ProviderClosed,
+            3 => StreamState::InterruptedAndClosed,
+            _ => unreachable!("invalid transaction stream state"),
+        }
+    }
+
+    fn note_error(&self, error: &anyhow::Error) {
+        let observation = if is_database_operation_timeout(error) {
+            StreamState::ClientInterrupted
+        } else if is_remote_stream_lost(error) {
+            StreamState::ProviderClosed
+        } else {
+            return;
+        };
+        self.0.fetch_or(observation as u8, Ordering::Release);
+    }
+
+    fn provider_closed(&self) -> bool {
+        matches!(
+            self.state(),
+            StreamState::ProviderClosed | StreamState::InterruptedAndClosed
+        )
+    }
+}
+
+enum TransactionHandle {
+    Active(libsql::Transaction),
+    Completed,
+}
+
+impl TransactionHandle {
+    fn active(&self) -> &libsql::Transaction {
+        match self {
+            Self::Active(inner) => inner,
+            Self::Completed => panic!("transaction already completed"),
+        }
+    }
+
+    fn take(&mut self) -> libsql::Transaction {
+        match std::mem::replace(self, Self::Completed) {
+            Self::Active(inner) => inner,
+            Self::Completed => panic!("transaction already completed"),
+        }
+    }
+}
+
+/// A primary receipt observation resolves a lost COMMIT response. Query errors
+/// stay errors and are exposed to callers as an indeterminate commit.
+enum PrimaryReceipt {
+    Present,
+    Absent,
+}
+
 pub struct Transaction {
-    inner: Option<libsql::Transaction>,
+    inner: TransactionHandle,
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
-    connection_tainted: Arc<AtomicBool>,
+    connection_health: Arc<SharedConnectionHealth>,
     connection_config_version: Arc<std::sync::atomic::AtomicU64>,
     pending_config_version: std::sync::atomic::AtomicU64,
-    /// False for snapshots and replica reads. Those transactions must not
-    /// upgrade into a write and take the reserved lock.
-    allows_write: bool,
+    write_state: WriteState,
     /// Remote reads and snapshots. Cleared in effect once a capture prepares
     /// a write; member write transactions never set it.
     read_deadline: Option<tokio::time::Instant>,
     mutation_receipt: Option<String>,
     capacity_dirty: AtomicBool,
     capacity_poisoned: AtomicBool,
-    write_prepared: AtomicBool,
-    /// The provider already closed this Hrana stream. Drop must not send
-    /// ROLLBACK on it; the connection is tainted and the next open uses a new one.
-    /// Shared with prepared statements so a stalled `query_map` can record it.
-    stream_exhausted: Arc<AtomicBool>,
-    /// Our deadline cancelled an in-flight call. The stream may still accept
-    /// ROLLBACK. This is not [`Self::stream_exhausted`].
-    client_deadline: Arc<AtomicBool>,
+    stream: Arc<TransactionStream>,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
     expected_lease_owner: Option<String>,
@@ -1748,7 +1862,7 @@ impl Transaction {
     /// `finish_read`, so it creates no receipt or capacity reservation.
     pub(crate) fn probe_write_permission(&self) -> Result<()> {
         anyhow::ensure!(
-            self.allows_write,
+            self.write_state.allows_write(),
             "read snapshot cannot take the write lock"
         );
         let restore_fence: Option<String> = self
@@ -1867,13 +1981,7 @@ impl Transaction {
     }
 
     fn note_remote_stream_loss(&self, error: &anyhow::Error) {
-        if is_database_operation_timeout(error) {
-            self.client_deadline.store(true, Ordering::Release);
-            return;
-        }
-        if is_remote_stream_lost(error) {
-            self.stream_exhausted.store(true, Ordering::Release);
-        }
+        self.stream.note_error(error);
     }
 
     /// One short ROLLBACK after our deadline. libSQL sends stream close with
@@ -1893,9 +2001,8 @@ impl Transaction {
 
     fn remote_write_needs_prompt_release(&self) -> bool {
         self.runtime.is_remote()
-            && self.client_deadline.load(Ordering::Acquire)
-            && !self.stream_exhausted.load(Ordering::Acquire)
-            && (self.allows_write || self.read_deadline.is_some())
+            && self.stream.state() == StreamState::ClientInterrupted
+            && (self.write_state.allows_write() || self.read_deadline.is_some())
     }
 
     /// Rollback for a remote read or snapshot, including one whose statements
@@ -1924,7 +2031,7 @@ impl Transaction {
     /// (writes, and a capture after it has prepared a mutation).
     fn statement_wait(&self) -> Option<Duration> {
         let deadline = self.read_deadline?;
-        if self.write_prepared.load(Ordering::Acquire) {
+        if self.write_state == WriteState::Prepared {
             return None;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1991,7 +2098,7 @@ impl Transaction {
             Ok(row.get::<String>(0)?)
         }) {
             Ok(inserted) => Ok(inserted),
-            Err(error) if self.stream_exhausted.load(Ordering::Acquire) => Err(error),
+            Err(error) if self.stream.provider_closed() => Err(error),
             Err(error)
                 if error
                     .chain()
@@ -2015,7 +2122,7 @@ impl Transaction {
 
     fn ensure_mutation_receipt_limit(&mut self, limit_bytes: u64) -> Result<()> {
         anyhow::ensure!(
-            self.allows_write,
+            self.write_state.allows_write(),
             "read snapshot cannot take the write lock"
         );
         if self.mutation_receipt.is_some() {
@@ -2034,7 +2141,7 @@ impl Transaction {
                         || error.to_string().contains("no such table: meta") => {}
                 Err(error) => return Err(error),
             }
-            self.write_prepared.store(true, Ordering::Release);
+            self.write_state.prepare()?;
             return Ok(());
         }
         // Receipt insertion itself can allocate pages. It is independently
@@ -2056,7 +2163,7 @@ impl Transaction {
             Err(error) => return Err(error),
         }
         self.mutation_receipt = Some(receipt);
-        self.write_prepared.store(true, Ordering::Release);
+        self.write_state.prepare()?;
         // Keep the existing bounded cleanup rate for receipt-bearing writes.
         if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
             self.execute_unchecked(
@@ -2111,7 +2218,7 @@ impl Transaction {
             "reclaim metadata mutation refused"
         );
         anyhow::ensure!(
-            self.write_prepared.load(Ordering::Acquire),
+            self.write_state == WriteState::Prepared,
             "write transaction has no mutation receipt or restore fence check"
         );
         let limit = self
@@ -2222,7 +2329,7 @@ impl Transaction {
         if let Some(expected) = self.expected_lease_owner.as_deref() {
             self.reject_unless_active_lease(expected)?;
         }
-        if self.allows_write
+        if self.write_state.allows_write()
             && let Some(instance) = self.expected_launcher.clone()
         {
             self.renew_launcher_fence(&instance)?;
@@ -2287,8 +2394,7 @@ impl Transaction {
                     self.pending_config_version.load(Ordering::Acquire),
                     Ordering::SeqCst,
                 );
-                self.runtime
-                    .drop_transaction(self.inner.take().expect("transaction already completed"));
+                self.runtime.drop_transaction(self.inner.take());
                 Ok(())
             }
             Err(commit_error) if self.runtime.is_remote() => {
@@ -2301,31 +2407,31 @@ impl Transaction {
                 // the baton may still be live, and the writer lock stays until
                 // the provider steals it unless we roll back promptly.
                 self.note_remote_stream_loss(&commit_error);
-                if self.stream_exhausted.load(Ordering::Acquire) {
-                    self.connection_tainted.store(true, Ordering::Release);
+                if self.stream.provider_closed() {
+                    self.connection_health.taint();
                 } else if self.remote_write_needs_prompt_release() {
                     let _rollback = self.release_remote_write_lock();
-                    self.connection_tainted.store(true, Ordering::Release);
+                    self.connection_health.taint();
                 } else {
                     let _rollback = self.runtime.block_on_database_cleanup(
                         "rollback after failed commit",
                         self.inner().execute_batch("ROLLBACK"),
                     );
                 }
-                let inner = self.inner.take().expect("transaction already completed");
+                let inner = self.inner.take();
                 self.runtime.drop_transaction(inner);
                 let Some(receipt) = self.mutation_receipt.as_deref() else {
                     return Err(DatabaseCommitIndeterminate(commit_error).into());
                 };
                 match self.reconcile_mutation_receipt(receipt) {
-                    Ok(true) => {
+                    Ok(PrimaryReceipt::Present) => {
                         self.connection_config_version.fetch_max(
                             self.pending_config_version.load(Ordering::Acquire),
                             Ordering::SeqCst,
                         );
                         Ok(())
                     }
-                    Ok(false) => Err(commit_error),
+                    Ok(PrimaryReceipt::Absent) => Err(commit_error),
                     Err(reconcile_error) => {
                         self.connection_config_version.fetch_max(
                             self.pending_config_version.load(Ordering::Acquire),
@@ -2345,11 +2451,11 @@ impl Transaction {
     /// Ends a primary-routed read snapshot without using COMMIT semantics.
     /// A lost response cannot make a read's outcome indeterminate.
     pub fn finish_read(mut self) -> Result<()> {
-        if self.stream_exhausted.load(Ordering::Acquire) {
+        if self.stream.provider_closed() {
             // The provider already closed this stream. ROLLBACK would wait out
             // the client deadline and cannot change the rows already collected.
-            self.connection_tainted.store(true, Ordering::Release);
-            let inner = self.inner.take().expect("transaction already completed");
+            self.connection_health.taint();
+            let inner = self.inner.take();
             self.runtime.drop_transaction(inner);
             return Ok(());
         }
@@ -2368,7 +2474,7 @@ impl Transaction {
         if let Err(error) = &result {
             self.note_remote_stream_loss(error);
         }
-        let inner = self.inner.take().expect("transaction already completed");
+        let inner = self.inner.take();
         self.runtime.drop_transaction(inner);
         match result {
             Ok(_) => Ok(()),
@@ -2382,7 +2488,7 @@ impl Transaction {
                     || is_database_operation_timeout(&error) =>
             {
                 if self.runtime.is_remote() {
-                    self.connection_tainted.store(true, Ordering::Release);
+                    self.connection_health.taint();
                 }
                 Ok(())
             }
@@ -2391,10 +2497,10 @@ impl Transaction {
     }
 
     fn inner(&self) -> &libsql::Transaction {
-        self.inner.as_ref().expect("transaction already completed")
+        self.inner.active()
     }
 
-    fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<bool> {
+    fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<PrimaryReceipt> {
         let connection = RuntimeOwned::new(
             self.runtime.block_on(async { self.database.connect() })?,
             &self.runtime,
@@ -2432,7 +2538,8 @@ impl Transaction {
         match (query, cleanup) {
             // Once the primary receipt query answered, the original outcome
             // is established. Cleanup failure cannot change that snapshot.
-            (Ok(found), _) => Ok(found),
+            (Ok(true), _) => Ok(PrimaryReceipt::Present),
+            (Ok(false), _) => Ok(PrimaryReceipt::Absent),
             (Err(error), _) => Err(error),
         }
     }
@@ -2458,7 +2565,7 @@ impl Transaction {
             return Ok(None);
         }
         anyhow::ensure!(
-            self.allows_write,
+            self.write_state.allows_write(),
             "read snapshot cannot take the write lock"
         );
         self.reserve_growth_limit(RECEIPT_GROWTH_ALLOWANCE, self.capacity_limits.growth)?;
@@ -2487,7 +2594,7 @@ impl Transaction {
             ""
         };
         self.mutation_receipt = Some(receipt);
-        self.write_prepared.store(true, Ordering::Release);
+        self.write_state.prepare()?;
         Ok(Some((admit, prune.to_string())))
     }
 
@@ -2522,28 +2629,28 @@ pub fn test_drop_next_commit_response() {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        let Some(_) = self.inner.as_ref() else {
+        if matches!(self.inner, TransactionHandle::Completed) {
             return;
-        };
-        if self.stream_exhausted.load(Ordering::Acquire) {
+        }
+        if self.stream.provider_closed() {
             // The provider already ended the transaction. Another ROLLBACK on
             // this stream fails and can block on the client deadline. Discard
             // the wrapper; the connection is unusable and the next open builds
             // a new one.
-            let inner = self.inner.take().expect("transaction already completed");
+            let inner = self.inner.take();
             if self.runtime.is_remote() {
                 self.runtime.drop_transaction(inner);
             } else {
                 std::mem::forget(inner);
             }
-            self.connection_tainted.store(true, Ordering::Release);
+            self.connection_health.taint();
             return;
         }
         if let Some(released) = self.budgeted_read_rollback("rollback transaction") {
-            let inner = self.inner.take().expect("transaction already completed");
+            let inner = self.inner.take();
             self.runtime.drop_transaction(inner);
             if released.is_err() {
-                self.connection_tainted.store(true, Ordering::Release);
+                self.connection_health.taint();
             }
             return;
         }
@@ -2553,10 +2660,10 @@ impl Drop for Transaction {
             // deadline, then drop the wrapper where no runtime is current so
             // libSQL does not spawn a second unbounded rollback.
             let released = self.release_remote_write_lock();
-            let inner = self.inner.take().expect("transaction already completed");
+            let inner = self.inner.take();
             self.runtime.drop_transaction(inner);
             if released.is_err() {
-                self.connection_tainted.store(true, Ordering::Release);
+                self.connection_health.taint();
             }
             return;
         }
@@ -2570,7 +2677,7 @@ impl Drop for Transaction {
             "rollback transaction",
             self.inner().execute_batch("ROLLBACK"),
         );
-        let inner = self.inner.take().expect("transaction already completed");
+        let inner = self.inner.take();
         match result {
             Ok(_) => self.runtime.drop_transaction(inner),
             Err(error) => {
@@ -2586,7 +2693,7 @@ impl Drop for Transaction {
                 } else {
                     std::mem::forget(inner);
                 }
-                self.connection_tainted.store(true, Ordering::Release);
+                self.connection_health.taint();
                 if self.runtime.is_remote() && is_remote_stream_lost(&error) {
                     tracing::debug!(%error, "discarded timed-out remote transaction stream");
                 } else {
@@ -2642,7 +2749,7 @@ impl SqlExecutor for Transaction {
     ) -> Result<usize> {
         require_mutation_sql(sql)?;
         anyhow::ensure!(
-            self.write_prepared.load(Ordering::Acquire),
+            self.write_state == WriteState::Prepared,
             "write transaction has no mutation receipt or restore fence check"
         );
         self.reserve_growth(max_growth_bytes)?;
@@ -2657,7 +2764,7 @@ impl SqlExecutor for Transaction {
     ) -> Result<usize> {
         require_reclaim_sql(sql)?;
         anyhow::ensure!(
-            self.write_prepared.load(Ordering::Acquire),
+            self.write_state == WriteState::Prepared,
             "write transaction has no mutation receipt or restore fence check"
         );
         let limit = self
@@ -2686,7 +2793,7 @@ impl SqlExecutor for Transaction {
     {
         require_mutation_sql(sql)?;
         anyhow::ensure!(
-            self.write_prepared.load(Ordering::Acquire),
+            self.write_state == WriteState::Prepared,
             "write transaction has no mutation receipt or restore fence check"
         );
         self.reserve_growth(max_growth_bytes)?;
@@ -2698,7 +2805,7 @@ impl SqlExecutor for Transaction {
     }
 
     fn is_write_transaction(&self) -> bool {
-        self.allows_write
+        self.write_state.allows_write()
     }
 
     fn capacity_page_size(&self) -> Result<u64> {
@@ -2719,7 +2826,7 @@ impl SqlExecutor for Transaction {
         require_read_sql(sql)?;
         let inner =
             self.map_stream(self.drive("transaction prepare", self.inner().prepare(sql)))?;
-        let read_deadline = if self.write_prepared.load(Ordering::Acquire) {
+        let read_deadline = if self.write_state == WriteState::Prepared {
             None
         } else {
             self.read_deadline
@@ -2728,8 +2835,7 @@ impl SqlExecutor for Transaction {
             inner: RuntimeOwned::new(inner, &self.runtime),
             runtime: self.runtime.clone(),
             read_deadline,
-            client_deadline: Arc::clone(&self.client_deadline),
-            stream_exhausted: Arc::clone(&self.stream_exhausted),
+            stream: Arc::clone(&self.stream),
         })
     }
 
