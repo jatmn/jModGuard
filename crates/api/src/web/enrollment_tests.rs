@@ -2264,6 +2264,162 @@ async fn action_key_errors_survive_the_bot_control_link() {
     );
 }
 
+// A previous bot commits the write but returns no canonical rule body.
+async fn assert_legacy_rule_save_omits_patch(rule_id: &str, rule: serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.use_writer_link(listener.local_addr().unwrap());
+    let expected_id = rule_id.to_owned();
+    let expected_rule = rule.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32().await.unwrap();
+        let mut request = vec![0; length as usize];
+        stream.read_exact(&mut request).await.unwrap();
+        let (op, _, _, _) = jmodguard::control::open_frame(
+            &"x".repeat(32).into_bytes(),
+            &request,
+            &std::sync::Mutex::new(jmodguard::control::NonceWindow::new()),
+        )
+        .unwrap();
+        let db::ControlOp::UpsertRule { id, rule, .. } = op else {
+            panic!("expected UpsertRule, got {op:?}");
+        };
+        assert_eq!(id, expected_id);
+        assert_eq!(serde_json::to_value(rule).unwrap(), expected_rule);
+        let bytes = serde_json::to_vec(&db::ControlReply::Saved {
+            body: serde_json::Value::Null,
+        })
+        .unwrap();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let (status, body) = f
+        .request(
+            "PUT",
+            &format!("/api/guilds/10/rules/{rule_id}"),
+            &serde_json::json!({"scope":"guild", "data":rule}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    assert!(
+        body.get("config_patch").is_none(),
+        "legacy acknowledgement must trigger an authoritative reload: {body}"
+    );
+    peer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_save_legacy_ack_omits_builtin_guild_patch() {
+    let rule: crate::types::RuleDef = serde_json::from_value(serde_json::json!({
+        "name":"Invite fixture", "description":"Operator guidance", "enabled":true,
+    }))
+    .unwrap();
+    assert_legacy_rule_save_omits_patch("invite", serde_json::to_value(rule).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_save_legacy_ack_omits_custom_patch() {
+    let rule: crate::types::RuleDef = serde_json::from_value(serde_json::json!({
+        "name":"Custom fixture", "description":"Operator guidance", "enabled":true,
+        "params":{"kind":"pattern", "pattern":"fixture"},
+        "actions":[{"at":1, "action":"warn"}],
+    }))
+    .unwrap();
+    assert_legacy_rule_save_omits_patch("custom:01234567", serde_json::to_value(rule).unwrap())
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_description_save_patch_uses_canonical_rule() {
+    use db::SqlExecutor;
+    const OLD: &str =
+        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    for (guild, scope, clear) in [
+        (0, "global", false),
+        (10, "guild", false),
+        (10, "global", false),
+        (10, "global", true),
+    ] {
+        let mut f = Fixture::new(true).await;
+        f.enroll(10).await;
+        // Model a real one-time upgrade before the API submits its stale copy.
+        let mut old = db::get_rule(&f.app.db, 0, "invite").await.unwrap().unwrap();
+        old.description = OLD.into();
+        let old_json = serde_json::to_string(&old).unwrap();
+        f.app
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "DELETE FROM meta WHERE key = 'invite_description_v1'",
+                    (),
+                    1024,
+                )?;
+                conn.execute_bounded(
+                    "UPDATE rules SET data = ?1 WHERE rule_id = 'invite'",
+                    db::params![old_json],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let upgraded = db::Db::open(&f.path, 2).unwrap();
+        drop(upgraded);
+        let bot = f.attach_save_writer().await;
+        let target = if scope == "global" { 0 } else { 10 };
+        let mut rule = db::get_rule(&bot.db, 0, "invite").await.unwrap().unwrap();
+        let current = rule.description.clone();
+        rule.description = OLD.into();
+        let path = format!("/api/guilds/{guild}/rules/invite");
+        // Seed the guild target with the upgraded shipped text too.
+        db::upsert_rule(
+            &bot.db,
+            target,
+            "invite",
+            &db::get_rule(&bot.db, 0, "invite").await.unwrap().unwrap(),
+        )
+        .await
+        .unwrap();
+        for (submitted, expected) in [
+            (OLD, current.as_str()),
+            ("Custom API guidance", "Custom API guidance"),
+            (OLD, "Custom API guidance"),
+        ] {
+            rule.description = submitted.into();
+            rule.enabled = false;
+            let (status, body) = f
+                .request(
+                    "PUT",
+                    &path,
+                    &serde_json::json!({
+                        "scope": scope, "data": rule, "clear_guild_override": clear,
+                    })
+                    .to_string(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut expected_rule = rule.clone();
+            expected_rule.description = expected.into();
+            assert_eq!(
+                body["config_patch"]["value"],
+                serde_json::json!(expected_rule),
+                "{guild}/{scope}/{clear}"
+            );
+            assert_eq!(body["config_patch"]["scope"], scope);
+            assert_eq!(body["config_patch"]["cleared_guild_override"], clear);
+            let stored = db::get_rule(&bot.db, target, "invite")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::json!(stored), body["config_patch"]["value"]);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn recovered_global_rule_save_cannot_clear_a_newer_override() {
     let mut f = Fixture::new(true).await;
@@ -5606,4 +5762,104 @@ async fn maximal_badword_batch_http_ack_is_compact_and_recovers_saved_ids() {
     for row in db::list_badwords(&bot.db, 10).await.unwrap() {
         assert_eq!(row.note.as_deref(), body["note"].as_str());
     }
+}
+
+#[tokio::test]
+async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    for body in [
+        r#"{"kind":"sample","value":" "}"#,
+        r#"{"kind":"url","value":"*"}"#,
+        r#"{"kind":"url","value":"example.*/*"}"#,
+        r#"{"kind":"sample","value":"sample","unexpected":true}"#,
+    ] {
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", body).await;
+        assert!(status.is_client_error());
+    }
+    for (kind, value, note) in [
+        ("sample", "a".repeat(4097), None),
+        ("url", format!("example.com/{}", "a".repeat(512)), None),
+        ("sample", "sample".into(), Some("n".repeat(513))),
+        ("sample", "sample".into(), Some("bad\nnote".into())),
+    ] {
+        let body = serde_json::json!({"kind":kind,"value":value,"note":note}).to_string();
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    for (scope, kind, value, note) in [
+        (
+            "guild",
+            "sample",
+            "Full Stack AI developer pitch",
+            Some("owner note"),
+        ),
+        ("global", "url", "tinyurl.com/*", None),
+    ] {
+        let input =
+            serde_json::json!({"scope":scope,"kind":kind,"value":value,"note":note}).to_string();
+        let (status, body) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"].as_i64().unwrap();
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, cfg) = f.request("POST", "/api/guilds/10/config", "").await;
+        let rows = cfg["known_spam"].as_array().unwrap();
+        let wire_id = id.to_string();
+        let row = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(wire_id.as_str()))
+            .unwrap();
+        assert_eq!(row["value"], value);
+        assert_eq!(row["note"], serde_json::json!(note));
+        let (status, body) = f
+            .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = f
+        .request_token(
+            "POST",
+            "/api/guilds/10/known-spam",
+            r#"{"kind":"sample","value":"stale"}"#,
+            Some("old-membership"),
+        )
+        .await;
+    assert!(status.is_client_error());
+}
+
+#[tokio::test]
+async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let global_write = db::ConfigurationWriteScope::new(
+        db::ConfigurationScope::Global,
+        db::ConfigurationScope::Global,
+    )
+    .unwrap();
+    let global = db::add_enrolled_known_spam(&f.app.db, global_write, "url", "tinyurl.com/*", None)
+        .await
+        .unwrap();
+    let other =
+        db::ConfigurationScope::Guild(db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap());
+    let other = db::ConfigurationWriteScope::new(other.clone(), other).unwrap();
+    let foreign = db::add_enrolled_known_spam(&f.app.db, other, "sample", "foreign sample", None)
+        .await
+        .unwrap();
+    for id in [global, foreign, i64::MAX] {
+        let (status, body) = f
+            .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "known spam entry not found");
+    }
+    let (status, _) = f
+        .request(
+            "POST",
+            "/api/guilds/10/known-spam",
+            r#"{"scope":"global","kind":"sample","value":"global sample"}"#,
+        )
+        .await;
+    assert!(status.is_client_error());
 }

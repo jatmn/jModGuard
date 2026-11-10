@@ -1,9 +1,10 @@
 //! Event routing: renders a template for an event type and posts it to the
 //! configured guild-scoped log channel. Routine delivery never archives an event.
 
-use serenity::builder::{CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateMessage};
+use serenity::builder::{
+    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateEmbed, CreateMessage,
+};
 use serenity::client::Context;
-use serenity::model::channel::MessageFlags;
 use serenity::model::event::MessageUpdateEvent;
 use serenity::model::guild::audit_log::{Action, AuditLogs, MemberAction};
 use serenity::model::id::{ChannelId, GuildId, MessageId};
@@ -1445,7 +1446,17 @@ pub(crate) async fn preview_automod(
     vars.insert("guild".into(), guild_id.get().to_string());
     let mut owned = vars.clone();
     templates::format_log_timestamps(&mut owned);
-    render_log_template("automod", &template, &mut owned)
+    let rendered = render_log_template("automod", &template, &mut owned);
+    // Fresh reviews use the shipped heading spelling that decision_edit promotes.
+    // Canonicalize only its separator; preserve custom headings and all body bytes.
+    let title = jmodguard::log_embeds::style("automod").title;
+    for separator in ["\r\n\r\n", "\r\n\n", "\n\r\n"] {
+        let heading = format!("{title}{separator}");
+        if let Some(body) = rendered.strip_prefix(&heading) {
+            return format!("{title}\n\n{body}");
+        }
+    }
+    rendered
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1592,7 +1603,7 @@ async fn emit_to_observed_with_audit(
             .map(String::as_str)
             .unwrap_or_else(|| default_template(event));
         templates::format_log_timestamps(&mut vars);
-        let rendered = render_log_template(event, template, &mut vars);
+        let _ = render_log_template(event, template, &mut vars);
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }
@@ -1623,13 +1634,13 @@ async fn emit_to_observed_with_audit(
             if after_rate_limit {
                 sink.send_after_rate_limit(
                     channel_id,
-                    log_message_with(&rendered, &rows),
+                    log_message_with(event, template, &vars, &rows),
                     &commit,
                     &on_global_rate_limit,
                 )
                 .await
             } else {
-                sink.send(channel_id, log_message_with(&rendered, &rows))
+                sink.send(channel_id, log_message_with(event, template, &vars, &rows))
                     .await?;
                 Ok(true)
             }
@@ -1761,21 +1772,39 @@ pub(crate) fn record_delivery_failure(app: &BotState) {
     }
 }
 
-fn log_message(content: &str) -> CreateMessage {
-    log_message_with(content, &[])
+pub(crate) fn discord_embed(embed: jmodguard::log_embeds::LogEmbed) -> CreateEmbed {
+    let embed = embed.bounded();
+    let mut builder = CreateEmbed::new().title(embed.title).color(embed.color);
+    if !embed.description.is_empty() {
+        builder = builder.description(embed.description);
+    }
+    for field in embed.fields {
+        builder = builder.field(field.name, field.value, field.inline);
+    }
+    builder
 }
 
-fn log_message_with(content: &str, components: &[CreateActionRow]) -> CreateMessage {
+fn log_message(event: &str, template: &str, vars: &BTreeMap<String, String>) -> CreateMessage {
+    log_message_with(event, template, vars, &[])
+}
+
+fn log_message_with(
+    event: &str,
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    components: &[CreateActionRow],
+) -> CreateMessage {
     let message = CreateMessage::new()
-        .content(clip(content, 2000))
+        .embed(discord_embed(jmodguard::log_embeds::render(
+            event, template, vars,
+        )))
         .allowed_mentions(
             CreateAllowedMentions::new()
                 .all_users(false)
                 .all_roles(false)
                 .everyone(false)
                 .replied_user(false),
-        )
-        .flags(MessageFlags::SUPPRESS_EMBEDS);
+        );
     if components.is_empty() {
         message
     } else {
@@ -1977,7 +2006,8 @@ fn split_automod_proving_content(content: &str) -> (Option<String>, String) {
     (None, content.to_string())
 }
 
-/// Discord log body after the same bounds delivery applies.
+/// Flat review body with the existing evidence bounds. The embed delivery path
+/// reuses these variable bounds before rendering fields or a custom description.
 /// Automod `{content}` is bounded for every template, including a guild override.
 pub(crate) fn render_log_template(
     event: &str,
@@ -1988,7 +2018,13 @@ pub(crate) fn render_log_template(
         bound_default_message_vars(event, vars);
     }
     if event == "automod" {
-        bound_automod_content_var(template, vars, 2000);
+        if template == default_template(event) {
+            // The shipped evidence is one field: keep proving digests whole
+            // within that field before the generic embed limiter sees it.
+            bound_automod_content_var("{content}", vars, 1024);
+        } else {
+            bound_automod_content_var(template, vars, 2000);
+        }
     }
     templates::render_bounded(template, vars, 2000)
 }
@@ -2376,13 +2412,13 @@ fn fallback_bulk_parts(
     fallback_display.insert(
         "details".into(),
         format!(
-            "attachment unavailable; {} entries omitted from plain-message fallback",
+            "Discord rejected the transcript attachment (HTTP 403); using bounded text fallback; {} entries omitted",
             omitted
         ),
     );
     let rendered = templates::render_bounded(template, &fallback_display, 2000);
     let summary = format!(
-        "Attachment unavailable. Unique deleted: {}; retained: {}; known missing: {}; storage unknown: {}; filtered: {}; entries omitted: {}; entries clipped: {}.\n",
+        "Discord rejected the transcript attachment (HTTP 403); using bounded text fallback. Unique deleted: {}; retained: {}; known missing: {}; storage unknown: {}; filtered: {}; entries omitted: {}; entries clipped: {}.\n",
         transcript.total,
         transcript.retained,
         transcript.unavailable,
@@ -2472,7 +2508,14 @@ async fn deliver_bulk_text_fallback_parts(
             left,
             crate::discord::race_discord_call(
                 &app.activation,
-                sink.send(destination, log_message(&details)),
+                sink.send(
+                    destination,
+                    log_message(
+                        "message_bulk_delete",
+                        "{details}",
+                        &BTreeMap::from([("details".into(), details)]),
+                    ),
+                ),
             ),
         )
         .await
@@ -2521,15 +2564,13 @@ async fn deliver_attached_bulk(
     template: &str,
     display: &BTreeMap<String, String>,
     transcript: &BulkTranscript,
-    rendered: &str,
     deadline: Duration,
     started: Instant,
 ) -> crate::automod_delete_marks::BulkDeliveryOutcome {
     use crate::automod_delete_marks::BulkDeliveryOutcome;
-    let message = log_message(rendered).add_file(CreateAttachment::bytes(
-        transcript.finish(),
-        "deleted-messages.txt",
-    ));
+    let message = log_message("message_bulk_delete", template, display).add_file(
+        CreateAttachment::bytes(transcript.finish(), "deleted-messages.txt"),
+    );
     let mut terminal_error: Option<serenity::Error> = None;
     let mut failure_recovery = app
         .remembered_discord_targets
@@ -2791,7 +2832,6 @@ pub(crate) async fn emit_retained_bulk_to(
             .get("message_bulk_delete")
             .map(String::as_str)
             .unwrap_or_else(|| default_template("message_bulk_delete"));
-        let rendered = templates::render_bounded(template, &display, 2000);
         let left = deadline.saturating_sub(started.elapsed());
         if left.is_zero() {
             record_delivery_failure(app);
@@ -2801,7 +2841,10 @@ pub(crate) async fn emit_retained_bulk_to(
             left,
             crate::discord::race_discord_call(
                 &app.activation,
-                sink.send(destination, log_message(&rendered)),
+                sink.send(
+                    destination,
+                    log_message("message_bulk_delete", template, &display),
+                ),
             ),
         )
         .await
@@ -2829,7 +2872,6 @@ pub(crate) async fn emit_retained_bulk_to(
         .unwrap_or_else(|| default_template("message_bulk_delete"));
     let mut display = vars;
     templates::format_log_timestamps(&mut display);
-    let rendered = templates::render_bounded(template, &display, 2000);
     deliver_attached_bulk(
         app,
         sink,
@@ -2838,7 +2880,6 @@ pub(crate) async fn emit_retained_bulk_to(
         template,
         &display,
         &transcript,
-        &rendered,
         deadline,
         started,
     )
@@ -3222,7 +3263,6 @@ async fn emit_failure_bulk(
         .map(String::as_str)
         .unwrap_or_else(|| default_template("message_bulk_delete"));
     templates::format_log_timestamps(&mut vars);
-    let rendered = templates::render_bounded(template, &vars, 2000);
     if !app.activation.may_record() {
         return;
     }
@@ -3236,7 +3276,6 @@ async fn emit_failure_bulk(
         template,
         &vars,
         &transcript,
-        &rendered,
         deadline,
         started,
     )
@@ -3623,6 +3662,7 @@ pub async fn emit_mod_action(
     enrollment: Option<db::GuildEnrollment>,
     ctx: &Context,
     guild_id: GuildId,
+    mut vars: BTreeMap<String, String>,
     action: &str,
     target_id: u64,
     target_name: &str,
@@ -3635,7 +3675,8 @@ pub async fn emit_mod_action(
     if !app.activation.may_record() {
         return;
     }
-    let mut vars = templates::user_vars(target_id, target_name, target_display);
+    // Keep command/response context; confirmed behavior facts override defaults.
+    vars.extend(templates::user_vars(target_id, target_name, target_display));
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
@@ -3768,7 +3809,7 @@ fn default_template(event: &str) -> &'static str {
 mod automod_delete_log;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Preserve the optional persistence result while making failed writes visible.
 pub(crate) fn log_persistence_result<T>(

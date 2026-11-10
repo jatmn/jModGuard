@@ -925,11 +925,13 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
-const SEED_META_MARKERS: [&str; 4] = [
+const SEED_META_MARKERS: [&str; 6] = [
+    "invite_description_v1",
     "readable_log_defaults_v1",
     "attachment_delete_template_v1",
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
+    "embed_log_defaults_v1",
 ];
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
@@ -1083,6 +1085,17 @@ fn globals_seed_satisfied_tx(conn: &impl SqlExecutor) -> Result<bool> {
         if meta_string_conn(conn, key)?.as_deref() != Some("1") {
             return Ok(false);
         }
+    }
+    // An old binary can restore the obsolete wording after the marker was set.
+    // Re-enter the existing seed transaction to repair it and bump config once.
+    let obsolete_invite: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rules WHERE rule_id = 'invite' AND
+         CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = ?1)",
+        params![crate::defaults::OLD_INVITE_DESCRIPTION],
+        |row| Ok(row.get(0)?),
+    )?;
+    if obsolete_invite {
+        return Ok(false);
     }
     // Counts are not enough. The pre-batch seed ran INSERT OR IGNORE for every
     // shipped key on each boot, so a deleted default came back and a customized
@@ -1251,6 +1264,19 @@ fn seed_globals_sql(
             sql_text(&serde_json::to_string(rule)?)
         ));
     }
+    // Re-apply on every seed, including after an old writer restores OLD with
+    // the marker already set. The exact-match UPDATE is idempotent and shares
+    // the existing writer transaction and change-based version accounting.
+    body.push_str(&format!(
+        "UPDATE rules SET data = json_set(data, '$.description', {}) \
+         WHERE rule_id = 'invite' AND \
+         CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = {};\n",
+        sql_text(crate::defaults::INVITE_DESCRIPTION),
+        sql_text(crate::defaults::OLD_INVITE_DESCRIPTION)
+    ));
+    if meta_string_conn(conn, "invite_description_v1")?.is_none() {
+        markers.push("invite_description_v1");
+    }
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
     if upgrade_presentation {
         let current_templates = crate::defaults::default_templates();
@@ -1326,6 +1352,23 @@ fn seed_globals_sql(
             sql_text(crate::defaults::PRE_BULK_STATUS_TEMPLATE)
         ));
         markers.push("retained_bulk_status_template_v1");
+    }
+    if meta_string_conn(conn, "embed_log_defaults_v1")?.is_none() {
+        let current = crate::defaults::rendered_log_templates();
+        for (event, old) in crate::defaults::pre_embed_log_templates() {
+            let new = current
+                .iter()
+                .find(|(name, _)| *name == event)
+                .context("shipped embed template")?
+                .1;
+            body.push_str(&format!(
+                "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
+                sql_text(new),
+                sql_text(event),
+                sql_text(old)
+            ));
+        }
+        markers.push("embed_log_defaults_v1");
     }
     for mut cmd in crate::defaults::default_global_seed_commands() {
         if cmd.name == "stats" && status_taken {

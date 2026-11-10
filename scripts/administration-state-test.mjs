@@ -111,7 +111,7 @@ function render(pageState, item) {
     components: [item], compatibility: { [item.component]: { installable: true } },
     apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
   };
-  run("ui.set({ snapshot: " + JSON.stringify(snapshot) + ", stale: false, authorized: true });", pageState.context);
+  run("ui.set({ snapshot: " + JSON.stringify(snapshot) + ", freshness: 'fresh', access: 'allowed' });", pageState.context);
 }
 
 test("owner update controls require a current installable candidate", () => {
@@ -496,7 +496,7 @@ test("a pending CDN purge keeps a reconciled WebUI release in Needs attention", 
     components: [webui], compatibility: { webui: { installable: true } },
     apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
     webui_purge_pending: pending,
-  }) + ", stale: false, authorized: true });", view.context);
+  }) + ", freshness: 'fresh', access: 'allowed' });", view.context);
   show(null);
   assert.match(textOf(view.elements.get("update-cards")), /Up to date/);
   show("Bunny Pull Zone purge failed after 6 attempts");
@@ -817,7 +817,7 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
 
 test("Database Usage renders disjoint physical groups and unknown guard status", () => {
   const view = page();
-  run(`ui.set({ authorized: true, activeView: "usage", usageSnapshot: { databases: [${JSON.stringify({
+  run(`ui.set({ access: "allowed", activeView: "usage", usageSnapshot: { databases: [${JSON.stringify({
     id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
     policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
     usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,

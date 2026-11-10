@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Point this worktree at .githooks so commits and pushes run ci-preflight.sh.
+# Point this worktree at .githooks for staged whitespace and pre-push contracts.
 # These hooks run locally; hosted CI uses the same gates.
 set -euo pipefail
 
@@ -46,5 +46,6 @@ git -C "$root" config --worktree core.hooksPath .githooks
 git -C "$root" config --worktree jmodguard.preflight-base "$base_ref"
 echo "Installed .githooks for this worktree (core.hooksPath) with preflight base $base_ref."
 echo "Git will use only .githooks here (previous hook directories are not chained)."
-echo "Each hook runs the full bash scripts/ci-preflight.sh suite."
+echo "Commits check staged whitespace; pushes run ci-preflight.sh --only contracts."
+echo "Run relevant tests locally; affected GitHub Actions checks gate merging."
 echo "This does not add GitHub Actions."

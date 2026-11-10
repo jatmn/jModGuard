@@ -7,6 +7,11 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
+pub(crate) const OLD_INVITE_DESCRIPTION: &str =
+    "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+pub(crate) const INVITE_DESCRIPTION: &str =
+    "Discord invite links, except invite codes configured in allowlist_codes.";
+
 pub fn default_rules() -> Vec<RuleDef> {
     let mut out = Vec::with_capacity(RULE_IDS.len());
     for id in RULE_IDS {
@@ -51,9 +56,15 @@ fn rule(id: &str) -> RuleDef {
                 action(4, "timeout", "Repeated banned words", 60, 0),
             ],
         ),
+        "known_spam" => (
+            "Known spam",
+            "Saved full messages and URL wildcards. First match bans and purges the previous hour; dry-run logs only.",
+            json!({}),
+            vec![crate::known_spam::action()],
+        ),
         "invite" => (
             "Invite links",
-            "Discord invite links, except invite codes configured in allowlist_codes.",
+            INVITE_DESCRIPTION,
             json!({"allowlist_codes": []}),
             vec![
                 action(1, "delete", "Invite link", 0, 0),
@@ -662,6 +673,173 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "member_join",
+            "Member joined\n\n**User:** {user} · {mention} (`{user_id}`)\n**Account created:** `{account_created}`\n**Account age:** `{account_age}`\n**Joined at:** `{time}`",
+        ),
+        (
+            "member_leave",
+            "Member left\n\n**User:** {user} · {mention} (`{user_id}`)\n**User ID:** `{user_id}`\n**Time in server:** `{duration}`\n**Joined at:** `{joined}`\n**Left at:** `{time}`",
+        ),
+        (
+            "member_ban",
+            "Member banned\n\n**User:** {user} · {mention} (`{user_id}`)\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "member_unban",
+            "Member unbanned\n\n**User:** {user} · {mention} (`{user_id}`)\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "member_kick",
+            "Member kicked\n\n**User:** {user} · {mention} (`{user_id}`)\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "message_edit",
+            "Message edited\n\n**Channel:** {channel}\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Before (last observed):** {before}\n**After:** {after}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
+        ),
+        (
+            "message_delete",
+            "Message deleted\n\n**Channel:** {channel}\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
+        ),
+        (
+            "message_bulk_delete",
+            "Messages deleted\n\n**Channel:** {channel}\n**Unique count:** `{count}`\n**Retained:** `{retained}`\n**Known missing:** `{unavailable}`\n**Storage unknown:** `{unknown}`\n**Filtered:** `{filtered}`\n**Transcript omitted:** `{omitted}`\n**Time:** `{time}`\n**Details:** {details}",
+        ),
+        (
+            "automod",
+            "Automod\n\n**Rule:** {rule}\n**User:** {mention}\n**Action:** {action}\n**Reason:** {reason}\n**Channel:** {channel}\n**Time:** `{time}`\n**Evidence:** {content}",
+        ),
+        (
+            "mod_action",
+            "Moderation action\n\n**Action:** {action}\n**User:** {user} · {mention}\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "timeout_add",
+            "Timeout added\n\n**User:** {user} · {mention} (`{user_id}`)\n**Moderator:** {actor}\n**Duration:** `{duration}`\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "timeout_remove",
+            "Timeout removed\n\n**User:** {user} · {mention} (`{user_id}`)\n**Moderator:** {actor}\n**Time:** `{time}`",
+        ),
+        (
+            "plan_executed",
+            "Custom command executed\n\n**Command:** `{command}`\n**Run by:** {actor}\n**Time:** `{time}`\n**Details:** {content}",
+        ),
+        (
+            "system",
+            "System notice\n\n**Time:** `{time}`\n**Details:** {content}",
+        ),
+    ]
+}
+
+/// `!userinfo` / `/userinfo` reply body (rendered and clipped to 2000 UTF-16 units).
+pub const USER_INFO_TEMPLATE: &str = "**User info**\n**ID:** `{user_id}`\n**Username:** {username}\n**Global name:** {global_name}\n**Nick:** {nick}\n**Account:** {account_created} ({account_age})\n**Joined:** {joined_at}\n**Roles:** {roles}\n**Voice:** {voice}\n**Warnings:** {warns}\n**Cases:**\n{cases}{clipped}";
+
+/// Appended to an attachment-burst review after a moderator uses a button.
+pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";
+pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
+pub const ATTACHMENT_BURST_TIMEOUT_ACTION: &str = "timeout {duration}";
+pub const ATTACHMENT_BURST_TIMEOUT_MISSED: &str = "timeout not applied; awaiting review";
+pub const ATTACHMENT_BURST_TIMEOUT_UNCERTAIN: &str = "timeout outcome uncertain; awaiting review";
+pub const ATTACHMENT_BURST_DENIED: &str = "That review action is not available to you.";
+pub const ATTACHMENT_BURST_HANDLED: &str = "That review was already handled.";
+pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
+pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
+pub const ATTACHMENT_BURST_BANNED: &str = "banned";
+pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
+
+/// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
+pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// DM when Discord already shows the user removed but a moderator requested `--dm`.
+pub const MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE: &str =
+    "You are already removed from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
+
+/// Slash option label for the optional kick/ban `dm` flag.
+pub const SLASH_MOD_REASON_DM_OPTION_TEMPLATE: &str = "DM the reason before applying the action";
+
+/// Follow-up when the preliminary reason DM was sent but kick/ban failed.
+pub const MOD_REASON_DM_MODERATION_FAILED_TEMPLATE: &str =
+    "Update: your removal from **{guild}** did not complete; you may still be in the server.";
+
+/// Shipped kick/ban confirmation clause when a reason DM was requested.
+pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";
+pub const MOD_REASON_DM_STATUS_SENT: &str = "Reason DM sent.";
+pub const MOD_REASON_DM_STATUS_NOT_SENT: &str = "Reason DM not sent.";
+pub const MOD_REASON_DM_STATUS_UNCERTAIN: &str = "Reason DM delivery uncertain.";
+
+/// User-facing error when kick/ban targets the bot itself.
+pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{command}`.";
+
+/// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
+///
+/// These stay out of [`default_templates`] so startup does not insert new
+/// global template rows. Delivery falls back to this wording until an operator
+/// saves an override.
+pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "member_role_update",
+            "Member roles updated\n\n**User:** {user} · {mention} (`{user_id}`)\n**Added:** {added}\n**Removed:** {removed}\n**Time:** `{time}`",
+        ),
+        (
+            "role_change",
+            "Role changed\n\n**Action:** {action}\n**Role:** {role} (`{role_id}`)\n**Name:** {role_name}\n**Detail:** {detail}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_join",
+            "Voice joined\n\n**User:** {user} · {mention} (`{user_id}`)\n**Channel:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_leave",
+            "Voice left\n\n**User:** {user} · {mention} (`{user_id}`)\n**Channel:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "voice_move",
+            "Voice moved\n\n**User:** {user} · {mention} (`{user_id}`)\n**From:** {before}\n**To:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "nickname_change",
+            "Nickname changed\n\n**User:** {user} · {mention} (`{user_id}`)\n**Before:** {before}\n**After:** {after}\n**Time:** `{time}`",
+        ),
+        (
+            "username_change",
+            "Username changed\n\n**User:** {user} · {mention} (`{user_id}`)\n**Username:** `{before}` → `{after}`\n**Display name:** `{before_global}` → `{after_global}`\n**Time:** `{time}`",
+        ),
+        (
+            "thread_create",
+            "Thread available\n\n**Notice:** {notice}\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Owner:** {mention}\n**Time:** `{time}`",
+        ),
+        (
+            "thread_update",
+            "Thread updated\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Before name:** {before}\n**Parent:** {channel}\n**Archived:** {archived}\n**Locked:** {locked}\n**Auto-archive:** {auto_archive}\n**Invitable:** {invitable}\n**Time:** `{time}`",
+        ),
+        (
+            "thread_delete",
+            "Thread deleted\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Time:** `{time}`",
+        ),
+        (
+            "automod_delete",
+            "Automod message deleted\n\n**Channel:** {channel}\n**Rule:** {rule} (`{rule_id}`)\n**Reason:** {reason}\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
+        ),
+        (
+            "member_rejoin",
+            "Member rejoined with prior cases\n\n**User:** {user} · {mention} (`{user_id}`)\n**Cases:** {cases}\n**Notice:** {notice}",
+        ),
+    ]
+}
+
+/// Shipped templates plus activity-log defaults. Startup seeding stays on
+/// [`default_templates`] alone.
+pub fn rendered_log_templates() -> Vec<(&'static str, &'static str)> {
+    let mut templates = default_templates();
+    templates.extend(activity_log_templates());
+    templates
+}
+
+/// Exact shipped strings before embed presentation. Match bytes, never custom wording.
+pub(crate) fn pre_embed_log_templates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "member_join",
             "**:inbox_tray: {user} joined the server**\n\n**User:** {mention} (`{user_id}`)\n**Account created:** `{account_created}`\n**Account age:** `{account_age}`\n**Joined at:** `{time}`",
         ),
         (
@@ -716,55 +894,6 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
             "system",
             "**:gear: System notice**\n\n**Time:** `{time}`\n{content}",
         ),
-    ]
-}
-
-/// `!userinfo` / `/userinfo` reply body (rendered and clipped to 2000 UTF-16 units).
-pub const USER_INFO_TEMPLATE: &str = "**User info**\n**ID:** `{user_id}`\n**Username:** {username}\n**Global name:** {global_name}\n**Nick:** {nick}\n**Account:** {account_created} ({account_age})\n**Joined:** {joined_at}\n**Roles:** {roles}\n**Voice:** {voice}\n**Warnings:** {warns}\n**Cases:**\n{cases}{clipped}";
-
-/// Appended to an attachment-burst review after a moderator uses a button.
-pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";
-pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
-pub const ATTACHMENT_BURST_TIMEOUT_ACTION: &str = "timeout {duration}";
-pub const ATTACHMENT_BURST_TIMEOUT_MISSED: &str = "timeout not applied; awaiting review";
-pub const ATTACHMENT_BURST_TIMEOUT_UNCERTAIN: &str = "timeout outcome uncertain; awaiting review";
-pub const ATTACHMENT_BURST_DENIED: &str = "That review action is not available to you.";
-pub const ATTACHMENT_BURST_HANDLED: &str = "That review was already handled.";
-pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
-pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
-pub const ATTACHMENT_BURST_BANNED: &str = "banned";
-pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
-
-/// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
-pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
-
-/// DM when Discord already shows the user removed but a moderator requested `--dm`.
-pub const MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE: &str =
-    "You are already removed from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";
-
-/// Slash option label for the optional kick/ban `dm` flag.
-pub const SLASH_MOD_REASON_DM_OPTION_TEMPLATE: &str = "DM the reason before applying the action";
-
-/// Follow-up when the preliminary reason DM was sent but kick/ban failed.
-pub const MOD_REASON_DM_MODERATION_FAILED_TEMPLATE: &str =
-    "Update: your removal from **{guild}** did not complete; you may still be in the server.";
-
-/// Shipped kick/ban confirmation clause when a reason DM was requested.
-pub const MOD_REASON_DM_CLAUSE_TEMPLATE: &str = " | {dm_status}";
-pub const MOD_REASON_DM_STATUS_SENT: &str = "Reason DM sent.";
-pub const MOD_REASON_DM_STATUS_NOT_SENT: &str = "Reason DM not sent.";
-pub const MOD_REASON_DM_STATUS_UNCERTAIN: &str = "Reason DM delivery uncertain.";
-
-/// User-facing error when kick/ban targets the bot itself.
-pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{command}`.";
-
-/// Code defaults for [`crate::types::ACTIVITY_LOG_EVENTS`].
-///
-/// These stay out of [`default_templates`] so startup does not insert new
-/// global template rows. Delivery falls back to this wording until an operator
-/// saves an override.
-pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
-    vec![
         (
             "member_role_update",
             "**:label: {user} roles updated**\n\n**User:** {mention} (`{user_id}`)\n**Added:** {added}\n**Removed:** {removed}\n**Time:** `{time}`",
@@ -814,14 +943,6 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
             "**:arrows_counterclockwise: {user} rejoined with prior moderation**\n\n**User:** {mention} (`{user_id}`)\n{cases}\n{notice}",
         ),
     ]
-}
-
-/// Shipped templates plus activity-log defaults. Startup seeding stays on
-/// [`default_templates`] alone.
-pub fn rendered_log_templates() -> Vec<(&'static str, &'static str)> {
-    let mut templates = default_templates();
-    templates.extend(activity_log_templates());
-    templates
 }
 
 /// Exact shipped delete template before attachment details were added.

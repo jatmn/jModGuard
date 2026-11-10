@@ -111,6 +111,8 @@ pub async fn guild_config(
         let global_row = snapshot.global_templates.get(event).cloned();
         templates.push(serde_json::json!({
             "event": event,
+            "shipped": def,
+            "embed_style": jmodguard::log_embeds::style(event),
             "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
             "guild_override": guild_row,
             "global": global_row.unwrap_or_else(|| def.to_string()),
@@ -144,6 +146,7 @@ pub async fn guild_config(
         "rules": rules,
         "badwords": badwords,
         "known_bad_images": snapshot.known_bad_images,
+        "known_spam": snapshot.known_spam,
         "commands": commands,
         "templates": templates,
         "log_channels": log_channels,
@@ -315,24 +318,30 @@ pub async fn put_rule(
     }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json_actor(
-        dashboard_actor(&auth),
-        db::ControlOp::UpsertRule {
-            request,
-            target,
-            id: rule_id.clone(),
-            rule: body.data.clone(),
-            clear_guild_override: body.clear_guild_override,
-        },
-    )
-    .await?;
+    let (_, saved) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::UpsertRule {
+                request,
+                target,
+                id: rule_id.clone(),
+                rule: body.data.clone(),
+                clear_guild_override: body.clear_guild_override,
+            },
+        )
+        .await?;
+    // Legacy bots acknowledge saves without a rule body. Let the dashboard
+    // reload authoritative configuration instead of applying a reset/delete.
+    if saved.is_null() {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "config_patch": {
             "kind": "rule",
             "id": rule_id,
             "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": body.data,
+            "value": saved,
             "cleared_guild_override": body.clear_guild_override,
         }
     })))
@@ -1512,4 +1521,72 @@ pub async fn remove_known_bad_image(
     Ok(Json(
         serde_json::json!({"ok": true, "changed": result["changed"]}),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownSpamBody {
+    scope: Option<String>,
+    kind: String,
+    value: String,
+    note: Option<String>,
+}
+
+pub async fn add_known_spam(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<KnownSpamBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let target = scope_from(&app, &auth, &body.scope, guild_id)?;
+    let write = super::configuration_write_scope(&app, &auth, guild_id, target)?;
+    let entry = jmodguard::known_spam::Entry::new(&body.kind, &body.value, body.note.as_deref())?;
+    let (request, target) = write.to_wires();
+    let (_, id) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::AddKnownSpam {
+                request,
+                target,
+                kind: entry.kind,
+                value: entry.value,
+                note: entry.note,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({"ok": true, "id": id})))
+}
+
+pub async fn delete_known_spam(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, id)): Path<(u64, i64)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let not_found = || ApiError(anyhow::anyhow!("known spam entry not found"));
+    let Some(entry) = db::get_known_spam_primary(&app.db, id).await? else {
+        return Err(not_found());
+    };
+    if !(entry.guild_id == GLOBAL_SCOPE && is_bot_owner(&app, &auth)
+        || entry.guild_id != GLOBAL_SCOPE && entry.guild_id == guild_id as i64)
+    {
+        return Err(not_found());
+    }
+    let write = super::configuration_write_scope(&app, &auth, guild_id, entry.guild_id)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::DeleteKnownSpam {
+            request,
+            target,
+            id,
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({"ok":true})))
 }

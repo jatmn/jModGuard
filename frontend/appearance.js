@@ -1,5 +1,14 @@
 import React, { useEffect, useState } from "react";
 
+// Preference and resolved theme differ while following the system.
+/** @typedef {{kind: "system"} | {kind: "fixed", theme: string}} AppearanceSelection */
+function appearanceSelection(preference) {
+  return preference === "system" ? { kind: "system" } : { kind: "fixed", theme: preference };
+}
+function resolvedAppearance(selection, systemDark) {
+  return (selection.kind === "system" ? systemDark : selection.theme === "dark") ? "dark" : "light";
+}
+
 export function useAppearance() {
   const [preference, setPreference] = useState(() => {
     let saved;
@@ -9,8 +18,9 @@ export function useAppearance() {
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => {
-      const dark = preference === "dark" || (preference === "system" && media.matches);
-      document.documentElement.dataset.theme = dark ? "dark" : "light";
+      const theme = resolvedAppearance(appearanceSelection(preference), media.matches);
+      const dark = theme === "dark";
+      document.documentElement.dataset.theme = theme;
       document.querySelector('meta[name="theme-color"]').content = dark ? "#101e33" : "#e0eeff";
     };
     apply();

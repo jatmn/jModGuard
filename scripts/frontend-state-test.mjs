@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { performance } from 'node:perf_hooks';
+import { renderToStaticMarkup } from '../tools/webui/node_modules/react-dom/server.node.js';
 import { randomUUID } from 'node:crypto';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
@@ -89,7 +91,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -99,7 +101,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -1020,7 +1022,7 @@ test('out-of-order server responses never overwrite the active server', async ()
   pending[0].resolve(response({ sentinel: 'first' }));
   await first;
   assert.equal(app.state.config.sentinel, 'second');
-  assert.equal(app.state.loading, false);
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('an older same-server refresh cannot roll back a newer saved snapshot', async () => {
@@ -1052,7 +1054,7 @@ test('an older refresh cannot roll back an acknowledged mutation representation'
   }));
   await old;
   assert.equal(app.state.config.rules[0].effective.enabled, false);
-  assert.equal(app.state.loading, false);
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('default-backed rule and template resets fall back instead of applying null', () => {
@@ -1105,8 +1107,8 @@ test('failed refresh clears stale settings and exposes a retryable error', async
   app.state.config = { settings: { prefix: 'stale' } };
   assert.equal(await app.loadConfig(), undefined);
   assert.equal(app.state.config, null);
-  assert.equal(app.state.error, 'offline');
-  assert.equal(app.state.loading, false);
+  assert.equal(app.state.configRead.error, 'offline');
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('async actions block duplicate submissions and release after errors', async () => {
@@ -1738,7 +1740,7 @@ for (const kind of ['rule', 'command']) {
   }
 }
 
-async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
+async function ruleSaveHarness({ scope = 'global', override = false, legacyAck = false } = {}) {
   const calls = [];
   const failures = { put: false, lost: false, refresh: false };
   let receipt;
@@ -1757,7 +1759,7 @@ async function ruleSaveHarness({ scope = 'global', override = false } = {}) {
       if (body.scope === 'global') globalRule = body.data;
       else guildRule = body.data;
       if (body.clear_guild_override) guildRule = null;
-      receipt = { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
+      receipt = legacyAck ? { ok: true } : { ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data, cleared_guild_override: !!body.clear_guild_override } };
       if (failures.lost) throw new Error('lost acknowledgement');
       return response(receipt);
     } else if (options.method === 'DELETE') {
@@ -1842,6 +1844,18 @@ test('a successful global rule save acknowledges both atomic effects without a c
   assert.equal(h.calls[0].body.scope, 'global');
   assert.equal(h.calls[0].body.clear_guild_override, true);
   assert.equal(h.app.state.config.rules[0].guild_override, null);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.equal(h.modal.isConnected, false);
+  assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');
+});
+
+test('a rule save without config_patch reloads authoritative configuration', async () => {
+  const h = await ruleSaveHarness({ scope: 'guild', legacyAck: true });
+  await fire(h.enabled, 'change', { target: { checked: false } });
+  await fire(h.save, 'click', {});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'POST']);
+  assert.ok(h.calls[1].url.endsWith('/config'));
+  assert.equal(h.app.state.config.rules[0].guild_override.enabled, false);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.equal(h.modal.isConnected, false);
   assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');
@@ -2328,6 +2342,56 @@ for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes
   });
 }
 
+for (const id of ['mention_spam', 'velocity']) {
+  test(`built-in ${id} window bounds reject invalid saves and accept endpoints`, async () => {
+    const calls = [];
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    for (const value of ['0', '601', '1', '600']) {
+      const modal = await h.app.editRule({name: id, rule_id: id, effective: {
+        enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'log'}],
+      }});
+      const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Window (seconds)')?.control;
+      assert.equal(input.min, '1');
+      assert.equal(input.max, '600');
+      input.value = value;
+      await fire(input, 'input');
+      const before = calls.length;
+      await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+      if (['0', '601'].includes(value)) {
+        assert.equal(calls.length, before, 'invalid window must not reach the API');
+        assert.match(textOf(h.document.body), /1–600 seconds/);
+        await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Cancel'), 'click');
+      } else {
+        assert.equal(calls.length, before + 1);
+        assert.equal(calls.at(-1).data.params.window_secs, Number(value));
+      }
+    }
+  });
+}
+
+for (const [stored, expected] of [
+  ['broken', []], [true, []], [{code: 'object'}, []],
+  [['keep', 123, null, false, {}, ['nested'], 'second'], ['keep', 'second']],
+]) {
+  test(`invite editor recovers malformed allowlist ${JSON.stringify(stored)}`, async () => {
+    const calls = [];
+    const h = harness(async (_url, options) => {
+      if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+      return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+    });
+    const modal = await h.app.editRule({name: 'Invite links', rule_id: 'invite', effective: {
+      enabled: true, dry_run: true, params: {allowlist_codes: stored}, actions: [{at: 1, action: 'log'}],
+    }});
+    const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Allowed invite codes (comma-separated)')?.control;
+    assert.equal(input.value, expected.join(', '));
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.deepEqual(calls[0].data.params.allowlist_codes, expected);
+  });
+}
+
 test('built-in numeric detection fields reject empty, negative and fractional values', async () => {
   const calls = [];
   const h = harness(async (_url, options) => {
@@ -2541,6 +2605,373 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
   await fire(submit, 'click', {});
   assert.equal(h.app.isDirty(), false);
   assert.equal(findNode(root, n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
+});
+
+// Exercise the mounted template preview, including draft edits, through its real renderer.
+function markdownPreview(text) {
+  const h = harness();
+  h.app.state.config = {templates: [{event: 'automod', effective: text}]};
+  h.app.navigate('templates');
+  return {h, panel: h.document.querySelector('.template-preview .log-embed-description')};
+}
+
+for (const [name, input, selector, expected] of [
+  ['heading 1', '# One', 'h1', 'One'],
+  ['heading 2', '## Two', 'h2', 'Two'],
+  ['heading 3', '### Three', 'h3', 'Three'],
+  ['subtext', '-# Small **note**', 'small strong', 'note'],
+  ['single-line quotes', '> **quoted**\n> second\nafter', 'blockquote strong', 'quoted'],
+  ['multiline quotes', '>>> first\nsecond\n**third**', 'blockquote strong', 'third'],
+  ['bullet lists', '- first\n* **second**', 'ul > li strong', 'second'],
+  ['numbered lists', '3. first\n4. **second**', 'ol[start="3"] > li strong', 'second'],
+  ['underline', '__under__', 'u', 'under'],
+  ['strikethrough', '~~gone~~', 's', 'gone'],
+  ['bold', '**bold**', 'strong', 'bold'],
+  ['star italics', '*italic*', 'em', 'italic'],
+  ['underscore italics', '_italic_', 'em', 'italic'],
+  ['bold italics', '***both***', 'strong em', 'both'],
+  ['nested emphasis and code', '__**bold `**literal**` end**__', 'u strong code', '**literal**'],
+  ['bold inside italics', '*italic **bold** italic*', 'em > strong', 'bold'],
+  ['italics closing with bold', '**bold *italic***', 'strong > em', 'italic'],
+  ['underline inside underscore italics', '_italic __under__ italic_', 'em > u', 'under'],
+  ['multiple-backtick code', '``literal `tick``', 'code', 'literal `tick'],
+  ['spoilers', '||secret **bold**||', 'details summary', 'Spoiler'],
+  ['inline code', '`**literal** <b>`', 'code', '**literal** <b>'],
+  ['fenced code', '```js\n**literal** <b>\n```', 'pre code', '**literal** <b>'],
+  ['masked links', '[**Docs**](https://example.test/a?x=1&y=2)', 'a strong', 'Docs'],
+]) {
+  test(`Markdown preview renders ${name}`, () => {
+    const {panel} = markdownPreview(input);
+    assert.equal(panel.querySelector(selector)?.textContent, expected);
+  });
+}
+
+test('Markdown preview keeps escaping, code and unsafe URLs inert', () => {
+  const input = String.raw`\# literal
+\> literal
+\- literal
+\*\*literal\*\* \_\_literal\_\_ \~\~literal\~\~ \|\|literal\|\| \[label](https://example.test)
+` + '\n<script>alert(1)</script><img src=x onerror=alert(1)>&lt;b&gt;\n'
+    + '[bad](javascript:alert(1)) [bad](JaVaScRiPt:alert(1)) [bad](data:text/html,x) [bad](//example.test) [bad](https:\n//example.test)\n'
+    + '`[bad](https://example.test) **literal**`';
+  const {panel} = markdownPreview(input);
+  assert.equal(panel.querySelector('script,img,b,a,blockquote,ul,h1,u,s,details'), null);
+  assert.match(panel.textContent, /# literal/);
+  assert.match(panel.textContent, /\*\*literal\*\*/);
+  assert.match(panel.textContent, /<script>alert\(1\)<\/script>/);
+  assert.match(panel.textContent, /&lt;b&gt;/);
+  assert.ok(panel.innerHTML.includes('&lt;script&gt;'));
+  assert.equal(panel.querySelector('code')?.textContent, '[bad](https://example.test) **literal**');
+});
+
+test('Markdown preview handles safe link attributes, nested lists and literal code blocks', () => {
+  const {panel} = markdownPreview('[link](HTTP://example.test/a_(b)?x="&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```');
+  assert.equal(panel.querySelector('a')?.getAttribute('href'), 'HTTP://example.test/a_(b)?x="&y=1');
+  assert.equal(panel.querySelector('a')?.getAttribute('rel'), 'noreferrer noopener');
+  assert.equal(panel.querySelector('a')?.getAttribute('onclick'), null);
+  assert.equal(panel.querySelector('ul ul li')?.textContent, 'nested');
+  assert.equal(panel.querySelector('pre code')?.textContent, '<script> & **literal**\n# no heading');
+  assert.equal(panel.querySelector('script,h1'), null);
+});
+
+test('Markdown preview updates unsaved edits and preserves sample substitutions', async () => {
+  const {h, panel} = markdownPreview('**Hello {user}**');
+  assert.equal(panel.querySelector('strong')?.textContent, 'Hello Alice');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = '## Changed\n__under__ and ||secret||';
+  await fire(input, 'input');
+  assert.equal(panel.querySelector('h2')?.textContent, 'Changed');
+  assert.equal(panel.querySelector('u')?.textContent, 'under');
+  assert.equal(panel.querySelector('details')?.open, false);
+});
+
+// Use the production parser without the embed description's existing 4096-unit
+// clipping. Instrument only string reads/searches, so CI load cannot hide a
+// repeated suffix scan or make the regression depend on a wall-clock deadline.
+function previewParser(maxWork = Infinity) {
+  let work = 0;
+  const charge = amount => {
+    work += amount;
+    assert.ok(work <= maxWork, `preview scan work ${work} exceeds ${maxWork}`);
+  };
+  const trackText = text => new Proxy({}, {
+    get(_target, key) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) charge(1);
+      const value = text[key];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        const result = value.apply(text, args);
+        if (key === 'startsWith') charge(args[0].length);
+        if (key === 'indexOf') charge((result < 0 ? text.length : result + args[0].length) - (args[1] || 0));
+        if (key === 'slice') charge(result.length);
+        return result;
+      };
+    },
+  });
+  const parserSource = source.slice(source.indexOf('function previewInline('));
+  const instrumented = parserSource.replace('  const out = [];', '  text = trackText(text);\n  const out = [];');
+  assert.notEqual(instrumented, parserSource, 'the production parser must be instrumented');
+  const render = vm.runInNewContext(instrumented + '\npreviewMarkdown', {h: React.createElement, trackText});
+  const plain = vm.runInNewContext(parserSource + '\npreviewMarkdown', {h: React.createElement});
+  return {render, plain, work: () => work};
+}
+
+for (const [name, input, literal = true] of [
+  ['unmatched brackets', '['.repeat(64000)],
+  ['unmatched link destinations', '[a]('.repeat(16000)],
+  ['labels without destinations', '[a]'.repeat(21333)],
+  ['closers without labels', ']('.repeat(32000)],
+  ['mixed brackets', '[[[]'.repeat(16000)],
+  ['one late bracket', '['.repeat(63999) + ']'],
+  ['one late link marker', '['.repeat(63998) + ']('],
+  ['inner balanced destination after unmatched openers', '[a]('.repeat(15999) + '[b](x)'],
+  ['unmatched backticks', 'a' + '`'.repeat(63999)],
+  ['emphasis across unmatched backticks', '*' + '`'.repeat(63998) + 'a'],
+  ['unmatched stars', '*'.repeat(64000)],
+  ['unmatched underscores', '_'.repeat(64000)],
+  ['unmatched tildes', '~'.repeat(64000)],
+  ['unmatched pipes', '|'.repeat(64000)],
+  // Each run is one tick longer than every later run, so it has no closer.
+  ['shrinking backtick runs', Array.from({length: 357}, (_, i) => '`'.repeat(357 - i)).join('a'), false],
+]) {
+  test(`Markdown preview bounds scan work for ${name}`, t => {
+    const parser = previewParser(input.length * 64);
+    const result = parser.render(input);
+    const start = performance.now();
+    const plain = parser.plain(input);
+    const elapsed = performance.now() - start;
+    t.diagnostic(`${input.length} characters: ${parser.work()} string operations; uninstrumented parser ${elapsed.toFixed(3)} ms`);
+    assert.equal(result.length, 1);
+    assert.ok(parser.work() > 0);
+    if (literal) {
+      assert.equal(result[0].props.children.join(''), input);
+      assert.equal(plain[0].props.children.join(''), input);
+    } else {
+      const markup = renderToStaticMarkup(React.createElement(React.Fragment, null, plain));
+      assert.equal(renderToStaticMarkup(React.createElement(React.Fragment, null, result)), markup);
+      assert.match(markup, /<code>/);
+    }
+  });
+}
+
+// Captured from main 3d80be82d020ee6c31244377a04abb6afe73f88f before
+// changing the parser. These include #487/#504 fixtures; the nested-emphasis
+// row uses Discord's result from #515.
+const previewBaseline = [
+  [
+    "[**Docs**](https://example.test/a?x=1&y=2)",
+    "<div><a href=\"https://example.test/a?x=1&amp;y=2\" target=\"_blank\" rel=\"noreferrer noopener\"><strong>Docs</strong></a></div>"
+  ],
+  [
+    "[outer [inner]](https://example.test/a_(b))",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">outer [inner]</a></div>"
+  ],
+  [
+    "[a]([b](https://example.test)",
+    "<div>[a](<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](unclosed [b](https://example.test)",
+    "<div>[a](unclosed <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[[[a](https://example.test)",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">[[a</a></div>"
+  ],
+  [
+    "[a](",
+    "<div>[a](</div>"
+  ],
+  [
+    "[a]",
+    "<div>[a]</div>"
+  ],
+  [
+    "](",
+    "<div>](</div>"
+  ],
+  [
+    "[[[]",
+    "<div>[[[]</div>"
+  ],
+  [
+    "[[[[late]",
+    "<div>[[[[late]</div>"
+  ],
+  [
+    "[[[[late](x)",
+    "<div>[[[[late](x)</div>"
+  ],
+  [
+    "[a](https://example.test/a_(b)) tail",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> tail</div>"
+  ],
+  [
+    "[a](https://example.test/a_(b) tail",
+    "<div>[a](https://example.test/a_(b) tail</div>"
+  ],
+  [
+    "[a](javascript:alert(1)) **next**",
+    "<div>[a](javascript:alert(1)) <strong>next</strong></div>"
+  ],
+  [
+    "[a](//example.test) [b](https://example.test)",
+    "<div>[a](//example.test) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://exa mple.test) [b](",
+    "<div>[a](https://exa mple.test) [b](</div>"
+  ],
+  [
+    "\\\\[escaped](https://example.test) [a\\\\](https://example.test)",
+    "<div>\\<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">escaped</a> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a\\</a></div>"
+  ],
+  [
+    "[a\\\\\\\\](https://example.test/a\\\\(b\\\\))",
+    "<div>[a\\\\\\\\](https://example.test/a\\\\(b\\\\))</div>"
+  ],
+  [
+    "[a\\\\\\\\\\\\](x) [b](https://example.test)",
+    "<div>[a\\\\\\\\\\\\](x) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test/a\\\\\\\\(b)) [b](https://example.test)",
+    "<div>[a](https://example.test/a\\\\\\\\(b)) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a `](literal)`](https://example.test)",
+    "<div>[a `](literal)`](https://example.test)</div>"
+  ],
+  [
+    "`[a](https://example.test)` [b]",
+    "<div><code>[a](https://example.test)</code> [b]</div>"
+  ],
+  [
+    "**[a](https://example.test)** _[b]_ __[c](bad)__",
+    "<div><strong><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></strong> <em>[b]</em> <u>[c](bad)</u></div>"
+  ],
+  [
+    "*italic **bold** italic*",
+    "<div><em>italic <strong>bold</strong> italic</em></div>"
+  ],
+  [
+    "__**bold `**literal**` end**__",
+    "<div><u><strong>bold <code>**literal**</code> end</strong></u></div>"
+  ],
+  [
+    "***[a](https://example.test)*** ||[b](bad)||",
+    "<div><strong><em><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></em></strong> <details class=\"preview-spoiler\"><summary>Spoiler</summary>[b](bad)</details></div>"
+  ],
+  [
+    "# [title](https://example.test)\r\n> [quote]\r\n- [[item]\n  - `[code]`",
+    "<h1><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">title</a></h1><blockquote><div>[quote]</div></blockquote><ul><li><div>[[item]</div><ul><li><div><code>[code]</code></div></li></ul></li></ul>"
+  ],
+  [
+    ">>> [a](https://example.test)\n[b](",
+    "<blockquote><div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></div><div>[b](</div></blockquote>"
+  ],
+  [
+    "```md\n[a](https://example.test) **literal**\n```\n[a]",
+    "<pre><code>[a](https://example.test) **literal**</code></pre><div>[a]</div>"
+  ],
+  [
+    "[a](https://example.test) [b](https://example.test/(c))",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <a href=\"https://example.test/(c)\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test/a\\)b) [b](https://example.test)",
+    "<div><a href=\"https://example.test/a)b\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test)\\[b](",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a>[b](</div>"
+  ],
+  [
+    "[a](https://example.test) **[** [b](https://example.test)",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <strong>[</strong> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a]([[[[x](bad)) [good](https://example.test)",
+    "<div>[a]([[[[x](bad)) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">good</a></div>"
+  ],
+  [
+    "[a](https://example.test/a_(b)) [x]([y](https://example.test)",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> [x](<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">y</a></div>"
+  ],
+  [
+    "Message deleted\n\n**Channel:** #general\n**Author:** @alice\n**Time:** `Nov 09, 2026 • 22:35:54 UTC`\n**Last observed text:** FREE NITRO https://example.test",
+    "<div>Message deleted</div><div><br/></div><div><strong>Channel:</strong> #general</div><div><strong>Author:</strong> @alice</div><div><strong>Time:</strong> <code>Nov 09, 2026 • 22:35:54 UTC</code></div><div><strong>Last observed text:</strong> FREE NITRO https://example.test</div>"
+  ],
+  [
+    "[link](HTTP://example.test/a_(b)?x=\"&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```",
+    "<div><a href=\"HTTP://example.test/a_(b)?x=&quot;&amp;y=1\" target=\"_blank\" rel=\"noreferrer noopener\">link</a></div><ul><li><div>parent</div><ul><li><div>nested</div></li></ul></li></ul><pre><code>&lt;script&gt; &amp; **literal**\n# no heading</code></pre>"
+  ],
+  [
+    "\\# literal\n\\> literal\n\\- literal\n<script>alert(1)</script>&lt;b&gt;\n[bad](https:\n//example.test)",
+    "<div># literal</div><div>&gt; literal</div><div>- literal</div><div>&lt;script&gt;alert(1)&lt;/script&gt;&amp;lt;b&amp;gt;</div><div>[bad](https:</div><div>//example.test)</div>"
+  ],
+  // Code-span closers, captured from main 4c406d8ed6b3067bbb47a81410fc445122f7d5ae
+  // before indexing backtick runs.
+  [
+    "a ``code` with tick`` b",
+    "<div>a <code>code` with tick</code> b</div>"
+  ],
+  [
+    "a ```x`` y````z",
+    "<div>a <code>x`` y</code>`z</div>"
+  ],
+  [
+    "a ```x`y`",
+    "<div>a ``<code>x</code>y`</div>"
+  ],
+  [
+    "a `x\\` y` z",
+    "<div>a <code>x\\</code> y` z</div>"
+  ],
+  [
+    "*a `*` b* _c ``_`` d_",
+    "<div><em>a <code>*</code> b</em> <em>c <code>_</code> d</em></div>"
+  ],
+  [
+    "**a ``**`` b `c**",
+    "<div><strong>a <code>**</code> b `c</strong></div>"
+  ],
+  [
+    "~~a `~~` ~~ ||b ```||``` c||",
+    "<div><s>a <code>~~</code> </s> <details class=\"preview-spoiler\"><summary>Spoiler</summary>b <code>||</code> c</details></div>"
+  ]
+];
+
+test('Markdown preview preserves main output for valid and malformed syntax', () => {
+  const parser = previewParser();
+  for (const [input, expected] of previewBaseline) {
+    const html = renderToStaticMarkup(React.createElement(React.Fragment, null, parser.plain(input)));
+    assert.equal(html, expected, JSON.stringify(input));
+  }
+});
+
+test('Markdown preview preserves the complete long template on edit and save', async () => {
+  let stored = '['.repeat(64000), saved;
+  const config = () => ({enrollment_id: 'original', templates: [{event: 'automod', effective: stored}]});
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT' && url.endsWith('/templates/automod')) {
+      saved = JSON.parse(options.body).template;
+      stored = saved;
+    }
+    return response(url.endsWith('/config') ? config() : {});
+  });
+  h.app.state.config = config();
+  h.app.navigate('templates');
+  const input = h.document.querySelector('.template-card textarea');
+  assert.equal(input.value, stored);
+  assert.equal(input.hasAttribute('maxlength'), false);
+  input.value = '[a]('.repeat(16000);
+  await fire(input, 'input');
+  assert.equal(input.value.length, 64000);
+  await fire(findNode(h.document.querySelector('.template-card'), n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(saved, '[a]('.repeat(16000));
+  assert.equal(h.app.state.config.templates[0].effective, saved);
+  assert.equal(h.document.querySelector('.template-card textarea').value, saved);
 });
 
 test('preview token is sent on API requests from this tab', async () => {
@@ -2912,10 +3343,10 @@ test('activity-log events from the config payload render template and log-channe
   assert.equal(cards.length, 2);
   assert.match(cards[0].textContent, /Voice join/);
   assert.match(cards[0].textContent, /voice_join/);
-  assert.match(cards[0].querySelector('pre').textContent, /Alice/);
-  assert.match(cards[0].querySelector('pre').textContent, /#general/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /Alice/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /#general/);
   assert.match(cards[1].textContent, /Member role update/);
-  assert.match(cards[1].querySelector('pre').textContent, /\{added\}/);
+  assert.match(cards[1].querySelector('.log-embed-description').textContent, /@Member/);
   h.app.navigate('logchannels');
   await settle();
   const logs = [...h.document.querySelectorAll('.log-channel-card')];
@@ -4487,4 +4918,125 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.deepEqual(submitted.data.params, {});
   assert.equal(h.app.state.tab, 'badwords');
   assert.equal(h.document.querySelector('.modal-overlay'), null);
+});
+
+ test('known spam dedicated page adds samples and URL wildcards, displays and removes scoped rows', async () => {
+  let rows = [];
+  const requests = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: rows, rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    requests.push({url, options});
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body);
+      rows.push({ id: String(rows.length + 1), guild_id: h.app.state.guildId, ...body });
+    } else if (options.method === 'DELETE') rows = rows.filter(row => !url.endsWith('/' + row.id));
+    return response({ok: true});
+  });
+  h.app.state.config = config();
+  h.app.state.tab = 'known-spam';
+  let panel = h.app.tabKnownSpam();
+  await settle();
+  assert.match(panel.textContent, /lightly rewritten/i);
+  const sample = panel.querySelector('textarea');
+  sample.value = 'I used to work as Full Stack AI developer'; await fire(sample, 'input');
+  const note = panel.querySelector('input[data-note]');
+  note.value = 'Owner sample'; await fire(note, 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(requests[0].options.method, 'POST');
+  assert.equal(JSON.parse(requests[0].options.body).kind, 'sample');
+  assert.equal(JSON.parse(requests[0].options.body).note, 'Owner sample');
+  panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent, /Full Stack AI developer/);
+  const url = panel.querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
+  assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
+  panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent, /tinyurl.com/);
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  assert.equal(requests[2].options.method, 'DELETE');
+  assert.equal(h.app.state.config.known_spam.length, 1);
+ });
+
+test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
+  const calls = [];
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: [], known_spam: []});
+  });
+  const rule = {name:'Known spam', enabled:true, dry_run:false, params:{}, actions:[{at:1,action:'ban',delete_days:0,purge_last_hour:true}], whitelist_users:[],whitelist_roles:[],whitelist_channels:[],include_channels:[],skip_moderators:false};
+  const modal = await h.app.editRule({name:'Known spam',rule_id:'known_spam',effective:rule});
+  assert.match(modal.textContent,/3600 seconds/);
+  assert.doesNotMatch(modal.textContent,/Action escalation/);
+  const dryLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Dry-run (log only)'));
+  await fire(findNode(dryLabel,n=>n.localName === 'input'),'change',{target:{checked:true}});
+  const skipLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Skip moderators'));
+  await fire(findNode(skipLabel,n=>n.localName === 'input'),'change',{target:{checked:true}});
+  await fire(findNode(modal,n=>n.localName === 'button' && n.textContent === 'Save'),'click');
+  assert.equal(calls[0].data.dry_run,true);
+  assert.equal(calls[0].data.skip_moderators,true);
+  assert.equal(calls[0].data.actions[0].purge_last_hour,true);
+});
+
+test('known spam inherited globals are visible and removal is owner only', async () => {
+  const h = harness();
+  h.app.state.config = {rules: [], known_spam: [{id:'7',guild_id:'0',kind:'url',value:'tinyurl.com/*',note:null}]};
+  const panel = h.app.tabKnownSpam(); await settle();
+  assert.match(panel.textContent,/tinyurl.com/);
+  assert.match(panel.textContent,/Owner only/);
+  assert.equal([...panel.querySelectorAll('button')].some(b=>b.textContent === 'Remove'),false);
+});
+
+test('template preview shows embed color, title and fields, then live custom description', async () => {
+  const h = harness();
+  const shipped = 'Message deleted\n\n**Channel:** {channel}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}';
+  h.app.state.config = { templates: [{
+    event: 'message_delete', effective: shipped, shipped,
+    embed_style: {title: 'Message deleted', color: 0xff6666, action_colors: {}, removal_color: null},
+  }] };
+  h.app.navigate('templates');
+  let embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  assert.equal(embed.querySelector('.log-embed-title').textContent, 'Message deleted');
+  assert.deepEqual([...embed.querySelectorAll('.log-embed-field > strong')].map(el => el.textContent), ['Channel', 'Author', 'Time', 'Last observed text']);
+  assert.match(embed.textContent, /#general/);
+  assert.match(embed.textContent, /@alice/);
+  assert.equal(embed.querySelector('code').textContent, 'Nov 09, 2026 • 22:35:54 UTC');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = 'My custom wording: {user} {reason} <script>alert(1)</script>';
+  await fire(input, 'input');
+  embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.querySelectorAll('.log-embed-field').length, 0);
+  assert.equal(embed.querySelector('.log-embed-description').textContent, 'My custom wording: Alice spam <script>alert(1)</script>');
+  assert.equal(embed.querySelector('script'), null);
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  input.value = '🦀'.repeat(3000);
+  await fire(input, 'input');
+  const description = h.document.querySelector('.log-embed-description').textContent;
+  assert.equal(description.length, 4095);
+  assert.ok(description.endsWith('…'));
+});
+
+test('embed preview applies dynamic action/removal accents and aggregate field limits', () => {
+  const previewSource = source.slice(source.indexOf('function clipEmbedText('), source.indexOf('function logPreviewText('));
+  const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
+  assert.equal(preview({embed_style: {title: 'Log event', color: 0xffb347}}, 'Unknown {constructor} {__proto__} {missing}', {}).description, 'Unknown {constructor} {__proto__} {missing}');
+  const record = {
+    shipped: 'Role changed\n\n**Action:** {action}',
+    embed_style: {title: 'Role changed', color: 0xffb347, action_colors: {created: 0x77dd77, deleted: 0xff6666}},
+  };
+  assert.equal(preview(record, record.shipped, {action: 'created'}).color, 0x77dd77);
+  assert.equal(preview(record, record.shipped, {action: 'deleted'}).color, 0xff6666);
+  assert.equal(preview(record, record.shipped, {action: 'updated'}).color, 0xffb347);
+  record.embed_style.removal_color = 0xff6666;
+  assert.equal(preview(record, record.shipped, {removed: '<@&123>'}).color, 0xff6666);
+  record.shipped = 'Role changed\n\n' + Array.from({length: 30}, (_, i) => `**Field ${i}:** {content}`).join('\n');
+  const embed = preview(record, record.shipped, {content: '🦀'.repeat(1000)});
+  const total = embed.title.length + embed.description.length + embed.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+  assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every(f => f.name.length <= 256 && f.value.length <= 1024));
+  assert.ok(total <= 6000);
+  assert.equal(embed.fields[0].value.length, 1023);
+  assert.equal(embed.fields[0].value.at(-1), '…');
 });

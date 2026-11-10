@@ -135,10 +135,13 @@ released versions remain subject to the license supplied with those versions.
 Owner-only, on-demand Pullfrog commands and diagnostics are documented in [docs/PULLFROG.md](docs/PULLFROG.md).
 It does not replace GitHub Actions CI.
 
+Run relevant local checks for ordinary PRs; see [Development notes](development.md#local-validation).
+Affected GitHub Actions checks remain required before merge.
+
 ```bash
-bash scripts/ci-preflight.sh
-# or: ./scripts/smoke-dual-process.sh
-# optional: bash scripts/install-git-hooks.sh  # full preflight; per-worktree; see AGENTS.md for --base
+bash scripts/ci-preflight.sh --only contracts  # docs-only example
+bash scripts/ci-preflight.sh                 # full validation for CI/build-control changes
+# optional: bash scripts/install-git-hooks.sh  # staged whitespace + pre-push contracts
 ```
 
 Bot and API are independent Cargo packages. The API defaults to `embed-ui` for local
@@ -160,3 +163,6 @@ frontend/                  static dashboard (Bunny Storage/CDN or local API embe
 migrations/                jmodguard-core-1, steps 0001–0009
 Dockerfile.bot / Dockerfile.api
 ```
+
+Known full-message samples and URL wildcards are managed on the dedicated
+[Known spam page](docs/KNOWN-SPAM.md), with first-hit Ban and purge (previous hour).

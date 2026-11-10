@@ -27,6 +27,8 @@ pub use jmodguard_runtime::set_shutdown_context;
 pub mod attachment_burst;
 pub mod ids;
 pub mod image_spam;
+pub mod known_spam;
+pub mod log_embeds;
 pub mod normalize;
 mod remote_https;
 pub mod templates;

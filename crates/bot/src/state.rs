@@ -2260,6 +2260,7 @@ pub struct CachedGuildConfig {
     pub log_filters: HashMap<String, db::LogFilter>,
     pub known_bad_hashes: std::collections::BTreeSet<[u8; 32]>,
     pub regexes: Vec<Regex>,
+    pub known_spam: jmodguard::known_spam::CompiledList,
     pub custom_patterns: HashMap<String, Regex>,
 }
 
@@ -2304,6 +2305,7 @@ impl CachedGuildConfig {
             loaded_at: Instant::now(),
             known_bad_hashes: parts.known_bad_images.iter()
                 .filter_map(|row| jmodguard::image_spam::parse_hash(&row.hash)).collect(),
+            known_spam: jmodguard::known_spam::CompiledList::new(&parts.known_spam),
             settings: parts.settings,
             rules: parts.rules,
             commands: parts.commands,

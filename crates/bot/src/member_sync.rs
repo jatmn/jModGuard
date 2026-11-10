@@ -1912,7 +1912,7 @@ mod tests {
             1,
             "verified absence must emit the suppressed leave exactly once"
         );
-        let content = messages[0]["content"].as_str().unwrap();
+        let content = crate::logging::tests::log_text(&messages[0]);
         assert!(content.contains("saved-user"));
         assert!(content.contains("|1h|"));
         assert!(

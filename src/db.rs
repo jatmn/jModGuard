@@ -41,8 +41,10 @@ mod enrollments;
 pub use enrollments::*;
 mod configuration;
 mod known_bad_images;
+mod known_spam;
 pub use configuration::*;
 pub use known_bad_images::*;
+pub use known_spam::*;
 mod nickname_jobs;
 pub use nickname_jobs::*;
 mod gateway_ban_deliveries;
@@ -89,6 +91,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0021_clear_builtin_command_access.sql"),
     include_str!("../migrations/0022_clear_userinfo_command_rows.sql"),
     include_str!("../migrations/0023_ban_expiry.sql"),
+    include_str!("../migrations/0024_known_spam.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

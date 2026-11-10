@@ -268,27 +268,142 @@ fn verify_configuration_write(
 // rules
 // ---------------------------------------------------------------------------
 
+/// Old writers cannot run the new save guard. Until the next bot bootstrap
+/// repairs storage, readers expose the same replacement as that repair.
+/// This does not write, inherit global guidance, or change pre-marker reads.
+fn normalize_invite_description_for_read(id: &str, rule: &mut RuleDef, upgraded: bool) {
+    if upgraded && id == "invite" && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION {
+        rule.description = crate::defaults::INVITE_DESCRIPTION.into();
+    }
+}
+
+fn load_rule_rows_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    id: Option<&str>,
+) -> Result<Vec<(String, RuleDef)>> {
+    // Read the marker and rows in one statement, also on remote connections.
+    let mut sql = String::from(
+        "SELECT rule_id, data, EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
+         FROM rules WHERE guild_id = ?1",
+    );
+    let mut args: Vec<Value> = vec![guild_id.into()];
+    if let Some(id) = id {
+        sql.push_str(" AND rule_id = ?2");
+        args.push(id.to_owned().into());
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args), |row| {
+        Ok((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<bool>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json, upgraded) = row?;
+        let mut rule = read_json(&json, "rules")?;
+        normalize_invite_description_for_read(&id, &mut rule, upgraded);
+        out.push((id, rule));
+    }
+    Ok(out)
+}
+
 pub async fn list_rules(db: &Db, guild_id: i64) -> Result<Vec<(String, RuleDef)>> {
-    load_rows(db, guild_id, "rules", "rule_id", None).await
+    db.with_conn(move |conn| load_rule_rows_conn(conn, guild_id, None))
+        .await
 }
 
 pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<RuleDef>> {
-    let rows: Vec<(String, RuleDef)> =
-        load_rows(db, guild_id, "rules", "rule_id", Some(rule_id)).await?;
-    Ok(rows.into_iter().next().map(|(_, r)| r))
+    let id = rule_id.to_owned();
+    db.with_conn(move |conn| {
+        Ok(load_rule_rows_conn(conn, guild_id, Some(&id))?
+            .into_iter()
+            .next()
+            .map(|(_, rule)| rule))
+    })
+    .await
 }
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
     crate::image_spam::validate_rule(rule_id, rule)?;
-    upsert_row(
-        db,
-        "rules",
-        "guild_id, rule_id",
-        vec![guild_id.into(), rule_id.to_string().into()],
-        rule.clone(),
-        false,
-        None,
-    )
+    upsert_rule_row(db, guild_id, rule_id, rule, None)
+        .await
+        .map(|_| ())
+}
+
+/// Normalize only the obsolete shipped text, while holding the same writer
+/// transaction as bootstrap/save. Custom descriptions remain operator-owned.
+fn rule_json_for_save_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<String> {
+    if id == "invite"
+        && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION
+        && (meta_string_conn(conn, "invite_description_v1")?.is_some()
+            || conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'
+                 AND CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = ?2)",
+                params![guild_id, crate::defaults::INVITE_DESCRIPTION],
+                |r| Ok(r.get::<bool>(0)?),
+            )?)
+    {
+        let mut stored: Option<String> = conn
+            .query_row(
+                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
+                params![guild_id],
+                |r| Ok(r.get(0)?),
+            )
+            .optional()?;
+        if stored.is_none() && guild_id != GLOBAL_SCOPE {
+            // A first guild override inherits its parent's description.
+            stored = conn
+                .query_row(
+                    "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
+                    params![GLOBAL_SCOPE],
+                    |r| Ok(r.get(0)?),
+                )
+                .optional()?;
+        }
+        let stored = stored
+            .and_then(|json| serde_json::from_str::<RuleDef>(&json).ok())
+            .filter(|saved| saved.description != crate::defaults::OLD_INVITE_DESCRIPTION);
+        let mut rule = rule.clone();
+        rule.description = stored
+            .map(|saved| saved.description)
+            .unwrap_or_else(|| crate::defaults::INVITE_DESCRIPTION.into());
+        return Ok(serde_json::to_string(&rule)?);
+    }
+    Ok(serde_json::to_string(rule)?)
+}
+
+async fn upsert_rule_row(
+    db: &Db,
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+    expected: Option<ConfigurationWriteScope>,
+) -> Result<RuleDef> {
+    let id = id.to_owned();
+    let rule = rule.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
+        let saved = serde_json::from_str(&json)?;
+        tx.execute_rows(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+            params![guild_id, id, json],
+            1,
+        )?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()?;
+        Ok(saved)
+    })
     .await
 }
 
@@ -981,9 +1096,19 @@ async fn copy_guild_config_inner(
         }
 
         if wants("rules") {
+            // Copy stored source text so OLD still reaches the destination save
+            // guard, which may need to preserve the destination's custom guidance.
             let rows = load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)?;
             if src != dst {
-                let replacement = prepare_copied_rules(dst, rows)?;
+                let mut replacement = prepare_copied_rules(dst, rows)?;
+                // Normalize before deletion so the save guard can retain the
+                // target's stored description, under this same writer lock.
+                for (id, rule) in &mut replacement {
+                    if id == "invite" {
+                        *rule =
+                            serde_json::from_str(&rule_json_for_save_conn(&tx, dst, id, rule)?)?;
+                    }
+                }
                 tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 insert_copied_rules(dst, &replacement, |sql, args, rows| {
                     tx.execute_insert_batch(sql, params_from_iter(args), rows)
@@ -1126,6 +1251,7 @@ pub struct ConfigParts {
     pub log_filters: std::collections::HashMap<String, LogFilter>,
     pub badwords: Vec<String>,
     pub known_bad_images: Vec<KnownBadImage>,
+    pub known_spam: Vec<crate::known_spam::Entry>,
 }
 
 /// Raw and effective data needed by one WebUI config response. Every field is
@@ -1139,6 +1265,7 @@ pub struct WebConfigSnapshot {
     pub global_rules: std::collections::HashMap<String, RuleDef>,
     pub badwords: Vec<Badword>,
     pub known_bad_images: Vec<KnownBadImage>,
+    pub known_spam: Vec<crate::known_spam::Entry>,
     pub guild_commands: std::collections::HashMap<String, CommandDef>,
     pub global_commands: std::collections::HashMap<String, CommandDef>,
     pub guild_templates: std::collections::HashMap<String, String>,
@@ -1208,6 +1335,10 @@ SELECT
         'added_via', added_via, 'actor', actor, 'note', note))
      FROM (SELECT hash, added_at, added_via, actor, note FROM known_bad_images
            WHERE guild_id = ?1 ORDER BY hash LIMIT 1024))
+  ,(SELECT json_group_array(json_object('id',id,'guild_id',guild_id,'kind',kind,'value',value,'note',note))
+     FROM (SELECT id,guild_id,kind,value,note FROM known_spam
+           WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
+  ,EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1225,6 +1356,7 @@ struct ConfigurationSnapshotRows {
     guild_log_filters: std::collections::HashMap<String, LogFilter>,
     badwords: Vec<Badword>,
     known_bad_images: Vec<KnownBadImage>,
+    known_spam: Vec<crate::known_spam::Entry>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
 }
 
@@ -1308,6 +1440,14 @@ fn load_configuration_snapshot_conn(
                 }),
                 _ => None,
             };
+            let upgraded = row.get::<bool>(24)?;
+            let mut guild_rules = parse_json_encoded_map(row.get(7)?, "rules")?;
+            let mut global_rules = parse_json_encoded_map(row.get(8)?, "rules")?;
+            for rules in [&mut guild_rules, &mut global_rules] {
+                if let Some(invite) = rules.get_mut("invite") {
+                    normalize_invite_description_for_read("invite", invite, upgraded);
+                }
+            }
             Ok(ConfigurationSnapshotRows {
                 versions: VersionState {
                     config,
@@ -1318,8 +1458,8 @@ fn load_configuration_snapshot_conn(
                 defaults,
                 guild_settings_raw,
                 global_settings_raw,
-                guild_rules: parse_json_encoded_map(row.get(7)?, "rules")?,
-                global_rules: parse_json_encoded_map(row.get(8)?, "rules")?,
+                guild_rules,
+                global_rules,
                 guild_commands: parse_json_encoded_map(row.get(9)?, "commands")?,
                 global_commands: parse_json_encoded_map(row.get(10)?, "commands")?,
                 guild_templates: parse_json_map(row.get(11)?, "templates")?,
@@ -1331,6 +1471,7 @@ fn load_configuration_snapshot_conn(
                     row.get(22)?,
                     "known_bad_images",
                 )?),
+                known_spam: parse_json_vec(row.get(23)?, "known_spam")?,
                 nickname_reconcile,
             })
         },
@@ -1368,6 +1509,7 @@ impl ConfigurationSnapshotRows {
             global_rules: self.global_rules,
             badwords: self.badwords,
             known_bad_images: self.known_bad_images,
+            known_spam: self.known_spam,
             guild_commands: self.guild_commands,
             global_commands: self.global_commands,
             guild_templates: self.guild_templates,
@@ -1459,6 +1601,7 @@ impl ConfigurationSnapshotRows {
                 log_filters: self.guild_log_filters,
                 badwords,
                 known_bad_images: self.known_bad_images,
+                known_spam: self.known_spam,
             },
         )
     }
@@ -1596,21 +1739,12 @@ pub async fn upsert_enrolled_rule(
     scope: ConfigurationWriteScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     crate::image_spam::validate_rule(id, rule)?;
     if crate::custom_rules::is_custom_id(id) {
         return upsert_enrolled_custom_rule(db, scope, id, rule).await;
     }
-    upsert_row(
-        db,
-        "rules",
-        "guild_id, rule_id",
-        vec![scope.guild_id().into(), id.to_owned().into()],
-        rule.clone(),
-        false,
-        Some(scope),
-    )
-    .await
+    upsert_rule_row(db, scope.guild_id(), id, rule, Some(scope)).await
 }
 
 /// The global rule editor's save and override clear are one captured mutation.
@@ -1619,7 +1753,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     request: ConfigurationScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     anyhow::ensure!(
         request.guild_id() > 0,
         "override clearing requires a server"
@@ -1632,12 +1766,14 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     let global = ConfigurationWriteScope::new(request.clone(), ConfigurationScope::Global)?;
     let guild = ConfigurationWriteScope::new(request.clone(), request)?;
     let id = id.to_owned();
-    let json = serde_json::to_string(rule)?;
+    let rule = rule.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         global.verify_conn(&tx)?;
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
+        let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
+        let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
             "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, ?1, ?2)
              ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
@@ -1650,7 +1786,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(saved)
     })
     .await
 }
@@ -1660,7 +1796,7 @@ async fn upsert_enrolled_custom_rule(
     scope: ConfigurationWriteScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     let guild_id = scope.guild_id();
     let json = serde_json::to_string(rule)?;
     let id_owned = id.to_owned();
@@ -1690,7 +1826,7 @@ async fn upsert_enrolled_custom_rule(
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(rule)
     })
     .await
 }
@@ -1847,12 +1983,10 @@ pub async fn get_enrolled_rule(
     let id = id.to_owned();
     configuration_read(db, scope, move |tx, guild| {
         read_layers(guild, |g| {
-            Ok(
-                load_rows_conn::<RuleDef>(tx, g, "rules", "rule_id", Some(&id))?
-                    .into_iter()
-                    .next()
-                    .map(|(_, row)| row),
-            )
+            Ok(load_rule_rows_conn(tx, g, Some(&id))?
+                .into_iter()
+                .next()
+                .map(|(_, row)| row))
         })
     })
     .await

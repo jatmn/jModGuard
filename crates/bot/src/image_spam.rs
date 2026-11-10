@@ -3945,6 +3945,7 @@ mod tests {
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
             known_bad_hashes: BTreeSet::new(),
+            known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
         };
@@ -4516,7 +4517,7 @@ mod tests {
                 1,
                 "partial and completed enforcement must report its outcome"
             );
-            let report = reports[0]["content"].as_str().unwrap();
+            let report = crate::logging::tests::log_text(&reports[0]);
             if expected_bans == 0 {
                 assert!(report.contains("remaining actions skipped"), "{report}");
                 assert!(
@@ -7999,6 +8000,7 @@ mod tests {
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
             known_bad_hashes: BTreeSet::new(),
+            known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
         };

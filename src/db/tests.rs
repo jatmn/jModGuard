@@ -321,7 +321,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch_bounded("DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
+        conn.execute_batch_bounded("DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
         conn.execute_batch_bounded(
             "DROP INDEX idx_bans_expiry; ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;",
             64 * 1024 * 1024,
@@ -4325,6 +4325,1483 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
                 .is_none()
         );
     });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn builtin_form_params_validate_through_rule_saves() {
+    let tmp = tmp_db_path("builtin_form_params");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope =
+            ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+                .unwrap();
+        for id in ["mention_spam", "velocity", "invite"] {
+            let mut rule = get_rule(&db, 0, id).await.unwrap().unwrap();
+            let original = serde_json::to_value(&rule).unwrap();
+            let invalid = if id == "invite" {
+                vec![
+                    serde_json::json!("bad"),
+                    serde_json::json!(true),
+                    serde_json::json!({}),
+                    serde_json::json!(["ok", 42]),
+                    serde_json::json!(["ok", null]),
+                ]
+            } else {
+                vec![
+                    serde_json::json!(0),
+                    serde_json::json!(601),
+                    serde_json::json!(u64::MAX),
+                    serde_json::json!(-1),
+                    serde_json::json!(1.5),
+                    serde_json::json!("10"),
+                ]
+            };
+            let key = if id == "invite" {
+                "allowlist_codes"
+            } else {
+                "window_secs"
+            };
+            for value in invalid {
+                rule.params[key] = value;
+                let error = upsert_enrolled_rule(&db, scope.clone(), id, &rule)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(if id == "invite" {
+                        "array of strings"
+                    } else {
+                        "1–600 seconds"
+                    }),
+                    "{error}"
+                );
+                assert!(upsert_rule(&db, 0, id, &rule).await.is_err());
+                assert_eq!(
+                    serde_json::to_value(get_rule(&db, 0, id).await.unwrap().unwrap()).unwrap(),
+                    original
+                );
+            }
+            let valid = if id == "invite" {
+                vec![serde_json::json!([]), serde_json::json!(["code"])]
+            } else {
+                vec![serde_json::json!(1), serde_json::json!(600)]
+            };
+            for value in valid {
+                rule.params[key] = value;
+                upsert_enrolled_rule(&db, scope.clone(), id, &rule)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    get_rule(&db, 0, id).await.unwrap().unwrap().params,
+                    rule.params
+                );
+            }
+            // Missing legacy keys retain the runtime defaults (or empty invite list).
+            rule.params = serde_json::json!({});
+            upsert_enrolled_rule(&db, scope.clone(), id, &rule)
+                .await
+                .unwrap();
+        }
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_upgrade_is_exact_and_once() {
+    use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
+    let tmp = tmp_db_path("invite_description_upgrade");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM meta WHERE key = 'invite_description_v1'",
+            (),
+            64 * 1024 * 1024,
+        )?;
+        let mut rule = crate::defaults::default_rules()
+            .into_iter()
+            .find(|r| r.name == "Invite links")
+            .unwrap();
+        rule.enabled = false;
+        rule.params = serde_json::json!({"allowlist_guilds": ["123"], "operator_key": true});
+        for guild in [0, 123, 456] {
+            rule.description = if guild == 456 {
+                "My custom invite guidance"
+            } else {
+                OLD
+            }
+            .into();
+            conn.execute_bounded(
+                "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                params![guild, serde_json::to_string(&rule)?],
+                64 * 1024 * 1024,
+            )?;
+        }
+        Ok(())
+    }))
+    .unwrap();
+    let before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let current = crate::defaults::default_rules()
+        .into_iter()
+        .find(|r| r.name == "Invite links")
+        .unwrap();
+    for guild in [0, 123, 456] {
+        let rule = tokio_test_block_on(get_rule(&db, guild, "invite"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rule.description,
+            if guild == 456 {
+                "My custom invite guidance"
+            } else {
+                &current.description
+            }
+        );
+        assert!(!rule.enabled);
+        assert_eq!(
+            rule.params,
+            serde_json::json!({"allowlist_guilds": ["123"], "operator_key": true})
+        );
+        assert_eq!(
+            serde_json::to_value(rule.actions).unwrap(),
+            serde_json::to_value(&current.actions).unwrap()
+        );
+    }
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        before + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before
+    );
+    // A custom description saved after migration stays operator-owned.
+    tokio_test_block_on(async {
+        let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        rule.description = "My post-upgrade custom wording".into();
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+    });
+    let after = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_rule(&db, 0, "invite"))
+            .unwrap()
+            .unwrap()
+            .description,
+        "My post-upgrade custom wording"
+    );
+    assert_eq!(tokio_test_block_on(get_config_version(&db)).unwrap(), after);
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+// Read storage directly so effective read normalization cannot hide a missing repair.
+async fn stored_rule_json(db: &Db, guild: i64, id: &str) -> serde_json::Value {
+    let id = id.to_owned();
+    db.with_conn(move |conn| {
+        let json: String = conn.query_row(
+            "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = ?2",
+            params![guild, id],
+            |row| Ok(row.get(0)?),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    })
+    .await
+    .unwrap()
+}
+
+async fn old_writer_rule(db: &Db, guild: i64, id: &str, json: serde_json::Value) {
+    let id = id.to_owned();
+    db.with_conn(move |conn| {
+        // Model an older binary: deliberately bypass the new save/copy guard.
+        conn.execute_rows(
+            "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+            params![guild, id, serde_json::to_string(&json)?],
+            1,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn invite_description_reapplies_after_old_writer_and_marker() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    let tmp = tmp_db_path("invite_reapply");
+    let mut db = Db::open(&tmp, 2).unwrap();
+    for round in 0..2 {
+        let mut expected = Vec::new();
+        tokio_test_block_on(async {
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let base = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            for (guild, description) in [
+                (0, OLD),
+                (123, OLD),
+                (456, "Custom guidance"),
+                (789, CURRENT),
+                (999, &format!("{OLD} ")),
+            ] {
+                let mut json = serde_json::to_value(&base).unwrap();
+                json["description"] = serde_json::json!(description);
+                json["enabled"] = serde_json::json!(false);
+                json["params"] = serde_json::json!({"operator_key": round});
+                json["actions"][0]["reason"] = serde_json::json!("Preserved action");
+                json["whitelist_users"] = serde_json::json!([12345]);
+                json["future_field"] = serde_json::json!({"preserved": true});
+                old_writer_rule(&db, guild, "invite", json.clone()).await;
+                if description == OLD {
+                    json["description"] = serde_json::json!(CURRENT);
+                }
+                expected.push((guild, "invite", json));
+            }
+            let mut other = serde_json::to_value(&base).unwrap();
+            other["description"] = serde_json::json!(OLD);
+            old_writer_rule(&db, 123, "velocity", other.clone()).await;
+            expected.push((123, "velocity", other));
+        });
+        let before = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+        drop(db);
+        db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            for (guild, id, json) in &expected {
+                assert_eq!(
+                    stored_rule_json(&db, *guild, id).await,
+                    *json,
+                    "round {round}, {guild}/{id}"
+                );
+            }
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, before.config + 1);
+            assert_ne!(after.config_revision, before.config_revision);
+            assert_eq!(after.slash, before.slash);
+            assert_eq!(after.slash_revision, before.slash_revision);
+        });
+        let repaired = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+        drop(db);
+        db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            for (guild, id, json) in &expected {
+                assert_eq!(stored_rule_json(&db, *guild, id).await, *json);
+            }
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, repaired.config);
+            assert_eq!(after.config_revision, repaired.config_revision);
+            assert_eq!(after.slash, repaired.slash);
+            assert_eq!(after.slash_revision, repaired.slash_revision);
+        });
+    }
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_old_writer_reads_are_marker_gated_without_restart() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    let tmp = tmp_db_path("invite_old_writer_reads");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope = ConfigurationScope::Guild(enroll_guild(&db, 123, 100).await.unwrap().unwrap());
+        let base = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        for marker in [false, true] {
+            db.with_conn(move |conn| {
+                conn.execute_reclaim("DELETE FROM meta WHERE key = 'invite_description_v1'", ())?;
+                if marker {
+                    write_meta_string_conn(conn, "invite_description_v1", "1")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            // Repeat old writes and reads on the same open process.
+            for _ in 0..2 {
+                for description in [OLD, CURRENT, "Custom guidance", &format!("{OLD} ")] {
+                    let mut rule = base.clone();
+                    rule.description = description.into();
+                    rule.enabled = false;
+                    rule.params = serde_json::json!({"allowlist_codes": ["keep-code"]});
+                    rule.actions[0].reason = "Preserved action".into();
+                    rule.whitelist_users = vec![12345];
+                    let stored = serde_json::to_value(&rule).unwrap();
+                    for guild in [0, 123] {
+                        old_writer_rule(&db, guild, "invite", stored.clone()).await;
+                        old_writer_rule(&db, guild, "velocity", stored.clone()).await;
+                    }
+                    let before = get_primary_versions(&db).await.unwrap();
+                    if marker && description == OLD {
+                        rule.description = CURRENT.into();
+                    }
+                    let expected = serde_json::to_value(&rule).unwrap();
+                    for guild in [0, 123] {
+                        assert_eq!(
+                            serde_json::to_value(
+                                get_rule(&db, guild, "invite").await.unwrap().unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        let rows = list_rules(&db, guild).await.unwrap();
+                        let invite = rows.iter().find(|(id, _)| id == "invite").unwrap();
+                        assert_eq!(serde_json::to_value(&invite.1).unwrap(), expected);
+                        assert_eq!(
+                            serde_json::to_value(
+                                get_rule(&db, guild, "velocity").await.unwrap().unwrap()
+                            )
+                            .unwrap(),
+                            stored
+                        );
+                        assert_eq!(
+                            stored_rule_json(&db, guild, "invite").await,
+                            stored,
+                            "reads must not write"
+                        );
+                        let parts = load_config_parts(&db, guild).await.unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&parts.rules["invite"]).unwrap(),
+                            expected
+                        );
+                        let target = if guild == 0 {
+                            ConfigurationScope::Global
+                        } else {
+                            scope.clone()
+                        };
+                        let layers = get_enrolled_rule(&db, target.clone(), "invite")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(layers.guild.unwrap()).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(layers.global.unwrap()).unwrap(),
+                            expected
+                        );
+                        let snapshot = load_enrolled_web_config_snapshot(&db, target)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.guild_rules["invite"]).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.global_rules["invite"]).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.guild_rules["velocity"]).unwrap(),
+                            stored
+                        );
+                    }
+                    let after = get_primary_versions(&db).await.unwrap();
+                    assert_eq!(after.config, before.config);
+                    assert_eq!(after.config_revision, before.config_revision);
+                    assert_eq!(after.slash, before.slash);
+                    assert_eq!(after.slash_revision, before.slash_revision);
+                }
+            }
+        }
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+// Exercise every built-in rule-save entry point used by callers/control dispatch.
+async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
+    let guild = ConfigurationScope::Guild(guild_enrollment(db, 123).await.unwrap().unwrap());
+    match mode {
+        "direct-global" => upsert_rule(db, 0, "invite", rule).await.unwrap(),
+        "direct-guild" => upsert_rule(db, 123, "invite", rule).await.unwrap(),
+        "enrolled-global" | "enrolled-guild" | "new-override" => {
+            let target = if mode == "enrolled-global" {
+                ConfigurationScope::Global
+            } else {
+                guild.clone()
+            };
+            upsert_enrolled_rule(
+                db,
+                ConfigurationWriteScope::new(guild, target).unwrap(),
+                "invite",
+                rule,
+            )
+            .await
+            .unwrap();
+        }
+        "global-clear" => {
+            upsert_global_rule_and_clear_enrolled_override(db, guild, "invite", rule)
+                .await
+                .unwrap();
+        }
+        _ => panic!("unknown save fixture"),
+    }
+}
+
+const INVITE_SAVE_MODES: [&str; 6] = [
+    "direct-global",
+    "direct-guild",
+    "enrolled-global",
+    "enrolled-guild",
+    "new-override",
+    "global-clear",
+];
+
+#[test]
+fn invite_description_stale_save_survives_upgrade_and_reopen() {
+    use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_stale_save");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            db.with_conn(|conn| {
+                conn.execute_bounded(
+                    "DELETE FROM meta WHERE key = 'invite_description_v1'", (), 1024,
+                )?;
+                let mut rule = crate::defaults::default_rules()
+                    .into_iter().find(|r| r.name == "Invite links").unwrap();
+                rule.description = OLD.into();
+                for guild in [0, 123] {
+                    conn.execute_bounded(
+                        "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                        params![guild, serde_json::to_string(&rule)?], 64 * 1024,
+                    )?;
+                }
+                Ok(())
+            }).await.unwrap();
+        });
+        // The editor loads before the bot's one-time bootstrap upgrade.
+        let mut stale = tokio_test_block_on(get_rule(&db, 123, "invite"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.description, OLD);
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        let current = tokio_test_block_on(get_rule(&db, 0, "invite"))
+            .unwrap()
+            .unwrap()
+            .description;
+        assert_ne!(current, OLD);
+        stale.enabled = false;
+        stale.params = serde_json::json!({"allowlist_codes": ["kept-code"]});
+        stale.actions[0].reason = "Operator's changed action".into();
+        let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+            0
+        } else {
+            123
+        };
+        tokio_test_block_on(async {
+            if mode == "new-override" {
+                delete_rule(&db, 123, "invite").await.unwrap();
+            }
+            save_invite_fixture(&db, mode, &stale).await;
+            let saved = get_rule(&db, target, "invite").await.unwrap().unwrap();
+            assert_eq!(saved.description, current, "{mode}");
+            let mut expected = stale.clone();
+            expected.description = current.clone();
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            if mode == "global-clear" {
+                assert!(get_rule(&db, 123, "invite").await.unwrap().is_none());
+            }
+        });
+        let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        assert_eq!(
+            tokio_test_block_on(get_rule(&db, target, "invite"))
+                .unwrap()
+                .unwrap()
+                .description,
+            current,
+            "{mode}"
+        );
+        assert_eq!(
+            tokio_test_block_on(get_config_version(&db)).unwrap(),
+            version
+        );
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn invite_description_stale_save_retains_post_upgrade_custom_guidance() {
+    use crate::defaults::OLD_INVITE_DESCRIPTION;
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_stale_custom");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut old = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            old.description = OLD_INVITE_DESCRIPTION.into();
+            db.with_conn(move |conn| {
+                conn.execute_bounded("DELETE FROM meta WHERE key = 'invite_description_v1'", (), 1024)?;
+                for guild in [0, 123] {
+                    conn.execute_bounded(
+                        "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                        params![guild, serde_json::to_string(&old)?], 64 * 1024,
+                    )?;
+                }
+                Ok(())
+            }).await.unwrap();
+        });
+        let mut stale = tokio_test_block_on(get_rule(&db, 123, "invite"))
+            .unwrap()
+            .unwrap();
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let mut custom = stale.clone();
+            custom.description = "Post-upgrade operator guidance".into();
+            save_invite_fixture(&db, mode, &custom).await;
+            stale.enabled = false;
+            stale.params = serde_json::json!({"allowlist_codes": ["kept-code"]});
+            stale.actions[0].reason = "Changed stale action".into();
+            save_invite_fixture(&db, mode, &stale).await;
+            let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+                0
+            } else {
+                123
+            };
+            let saved = get_rule(&db, target, "invite").await.unwrap().unwrap();
+            let mut expected = stale.clone();
+            expected.description = custom.description;
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn invite_description_save_preserves_custom_and_current_on_fresh_install() {
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_description_save_edges");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            let current = rule.description.clone();
+            let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+                0
+            } else {
+                123
+            };
+            // No upgrade was needed: a fresh install already has the current text.
+            for description in [
+                current.as_str(),
+                "My custom invite guidance",
+                current.as_str(),
+            ] {
+                rule.description = description.into();
+                save_invite_fixture(&db, mode, &rule).await;
+                assert_eq!(
+                    get_rule(&db, target, "invite")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .description,
+                    description,
+                    "{mode}"
+                );
+            }
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn invite_description_save_guard_is_exact_and_checks_stored_text_without_marker() {
+    use crate::defaults::{INVITE_DESCRIPTION, OLD_INVITE_DESCRIPTION};
+    let tmp = tmp_db_path("invite_description_guard");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM meta WHERE key = 'invite_description_v1'",
+                (),
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // A row already holding the upgraded text is protected even without the marker.
+        rule.description = OLD_INVITE_DESCRIPTION.into();
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            INVITE_DESCRIPTION
+        );
+        // A pre-upgrade/new row without the marker is not silently migrated by saves.
+        upsert_rule(&db, 123, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 123, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            OLD_INVITE_DESCRIPTION
+        );
+        db.with_conn(|conn| write_meta_string_conn(conn, "invite_description_v1", "1"))
+            .await
+            .unwrap();
+        // Neither a near-match string nor another rule ID is the obsolete shipped default.
+        rule.description = format!("{OLD_INVITE_DESCRIPTION} ");
+        upsert_rule(&db, 0, "invite", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "invite")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            rule.description
+        );
+        rule.description = OLD_INVITE_DESCRIPTION.into();
+        upsert_rule(&db, 0, "velocity", &rule).await.unwrap();
+        assert_eq!(
+            get_rule(&db, 0, "velocity")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            OLD_INVITE_DESCRIPTION
+        );
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_first_override_inherits_global_on_stale_save() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (global, stored, incoming, target, expected) in [
+                (Some("Global guidance"), None, OLD, 123, "Global guidance"),
+                // A blank global is inherited, as for a guild without an override.
+                (Some(""), None, OLD, 123, ""),
+                (Some(" \t "), None, OLD, 123, " \t "),
+                (Some(CURRENT), None, OLD, 123, CURRENT),
+                (None, None, OLD, 123, CURRENT),
+                (Some(OLD), None, OLD, 123, CURRENT),
+                (
+                    Some("Global guidance"),
+                    Some("Guild guidance"),
+                    OLD,
+                    123,
+                    "Guild guidance",
+                ),
+                (Some("Global guidance"), Some(OLD), OLD, 123, CURRENT),
+                (
+                    Some("Global guidance"),
+                    None,
+                    "New guidance",
+                    123,
+                    "New guidance",
+                ),
+                (Some("Global guidance"), None, CURRENT, 123, CURRENT),
+                (Some("Global guidance"), None, OLD, 0, "Global guidance"),
+                (None, None, OLD, 0, CURRENT),
+            ] {
+                let tmp = tmp_db_path("invite_first_override_save");
+                let db = Db::open(&tmp, 2).unwrap();
+                let guild =
+                    ConfigurationScope::Guild(enroll_guild(&db, 123, 100).await.unwrap().unwrap());
+                let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+                let global_json = global.map(|description| {
+                    let mut global = rule.clone();
+                    global.description = description.into();
+                    serde_json::to_string(&global).unwrap()
+                });
+                let stored_json = stored.map(|description| {
+                    let mut stored = rule.clone();
+                    stored.description = description.into();
+                    serde_json::to_string(&stored).unwrap()
+                });
+                db.with_conn(move |conn| {
+                    write_meta_string_conn(conn, "invite_description_v1", "1")?;
+                    conn.execute_reclaim(
+                        "DELETE FROM rules WHERE rule_id = 'invite' AND guild_id IN (0, 123)",
+                        (),
+                    )?;
+                    for (guild_id, json) in [(0, global_json), (123, stored_json)] {
+                        if let Some(json) = json {
+                            conn.execute_rows(
+                                "INSERT INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                                params![guild_id, json],
+                                1,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }).await.unwrap();
+                assert_eq!(
+                    get_rule(&db, 123, "invite").await.unwrap().is_some(),
+                    stored.is_some()
+                );
+                rule.description = incoming.into();
+                rule.enabled = false;
+                rule.params = serde_json::json!({"allowlist_codes": ["kept-code"]});
+                rule.actions[0].reason = "Stale editor action".into();
+                rule.whitelist_users = vec![12345];
+                let mut expected_rule = rule.clone();
+                expected_rule.description = expected.into();
+                let expected_json = serde_json::to_value(expected_rule).unwrap();
+                let target_scope = if target == 0 {
+                    ConfigurationScope::Global
+                } else {
+                    guild.clone()
+                };
+                let before = get_primary_versions(&db).await.unwrap();
+                match mode {
+                    "direct" => upsert_rule(&db, target, "invite", &rule).await.unwrap(),
+                    "enrolled" => {
+                        let saved = upsert_enrolled_rule(
+                            &db,
+                            ConfigurationWriteScope::new(guild, target_scope).unwrap(),
+                            "invite",
+                            &rule,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(serde_json::to_value(saved).unwrap(), expected_json);
+                    }
+                    "control" => {
+                        let reply = apply_control(
+                            &db,
+                            None,
+                            ControlOp::UpsertRule {
+                                request: guild.to_wire(),
+                                target: target_scope.to_wire(),
+                                id: "invite".into(),
+                                rule,
+                                clear_guild_override: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        match reply {
+                            ControlReply::Saved { body } => assert_eq!(body, expected_json),
+                            reply => panic!("unexpected save reply: {reply:?}"),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let saved = get_rule(&db, target, "invite").await.unwrap().unwrap();
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    expected_json,
+                    "{mode}, global={global:?}, stored={stored:?}, incoming={incoming}, target={target}"
+                );
+                let after = get_primary_versions(&db).await.unwrap();
+                assert_eq!(after.config, before.config + 1);
+                assert_ne!(after.config_revision, before.config_revision);
+                assert_eq!(after.slash, before.slash);
+                assert_eq!(after.slash_revision, before.slash_revision);
+                drop(db);
+                cleanup_db(&tmp);
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_first_override_copy_inherits_global_like_save() {
+    use crate::defaults::OLD_INVITE_DESCRIPTION;
+    // A blank global is inherited by copies as well as saves.
+    let cases = ["direct", "enrolled", "control"]
+        .into_iter()
+        .flat_map(|mode| {
+            ["Inherited global copy guidance", "", " \t "].map(|global| (mode, global))
+        });
+    tokio_test_block_on(async {
+        for (mode, global_description) in cases {
+            let tmp = tmp_db_path("invite_first_override_copy");
+            let db = Db::open(&tmp, 2).unwrap();
+            let source =
+                ConfigurationScope::Guild(enroll_guild(&db, 10, 100).await.unwrap().unwrap());
+            let destination =
+                ConfigurationScope::Guild(enroll_guild(&db, 20, 100).await.unwrap().unwrap());
+            let mut global = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            global.description = global_description.into();
+            upsert_rule(&db, 0, "invite", &global).await.unwrap();
+            let mut stale = global.clone();
+            stale.description = OLD_INVITE_DESCRIPTION.into();
+            stale.enabled = false;
+            stale.params = serde_json::json!({"allowlist_codes": ["source-code"]});
+            stale.actions[0].reason = "Copied stale action".into();
+            stale.whitelist_users = vec![12345];
+            let source_json = serde_json::to_value(&stale).unwrap();
+            db.with_conn(move |conn| {
+                write_meta_string_conn(conn, "invite_description_v1", "1")?;
+                conn.execute_rows(
+                    "INSERT INTO rules(guild_id, rule_id, data) VALUES (10, 'invite', ?1)",
+                    params![serde_json::to_string(&stale)?],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(get_rule(&db, 20, "invite").await.unwrap().is_none());
+            let before = get_primary_versions(&db).await.unwrap();
+            let sections = vec!["rules".into()];
+            let ack = match mode {
+                "direct" => {
+                    serde_json::to_value(copy_guild_config(&db, 10, 20, sections).await.unwrap())
+                        .unwrap()
+                }
+                "enrolled" => serde_json::to_value(
+                    copy_enrolled_guild_config(&db, source.clone(), destination.clone(), sections)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
+                "control" => match apply_control(
+                    &db,
+                    None,
+                    ControlOp::CopyGuildConfig {
+                        source: source.to_wire(),
+                        destination: destination.to_wire(),
+                        sections,
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                {
+                    ControlReply::Saved { body } => body,
+                    reply => panic!("unexpected copy reply: {reply:?}"),
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                ack,
+                serde_json::json!({
+                    "copied": ["rules"], "skipped_badwords": 0, "skipped_logchannels": false,
+                })
+            );
+            let mut expected = source_json.clone();
+            expected["description"] = serde_json::json!(global.description);
+            assert_eq!(
+                serde_json::to_value(get_rule(&db, 20, "invite").await.unwrap().unwrap()).unwrap(),
+                expected,
+                "{mode}, global={global_description:?}"
+            );
+            assert_eq!(stored_rule_json(&db, 10, "invite").await, source_json);
+            // Direct saves and copies must resolve the same inherited description.
+            // Submit the stored stale rule, rather than its normalized read view.
+            let stale = serde_json::from_value(source_json).unwrap();
+            upsert_rule(&db, 30, "invite", &stale).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(get_rule(&db, 30, "invite").await.unwrap().unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_value(get_rule(&db, 0, "invite").await.unwrap().unwrap()).unwrap(),
+                serde_json::to_value(global).unwrap()
+            );
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, before.config + 2);
+            assert_eq!(after.slash, before.slash);
+            assert_eq!(after.slash_revision, before.slash_revision);
+            drop(db);
+            cleanup_db(&tmp);
+        }
+    });
+}
+
+// Run one copy through a public copy API or the dashboard's control dispatch.
+async fn copy_rules_fixture(
+    db: &Db,
+    mode: &str,
+    source: &ConfigurationScope,
+    destination: &ConfigurationScope,
+    sections: Vec<String>,
+) -> Result<serde_json::Value> {
+    Ok(match mode {
+        "direct" => serde_json::to_value(
+            copy_guild_config(db, source.guild_id(), destination.guild_id(), sections).await?,
+        )?,
+        "enrolled" => serde_json::to_value(
+            copy_enrolled_guild_config(db, source.clone(), destination.clone(), sections).await?,
+        )?,
+        "control" => match apply_control(
+            db,
+            None,
+            ControlOp::CopyGuildConfig {
+                source: source.to_wire(),
+                destination: destination.to_wire(),
+                sections,
+            },
+            None,
+        )
+        .await?
+        {
+            ControlReply::Saved { body } => body,
+            reply => panic!("unexpected copy reply: {reply:?}"),
+        },
+        _ => panic!("unknown copy fixture"),
+    })
+}
+
+// Exercise both public copy APIs and the dashboard's control dispatch, including
+// global sources/targets. Expected text is supplied independently of the guard.
+async fn assert_invite_copy_case(
+    mode: &str,
+    src: i64,
+    dst: i64,
+    description: &str,
+    stored: Option<&str>,
+    marker: bool,
+    expected_description: &str,
+) {
+    let tmp = tmp_db_path("invite_copy");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut scopes = Vec::new();
+    for guild in [src, dst] {
+        scopes.push(if guild == 0 {
+            ConfigurationScope::Global
+        } else {
+            ConfigurationScope::Guild(enroll_guild(&db, guild, 100).await.unwrap().unwrap())
+        });
+    }
+    let mut invite = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+    invite.description = description.into();
+    invite.enabled = false;
+    invite.params = serde_json::json!({"allowlist_codes": ["source-code"]});
+    invite.actions[0].reason = "Copied action reason".into();
+    invite.whitelist_users = vec![12345];
+    let mut other = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+    // Exact obsolete text on another built-in must not trigger normalization.
+    other.description = crate::defaults::OLD_INVITE_DESCRIPTION.into();
+    let mut rows = vec![
+        ("invite".to_owned(), invite.clone()),
+        ("velocity".into(), other),
+    ];
+    if src != 0 && dst != 0 {
+        let mut custom = invite.clone();
+        custom.name = "Custom pattern".into();
+        custom.description = crate::defaults::OLD_INVITE_DESCRIPTION.into();
+        custom.dry_run = true; // Existing create admission also requires dry-run.
+        custom.actions.truncate(1);
+        custom.params = serde_json::json!({"kind": "pattern", "pattern": "scam"});
+        rows.push(("custom:0123456789abcdef".into(), custom));
+    }
+    let source_rows = rows.clone();
+    let stored = stored.map(|description| {
+        let mut rule = invite.clone();
+        rule.description = description.into();
+        rule
+    });
+    db.with_conn(move |conn| {
+        conn.execute_reclaim(
+            "DELETE FROM rules WHERE guild_id IN (?1, ?2)",
+            params![src, dst],
+        )?;
+        conn.execute_reclaim("DELETE FROM meta WHERE key = 'invite_description_v1'", ())?;
+        if marker {
+            write_meta_string_conn(conn, "invite_description_v1", "1")?;
+        }
+        for (id, rule) in source_rows {
+            conn.execute_rows(
+                "INSERT INTO rules(guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+                params![src, id, serde_json::to_string(&rule)?],
+                1,
+            )?;
+        }
+        if let Some(rule) = stored {
+            conn.execute_rows(
+                "INSERT INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                params![dst, serde_json::to_string(&rule)?],
+                1,
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let before = get_primary_versions(&db).await.unwrap();
+    let ack = copy_rules_fixture(&db, mode, &scopes[0], &scopes[1], vec!["rules".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        ack,
+        serde_json::json!({
+            "copied": ["rules"], "skipped_badwords": 0, "skipped_logchannels": false,
+        })
+    );
+    let after = get_primary_versions(&db).await.unwrap();
+    assert_eq!(after.config, before.config + 1);
+    assert_ne!(after.config_revision, before.config_revision);
+    assert_eq!(after.slash, before.slash);
+    assert_eq!(after.slash_revision, before.slash_revision);
+    assert_eq!(list_rules(&db, dst).await.unwrap().len(), rows.len());
+    for (id, source) in rows {
+        let saved = get_rule(&db, dst, &id).await.unwrap().unwrap();
+        let mut expected = source.clone();
+        if id == "invite" {
+            expected.description = expected_description.into();
+        }
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "{mode} {src}->{dst} {id}, marker={marker}, source={description}"
+        );
+        assert_eq!(
+            stored_rule_json(&db, src, &id).await,
+            serde_json::to_value(source).unwrap(),
+            "copy must not rewrite the source"
+        );
+    }
+    db.with_conn(move |conn| {
+        assert_eq!(
+            meta_string_conn(conn, "invite_description_v1")?.is_some(),
+            marker
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_copy_guards_old_text_using_target_row() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                for (stored, expected) in [
+                    (None, CURRENT),
+                    (Some(OLD), CURRENT),
+                    (Some(CURRENT), CURRENT),
+                    (Some("Target custom guidance"), "Target custom guidance"),
+                ] {
+                    assert_invite_copy_case(mode, src, dst, OLD, stored, true, expected).await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_preserves_custom_current_and_near_match() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                for description in ["Source custom guidance", CURRENT, &format!("{OLD} ")] {
+                    assert_invite_copy_case(
+                        mode,
+                        src,
+                        dst,
+                        description,
+                        Some("Target custom guidance"),
+                        true,
+                        description,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_without_marker_matches_save_semantics() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
+                // Fresh/current target is protected without a migration marker;
+                // missing, old and custom pre-upgrade targets still accept OLD.
+                for (stored, expected) in [
+                    (Some(CURRENT), CURRENT),
+                    (None, OLD),
+                    (Some(OLD), OLD),
+                    (Some("Pre-upgrade custom guidance"), OLD),
+                ] {
+                    assert_invite_copy_case(mode, src, dst, OLD, stored, false, expected).await;
+                }
+                assert_invite_copy_case(mode, src, dst, CURRENT, None, false, CURRENT).await;
+                assert_invite_copy_case(
+                    mode,
+                    src,
+                    dst,
+                    "Source custom guidance",
+                    None,
+                    false,
+                    "Source custom guidance",
+                )
+                .await;
+            }
+        }
+    });
+}
+
+async fn stale_invite_rule(db: &Db) -> RuleDef {
+    let mut rule = get_rule(db, 0, "invite").await.unwrap().unwrap();
+    rule.description = crate::defaults::OLD_INVITE_DESCRIPTION.into();
+    rule.enabled = false;
+    rule.params = serde_json::json!({"allowlist_codes": ["source-code"]});
+    rule.actions[0].reason = "Copied stale action".into();
+    rule
+}
+
+// Store rows directly so neither the save guard nor read normalization runs.
+async fn write_raw_rules(db: &Db, marker: bool, rows: Vec<(i64, &'static str, String)>) {
+    db.with_conn(move |conn| {
+        conn.execute_reclaim("DELETE FROM meta WHERE key = 'invite_description_v1'", ())?;
+        if marker {
+            write_meta_string_conn(conn, "invite_description_v1", "1")?;
+        }
+        for (guild, id, data) in rows {
+            conn.execute_bounded(
+                "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+                params![guild, id, data],
+                64 * 1024,
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn invite_description_copy_rolls_back_after_destination_delete() {
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            let tmp = tmp_db_path("invite_copy_rollback");
+            let db = Db::open(&tmp, 2).unwrap();
+            let source =
+                ConfigurationScope::Guild(enroll_guild(&db, 10, 100).await.unwrap().unwrap());
+            let destination =
+                ConfigurationScope::Guild(enroll_guild(&db, 20, 100).await.unwrap().unwrap());
+            let stale = stale_invite_rule(&db).await;
+            let mut target = stale.clone();
+            target.description = "Target custom guidance".into();
+            target.enabled = true;
+            let mut velocity = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+            velocity.description = "Target velocity guidance".into();
+            write_raw_rules(
+                &db,
+                true,
+                vec![
+                    (10, "invite", serde_json::to_string(&stale).unwrap()),
+                    (20, "invite", serde_json::to_string(&target).unwrap()),
+                    (20, "velocity", serde_json::to_string(&velocity).unwrap()),
+                ],
+            )
+            .await;
+            // No source pattern is enforceable, so the badwords section fails after
+            // the rules section has deleted and replaced the destination rows.
+            db.with_conn(|conn| {
+                conn.execute_bounded(
+                    "INSERT INTO badwords (guild_id, pattern, note) VALUES (10, ?1, NULL)",
+                    params![r"\w{100000}"],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let sections = || vec!["rules".to_owned(), "badwords".to_owned()];
+            let before = get_primary_versions(&db).await.unwrap();
+            let error = copy_rules_fixture(&db, mode, &source, &destination, sections())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("badwords copy refused"),
+                "{mode}: {error:#}"
+            );
+            assert_eq!(list_rules(&db, 20).await.unwrap().len(), 2, "{mode}");
+            assert_eq!(
+                stored_rule_json(&db, 20, "invite").await,
+                serde_json::to_value(&target).unwrap(),
+                "{mode}"
+            );
+            assert_eq!(
+                stored_rule_json(&db, 20, "velocity").await,
+                serde_json::to_value(&velocity).unwrap(),
+                "{mode}"
+            );
+            assert_eq!(
+                stored_rule_json(&db, 10, "invite").await,
+                serde_json::to_value(&stale).unwrap()
+            );
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, before.config);
+            assert_eq!(after.config_revision, before.config_revision);
+            assert_eq!(after.slash, before.slash);
+            assert_eq!(after.slash_revision, before.slash_revision);
+
+            // With an enforceable pattern the same copy commits its DELETE and
+            // keeps the target's guidance through the save guard.
+            db.with_conn(|conn| {
+                conn.execute_reclaim("DELETE FROM badwords WHERE guild_id = 10", ())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            crate::db::add_badword(&db, 10, "scam", None).await.unwrap();
+            let before = get_primary_versions(&db).await.unwrap();
+            copy_rules_fixture(&db, mode, &source, &destination, sections())
+                .await
+                .unwrap();
+            let mut expected = stale.clone();
+            expected.description = target.description.clone();
+            assert_eq!(
+                list_rules(&db, 20).await.unwrap().len(),
+                1,
+                "{mode}: velocity row must be deleted"
+            );
+            assert_eq!(
+                stored_rule_json(&db, 20, "invite").await,
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+            assert_eq!(
+                get_primary_versions(&db).await.unwrap().config,
+                before.config + 1
+            );
+            drop(db);
+            cleanup_db(&tmp);
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_replaces_malformed_destination_row() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    tokio_test_block_on(async {
+        for mode in ["direct", "enrolled", "control"] {
+            for src in [10, 0] {
+                // The guard cannot read a malformed target. With the marker it uses
+                // the shipped text; without it the gate stays off and OLD is copied.
+                for (marker, expected) in [(true, CURRENT), (false, OLD)] {
+                    let tmp = tmp_db_path("invite_copy_malformed");
+                    let db = Db::open(&tmp, 2).unwrap();
+                    let source = if src == 0 {
+                        ConfigurationScope::Global
+                    } else {
+                        ConfigurationScope::Guild(
+                            enroll_guild(&db, src, 100).await.unwrap().unwrap(),
+                        )
+                    };
+                    let destination = ConfigurationScope::Guild(
+                        enroll_guild(&db, 20, 100).await.unwrap().unwrap(),
+                    );
+                    let stale = stale_invite_rule(&db).await;
+                    write_raw_rules(
+                        &db,
+                        marker,
+                        vec![
+                            (src, "invite", serde_json::to_string(&stale).unwrap()),
+                            (20, "invite", "{not json".into()),
+                        ],
+                    )
+                    .await;
+                    let ack =
+                        copy_rules_fixture(&db, mode, &source, &destination, vec!["rules".into()])
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        ack,
+                        serde_json::json!({
+                            "copied": ["rules"], "skipped_badwords": 0, "skipped_logchannels": false,
+                        })
+                    );
+                    let mut want = serde_json::to_value(&stale).unwrap();
+                    want["description"] = serde_json::json!(expected);
+                    assert_eq!(
+                        stored_rule_json(&db, 20, "invite").await,
+                        want,
+                        "{mode} src={src} marker={marker}"
+                    );
+                    assert_eq!(
+                        stored_rule_json(&db, src, "invite").await,
+                        serde_json::to_value(&stale).unwrap()
+                    );
+                    drop(db);
+                    cleanup_db(&tmp);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn invite_description_copy_persists_after_reopen() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    // Without the marker, copied OLD stays until the next bot bootstrap upgrades
+    // it: the marker remains the only upgrade trigger (#510).
+    for (marker, stored, copied, reopened) in [
+        (
+            true,
+            Some("Target custom guidance"),
+            "Target custom guidance",
+            "Target custom guidance",
+        ),
+        (true, None, CURRENT, CURRENT),
+        (false, None, OLD, CURRENT),
+    ] {
+        let tmp = tmp_db_path("invite_copy_reopen");
+        let db = Db::open(&tmp, 2).unwrap();
+        let (destination, stale) = tokio_test_block_on(async {
+            let source =
+                ConfigurationScope::Guild(enroll_guild(&db, 10, 100).await.unwrap().unwrap());
+            let destination =
+                ConfigurationScope::Guild(enroll_guild(&db, 20, 100).await.unwrap().unwrap());
+            let stale = stale_invite_rule(&db).await;
+            let mut rows = vec![(10, "invite", serde_json::to_string(&stale).unwrap())];
+            if let Some(description) = stored {
+                let mut target = stale.clone();
+                target.description = description.into();
+                rows.push((20, "invite", serde_json::to_string(&target).unwrap()));
+            }
+            write_raw_rules(&db, marker, rows).await;
+            copy_rules_fixture(&db, "control", &source, &destination, vec!["rules".into()])
+                .await
+                .unwrap();
+            (destination, stale)
+        });
+        let expected = |description: &str| {
+            let mut rule = serde_json::to_value(&stale).unwrap();
+            rule["description"] = serde_json::json!(description);
+            rule
+        };
+        let case = format!("marker={marker}, stored={stored:?}");
+        assert_eq!(
+            tokio_test_block_on(stored_rule_json(&db, 20, "invite")),
+            expected(copied),
+            "{case}"
+        );
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            assert_eq!(
+                stored_rule_json(&db, 20, "invite").await,
+                expected(reopened),
+                "{case}"
+            );
+            // The dashboard editor reopens the copied rule through its captured read.
+            let snapshot = load_enrolled_web_config_snapshot(&db, destination)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&snapshot.guild_rules["invite"]).unwrap(),
+                expected(reopened),
+                "{case}"
+            );
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn embed_defaults_upgrade_only_exact_untouched_rows_once() {
+    let tmp = tmp_db_path("embed_defaults");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded("DELETE FROM meta WHERE key='embed_log_defaults_v1'", (), 65_536)?;
+        for (event, old) in crate::defaults::pre_embed_log_templates() {
+            for guild in [0, 123, 456] {
+                let text = if guild == 456 { format!("custom {old}") } else { old.into() };
+                conn.execute_bounded(
+                    "INSERT OR REPLACE INTO templates(guild_id,event_type,template) VALUES(?1,?2,?3)",
+                    params![guild, event, text], 65_536,
+                )?;
+            }
+        }
+        Ok(())
+    })).unwrap();
+    let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
+    for guild in [0, 123, 456] {
+        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
+        for (event, new) in crate::defaults::rendered_log_templates() {
+            if guild == 456 {
+                let old = crate::defaults::pre_embed_log_templates()
+                    .into_iter()
+                    .find(|(e, _)| *e == event)
+                    .unwrap()
+                    .1;
+                assert_eq!(parts.templates[event], format!("custom {old}"));
+            } else {
+                assert_eq!(parts.templates[event], new);
+            }
+        }
+    }
+    tokio_test_block_on(db.with_conn(|conn| {
+        let (event, old) = crate::defaults::pre_embed_log_templates()[0];
+        conn.execute_bounded(
+            "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type=?2",
+            params![old, event],
+            65_536,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
+    let (event, old) = crate::defaults::pre_embed_log_templates()[0];
+    assert_eq!(parts.templates[event], old);
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
     drop(db);
     cleanup_db(&tmp);
 }

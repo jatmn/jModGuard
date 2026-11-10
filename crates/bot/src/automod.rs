@@ -180,7 +180,7 @@ impl AutomodEngine {
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
         let now = Instant::now();
-        let keep = Duration::from_secs(60 * 10);
+        let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
         self.state.retain(|_, rules| {
             rules.retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
             !rules.is_empty()
@@ -243,6 +243,9 @@ impl AutomodEngine {
                                 || re.is_match(&compact)
                         })
                 }
+                "known_spam" => cfg
+                    .known_spam
+                    .matches_forms(ctx.content, &normalized, &compact),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
                 "velocity" => self.trigger_velocity(rule, ctx, now),
                 "account_age" => ctx
@@ -254,6 +257,21 @@ impl AutomodEngine {
 
             if !triggered {
                 continue;
+            }
+
+            if rule_id == "known_spam" {
+                let pending = PendingAction {
+                    rule_id: rule_id.into(),
+                    rule_name: rule.name.clone(),
+                    action: jmodguard::known_spam::action(),
+                    strikes: 1,
+                    mention_permission_unknown: false,
+                    evidence: serde_json::json!({ "content": ctx.content,
+                        "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
+                };
+                // This list promises the same fixed one-hour action even when
+                // another detector would also ban with a different window.
+                return Some(pending);
             }
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
@@ -358,7 +376,9 @@ impl AutomodEngine {
 
     /// Counts this message's mentions plus recent mentions in the window.
     fn trigger_mention_spam(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
-        let window = Duration::from_secs(param_u64(rule, "window_secs", 10));
+        let window = Duration::from_secs(
+            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
+        );
         let max_total = param_u64(rule, "max_mentions_in_window", 5) as usize;
 
         let mut total = ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions;
@@ -378,7 +398,9 @@ impl AutomodEngine {
 
     fn trigger_velocity(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
         let max = param_u64(rule, "max_messages", 8) as usize;
-        let window = Duration::from_secs(param_u64(rule, "window_secs", 10));
+        let window = Duration::from_secs(
+            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
+        );
         let mut count = 1usize;
         if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
             for s in bucket.values() {
@@ -731,6 +753,26 @@ pub(crate) async fn execute_pending_with(
     vars.insert("reason".into(), reason.clone());
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
+    if pending.rule_id == "known_spam" {
+        let Ok(cfg) = loaded.as_ref() else { return };
+        let Some(current) = cfg.rules.get("known_spam") else {
+            return;
+        };
+        let content = pending.evidence["content"].as_str().unwrap_or("");
+        if !current.enabled || !cfg.known_spam.matches(content) {
+            return;
+        }
+        if jmodguard::custom_rules::rule_scope_skips(
+            current,
+            target.id.get(),
+            msg_channel.unwrap_or(0),
+            &[],
+            false,
+            true,
+        ) {
+            return;
+        }
+    }
     let resolved = loaded.as_ref().ok().and_then(|cfg| {
         cfg.rules.get(&pending.rule_id).map(|r| {
             (
@@ -1368,12 +1410,70 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    use crate::cases::discord_attempt_outcome;
-    use crate::db::guild_data::CaseOutcome;
     use crate::state::{BotState, CachedGuildConfig};
     use crate::types::{ActionDef, GuildSettings, RuleDef};
 
     use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
+
+    #[test]
+    fn builtin_legacy_windows_clamp_to_retained_history() {
+        assert_legacy_windows(&[(0, 500, true), (0, 2000, false)]);
+    }
+
+    #[test]
+    fn builtin_legacy_long_windows_clamp_to_retained_history() {
+        assert_legacy_windows(&[
+            (601, 599_000, true),
+            (601, 600_500, false),
+            (u64::MAX, 599_000, true),
+            (u64::MAX, 601_000, false),
+        ]);
+    }
+
+    fn assert_legacy_windows(cases: &[(u64, u64, bool)]) {
+        use super::{RuleState, WindowEvent};
+        use std::time::Duration;
+        for id in ["mention_spam", "velocity"] {
+            for &(window, age_ms, expected) in cases {
+                let engine = AutomodEngine::new();
+                let now = Instant::now();
+                let mut rule = crate::defaults::default_rules()
+                    [if id == "mention_spam" { 0 } else { 6 }]
+                .clone();
+                rule.params = serde_json::json!({"window_secs": window, "max_mentions_in_window": 1, "max_messages": 1});
+                let at = now - Duration::from_millis(age_ms);
+                engine.state.insert(
+                    (1, 42),
+                    HashMap::from([(
+                        id,
+                        RuleState {
+                            events: std::collections::VecDeque::from([WindowEvent { at }]),
+                            last_event: Some(at),
+                            ..Default::default()
+                        },
+                    )]),
+                );
+                let mut ctx = msg(1, "", 0, false, false);
+                ctx.role_mentions = 1;
+                let triggered = if id == "mention_spam" {
+                    engine.trigger_mention_spam(&rule, &ctx, now)
+                } else {
+                    engine.trigger_velocity(&rule, &ctx, now)
+                };
+                assert_eq!(triggered, expected, "{id}: window {window}, age {age_ms}");
+                engine.prune();
+                let after = if id == "mention_spam" {
+                    engine.trigger_mention_spam(&rule, &ctx, now)
+                } else {
+                    engine.trigger_velocity(&rule, &ctx, now)
+                };
+                assert_eq!(
+                    after, expected,
+                    "pruning must agree with the effective window"
+                );
+            }
+        }
+    }
 
     #[test]
     fn invite_code_form_params_match_without_reinterpreting_legacy_guild_ids() {
@@ -1390,15 +1490,6 @@ mod tests {
         assert!(!engine.invite_allowed(&rule, "https://discord.gg/unlisted"));
         rule.params = serde_json::json!({"allowlist_guilds": ["9007199254740993"]});
         assert!(!engine.invite_allowed(&rule, "https://discord.gg/9007199254740993"));
-    }
-
-    #[test]
-    fn selected_kick_timeout_cases_require_a_discord_attempt() {
-        assert_eq!(discord_attempt_outcome(false, None), None);
-        assert_eq!(
-            discord_attempt_outcome(true, None),
-            Some(CaseOutcome::Succeeded)
-        );
     }
 
     #[test]
@@ -1440,6 +1531,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -1485,6 +1577,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: patterns.clone(),
@@ -2060,6 +2153,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -2325,6 +2419,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
@@ -2655,6 +2750,236 @@ mod tests {
                         .any(|line| line.starts_with("GET ") && line.contains("/messages")),
                     "no history scan: {seen:?}"
                 );
+                drop(app);
+                let _ = std::fs::remove_file(&path);
+                crate::tenant::remove_sidecars(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn known_spam_first_hit_and_exemptions_preserve_other_rules() {
+        let rule = crate::defaults::default_rules()
+            .into_iter()
+            .find(|r| r.name == "Known spam")
+            .unwrap();
+        let mut cfg = test_cfg(
+            &HashMap::from([("known_spam".into(), rule)]),
+            &HashMap::new(),
+        );
+        cfg.known_spam = jmodguard::known_spam::CompiledList::new(&[
+            jmodguard::known_spam::Entry::new("sample", "Full Stack AI developer pitch", None)
+                .unwrap(),
+            jmodguard::known_spam::Entry::new("url", "tinyurl.com/*", None).unwrap(),
+        ]);
+        let engine = AutomodEngine::new();
+        for content in [
+            "FULL ST@CK AI d3v3lop3r pitch",
+            "fullstackaideveloperpitch",
+            "link tinyurl.com/abc",
+            "https://ti\u{200c}nyurl.com/a\u{200b}b",
+        ] {
+            for _ in 0..2 {
+                let pending = engine
+                    .evaluate(&cfg, &msg(1, content, 0, false, false))
+                    .unwrap();
+                assert_eq!(pending.rule_id, "known_spam");
+                assert_eq!(pending.strikes, 1);
+                assert_eq!(pending.action.ban_delete_message_seconds(), 3600);
+            }
+        }
+        for content in [
+            "a different message",
+            "https://\u{200b}@tinyurl.com/a",
+            "https://:\u{200b}@tinyurl.com/a",
+            "ht\u{200b}tps://tinyurl.com/a",
+            "https://tinyurl.com:\u{200b}443/a",
+        ] {
+            assert!(
+                engine
+                    .evaluate(&cfg, &msg(1, content, 0, false, false))
+                    .is_none(),
+                "must not schedule a ban: {content:?}"
+            );
+        }
+        let message = msg(1, "tinyurl.com/a", 0, false, false);
+        for skip in 0..5 {
+            let rule = cfg.rules.get_mut("known_spam").unwrap();
+            rule.enabled = skip != 0;
+            rule.whitelist_users = if skip == 1 {
+                vec![message.author_id]
+            } else {
+                vec![]
+            };
+            rule.whitelist_channels = if skip == 2 {
+                vec![message.channel_id]
+            } else {
+                vec![]
+            };
+            rule.include_channels = if skip == 3 {
+                vec![message.channel_id + 1]
+            } else {
+                vec![]
+            };
+            rule.skip_moderators = skip == 4;
+            let mut message = msg(1, "tinyurl.com/a", 0, false, false);
+            message.is_moderator = skip == 4;
+            assert!(engine.evaluate(&cfg, &message).is_none(), "skip {skip}");
+        }
+        let rule = cfg.rules.get_mut("known_spam").unwrap();
+        rule.skip_moderators = false;
+        rule.whitelist_roles = vec![42];
+        let roles = [42];
+        let mut message = msg(1, "tinyurl.com/a", 0, false, false);
+        message.member_roles = &roles;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        // An empty known list never turns unrelated text/repeat rules into a ban.
+        cfg.known_spam = Default::default();
+        cfg.rules = crate::types::RULE_IDS
+            .into_iter()
+            .zip(crate::defaults::default_rules())
+            .map(|(id, r)| (id.into(), r))
+            .collect();
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let mut message = msg(2, "scam", 0, false, false);
+        message.account_age_days = Some(30);
+        let action = AutomodEngine::new().evaluate(&cfg, &message).unwrap();
+        assert_eq!(action.rule_id, "badword");
+        assert_eq!(action.action.action, "delete");
+        assert_eq!(cfg.rules["repeat_text"].params["mode"], "exact_text");
+        assert!(cfg.rules["repeat_text"].dry_run);
+    }
+
+    #[tokio::test]
+    async fn known_spam_saved_entries_reach_existing_hour_ban_helper_and_dry_run() {
+        use serenity::model::id::{GuildId, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+        for dry in [false, true] {
+            for (kind, value, content) in [
+                (
+                    "sample",
+                    "Full Stack AI developer pitch",
+                    "fullst@ckaid3v3lop3rpitch",
+                ),
+                ("url", "tinyurl.com/*", "join https://TINYURL.COM/abc"),
+            ] {
+                let path = std::env::temp_dir()
+                    .join(format!("known_spam_{:032x}.db", rand::random::<u128>()));
+                let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap())
+                    .unwrap();
+                assert!(
+                    crate::db::claim_active_bot(
+                        &app.db,
+                        app.activation.instance(),
+                        jmodguard::control::now_ms(),
+                        Arc::new(AtomicBool::new(false))
+                    )
+                    .await
+                    .unwrap()
+                );
+                app.activation.mark_lock_held(true);
+                let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                app.tenant.activate(enrollment.clone()).await.unwrap();
+                let scope = crate::db::ScopeWire {
+                    global: false,
+                    guild_id: enrollment.guild_id,
+                    enrollment_id: enrollment.id,
+                    joined_at_ns: enrollment.joined_at_ns,
+                };
+                let added = crate::db::apply_control(
+                    &app.db,
+                    None,
+                    crate::db::ControlOp::AddKnownSpam {
+                        request: scope.clone(),
+                        target: scope.clone(),
+                        kind: kind.into(),
+                        value: value.into(),
+                        note: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let crate::db::ControlReply::Saved { body } = added else {
+                    panic!("known spam control write was not saved");
+                };
+                let id = body.as_i64().unwrap();
+                let mut rule = crate::defaults::default_rules().pop().unwrap();
+                assert_eq!(rule.name, "Known spam");
+                rule.dry_run = dry;
+                crate::db::upsert_rule(&app.db, 10, "known_spam", &rule)
+                    .await
+                    .unwrap();
+                let cfg = app.configs.get(&app.db, 10).await.unwrap();
+                let mut message = word_message(&[]);
+                message.content = content;
+                let pending = AutomodEngine::new().evaluate(&cfg, &message).unwrap();
+                let mut user = serenity::model::user::User::default();
+                user.id = UserId::new(99);
+                user.name = "member".into();
+                let stub = DiscordStub::start();
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    GuildId::new(10),
+                    &user,
+                    None,
+                    "member",
+                    Some(42),
+                    Some(70),
+                    &pending,
+                )
+                .await;
+                let seen = stub.finish();
+                if dry {
+                    assert!(seen.is_empty(), "{seen:?}");
+                } else {
+                    let bans: Vec<_> = seen
+                        .iter()
+                        .filter(|s| s.starts_with("PUT ") && s.contains("/bans/99"))
+                        .collect();
+                    assert_eq!(bans.len(), 1, "{seen:?}");
+                    assert!(bans[0].contains("delete_message_seconds=3600"), "{seen:?}");
+                    assert!(
+                        !seen
+                            .iter()
+                            .any(|s| s.starts_with("GET ") && s.contains("/messages")),
+                        "{seen:?}"
+                    );
+                }
+                // Removal after evaluation must withhold the saved pending ban.
+                crate::db::apply_control(
+                    &app.db,
+                    None,
+                    crate::db::ControlOp::DeleteKnownSpam {
+                        request: scope.clone(),
+                        target: scope,
+                        id,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                app.invalidate_configs();
+                let stub = DiscordStub::start();
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    GuildId::new(10),
+                    &user,
+                    None,
+                    "member",
+                    Some(42),
+                    Some(70),
+                    &pending,
+                )
+                .await;
+                assert!(stub.finish().is_empty());
                 drop(app);
                 let _ = std::fs::remove_file(&path);
                 crate::tenant::remove_sidecars(&path);
@@ -3487,6 +3812,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),

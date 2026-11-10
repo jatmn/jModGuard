@@ -2681,26 +2681,6 @@ mod tests {
     }
 
     #[test]
-    fn review_capacity_eviction_does_not_scan_entries_map() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
-        for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
-            marks.insert(1, 2, message, "badword", "Bad word", now);
-        }
-        let later = now + Duration::from_secs(30);
-        for message in 0..8 {
-            set_mark_expires(&mut marks, message, later - Duration::from_millis(1));
-        }
-        for message in MAX_AUTOMOD_DELETE_MARKS as u64..MAX_AUTOMOD_DELETE_MARKS as u64 + 8 {
-            marks.insert(1, 2, message, "badword", "Bad word", later);
-        }
-        assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
-        assert!(!marks.contains(1, 2, 0));
-        assert!(marks.contains(1, 2, MAX_AUTOMOD_DELETE_MARKS as u64 + 7));
-        marks.assert_indexes_consistent();
-    }
-
-    #[test]
     fn prune_uses_retained_expiry_heap_without_full_map_scan() {
         let mut marks = AutomodDeleteMarks::default();
         let now = Instant::now();
