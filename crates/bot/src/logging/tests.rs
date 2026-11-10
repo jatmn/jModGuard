@@ -146,6 +146,16 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
 }
 
 #[test]
+fn bulk_fallback_copy_names_the_attachment_rejection_trigger() {
+    let mut transcript = BulkTranscript::new(1);
+    transcript.push(MessageId::new(123), None);
+    let parts = fallback_bulk_parts("{details}", &BTreeMap::new(), &transcript);
+    assert!(parts[0].contains("Discord rejected the transcript attachment (HTTP 403)"));
+    assert!(parts[0].contains("bounded text fallback"));
+    assert!(!parts[0].contains("plain-message fallback"));
+}
+
+#[test]
 fn retained_edit_and_delete_reports_distinguish_empty_missing_and_gap() {
     let mut before = MessageSnapshot {
         guild_id: 789,
@@ -5316,14 +5326,4 @@ fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     assert_eq!(content, whole_hash_notice(&proving_digests(40), 1024));
     assert!(content.ends_with("and 25 more"));
     assert!(!content.contains('…'));
-}
-
-#[test]
-fn bulk_fallback_copy_names_the_attachment_rejection_trigger() {
-    let mut transcript = BulkTranscript::new(1);
-    transcript.push(MessageId::new(123), None);
-    let parts = fallback_bulk_parts("{details}", &BTreeMap::new(), &transcript);
-    assert!(parts[0].contains("Discord rejected the transcript attachment (HTTP 403)"));
-    assert!(parts[0].contains("bounded text fallback"));
-    assert!(!parts[0].contains("plain-message fallback"));
 }

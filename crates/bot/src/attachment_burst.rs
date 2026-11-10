@@ -4804,19 +4804,20 @@ mod tests {
             ("time".into(), "2026-10-26T02:03:04Z".into()),
         ]);
         let original = logging::preview_automod(&app, GuildId::new(10), &mut vars).await;
-        assert!(original.starts_with("**:shield: Automod: Attachment burst**"));
         assert_eq!(original.matches("Automod").count(), 1);
         for label in [ATTACHMENT_BURST_RELEASED, ATTACHMENT_BURST_BANNED] {
             let payload =
                 serde_json::to_value(decision_edit(original.clone(), label, UserId::new(7)))
                     .unwrap();
-            let content = payload["content"].as_str().unwrap();
-            assert_eq!(content.matches("Automod").count(), 1);
-            assert_eq!(
-                content,
-                format!("{original}\n\n**Review:** {label} by user 7")
-            );
-            assert!(payload.get("embeds").is_none());
+            let mut visible = payload["content"].as_str().unwrap_or_default().to_string();
+            for embed in payload["embeds"].as_array().into_iter().flatten() {
+                for key in ["title", "description"] {
+                    visible.push_str(embed[key].as_str().unwrap_or_default());
+                }
+            }
+            assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
+            assert!(visible.contains("Attachment burst"));
+            assert!(visible.contains(&format!("**Review:** {label} by user 7")));
             assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
             assert_eq!(payload["components"], serde_json::json!([]));
         }

@@ -2605,6 +2605,81 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
   assert.equal(findNode(root, n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
 });
 
+// Exercise the mounted template preview, including draft edits, through its real renderer.
+function markdownPreview(text) {
+  const h = harness();
+  h.app.state.config = {templates: [{event: 'automod', effective: text}]};
+  h.app.navigate('templates');
+  return {h, panel: h.document.querySelector('.template-preview .log-embed-description')};
+}
+
+for (const [name, input, selector, expected] of [
+  ['heading 1', '# One', 'h1', 'One'],
+  ['heading 2', '## Two', 'h2', 'Two'],
+  ['heading 3', '### Three', 'h3', 'Three'],
+  ['subtext', '-# Small **note**', 'small strong', 'note'],
+  ['single-line quotes', '> **quoted**\n> second\nafter', 'blockquote strong', 'quoted'],
+  ['multiline quotes', '>>> first\nsecond\n**third**', 'blockquote strong', 'third'],
+  ['bullet lists', '- first\n* **second**', 'ul > li strong', 'second'],
+  ['numbered lists', '3. first\n4. **second**', 'ol[start="3"] > li strong', 'second'],
+  ['underline', '__under__', 'u', 'under'],
+  ['strikethrough', '~~gone~~', 's', 'gone'],
+  ['bold', '**bold**', 'strong', 'bold'],
+  ['star italics', '*italic*', 'em', 'italic'],
+  ['underscore italics', '_italic_', 'em', 'italic'],
+  ['bold italics', '***both***', 'strong em', 'both'],
+  ['nested emphasis and code', '__**bold `**literal**` end**__', 'u strong code', '**literal**'],
+  ['multiple-backtick code', '``literal `tick``', 'code', 'literal `tick'],
+  ['spoilers', '||secret **bold**||', 'details summary', 'Spoiler'],
+  ['inline code', '`**literal** <b>`', 'code', '**literal** <b>'],
+  ['fenced code', '```js\n**literal** <b>\n```', 'pre code', '**literal** <b>'],
+  ['masked links', '[**Docs**](https://example.test/a?x=1&y=2)', 'a strong', 'Docs'],
+]) {
+  test(`Markdown preview renders ${name}`, () => {
+    const {panel} = markdownPreview(input);
+    assert.equal(panel.querySelector(selector)?.textContent, expected);
+  });
+}
+
+test('Markdown preview keeps escaping, code and unsafe URLs inert', () => {
+  const input = String.raw`\# literal
+\> literal
+\- literal
+\*\*literal\*\* \_\_literal\_\_ \~\~literal\~\~ \|\|literal\|\| \[label](https://example.test)
+` + '\n<script>alert(1)</script><img src=x onerror=alert(1)>&lt;b&gt;\n'
+    + '[bad](javascript:alert(1)) [bad](JaVaScRiPt:alert(1)) [bad](data:text/html,x) [bad](//example.test) [bad](https:\n//example.test)\n'
+    + '`[bad](https://example.test) **literal**`';
+  const {panel} = markdownPreview(input);
+  assert.equal(panel.querySelector('script,img,b,a,blockquote,ul,h1,u,s,details'), null);
+  assert.match(panel.textContent, /# literal/);
+  assert.match(panel.textContent, /\*\*literal\*\*/);
+  assert.match(panel.textContent, /<script>alert\(1\)<\/script>/);
+  assert.match(panel.textContent, /&lt;b&gt;/);
+  assert.ok(panel.innerHTML.includes('&lt;script&gt;'));
+  assert.equal(panel.querySelector('code')?.textContent, '[bad](https://example.test) **literal**');
+});
+
+test('Markdown preview handles safe link attributes, nested lists and literal code blocks', () => {
+  const {panel} = markdownPreview('[link](HTTP://example.test/a_(b)?x="&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```');
+  assert.equal(panel.querySelector('a')?.getAttribute('href'), 'HTTP://example.test/a_(b)?x="&y=1');
+  assert.equal(panel.querySelector('a')?.getAttribute('rel'), 'noreferrer noopener');
+  assert.equal(panel.querySelector('a')?.getAttribute('onclick'), null);
+  assert.equal(panel.querySelector('ul ul li')?.textContent, 'nested');
+  assert.equal(panel.querySelector('pre code')?.textContent, '<script> & **literal**\n# no heading');
+  assert.equal(panel.querySelector('script,h1'), null);
+});
+
+test('Markdown preview updates unsaved edits and preserves sample substitutions', async () => {
+  const {h, panel} = markdownPreview('**Hello {user}**');
+  assert.equal(panel.querySelector('strong')?.textContent, 'Hello Alice');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = '## Changed\n__under__ and ||secret||';
+  await fire(input, 'input');
+  assert.equal(panel.querySelector('h2')?.textContent, 'Changed');
+  assert.equal(panel.querySelector('u')?.textContent, 'under');
+  assert.equal(panel.querySelector('details')?.open, false);
+});
+
 test('preview token is sent on API requests from this tab', async () => {
   let headers;
   const { app, session } = harness(async (_url, options) => {
@@ -4670,73 +4745,4 @@ test('embed preview applies dynamic action/removal accents and aggregate field l
   assert.ok(total <= 6000);
   assert.equal(embed.fields[0].value.length, 1023);
   assert.equal(embed.fields[0].value.at(-1), '…');
-});
-
-// Exercise the mounted template preview, including draft edits, through its real renderer.
-function markdownPreview(text) {
-  const h = harness();
-  h.app.state.config = {templates: [{event: 'automod', effective: text}]};
-  h.app.navigate('templates');
-  return {h, panel: h.document.querySelector('.template-preview .log-embed-description')};
-}
-
-for (const [name, input, selector, expected] of [
-  ['heading 1', '# One', 'h1', 'One'],
-  ['heading 2', '## Two', 'h2', 'Two'],
-  ['heading 3', '### Three', 'h3', 'Three'],
-  ['subtext', '-# Small **note**', 'small strong', 'note'],
-  ['single-line quotes', '> **quoted**\n> second\nafter', 'blockquote strong', 'quoted'],
-  ['multiline quotes', '>>> first\nsecond\n**third**', 'blockquote strong', 'third'],
-  ['bullet lists', '- first\n* **second**', 'ul > li strong', 'second'],
-  ['numbered lists', '3. first\n4. **second**', 'ol[start="3"] > li strong', 'second'],
-  ['underline', '__under__', 'u', 'under'],
-  ['strikethrough', '~~gone~~', 's', 'gone'],
-  ['bold and italics', '**bold** *italic* _also italic_', 'strong', 'bold'],
-  ['spoilers', '||secret **bold**||', 'details summary', 'Spoiler'],
-  ['inline code', '`**literal** <b>`', 'code', '**literal** <b>'],
-  ['fenced code', '```js\n**literal** <b>\n```', 'pre code', '**literal** <b>'],
-  ['masked links', '[**Docs**](https://example.test/a?x=1&y=2)', 'a strong', 'Docs'],
-]) {
-  test(`Markdown preview renders ${name}`, () => {
-    const {panel} = markdownPreview(input);
-    assert.equal(panel.querySelector(selector)?.textContent, expected);
-  });
-}
-
-test('Markdown preview keeps escaping, code and unsafe URLs inert', () => {
-  const input = String.raw`\# literal
-\> literal
-\- literal
-\*\*literal\*\* \_\_literal\_\_ \~\~literal\~\~ \|\|literal\|\| \[label](https://example.test)
-` + '\n<script>alert(1)</script><img src=x onerror=alert(1)>&lt;b&gt;\n'
-    + '[bad](javascript:alert(1)) [bad](JaVaScRiPt:alert(1)) [bad](data:text/html,x) [bad](//example.test) [bad](https:\n//example.test)\n'
-    + '`[bad](https://example.test) **literal**`';
-  const {panel} = markdownPreview(input);
-  assert.equal(panel.querySelector('script,img,b,a,blockquote,ul,h1,u,s,details'), null);
-  assert.match(panel.textContent, /# literal/);
-  assert.match(panel.textContent, /\*\*literal\*\*/);
-  assert.match(panel.textContent, /<script>alert\(1\)<\/script>/);
-  assert.match(panel.textContent, /&lt;b&gt;/);
-  assert.ok(panel.innerHTML.includes('&lt;script&gt;'));
-  assert.equal(panel.querySelector('code')?.textContent, '[bad](https://example.test) **literal**');
-});
-
-test('Markdown preview handles safe link attributes, nested lists and literal code blocks', () => {
-  const {panel} = markdownPreview('[link](HTTP://example.test/a_(b)?x="&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```');
-  assert.equal(panel.querySelector('a')?.getAttribute('href'), 'HTTP://example.test/a_(b)?x="&y=1');
-  assert.equal(panel.querySelector('a')?.getAttribute('rel'), 'noreferrer noopener');
-  assert.equal(panel.querySelector('ul ul li')?.textContent, 'nested');
-  assert.equal(panel.querySelector('pre code')?.textContent, '<script> & **literal**\n# no heading');
-  assert.equal(panel.querySelector('script,h1'), null);
-});
-
-test('Markdown preview updates unsaved edits and preserves sample substitutions', async () => {
-  const {h, panel} = markdownPreview('**Hello {user}**');
-  assert.equal(panel.querySelector('strong')?.textContent, 'Hello Alice');
-  const input = h.document.querySelector('.template-card textarea');
-  input.value = '## Changed\n__under__ and ||secret||';
-  await fire(input, 'input');
-  assert.equal(panel.querySelector('h2')?.textContent, 'Changed');
-  assert.equal(panel.querySelector('u')?.textContent, 'under');
-  assert.equal(panel.querySelector('details')?.open, false);
 });

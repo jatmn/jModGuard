@@ -5697,9 +5697,14 @@ function tabActions() {
 function previewInline(text, depth = 0) {
   if (depth >= 20) return [text];
   const out = [];
-  const closing = (marker, start) => {
+  const closing = (marker, start, skipCode = false) => {
     for (let i = start; i < text.length; i++) {
       if (text[i] === "\\") { i++; continue; }
+      if (skipCode && text[i] === "`") {
+        const ticks = text.slice(i).match(/^`+/)[0];
+        const end = text.indexOf(ticks, i + ticks.length);
+        if (end >= 0) { i = end + ticks.length - 1; continue; }
+      }
       if (text.startsWith(marker, i)) return i;
     }
     return -1;
@@ -5741,7 +5746,7 @@ function previewInline(text, depth = 0) {
     let matched = false;
     for (const [marker, tag] of [["***", "strong"], ["**", "strong"], ["__", "u"], ["~~", "s"], ["||", "details"], ["*", "em"], ["_", "em"]]) {
       if (!text.startsWith(marker, i)) continue;
-      const end = closing(marker, i + marker.length);
+      const end = closing(marker, i + marker.length, true);
       if (end <= i + marker.length) continue;
       let children = previewInline(text.slice(i + marker.length, end), depth + 1);
       if (marker === "***") children = h("em", {}, children);

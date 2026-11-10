@@ -255,8 +255,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .template-input { min-height: 14rem; line-height: 1.6; resize: vertical; }
 .template-preview { min-width: 0; }
 .template-preview > strong { display: block; font-size: .75rem; margin-bottom: 8px; }
-.template-preview .discord-markdown { background: var(--panel2); border: 1px solid var(--shell-border); border-radius: 8px; padding: 16px; overflow-wrap: anywhere; }
-.template-preview .discord-markdown { white-space: pre-wrap; }
+.template-preview .discord-markdown { background: var(--panel2); border: 1px solid var(--shell-border); border-radius: 8px; padding: 16px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .template-preview .discord-markdown :is(h1, h2, h3) { font-weight: bold; margin: 0; }
 .template-preview .discord-markdown h1 { font-size: 1.5em; }
 .template-preview .discord-markdown h2 { font-size: 1.25em; }
