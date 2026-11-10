@@ -182,9 +182,13 @@ static URL_TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
 // there so an adjacent link is checked too, without splitting raw URL contents.
 fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     let mut offset = 0;
+    let mut pending = None;
     std::iter::from_fn(move || {
+        if let Some(token) = pending.take() {
+            return Some(token);
+        }
         let token = URL_TOKENS.find_at(content, offset)?;
-        let mut start = token.start();
+        let mut start;
         let mut end = token.end();
         // Detect visible URLs despite invisible destination padding, even when
         // the markup is not a valid rendered link. Reuse Badwords' format set.
@@ -212,6 +216,45 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                     }
                     b')' => depth -= 1,
                     _ => {}
+                }
+            }
+        } else {
+            let bare = token
+                .as_str()
+                .trim_start_matches(crate::normalize::is_zero_width);
+            start = token.end() - bare.len();
+            let head = bare.split(['/', '?', '#']).next().unwrap_or_default();
+            // Keep structural userinfo on the complete candidate for exclusion.
+            if let Some(i) = head.find(crate::normalize::is_zero_width)
+                && !head.contains('@')
+            {
+                let prefix = &head[..i];
+                let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
+                let text = url_token_text(candidate);
+                if ["http://", "https://"].iter().any(|scheme| {
+                    text.get(..scheme.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                }) {
+                    start = token.end() - candidate.len();
+                } else if ((!prefix.contains(['.', ':', '\u{3002}', '\u{ff0e}', '\u{ff61}'])
+                    && !["%2e", "%e3%80%82", "%ef%bc%8e", "%ef%bd%a1"]
+                        .iter()
+                        .any(|separator| {
+                            prefix
+                                .as_bytes()
+                                .windows(separator.len())
+                                .any(|part| part.eq_ignore_ascii_case(separator.as_bytes()))
+                        }))
+                    || prefix.chars().all(|c| c == ':'))
+                    && text
+                        .split(['/', '?', '#'])
+                        .next()
+                        .is_some_and(|host| host.contains('.'))
+                {
+                    // Prose and host fragments can look alike. Try the complete
+                    // host first so URL parsing retains its normalization; only
+                    // then try a new host after glued prose, never a URL path.
+                    pending = Some(candidate);
                 }
             }
         }
@@ -623,6 +666,277 @@ mod tests {
                 assert!(tokens.contains(&"https://spam.example/a(b)"), "{tokens:?}");
             }
         }
+    }
+    #[test]
+    fn known_spam_bare_urls_match_invisible_prefix_positions() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for before in ["", " ", "word", "!", "é🦀:"] {
+            for url in ["https://tinyurl.com/a", "http://tinyurl.com/a"] {
+                let text = format!("{before}\u{200b}{url} after");
+                if !compiled.matches(&text) {
+                    missed.push(text);
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed bare URLs: {missed:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_match_invisible_prefix_runs() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        // Reuse the explicit #507 fixtures, including every shared invisible
+        // and Unicode whitespace, independently of the production predicate.
+        for padding in unicode_destination_prefixes() {
+            for prefix in [
+                padding.clone(),
+                format!("\u{200b}\u{2060}{padding}\u{feff}"),
+            ] {
+                for before in ["", "word", "("] {
+                    let text = format!("{before}{prefix}https://tinyurl.com/a");
+                    if !compiled.matches(&text) {
+                        missed.push(text);
+                    }
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed bare URLs: {missed:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_match_schemeless_invisible_prefixes() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for padding in unicode_destination_prefixes() {
+            for url in ["tinyurl.com", "tinyurl.com/a"] {
+                for before in ["", "word", ":"] {
+                    let text = format!("{before}{padding}{url}");
+                    if !compiled.matches(&text) {
+                        missed.push(text);
+                    }
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed scheme-less URLs: {missed:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_safe_components_with_invisible_prefixes() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for padding in unicode_destination_prefixes() {
+            for destination in [
+                "https://safe.example/",
+                "https://safe.example/?q=(tinyurl.com/a)",
+                "https://safe.example/(tinyurl.com/a)",
+                "https://safe.example/#(tinyurl.com/a)",
+                "https://safe.example/?u=[tinyurl.com/a]",
+                "https://safe.example/?u=\"tinyurl.com/a\"",
+                "https://safe.example/?u='tinyurl.com/a'",
+                "https://safe.example/?u={tinyurl.com/a}",
+                "https://safe.example/tinyurl.com/a",
+                "https://safe.example/?u=(https://tinyurl.com/a)",
+                "https://safe.example/?q=[b](https://tinyurl.com/a)",
+                "safe.example/?q=(tinyurl.com/a)",
+                "https://safe.example/?q=\u{200b}https://tinyurl.com/a",
+                "safe.example/\u{200b}tinyurl.com/a",
+            ] {
+                let safe = format!("{padding}{destination}");
+                assert!(!compiled.matches(&safe), "{safe:?}");
+                assert_eq!(url_tokens(&safe).last(), Some(destination));
+                let spam = format!("{safe} {padding}https://tinyurl.com/a");
+                if !compiled.matches(&spam) {
+                    missed.push(spam);
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed following URLs: {missed:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_mix_invisible_prefixes_with_markdown() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for padding in unicode_destination_prefixes() {
+            for text in [
+                format!("{padding}[a](https://safe.example) {padding}https://tinyurl.com/a"),
+                format!("{padding}https://safe.example {padding}[a](https://tinyurl.com/a)"),
+                format!("{padding}[a]({padding}https://safe.example)word{padding}tinyurl.com/a"),
+                format!(
+                    "word{padding}https://tinyurl.com/a {padding}[a]({padding}https://safe.example)"
+                ),
+            ] {
+                if !compiled.matches(&text) {
+                    missed.push(text);
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed mixed URLs: {missed:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_keep_utf8_boundaries_with_invisible_prefixes() {
+        let compiled = list("url", "tinyurl.com/*");
+        // Keep prose glued to the URL candidate: whitespace would produce an
+        // additional prose token, independently of invisible-prefix handling.
+        for padding in unicode_destination_prefixes()
+            .filter(|padding| !padding.chars().any(char::is_whitespace))
+        {
+            let text = format!("é🦀{padding}https://tinyurl.com/🦀(é) after");
+            assert_eq!(
+                url_tokens(&text).collect::<Vec<_>>(),
+                ["https://tinyurl.com/🦀(é)", "after"],
+                "{text:?}"
+            );
+            assert!(compiled.matches(&text), "{text:?}");
+            // URL components stay byte-for-byte intact, including invisibles.
+            for url in [
+                "https://ti\u{200b}nyurl.com/a",
+                "https://tinyurl.com/a\u{200b}b",
+                "https://safe.example/?u=\u{200b}tinyurl.com/a",
+                "https://safe.example/#\u{200b}https://tinyurl.com/a",
+            ] {
+                assert_eq!(url_tokens(&format!("{padding}{url}")).last(), Some(url));
+            }
+        }
+    }
+    #[test]
+    fn known_spam_bare_urls_handle_invisible_only_messages() {
+        let compiled = list("url", "tinyurl.com/*");
+        for padding in unicode_destination_prefixes() {
+            assert!(!compiled.matches(&padding), "{padding:?}");
+            assert!(url_tokens(&padding).count() <= padding.chars().count());
+        }
+        assert!(!compiled.matches("\u{200b}\u{2060}\u{feff}\u{034f}"));
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_normalized_schemeless_hosts() {
+        let compiled = list("url", "tinyurl.com/*");
+        for text in [
+            "tiny\u{200b}url.com/a",
+            "tinyurl.com\u{200b}/a",
+            "tinyurl.com\u{200b}?q=1",
+        ] {
+            assert!(compiled.matches(text), "{text:?}");
+            assert!(url_tokens(text).any(|token| token == text), "{text:?}");
+        }
+        assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_host_ending_invisibles() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut missed = Vec::new();
+        for invisible in ['\u{200b}', '\u{00ad}', '\u{feff}'] {
+            for suffix in ["", "/a", "?q=1", "#frag"] {
+                let text = format!("tinyurl.com{invisible}{suffix}");
+                if !compiled.matches(&text) {
+                    missed.push(text.clone());
+                }
+                assert_eq!(url_tokens(&text).collect::<Vec<_>>(), [text.as_str()]);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "missed host-ending invisibles: {missed:?}"
+        );
+    }
+    #[test]
+    fn known_spam_bare_urls_keep_paths_after_host_ending_invisibles() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for invisible in ['\u{200b}', '\u{00ad}', '\u{feff}'] {
+            let safe = format!("safe.example{invisible}/tinyurl.com/a");
+            for text in [safe.clone(), format!("https://safe.example/ {safe}")] {
+                if compiled.matches(&text) {
+                    false_positives.push(text);
+                }
+            }
+            assert_eq!(url_tokens(&safe).collect::<Vec<_>>(), [safe.as_str()]);
+            assert!(compiled.matches(&format!("{safe} \u{200b}https://tinyurl.com/a")));
+        }
+        assert!(
+            false_positives.is_empty(),
+            "promoted paths: {false_positives:?}"
+        );
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_email_userinfo_exclusions() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for text in [
+            "user@tinyurl.com",
+            "user@tinyurl.com/a",
+            "user@\u{200b}tinyurl.com",
+            "user@\u{200b}tinyurl.com/a",
+            "user\u{200b}@tinyurl.com/a",
+            "user@\u{00ad}tinyurl.com/a",
+            "user@\u{feff}tinyurl.com/a",
+            "a\u{200b}user@tinyurl.com/a",
+            "user:pw@\u{200b}tinyurl.com/a",
+            "\u{200b}user@tinyurl.com/a",
+            "http://user@tinyurl.com/a",
+            "https://user@\u{200b}tinyurl.com/a",
+        ] {
+            if compiled.matches(text) {
+                false_positives.push(text);
+            }
+        }
+        assert!(false_positives.is_empty(), "{false_positives:?}");
+        assert!(compiled.matches("foo\u{200b}tinyurl.com/a"));
+        assert!(compiled.matches("tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_bare_urls_do_not_discard_credential_prefixes() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for text in [
+            "user@\u{200b}https://tinyurl.com/a",
+            "user:pw@\u{200b}https://tinyurl.com/a",
+            "user:pw\u{200b}tinyurl.com/a",
+        ] {
+            if compiled.matches(text) {
+                false_positives.push(text);
+            }
+        }
+        assert!(false_positives.is_empty(), "{false_positives:?}");
+        // A port on the suffix and prose punctuation before an explicit scheme
+        // are not discarded credential prefixes.
+        assert!(compiled.matches("foo\u{200b}tinyurl.com:443/a"));
+        assert!(compiled.matches("word:\u{200b}https://tinyurl.com/a"));
+    }
+    fn assert_bare_host_separator_boundary(separator: &str) {
+        let compiled = list("url", "tinyurl.com/*");
+        assert!(!compiled.matches("safe.\u{200b}tinyurl.com/a"));
+        let text = format!("safe{separator}\u{200b}tinyurl.com/a");
+        assert!(!compiled.matches(&text), "{text:?}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_ideographic_full_stop() {
+        assert_bare_host_separator_boundary("\u{3002}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_fullwidth_full_stop() {
+        assert_bare_host_separator_boundary("\u{ff0e}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_halfwidth_full_stop() {
+        assert_bare_host_separator_boundary("\u{ff61}");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_percent_dot_lowercase() {
+        assert_bare_host_separator_boundary("%2e");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_percent_dot_uppercase() {
+        assert_bare_host_separator_boundary("%2E");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_ideographic_full_stop() {
+        assert_bare_host_separator_boundary("%E3%80%82");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_fullwidth_full_stop() {
+        assert_bare_host_separator_boundary("%EF%BC%8E");
+    }
+    #[test]
+    fn known_spam_bare_urls_preserve_encoded_halfwidth_full_stop() {
+        assert_bare_host_separator_boundary("%EF%BD%A1");
     }
     #[test]
     fn known_spam_urls_match_next_to_punctuation() {
