@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(recent.event, "thread_create");
         assert_eq!(recent.vars["notice"], "created");
         let recent_text = thread_create_wording(&recent);
-        assert!(recent_text.contains("Thread created"));
+        assert!(recent_text.contains("Thread available\n\n**Notice:** created"));
         assert!(!recent_text.contains("joined/visible"));
         assert!(!recent.vars.contains_key("content"));
 
@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(earlier.event, "thread_create");
         assert_eq!(earlier.vars["notice"], "joined/visible");
         let earlier_text = thread_create_wording(&earlier);
-        assert!(earlier_text.contains("Thread joined/visible"));
+        assert!(earlier_text.contains("Thread available\n\n**Notice:** joined/visible"));
         assert!(!earlier_text.contains("Thread created"));
         assert!(!earlier.vars.contains_key("content"));
 
@@ -1046,8 +1046,8 @@ mod tests {
                 let messages = sink.messages.lock().unwrap();
                 assert_eq!(messages.len(), 1, "{event}");
                 assert_eq!(messages[0].0, ChannelId::new(456));
-                let text = messages[0].1["content"].as_str().unwrap();
-                assert!(text.encode_utf16().count() <= 2000, "{event}");
+                let text = crate::logging::tests::log_text(&messages[0].1);
+                assert!(text.encode_utf16().count() <= 6000, "{event}");
                 assert!(!text.contains("message body"), "{event}");
             }
             sink.messages.lock().unwrap().clear();

@@ -2605,6 +2605,81 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
   assert.equal(findNode(root, n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
 });
 
+// Exercise the mounted template preview, including draft edits, through its real renderer.
+function markdownPreview(text) {
+  const h = harness();
+  h.app.state.config = {templates: [{event: 'automod', effective: text}]};
+  h.app.navigate('templates');
+  return {h, panel: h.document.querySelector('.template-preview .log-embed-description')};
+}
+
+for (const [name, input, selector, expected] of [
+  ['heading 1', '# One', 'h1', 'One'],
+  ['heading 2', '## Two', 'h2', 'Two'],
+  ['heading 3', '### Three', 'h3', 'Three'],
+  ['subtext', '-# Small **note**', 'small strong', 'note'],
+  ['single-line quotes', '> **quoted**\n> second\nafter', 'blockquote strong', 'quoted'],
+  ['multiline quotes', '>>> first\nsecond\n**third**', 'blockquote strong', 'third'],
+  ['bullet lists', '- first\n* **second**', 'ul > li strong', 'second'],
+  ['numbered lists', '3. first\n4. **second**', 'ol[start="3"] > li strong', 'second'],
+  ['underline', '__under__', 'u', 'under'],
+  ['strikethrough', '~~gone~~', 's', 'gone'],
+  ['bold', '**bold**', 'strong', 'bold'],
+  ['star italics', '*italic*', 'em', 'italic'],
+  ['underscore italics', '_italic_', 'em', 'italic'],
+  ['bold italics', '***both***', 'strong em', 'both'],
+  ['nested emphasis and code', '__**bold `**literal**` end**__', 'u strong code', '**literal**'],
+  ['multiple-backtick code', '``literal `tick``', 'code', 'literal `tick'],
+  ['spoilers', '||secret **bold**||', 'details summary', 'Spoiler'],
+  ['inline code', '`**literal** <b>`', 'code', '**literal** <b>'],
+  ['fenced code', '```js\n**literal** <b>\n```', 'pre code', '**literal** <b>'],
+  ['masked links', '[**Docs**](https://example.test/a?x=1&y=2)', 'a strong', 'Docs'],
+]) {
+  test(`Markdown preview renders ${name}`, () => {
+    const {panel} = markdownPreview(input);
+    assert.equal(panel.querySelector(selector)?.textContent, expected);
+  });
+}
+
+test('Markdown preview keeps escaping, code and unsafe URLs inert', () => {
+  const input = String.raw`\# literal
+\> literal
+\- literal
+\*\*literal\*\* \_\_literal\_\_ \~\~literal\~\~ \|\|literal\|\| \[label](https://example.test)
+` + '\n<script>alert(1)</script><img src=x onerror=alert(1)>&lt;b&gt;\n'
+    + '[bad](javascript:alert(1)) [bad](JaVaScRiPt:alert(1)) [bad](data:text/html,x) [bad](//example.test) [bad](https:\n//example.test)\n'
+    + '`[bad](https://example.test) **literal**`';
+  const {panel} = markdownPreview(input);
+  assert.equal(panel.querySelector('script,img,b,a,blockquote,ul,h1,u,s,details'), null);
+  assert.match(panel.textContent, /# literal/);
+  assert.match(panel.textContent, /\*\*literal\*\*/);
+  assert.match(panel.textContent, /<script>alert\(1\)<\/script>/);
+  assert.match(panel.textContent, /&lt;b&gt;/);
+  assert.ok(panel.innerHTML.includes('&lt;script&gt;'));
+  assert.equal(panel.querySelector('code')?.textContent, '[bad](https://example.test) **literal**');
+});
+
+test('Markdown preview handles safe link attributes, nested lists and literal code blocks', () => {
+  const {panel} = markdownPreview('[link](HTTP://example.test/a_(b)?x="&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```');
+  assert.equal(panel.querySelector('a')?.getAttribute('href'), 'HTTP://example.test/a_(b)?x="&y=1');
+  assert.equal(panel.querySelector('a')?.getAttribute('rel'), 'noreferrer noopener');
+  assert.equal(panel.querySelector('a')?.getAttribute('onclick'), null);
+  assert.equal(panel.querySelector('ul ul li')?.textContent, 'nested');
+  assert.equal(panel.querySelector('pre code')?.textContent, '<script> & **literal**\n# no heading');
+  assert.equal(panel.querySelector('script,h1'), null);
+});
+
+test('Markdown preview updates unsaved edits and preserves sample substitutions', async () => {
+  const {h, panel} = markdownPreview('**Hello {user}**');
+  assert.equal(panel.querySelector('strong')?.textContent, 'Hello Alice');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = '## Changed\n__under__ and ||secret||';
+  await fire(input, 'input');
+  assert.equal(panel.querySelector('h2')?.textContent, 'Changed');
+  assert.equal(panel.querySelector('u')?.textContent, 'under');
+  assert.equal(panel.querySelector('details')?.open, false);
+});
+
 test('preview token is sent on API requests from this tab', async () => {
   let headers;
   const { app, session } = harness(async (_url, options) => {
@@ -2974,10 +3049,10 @@ test('activity-log events from the config payload render template and log-channe
   assert.equal(cards.length, 2);
   assert.match(cards[0].textContent, /Voice join/);
   assert.match(cards[0].textContent, /voice_join/);
-  assert.match(cards[0].querySelector('pre').textContent, /Alice/);
-  assert.match(cards[0].querySelector('pre').textContent, /#general/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /Alice/);
+  assert.match(cards[0].querySelector('.log-embed-description').textContent, /#general/);
   assert.match(cards[1].textContent, /Member role update/);
-  assert.match(cards[1].querySelector('pre').textContent, /\{added\}/);
+  assert.match(cards[1].querySelector('.log-embed-description').textContent, /@Member/);
   h.app.navigate('logchannels');
   await settle();
   const logs = [...h.document.querySelectorAll('.log-channel-card')];
@@ -4617,4 +4692,57 @@ test('known spam inherited globals are visible and removal is owner only', async
   assert.match(panel.textContent,/tinyurl.com/);
   assert.match(panel.textContent,/Owner only/);
   assert.equal([...panel.querySelectorAll('button')].some(b=>b.textContent === 'Remove'),false);
+});
+
+test('template preview shows embed color, title and fields, then live custom description', async () => {
+  const h = harness();
+  const shipped = 'Message deleted\n\n**Channel:** {channel}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}';
+  h.app.state.config = { templates: [{
+    event: 'message_delete', effective: shipped, shipped,
+    embed_style: {title: 'Message deleted', color: 0xff6666, action_colors: {}, removal_color: null},
+  }] };
+  h.app.navigate('templates');
+  let embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  assert.equal(embed.querySelector('.log-embed-title').textContent, 'Message deleted');
+  assert.deepEqual([...embed.querySelectorAll('.log-embed-field > strong')].map(el => el.textContent), ['Channel', 'Author', 'Time', 'Last observed text']);
+  assert.match(embed.textContent, /#general/);
+  assert.match(embed.textContent, /@alice/);
+  assert.equal(embed.querySelector('code').textContent, 'Nov 09, 2026 • 22:35:54 UTC');
+  const input = h.document.querySelector('.template-card textarea');
+  input.value = 'My custom wording: {user} {reason} <script>alert(1)</script>';
+  await fire(input, 'input');
+  embed = h.document.querySelector('.log-embed');
+  assert.equal(embed.querySelectorAll('.log-embed-field').length, 0);
+  assert.equal(embed.querySelector('.log-embed-description').textContent, 'My custom wording: Alice spam <script>alert(1)</script>');
+  assert.equal(embed.querySelector('script'), null);
+  assert.equal(embed.style.borderLeftColor, 'rgb(255, 102, 102)');
+  input.value = '🦀'.repeat(3000);
+  await fire(input, 'input');
+  const description = h.document.querySelector('.log-embed-description').textContent;
+  assert.equal(description.length, 4095);
+  assert.ok(description.endsWith('…'));
+});
+
+test('embed preview applies dynamic action/removal accents and aggregate field limits', () => {
+  const previewSource = source.slice(source.indexOf('function clipEmbedText('), source.indexOf('function logPreviewText('));
+  const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
+  assert.equal(preview({embed_style: {title: 'Log event', color: 0xffb347}}, 'Unknown {constructor} {__proto__} {missing}', {}).description, 'Unknown {constructor} {__proto__} {missing}');
+  const record = {
+    shipped: 'Role changed\n\n**Action:** {action}',
+    embed_style: {title: 'Role changed', color: 0xffb347, action_colors: {created: 0x77dd77, deleted: 0xff6666}},
+  };
+  assert.equal(preview(record, record.shipped, {action: 'created'}).color, 0x77dd77);
+  assert.equal(preview(record, record.shipped, {action: 'deleted'}).color, 0xff6666);
+  assert.equal(preview(record, record.shipped, {action: 'updated'}).color, 0xffb347);
+  record.embed_style.removal_color = 0xff6666;
+  assert.equal(preview(record, record.shipped, {removed: '<@&123>'}).color, 0xff6666);
+  record.shipped = 'Role changed\n\n' + Array.from({length: 30}, (_, i) => `**Field ${i}:** {content}`).join('\n');
+  const embed = preview(record, record.shipped, {content: '🦀'.repeat(1000)});
+  const total = embed.title.length + embed.description.length + embed.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+  assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every(f => f.name.length <= 256 && f.value.length <= 1024));
+  assert.ok(total <= 6000);
+  assert.equal(embed.fields[0].value.length, 1023);
+  assert.equal(embed.fields[0].value.at(-1), '…');
 });

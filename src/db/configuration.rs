@@ -303,13 +303,23 @@ fn rule_json_for_save_conn(
                 |r| Ok(r.get::<bool>(0)?),
             )?)
     {
-        let stored: Option<String> = conn
+        let mut stored: Option<String> = conn
             .query_row(
                 "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
                 params![guild_id],
                 |r| Ok(r.get(0)?),
             )
             .optional()?;
+        if stored.is_none() && guild_id != GLOBAL_SCOPE {
+            // A first guild override inherits its parent's description.
+            stored = conn
+                .query_row(
+                    "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
+                    params![GLOBAL_SCOPE],
+                    |r| Ok(r.get(0)?),
+                )
+                .optional()?;
+        }
         let stored = stored
             .and_then(|json| serde_json::from_str::<RuleDef>(&json).ok())
             .filter(|saved| saved.description != crate::defaults::OLD_INVITE_DESCRIPTION);

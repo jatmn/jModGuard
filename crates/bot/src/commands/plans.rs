@@ -47,6 +47,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         );
     }
     let mut responses: Vec<String> = Vec::new();
+    let mut emitted_log_events = Vec::new();
 
     for (idx, step) in steps.iter().enumerate() {
         let res = run_step(
@@ -56,6 +57,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
             target,
             &mut vars,
             &mut responses,
+            &mut emitted_log_events,
         )
         .await;
         if let Err(e) = res {
@@ -69,6 +71,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         responses.join("\n")
     };
     vars.insert("content".into(), content.clone());
+    vars.insert("response".into(), content.clone());
 
     let _ = record_moderation_plan(
         &env.app.db,
@@ -78,14 +81,21 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         steps,
     )
     .await;
-    logging::emit(
-        env.app,
-        env.ctx,
-        env.guild_id,
-        "plan_executed",
-        vars.clone(),
-    )
-    .await;
+    if !emitted_log_events
+        .iter()
+        .any(|event| event == "plan_executed")
+    {
+        let log_vars = super::command_log_vars(
+            &env.cmd.name,
+            "plan_executed",
+            &vars,
+            &env.ctx.cache,
+            env.actor,
+            env.channel_id,
+        );
+        logging::emit(env.app, env.ctx, env.guild_id, "plan_executed", log_vars).await;
+        emitted_log_events.push("plan_executed".into());
+    }
 
     Ok(BehaviorOutcome {
         response: if content.is_empty() {
@@ -94,6 +104,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
             Some(content)
         },
         vars,
+        emitted_log_events,
         suppress_response: false,
     })
 }
@@ -203,6 +214,7 @@ async fn run_guarded_case_step(
     result.map_err(|error| anyhow!("{error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_step(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
@@ -210,12 +222,14 @@ async fn run_step(
     target: Option<UserId>,
     vars: &mut std::collections::BTreeMap<String, String>,
     responses: &mut Vec<String>,
+    emitted_log_events: &mut Vec<String>,
 ) -> Result<()> {
     let guild_id = env.guild_id;
     match step {
         PlanStep::Reply { template } => {
             let text = crate::templates::render(template, vars);
             responses.push(text);
+            vars.insert("response".into(), responses.join("\n"));
         }
         PlanStep::Dm { template } => {
             refuse_fenced_discord_mutation(env).await?;
@@ -247,7 +261,17 @@ async fn run_step(
             let mut v = vars.clone();
             v.insert("content".into(), text);
             require_plan_writer(&env.app.activation).await?;
+            let v = super::command_log_vars(
+                &env.cmd.name,
+                event,
+                &v,
+                &env.ctx.cache,
+                env.actor,
+                env.channel_id,
+            );
             logging::emit(env.app, env.ctx, guild_id, event, v).await;
+            // Explicit steps always emit; only outcome reports use this tracking to deduplicate.
+            emitted_log_events.push(event.clone());
         }
         PlanStep::AddRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;

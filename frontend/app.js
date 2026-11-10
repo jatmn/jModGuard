@@ -3108,11 +3108,85 @@ function tabTemplates() {
       h(
         "p",
         { className: "muted" },
-        "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Activity reports also supply {added}, {removed}, {role}, {role_id}, {role_name}, {detail}, {before_global}, {after_global}, {thread}, {thread_id}, {thread_name}, {notice}, {archived}, {locked}, {auto_archive}, and {invitable} when that event has them. They do not supply message text. Custom templates keep their wording. The readable-log upgrade updates exact previous defaults once; dates include whole seconds and UTC. Add fields to custom templates where needed.",
+        "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Activity reports also supply {added}, {removed}, {role}, {role_id}, {role_name}, {detail}, {before_global}, {after_global}, {thread}, {thread_id}, {thread_name}, {notice}, {archived}, {locked}, {auto_archive}, and {invitable} when that event has them. They do not supply message text. Custom templates keep their wording. Log posts use colored embeds. Shipped defaults become fields; customized text fills the description. The embed upgrade updates exact previous defaults once; dates include whole seconds and UTC. The preview uses sample data and the same embed limits.",
       ),
     ),
     ...state.config.templates.map((t) => h(TemplateCard, { key: t.event, record: t })),
   );
+}
+
+// Same UTF-16 budget and substitution order as the shared log renderer.
+function clipEmbedText(text, limit) {
+  if (text.length <= limit) return text;
+  if (!limit) return "";
+  let out = "";
+  for (const ch of text) {
+    if (out.length + ch.length > limit - 1) break;
+    out += ch;
+  }
+  return out + "…";
+}
+
+function renderEmbedText(template, vars, limit) {
+  let out = "";
+  for (const chunk of template.match(/[^}]*}|[^}]+$/g) || []) {
+    const start = chunk.endsWith("}") ? chunk.lastIndexOf("{") : -1;
+    const key = start >= 0 ? chunk.slice(start + 1, -1) : "";
+    const value = Object.hasOwn(vars, key) ? vars[key] : undefined;
+    for (const text of value === undefined ? [chunk] : [chunk.slice(0, start), value]) {
+      for (const ch of text) {
+        if (out.length + ch.length > limit) {
+          if (!limit) return "";
+          // Rust pops the last scalar only when the budget is exhausted.
+          if (out.length === limit) out = Array.from(out).slice(0, -1).join("");
+          return out + "…";
+        }
+        out += ch;
+      }
+    }
+  }
+  return out;
+}
+
+function templateEmbedPreview(record, template, vars) {
+  const style = record.embed_style || { title: "Log event", color: 0xffb347 };
+  const action = (vars.action || "").trim().toLowerCase();
+  const color = style.removal_color && vars.removed && vars.removed !== "none"
+    ? style.removal_color : style.action_colors?.[action] ?? style.color;
+  const title = clipEmbedText(style.title, 256);
+  let left = 6000 - title.length;
+  const fields = [];
+  let description = "";
+  if (template === record.shipped) {
+    for (const line of template.split("\n").slice(1)) {
+      const match = line.match(/^\*\*(.*?):\*\* (.*)$/);
+      if (!match || fields.length === 25 || left < 2) continue;
+      const name = clipEmbedText(match[1], Math.min(256, left - 1));
+      left -= name.length;
+      const value = clipEmbedText(renderEmbedText(match[2], vars, 1024) || "—", Math.min(1024, left));
+      left -= value.length;
+      fields.push({ name, value });
+    }
+  } else {
+    description = renderEmbedText(template, vars, Math.min(4096, left));
+  }
+  return { title, color, description, fields };
+}
+
+function logPreviewText(text) {
+  return previewMarkdown(text);
+}
+
+function LogEmbedPreview({ embed }) {
+  return h("div", {
+    className: "log-embed",
+    style: { borderLeftColor: `#${embed.color.toString(16).padStart(6, "0")}` },
+  },
+  h("strong", { className: "log-embed-title" }, embed.title),
+  embed.description ? h("div", { className: "log-embed-description discord-markdown" }, logPreviewText(embed.description)) : null,
+  ...embed.fields.map((field, key) => h("div", { className: "log-embed-field", key },
+    h("strong", {}, field.name), h("div", { className: "discord-markdown" }, logPreviewText(field.value)),
+  )));
 }
 
 function TemplateCard({ record: t }) {
@@ -3125,19 +3199,22 @@ function TemplateCard({ record: t }) {
     spellCheck: false,
     defaultValue: t.effective,
   });
-  const preview = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? (
-    t.effective
-      .replaceAll("{user}", "Alice")
-      .replaceAll("{mention}", "@alice")
-      .replaceAll("{channel}", "#general")
-      .replaceAll("{actor}", "Bob (mod)")
-      .replaceAll("{reason}", "spam")
-      .replaceAll("{rule}", "mention_spam")
-      .replaceAll("{action}", "ban")
-      .replaceAll("{content}", "FREE NITRO http://scam.link")
-      .replaceAll("{count}", "3")
-      .replaceAll("{time}", new Date().toISOString())
-  );
+  const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
+  const preview = templateEmbedPreview(t, template, {
+    user: "Alice", user_id: "123456789012345678", mention: "@alice", channel: "#general",
+    actor: "Bob (mod)", reason: "spam", rule: "mention_spam", action: t.event === "role_change" ? "updated" : "ban",
+    content: "FREE NITRO https://example.test", count: "3", removed: "none", added: "@Member",
+    before: "Previous text", after: "Updated text", attachments: "none", coverage: "retained snapshot",
+    message_url: "https://discord.com/channels/1/2/3", time: "Nov 09, 2026 • 22:35:54 UTC",
+    account_created: "Nov 01, 2026 • 10:00:00 UTC", account_age: "1w 1d", duration: "1d",
+    joined: "Nov 08, 2026 • 22:35:54 UTC", cases: "Case #1: warning", notice: t.event === "thread_create" ? "created" : "Prior moderation",
+    retained: "2", unavailable: "1", unknown: "0", filtered: "0", omitted: "0",
+    details: "transcript attached", rule_id: "mention_spam", command: "example",
+    role: "@Member", role_id: "123456789012345679", role_name: "Member", detail: "Permissions updated",
+    before_global: "Alice", after_global: "Alice Example", thread: "#discussion",
+    thread_id: "123456789012345680", thread_name: "Discussion", archived: "false", locked: "false",
+    auto_archive: "1d", invitable: "true",
+  });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
   return h(
@@ -3155,7 +3232,7 @@ function TemplateCard({ record: t }) {
           "div",
           { className: "template-preview" },
           h("strong", {}, "Preview"),
-          h("pre", { className: "code" }, preview),
+          h(LogEmbedPreview, { embed: preview }),
         ),
       ),
       h(
@@ -5613,6 +5690,118 @@ function tabActions() {
           ),
     ),
   );
+}
+
+// Render only fixed React elements and text children: React escapes HTML before
+// it reaches the DOM. Never parse user text as HTML or use innerHTML here.
+function previewInline(text, depth = 0) {
+  if (depth >= 20) return [text];
+  const out = [];
+  const closing = (marker, start, skipCode = false) => {
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === "\\") { i++; continue; }
+      if (skipCode && text[i] === "`") {
+        const ticks = text.slice(i).match(/^`+/)[0];
+        const end = text.indexOf(ticks, i + ticks.length);
+        if (end >= 0) { i = end + ticks.length - 1; continue; }
+      }
+      if (text.startsWith(marker, i)) return i;
+    }
+    return -1;
+  };
+  for (let i = 0; i < text.length;) {
+    const key = i;
+    if (text[i] === "\\" && /[\\`*_{}[\]()#+\-.!>~|]/.test(text[i + 1] || "")) {
+      out.push(text[i + 1]); i += 2; continue;
+    }
+    if (text[i] === "`") {
+      const marker = text.slice(i).match(/^`+/)[0];
+      const end = text.indexOf(marker, i + marker.length);
+      if (end >= 0) {
+        out.push(h("code", { key }, text.slice(i + marker.length, end)));
+        i = end + marker.length; continue;
+      }
+    }
+    if (text[i] === "[") {
+      const labelEnd = closing("](", i + 1);
+      if (labelEnd >= 0) {
+        let end = labelEnd + 2, balance = 1;
+        for (; end < text.length; end++) {
+          if (text[end] === "\\") { end++; continue; }
+          if (text[end] === "(") balance++;
+          if (text[end] === ")" && --balance === 0) break;
+        }
+        if (balance === 0) {
+          const url = text.slice(labelEnd + 2, end).replace(/\\([()])/g, "$1");
+          if (/^https?:\/\/[^\s<>\\]+$/i.test(url)) {
+            out.push(h("a", { key, href: url, target: "_blank", rel: "noreferrer noopener" },
+              previewInline(text.slice(i + 1, labelEnd), depth + 1)));
+            i = end + 1; continue;
+          }
+          // An unsafe target stays literal, including any Markdown within it.
+          out.push(text.slice(i, end + 1)); i = end + 1; continue;
+        }
+      }
+    }
+    let matched = false;
+    for (const [marker, tag] of [["***", "strong"], ["**", "strong"], ["__", "u"], ["~~", "s"], ["||", "details"], ["*", "em"], ["_", "em"]]) {
+      if (!text.startsWith(marker, i)) continue;
+      const end = closing(marker, i + marker.length, true);
+      if (end <= i + marker.length) continue;
+      let children = previewInline(text.slice(i + marker.length, end), depth + 1);
+      if (marker === "***") children = h("em", {}, children);
+      out.push(marker === "||"
+        ? h(tag, { key, className: "preview-spoiler" }, h("summary", {}, "Spoiler"), children)
+        : h(tag, { key }, children));
+      i = end + marker.length; matched = true; break;
+    }
+    if (!matched) out.push(text[i++]);
+  }
+  return out;
+}
+
+function previewMarkdown(text, depth = 0) {
+  if (depth >= 20) return [text];
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  const listItem = line => line.match(/^( *)([-*]|\d+\.) (.*)$/);
+  for (let i = 0; i < lines.length;) {
+    const key = i, line = lines[i];
+    const fence = line.match(/^(`{3,})([^`]*)$/);
+    if (fence) {
+      const code = [];
+      i++;
+      while (i < lines.length && !new RegExp("^`{" + fence[1].length + ",}\\s*$").test(lines[i])) code.push(lines[i++]);
+      if (i < lines.length) i++;
+      out.push(h("pre", { key }, h("code", {}, code.join("\n")))); continue;
+    }
+    if (line.startsWith(">>> ")) {
+      const quoted = [line.slice(4), ...lines.slice(i + 1)].join("\n");
+      out.push(h("blockquote", { key }, previewMarkdown(quoted, depth + 1))); break;
+    }
+    if (line.startsWith("> ")) {
+      const quoted = [];
+      while (i < lines.length && lines[i].startsWith("> ")) quoted.push(lines[i++].slice(2));
+      out.push(h("blockquote", { key }, previewMarkdown(quoted.join("\n"), depth + 1))); continue;
+    }
+    const item = listItem(line);
+    if (item) {
+      const ordered = item[2].endsWith("."), indent = item[1].length, items = [];
+      while (i < lines.length) {
+        const next = listItem(lines[i]);
+        if (!next || next[1].length !== indent || next[2].endsWith(".") !== ordered) break;
+        const body = [next[3]], itemKey = i++;
+        while (i < lines.length && lines[i].startsWith(" ".repeat(indent + 2))) body.push(lines[i++].slice(indent + 2));
+        items.push(h("li", { key: itemKey }, previewMarkdown(body.join("\n"), depth + 1)));
+      }
+      out.push(h(ordered ? "ol" : "ul", { key, ...(ordered ? { start: Number.parseInt(item[2], 10) } : {}) }, items)); continue;
+    }
+    const heading = line.match(/^(#{1,3}|-#) (.*)$/);
+    out.push(h(heading ? heading[1] === "-#" ? "small" : "h" + heading[1].length : "div", { key },
+      line === "" ? h("br") : previewInline(heading ? heading[2] : line)));
+    i++;
+  }
+  return out;
 }
 
 capturePreviewToken();

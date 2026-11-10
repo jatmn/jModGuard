@@ -918,10 +918,7 @@ impl LogDelivery for Sink {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
         self.messages.lock().unwrap().push((
             channel,
-            serde_json::to_value(message)?["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            crate::logging::tests::log_text(&serde_json::to_value(message)?),
         ));
         Ok(())
     }

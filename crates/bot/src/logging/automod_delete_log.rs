@@ -824,7 +824,9 @@ async fn external_bulk_during_pending_delete_timeout_stays_a_plain_delete() {
         "{bodies:?}"
     );
     assert!(
-        bodies.iter().all(|body| !body.contains("Automod deleted")),
+        bodies
+            .iter()
+            .all(|body| !body.contains("Automod message deleted")),
         "{bodies:?}"
     );
 }
@@ -883,9 +885,12 @@ async fn uncertain_gateway_timeout_keeps_plain_delete_and_retained_text() {
     assert_eq!(sent[0].0, ChannelId::new(902));
     let body = sent[0].1.to_string();
     assert!(body.contains("Message deleted"), "{body}");
-    assert!(!body.contains("Automod deleted"), "{body}");
+    assert!(!body.contains("Automod message deleted"), "{body}");
     assert!(body.contains("after uncertain REST"), "{body}");
-    assert!(body.contains("**Last observed text:**"), "{body}");
+    assert_eq!(
+        sent[0].1["embeds"][0]["fields"][4]["name"],
+        "Last observed text"
+    );
 }
 
 #[test]
@@ -1210,9 +1215,11 @@ async fn account_pending_bulk(
         "{automod} {message} {bulk} {outcome:?} author={filter_author} channel={filter_channel} {bodies:?}"
     );
     let automod_logged = bodies.iter().any(|body| {
-        body.contains("901") && body.contains("Automod deleted") && body.contains("Bad words")
+        body.contains("901")
+            && body.contains("Automod message deleted")
+            && body.contains("Bad words")
     }) || bodies.iter().any(|body| {
-        !automod && message && body.contains("902") && body.contains("Automod deleted")
+        !automod && message && body.contains("902") && body.contains("Automod message deleted")
     });
     let plain_logged = bodies
         .iter()
@@ -1406,7 +1413,7 @@ async fn bulk_only_slot_saturation_replays_one_log_when_rest_fails() {
             "{bodies:?}"
         );
         assert!(
-            !bodies[0].contains("Automod deleted"),
+            !bodies[0].contains("Automod message deleted"),
             "fallback must not be labeled automod: {bodies:?}"
         );
     }
@@ -2047,7 +2054,7 @@ async fn bulk_owner_does_not_emit_again_when_an_individual_route_appears() {
     let bodies = sink_bodies(&sink);
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(bodies[0].starts_with("903 "), "{bodies:?}");
-    assert!(!bodies[0].contains("Automod deleted"), "{bodies:?}");
+    assert!(!bodies[0].contains("Automod message deleted"), "{bodies:?}");
 }
 
 #[tokio::test]
