@@ -1229,7 +1229,7 @@ mod tests {
             std::env::temp_dir().join(format!("armed_lease_{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
         db.with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "INSERT INTO meta (key, value) VALUES ('lease_probe', 'open')",
@@ -1254,7 +1254,7 @@ mod tests {
         release_active_bot(&db, &owner).await.unwrap();
         let error = db
             .with_conn(|conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 tx.ensure_mutation_receipt()?;
                 tx.execute_bounded(
                     "UPDATE meta SET value='closed' WHERE key='lease_probe'",
@@ -1280,7 +1280,7 @@ mod tests {
     async fn write_lease(db: &Db, owner: &str, expires: i64) {
         let value = format!("{owner} {expires}");
         db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "INSERT INTO meta (key, value) VALUES ('active_bot_lease', ?1)

@@ -193,7 +193,7 @@ impl GuildDataStore {
         );
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
-            let mut tx=conn.transaction_primary_read()?;
+            let mut tx=conn.transaction_primary_write()?;
             verify_scope(&tx,&expected,&scope,true)?;
             anyhow::ensure!(live(&tx,&scope,&case)?,CaseError::Conflict);
             if let Some(old)=record(&tx,&scope,&id)? {
@@ -232,7 +232,7 @@ impl GuildDataStore {
         }
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
-            let mut tx=conn.transaction_primary_read()?;
+            let mut tx=conn.transaction_primary_write()?;
             let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
             let old=record(&tx,&scope,&id)?.ok_or(CaseError::Conflict)?;
             anyhow::ensure!(old.job.case_id==case,CaseError::Conflict);
@@ -267,7 +267,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
-            let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,false)?;
+            let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,false)?;
             let old=record(&tx,&scope,&id)?.ok_or(CaseError::Conflict)?;
             anyhow::ensure!(old.job.case_id==case,CaseError::Conflict);
             if old.job.state==EvidenceState::Erased {tx.finish_read()?;return Ok(false);}
@@ -374,7 +374,7 @@ impl GuildDataStore {
         anyhow::ensure!(count > 0 && count <= limits.max_page_size, CaseError::Limit);
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
-            let mut tx=conn.transaction_primary_read()?;
+            let mut tx=conn.transaction_primary_write()?;
             let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
             anyhow::ensure!(!active,CaseError::Active);
             let any:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND cancelled=0)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;

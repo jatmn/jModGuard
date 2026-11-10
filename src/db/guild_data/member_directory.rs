@@ -1073,7 +1073,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             tx.member_execute("INSERT OR IGNORE INTO guild_member_pending_bans(guild_id,enrollment_id,user_id,operation_id,started_at_ms,retry_after_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,operation_id,now_ms,now_ms.saturating_add(300_000)])?;tx.commit()
         }).await
     }
@@ -1094,7 +1094,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         let operation_id = operation_id.to_string();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let started:Option<i64>=tx.query_row("SELECT started_at_ms FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND operation_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,operation_id.as_str()],|r|Ok(r.get(0)?)).optional()?;
             let Some(started)=started else {tx.finish_read()?;return Ok(())};
             match outcome {
@@ -1137,7 +1137,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let current:Option<i64>=tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id],|r|Ok(r.get(0)?)).optional()?;
             anyhow::ensure!(current==candidate.revision,MemberSyncError::Stale);
             let removed=tx.member_execute("DELETE FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND operation_id=?4 AND started_at_ms=?5",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id,candidate.operation_id,candidate.started_at_ms])?;
@@ -1164,7 +1164,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let changed=tx.member_execute("UPDATE guild_member_pending_bans SET retry_after_ms=?6 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND operation_id=?4 AND started_at_ms=?5",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id,candidate.operation_id,candidate.started_at_ms,next_attempt_at_ms])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
         }).await
@@ -1185,7 +1185,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,bot_id)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,bot_id)?;
             let (after,done):(Option<String>,bool)=tx.query_row("SELECT case_backfill_after,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if done {tx.finish_read()?;return Ok(true)}
             let legacy_cases: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 LIMIT 1)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
@@ -1270,7 +1270,7 @@ impl GuildDataStore {
             let (writer_generation, admitted_owner) =
                 coverage_gap_writer_prelude(core.as_ref(), conn)?;
             run_coverage_gap_after_writer_fence_hook(&hook_database);
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             // The shared guild probe reads the lease twice so a test can change
             // it between those reads. The second snapshot does not fit in this
             // mark's remote lifetime, so commit checks the admitted owner once.
@@ -1342,7 +1342,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+            let mut tx=conn.transaction_primary_write()?; verify_scope(&tx,&expected,&scope,true)?;
             let admission=tx.query_row("SELECT enrollment_id,seed_admitted FROM guild_member_feature WHERE guild_id=?1",params![scope.guild_id()],|r|Ok((r.get::<String>(0)?,r.get::<bool>(1)?))).optional()?;
             let eligible=matches!(admission,Some((ref id,false)) if id==&scope.enrollment.id);
             if ensure_seed_bot(&tx,&scope,bot_id)?.is_none() && eligible {
@@ -1446,7 +1446,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         anyhow::ensure!(guild > 0 && fenced_at_ms > 0, MemberSyncError::Invalid);
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 tx.ensure_mutation_receipt()?;
                 tx.execute_rows(
                     "INSERT INTO guild_local_write_fence(guild_id, fenced_at_ms) VALUES(?1, ?2)
@@ -1487,7 +1487,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx=conn.transaction_primary_read()?;
+            let mut tx=conn.transaction_primary_write()?;
             verify_scope(&tx,&expected,&scope,true)?;
             ensure_seed_bot(&tx,&scope,bot_id)?;
             let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND run_kind='initial' AND phase='members' AND status='queued' AND processed=0 AND last_progress_at_ms IS NULL AND total_estimate IS NULL AND started_at_ms BETWEEN ?4 AND ?5)",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,now_ms.saturating_sub(60_000),now_ms],|r|Ok(r.get(0)?))?;
@@ -1508,7 +1508,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 tx.ensure_mutation_receipt()?;
                 let outcome = upsert_member(&tx, &scope, &observation, "observed")?;
@@ -1588,7 +1588,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         let stay_id = stay_id.to_owned();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 tx.ensure_mutation_receipt()?;
                 tx.member_execute(
@@ -1666,7 +1666,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+            let mut tx=conn.transaction_primary_write()?; verify_scope(&tx,&expected,&scope,true)?;
             let row=tx.query_row("SELECT is_current,joined_at_ms,current_stay_id,ever_banned,revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],|r|Ok((r.get::<bool>(0)?,r.get::<Option<i64>>(1)?,r.get::<Option<String>>(2)?,r.get::<bool>(3)?,r.get::<i64>(4)?))).optional()?;
             let Some((current,joined,stay,retained,revision))=row else {
                 // A remove observed while the first roster page is in flight
@@ -1831,7 +1831,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             .transpose()?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| { let mut tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn| { let mut tx=conn.transaction_primary_write()?; verify_scope(&tx,&expected,&scope,true)?;
             let old=tx.query_row("SELECT is_banned,ban_observed_at_ms,revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],|r|Ok((r.get::<bool>(0)?,r.get::<Option<i64>>(1)?,r.get::<i64>(2)?))).optional()?;
             if let Some((state,time,revision))=old {
                 if time.is_some_and(|v|v>observed_at_ms || (v==observed_at_ms && state!=banned)) {
@@ -2650,7 +2650,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
             let completed=ensure_seed_bot(&tx,&scope,bot_id)?.flatten();
             if completed.is_none(){tx.finish_read()?;return Ok(None)}
             let row=tx.query_row("SELECT run_id,cursor,generation,lease_owner,lease_until_ms,next_attempt_at_ms,request_after_ms,status,started_at_ms,status_reason FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<Option<String>>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?,r.get::<Option<i64>>(4)?,r.get::<Option<i64>>(5)?,r.get::<Option<i64>>(6)?,r.get::<String>(7)?,r.get::<i64>(8)?,r.get::<Option<String>>(9)?))).optional()?;
@@ -2683,7 +2683,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,claim.bot_id)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;ensure_seed_bot(&tx,&scope,claim.bot_id)?;
             let row=tx.query_row("SELECT run_id,cursor,generation,lease_owner,lease_until_ms FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id],|r|Ok((r.get::<String>(0)?,r.get::<Option<String>>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?,r.get::<Option<i64>>(4)?))).optional()?;
             anyhow::ensure!(row.is_some_and(|(run,cursor,generation,owner,until)|run==claim.run_id && cursor==claim.cursor && generation==claim.generation && owner.as_deref()==Some(claim.worker_id.as_str()) && until.is_some_and(|v|v>=now_ms)),MemberSyncError::Stale);
             tx.ensure_mutation_receipt()?;ingest_member_audits(&tx,&scope,claim.bot_id,&audits,now_ms)?;
@@ -2712,7 +2712,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let state=if reason=="permission_denied"||reason=="pagination_stalled"{"needs_attention"}else{"waiting"};
             let changed=tx.member_execute("UPDATE guild_member_audit_recovery SET status=?9,status_reason=?4,next_attempt_at_ms=?5,request_after_ms=MAX(coalesce(request_after_ms,0),?5),lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND run_id=?6 AND generation=?7 AND lease_owner=?8",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id,reason,next_attempt_at_ms,claim.run_id,claim.generation,claim.worker_id,state])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
@@ -2735,7 +2735,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         let reason = reason.to_string();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let revision:i64=tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],|r|Ok(r.get(0)?)).optional()?.unwrap_or(-1);
             queue_target_check_tx(&tx,&scope,user_id,kind,&reason,revision,now_ms)?;tx.commit()
         }).await
@@ -2753,7 +2753,7 @@ impl GuildDataStore {
         anyhow::ensure!(now_ms > 0, MemberSyncError::Invalid);
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn| {let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
             let saved=tx.query_row("SELECT row_revision,reason,requested_at_ms,expected_stay_id FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,check.kind.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<String>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?))).optional()?;
             if !saved.as_ref().is_some_and(|(revision,reason,requested,stay)| *revision==check.revision && reason==&check.reason && *requested==check.requested_at_ms && stay==&check.expected_stay_id) {
                 tx.finish_read()?;return Ok(false);
@@ -2801,7 +2801,7 @@ impl GuildDataStore {
             MemberSyncError::Invalid
         );
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
             let saved=tx.query_row("SELECT row_revision,reason,requested_at_ms,expected_stay_id FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,check.kind.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<String>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?))).optional()?;
             anyhow::ensure!(saved.as_ref().is_some_and(|(revision,reason,requested,stay)| *revision==check.revision && reason==&check.reason && *requested==check.requested_at_ms && stay==&check.expected_stay_id) && verification.revision==check.revision,MemberSyncError::Stale);
             let actual=tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id],|r|Ok(r.get::<i64>(0)?)).optional()?;
@@ -2843,7 +2843,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let changed=tx.member_execute("UPDATE guild_member_target_checks SET next_attempt_at_ms=?5 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind=?4 AND row_revision IS ?6 AND expected_stay_id IS ?7 AND requested_at_ms=?8",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,check.kind.as_str(),next_attempt_at_ms,check.revision,check.expected_stay_id.as_deref(),check.requested_at_ms])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
         }).await
@@ -2856,7 +2856,7 @@ impl GuildDataStore {
     ) -> Result<Option<MemberCleanupCandidate>> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
             // A real departure is eligible after its grace. Keep affected-user
             // checks paced during initial import, but retain the saved stay
             // until available ban/audit and local case history are processed.
@@ -2891,7 +2891,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let row=tx.query_row("SELECT is_current,is_banned,ever_banned,revision,cleanup_after_ms,cleanup_member_checked_at_ms FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id],|r|Ok((r.get::<bool>(0)?,r.get::<bool>(1)?,r.get::<bool>(2)?,r.get::<i64>(3)?,r.get::<Option<i64>>(4)?,r.get::<Option<i64>>(5)?))).optional()?;
             let Some((current,was_banned,retained,rev,deadline,checked_at))=row else{return Err(MemberSyncError::Stale.into())};
             anyhow::ensure!(!current && !was_banned && !retained && rev==candidate.revision && deadline.is_some_and(|v|v<=now_ms),MemberSyncError::Stale);
@@ -2918,7 +2918,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let changed=tx.member_execute("UPDATE guild_member_directory SET cleanup_after_ms=?5,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND revision=?4 AND is_current=0 AND is_banned=0 AND ever_banned=0",params![scope.guild_id(),scope.enrollment.id.as_str(),candidate.user_id,candidate.revision,next_attempt_at_ms])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);bump_revision(&tx,&scope)?;tx.commit()
         }).await
@@ -3208,7 +3208,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| { let mut tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?; ensure_seed_bot(&tx,&scope,bot_id)?;
+        self.db.with_conn(move |conn| { let mut tx=conn.transaction_primary_write()?; verify_scope(&tx,&expected,&scope,true)?; ensure_seed_bot(&tx,&scope,bot_id)?;
             let row=tx.query_row("SELECT run_id,phase,cursor,generation,lease_owner,lease_until_ms,next_attempt_at_ms,request_after_ms,status,started_at_ms FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?,r.get::<i64>(3)?,r.get::<Option<String>>(4)?,r.get::<Option<i64>>(5)?,r.get::<Option<i64>>(6)?,r.get::<Option<i64>>(7)?,r.get::<String>(8)?,r.get::<i64>(9)?))).optional()?;
             let Some((run_id,phase,cursor,generation,owner,until,next,request_after,state,started_at))=row else {tx.finish_read()?;return Ok(None)};
             if !matches!(state.as_str(),"queued"|"running"|"waiting") || next.is_some_and(|v|v>now_ms) || request_after.is_some_and(|v|v>now_ms) || owner.is_some()&&until.is_some_and(|v|v>now_ms) {tx.finish_read()?;return Ok(None)}
@@ -3249,7 +3249,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn| {let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
             let row=tx.query_row("SELECT run_id,phase,cursor,generation,lease_owner,lease_until_ms,run_kind,processed FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?,r.get::<i64>(3)?,r.get::<Option<String>>(4)?,r.get::<Option<i64>>(5)?,r.get::<String>(6)?,r.get::<i64>(7)?))).optional()?;
             let current_revision:i64=tx.query_row("SELECT directory_revision FROM guild_member_seed WHERE guild_id=?1",params![scope.guild_id()],|r|Ok(r.get(0)?))?;
             let Some((run,phase,cursor,generation,owner,until,run_kind,processed_before))=row else {return Err(MemberSyncError::Stale.into())};
@@ -3309,7 +3309,7 @@ impl GuildDataStore {
                 if run_kind=="reconcile" {tx.member_execute("UPDATE guild_member_seed SET reconciliation_needed=0,reconciliation_reason=NULL,gap_at_ms=NULL WHERE guild_id=?1 AND gap_generation=(SELECT reconcile_gap_generation FROM guild_member_sync WHERE guild_id=?1)",params![scope.guild_id()])?;}
             }
             if settled && run_kind=="initial" {tx.member_execute("INSERT OR IGNORE INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),?2,'queued',?2 FROM guild_member_seed WHERE guild_id=?1 AND reconciliation_needed=1 AND initial_completed_at_ms IS NOT NULL",params![scope.guild_id(),now_ms])?;}
-            tx.commit()?;let read=conn.transaction_primary_read()?;verify_scope(&read,&expected,&scope,true)?;let out=status(&read,&scope,claim.bot_id,now_ms,true)?;read.finish_read()?;Ok(out)
+            tx.commit()?;let read=conn.transaction_primary_write()?;verify_scope(&read,&expected,&scope,true)?;let out=status(&read,&scope,claim.bot_id,now_ms,true)?;read.finish_read()?;Ok(out)
         }).await
     }
 
@@ -3328,7 +3328,7 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
             let state=if reason=="permission_denied"||reason=="pagination_stalled"{"needs_attention"}else{"waiting"};
             let changed=tx.member_execute("UPDATE guild_member_sync SET status=?11,status_reason=?4,next_attempt_at_ms=?5,request_after_ms=MAX(coalesce(request_after_ms,0),?5),lease_owner=NULL,lease_until_ms=NULL,progress_revision=progress_revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND run_id=?6 AND generation=?7 AND lease_owner=?8 AND phase=?9 AND cursor IS ?10",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id,reason,next_attempt_at_ms,claim.run_id,claim.generation,claim.worker_id,claim.phase.as_str(),claim.cursor,state])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
@@ -3350,11 +3350,11 @@ impl GuildDataStore {
         );
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;let completed=ensure_seed_bot(&tx,&scope,bot_id)?.ok_or(MemberSyncError::Stale)?;
+        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;let completed=ensure_seed_bot(&tx,&scope,bot_id)?.ok_or(MemberSyncError::Stale)?;
             let current=tx.query_row("SELECT run_kind,status,last_operation_key,lease_until_ms FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?,r.get::<Option<i64>>(3)?))).optional()?;
             let Some((kind,state,last_key,lease_until))=current else {return Err(MemberSyncError::MissingJob.into())};
             let audit_stalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled')",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok(r.get(0)?))?;
-            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state=="complete") || (action==MemberSyncAction::Retry && state=="complete" && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms,true)?;read.finish_read()?;return Ok(out)}
+            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state=="complete") || (action==MemberSyncAction::Retry && state=="complete" && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_write()?;let out=status(&read,&scope,bot_id,now_ms,true)?;read.finish_read()?;return Ok(out)}
             let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>matches!(state.as_str(),"needs_attention"|"waiting")||(state=="running"&&lease_until.is_some_and(|until|until<now_ms))||(state=="complete"&&audit_stalled),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
             anyhow::ensure!(allowed,MemberSyncError::Invalid);
             tx.ensure_mutation_receipt()?;

@@ -54,7 +54,7 @@ async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
         .await
         .unwrap();
     let (count, logical, sum): (i64, i64, i64) = store.db.with_conn_sync(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let health = tx.query_row("SELECT snapshot_count,snapshot_logical_bytes FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get::<i64>(0)?, r.get::<i64>(1)?)))?;
         let sum = tx.query_row("SELECT COALESCE(SUM(encoded_bytes),0) FROM guild_message_snapshots", (), |r| Ok(r.get::<i64>(0)?))?;
         tx.finish_read()?;
@@ -82,7 +82,7 @@ async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
         1
     );
     let counters: (i64, i64, i64, i64, i64) = store.db.with_conn_sync(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_write()?;
         let row = tx.query_row("SELECT snapshot_count,snapshot_logical_bytes,estimated_snapshot_bytes,expired_count,evicted_count FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         tx.finish_read()?;
         Ok(row)
@@ -354,7 +354,7 @@ async fn stale_delete_clock_cannot_report_expired_snapshot() {
     let guild = scope.guild_id();
     let enrollment = scope.enrollment.id.clone();
     store.db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
             "INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,author_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes,reservation_bytes) VALUES(?1,?2,20,93,30,'expired',?3,?4,?4,?5,1,7,0)",
@@ -421,7 +421,7 @@ async fn same_size_edit_near_budget_does_not_recharge_row_reserve() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "UPDATE guild_snapshot_health SET estimated_snapshot_bytes=?1 WHERE singleton=1",
@@ -456,7 +456,7 @@ async fn consumed_snapshot_invalidates_physical_sample() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "UPDATE guild_snapshot_health SET physical_sample_at_ms=?1,physical_sample_bytes=?2 WHERE singleton=1",
@@ -499,7 +499,7 @@ async fn conservative_debt_cannot_exceed_fresh_whole_file_bound() {
         SnapshotOutcome::Stored
     );
     store.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
             "UPDATE guild_snapshot_health SET physical_debt_bytes=?1,physical_sample_at_ms=?2 WHERE singleton=1",
@@ -1330,7 +1330,7 @@ async fn capture_batch_pressure_split_makes_no_partial_writes() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded(
                 "UPDATE guild_snapshot_health SET estimated_snapshot_bytes=?1 WHERE singleton=1",

@@ -13,7 +13,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 verify_identity(&tx, &expected)?;
                 let bound: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM guild_bindings WHERE guild_id=?1)",
@@ -57,7 +57,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
                 anyhow::ensure!(!active, CaseError::Active);
                 let snapshots: i64 = tx.query_row(

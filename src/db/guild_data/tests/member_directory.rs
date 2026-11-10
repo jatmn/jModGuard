@@ -122,7 +122,7 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
             .len(),
         1
     );
-    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=10 AND case_id='cccccccccccccccccccccccccccccccc'",())?;tx.commit()}).await.unwrap();
+    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_write()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=10 AND case_id='cccccccccccccccccccccccccccccccc'",())?;tx.commit()}).await.unwrap();
     assert!(
         store
             .member_history(scope.clone(), 77, None, 50)
@@ -134,7 +134,7 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.member_execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
@@ -195,7 +195,7 @@ async fn long_request_lease_commits_member_and_audit_pages_after_ninety_seconds(
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute(
                 "UPDATE guild_member_seed SET initial_completed_at_ms=121001 WHERE guild_id=10",
@@ -429,7 +429,7 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.member_execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
@@ -528,7 +528,7 @@ async fn pending_ban_fences_cleanup_until_verified_or_failed() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute(
                 "UPDATE guild_member_seed SET initial_completed_at_ms=2000,case_backfill_done=1 WHERE guild_id=10",
@@ -661,7 +661,7 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute(
                 "UPDATE guild_member_seed SET initial_completed_at_ms=2000 WHERE guild_id=10",
@@ -1599,7 +1599,7 @@ async fn retry_requeues_audit_pagination_stall_after_initial_complete() {
         .await
         .unwrap();
     store.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.member_execute(
             "UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",
@@ -1650,7 +1650,7 @@ async fn retry_does_not_resume_paused_reconciliation_for_stalled_audit() {
         .await
         .unwrap();
     store.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10", ())?;
         tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=5000 WHERE guild_id=10", ())?;
@@ -1929,7 +1929,7 @@ async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion()
             .unwrap()
             .is_some()
     );
-    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",())?;tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=10",())?;tx.commit()}).await.unwrap();
+    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_write()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",())?;tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=10",())?;tx.commit()}).await.unwrap();
     store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 6_000)
         .await
@@ -2736,7 +2736,7 @@ async fn eligible_first_status_is_queued_but_admitted_missing_metadata_fails_clo
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.commit()
@@ -3764,7 +3764,7 @@ async fn admitted_missing_sync_job_rejects_controls_without_reseeding() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.commit()
@@ -5294,7 +5294,7 @@ async fn linking_an_audit_that_is_already_attached_still_retains_the_unban() {
     store
         .db
         .with_conn(|conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             tx.ensure_mutation_receipt()?;
             tx.member_execute(
                 "UPDATE guild_member_directory SET ever_banned=0 WHERE guild_id=10 AND user_id=71",
@@ -6514,7 +6514,7 @@ async fn assert_restore_fence_after_admission_rolls_back(
                     local_for_hook
                         .db
                         .with_conn(move |conn| {
-                            let mut tx = conn.transaction_primary_read()?;
+                            let mut tx = conn.transaction_primary_write()?;
                             tx.ensure_mutation_receipt()?;
                             if !meta_present {
                                 tx.execute_batch_bounded(
@@ -6996,7 +6996,7 @@ async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
                     store_for_bump
                         .db
                         .with_conn(|conn| {
-                            let mut tx = conn.transaction_primary_read()?;
+                            let mut tx = conn.transaction_primary_write()?;
                             tx.ensure_mutation_receipt()?;
                             tx.member_execute(
                                 "UPDATE guild_member_seed SET directory_revision=directory_revision+1 WHERE guild_id=10",
@@ -7051,7 +7051,7 @@ async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
                     store_for_bump
                         .db
                         .with_conn(|conn| {
-                            let mut tx = conn.transaction_primary_read()?;
+                            let mut tx = conn.transaction_primary_write()?;
                             tx.ensure_mutation_receipt()?;
                             tx.member_execute(
                                 "UPDATE guild_member_seed SET directory_revision=directory_revision+1,reconciliation_needed=1,reconciliation_reason='foreign_gap' WHERE guild_id=10",

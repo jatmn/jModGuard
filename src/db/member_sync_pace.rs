@@ -31,7 +31,7 @@ pub async fn claim_member_sync_request(
         "invalid member sync request claim"
     );
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         let row = tx.query_row(
             "SELECT request_after_ms,lease_owner,lease_until_ms,generation FROM member_sync_pacing WHERE bot_id=?1",
             params![bot_id],
@@ -71,7 +71,7 @@ pub async fn extend_member_sync_request_after(
         "invalid member sync pacing deadline"
     );
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_rows(
             "INSERT INTO member_sync_pacing(bot_id,request_after_ms) VALUES(?1,?2)
@@ -90,7 +90,7 @@ pub async fn finish_member_sync_request(
 ) -> Result<bool> {
     anyhow::ensure!(request_after_ms > 0, "invalid member sync pacing deadline");
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         let changed = tx.execute_matching(
             "UPDATE member_sync_pacing SET request_after_ms=MAX(request_after_ms,?4),lease_owner=NULL,lease_until_ms=NULL
