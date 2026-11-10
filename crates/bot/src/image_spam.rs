@@ -3909,6 +3909,7 @@ mod tests {
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
             known_bad_hashes: BTreeSet::new(),
+            known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
         };
@@ -7923,6 +7924,7 @@ mod tests {
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
             known_bad_hashes: BTreeSet::new(),
+            known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
         };

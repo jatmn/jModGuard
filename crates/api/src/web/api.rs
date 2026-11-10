@@ -144,6 +144,7 @@ pub async fn guild_config(
         "rules": rules,
         "badwords": badwords,
         "known_bad_images": snapshot.known_bad_images,
+        "known_spam": snapshot.known_spam,
         "commands": commands,
         "templates": templates,
         "log_channels": log_channels,
@@ -1512,4 +1513,72 @@ pub async fn remove_known_bad_image(
     Ok(Json(
         serde_json::json!({"ok": true, "changed": result["changed"]}),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownSpamBody {
+    scope: Option<String>,
+    kind: String,
+    value: String,
+    note: Option<String>,
+}
+
+pub async fn add_known_spam(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<KnownSpamBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let target = scope_from(&app, &auth, &body.scope, guild_id)?;
+    let write = super::configuration_write_scope(&app, &auth, guild_id, target)?;
+    let entry = jmodguard::known_spam::Entry::new(&body.kind, &body.value, body.note.as_deref())?;
+    let (request, target) = write.to_wires();
+    let (_, id) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::AddKnownSpam {
+                request,
+                target,
+                kind: entry.kind,
+                value: entry.value,
+                note: entry.note,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({"ok": true, "id": id})))
+}
+
+pub async fn delete_known_spam(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, id)): Path<(u64, i64)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let not_found = || ApiError(anyhow::anyhow!("known spam entry not found"));
+    let Some(entry) = db::get_known_spam_primary(&app.db, id).await? else {
+        return Err(not_found());
+    };
+    if !(entry.guild_id == GLOBAL_SCOPE && is_bot_owner(&app, &auth)
+        || entry.guild_id != GLOBAL_SCOPE && entry.guild_id == guild_id as i64)
+    {
+        return Err(not_found());
+    }
+    let write = super::configuration_write_scope(&app, &auth, guild_id, entry.guild_id)?;
+    let (request, target) = write.to_wires();
+    app.commit_json_actor(
+        dashboard_actor(&auth),
+        db::ControlOp::DeleteKnownSpam {
+            request,
+            target,
+            id,
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({"ok":true})))
 }

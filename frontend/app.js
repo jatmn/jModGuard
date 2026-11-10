@@ -140,6 +140,7 @@ function App() {
     ["dashboard", "◈", "Dashboard"],
     ["rules", "◇", "Automod Rules"],
     ["badwords", "⊘", "Badwords"],
+    ["known-spam", "⊗", "Known spam"],
     ["known-bad-images", "▧", "Known-bad images"],
     ["commands", "⌘", "Commands"],
     ["templates", "≡", "Templates"],
@@ -391,6 +392,7 @@ function Content() {
     dashboard: tabDashboard,
     rules: tabRules,
     badwords: tabBadwords,
+    "known-spam": tabKnownSpam,
     "known-bad-images": tabKnownBadImages,
     commands: tabCommands,
     templates: tabTemplates,
@@ -534,6 +536,7 @@ const tabs = [
   "dashboard",
   "rules",
   "badwords",
+  "known-spam",
   "known-bad-images",
   "commands",
   "templates",
@@ -786,7 +789,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -794,6 +797,7 @@ function pageEnrollment(path, method = "GET") {
       [
         "rules",
         "badwords",
+        "known-spam",
         "known-bad-images",
         "commands",
         "templates",
@@ -837,7 +841,7 @@ function throwApiFailure(data, status, retryAfterMs) {
 
 async function api(path, method = "GET", body = null, signal, reconcileRecovered) {
   const save = ["POST", "PUT"].includes(method) &&
-    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
+    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-spam|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
     (method !== "POST" || body !== null);
   if (save) return submitSave(path, method, body, signal, reconcileRecovered);
   return apiRequest(path, method, body, signal);
@@ -1743,7 +1747,7 @@ function newCustomRuleDraft() {
 }
 
 function tabRules() {
-  const rules = state.config.rules;
+  const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam");
   return h(
     "div",
     {},
@@ -2062,6 +2066,7 @@ function RuleEditor({ record: r }) {
   const spam = spamRule(r.rule_id);
   const textRule = r.rule_id === "repeat_text";
   const image = r.rule_id === "attachment_flood";
+  const knownSpam = r.rule_id === "known_spam";
   const imageChannelsRef = useRef(null);
   const imageChannels = h(Input, {
     ref: imageChannelsRef,
@@ -2257,8 +2262,10 @@ function RuleEditor({ record: r }) {
         )
       : r.rule_id === "badword"
         ? h("p", { className: "field-help" }, "Manage words and advanced regex in Badwords. These settings apply to that saved list.")
-        : detectionFields,
-    spam
+        : knownSpam
+          ? h("p", { className: "field-help" }, "First match: Ban and purge the previous hour (3600 seconds). No strike ladder. Manage samples and URLs on Known spam.")
+          : detectionFields,
+    spam || knownSpam
       ? null
       : field(
           "Action escalation",
@@ -2347,7 +2354,7 @@ function RuleEditor({ record: r }) {
                   throw new Error(
                     "Channels must be 2–10 and window 1–600 seconds, all whole numbers. Images 1–10. Text length 1–2000.",
                   );
-              } else if (r.rule_id !== "badword") {
+              } else if (r.rule_id !== "badword" && !knownSpam) {
                 const params = {};
                 for (const [key, label] of numberParams) {
                   const input = numberParamsRef.current[key];
@@ -5339,6 +5346,62 @@ function tabEvents() {
     ),
   );
 }
+const STOCKS_SPAM_EXAMPLE = "📈 **Looking for a community focused on stocks and trading?**\n\nJoin our growing community to learn from experienced investors, share market insights, discuss stock ideas, and exchange trading strategies.\nNo spam or aggressive promotion—just practical market discussions.\nWe welcome active investors and value your thoughts and feedback.\n👇 Interested? Join us here:";
+const AI_SPAM_EXAMPLE = "I used to work as Full Stack AI developer at several software companies but I’m currently available and working remotely because my last contract ended. Right now I am resting at home. If you have any AI projects or need support, I’d be happy to help, just reach out.";
+
+function tabKnownSpam() {
+  const { drafts } = useStore(ui);
+  const scopeRef = useRef(null);
+  const guildId = state.guildId;
+  const rows = state.config.known_spam || [];
+  const rule = (state.config.rules || []).find((r) => r.rule_id === "known_spam");
+  const add = async (kind) => {
+    const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
+    const value = drafts[key]?.value || "";
+    if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
+    await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam`, "POST", {
+      scope: scopeRef.current.value, kind, value, note: drafts["known-spam:note"]?.value || null,
+    }), () => toast("Known spam entry added", "success"));
+  };
+  return h("div", null,
+    h("h2", null, "Known spam"),
+    h("p", { className: "muted" }, "Save full confirmed spam messages or URL wildcards. First match bans and purges Discord’s Previous Hour (3600 seconds). Dry-run only logs. The list uses the rule’s enable, skip lists and skip-moderators settings below. Global entries apply to every server; only the bot owner can edit them."),
+    h("p", { className: "field-help" }, "Samples match the whole message, using the same raw, normalized and whitespace-stripped forms as Badwords (case, accents, zero-width characters and supported leetspeak). A lightly rewritten pitch may not match. Quoting or adding different text does not match a sample; URL patterns still apply."),
+    rule ? ruleCard(rule) : null,
+    h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border" },
+      h("div", { className: "card-body" },
+        field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
+        field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
+        field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." })),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note"], onClick: () => add("sample") }, "Add sample"),
+        field("URL wildcard (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:url", "data-url": true, maxLength: 512, placeholder: "tinyurl.com/*" })),
+        h("p", { className: "field-help" }, "HTTP/HTTPS scheme is optional and ignored. Hosts ignore case; tinyurl.com/* matches that exact host, not subdomains. *.example.com/* matches subdomains only. Omitted path means /*. Paths are case-sensitive; * matches zero or more characters, including /. Query and fragment are ignored in links and forbidden in patterns. No regex, credentials or ports in patterns. Bare domain links also match. Up to 1024 entries per scope; normalized duplicates are rejected."),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note"], onClick: () => add("url") }, "Add URL pattern"),
+      ),
+    ),
+    h("details", { className: "card bg-base-100 card-border" },
+      h("summary", null, "Paste-as-sample examples (not active until saved)"),
+      h("p", null, "Copy the full owner sample you want to save into the sample field. These examples are not preloaded entries."),
+      h("pre", { style: { whiteSpace: "pre-wrap" } }, STOCKS_SPAM_EXAMPLE),
+      h("pre", { style: { whiteSpace: "pre-wrap" } }, AI_SPAM_EXAMPLE),
+    ),
+    h(DataTable, { headings: ["Type", "Sample or URL pattern", "Note", "Scope", "Actions"] },
+      rows.length ? rows.map((row) => h("tr", { key: row.id },
+        h("td", null, row.kind === "url" ? "URL" : "Sample"),
+        h("td", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.value),
+        h("td", null, row.note || "—"), h("td", null, row.guild_id === "0" ? "Global" : "This server"),
+        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(ActionButton, { className: "btn btn-sm",
+          onClick: async () => {
+            if (!confirm("Remove this known spam entry?")) return;
+            await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
+            if (state.guildId === guildId && await loadConfig()) renderTab();
+          },
+        }, "Remove") : "Owner only"),
+      )) : h("tr", null, h("td", { colSpan: 5, className: "muted" }, "No known spam entries.")),
+    ),
+  );
+}
+
 function tabKnownBadImages() {
   const [query, setQuery] = useState("");
   const { drafts } = useStore(ui);

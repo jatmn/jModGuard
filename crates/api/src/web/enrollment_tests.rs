@@ -5605,3 +5605,103 @@ async fn maximal_badword_batch_http_ack_is_compact_and_recovers_saved_ids() {
         assert_eq!(row.note.as_deref(), body["note"].as_str());
     }
 }
+
+#[tokio::test]
+async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    for body in [
+        r#"{"kind":"sample","value":" "}"#,
+        r#"{"kind":"url","value":"*"}"#,
+        r#"{"kind":"url","value":"example.*/*"}"#,
+        r#"{"kind":"sample","value":"sample","unexpected":true}"#,
+    ] {
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", body).await;
+        assert!(status.is_client_error());
+    }
+    for (kind, value, note) in [
+        ("sample", "a".repeat(4097), None),
+        ("url", format!("example.com/{}", "a".repeat(512)), None),
+        ("sample", "sample".into(), Some("n".repeat(513))),
+        ("sample", "sample".into(), Some("bad\nnote".into())),
+    ] {
+        let body = serde_json::json!({"kind":kind,"value":value,"note":note}).to_string();
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    for (scope, kind, value, note) in [
+        (
+            "guild",
+            "sample",
+            "Full Stack AI developer pitch",
+            Some("owner note"),
+        ),
+        ("global", "url", "tinyurl.com/*", None),
+    ] {
+        let input =
+            serde_json::json!({"scope":scope,"kind":kind,"value":value,"note":note}).to_string();
+        let (status, body) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"].as_i64().unwrap();
+        let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, cfg) = f.request("POST", "/api/guilds/10/config", "").await;
+        let rows = cfg["known_spam"].as_array().unwrap();
+        let wire_id = id.to_string();
+        let row = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(wire_id.as_str()))
+            .unwrap();
+        assert_eq!(row["value"], value);
+        assert_eq!(row["note"], serde_json::json!(note));
+        let (status, body) = f
+            .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = f
+        .request_token(
+            "POST",
+            "/api/guilds/10/known-spam",
+            r#"{"kind":"sample","value":"stale"}"#,
+            Some("old-membership"),
+        )
+        .await;
+    assert!(status.is_client_error());
+}
+
+#[tokio::test]
+async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let global_write = db::ConfigurationWriteScope::new(
+        db::ConfigurationScope::Global,
+        db::ConfigurationScope::Global,
+    )
+    .unwrap();
+    let global = db::add_enrolled_known_spam(&f.app.db, global_write, "url", "tinyurl.com/*", None)
+        .await
+        .unwrap();
+    let other =
+        db::ConfigurationScope::Guild(db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap());
+    let other = db::ConfigurationWriteScope::new(other.clone(), other).unwrap();
+    let foreign = db::add_enrolled_known_spam(&f.app.db, other, "sample", "foreign sample", None)
+        .await
+        .unwrap();
+    for id in [global, foreign, i64::MAX] {
+        let (status, body) = f
+            .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "known spam entry not found");
+    }
+    let (status, _) = f
+        .request(
+            "POST",
+            "/api/guilds/10/known-spam",
+            r#"{"scope":"global","kind":"sample","value":"global sample"}"#,
+        )
+        .await;
+    assert!(status.is_client_error());
+}

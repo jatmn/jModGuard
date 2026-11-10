@@ -1486,6 +1486,14 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
                 .delete(api::delete_rule),
         )
         .route(
+            "/api/guilds/{guild_id}/known-spam",
+            axum::routing::post(api::add_known_spam),
+        )
+        .route(
+            "/api/guilds/{guild_id}/known-spam/{id}",
+            axum::routing::delete(api::delete_known_spam),
+        )
+        .route(
             "/api/guilds/{guild_id}/badwords",
             get(api::list_badwords).post(api::add_badword),
         )

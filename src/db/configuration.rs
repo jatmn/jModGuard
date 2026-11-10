@@ -1126,6 +1126,7 @@ pub struct ConfigParts {
     pub log_filters: std::collections::HashMap<String, LogFilter>,
     pub badwords: Vec<String>,
     pub known_bad_images: Vec<KnownBadImage>,
+    pub known_spam: Vec<crate::known_spam::Entry>,
 }
 
 /// Raw and effective data needed by one WebUI config response. Every field is
@@ -1139,6 +1140,7 @@ pub struct WebConfigSnapshot {
     pub global_rules: std::collections::HashMap<String, RuleDef>,
     pub badwords: Vec<Badword>,
     pub known_bad_images: Vec<KnownBadImage>,
+    pub known_spam: Vec<crate::known_spam::Entry>,
     pub guild_commands: std::collections::HashMap<String, CommandDef>,
     pub global_commands: std::collections::HashMap<String, CommandDef>,
     pub guild_templates: std::collections::HashMap<String, String>,
@@ -1208,6 +1210,9 @@ SELECT
         'added_via', added_via, 'actor', actor, 'note', note))
      FROM (SELECT hash, added_at, added_via, actor, note FROM known_bad_images
            WHERE guild_id = ?1 ORDER BY hash LIMIT 1024))
+  ,(SELECT json_group_array(json_object('id',id,'guild_id',guild_id,'kind',kind,'value',value,'note',note))
+     FROM (SELECT id,guild_id,kind,value,note FROM known_spam
+           WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1225,6 +1230,7 @@ struct ConfigurationSnapshotRows {
     guild_log_filters: std::collections::HashMap<String, LogFilter>,
     badwords: Vec<Badword>,
     known_bad_images: Vec<KnownBadImage>,
+    known_spam: Vec<crate::known_spam::Entry>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
 }
 
@@ -1331,6 +1337,7 @@ fn load_configuration_snapshot_conn(
                     row.get(22)?,
                     "known_bad_images",
                 )?),
+                known_spam: parse_json_vec(row.get(23)?, "known_spam")?,
                 nickname_reconcile,
             })
         },
@@ -1368,6 +1375,7 @@ impl ConfigurationSnapshotRows {
             global_rules: self.global_rules,
             badwords: self.badwords,
             known_bad_images: self.known_bad_images,
+            known_spam: self.known_spam,
             guild_commands: self.guild_commands,
             global_commands: self.global_commands,
             guild_templates: self.guild_templates,
@@ -1459,6 +1467,7 @@ impl ConfigurationSnapshotRows {
                 log_filters: self.guild_log_filters,
                 badwords,
                 known_bad_images: self.known_bad_images,
+                known_spam: self.known_spam,
             },
         )
     }
