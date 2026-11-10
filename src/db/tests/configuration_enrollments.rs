@@ -298,7 +298,9 @@ async fn stale_configuration_writes_preserve_rows_and_both_version_markers() {
             let before = get_primary_versions(&f.db).await.unwrap();
             let scope = edit_scope(&request, global);
             let results = [
-                upsert_enrolled_rule(&f.db, scope.clone(), "new", &rule).await,
+                upsert_enrolled_rule(&f.db, scope.clone(), "new", &rule)
+                    .await
+                    .map(|_| ()),
                 delete_enrolled_rule(&f.db, scope.clone(), "fixture").await,
                 upsert_enrolled_command(
                     &f.db,

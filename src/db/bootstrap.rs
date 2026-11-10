@@ -1218,18 +1218,14 @@ fn seed_globals_sql(
         ));
     }
     if meta_string_conn(conn, "invite_description_v1")?.is_none() {
-        let invite = crate::defaults::default_rules()
-            .into_iter()
-            .find(|rule| rule.name == "Invite links")
-            .context("shipped invite rule")?;
         // Refresh only the old shipped description, across global and guild
         // rows. Preserve every operator setting and custom description.
         body.push_str(&format!(
             "UPDATE rules SET data = json_set(data, '$.description', {}) \
              WHERE rule_id = 'invite' AND \
              CASE WHEN json_valid(data) THEN json_extract(data, '$.description') END = {};\n",
-            sql_text(&invite.description),
-            sql_text("Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).")
+            sql_text(crate::defaults::INVITE_DESCRIPTION),
+            sql_text(crate::defaults::OLD_INVITE_DESCRIPTION)
         ));
         markers.push("invite_description_v1");
     }

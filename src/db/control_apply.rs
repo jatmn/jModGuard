@@ -623,17 +623,19 @@ async fn apply_control_inner(
             rule,
             clear_guild_override,
         } => {
-            if clear_guild_override {
+            let saved = if clear_guild_override {
                 anyhow::ensure!(
                     target.global,
                     "override clearing requires a global rule target"
                 );
                 upsert_global_rule_and_clear_enrolled_override(db, scope_of(request)?, &id, &rule)
-                    .await?;
+                    .await?
             } else {
-                upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?;
-            }
-            saved_null()
+                upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?
+            };
+            Ok(ControlReply::Saved {
+                body: serde_json::to_value(saved)?,
+            })
         }
         ControlOp::DeleteRule {
             request,
