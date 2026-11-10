@@ -54,6 +54,33 @@ impl EvidenceState {
         }
     }
 }
+/// Independent of the journal phase; cancellation does not prove writes stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceCancellation {
+    NotCancelled,
+    Cancelled,
+}
+
+impl EvidenceCancellation {
+    fn from_cancelled(cancelled: bool) -> Self {
+        if cancelled {
+            Self::Cancelled
+        } else {
+            Self::NotCancelled
+        }
+    }
+
+    fn for_membership(self, active: bool) -> Self {
+        if active { self } else { Self::Cancelled }
+    }
+}
+
+/// The existing settlement choice after scope, cancellation and parent checks.
+enum CaptureSettlement {
+    Publish(String),
+    Cleanup,
+}
+
 /// Internal lifecycle snapshot, not permission to upload/read/delete an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceJob {
@@ -63,7 +90,7 @@ pub struct EvidenceJob {
     pub object_key: String,
     pub reserved_bytes: u64,
     pub state: EvidenceState,
-    pub cancelled: bool,
+    pub cancellation: EvidenceCancellation,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReserveEvidence {
@@ -107,7 +134,7 @@ fn job(row: &Row, scope: &GuildDataScope) -> Result<EvidenceJob> {
         storage_id: CaseId::try_from(row.get::<String>(2)?)?,
         reserved_bytes: u64::try_from(row.get::<i64>(3)?)?,
         state: EvidenceState::from_sql(row.get(4)?)?,
-        cancelled: row.get(5)?,
+        cancellation: EvidenceCancellation::from_cancelled(row.get(5)?),
     })
 }
 pub(super) struct Record {
@@ -160,7 +187,7 @@ impl GuildDataStore {
                 let mut job = record(&tx, &scope, &id)?.map(|r| r.job);
                 if let Some(job) = job.as_mut() {
                     anyhow::ensure!(job.case_id == case, CaseError::Conflict);
-                    job.cancelled |= !active;
+                    job.cancellation = job.cancellation.for_membership(active);
                 }
                 tx.finish_read()?;
                 Ok(job)
@@ -197,7 +224,7 @@ impl GuildDataStore {
             verify_scope(&tx,&expected,&scope,true)?;
             anyhow::ensure!(live(&tx,&scope,&case)?,CaseError::Conflict);
             if let Some(old)=record(&tx,&scope,&id)? {
-                anyhow::ensure!(old.job.case_id==case && old.job.storage_id==request.storage_id && old.job.reserved_bytes==request.bytes && (old.job.cancelled || old.origin.as_ref()==Some(&request.origin)),CaseError::Conflict);
+                anyhow::ensure!(old.job.case_id==case && old.job.storage_id==request.storage_id && old.job.reserved_bytes==request.bytes && (old.job.cancellation==EvidenceCancellation::Cancelled || old.origin.as_ref()==Some(&request.origin)),CaseError::Conflict);
                 tx.finish_read()?;return Ok(ReserveEvidence{created:false,job:old.job});
             }
             let (count,bytes)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(reserved_bytes),0) FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<i64>(1)?)))?;
@@ -243,9 +270,9 @@ impl GuildDataStore {
                 }
                 tx.finish_read()?;return Ok(old.job.state);
             }
-            let digest=match result {EvidenceCapture::Stored{sha256,..} if active && !old.job.cancelled && live(&tx,&scope,&case)?=>Some(sha256),_=>None};
+            let settlement=match result {EvidenceCapture::Stored{sha256,..} if active && old.job.cancellation==EvidenceCancellation::NotCancelled && live(&tx,&scope,&case)?=>CaptureSettlement::Publish(sha256),_=>CaptureSettlement::Cleanup};
             tx.ensure_mutation_receipt()?;
-            if let Some(digest)=digest {
+            if let CaptureSettlement::Publish(digest)=settlement {
                 tx.execute_rows("UPDATE guild_case_evidence SET state=1,sha256=?4 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),digest.as_str()], 1)?;
                 tx.commit()?;Ok(EvidenceState::Available)
             } else {
@@ -407,7 +434,7 @@ impl GuildDataStore {
         self.db.with_conn(move|conn|{
             let tx=conn.transaction_primary_snapshot()?;let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
             let mut stmt=tx.prepare("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND (state=?3 OR (?3=-1 AND (state=2 OR (state=0 AND cancelled=1)))) AND evidence_id>?4 ORDER BY evidence_id LIMIT ?5")?;
-            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),state,after.as_ref().map_or("",CaseId::as_str),i64::from(count)],|r|{let mut job=job(r,&scope)?;job.cancelled|=!active;Ok(job)})?;
+            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),state,after.as_ref().map_or("",CaseId::as_str),i64::from(count)],|r|{let mut job=job(r,&scope)?;job.cancellation=job.cancellation.for_membership(active);Ok(job)})?;
             let jobs=rows.collect::<Result<Vec<_>>>()?;drop(stmt);tx.finish_read()?;Ok(jobs)
         }).await
     }

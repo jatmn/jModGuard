@@ -408,7 +408,7 @@ impl LocalEvidenceStore {
             if job.state != EvidenceState::Capturing {
                 return Ok(job.state);
             }
-            let verified = if job.cancelled {
+            let verified = if job.cancellation == EvidenceCancellation::Cancelled {
                 Ok(None)
             } else {
                 this.verified_digest(&job)
@@ -439,7 +439,9 @@ impl LocalEvidenceStore {
                 target.evidence_id.clone(),
             ))?;
             let paths = this.paths(&job, false)?;
-            let state = if job.state == EvidenceState::Capturing && job.cancelled {
+            let state = if job.state == EvidenceState::Capturing
+                && job.cancellation == EvidenceCancellation::Cancelled
+            {
                 rt.block_on(store.settle_evidence_capture(
                     target.scope.clone(),
                     target.case_id.clone(),

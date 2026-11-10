@@ -25,7 +25,7 @@ impl GuildDataStore {
             let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let job = record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job;
-            anyhow::ensure!(job.case_id == case && job.state == EvidenceState::Capturing && !job.cancelled, CaseError::Conflict);
+            anyhow::ensure!(job.case_id == case && job.state == EvidenceState::Capturing && job.cancellation == EvidenceCancellation::NotCancelled, CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
             tx.execute_rows("INSERT INTO guild_bunny_evidence(guild_id,enrollment_id,evidence_id,storage_id,binding,sha256,accepted) VALUES(?1,?2,?3,?4,?5,?6,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),job.storage_id.as_str(),binding,sha256], 1)?;
             tx.commit()

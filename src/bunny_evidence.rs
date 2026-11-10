@@ -267,7 +267,7 @@ impl BunnyEvidenceStore {
         ensure!(
             self.job(store, target).await? == *job
                 && job.state == EvidenceState::Available
-                && !job.cancelled,
+                && job.cancellation == EvidenceCancellation::NotCancelled,
             "evidence is not available in this scope"
         );
         self.progress(store, target).await?;
@@ -424,7 +424,7 @@ impl BunnyEvidenceStore {
         if job.state != EvidenceState::Capturing {
             return Ok(job.state);
         }
-        let capture = if job.cancelled {
+        let capture = if job.cancellation == EvidenceCancellation::Cancelled {
             EvidenceCapture::Discarded
         } else {
             let hash = progress
@@ -468,7 +468,9 @@ impl BunnyEvidenceStore {
                 let mut job = this.job(&store, &t).await?;
                 this.progress(&store, &t).await?;
                 this.verify_resource().await?;
-                if job.state == EvidenceState::Capturing && job.cancelled {
+                if job.state == EvidenceState::Capturing
+                    && job.cancellation == EvidenceCancellation::Cancelled
+                {
                     job.state = store
                         .settle_evidence_capture(
                             t.scope.clone(),
