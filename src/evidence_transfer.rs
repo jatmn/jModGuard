@@ -32,6 +32,34 @@ pub struct LocalEvidenceStore {
     admission: Arc<Semaphore>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceOpenMode {
+    Initialize,
+    Existing,
+}
+
+/// Owns the acquired OS lock until this guard is dropped.
+struct LockedResource {
+    _file: File,
+}
+
+#[derive(PartialEq, Eq)]
+enum ParentPath {
+    Present,
+    Missing,
+}
+
+/// Produced only after hashing and syncing the data and completion receipt.
+struct VerifiedCapture {
+    sha256: String,
+}
+
+enum CaptureVerification {
+    /// No verified receipt, including when cancellation skips verification.
+    Unverified,
+    Verified(VerifiedCapture),
+}
+
 fn directory(path: &Path, create: bool) -> Result<()> {
     if create && !path.try_exists()? {
         match fs::DirBuilder::new().mode(0o700).create(path) {
@@ -86,11 +114,11 @@ fn sync_parent(path: &Path) -> Result<()> {
 impl LocalEvidenceStore {
     /// Startup/blocking operation. Only create a new/empty private resource, never adopt files.
     pub fn initialize(root: PathBuf, storage_id: CaseId, buffer_bytes: usize) -> Result<Self> {
-        Self::connect(root, storage_id, buffer_bytes, true)
+        Self::connect(root, storage_id, buffer_bytes, ResourceOpenMode::Initialize)
     }
     /// Reopen an existing exact resource identity. The stable lock file must already exist.
     pub fn open(root: PathBuf, storage_id: CaseId, buffer_bytes: usize) -> Result<Self> {
-        Self::connect(root, storage_id, buffer_bytes, false)
+        Self::connect(root, storage_id, buffer_bytes, ResourceOpenMode::Existing)
     }
     fn identity(&self) -> String {
         format!("jmodguard-evidence-local-1\n{}\n", self.storage_id.as_str())
@@ -99,13 +127,13 @@ impl LocalEvidenceStore {
         root: PathBuf,
         storage_id: CaseId,
         buffer_bytes: usize,
-        create: bool,
+        mode: ResourceOpenMode,
     ) -> Result<Self> {
         ensure!(
             root.is_absolute() && buffer_bytes > 0,
             "absolute private root and positive buffer required"
         );
-        directory(&root, create)?;
+        directory(&root, mode == ResourceOpenMode::Initialize)?;
         let this = Self {
             root,
             storage_id,
@@ -115,7 +143,10 @@ impl LocalEvidenceStore {
         let identity = this.root.join("identity");
         let lock = this.root.join("lock");
         if !regular(&identity)? {
-            ensure!(create, "unmarked evidence resource");
+            ensure!(
+                mode == ResourceOpenMode::Initialize,
+                "unmarked evidence resource"
+            );
             for entry in fs::read_dir(&this.root)? {
                 ensure!(
                     entry?.file_name() == "lock",
@@ -137,7 +168,10 @@ impl LocalEvidenceStore {
         }
         let _lock = this.lock()?;
         if small_file(&identity)?.is_none() {
-            ensure!(create, "unmarked evidence resource");
+            ensure!(
+                mode == ResourceOpenMode::Initialize,
+                "unmarked evidence resource"
+            );
             for entry in fs::read_dir(&this.root)? {
                 ensure!(
                     entry?.file_name() == "lock",
@@ -152,14 +186,14 @@ impl LocalEvidenceStore {
         this.verify()?;
         Ok(this)
     }
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> Result<LockedResource> {
         directory(&self.root, false)?;
         let path = self.root.join("lock");
         ensure!(regular(&path)?, "missing stable resource lock");
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         file.try_lock()
             .context("evidence resource busy or locking unsupported")?;
-        Ok(file)
+        Ok(LockedResource { _file: file })
     }
     fn verify(&self) -> Result<()> {
         ensure!(
@@ -200,15 +234,17 @@ impl LocalEvidenceStore {
             "invalid derived object key"
         );
         let mut parent = self.root.clone();
-        let mut missing = false;
+        let mut parent_state = ParentPath::Present;
         for part in key.parent().context("missing object parent")?.components() {
             parent.push(part.as_os_str());
             if create {
                 directory(&parent, true)?;
-            } else if !missing {
+            } else if parent_state == ParentPath::Present {
                 match fs::symlink_metadata(&parent) {
                     Ok(_) => directory(&parent, false)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        parent_state = ParentPath::Missing
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -265,7 +301,7 @@ impl LocalEvidenceStore {
         }
         Ok(encoded)
     }
-    fn write_object(&self, job: &EvidenceJob, source: &mut impl Read) -> Result<String> {
+    fn write_object(&self, job: &EvidenceJob, source: &mut impl Read) -> Result<VerifiedCapture> {
         let [data, complete, temp] = self.paths(job, true)?;
         ensure!(
             !regular(&data)? && !regular(&complete)? && !regular(&temp)?,
@@ -287,12 +323,12 @@ impl LocalEvidenceStore {
         drop(receipt);
         fs::rename(&temp, &complete)?;
         sync_parent(&complete)?;
-        Ok(digest)
+        Ok(VerifiedCapture { sha256: digest })
     }
-    fn verified_digest(&self, job: &EvidenceJob) -> Result<Option<String>> {
+    fn verify_capture(&self, job: &EvidenceJob) -> Result<CaptureVerification> {
         let [data, complete, _] = self.paths(job, false)?;
         let Some(receipt) = small_file(&complete)? else {
-            return Ok(None);
+            return Ok(CaptureVerification::Unverified);
         };
         let mut lines = receipt.lines();
         let size = lines
@@ -318,17 +354,22 @@ impl LocalEvidenceStore {
         file.sync_all()?;
         File::open(&complete)?.sync_all()?;
         sync_parent(&complete)?;
-        Ok(Some(actual))
+        Ok(CaptureVerification::Verified(VerifiedCapture {
+            sha256: actual,
+        }))
     }
 
     /// Verified private object bytes for an authorized dashboard/API reader.
     pub fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
         let _lock = self.lock()?;
         self.verify()?;
-        let digest = self
-            .verified_digest(job)?
-            .context("evidence is not available")?;
-        ensure!(digest == expected_sha, "stored evidence checksum mismatch");
+        let CaptureVerification::Verified(capture) = self.verify_capture(job)? else {
+            anyhow::bail!("evidence is not available");
+        };
+        ensure!(
+            capture.sha256 == expected_sha,
+            "stored evidence checksum mismatch"
+        );
         let [data, _, _] = self.paths(job, false)?;
         let mut buf = Vec::new();
         File::open(data)?.read_to_end(&mut buf)?;
@@ -368,7 +409,7 @@ impl LocalEvidenceStore {
             );
             let result = this.write_object(&reserved.job, &mut source);
             match result {
-                Ok(sha256) => rt.block_on(store.settle_evidence_capture(
+                Ok(VerifiedCapture { sha256 }) => rt.block_on(store.settle_evidence_capture(
                     t.scope,
                     t.case_id,
                     t.evidence_id,
@@ -409,14 +450,14 @@ impl LocalEvidenceStore {
                 return Ok(job.state);
             }
             let verified = if job.cancellation == EvidenceCancellation::Cancelled {
-                Ok(None)
+                Ok(CaptureVerification::Unverified)
             } else {
-                this.verified_digest(&job)
+                this.verify_capture(&job)
             };
             let capture = match &verified {
-                Ok(Some(sha256)) => EvidenceCapture::Stored {
+                Ok(CaptureVerification::Verified(capture)) => EvidenceCapture::Stored {
                     bytes: job.reserved_bytes,
-                    sha256: sha256.clone(),
+                    sha256: capture.sha256.clone(),
                 },
                 _ => EvidenceCapture::Discarded,
             };
