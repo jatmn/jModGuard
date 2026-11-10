@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local pre-push: full bash scripts/ci-preflight.sh, not the path-selected CI groups.
+# Local pre-push: lightweight contracts; affected application gates run in CI.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 # Drain the ref list Git sends on stdin so the hook cannot SIGPIPE the client.
@@ -8,4 +8,4 @@ base_ref="$(git -C "$root" config --get jmodguard.preflight-base 2>/dev/null || 
 if [ -z "$base_ref" ]; then
   base_ref="origin/main"
 fi
-exec bash "$root/scripts/ci-preflight.sh" --base "$base_ref"
+exec bash "$root/scripts/ci-preflight.sh" --base "$base_ref" --only contracts

@@ -442,7 +442,7 @@ usage() {
 Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
 
 Run the CI gates locally or on an ephemeral GitHub-hosted Linux runner.
-With no --only, run the full suite (local hooks and a complete check).
+With no --only, run the full suite (CI/build-control changes or a complete check).
 GitHub Actions groups affected checks into jobs. Known groups: contracts,
 frontend, fmt, dylint, api, bot, runtime, updater, core, integration,
 boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
@@ -504,10 +504,6 @@ for hook in pre-commit pre-push; do
   fi
   if [ ! -x "$hook_path" ]; then
     echo "ci-preflight: .githooks/$hook must be executable (git skips non-executable hooks)" >&2
-    exit 1
-  fi
-  if ! grep -Fq 'scripts/ci-preflight.sh' "$hook_path"; then
-    echo "ci-preflight: .githooks/$hook must invoke scripts/ci-preflight.sh" >&2
     exit 1
   fi
 done
@@ -803,9 +799,6 @@ if should_run contracts; then
   whitespace_check
   echo 'ci-preflight: bash scripts/select-checks-test.sh'
   bash scripts/select-checks-test.sh
-
-  echo 'ci-preflight: bash scripts/ci-timed-cargo-test.sh'
-  bash scripts/ci-timed-cargo-test.sh
 fi
 
 if should_run publish-tests; then
@@ -881,8 +874,8 @@ else
     cargo build --locked -p jmodguard-bot
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
-    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture || exit $?
+    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture'
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture || exit $?
   fi
 fi
 
@@ -940,14 +933,18 @@ if [ -z "${only_names}" ]; then
   echo 'ci-preflight: cargo build --locked -p jmodguard-api'
   cargo build --locked -p jmodguard-api
 
-  echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture || exit $?
+  echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture'
+  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture || exit $?
 
   echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
   cargo build --locked -p jmodguard-api --no-default-features
 fi
 
 if should_run supply-chain; then
+  # This uses real Cargo/rustc. Keep docs-only contracts free of Rust setup.
+  echo 'ci-preflight: bash scripts/ci-timed-cargo-test.sh'
+  bash scripts/ci-timed-cargo-test.sh
+
   echo 'ci-preflight: bash scripts/ci-preflight-test.sh'
   bash scripts/ci-preflight-test.sh
 

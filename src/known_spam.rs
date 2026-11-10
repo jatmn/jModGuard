@@ -237,11 +237,14 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                 let prefix = &head[..i];
                 let candidate = bare[i..].trim_start_matches(crate::normalize::is_zero_width);
                 let text = url_token_text(candidate);
-                if ["http://", "https://"].iter().any(|scheme| {
-                    text.get(..scheme.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
-                }) {
-                    start = token.end() - candidate.len();
+                if starts_with_url_scheme(text) {
+                    // Keep paired openers belonging to this URL token (#521).
+                    // A marker after prose may close that prose instead.
+                    start = if starts_with_url_scheme(url_token_text(bare)) {
+                        token.end() - bare.len()
+                    } else {
+                        token.end() - candidate.len()
+                    };
                 } else if ((!prefix.contains(['.', ':', '\u{3002}', '\u{ff0e}', '\u{ff61}'])
                     && !["%2e", "%e3%80%82", "%ef%bc%8e", "%ef%bd%a1"]
                         .iter()
@@ -269,6 +272,16 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+// Discord message formatting markers that can wrap a URL as a pair.
+const FORMAT_MARKERS: [&str; 6] = ["**", "__", "~~", "*", "_", "~"];
+
+fn starts_with_url_scheme(text: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        text.get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    })
+}
+
 // Emphasis markers belong to Discord message formatting, not the URL path.
 // Remove only paired outer markers so a literal trailing path * stays literal.
 fn url_token_text(mut token: &str) -> &str {
@@ -281,10 +294,23 @@ fn url_token_text(mut token: &str) -> &str {
         token = token[..token.len() - 1].trim_end_matches(['.', ',', ';', '!', '?', ':']);
         unmatched -= 1;
     }
-    while let Some(inner) = ["**", "__", "~~", "*", "_", "~"].iter().find_map(|marker| {
+    while let Some(inner) = FORMAT_MARKERS.iter().find_map(|marker| {
         token
             .strip_prefix(marker)
             .and_then(|inner| inner.strip_suffix(marker))
+            .map(|inner| {
+                let head = inner
+                    .split(['/', '\\', '?', '#'])
+                    .next()
+                    .unwrap_or_default();
+                if head.contains('@') {
+                    // Preserve invisible-only usernames for credential exclusion.
+                    inner
+                } else {
+                    // An invisible prefix can hide inside the opener (#521).
+                    inner.trim_start_matches(crate::normalize::is_zero_width)
+                }
+            })
     }) {
         token = inner;
     }
@@ -337,34 +363,61 @@ impl CompiledList {
         }
         url_tokens(raw).any(|token| {
             let token = url_token_text(token);
-            // Invisible characters inside a URL's host or path would otherwise
-            // fail parsing or percent-encode into the path. Ignore them for
-            // matching, the way the surrounding context already does. An '@'
-            // in the authority marks userinfo: invisibles before it are part
-            // of the username and must keep the userinfo exclusion.
+            // Recognize the scheme before normalization: cleaning must never
+            // turn a malformed scheme into an HTTP(S) URL.
+            let scheme_len = ["http://", "https://"]
+                .iter()
+                .find(|scheme| {
+                    token
+                        .get(..scheme.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                })
+                .map_or(0, |scheme| scheme.len());
             let cleaned;
             let token = if token.contains(crate::normalize::is_zero_width) {
-                let authority_end = token.find(['/', '\\', '?', '#']).unwrap_or(token.len());
-                let userinfo_end = token[..authority_end].rfind('@').map_or(0, |i| i + 1);
-                let mut out = String::with_capacity(token.len());
-                out.push_str(&token[..userinfo_end]);
-                out.extend(
-                    token[userinfo_end..]
-                        .chars()
-                        .filter(|c| !crate::normalize::is_zero_width(*c)),
-                );
-                cleaned = out;
+                // HTTP(S) parsing skips extra slashes/backslashes before the
+                // authority. Locate userinfo there, not in the scheme prefix.
+                let authority_start =
+                    token.len() - token[scheme_len..].trim_start_matches(['/', '\\']).len();
+                let authority_end = authority_start
+                    + token[authority_start..]
+                        .find(['/', '\\', '?', '#'])
+                        .unwrap_or(token.len() - authority_start);
+                let host_start = token[authority_start..authority_end]
+                    .rfind('@')
+                    .map_or(authority_start, |i| authority_start + i + 1);
+                let host_end = host_start
+                    + token[host_start..authority_end]
+                        .find(':')
+                        .unwrap_or(authority_end - host_start);
+                // Removing the entire host would let the HTTP parser promote
+                // a later path component into the authority (https:///host).
+                if token[host_start..host_end]
+                    .chars()
+                    .all(crate::normalize::is_zero_width)
+                {
+                    return false;
+                }
+                let path_end = authority_end
+                    + token[authority_end..]
+                        .find(['?', '#'])
+                        .unwrap_or(token.len() - authority_end);
+                // Only host/path invisibles may be removed. Preserve userinfo,
+                // ports, queries and fragments for the existing parser checks.
+                cleaned = token
+                    .char_indices()
+                    .filter(|(i, c)| {
+                        !((host_start..host_end).contains(i)
+                            || (authority_end..path_end).contains(i))
+                            || !crate::normalize::is_zero_width(*c)
+                    })
+                    .map(|(_, c)| c)
+                    .collect::<String>();
                 cleaned.as_str()
             } else {
                 token
             };
-            let parsed = if token
-                .get(..7)
-                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
-                || token
-                    .get(..8)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
-            {
+            let parsed = if scheme_len != 0 {
                 url::Url::parse(token)
             } else {
                 url::Url::parse(&format!("https://{token}"))
@@ -941,6 +994,12 @@ mod tests {
                     if compiled.matches(&text) {
                         false_positives.push(text);
                     }
+                    for marker in FORMAT_MARKERS {
+                        let text = format!("{before}{marker}{username}{rest}{marker}");
+                        if compiled.matches(&text) {
+                            false_positives.push(text);
+                        }
+                    }
                 }
             }
         }
@@ -949,6 +1008,9 @@ mod tests {
         assert!(compiled.matches("@tinyurl.com/a"));
         assert!(compiled.matches("\u{200b} @tinyurl.com/a"));
         assert!(compiled.matches("\u{200b}https://tinyurl.com/a"));
+        for marker in FORMAT_MARKERS {
+            assert!(compiled.matches(&format!("{marker}@tinyurl.com/a{marker}")));
+        }
     }
     #[test]
     fn known_spam_bare_urls_do_not_discard_credential_prefixes() {
@@ -968,6 +1030,74 @@ mod tests {
         // are not discarded credential prefixes.
         assert!(compiled.matches("foo\u{200b}tinyurl.com:443/a"));
         assert!(compiled.matches("word:\u{200b}https://tinyurl.com/a"));
+    }
+    #[test]
+    fn known_spam_urls_match_emphasis_wrapped_invisible_prefixes() {
+        // Issue #521: an invisible character between the emphasis opener and
+        // the URL must not defeat paired-marker stripping, so exact-path rules
+        // keep matching emphasized URLs.
+        let exact = list("url", "example.com/Promo");
+        let schemeless = list("url", "tinyurl.com/a");
+        let wildcard = list("url", "tinyurl.com/*");
+        // Literal issue examples. The wildcard rules already matched on main;
+        // the exact-path rules are the reported failure.
+        assert!(wildcard.matches("**\u{200b}https://tinyurl.com/a**"));
+        assert!(wildcard.matches("__\u{200b}tinyurl.com/a__"));
+        assert!(exact.matches("\u{200b}**https://example.com/Promo**"));
+        let mut missed = Vec::new();
+        for padding in unicode_destination_prefixes()
+            .filter(|padding| !padding.chars().any(char::is_whitespace))
+        {
+            for marker in ["**", "__", "~~", "*", "_", "~"] {
+                for text in [
+                    format!("{marker}{padding}https://example.com/Promo{marker}"),
+                    format!("{marker}{padding}http://example.com/Promo{marker}"),
+                ] {
+                    if !exact.matches(&text) {
+                        missed.push(text);
+                    }
+                }
+                for text in [
+                    format!("{marker}{padding}https://tinyurl.com/a{marker}"),
+                    format!("{marker}{padding}tinyurl.com/a{marker}"),
+                ] {
+                    if !schemeless.matches(&text) {
+                        missed.push(text);
+                    }
+                }
+            }
+        }
+        assert!(missed.is_empty(), "missed emphasized URLs: {missed:?}");
+        // Unpaired or mismatched trailing markers stay literal for exact rules.
+        for padding in unicode_destination_prefixes()
+            .filter(|padding| !padding.chars().any(char::is_whitespace))
+        {
+            for text in [
+                format!("**{padding}https://example.com/Promo*"),
+                format!("*{padding}https://example.com/Promo**"),
+                format!("__{padding}https://example.com/Promo**"),
+            ] {
+                assert!(!exact.matches(&text), "{text:?}");
+            }
+        }
+        assert!(!exact.matches("https://example.com/Promo*"));
+    }
+    #[test]
+    fn known_spam_urls_preserve_literal_markers_after_emphasized_prose() {
+        let exact = list("url", "example.com/Promo");
+        for padding in unicode_destination_prefixes()
+            .filter(|padding| !padding.chars().any(char::is_whitespace))
+        {
+            for marker in FORMAT_MARKERS {
+                for scheme in ["http://", "https://"] {
+                    let text =
+                        format!("{marker}word{marker}{padding}{scheme}example.com/Promo{marker}");
+                    assert!(!exact.matches(&text), "{text:?}");
+                    let text = format!("{marker}word{marker}{padding}{scheme}example.com/Promo");
+                    assert!(exact.matches(&text), "{text:?}");
+                }
+            }
+        }
     }
     fn assert_bare_host_separator_boundary(separator: &str) {
         let compiled = list("url", "tinyurl.com/*");
@@ -1054,6 +1184,54 @@ mod tests {
             "https://safe.\u{200b}tinyurl.com/a",
         ] {
             assert!(!compiled.matches(text), "{text:?}");
+        }
+    }
+    #[test]
+    fn known_spam_urls_preserve_invisible_credentials_schemes_and_ports() {
+        let compiled = list("url", "tinyurl.com/*");
+        let mut false_positives = Vec::new();
+        for invisible in [
+            "\u{200b}",
+            "\u{00ad}",
+            "\u{feff}",
+            "\u{200b}\u{2060}\u{034f}",
+        ] {
+            for scheme in ["http", "https", "hTtPs"] {
+                for url in [
+                    format!("{scheme}://{invisible}@tinyurl.com/a"),
+                    format!("{scheme}://{invisible}/tinyurl.com/a"),
+                    format!("{scheme}://{invisible}/{invisible}@tinyurl.com/a"),
+                    format!("{scheme}://:{invisible}@tinyurl.com/a"),
+                    format!("{scheme}:///{invisible}@tinyurl.com/a"),
+                    format!("{scheme}://\\{invisible}@tinyurl.com/a"),
+                    format!("{scheme}://tinyurl.com:{invisible}443/a"),
+                    format!("{scheme}://ti{invisible}nyurl.com:4{invisible}43/a"),
+                    format!("h{invisible}{}://tinyurl.com/a", &scheme[1..]),
+                ] {
+                    for text in [url.clone(), format!("[join]({url})")] {
+                        if compiled.matches(&text) {
+                            false_positives.push(text);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            false_positives.is_empty(),
+            "false positives: {false_positives:?}"
+        );
+    }
+    #[test]
+    fn known_spam_urls_clean_host_and_path_with_preserved_components() {
+        let compiled = list("url", "tinyurl.com/ab");
+        for url in [
+            "hTtPs://ti\u{200c}nyurl.com:443/a\u{200b}b?q=@keep#fragment",
+            "http://ti\u{200c}nyurl.com:80/a\u{200b}b",
+            "https:///ti\u{200c}nyurl.com/a\u{200b}b",
+            "https://\\ti\u{200c}nyurl.com/a\u{200b}b",
+            "https://ti\u{200c}nyurl.com\\a\u{200b}b",
+        ] {
+            assert!(compiled.matches(url), "{url:?}");
         }
     }
     #[test]
