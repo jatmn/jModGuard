@@ -19,7 +19,7 @@ pub async fn queue_guild_erasure(
         "invalid guild erasure"
     );
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
@@ -105,7 +105,7 @@ pub(crate) async fn next_guild_erasure_after(
 pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> {
     let guild = job.guild_id;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.prepare_reclaim()?;
         tx.execute_reclaim(
             "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
@@ -124,7 +124,7 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
 pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         if super::enrollments::active_enrollment_conn(&tx, guild)?.is_some() {
             tx.finish_read()?;
             return Ok(false);
@@ -232,7 +232,7 @@ pub async fn evidence_storage_id(db: &Db, configured: &str) -> Result<String> {
             }
             tx.finish_read()?;
         }
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         if let Some(existing) = tx
             .query_row(
                 "SELECT value FROM meta WHERE key='evidence_storage_id'",

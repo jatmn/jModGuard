@@ -282,7 +282,7 @@ impl GuildDataStore {
             if stall_case_source(&source) {
                 std::thread::sleep(std::time::Duration::from_millis(1_500));
             }
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let matched = super::case_sources::source_match(&tx, &scope, &source)?;
             // Fetch only matching identities and a SQL equality bit, never another payload.
@@ -330,7 +330,7 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             tx.ensure_mutation_receipt()?;
             tx.execute_rows(
@@ -359,7 +359,7 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             tx.ensure_mutation_receipt()?;
             tx.execute_rows(
@@ -529,7 +529,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         let core = self.core.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
                 tx.finish_read()?;
                 return Err(error);
@@ -557,7 +557,7 @@ impl GuildDataStore {
         limits.page(count)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             let (active,_) = verify_scope(&tx, &expected, &scope, false)?;
             anyhow::ensure!(!active, CaseError::Active);
             let any: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2)", params![scope.guild_id(),scope.enrollment.id.as_str()], |r| Ok(r.get(0)?))?;
@@ -582,7 +582,7 @@ impl GuildDataStore {
         let outcome_sql = outcome_sql(&outcome)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let payload: Option<String> = tx.query_row(
                 "SELECT payload FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0",

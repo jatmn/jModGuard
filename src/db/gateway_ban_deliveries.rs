@@ -62,7 +62,7 @@ pub async fn save_gateway_ban_delivery(
     );
     let payload = serde_json::to_string(&delivery)?;
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &delivery.enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, delivery.enrollment.guild_id)?;
         if let Some(saved) = tx.query_row(
@@ -109,7 +109,7 @@ pub async fn pending_gateway_ban_deliveries(
 
 pub async fn acknowledge_gateway_ban_case(db: &Db, delivery: GatewayBanDelivery) -> Result<()> {
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &delivery.enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, delivery.enrollment.guild_id)?;
         let pending: bool = tx.query_row(
@@ -170,7 +170,7 @@ pub async fn apply_gateway_ban_delivery(db: &Db, id: String) -> Result<Option<Ga
                 super::moderation::record_gateway_ban_conn(conn,&delivery.enrollment,delivery.enrollment.guild_id,delivery.user_id,Some(user_name),user_display_name,GATEWAY_BAN_REASON.to_owned(),delivery.observed_at,owned_by_bot,operation_id,member_was_banned,None,pending_audits,audit_after_ms,Some(&id)).map(Some)
             }
             GatewayBanPayload::Unban {suppressed} => {
-                let mut tx=conn.transaction_primary_read()?;
+                let mut tx=conn.transaction_primary_write()?;
                 super::enrollments::verify_enrollment_conn(&tx,&delivery.enrollment)?;
                 super::guild_stores::refuse_fenced_write(&tx,delivery.enrollment.guild_id)?;
                 let applied:bool=tx.query_row("SELECT applied FROM gateway_ban_deliveries WHERE id=?1",params![id.clone()],|row|Ok(row.get(0)?))?;
@@ -196,7 +196,7 @@ pub async fn acknowledge_gateway_ban_audit(db: &Db, delivery: GatewayBanDelivery
         anyhow::bail!("not an audit delivery")
     };
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &delivery.enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, delivery.enrollment.guild_id)?;
         anyhow::ensure!(

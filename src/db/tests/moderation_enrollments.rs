@@ -1557,7 +1557,7 @@ async fn stale_attributed_manual_mirror_after_unban_records_a_distinct_gateway_b
     .await
     .unwrap();
     f.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
             "INSERT INTO events (guild_id, event_type, user_id, data, created_at)
@@ -1724,7 +1724,7 @@ async fn observed_unban_after_placeholder_allows_a_new_manual_gateway_ban() {
         panic!("first manual ban must insert, got {first:?}");
     };
     f.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
             "INSERT INTO events (guild_id, event_type, user_id, data, created_at)
@@ -1993,7 +1993,7 @@ async fn nullable_reason_active_mirror_is_handled() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     f.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
             "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)

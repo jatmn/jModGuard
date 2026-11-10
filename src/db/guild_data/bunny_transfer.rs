@@ -22,7 +22,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let job = record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job;
             anyhow::ensure!(job.case_id == case && job.state == EvidenceState::Capturing && !job.cancelled, CaseError::Conflict);
@@ -58,7 +58,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx=conn.transaction_primary_read()?;
+            let mut tx=conn.transaction_primary_write()?;
             verify_scope(&tx,&expected,&scope,false)?;
             anyhow::ensure!(record(&tx,&scope,&id)?.ok_or(CaseError::Conflict)?.job.case_id==case,CaseError::Conflict);
             let accepted:bool=tx.query_row("SELECT accepted FROM guild_bunny_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r|Ok(r.get(0)?))?;

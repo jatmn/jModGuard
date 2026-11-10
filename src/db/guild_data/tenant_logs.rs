@@ -99,7 +99,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             verify_bound_placement(&tx, &expected, &scope.placement)?;
             if membership(&tx, scope.guild_id())?.is_some() {
                 verify_scope(&tx, &expected, &scope, true)?;
@@ -147,7 +147,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
+                let mut tx = conn.transaction_primary_write()?;
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
                 if !active {
                     return tx.finish_read();
@@ -207,7 +207,7 @@ impl GuildDataStore {
         let event = event.to_owned();
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            let mut tx = conn.transaction_primary_write()?;
             let (_, current_revision) = verify_scope(&tx, &expected, &scope, true)?;
             anyhow::ensure!(revision == current_revision, TenantDataError::Revision);
             let current = tx.query_row("SELECT channel_id FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 AND event_type=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str()], |r| Ok(r.get::<i64>(0)?)).optional()?;

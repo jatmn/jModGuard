@@ -308,7 +308,7 @@ pub async fn finish_nickname_reconcile(
 pub async fn acknowledge_nickname_reconcile(db: &Db, job: &NicknameReconcileJob) -> Result<()> {
     let job = job.clone();
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
+        let mut tx = conn.transaction_primary_write()?;
         if !nickname_job_matches_conn(&tx, &job)? {
             tx.finish_read()?;
             return Ok(());

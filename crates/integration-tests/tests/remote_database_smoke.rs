@@ -259,7 +259,7 @@ async fn exercise_remote_capacity_race(bot: &Db, api: &Db) {
     let count_sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = bot
         .with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_write()?;
             let count = tx.query_row(&count_sql, (), |row| Ok(row.get::<i64>(0)?))?;
             tx.finish_read()?;
             Ok(count)
