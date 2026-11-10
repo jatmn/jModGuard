@@ -1489,7 +1489,17 @@ pub(crate) async fn preview_automod(
     vars.insert("guild".into(), guild_id.get().to_string());
     let mut owned = vars.clone();
     templates::format_log_timestamps(&mut owned);
-    render_log_template("automod", &template, &mut owned)
+    let rendered = render_log_template("automod", &template, &mut owned);
+    // Fresh reviews use the shipped heading spelling that decision_edit promotes.
+    // Canonicalize only its separator; preserve custom headings and all body bytes.
+    let title = jmodguard::log_embeds::style("automod").title;
+    for separator in ["\r\n\r\n", "\r\n\n", "\n\r\n"] {
+        let heading = format!("{title}{separator}");
+        if let Some(body) = rendered.strip_prefix(&heading) {
+            return format!("{title}\n\n{body}");
+        }
+    }
+    rendered
 }
 
 #[allow(clippy::too_many_arguments)]
