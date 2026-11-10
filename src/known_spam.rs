@@ -184,15 +184,21 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
     let mut offset = 0;
     std::iter::from_fn(move || {
         let token = URL_TOKENS.find_at(content, offset)?;
+        let mut start = token.start();
         let mut end = token.end();
-        // Allow destination whitespace without splitting raw URL components.
+        // Detect visible URLs despite invisible destination padding, even when
+        // the markup is not a valid rendered link. Reuse Badwords' format set.
+        let is_padding = |c: char| c.is_whitespace() || crate::normalize::is_zero_width(c);
         if content[..token.start()]
-            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .trim_end_matches(is_padding)
             .ends_with("](")
         {
+            // Non-whitespace format characters can be inside the regex token.
+            let destination = token.as_str().trim_start_matches(is_padding);
+            start = token.end() - destination.len();
             let mut depth = 0;
             let mut escaped = false;
-            for (i, byte) in token.as_str().bytes().enumerate() {
+            for (i, byte) in destination.bytes().enumerate() {
                 if escaped {
                     escaped = false;
                     continue;
@@ -201,7 +207,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
                     b'\\' => escaped = true,
                     b'(' => depth += 1,
                     b')' if depth == 0 => {
-                        end = token.start() + i;
+                        end = start + i;
                         break;
                     }
                     b')' => depth -= 1,
@@ -210,7 +216,7 @@ fn url_tokens(content: &str) -> impl Iterator<Item = &str> {
             }
         }
         offset = end;
-        Some(&content[token.start()..end])
+        Some(&content[start..end])
     })
 }
 

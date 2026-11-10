@@ -31,7 +31,7 @@ fn leetspeak(c: char) -> Option<char> {
     })
 }
 
-fn is_zero_width(c: char) -> bool {
+pub(crate) fn is_zero_width(c: char) -> bool {
     matches!(
         c,
         '\u{200B}'
