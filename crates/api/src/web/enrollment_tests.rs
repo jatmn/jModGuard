@@ -5705,3 +5705,97 @@ async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
         .await;
     assert!(status.is_client_error());
 }
+
+// Compare the wire value with the actual JSON column, without RuleDef decoding.
+async fn stored_rule_json(db: &db::Db, guild: i64, id: &str) -> serde_json::Value {
+    let id = id.to_owned();
+    let raw: String = db
+        .with_conn(move |conn| {
+            db::SqlExecutor::query_row(
+                conn,
+                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = ?2",
+                db::params![guild, id],
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_rule_normalized_input_matches_database_and_get() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    // Existing RuleDef serde fills defaults, drops unknown fields, and writes
+    // snowflakes as canonical decimal strings. No new save behavior is needed.
+    let submitted = serde_json::json!({
+        "name": "Operator rule", "description": "Kept description",
+        "whitelist_roles": [99, " 00123 "], "unknown_field": "discarded"
+    });
+    let path = "/api/guilds/10/rules/mention_spam";
+    let (status, reply) = f.request("PUT", path, &serde_json::json!({"data": submitted}).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let stored = stored_rule_json(&bot.db, 10, "mention_spam").await;
+    let (status, get) = f.request("GET", path, "").await;
+    assert_eq!(status, StatusCode::OK, "{get}");
+    assert_eq!(reply["config_patch"]["value"], stored);
+    assert_eq!(stored, get["guild_override"]);
+    assert_eq!(stored, get["effective"]);
+    assert_ne!(stored, submitted);
+    assert_eq!(stored["enabled"], true);
+    assert_eq!(stored["whitelist_roles"], serde_json::json!(["99", "123"]));
+    assert!(stored.get("unknown_field").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_rule_canonical_body_preserves_value_and_target_layer() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let rule = crate::defaults::default_rules().remove(0);
+    let canonical = serde_json::to_value(&rule).unwrap();
+    // Global saves from a guild must return the saved global layer even when
+    // a different guild override remains effective. Also cover override clear.
+    for (guild, scope, clear) in [(10, "guild", false), (10, "global", false), (10, "global", true), (0, "global", false)] {
+        let mut override_rule = rule.clone();
+        override_rule.name = "Different guild override".into();
+        db::upsert_rule(&bot.db, 10, "mention_spam", &override_rule).await.unwrap();
+        let path = format!("/api/guilds/{guild}/rules/mention_spam");
+        let (status, reply) = f.request("PUT", &path, &serde_json::json!({
+            "scope": scope, "data": canonical, "clear_guild_override": clear
+        }).to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(reply, serde_json::json!({"ok":true, "config_patch": {
+            "kind":"rule", "id":"mention_spam", "scope":scope,
+            "value":canonical, "cleared_guild_override":clear
+        }}));
+        let target = if scope == "global" { 0 } else { guild };
+        assert_eq!(canonical, stored_rule_json(&bot.db, target, "mention_spam").await);
+        let (status, get) = f.request("GET", &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{get}");
+        assert_eq!(canonical, get[if scope == "global" { "global" } else { "guild_override" }]);
+        if clear { assert!(get["guild_override"].is_null()); }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_rule_errors_preserve_status_and_database() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let canonical = serde_json::to_value(crate::defaults::default_rules().remove(0)).unwrap();
+    let before = stored_rule_json(&bot.db, 0, "mention_spam").await;
+    let (status, reply) = f.request("PUT", "/api/guilds/10/rules/not-a-rule", &serde_json::json!({"data":canonical}).to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply["error"], "unknown rule `not-a-rule`");
+    let path = "/api/guilds/10/rules/mention_spam";
+    let (status, _) = f.request("PUT", path, r#"{"data":{"name":"missing description"}}"#).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, reply) = f.request("PUT", path, &serde_json::json!({"data":canonical,"clear_guild_override":true}).to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply["error"], "override clearing requires a global rule save from a server");
+    assert!(db::get_rule(&bot.db, 10, "mention_spam").await.unwrap().is_none());
+    assert_eq!(before, stored_rule_json(&bot.db, 0, "mention_spam").await);
+}
