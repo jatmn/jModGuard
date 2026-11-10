@@ -4500,6 +4500,221 @@ fn invite_description_upgrade_is_exact_and_once() {
     cleanup_db(&tmp);
 }
 
+// Read storage directly so effective read normalization cannot hide a missing repair.
+async fn stored_rule_json(db: &Db, guild: i64, id: &str) -> serde_json::Value {
+    let id = id.to_owned();
+    db.with_conn(move |conn| {
+        let json: String = conn.query_row(
+            "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = ?2",
+            params![guild, id],
+            |row| Ok(row.get(0)?),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    })
+    .await
+    .unwrap()
+}
+
+async fn old_writer_rule(db: &Db, guild: i64, id: &str, json: serde_json::Value) {
+    let id = id.to_owned();
+    db.with_conn(move |conn| {
+        // Model an older binary: deliberately bypass the new save/copy guard.
+        conn.execute_rows(
+            "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
+            params![guild, id, serde_json::to_string(&json)?],
+            1,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn invite_description_reapplies_after_old_writer_and_marker() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    let tmp = tmp_db_path("invite_reapply");
+    let mut db = Db::open(&tmp, 2).unwrap();
+    for round in 0..2 {
+        let mut expected = Vec::new();
+        tokio_test_block_on(async {
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let base = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            for (guild, description) in [
+                (0, OLD),
+                (123, OLD),
+                (456, "Custom guidance"),
+                (789, CURRENT),
+                (999, &format!("{OLD} ")),
+            ] {
+                let mut json = serde_json::to_value(&base).unwrap();
+                json["description"] = serde_json::json!(description);
+                json["enabled"] = serde_json::json!(false);
+                json["params"] = serde_json::json!({"operator_key": round});
+                json["actions"][0]["reason"] = serde_json::json!("Preserved action");
+                json["whitelist_users"] = serde_json::json!([12345]);
+                json["future_field"] = serde_json::json!({"preserved": true});
+                old_writer_rule(&db, guild, "invite", json.clone()).await;
+                if description == OLD {
+                    json["description"] = serde_json::json!(CURRENT);
+                }
+                expected.push((guild, "invite", json));
+            }
+            let mut other = serde_json::to_value(&base).unwrap();
+            other["description"] = serde_json::json!(OLD);
+            old_writer_rule(&db, 123, "velocity", other.clone()).await;
+            expected.push((123, "velocity", other));
+        });
+        let before = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+        drop(db);
+        db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            for (guild, id, json) in &expected {
+                assert_eq!(
+                    stored_rule_json(&db, *guild, id).await,
+                    *json,
+                    "round {round}, {guild}/{id}"
+                );
+            }
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, before.config + 1);
+            assert_ne!(after.config_revision, before.config_revision);
+            assert_eq!(after.slash, before.slash);
+            assert_eq!(after.slash_revision, before.slash_revision);
+        });
+        let repaired = tokio_test_block_on(get_primary_versions(&db)).unwrap();
+        drop(db);
+        db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            for (guild, id, json) in &expected {
+                assert_eq!(stored_rule_json(&db, *guild, id).await, *json);
+            }
+            let after = get_primary_versions(&db).await.unwrap();
+            assert_eq!(after.config, repaired.config);
+            assert_eq!(after.config_revision, repaired.config_revision);
+            assert_eq!(after.slash, repaired.slash);
+            assert_eq!(after.slash_revision, repaired.slash_revision);
+        });
+    }
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn invite_description_old_writer_reads_are_marker_gated_without_restart() {
+    use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
+    let tmp = tmp_db_path("invite_old_writer_reads");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope = ConfigurationScope::Guild(enroll_guild(&db, 123, 100).await.unwrap().unwrap());
+        let base = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+        for marker in [false, true] {
+            db.with_conn(move |conn| {
+                conn.execute_reclaim("DELETE FROM meta WHERE key = 'invite_description_v1'", ())?;
+                if marker {
+                    write_meta_string_conn(conn, "invite_description_v1", "1")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            // Repeat old writes and reads on the same open process.
+            for _ in 0..2 {
+                for description in [OLD, CURRENT, "Custom guidance", &format!("{OLD} ")] {
+                    let mut rule = base.clone();
+                    rule.description = description.into();
+                    rule.enabled = false;
+                    rule.params = serde_json::json!({"allowlist_codes": ["keep-code"]});
+                    rule.actions[0].reason = "Preserved action".into();
+                    rule.whitelist_users = vec![12345];
+                    let stored = serde_json::to_value(&rule).unwrap();
+                    for guild in [0, 123] {
+                        old_writer_rule(&db, guild, "invite", stored.clone()).await;
+                        old_writer_rule(&db, guild, "velocity", stored.clone()).await;
+                    }
+                    let before = get_primary_versions(&db).await.unwrap();
+                    if marker && description == OLD {
+                        rule.description = CURRENT.into();
+                    }
+                    let expected = serde_json::to_value(&rule).unwrap();
+                    for guild in [0, 123] {
+                        assert_eq!(
+                            serde_json::to_value(
+                                get_rule(&db, guild, "invite").await.unwrap().unwrap()
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                        let rows = list_rules(&db, guild).await.unwrap();
+                        let invite = rows.iter().find(|(id, _)| id == "invite").unwrap();
+                        assert_eq!(serde_json::to_value(&invite.1).unwrap(), expected);
+                        assert_eq!(
+                            serde_json::to_value(
+                                get_rule(&db, guild, "velocity").await.unwrap().unwrap()
+                            )
+                            .unwrap(),
+                            stored
+                        );
+                        assert_eq!(
+                            stored_rule_json(&db, guild, "invite").await,
+                            stored,
+                            "reads must not write"
+                        );
+                        let parts = load_config_parts(&db, guild).await.unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&parts.rules["invite"]).unwrap(),
+                            expected
+                        );
+                        let target = if guild == 0 {
+                            ConfigurationScope::Global
+                        } else {
+                            scope.clone()
+                        };
+                        let layers = get_enrolled_rule(&db, target.clone(), "invite")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(layers.guild.unwrap()).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(layers.global.unwrap()).unwrap(),
+                            expected
+                        );
+                        let snapshot = load_enrolled_web_config_snapshot(&db, target)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.guild_rules["invite"]).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.global_rules["invite"]).unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&snapshot.guild_rules["velocity"]).unwrap(),
+                            stored
+                        );
+                    }
+                    let after = get_primary_versions(&db).await.unwrap();
+                    assert_eq!(after.config, before.config);
+                    assert_eq!(after.config_revision, before.config_revision);
+                    assert_eq!(after.slash, before.slash);
+                    assert_eq!(after.slash_revision, before.slash_revision);
+                }
+            }
+        }
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
 // Exercise every built-in rule-save entry point used by callers/control dispatch.
 async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
     let guild = ConfigurationScope::Guild(guild_enrollment(db, 123).await.unwrap().unwrap());
@@ -5000,12 +5215,10 @@ fn invite_description_first_override_copy_inherits_global_like_save() {
                 expected,
                 "{mode}"
             );
-            assert_eq!(
-                serde_json::to_value(get_rule(&db, 10, "invite").await.unwrap().unwrap()).unwrap(),
-                source_json
-            );
+            assert_eq!(stored_rule_json(&db, 10, "invite").await, source_json);
             // Direct saves and copies must resolve the same inherited description.
-            let stale = get_rule(&db, 10, "invite").await.unwrap().unwrap();
+            // Submit the stored stale rule, rather than its normalized read view.
+            let stale = serde_json::from_value(source_json).unwrap();
             upsert_rule(&db, 30, "invite", &stale).await.unwrap();
             assert_eq!(
                 serde_json::to_value(get_rule(&db, 30, "invite").await.unwrap().unwrap()).unwrap(),
@@ -5155,7 +5368,7 @@ async fn assert_invite_copy_case(
             "{mode} {src}->{dst} {id}, marker={marker}, source={description}"
         );
         assert_eq!(
-            serde_json::to_value(get_rule(&db, src, &id).await.unwrap().unwrap()).unwrap(),
+            stored_rule_json(&db, src, &id).await,
             serde_json::to_value(source).unwrap(),
             "copy must not rewrite the source"
         );
