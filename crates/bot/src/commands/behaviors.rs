@@ -370,6 +370,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: if log_ban {
+                    vec!["mod_action".into()]
+                } else {
+                    Vec::new()
+                },
                 suppress_response: false,
             })
         }
@@ -448,6 +453,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -539,6 +545,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -608,6 +615,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -710,6 +718,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec![
+                    "mod_action".into(),
+                    if minutes == 0 {
+                        "timeout_remove".into()
+                    } else {
+                        "timeout_add".into()
+                    },
+                ],
                 suppress_response: false,
             })
         }
@@ -774,6 +790,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -783,6 +800,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
+            vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             let warns =
                 db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
@@ -790,6 +808,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some(format!("**{}** has no warnings.", target_user.name)),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -810,6 +829,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -838,6 +858,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -858,6 +879,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                             &vars,
                         )),
                         vars,
+                        emitted_log_events: Vec::new(),
                         suppress_response: false,
                     });
                 }
@@ -908,6 +930,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -918,6 +941,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some("No bans recorded.".into()),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -935,6 +959,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -986,6 +1011,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -1009,6 +1035,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 // The posted message is already visible in the invocation
                 // channel, so a confirmation reply there would be redundant.
                 suppress_response: target == env.channel_id,
@@ -1054,6 +1081,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
             })
         }
@@ -1088,6 +1116,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1112,6 +1141,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1139,6 +1169,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1188,6 +1219,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1201,6 +1233,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1215,6 +1248,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1539,6 +1573,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("**Event templates:**\n{response}")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1549,6 +1584,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}`:\n```\n{t}\n```")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1563,6 +1599,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` updated for this server.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1573,6 +1610,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` reset to global/default.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1610,6 +1648,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("**Automod rules:**\n{}", lines.join("\n"))),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1632,6 +1671,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                     if rule.enabled { "enabled" } else { "disabled" }
                 )),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1656,6 +1696,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1738,6 +1779,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                             .into(),
                     ),
                     vars,
+                    emitted_log_events: Vec::new(),
                     suppress_response: false,
                 });
             }
@@ -1749,6 +1791,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("**Log channels:**\n{response}")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1768,6 +1811,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` now logs to <#{channel}>.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }
@@ -1778,6 +1822,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` logging cleared for this server.")),
                 vars,
+                emitted_log_events: Vec::new(),
                 suppress_response: false,
             })
         }

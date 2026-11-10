@@ -254,6 +254,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
     let outcome = super::super::BehaviorOutcome {
         response: Some(body),
         vars: std::collections::BTreeMap::new(),
+        emitted_log_events: Vec::new(),
         suppress_response: false,
     };
     let slash = super::super::SlashCtx {
@@ -312,6 +313,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
         super::super::BehaviorOutcome {
             response: Some(format!("{USER_MENTION} @everyone")),
             vars: std::collections::BTreeMap::new(),
+            emitted_log_events: Vec::new(),
             suppress_response: false,
         },
     )
@@ -381,12 +383,23 @@ async fn capturing_proxy() -> (
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    capturing_proxy_for_commands(false).await
+}
+
+async fn capturing_proxy_for_commands(
+    success: bool,
+) -> (
+    serenity::http::Http,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let slot = Arc::clone(&captured);
     let server = tokio::spawn(async move {
+        let mut banned = false;
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut request = Vec::new();
             let mut header_end = None;
@@ -418,12 +431,41 @@ async fn capturing_proxy() -> (
                     }
                 }
             }
-            slot.lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&request).into_owned());
-            let body = "{}";
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let route = request.lines().next().unwrap_or_default();
+            let (status, body) = if !success {
+                ("403 Forbidden", "{}".to_string())
+            } else if route.starts_with("GET ") && route.contains("/bans/") && banned {
+                ("200 OK", serde_json::json!({"user": target_member(10, 91, None).user, "reason": "test reason"}).to_string())
+            } else if route.starts_with("GET ") && route.contains("/bans/") {
+                (
+                    "404 Not Found",
+                    r#"{"code":10026,"message":"Unknown Ban"}"#.into(),
+                )
+            } else if route.starts_with("PATCH ") && route.contains("/members/") {
+                (
+                    "200 OK",
+                    serde_json::to_string(&target_member(10, 91, None)).unwrap(),
+                )
+            } else if route.starts_with("POST ") && route.contains("/messages") {
+                (
+                    "200 OK",
+                    serde_json::to_string(&serenity::model::channel::Message::default()).unwrap(),
+                )
+            } else if route.starts_with("GET ") && route.contains("/messages") {
+                ("200 OK", "[]".into())
+            } else {
+                ("204 No Content", String::new())
+            };
+            if route.starts_with("PUT ") && route.contains("/bans/") {
+                banned = true;
+            }
+            if route.starts_with("DELETE ") && route.contains("/bans/") {
+                banned = false;
+            }
+            slot.lock().unwrap().push(request);
             let response = format!(
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -2114,4 +2156,205 @@ fn voice_line(report: &str) -> String {
         .find(|line| line.contains("**Voice:**"))
         .unwrap_or_else(|| panic!("no voice line in {payload}"))
         .to_string()
+}
+
+// Real behavior execution, SQLite enrollment and REST serialization; only the
+// Discord service is a local HTTP fixture. Prefix and slash share log_outcome.
+async fn assert_command_mod_action(name: &str, args: &str, targeted: bool) {
+    let cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == name)
+        .unwrap();
+    assert_configured_command_mod_action(cmd, args, targeted, 1).await;
+}
+
+async fn assert_configured_command_mod_action(
+    cmd: crate::types::CommandDef,
+    args: &str,
+    targeted: bool,
+    invocations: usize,
+) {
+    let name = &cmd.name;
+    let path = std::env::temp_dir().join(format!("command_log_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+    app.activation.mark_lock_held(true);
+    let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    app.tenant.activate(enrollment).await.unwrap();
+    crate::db::upsert_log_channel(&app.db, 10, "mod_action", 999)
+        .await
+        .unwrap();
+    let cache = Arc::new(Cache::new());
+    remember_guild(&cache, 10, Some(target_member(10, 91, None)), None);
+    let (http, requests, server) = capturing_proxy_for_commands(true).await;
+    let ctx = test_context(cache, Arc::new(http)).await;
+    let mut actor = target_member(10, 7, Some("Moderator"));
+    actor.user.name = "Moderator".into();
+    for invocation in 1..=invocations {
+        let env = crate::commands::CmdEnv::new(
+            &app,
+            &ctx,
+            &cmd,
+            GuildId::new(10),
+            ChannelId::new(1),
+            UserId::new(7),
+            actor.clone(),
+            Args::new(args),
+            false,
+            None,
+        );
+        let outcome = crate::commands::run_command(env).await.unwrap();
+        assert_eq!(
+            outcome.vars["user"], "Moderator",
+            "reply user must remain the actor"
+        );
+        crate::commands::log_outcome(
+            &app,
+            ctx.http.as_ref(),
+            &ctx.cache,
+            &cmd,
+            GuildId::new(10),
+            ChannelId::new(1),
+            UserId::new(7),
+            outcome,
+        )
+        .await;
+        let count = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.lines().next().unwrap().starts_with("POST ")
+                    && request.contains("/channels/999/messages")
+            })
+            .count();
+        assert_eq!(
+            count, invocation,
+            "{name}: exactly one mod_action per invocation"
+        );
+    }
+    let payloads: Vec<serde_json::Value> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request.lines().next().unwrap().starts_with("POST ")
+                && request.contains("/channels/999/messages")
+        })
+        .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+        .collect();
+    assert_eq!(
+        payloads.len(),
+        invocations,
+        "{name}: exactly one mod_action emit; payloads={payloads:?}"
+    );
+    for payload in &payloads {
+        let embed = &payload["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        let field = |name: &str| {
+            fields.iter().find(|field| field["name"] == name).unwrap()["value"]
+                .as_str()
+                .unwrap()
+        };
+        if targeted {
+            assert_eq!(
+                field("User"),
+                "targetuser · <@91>",
+                "{name}: target, not moderator"
+            );
+            assert!(field("User").contains("91"));
+        } else {
+            assert_eq!(field("User"), "Moderator · <@7>");
+        }
+        assert_eq!(field("Moderator"), "Moderator (<@7>)");
+        for text in fields.iter().map(|field| field["value"].as_str().unwrap()) {
+            assert!(
+                !text.contains(['{', '}']),
+                "{name}: unresolved placeholder: {text}"
+            );
+        }
+    }
+    server.abort();
+    drop(ctx);
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn command_mod_action_warn_once() {
+    assert_command_mod_action("warn", "91 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_kick_once() {
+    assert_command_mod_action("kick", "91 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_ban_once() {
+    assert_command_mod_action("ban", "91 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_timeout_once() {
+    assert_command_mod_action("timeout", "91 5 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_timeout_remove_once() {
+    assert_command_mod_action("timeout", "91 0 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_warns_target() {
+    assert_command_mod_action("warns", "91", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_userinfo_target() {
+    assert_command_mod_action("userinfo", "91", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_without_target() {
+    assert_command_mod_action("banlist", "", false).await;
+}
+
+#[tokio::test]
+async fn command_mod_action_softban_once() {
+    assert_command_mod_action("softban", "91 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_unban_once() {
+    assert_command_mod_action("unban", "91 test reason", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_warnclear_once() {
+    assert_command_mod_action("warnclear", "91", true).await;
+}
+#[tokio::test]
+async fn command_mod_action_existing_ban_keeps_outcome_row() {
+    let cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .unwrap();
+    assert_configured_command_mod_action(cmd, "91 test reason", true, 2).await;
+}
+#[tokio::test]
+async fn command_mod_action_targeted_plan_with_and_without_log_step() {
+    use crate::types::{Behavior, PlanStep};
+    for explicit_log in [true, false] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "warn")
+            .unwrap();
+        cmd.name = "custom-plan".into();
+        let mut steps = vec![PlanStep::AddRole { role_id: 50 }];
+        if explicit_log {
+            steps.push(PlanStep::Log {
+                event: "mod_action".into(),
+                template: "custom {user}".into(),
+            });
+        }
+        cmd.behavior = Behavior::Plan { steps };
+        assert_configured_command_mod_action(cmd, "91", true, 1).await;
+    }
 }

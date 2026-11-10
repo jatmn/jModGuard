@@ -702,9 +702,17 @@ pub(crate) async fn run(
         CasesField::Lines(lines) => render_userinfo_message(template, &snapshot, &warns, lines),
     };
     vars.insert("target_id".into(), target.to_string());
+    vars.insert(
+        "target".into(),
+        snapshot
+            .username
+            .clone()
+            .unwrap_or_else(|| target.to_string()),
+    );
     Ok(BehaviorOutcome {
         response: Some(response),
         vars: vars.clone(),
+        emitted_log_events: Vec::new(),
         suppress_response: false,
     })
 }
