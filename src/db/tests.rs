@@ -4500,3 +4500,169 @@ fn invite_description_upgrade_is_exact_and_once() {
     drop(db);
     cleanup_db(&tmp);
 }
+
+// Exercise every built-in rule-save entry point used by callers/control dispatch.
+async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
+    let guild = ConfigurationScope::Guild(guild_enrollment(db, 123).await.unwrap().unwrap());
+    match mode {
+        "direct-global" => upsert_rule(db, 0, "invite", rule).await.unwrap(),
+        "direct-guild" => upsert_rule(db, 123, "invite", rule).await.unwrap(),
+        "enrolled-global" | "enrolled-guild" | "new-override" => {
+            let target = if mode == "enrolled-global" {
+                ConfigurationScope::Global
+            } else {
+                guild.clone()
+            };
+            upsert_enrolled_rule(
+                db,
+                ConfigurationWriteScope::new(guild, target).unwrap(),
+                "invite",
+                rule,
+            )
+            .await
+            .unwrap();
+        }
+        "global-clear" => {
+            upsert_global_rule_and_clear_enrolled_override(db, guild, "invite", rule)
+                .await
+                .unwrap();
+        }
+        _ => panic!("unknown save fixture"),
+    }
+}
+
+const INVITE_SAVE_MODES: [&str; 6] = [
+    "direct-global",
+    "direct-guild",
+    "enrolled-global",
+    "enrolled-guild",
+    "new-override",
+    "global-clear",
+];
+
+#[test]
+fn invite_description_stale_save_survives_upgrade_and_reopen() {
+    const OLD: &str =
+        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_stale_save");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            db.with_conn(|conn| {
+                conn.execute_bounded(
+                    "DELETE FROM meta WHERE key = 'invite_description_v1'", (), 1024,
+                )?;
+                let mut rule = crate::defaults::default_rules()
+                    .into_iter().find(|r| r.name == "Invite links").unwrap();
+                rule.description = OLD.into();
+                for guild in [0, 123] {
+                    conn.execute_bounded(
+                        "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                        params![guild, serde_json::to_string(&rule)?], 64 * 1024,
+                    )?;
+                }
+                Ok(())
+            }).await.unwrap();
+        });
+        // The editor loads before the bot's one-time bootstrap upgrade.
+        let mut stale = tokio_test_block_on(get_rule(&db, 123, "invite"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.description, OLD);
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        let current = tokio_test_block_on(get_rule(&db, 0, "invite"))
+            .unwrap()
+            .unwrap()
+            .description;
+        assert_ne!(current, OLD);
+        stale.enabled = false;
+        stale.params = serde_json::json!({"allowlist_codes": ["kept-code"]});
+        stale.actions[0].reason = "Operator's changed action".into();
+        let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+            0
+        } else {
+            123
+        };
+        tokio_test_block_on(async {
+            if mode == "new-override" {
+                delete_rule(&db, 123, "invite").await.unwrap();
+            }
+            save_invite_fixture(&db, mode, &stale).await;
+            let saved = get_rule(&db, target, "invite").await.unwrap().unwrap();
+            assert_eq!(saved.description, current, "{mode}");
+            let mut expected = stale.clone();
+            expected.description = current.clone();
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            if mode == "global-clear" {
+                assert!(get_rule(&db, 123, "invite").await.unwrap().is_none());
+            }
+        });
+        let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        assert_eq!(
+            tokio_test_block_on(get_rule(&db, target, "invite"))
+                .unwrap()
+                .unwrap()
+                .description,
+            current,
+            "{mode}"
+        );
+        assert_eq!(
+            tokio_test_block_on(get_config_version(&db)).unwrap(),
+            version
+        );
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn invite_description_save_preserves_custom_and_current_on_fresh_install() {
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_description_save_edges");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut rule = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            let current = rule.description.clone();
+            let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+                0
+            } else {
+                123
+            };
+            // No upgrade was needed: a fresh install already has the current text.
+            for description in [
+                current.as_str(),
+                "My custom invite guidance",
+                current.as_str(),
+            ] {
+                rule.description = description.into();
+                save_invite_fixture(&db, mode, &rule).await;
+                assert_eq!(
+                    get_rule(&db, target, "invite")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .description,
+                    description,
+                    "{mode}"
+                );
+            }
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
