@@ -327,13 +327,28 @@ pub async fn put_rule(
         },
     )
     .await?;
+    // Use the same captured primary read as GET so server-side save changes
+    // are reflected in the editor. A global save must return the global layer,
+    // even when a guild override remains effective.
+    let layers = db::get_enrolled_rule(
+        &app.db,
+        super::configuration_scope(&app, &auth, guild_id)?,
+        &rule_id,
+    )
+    .await?;
+    let saved = if scope == GLOBAL_SCOPE {
+        layers.global
+    } else {
+        layers.guild
+    }
+    .ok_or_else(|| ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")))?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "config_patch": {
             "kind": "rule",
             "id": rule_id,
             "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": body.data,
+            "value": saved,
             "cleared_guild_override": body.clear_guild_override,
         }
     })))
