@@ -2265,6 +2265,93 @@ async fn action_key_errors_survive_the_bot_control_link() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn invite_description_save_patch_uses_canonical_rule() {
+    use db::SqlExecutor;
+    const OLD: &str =
+        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    for (guild, scope, clear) in [
+        (0, "global", false),
+        (10, "guild", false),
+        (10, "global", false),
+        (10, "global", true),
+    ] {
+        let mut f = Fixture::new(true).await;
+        f.enroll(10).await;
+        // Model a real one-time upgrade before the API submits its stale copy.
+        let mut old = db::get_rule(&f.app.db, 0, "invite").await.unwrap().unwrap();
+        old.description = OLD.into();
+        let old_json = serde_json::to_string(&old).unwrap();
+        f.app
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "DELETE FROM meta WHERE key = 'invite_description_v1'",
+                    (),
+                    1024,
+                )?;
+                conn.execute_bounded(
+                    "UPDATE rules SET data = ?1 WHERE rule_id = 'invite'",
+                    db::params![old_json],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let upgraded = db::Db::open(&f.path, 2).unwrap();
+        drop(upgraded);
+        let bot = f.attach_save_writer().await;
+        let target = if scope == "global" { 0 } else { 10 };
+        let mut rule = db::get_rule(&bot.db, 0, "invite").await.unwrap().unwrap();
+        let current = rule.description.clone();
+        rule.description = OLD.into();
+        let path = format!("/api/guilds/{guild}/rules/invite");
+        // Seed the guild target with the upgraded shipped text too.
+        db::upsert_rule(
+            &bot.db,
+            target,
+            "invite",
+            &db::get_rule(&bot.db, 0, "invite").await.unwrap().unwrap(),
+        )
+        .await
+        .unwrap();
+        for (submitted, expected) in [
+            (OLD, current.as_str()),
+            ("Custom API guidance", "Custom API guidance"),
+            (OLD, "Custom API guidance"),
+        ] {
+            rule.description = submitted.into();
+            rule.enabled = false;
+            let (status, body) = f
+                .request(
+                    "PUT",
+                    &path,
+                    &serde_json::json!({
+                        "scope": scope, "data": rule, "clear_guild_override": clear,
+                    })
+                    .to_string(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut expected_rule = rule.clone();
+            expected_rule.description = expected.into();
+            assert_eq!(
+                body["config_patch"]["value"],
+                serde_json::json!(expected_rule),
+                "{guild}/{scope}/{clear}"
+            );
+            assert_eq!(body["config_patch"]["scope"], scope);
+            assert_eq!(body["config_patch"]["cleared_guild_override"], clear);
+            let stored = db::get_rule(&bot.db, target, "invite")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::json!(stored), body["config_patch"]["value"]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn recovered_global_rule_save_cannot_clear_a_newer_override() {
     let mut f = Fixture::new(true).await;
     f.enroll(10).await;

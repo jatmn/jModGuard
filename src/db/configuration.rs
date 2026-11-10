@@ -280,7 +280,9 @@ pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<Ru
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
     crate::image_spam::validate_rule(rule_id, rule)?;
-    upsert_rule_row(db, guild_id, rule_id, rule, None).await
+    upsert_rule_row(db, guild_id, rule_id, rule, None)
+        .await
+        .map(|_| ())
 }
 
 /// Normalize only the obsolete shipped text, while holding the same writer
@@ -301,8 +303,20 @@ fn rule_json_for_save_conn(
                 |r| Ok(r.get::<bool>(0)?),
             )?)
     {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
+                params![guild_id],
+                |r| Ok(r.get(0)?),
+            )
+            .optional()?;
+        let stored = stored
+            .and_then(|json| serde_json::from_str::<RuleDef>(&json).ok())
+            .filter(|saved| saved.description != crate::defaults::OLD_INVITE_DESCRIPTION);
         let mut rule = rule.clone();
-        rule.description = crate::defaults::INVITE_DESCRIPTION.into();
+        rule.description = stored
+            .map(|saved| saved.description)
+            .unwrap_or_else(|| crate::defaults::INVITE_DESCRIPTION.into());
         return Ok(serde_json::to_string(&rule)?);
     }
     Ok(serde_json::to_string(rule)?)
@@ -314,13 +328,14 @@ async fn upsert_rule_row(
     id: &str,
     rule: &RuleDef,
     expected: Option<ConfigurationWriteScope>,
-) -> Result<()> {
+) -> Result<RuleDef> {
     let id = id.to_owned();
     let rule = rule.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
+        let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
             "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
@@ -329,7 +344,7 @@ async fn upsert_rule_row(
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(saved)
     })
     .await
 }
@@ -1647,7 +1662,7 @@ pub async fn upsert_enrolled_rule(
     scope: ConfigurationWriteScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     crate::image_spam::validate_rule(id, rule)?;
     if crate::custom_rules::is_custom_id(id) {
         return upsert_enrolled_custom_rule(db, scope, id, rule).await;
@@ -1661,7 +1676,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     request: ConfigurationScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     anyhow::ensure!(
         request.guild_id() > 0,
         "override clearing requires a server"
@@ -1681,6 +1696,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
+        let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
             "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, ?1, ?2)
              ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
@@ -1693,7 +1709,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(saved)
     })
     .await
 }
@@ -1703,7 +1719,7 @@ async fn upsert_enrolled_custom_rule(
     scope: ConfigurationWriteScope,
     id: &str,
     rule: &RuleDef,
-) -> Result<()> {
+) -> Result<RuleDef> {
     let guild_id = scope.guild_id();
     let json = serde_json::to_string(rule)?;
     let id_owned = id.to_owned();
@@ -1733,7 +1749,7 @@ async fn upsert_enrolled_custom_rule(
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(rule)
     })
     .await
 }

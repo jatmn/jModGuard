@@ -4628,6 +4628,65 @@ fn invite_description_stale_save_survives_upgrade_and_reopen() {
 }
 
 #[test]
+fn invite_description_stale_save_retains_post_upgrade_custom_guidance() {
+    use crate::defaults::OLD_INVITE_DESCRIPTION;
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("invite_stale_custom");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut old = get_rule(&db, 0, "invite").await.unwrap().unwrap();
+            old.description = OLD_INVITE_DESCRIPTION.into();
+            db.with_conn(move |conn| {
+                conn.execute_bounded("DELETE FROM meta WHERE key = 'invite_description_v1'", (), 1024)?;
+                for guild in [0, 123] {
+                    conn.execute_bounded(
+                        "INSERT OR REPLACE INTO rules(guild_id, rule_id, data) VALUES (?1, 'invite', ?2)",
+                        params![guild, serde_json::to_string(&old)?], 64 * 1024,
+                    )?;
+                }
+                Ok(())
+            }).await.unwrap();
+        });
+        let mut stale = tokio_test_block_on(get_rule(&db, 123, "invite"))
+            .unwrap()
+            .unwrap();
+        drop(db);
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            db.with_conn(|conn| {
+                assert!(meta_string_conn(conn, "invite_description_v1")?.is_some());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let mut custom = stale.clone();
+            custom.description = "Post-upgrade operator guidance".into();
+            save_invite_fixture(&db, mode, &custom).await;
+            stale.enabled = false;
+            stale.params = serde_json::json!({"allowlist_codes": ["kept-code"]});
+            stale.actions[0].reason = "Changed stale action".into();
+            save_invite_fixture(&db, mode, &stale).await;
+            let target = if matches!(mode, "direct-global" | "enrolled-global" | "global-clear") {
+                0
+            } else {
+                123
+            };
+            let saved = get_rule(&db, target, "invite").await.unwrap().unwrap();
+            let mut expected = stale.clone();
+            expected.description = custom.description;
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
 fn invite_description_save_preserves_custom_and_current_on_fresh_install() {
     for mode in INVITE_SAVE_MODES {
         let tmp = tmp_db_path("invite_description_save_edges");
