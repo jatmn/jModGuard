@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { performance } from 'node:perf_hooks';
+import { renderToStaticMarkup } from '../tools/webui/node_modules/react-dom/server.node.js';
 import { randomUUID } from 'node:crypto';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
@@ -2678,6 +2680,250 @@ test('Markdown preview updates unsaved edits and preserves sample substitutions'
   assert.equal(panel.querySelector('h2')?.textContent, 'Changed');
   assert.equal(panel.querySelector('u')?.textContent, 'under');
   assert.equal(panel.querySelector('details')?.open, false);
+});
+
+// Use the production parser without the embed description's existing 4096-unit
+// clipping. Instrument only string reads/searches, so CI load cannot hide a
+// repeated suffix scan or make the regression depend on a wall-clock deadline.
+function previewParser(maxWork = Infinity) {
+  let work = 0;
+  const charge = amount => {
+    work += amount;
+    assert.ok(work <= maxWork, `preview scan work ${work} exceeds ${maxWork}`);
+  };
+  const trackText = text => new Proxy({}, {
+    get(_target, key) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) charge(1);
+      const value = text[key];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        const result = value.apply(text, args);
+        if (key === 'startsWith') charge(args[0].length);
+        if (key === 'indexOf') charge((result < 0 ? text.length : result + args[0].length) - (args[1] || 0));
+        return result;
+      };
+    },
+  });
+  const parserSource = source.slice(source.indexOf('function previewInline('));
+  const instrumented = parserSource.replace('  const out = [];', '  text = trackText(text);\n  const out = [];');
+  assert.notEqual(instrumented, parserSource, 'the production parser must be instrumented');
+  const render = vm.runInNewContext(instrumented + '\npreviewMarkdown', {h: React.createElement, trackText});
+  const plain = vm.runInNewContext(parserSource + '\npreviewMarkdown', {h: React.createElement});
+  return {render, plain, work: () => work};
+}
+
+for (const [name, input] of [
+  ['unmatched brackets', '['.repeat(64000)],
+  ['unmatched link destinations', '[a]('.repeat(16000)],
+  ['labels without destinations', '[a]'.repeat(21333)],
+  ['closers without labels', ']('.repeat(32000)],
+  ['mixed brackets', '[[[]'.repeat(16000)],
+  ['one late bracket', '['.repeat(63999) + ']'],
+  ['one late link marker', '['.repeat(63998) + ']('],
+  ['inner balanced destination after unmatched openers', '[a]('.repeat(15999) + '[b](x)'],
+]) {
+  test(`Markdown preview bounds scan work for ${name}`, t => {
+    const parser = previewParser(input.length * 64);
+    const result = parser.render(input);
+    const start = performance.now();
+    const plain = parser.plain(input);
+    const elapsed = performance.now() - start;
+    t.diagnostic(`${input.length} characters: ${parser.work()} string operations; uninstrumented parser ${elapsed.toFixed(3)} ms`);
+    assert.equal(result.length, 1);
+    assert.ok(parser.work() > 0);
+    assert.equal(result[0].props.children.join(''), input);
+    assert.equal(plain[0].props.children.join(''), input);
+  });
+}
+
+// Captured from main 3d80be82d020ee6c31244377a04abb6afe73f88f before
+// changing the parser. These include #487/#504 fixtures and deliberately retain
+// main's imperfect nested-emphasis result (#515).
+const previewBaseline = [
+  [
+    "[**Docs**](https://example.test/a?x=1&y=2)",
+    "<div><a href=\"https://example.test/a?x=1&amp;y=2\" target=\"_blank\" rel=\"noreferrer noopener\"><strong>Docs</strong></a></div>"
+  ],
+  [
+    "[outer [inner]](https://example.test/a_(b))",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">outer [inner]</a></div>"
+  ],
+  [
+    "[a]([b](https://example.test)",
+    "<div>[a](<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](unclosed [b](https://example.test)",
+    "<div>[a](unclosed <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[[[a](https://example.test)",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">[[a</a></div>"
+  ],
+  [
+    "[a](",
+    "<div>[a](</div>"
+  ],
+  [
+    "[a]",
+    "<div>[a]</div>"
+  ],
+  [
+    "](",
+    "<div>](</div>"
+  ],
+  [
+    "[[[]",
+    "<div>[[[]</div>"
+  ],
+  [
+    "[[[[late]",
+    "<div>[[[[late]</div>"
+  ],
+  [
+    "[[[[late](x)",
+    "<div>[[[[late](x)</div>"
+  ],
+  [
+    "[a](https://example.test/a_(b)) tail",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> tail</div>"
+  ],
+  [
+    "[a](https://example.test/a_(b) tail",
+    "<div>[a](https://example.test/a_(b) tail</div>"
+  ],
+  [
+    "[a](javascript:alert(1)) **next**",
+    "<div>[a](javascript:alert(1)) <strong>next</strong></div>"
+  ],
+  [
+    "[a](//example.test) [b](https://example.test)",
+    "<div>[a](//example.test) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://exa mple.test) [b](",
+    "<div>[a](https://exa mple.test) [b](</div>"
+  ],
+  [
+    "\\\\[escaped](https://example.test) [a\\\\](https://example.test)",
+    "<div>\\<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">escaped</a> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a\\</a></div>"
+  ],
+  [
+    "[a\\\\\\\\](https://example.test/a\\\\(b\\\\))",
+    "<div>[a\\\\\\\\](https://example.test/a\\\\(b\\\\))</div>"
+  ],
+  [
+    "[a\\\\\\\\\\\\](x) [b](https://example.test)",
+    "<div>[a\\\\\\\\\\\\](x) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test/a\\\\\\\\(b)) [b](https://example.test)",
+    "<div>[a](https://example.test/a\\\\\\\\(b)) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a `](literal)`](https://example.test)",
+    "<div>[a `](literal)`](https://example.test)</div>"
+  ],
+  [
+    "`[a](https://example.test)` [b]",
+    "<div><code>[a](https://example.test)</code> [b]</div>"
+  ],
+  [
+    "**[a](https://example.test)** _[b]_ __[c](bad)__",
+    "<div><strong><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></strong> <em>[b]</em> <u>[c](bad)</u></div>"
+  ],
+  [
+    "*italic **bold** italic*",
+    "<div><em>italic </em><em>bold</em><em> italic</em></div>"
+  ],
+  [
+    "__**bold `**literal**` end**__",
+    "<div><u><strong>bold <code>**literal**</code> end</strong></u></div>"
+  ],
+  [
+    "***[a](https://example.test)*** ||[b](bad)||",
+    "<div><strong><em><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></em></strong> <details class=\"preview-spoiler\"><summary>Spoiler</summary>[b](bad)</details></div>"
+  ],
+  [
+    "# [title](https://example.test)\r\n> [quote]\r\n- [[item]\n  - `[code]`",
+    "<h1><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">title</a></h1><blockquote><div>[quote]</div></blockquote><ul><li><div>[[item]</div><ul><li><div><code>[code]</code></div></li></ul></li></ul>"
+  ],
+  [
+    ">>> [a](https://example.test)\n[b](",
+    "<blockquote><div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a></div><div>[b](</div></blockquote>"
+  ],
+  [
+    "```md\n[a](https://example.test) **literal**\n```\n[a]",
+    "<pre><code>[a](https://example.test) **literal**</code></pre><div>[a]</div>"
+  ],
+  [
+    "[a](https://example.test) [b](https://example.test/(c))",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <a href=\"https://example.test/(c)\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test/a\\)b) [b](https://example.test)",
+    "<div><a href=\"https://example.test/a)b\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a](https://example.test)\\[b](",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a>[b](</div>"
+  ],
+  [
+    "[a](https://example.test) **[** [b](https://example.test)",
+    "<div><a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> <strong>[</strong> <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">b</a></div>"
+  ],
+  [
+    "[a]([[[[x](bad)) [good](https://example.test)",
+    "<div>[a]([[[[x](bad)) <a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">good</a></div>"
+  ],
+  [
+    "[a](https://example.test/a_(b)) [x]([y](https://example.test)",
+    "<div><a href=\"https://example.test/a_(b)\" target=\"_blank\" rel=\"noreferrer noopener\">a</a> [x](<a href=\"https://example.test\" target=\"_blank\" rel=\"noreferrer noopener\">y</a></div>"
+  ],
+  [
+    "Message deleted\n\n**Channel:** #general\n**Author:** @alice\n**Time:** `Nov 09, 2026 • 22:35:54 UTC`\n**Last observed text:** FREE NITRO https://example.test",
+    "<div>Message deleted</div><div><br/></div><div><strong>Channel:</strong> #general</div><div><strong>Author:</strong> @alice</div><div><strong>Time:</strong> <code>Nov 09, 2026 • 22:35:54 UTC</code></div><div><strong>Last observed text:</strong> FREE NITRO https://example.test</div>"
+  ],
+  [
+    "[link](HTTP://example.test/a_(b)?x=\"&y=1)\n- parent\n  - nested\n```html\n<script> & **literal**\n# no heading\n```",
+    "<div><a href=\"HTTP://example.test/a_(b)?x=&quot;&amp;y=1\" target=\"_blank\" rel=\"noreferrer noopener\">link</a></div><ul><li><div>parent</div><ul><li><div>nested</div></li></ul></li></ul><pre><code>&lt;script&gt; &amp; **literal**\n# no heading</code></pre>"
+  ],
+  [
+    "\\# literal\n\\> literal\n\\- literal\n<script>alert(1)</script>&lt;b&gt;\n[bad](https:\n//example.test)",
+    "<div># literal</div><div>&gt; literal</div><div>- literal</div><div>&lt;script&gt;alert(1)&lt;/script&gt;&amp;lt;b&amp;gt;</div><div>[bad](https:</div><div>//example.test)</div>"
+  ]
+];
+
+test('Markdown preview preserves main output for valid and malformed syntax', () => {
+  const parser = previewParser();
+  for (const [input, expected] of previewBaseline) {
+    const html = renderToStaticMarkup(React.createElement(React.Fragment, null, parser.plain(input)));
+    assert.equal(html, expected, JSON.stringify(input));
+  }
+});
+
+test('Markdown preview preserves the complete long template on edit and save', async () => {
+  let stored = '['.repeat(64000), saved;
+  const config = () => ({enrollment_id: 'original', templates: [{event: 'automod', effective: stored}]});
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT' && url.endsWith('/templates/automod')) {
+      saved = JSON.parse(options.body).template;
+      stored = saved;
+    }
+    return response(url.endsWith('/config') ? config() : {});
+  });
+  h.app.state.config = config();
+  h.app.navigate('templates');
+  const input = h.document.querySelector('.template-card textarea');
+  assert.equal(input.value, stored);
+  assert.equal(input.hasAttribute('maxlength'), false);
+  input.value = '[a]('.repeat(16000);
+  await fire(input, 'input');
+  assert.equal(input.value.length, 64000);
+  await fire(findNode(h.document.querySelector('.template-card'), n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(saved, '[a]('.repeat(16000));
+  assert.equal(h.app.state.config.templates[0].effective, saved);
+  assert.equal(h.document.querySelector('.template-card textarea').value, saved);
 });
 
 test('preview token is sent on API requests from this tab', async () => {
