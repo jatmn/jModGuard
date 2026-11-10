@@ -1114,7 +1114,9 @@ impl TenantRuntime {
 }
 
 async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDataStore> {
-    let stamped = GuildDataStore::existing_registration(store.options.clone())?;
+    let options = store.options.clone();
+    let stamped =
+        db::run_cancellable_db_work(move || GuildDataStore::existing_registration(options)).await?;
     if stamped.is_none() {
         use crate::db::SqlExecutor;
         let id = store.registration.id().as_str().to_owned();
@@ -1148,11 +1150,15 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
     } else {
         store.registration.clone()
     };
-    let opened = if store.options.read_only {
-        GuildDataStore::open(store.options.clone(), expected)?
-    } else {
-        GuildDataStore::initialize(store.options.clone(), expected)?
-    };
+    let options = store.options.clone();
+    let opened = db::run_cancellable_db_work(move || {
+        if options.read_only {
+            GuildDataStore::open(options, expected)
+        } else {
+            GuildDataStore::initialize(options, expected)
+        }
+    })
+    .await?;
     Ok(opened.with_core_write_fence(core.clone()))
 }
 

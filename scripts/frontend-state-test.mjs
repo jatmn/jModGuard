@@ -4260,3 +4260,50 @@ for (const id of ['mention_spam', 'custom:0123456789abcdef', 'attachment_flood',
     }
   });
 }
+
+test('Cases shows a prominent loading state before the list resolves, then empty state', async () => {
+  let resolve;
+  const h = harness(() => new Promise(done => { resolve = done; }));
+  const panel = h.app.tabCases();
+  const status = panel.querySelector('[role="status"]');
+  assert.ok(status, 'loading is visible on the initial render');
+  assert.match(status.textContent, /Loading cases/);
+  assert.equal(panel.querySelector('table'), null, 'hide the empty table while loading');
+  resolve(response({cases: [], summaries: {}}));
+  await settle();
+  assert.equal(panel.querySelector('[role="status"]'), null);
+  assert.match(textOf(panel), /No selected cases on this page/);
+});
+
+test('Cases replaces loading with the browser timeout error', async () => {
+  const h = harness((_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name: 'AbortError'})));
+  }));
+  const panel = h.app.tabCases();
+  await settle();
+  const timer = [...h.timers.values()].find(timer => timer.delay === 30000);
+  assert.ok(timer);
+  await timer.fn();
+  assert.equal(panel.querySelector('[role="status"]'), null);
+  assert.match(panel.querySelector('[role="alert"]').textContent, /Could not load cases: Request timed out/);
+});
+
+test('Cases cancels the superseded list on refresh and displays server errors', async () => {
+  const signals = [];
+  let resolve;
+  const h = harness((_url, options) => {
+    signals.push(options.signal);
+    return new Promise(done => { resolve = done; });
+  });
+  const panel = h.app.tabCases();
+  await settle();
+  const refresh = [...panel.querySelectorAll('button')].find(button => button.textContent === 'Refresh');
+  await fire(refresh, 'click');
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0].aborted, true);
+  assert.equal(signals[1].aborted, false);
+  resolve({ok: false, status: 503, headers: {get: () => null}, text: async () => JSON.stringify({error: 'guild store is unavailable'})});
+  await settle();
+  assert.match(panel.querySelector('[role="alert"]').textContent, /Could not load cases: guild store is unavailable/);
+  assert.equal(panel.querySelector('[role="status"]'), null);
+});

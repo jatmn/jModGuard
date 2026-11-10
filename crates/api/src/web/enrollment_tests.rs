@@ -5282,6 +5282,19 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
             })
         );
     }
+    for limit in [0, 1, 100, u32::MAX] {
+        let (status, page) = f
+            .request(
+                "POST",
+                &format!("/api/guilds/10/cases?limit={limit}&removed=false"),
+                "",
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let count = if limit <= 1 { 1 } else { 51 };
+        assert_eq!(page["cases"], serde_json::json!(expected[..count]));
+        assert_eq!(page["summaries"].as_object().unwrap().len(), count);
+    }
     store
         .remove_case(scope, CaseId::try_from(expected[49].clone()).unwrap())
         .await
@@ -5305,4 +5318,71 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["cases"], serde_json::json!([]));
     assert_eq!(empty["summaries"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn case_list_deadline_includes_waiting_for_a_local_connection() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (entered, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut releases = Vec::new();
+    let mut blockers = Vec::new();
+    // Exhaust the actual local pool. Local checkout has no independent timeout.
+    for _ in 0..2 {
+        let db = f.app.db.clone();
+        let entered = entered.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        releases.push(release);
+        blockers.push(tokio::spawn(async move {
+            db.with_conn(move |_| {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }));
+    }
+    received.recv().await.unwrap();
+    received.recv().await.unwrap();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(22),
+        f.request_token(
+            "POST",
+            "/api/guilds/10/cases?limit=50&removed=false",
+            "",
+            Some(&enrollment.id),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for blocker in blockers {
+        blocker.await.unwrap();
+    }
+    let (status, body) = result.expect("Cases handler exceeded its request budget");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Cases request timed out"),
+        "{body}"
+    );
+    assert!(elapsed < Duration::from_secs(21), "{elapsed:?}");
+    // The cancelled pool waiter must neither consume a slot nor leave more work.
+    let (status, body) = f.request("POST", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cases"], serde_json::json!([]));
 }

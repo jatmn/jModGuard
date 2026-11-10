@@ -1963,3 +1963,78 @@ async fn read_only_evidence_retries_until_storage_id_appears() {
     }
     remove_sidecars(&path);
 }
+
+// A real libSQL HTTP request stalls during the cold registration probe, before
+// any primary snapshot begins. The server has a finite fallback so the baseline
+// implementation fails the timing assertion without leaving a hung test.
+#[tokio::test]
+async fn cold_store_open_yields_to_deadline_and_cancels_remote_probe() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let observed = disconnected.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let started = Instant::now();
+        let mut buffer = [0; 8192];
+        while started.elapsed() < Duration::from_millis(800) {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    observed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
+        }
+        let _ = stream.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    });
+    let resolved = ResolvedStore {
+        registration: StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared),
+        options: GuildStoreOptions {
+            path: PathBuf::new(),
+            url: format!("http://{address}"),
+            token: "read-only-fixture".into(),
+            pool_size: 2,
+            read_only: true,
+        },
+    };
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(probe.clone()));
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        open_runtime_store(&f.db, &resolved),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    // Yielding and dropping the open must also end its actual HTTP request.
+    tokio::task::spawn_blocking(move || server.join().unwrap())
+        .await
+        .unwrap();
+    assert!(probe.queries() > 0, "cold-open work must remain observable");
+    assert!(result.is_err(), "cold open bypassed the caller deadline");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "cold open took {elapsed:?}"
+    );
+    assert!(
+        disconnected.load(Ordering::SeqCst),
+        "abandoned cold-open HTTP work continued"
+    );
+}
