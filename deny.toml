@@ -37,6 +37,29 @@ ignore = true
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
+# Duplicate crate versions we accept for now, each introduced by a transitive
+# dependency we cannot bump ourselves (#544). Every entry pins the old major
+# so a skip expires on its own when the owning upstream moves: the version
+# then no longer matches and the duplicate warning returns (or the entry
+# becomes unmatched), while a genuinely new duplicate still warns. Pick these
+# up when the upstream releases listed in #544 ship; the libsql 0.10 remote
+# stack (hyper 0.14 / h2 0.3 / http 0.2) overlaps #349 and moves with it.
+skip = [
+    { crate = "getrandom@0.2", reason = "ring 0.17 still pins getrandom 0.2 (#544)" },
+    { crate = "http@0.2", reason = "hyper 0.14 / h2 0.3 remote stack via libsql 0.10 and the in-tree connector, tracked with #349 (#544)" },
+    { crate = "lock_api@0.4", reason = "parking_lot 0.12 via libsql 0.10 (#544)" },
+    { crate = "parking_lot@0.12", reason = "libsql 0.10 remote client (#544)" },
+    { crate = "parking_lot_core@0.9", reason = "parking_lot 0.12 via libsql 0.10 (#544)" },
+    { crate = "rand@0.8", reason = "phf_generator build dependency of the patched libsql-sqlite3-parser (#544)" },
+    { crate = "rand_core@0.6", reason = "rand 0.8 via phf_generator, build dependency of the patched libsql-sqlite3-parser (#544)" },
+    { crate = "redox_syscall@0.5", reason = "parking_lot_core 0.9 via libsql 0.10 (#544)" },
+    { crate = "shlex@1", reason = "bindgen 0.66 build dependency of libsql-ffi (#544)" },
+    { crate = "socket2@0.5", reason = "hyper 0.14 remote stack, tracked with #349 (#544)" },
+    { crate = "syn@2", reason = "old proc-macro stacks (thiserror 1 via libsql, bindgen, prost-derive) (#544)" },
+    { crate = "thiserror@1", reason = "libsql 0.10 (#544)" },
+    { crate = "thiserror-impl@1", reason = "thiserror 1 via libsql 0.10 (#544)" },
+    { crate = "windows-sys@0.52", reason = "ring 0.17, socket2 0.5 and rustix 0.38 via bindgen (#544)" },
+]
 
 [sources]
 unknown-registry = "deny"
