@@ -84,6 +84,14 @@ pub enum StoreCheckError {
     Unbound,
 }
 
+impl StoreCheckError {
+    /// A schema refusal is deterministic: it repeats on every start until an operator
+    /// runs a release that matches the store (one a newer release migrated is never downgraded). A failed read surfaces as itself.
+    pub fn is_schema_refusal(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Schema(_)))
+    }
+}
+
 /// Non-secret identity for operator-facing refusals: never the URL or token.
 fn store_label(id: &str, dedicated: Option<i64>) -> String {
     match dedicated {

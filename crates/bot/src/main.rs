@@ -186,7 +186,19 @@ async fn main() -> Result<()> {
     };
     tracing::info!("database ready (migrate=true) at {}", cfg.db.log_label());
 
-    let app = BotState::new(cfg.clone(), db)?;
+    let app = match BotState::new(cfg.clone(), db) {
+        Ok(app) => app,
+        // Exiting would make the launcher restart this child into the same refusal.
+        // Hold with health up and no lease, as for an unsupported launcher.
+        Err(error) if jmodguard::db::guild_data::StoreCheckError::is_schema_refusal(&error) => {
+            tracing::error!(
+                "{error:#}; bot held without the writer lease. Run a release that matches the store, then restart the container"
+            );
+            idle_until_shutdown().await;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let activation = Arc::clone(&app.activation);
     match jmodguard_bot::activation::claim_writer_lease(
         app.cfg.bot.control_secret.as_str(),
