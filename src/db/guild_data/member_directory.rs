@@ -2308,6 +2308,70 @@ fn audit_gap_recovery_pending(conn: &impl SqlExecutor, scope: &GuildDataScope) -
     conn.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND status!='complete')",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))
 }
 
+enum CleanupLookup {
+    Idle,
+    CheckMember {
+        user_id: i64,
+        revision: i64,
+        reason: &'static str,
+    },
+    Ban(MemberCleanupCandidate),
+}
+
+fn cleanup_lookup(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    now_ms: i64,
+) -> Result<CleanupLookup> {
+    // A real departure is eligible after its grace. Keep affected-user
+    // checks paced during initial import, but retain the saved stay
+    // until available ban/audit and local case history are processed.
+    let gate:Option<(Option<i64>,Option<i64>,bool)>=conn.query_row("SELECT gap_at_ms,initial_completed_at_ms,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((gap_at, completed, backfill_done)) = gate else {
+        return Ok(CleanupLookup::Idle);
+    };
+    let history = CleanupHistory::from_saved(completed, BackfillProgress::from(backfill_done));
+    if audit_gap_recovery_pending(conn, scope)? {
+        return Ok(CleanupLookup::Idle);
+    }
+    // During initial history import, already checked candidates wait
+    // without hiding the next unverified departure in the queue.
+    let row = conn
+        .query_row(
+            MEMBER_CLEANUP_CANDIDATE_SQL,
+            params![
+                scope.guild_id(),
+                scope.enrollment.id.as_str(),
+                now_ms,
+                history == CleanupHistory::Ready,
+                gap_at
+            ],
+            |r| {
+                Ok((
+                    r.get::<i64>(0)?,
+                    r.get::<i64>(1)?,
+                    r.get::<Option<i64>>(2)?,
+                    r.get::<Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((user_id, revision, checked_at, departed_at)) = row else {
+        return Ok(CleanupLookup::Idle);
+    };
+    Ok(match history.next_step(gap_at, checked_at, departed_at) {
+        CleanupStep::CheckMember(reason) => CleanupLookup::CheckMember {
+            user_id,
+            revision,
+            reason,
+        },
+        // Current absence cannot disprove a ban/unban still waiting
+        // in bounded initial audit pages or local case backfill.
+        CleanupStep::WaitForHistory => CleanupLookup::Idle,
+        CleanupStep::CheckBan => CleanupLookup::Ban(MemberCleanupCandidate { user_id, revision }),
+    })
+}
+
 // A confirmed current ban proves absence, but does not provide a leave time.
 fn close_current_for_ban(
     conn: &impl SqlExecutor,
@@ -3316,31 +3380,62 @@ impl GuildDataStore {
         now_ms: i64,
     ) -> Result<Option<MemberCleanupCandidate>> {
         checked_scope(self, &scope)?;
+        // Almost every poll finds nothing to queue. Read it in a snapshot so an
+        // idle lookup never holds the writer lock across several remote round
+        // trips; only queueing a member check takes the write transaction.
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_write()?;verify_scope(&tx,&expected,&scope,true)?;
-            // A real departure is eligible after its grace. Keep affected-user
-            // checks paced during initial import, but retain the saved stay
-            // until available ban/audit and local case history are processed.
-            let gate:Option<(Option<i64>,Option<i64>,bool)>=tx.query_row("SELECT gap_at_ms,initial_completed_at_ms,case_backfill_done FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-            let Some((gap_at,completed,backfill_done))=gate else {tx.finish_read()?;return Ok(None)};
-            let history=CleanupHistory::from_saved(completed,BackfillProgress::from(backfill_done));
-            if audit_gap_recovery_pending(&tx,&scope)? {tx.finish_read()?;return Ok(None)}
-            // During initial history import, already checked candidates wait
-            // without hiding the next unverified departure in the queue.
-            let row=tx.query_row(MEMBER_CLEANUP_CANDIDATE_SQL,params![scope.guild_id(),scope.enrollment.id.as_str(),now_ms,history == CleanupHistory::Ready,gap_at],|r|Ok((r.get::<i64>(0)?,r.get::<i64>(1)?,r.get::<Option<i64>>(2)?,r.get::<Option<i64>>(3)?))).optional()?;
-            if let Some((user_id,revision,checked_at,departed_at))=row {
-                match history.next_step(gap_at,checked_at,departed_at) {
-                    CleanupStep::CheckMember(reason) => {
-                        tx.ensure_mutation_receipt()?;queue_target_check_tx(&tx,&scope,user_id,MemberVerifyKind::Member,reason,revision,now_ms)?;tx.commit()?;return Ok(None);
+        let read_scope = scope.clone();
+        let lookup = self
+            .db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &read_scope, true)?;
+                let lookup = cleanup_lookup(&tx, &read_scope, now_ms)?;
+                tx.finish_read()?;
+                Ok(lookup)
+            })
+            .await?;
+        match lookup {
+            CleanupLookup::Idle => return Ok(None),
+            CleanupLookup::Ban(candidate) => return Ok(Some(candidate)),
+            CleanupLookup::CheckMember { .. } => {}
+        }
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_write()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                // The snapshot may be stale by now; decide again under the lock.
+                match cleanup_lookup(&tx, &scope, now_ms)? {
+                    CleanupLookup::CheckMember {
+                        user_id,
+                        revision,
+                        reason,
+                    } => {
+                        tx.ensure_mutation_receipt()?;
+                        queue_target_check_tx(
+                            &tx,
+                            &scope,
+                            user_id,
+                            MemberVerifyKind::Member,
+                            reason,
+                            revision,
+                            now_ms,
+                        )?;
+                        tx.commit()?;
+                        Ok(None)
                     }
-                    // Current absence cannot disprove a ban/unban still waiting
-                    // in bounded initial audit pages or local case backfill.
-                    CleanupStep::WaitForHistory => {tx.finish_read()?;return Ok(None)}
-                    CleanupStep::CheckBan => {tx.finish_read()?;return Ok(Some(MemberCleanupCandidate{user_id,revision}));}
+                    CleanupLookup::Ban(candidate) => {
+                        tx.finish_read()?;
+                        Ok(Some(candidate))
+                    }
+                    CleanupLookup::Idle => {
+                        tx.finish_read()?;
+                        Ok(None)
+                    }
                 }
-            }
-            tx.finish_read()?;Ok(None)
-        }).await
+            })
+            .await
     }
 
     pub async fn settle_member_cleanup(
