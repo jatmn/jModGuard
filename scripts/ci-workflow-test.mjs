@@ -953,9 +953,19 @@ const hookDir = fs.mkdtempSync(path.join(os.tmpdir(), "jmodguard-hooks-"));
 try {
   const repo = path.join(hookDir, "repo");
   const remote = path.join(hookDir, "remote.git");
-  run("git", ["init", "-q", "--initial-branch=main", repo]);
-  run("git", ["init", "-q", "--bare", remote]);
-  const git = (...args) => run("git", ["-C", repo, ...args]);
+  const calls = path.join(hookDir, "calls");
+  const globalConfig = path.join(hookDir, "gitconfig");
+  const inheritedHooks = path.join(hookDir, "global-hooks");
+  fs.mkdirSync(inheritedHooks);
+  for (const hook of ["pre-commit", "pre-push"]) {
+    fs.writeFileSync(path.join(inheritedHooks, hook),
+      '#!/bin/sh\necho "unexpected inherited hook" >&2\nexit 97\n', { mode: 0o755 });
+  }
+  run("git", ["config", "--file", globalConfig, "core.hooksPath", inheritedHooks]);
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: globalConfig, HOOK_CALLS: calls };
+  run("git", ["init", "-q", "--initial-branch=main", repo], { env });
+  run("git", ["init", "-q", "--bare", remote], { env });
+  const git = (...args) => run("git", ["-C", repo, ...args], { env });
   git("config", "user.name", "Hook test");
   git("config", "user.email", "hook@example.invalid");
   git("config", "commit.gpgsign", "false");
@@ -963,14 +973,13 @@ try {
   fs.mkdirSync(path.join(repo, "scripts"));
   fs.cpSync(path.join(root, ".githooks"), path.join(repo, ".githooks"), { recursive: true });
   fs.copyFileSync(path.join(root, "scripts/install-git-hooks.sh"), path.join(repo, "scripts/install-git-hooks.sh"));
-  const calls = path.join(hookDir, "calls");
   fs.writeFileSync(path.join(repo, "scripts/ci-preflight.sh"),
     '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$HOOK_CALLS"\nexit "${HOOK_RESULT:-0}"\n');
   fs.writeFileSync(path.join(repo, "notes.md"), "base\n");
   git("add", ".");
-  git("commit", "-qm", "base");
-  git("push", "-qu", "origin", "main");
-  const env = { ...process.env, HOOK_CALLS: calls };
+  // Bootstrap without user hooks; subsequent operations exercise installed hooks.
+  git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "base");
+  git("-c", "core.hooksPath=/dev/null", "push", "-qu", "origin", "main");
   run("bash", ["scripts/install-git-hooks.sh", "--base", "origin/main"], { cwd: repo, env });
   fs.writeFileSync(path.join(repo, "notes.md"), "clean staged change\n");
   git("add", "notes.md");
