@@ -17,7 +17,11 @@ regression plus the affected local checks. Record the commands and results in th
 PR. **CI passed** must succeed before merge; GitHub Actions selects all affected
 groups from the complete PR diff, including earlier code commits.
 
-Examples (combine groups when a change crosses boundaries):
+These are partial local feedback examples, not complete affected-check plans.
+`--only` runs the named groups; it does not add their affected consumers or boundary
+checks. Use the selector example below to inspect the full affected group list,
+then choose local checks relevant to the changed behavior. CI runs the complete
+affected plan before merge.
 
 ```bash
 # Documentation or sample configuration:
