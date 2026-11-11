@@ -74,14 +74,39 @@ pub struct GuildDataStore {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreCheckError {
-    #[error("unsupported guild-store schema")]
-    Schema,
+    #[error("unsupported guild-store schema: {0}")]
+    Schema(String),
     #[error("guild-store identity or ownership does not match")]
     Identity,
     #[error("guild placement does not match this store")]
     Placement,
     #[error("guild has no binding in this store")]
     Unbound,
+}
+
+/// Non-secret identity for operator-facing refusals: never the URL or token.
+fn store_label(id: &str, dedicated: Option<i64>) -> String {
+    match dedicated {
+        None => format!("{id} (shared)"),
+        Some(guild_id) => format!("{id} (dedicated to guild {guild_id})"),
+    }
+}
+
+/// Runs before the stamped identity row is read, so it names the configured store and
+/// advises conditionally. The advice mirrors `GuildSchemaLayout::observed`: only versions
+/// `1..wanted` are migratable; a nonempty store at version 0 or below is never adopted.
+fn version_mismatch(id: &str, dedicated: Option<i64>, found: i64, wanted: i64) -> StoreCheckError {
+    let action = if found > wanted {
+        "if a newer jModGuard release migrated the store, run that release or a later one (a store is never downgraded)"
+    } else if found >= 1 {
+        "if the store is older, start the bot so it migrates the store; otherwise restore the original store"
+    } else {
+        "a store with no recognized schema version is never adopted; restore the original store"
+    };
+    StoreCheckError::Schema(format!(
+        "the database configured as store {} is at schema version {found}, but this build expects {wanted}; {action}",
+        store_label(id, dedicated)
+    ))
 }
 
 fn owner(registration: &StoreRegistration) -> Option<i64> {
@@ -101,17 +126,40 @@ fn read_existing_registration(conn: &impl SqlExecutor) -> Result<Option<StoreReg
     if version == 0 && objects == 0 {
         return Ok(None);
     }
+    // Only an absent marker table means "not a guild store". A failed read of an
+    // existing marker (a remote timeout, for example) must surface as itself. SQLite resolves
+    // table names case-insensitively, so the presence probe does too.
+    let marked: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='store_identity' COLLATE NOCASE",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
+    anyhow::ensure!(
+        marked > 0,
+        StoreCheckError::Schema(format!(
+            "no store identity marker (user_version {version}, {objects} objects); this is not a jModGuard guild store"
+        ))
+    );
     let identity = conn
         .query_row(
             "SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1",
             (),
             |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?)),
         )
-        .optional();
-    let Some((family, id, dedicated)) = identity.ok().flatten() else {
-        return Err(StoreCheckError::Schema.into());
+        .optional()?;
+    let Some((family, id, dedicated)) = identity else {
+        return Err(StoreCheckError::Schema(format!(
+            "the store identity marker has no identity row (user_version {version}, {objects} objects)"
+        ))
+        .into());
     };
-    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+    // The stored id is not parsed until the family matches, so it is untrusted text here.
+    anyhow::ensure!(
+        family == FAMILY,
+        StoreCheckError::Schema(format!(
+            "store {id:?} has schema family {family:?}, expected {FAMILY:?}"
+        ))
+    );
     let policy = match dedicated {
         None => StorePolicy::Shared,
         Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
@@ -140,9 +188,19 @@ fn verify_identity_row(
         )
         .optional()?;
     let Some((family, id, dedicated)) = identity else {
-        return Err(StoreCheckError::Schema.into());
+        return Err(StoreCheckError::Schema(format!(
+            "store {} has no identity row",
+            store_label(expected_store_id, expected_dedicated)
+        ))
+        .into());
     };
-    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+    anyhow::ensure!(
+        family == FAMILY,
+        StoreCheckError::Schema(format!(
+            "store {} has schema family {family:?}, expected {FAMILY:?}",
+            store_label(expected_store_id, expected_dedicated)
+        ))
+    );
     anyhow::ensure!(
         id == expected_store_id && dedicated == expected_dedicated,
         StoreCheckError::Identity
@@ -199,7 +257,10 @@ fn verify_identity_version(
     let full = (|| -> Result<()> {
         let (version, schema_version, objects): (i64, i64, String) =
             conn.query_row(CATALOG_SQL, (), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        anyhow::ensure!(version == wanted, StoreCheckError::Schema);
+        anyhow::ensure!(
+            version == wanted,
+            version_mismatch(expected_store_id, expected_dedicated, version, wanted)
+        );
         let objects: std::collections::HashSet<(String, String)> = serde_json::from_str(&objects)?;
         let has = |kind: &str, name: &str| objects.contains(&(kind.to_owned(), name.to_owned()));
         let required: &[(i64, &str, &str)] = &[
@@ -284,36 +345,37 @@ fn verify_identity_version(
             (15, "table", "guild_local_write_fence guild_writer_epoch"),
             (15, "trigger", "guild_case_settle_retain"),
         ];
+        let missing = |kind: &str, name: &str| {
+            StoreCheckError::Schema(format!(
+                "store {} at schema version {wanted} is missing {kind} {name}",
+                store_label(expected_store_id, expected_dedicated)
+            ))
+        };
         for (version, kind, names) in required {
-            if wanted >= *version {
-                anyhow::ensure!(
-                    names.split_whitespace().all(|name| has(kind, name)),
-                    StoreCheckError::Schema
-                );
+            if wanted >= *version
+                && let Some(name) = names.split_whitespace().find(|name| !has(kind, name))
+            {
+                return Err(missing(kind, name).into());
             }
         }
+        let binding_delete = if wanted >= 8 {
+            "guild_binding_delete"
+        } else {
+            "guild_binding_no_delete"
+        };
         anyhow::ensure!(
-            has(
-                "trigger",
-                if wanted >= 8 {
-                    "guild_binding_delete"
-                } else {
-                    "guild_binding_no_delete"
-                }
-            ),
-            StoreCheckError::Schema
+            has("trigger", binding_delete),
+            missing("trigger", binding_delete)
         );
         if wanted >= 2 {
+            let membership_delete = if wanted >= 8 {
+                "guild_membership_delete"
+            } else {
+                "guild_membership_no_delete"
+            };
             anyhow::ensure!(
-                has(
-                    "trigger",
-                    if wanted >= 8 {
-                        "guild_membership_delete"
-                    } else {
-                        "guild_membership_no_delete"
-                    }
-                ),
-                StoreCheckError::Schema
+                has("trigger", membership_delete),
+                missing("trigger", membership_delete)
             );
         }
         verify_identity_row(conn, expected_store_id, expected_dedicated)?;

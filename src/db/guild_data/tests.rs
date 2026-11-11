@@ -120,6 +120,105 @@ async fn existing_registration_reads_stamped_identity_without_creating() {
 }
 
 #[tokio::test]
+async fn existing_registration_does_not_relabel_unreadable_identity_as_schema_mismatch() {
+    let f = Fixture::new();
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded("CREATE TABLE sentinel(value TEXT)", 64 * 1024 * 1024)
+            .unwrap();
+    }
+    let unmarked = format!(
+        "{:#}",
+        GuildDataStore::existing_registration(f.options()).unwrap_err()
+    );
+    assert!(
+        unmarked.contains("unsupported guild-store schema")
+            && unmarked.contains("no store identity marker")
+            && unmarked.contains("user_version 0"),
+        "{unmarked}"
+    );
+    // SQLite resolves table names case-insensitively, so a differently cased marker is present.
+    for name in ["store_identity", "STORE_IDENTITY"] {
+        {
+            let raw = Connection::open(&f.store_path).unwrap();
+            raw.execute_batch_bounded(
+                &format!("CREATE TABLE {name}(singleton INTEGER, schema_family TEXT, store_id TEXT, dedicated_guild_id INTEGER)"),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        }
+        // A present but empty marker is a missing row, not an absent marker.
+        let empty = format!(
+            "{:#}",
+            GuildDataStore::existing_registration(f.options()).unwrap_err()
+        );
+        assert!(
+            empty.contains("no identity row") && !empty.contains("not a jModGuard guild store"),
+            "{name}: {empty}"
+        );
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded(&format!("DROP TABLE {name}"), 64 * 1024 * 1024)
+            .unwrap();
+    }
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded(
+            "CREATE TABLE store_identity(singleton INTEGER)",
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+    }
+    // The marker table exists but its read fails, as a remote read error would.
+    let unreadable = format!(
+        "{:#}",
+        GuildDataStore::existing_registration(f.options()).unwrap_err()
+    );
+    assert!(
+        !unreadable.contains("unsupported guild-store schema")
+            && unreadable.contains("no such column"),
+        "a failed identity read must surface its own cause: {unreadable}"
+    );
+}
+
+#[tokio::test]
+async fn existing_registration_escapes_untrusted_identity_text_in_refusals() {
+    let f = Fixture::new();
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded(
+            "CREATE TABLE store_identity(singleton INTEGER, schema_family TEXT, store_id TEXT, dedicated_guild_id INTEGER);
+             INSERT INTO store_identity VALUES(1, 'other-family', 'a' || char(10) || 'ERROR forged', NULL)",
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+    }
+    let text = format!(
+        "{:#}",
+        GuildDataStore::existing_registration(f.options()).unwrap_err()
+    );
+    assert!(
+        text.contains("other-family") && text.contains("forged") && !text.contains('\n'),
+        "stored identity text must not forge log lines: {text:?}"
+    );
+}
+
+#[test]
+fn version_mismatch_advice_follows_the_migratable_range() {
+    let advice = |found| version_mismatch("store", None, found, VERSION).to_string();
+    let newer = advice(VERSION + 1);
+    assert!(newer.contains("never downgraded") && !newer.contains("start the bot"));
+    let older = advice(1);
+    assert!(older.contains("start the bot") && !older.contains("never downgraded"));
+    for unrecognized in [0, -1] {
+        let text = advice(unrecognized);
+        assert!(
+            text.contains("no recognized schema version") && !text.contains("start the bot"),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
@@ -158,8 +257,29 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
             .with_conn(move |c| c.pragma_update(None, "user_version", version))
             .await
             .unwrap();
-        assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
-        assert!(GuildDataStore::initialize(f.options(), reg.clone()).is_err());
+        let refusals = [
+            GuildDataStore::open(f.options(), reg.clone()).err(),
+            GuildDataStore::initialize(f.options(), reg.clone()).err(),
+        ];
+        for refusal in refusals {
+            let text = format!("{:#}", refusal.expect("mismatched version must be refused"));
+            assert!(
+                text.contains(reg.id().as_str())
+                    && text.contains("shared")
+                    && text.contains(&format!("version {version}"))
+                    && text.contains(&format!("expects {VERSION}")),
+                "refusal must name the store and both versions: {text}"
+            );
+            assert_eq!(
+                text.contains("never downgraded"),
+                version > VERSION,
+                "only a newer store gets the newer-release action: {text}"
+            );
+            assert!(
+                !text.contains("start the bot"),
+                "a refused store must not be told the bot will migrate it: {text}"
+            );
+        }
     }
     store
         .db
