@@ -2471,18 +2471,20 @@ impl Transaction {
                 );
             }
         }
-        let mut result = self
+        let result = self
             .runtime
             .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
         #[cfg(debug_assertions)]
-        if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
-            result = Err(database_operation_timed_out(
+        let result = if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
+            Err(database_operation_timed_out(
                 "commit transaction",
                 self.runtime
                     .operation_timeout
                     .unwrap_or(Duration::from_secs(1)),
-            ));
-        }
+            ))
+        } else {
+            result
+        };
         match result {
             Ok(_) => {
                 self.connection_config_version.fetch_max(
