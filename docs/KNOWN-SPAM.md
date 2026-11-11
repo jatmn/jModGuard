@@ -35,11 +35,18 @@ avoided so quoting a small portion of a pitch does not trigger a ban.
   characters plus `*` for zero or more characters, including `/`. The pattern is
   anchored to the whole parsed path. An omitted path means `/*`; an explicit `/`
   matches only the root path. Percent escapes retain URL-parser spelling; there
-  is no percent-decoding or Unicode/leet normalization of URL hosts/paths.
+  is no percent-decoding.
+- Before parsing message links, supported zero-width characters (the same set
+  removed by Badwords sample normalization) are removed from hosts and paths in
+  both HTTP/HTTPS and scheme-less tokens. No other Unicode/leet normalization is
+  performed before parsing. The URL parser's canonicalization still applies,
+  including IDNA conversion of Unicode hostnames to ASCII/punycode.
+  Scheme recognition, credentials and ports are preserved; cleanup does not
+  repair malformed schemes or ports into matching URLs.
 - Query strings and fragments in messages are ignored. Patterns cannot contain
   queries, fragments, credentials, ports, whitespace, dot path segments or regexes.
-  Only ASCII DNS hosts with at least two labels are accepted. Message link ports
-  do not change the host/path match. Credential-bearing links are excluded.
+  Pattern hosts must be ASCII DNS names with at least two labels. Message link
+  ports do not change the host/path match. Credential-bearing links are excluded.
 - Links are parsed from whitespace/Markdown-delimited tokens. Paired outer
   emphasis markers and trailing sentence punctuation (`.,;!?:`) are removed.
   A literal trailing path `*` is retained when there is no paired opening marker.

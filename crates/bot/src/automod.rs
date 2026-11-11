@@ -2731,6 +2731,7 @@ mod tests {
             "FULL ST@CK AI d3v3lop3r pitch",
             "fullstackaideveloperpitch",
             "link tinyurl.com/abc",
+            "https://ti\u{200c}nyurl.com/a\u{200b}b",
         ] {
             for _ in 0..2 {
                 let pending = engine
@@ -2741,11 +2742,20 @@ mod tests {
                 assert_eq!(pending.action.ban_delete_message_seconds(), 3600);
             }
         }
-        assert!(
-            engine
-                .evaluate(&cfg, &msg(1, "a different message", 0, false, false))
-                .is_none()
-        );
+        for content in [
+            "a different message",
+            "https://\u{200b}@tinyurl.com/a",
+            "https://:\u{200b}@tinyurl.com/a",
+            "ht\u{200b}tps://tinyurl.com/a",
+            "https://tinyurl.com:\u{200b}443/a",
+        ] {
+            assert!(
+                engine
+                    .evaluate(&cfg, &msg(1, content, 0, false, false))
+                    .is_none(),
+                "must not schedule a ban: {content:?}"
+            );
+        }
         let message = msg(1, "tinyurl.com/a", 0, false, false);
         for skip in 0..5 {
             let rule = cfg.rules.get_mut("known_spam").unwrap();
