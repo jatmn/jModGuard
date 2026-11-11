@@ -2,3 +2,4 @@
 # Static release package only. The API remains a JSON/OAuth image without UI.
 FROM scratch
 COPY dist/webui/ /webui/
+USER 10001:10001
