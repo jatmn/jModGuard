@@ -359,7 +359,7 @@ JS
       --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
     )
     if [[ -f "$context/src/db/update_control.rs" ]]; then
-      local guild_schema control_protocol launcher_revision min_launcher_revision
+      local guild_schema guild_schema_file control_protocol launcher_revision min_launcher_revision
       read -r control_protocol launcher_revision min_launcher_revision < <(node - "$context/src/db/update_control.rs" <<'JS'
 const fs = require("node:fs");
 const source = fs.readFileSync(process.argv[2], "utf8");
@@ -379,7 +379,12 @@ JS
         args+=(--label "io.jmodguard.launcher-revision=${launcher_revision}"
           --label "io.jmodguard.min-launcher-revision=${min_launcher_revision}")
       fi
-      guild_schema="$(cat "$context/migrations/guild/current_version.txt")"
+      # Historical selected sources predate the schema expression's rename.
+      guild_schema_file="$context/migrations/guild/current_version.txt"
+      if [[ ! -f "$guild_schema_file" ]]; then
+        guild_schema_file="$context/migrations/guild/current_version.rs"
+      fi
+      guild_schema="$(cat "$guild_schema_file")"
       [[ "$guild_schema" =~ ^[1-9][0-9]*$ ]] || publish_fail 'invalid selected guild schema'
       args+=(
         --label "io.jmodguard.update-control=${control_protocol}"
