@@ -2,11 +2,15 @@
 
 use std::collections::BTreeMap;
 
-/// Compact Discord elapsed time, using fixed 30-day months and 7-day weeks.
+/// Compact Discord elapsed time, using fixed 360-day years (twelve 30-day
+/// months), 30-day months, and 7-day weeks, not calendar years or months.
 /// Leading/trailing zero units are omitted; intermediate zeros stay, so one
 /// day and 38 seconds is `1d 0h 0m 38s`. `mo` distinguishes months from minutes.
 pub fn format_duration(seconds: u64) -> String {
+    let years = seconds / 31_104_000;
+    let seconds = seconds % 31_104_000;
     let parts = [
+        (years, "y"),
         (seconds / 2_592_000, "mo"),
         ((seconds % 2_592_000) / 604_800, "w"),
         ((seconds % 2_592_000) % 604_800 / 86_400, "d"),
@@ -557,6 +561,15 @@ mod presentation_tests {
             (2592000, "1mo"),
             (5184001, "2mo 0w 0d 0h 0m 1s"),
             (6062706, "2mo 1w 3d 4h 5m 6s"),
+            (31_103_999, "11mo 4w 1d 23h 59m 59s"),
+            (31_104_000, "1y"), // 360 days = twelve fixed 30-day months.
+            (31_104_001, "1y 0mo 0w 0d 0h 0m 1s"),
+            (361 * 86_400, "1y 0mo 0w 1d"),
+            (364 * 86_400, "1y 0mo 0w 4d"),
+            (365 * 86_400, "1y 0mo 0w 5d"),
+            (62_208_000, "2y"),
+            (285_120_000, "9y 2mo"), // Previously 110mo.
+            (285_998_706, "9y 2mo 1w 3d 4h 5m 6s"),
         ] {
             assert_eq!(format_duration(seconds), expected, "{seconds}");
             assert_eq!(format_compact_duration(seconds), expected, "{seconds}");

@@ -96,7 +96,7 @@ and persistence contracts below are unchanged.
   This last fallback retains only guild/user IDs
   and join timestamps in memory (at most 4096 entries, usable for one hour after
   observation), consumes them on leave and clears them on rejoin or guild reload/removal.
-  Reports show the join date and elapsed months/weeks/days/hours/minutes/seconds when known. Missing join
+  Reports show the join date and elapsed years/months/weeks/days/hours/minutes/seconds (fixed 360-day years, 30-day months) when known. Missing join
   context is unavailable; no roster is fetched and no historical join count is fabricated.
 - Ban/unban reports look up the recent Discord audit entry for the same target and
   action to display the moderator and actual reason. The bot needs **View Audit Log**.

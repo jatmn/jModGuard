@@ -126,9 +126,9 @@ Prefix aliases match exactly. Slash command names must be
 `[a-z0-9_-]` — the slash sync sanitizes names automatically.
 
 Stats uses bold labels and inline-code values. Uptime, moderation records, warns,
-and bans have a leading emote. Uptime and release ages use compact months, weeks,
-days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
-`1d 0h 0m 38s`), with fixed 30-day months and 7-day weeks,
+and bans have a leading emote. Uptime and release ages use compact years, months,
+weeks, days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
+`1d 0h 0m 38s`), with fixed 360-day years, 30-day months, and 7-day weeks,
 rounded down to whole seconds; a newly started process shows `0s`. Release
 availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source matches
 but the image digest is unverified, ❓ unknown. A component with no cached

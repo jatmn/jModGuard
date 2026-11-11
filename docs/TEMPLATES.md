@@ -30,7 +30,7 @@ preview) or via `!template`.
 | `{count}` | bulk delete count / purge count / warn count |
 | `{duration}` | compact timeout length / slowmode interval / time in server |
 | `{account_created}` | account creation timestamp |
-| `{account_age}` | compact account age |
+| `{account_age}` | compact account age, including years (`y`) |
 | `{joined}` | supplied/cached join timestamp in join/leave reports (readable UTC date), or unavailable |
 | `{time}` | event timestamp (readable UTC date and time, including seconds) |
 | `{command}` | command name (command log events) |
@@ -148,9 +148,11 @@ time. Date formatting also applies to the standard `{time}`, `{account_created}`
 and `{joined}` variables in custom templates; other content is not rewritten.
 
 Durations use the same compact format as Stats: `3m 36s`, or
-`2mo 1w 3d 4h 5m 6s` for longer spans. Units are `mo`, `w`, `d`, `h`, `m`,
-and `s`, using fixed 30-day months and 7-day weeks. Leading and trailing zero
-units are omitted; intermediate zeros remain (`1d 0h 0m 38s`). Zero is `0s`.
+`9y 2mo 1w 3d 4h 5m 6s` for longer spans. Units are `y`, `mo`, `w`, `d`, `h`,
+`m`, and `s`, using fixed 360-day years (twelve 30-day months), 30-day months,
+and 7-day weeks. These are elapsed units, not calendar years or months: 360 days
+is `1y`, and 365 days is `1y 0mo 0w 5d`. Leading and trailing zero units are
+omitted; intermediate zeros remain (`1d 0h 0m 38s`). Zero is `0s`.
 Missing leave context says `Unavailable`.
 The timeout and slowmode command replies also expose `{duration}`; raw
 `{minutes}` and `{seconds}` remain available for custom command responses.
