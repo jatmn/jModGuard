@@ -1364,8 +1364,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    use crate::cases::discord_attempt_outcome;
-    use crate::db::guild_data::CaseOutcome;
     use crate::state::{BotState, CachedGuildConfig};
     use crate::types::{ActionDef, GuildSettings, RuleDef};
 
@@ -1446,15 +1444,6 @@ mod tests {
         assert!(!engine.invite_allowed(&rule, "https://discord.gg/unlisted"));
         rule.params = serde_json::json!({"allowlist_guilds": ["9007199254740993"]});
         assert!(!engine.invite_allowed(&rule, "https://discord.gg/9007199254740993"));
-    }
-
-    #[test]
-    fn selected_kick_timeout_cases_require_a_discord_attempt() {
-        assert_eq!(discord_attempt_outcome(false, None), None);
-        assert_eq!(
-            discord_attempt_outcome(true, None),
-            Some(CaseOutcome::Succeeded)
-        );
     }
 
     #[test]

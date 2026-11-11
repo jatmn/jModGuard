@@ -65,8 +65,9 @@ Headless UI are bundled into the existing CSS/JS files, with no runtime CDN depe
 ## Local validation
 
 Run `bash scripts/ci-preflight.sh` for the full local validation suite. It builds the
-bot and API executables and runs the dual-process smoke test with `--include-ignored`;
-a bare `cargo test` skips that executable test. The suite also runs
+bot and API executables and runs the dual-process smoke test with `--ignored`;
+the earlier workspace run covers the ordinary in-process cases. A bare `cargo test`
+skips that executable test. The suite also runs
 `scripts/public-install-acceptance-test.sh` to check public-source documentation.
 These checks do not provision a provider account or prove production cutover.
 

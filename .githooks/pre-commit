@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Local pre-commit: full bash scripts/ci-preflight.sh, not the path-selected CI groups.
+# Check exactly the staged patch. Relevant tests run during development and in CI.
 set -euo pipefail
-root="$(git rev-parse --show-toplevel)"
-base_ref="$(git -C "$root" config --get jmodguard.preflight-base 2>/dev/null || true)"
-if [ -z "$base_ref" ]; then
-  base_ref="origin/main"
-fi
-exec bash "$root/scripts/ci-preflight.sh" --base "$base_ref"
+exec git diff --cached --check

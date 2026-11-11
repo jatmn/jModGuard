@@ -265,7 +265,8 @@ fn wait_status(
 
 /// Requires `jmodguard-bot` and `jmodguard-api` in the same cargo profile
 /// directory as this test. `cargo test --workspace` does not build those
-/// bins; `scripts/ci-preflight.sh` builds them and passes `--include-ignored`.
+/// bins; `scripts/ci-preflight.sh` builds them and passes `--ignored`, after
+/// covering the ordinary in-process cases in its workspace or integration run.
 #[tokio::test]
 #[ignore = "needs the built jmodguard-bot and jmodguard-api binaries"]
 async fn smoke_bot_and_api_executables_share_sqlite() {

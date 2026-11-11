@@ -78,8 +78,16 @@ path, and the ignored two-process smoke still runs after building both services.
 Local preflight uses nextest when installed, with the existing GNU timeout
 fallback for unavailable nextest or unsupported arguments.
 
-CI passes selected groups as repeated `--only` arguments. Local hooks always run
-the full gate. Separate `bash scripts/ci-remote-database.sh` starts disposable
+CI passes selected groups as repeated `--only` arguments. Ordinary contributors
+run relevant local checks and rely on **CI passed** for complete affected validation;
+see [Local validation](../development.md#local-validation). CI/build-control changes
+still require a full local preflight. Optional hooks check staged whitespace at
+commit and lightweight contracts at push, without repeating the full suite.
+The real-Cargo timeout-runner regression suite belongs to `supply-chain`, which
+already runs for runner changes and Rust plans; documentation-only contracts do
+not compile its fixture workspace. The ordinary integration suite runs the two
+in-process smoke cases; the post-build smoke invocation runs only the ignored
+executable case, so each case runs once. Separate `bash scripts/ci-remote-database.sh` starts disposable
 loopback-only libSQL containers for the existing remote database, guild store,
 and Bunny journal tests. These fixtures do not contact Discord, Bunny accounts,
 or operator databases.
