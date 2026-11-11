@@ -10,17 +10,55 @@ Upgrades: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 
 Contributor / agent build commands and invariants: **[AGENTS.md](AGENTS.md)**.
 
-Automated verification (no Discord tokens):
+## Local validation
+
+For ordinary PRs, reproduce the reported failure and run the smallest relevant
+regression plus the affected local checks. Record the commands and results in the
+PR. **CI passed** must succeed before merge; GitHub Actions selects all affected
+groups from the complete PR diff, including earlier code commits.
+
+Examples (combine groups when a change crosses boundaries):
+
+```bash
+# Documentation or sample configuration:
+bash scripts/ci-preflight.sh --only contracts
+# Browser changes (includes dependency install/build, lint and frontend tests):
+bash scripts/ci-preflight.sh --only frontend
+# Bot-only Rust work (Clippy, package tests and binary build):
+bash scripts/ci-preflight.sh --only fmt --only bot
+# API work: both feature modes and builds:
+bash scripts/ci-preflight.sh --only fmt --only api
+# Inspect all groups selected for concrete paths; include every changed surface:
+bash scripts/select-checks.sh plan --files src/db.rs frontend/app.js
+```
+
+Shared data changes need their consumers; service-boundary changes need integration
+and boundary checks. Run `bash scripts/ci-remote-database.sh` when changing remote
+SQL/transaction behavior; it uses disposable local libSQL containers, not a live
+provider. Frontend embedding and other affected consumers are also checked by CI.
+A focused local run does not replace that hosted gate.
+
+Run the full preflight before submitting changes to CI orchestration, toolchains,
+workspace-wide dependency/build configuration, or when affected scope is uncertain:
 
 ```bash
 bash scripts/ci-preflight.sh
-# or: ./scripts/smoke-dual-process.sh
+# Equivalent full-suite alias (not a cheap smoke command):
+# bash scripts/smoke-dual-process.sh
 ```
 
-Local hooks run that full script. GitHub Actions selects groups from the diff
-(`bash scripts/select-checks.sh`) and runs `ci-preflight.sh --only <group>`.
-Remote libSQL containers stay in the `remote-database` group, which is
-skipped for docs-only, WebUI-only, and API-only diffs. Optional local hooks:
+Run broad validation once on the final candidate. After another edit, rerun checks
+whose inputs changed and reuse unaffected evidence; do not rerun the entire suite
+just because a commit or push occurred. Do not omit a distinct regression merely
+to lower the test count.
+
+Install cargo-nextest for local Rust runs (`cargo install cargo-nextest --locked
+--version 0.9.148`, the CI pin). Preflight uses it automatically. Without nextest,
+the GNU timeout fallback invokes Cargo separately for each test and runs them
+sequentially; thousands of cases make this much slower. Both paths retain per-test
+timeouts. A cold install/build is setup cost, not application-test execution time.
+
+Optional local hooks:
 
 ```bash
 bash scripts/install-git-hooks.sh
@@ -28,11 +66,12 @@ bash scripts/install-git-hooks.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That sets worktree-local `core.hooksPath` to `.githooks` so `pre-commit` and
-`pre-push` run the full `bash scripts/ci-preflight.sh` suite (commit then
-push runs it twice). Git then uses only `.githooks` in this worktree; previous
-hook directories are not chained. Linked worktrees are unaffected unless you run
-install there too. The hooks are local; GitHub Actions runs the selected CI groups.
+This sets worktree-local `core.hooksPath` to `.githooks`. Pre-commit checks only
+staged whitespace; pre-push runs `ci-preflight.sh --only contracts` once and blocks
+on failure. Neither starts the full Rust suite. Run relevant tests before pushing;
+the hooks do not infer application coverage. Git uses only `.githooks` in this
+worktree; previous hook directories are not chained. Linked worktrees are unaffected
+unless you install there too. Existing installations pick up the tracked hook edits.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.

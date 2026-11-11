@@ -946,4 +946,55 @@ assert.notEqual(noDigest.status, 0);
 assert.match(noDigest.stderr, /preserved version 21 has no digest to restore/);
 assert.equal(noDigest.dockerText, "");
 assert.equal(noDigest.calls.some(call => call.method === "DELETE"), false);
+// Exercise the installed hooks through Git: commits check the index; pushes run
+// contracts once. The preflight substitute records selection and failure flow,
+// not application-test success (covered by the real final preflight).
+const hookDir = fs.mkdtempSync(path.join(os.tmpdir(), "jmodguard-hooks-"));
+try {
+  const repo = path.join(hookDir, "repo");
+  const remote = path.join(hookDir, "remote.git");
+  run("git", ["init", "-q", "--initial-branch=main", repo]);
+  run("git", ["init", "-q", "--bare", remote]);
+  const git = (...args) => run("git", ["-C", repo, ...args]);
+  git("config", "user.name", "Hook test");
+  git("config", "user.email", "hook@example.invalid");
+  git("config", "commit.gpgsign", "false");
+  git("remote", "add", "origin", remote);
+  fs.mkdirSync(path.join(repo, "scripts"));
+  fs.cpSync(path.join(root, ".githooks"), path.join(repo, ".githooks"), { recursive: true });
+  fs.copyFileSync(path.join(root, "scripts/install-git-hooks.sh"), path.join(repo, "scripts/install-git-hooks.sh"));
+  const calls = path.join(hookDir, "calls");
+  fs.writeFileSync(path.join(repo, "scripts/ci-preflight.sh"),
+    '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$HOOK_CALLS"\nexit "${HOOK_RESULT:-0}"\n');
+  fs.writeFileSync(path.join(repo, "notes.md"), "base\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("push", "-qu", "origin", "main");
+  const env = { ...process.env, HOOK_CALLS: calls };
+  run("bash", ["scripts/install-git-hooks.sh", "--base", "origin/main"], { cwd: repo, env });
+  fs.writeFileSync(path.join(repo, "notes.md"), "clean staged change\n");
+  git("add", "notes.md");
+  // Unstaged whitespace is not part of this commit.
+  fs.appendFileSync(path.join(repo, "notes.md"), "unstaged trailing space \n");
+  run("git", ["commit", "-qm", "clean index"], { cwd: repo, env });
+  assert.equal(fs.existsSync(calls), false, "commit must not run preflight");
+  git("add", "notes.md");
+  const bad = spawnSync("git", ["commit", "-qm", "bad index"], { cwd: repo, env, encoding: "utf8" });
+  assert.notEqual(bad.status, 0, "staged whitespace must block commit");
+  assert.match(bad.stderr + bad.stdout, /trailing whitespace/);
+  git("restore", "--staged", "--worktree", "notes.md");
+  run("git", ["push", "origin", "main"], { cwd: repo, env });
+  assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), ["--base origin/main --only contracts"]);
+  fs.writeFileSync(path.join(repo, "notes.md"), "another change\n");
+  git("add", "notes.md");
+  run("git", ["commit", "-qm", "next"], { cwd: repo, env });
+  const remoteBefore = run("git", ["--git-dir", remote, "rev-parse", "main"]);
+  const refused = spawnSync("git", ["push", "origin", "main"], {
+    cwd: repo, env: { ...env, HOOK_RESULT: "7" }, encoding: "utf8",
+  });
+  assert.notEqual(refused.status, 0, "failed contracts must block push");
+  assert.equal(run("git", ["--git-dir", remote, "rev-parse", "main"]), remoteBefore);
+} finally {
+  fs.rmSync(hookDir, { recursive: true, force: true });
+}
 console.log("ci-workflow-test: ok");

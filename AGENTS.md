@@ -208,8 +208,16 @@ and `npm run build --prefix tools/webui`. Rebuild after frontend/build-input cha
 Generated assets and third-party source must not be committed. Local preflight
 and publication build these assets automatically.
 
-Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
-GitHub Actions runs affected check groups; see `docs/CI.md`.
+For ordinary PRs, run the regression and checks relevant to the changed behavior
+locally; see the selection examples in `development.md`. Record commands, results,
+and simulated boundaries in the PR. GitHub Actions runs affected check groups and
+**CI passed** remains required before merge; a local focused pass is not a merge gate.
+Do not repeat full validation for each edit, commit, and push. After a follow-up
+edit, rerun affected checks and retain evidence for unchanged inputs.
+Run the full Linux preflight (`bash scripts/ci-preflight.sh`, no `--only`) before
+submitting changes to CI orchestration, toolchains, workspace-wide dependency/build
+configuration, or when affected scope cannot be established. It also remains
+available for an explicit complete check; see `docs/CI.md`.
 The Publish workflow calls the same checks before publishing verified images. Pullfrog
 retains its owner-command workflow (`docs/PULLFROG.md`); Socket Security remains
 a separate manifest scan (`.github/workflows/socket.yml`). Set the
@@ -223,13 +231,13 @@ After enabling the key, let a scan run on `main` before relying on pull request 
 bash scripts/ci-preflight.sh
 # For a PR whose base is not main:
 # bash scripts/ci-preflight.sh --base origin/<base-branch>
-# Optional local git hooks (the same full local preflight).
+# Optional local hooks: staged whitespace at commit, contracts at push.
 # Worktree-local core.hooksPath (.githooks); does not chain previous hook dirs:
 # bash scripts/install-git-hooks.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That script runs lockfile verification, `cargo fmt --check`,
+The full script runs lockfile verification, `cargo fmt --check`,
 `bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
 general lints pinned in `dylint.toml`),
 whitespace `git diff --check`, the publisher/release contract tests
@@ -244,8 +252,8 @@ then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=24`
 `tools/eslint/package.json` `engines`),
 frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
-with `--include-ignored` (that ignored test launches those binaries; the
-workspace test runs only the in-process smoke), the API build without default features,
+with `--ignored` (that test launches those binaries; the ordinary
+workspace run already covers the two in-process cases), the API build without default features,
 `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
@@ -291,7 +299,7 @@ Preserve useful unit, integration, static-boundary, and smoke tests. Before remo
 or consolidating coverage, identify the exact remaining cases, assertions, and CI
 routes, or explain which requirement is obsolete. Shared or parameterized cases can
 protect several entry points; neither test counts nor an E2E-only policy is the goal.
-Follow the existing preflight and relevant separate remote-database gates above;
+Follow the local validation policy and relevant separate remote-database gates above;
 report unrun checks and simulated boundaries explicitly. These principles do not
 authorize live provider calls or require a Codex skill to contribute.
 
