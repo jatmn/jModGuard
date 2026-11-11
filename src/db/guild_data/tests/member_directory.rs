@@ -6567,6 +6567,82 @@ async fn coverage_gap_meta_created_after_admission_rolls_back_the_mark() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_cleanup_lookup_takes_the_writer_lock_only_to_queue_a_check() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+
+    // (case backfill finished, lookup time, expected immediate BEGINs)
+    for (backfill_done, now_ms, queues_check, begins_expected) in [
+        (false, 3_001, false, 0),
+        (true, 400_000, false, 0),
+        (false, 400_000, true, 1),
+    ] {
+        let (f, local, scope) = ready().await;
+        complete_for_checks(&local, &scope).await;
+        local
+            .db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_write()?;
+                tx.ensure_mutation_receipt()?;
+                tx.member_execute(
+                    "UPDATE guild_member_seed SET case_backfill_done=?1 WHERE guild_id=10",
+                    params![backfill_done],
+                )?;
+                tx.commit()
+            })
+            .await
+            .unwrap();
+        local
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: 91,
+                    username: None,
+                    global_name: None,
+                    nickname: None,
+                    joined_at_ms: Some(500),
+                    observed_at_ms: 1_000,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+        local.depart_member(scope.clone(), 91, 3_000).await.unwrap();
+        let (fixture, db) =
+            HranaFixture::delayed_database(&f.store_path, Duration::ZERO, Duration::from_secs(5))
+                .await;
+        let remote = GuildDataStore {
+            db,
+            expected: local.expected.clone(),
+            core: None,
+        };
+        let begins = fixture.immediate_begins();
+        let candidate = remote
+            .next_member_cleanup_candidate(scope.clone(), now_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate.is_some(),
+            backfill_done && now_ms > 3_001,
+            "a ban lookup is returned for the caller to verify"
+        );
+        assert_eq!(
+            fixture.immediate_begins() - begins,
+            begins_expected,
+            "backfill_done={backfill_done} now_ms={now_ms}"
+        );
+        assert_eq!(
+            local
+                .next_member_target_check(scope.clone(), now_ms)
+                .await
+                .unwrap()
+                .is_some(),
+            queues_check
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
     use crate::db::tests::remote_stream::HranaFixture;
     use std::time::{Duration, Instant};
