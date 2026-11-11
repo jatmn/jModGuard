@@ -127,7 +127,8 @@ fn get(addr: &str, path: &str) -> String {
     }
 }
 
-fn lease_present(path: &Path) -> bool {
+/// `Err` when the lease row cannot be read; a readable database with no lease is `Ok(false)`.
+fn read_lease(path: &Path) -> Result<bool, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -143,21 +144,23 @@ fn lease_present(path: &Path) -> bool {
             default_prefix: "!".into(),
             retention_days: 1,
         };
-        let Ok(db) = jmodguard::db::Db::open_with(opts) else {
-            return false;
-        };
+        let db = jmodguard::db::Db::open_with(opts).map_err(|error| format!("{error:#}"))?;
         db.with_conn(|conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key='active_bot_lease'",
-                    (),
-                    |row| Ok(row.get::<String>(0)?),
-                )
-                .is_ok())
+            let leases: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key='active_bot_lease'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            Ok(leases > 0)
         })
         .await
-        .unwrap_or(false)
+        .map_err(|error| format!("{error:#}"))
     })
+}
+
+/// Polling form for waiting on a claim: a database that is not readable yet counts as no lease.
+fn lease_present(path: &Path) -> bool {
+    read_lease(path).unwrap_or(false)
 }
 
 #[test]
@@ -296,6 +299,7 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
 
     let root = temp_root("store-ahead");
     let db_path = root.join("core.db");
+    let store_id = StoreId::new();
     let store_path = root.join("core.db.guild.db");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -311,11 +315,10 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
             token: String::new(),
             pool_size: 2,
         };
-        let id = StoreId::new();
         drop(
             GuildDataStore::initialize(
                 options,
-                StoreRegistration::for_test(id, StorePolicy::Shared),
+                StoreRegistration::for_test(store_id.clone(), StorePolicy::Shared),
             )
             .unwrap(),
         );
@@ -344,6 +347,7 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
     let log = wait_log(&running, "bot held without the writer lease");
     assert!(
         log.contains("unsupported guild-store schema")
+            && log.contains(store_id.as_str())
             && log.contains("schema version 99")
             && log.contains("expects 17"),
         "{log}"
@@ -357,7 +361,7 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
         "a refused store must hold the child, not exit for a launcher restart"
     );
     assert!(
-        !lease_present(&db_path),
+        !read_lease(&db_path).expect("the lease row must be readable to prove it is absent"),
         "the held bot must not claim the lease"
     );
     assert!(
