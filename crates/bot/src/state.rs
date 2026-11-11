@@ -977,7 +977,7 @@ impl BotState {
             "log.discord_timeout_secs must be positive"
         );
         let image_spam = crate::image_spam::Detector::new(cfg.image_spam.clone())?;
-        let attachment_burst = crate::attachment_burst::Tracker::new(cfg.attachment_burst.clone());
+        let attachment_burst = crate::attachment_burst::Tracker::new(cfg.attachment_burst.clone())?;
         let tenant =
             crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
         let log_delivery_slots =

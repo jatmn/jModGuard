@@ -193,10 +193,10 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new(settings: Settings) -> Self {
-        Self {
+    pub fn new(settings: Settings) -> anyhow::Result<Self> {
+        Ok(Self {
             settings,
-            process_nonce: fresh_nonce(),
+            process_nonce: fresh_nonce()?,
             state: Mutex::new(State {
                 guilds: HashMap::new(),
                 authors: 0,
@@ -212,7 +212,7 @@ impl Tracker {
             hits: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
             timeout_locks: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn prune(&self) {
@@ -1102,11 +1102,16 @@ impl State {
     }
 }
 
-fn fresh_nonce() -> u64 {
+/// Draws the per-process review-button nonce straight from the OS RNG so an
+/// entropy failure is a startup error rather than a `ThreadRng` panic.
+fn fresh_nonce() -> anyhow::Result<u64> {
+    use rand::TryRng as _;
     loop {
-        let value = rand::random::<u64>();
+        let value = rand::rngs::SysRng.try_next_u64().map_err(|err| {
+            anyhow::anyhow!("OS random source unavailable for review nonce: {err}")
+        })?;
         if value != 0 {
-            return value;
+            return Ok(value);
         }
     }
 }
@@ -2755,7 +2760,7 @@ mod tests {
     }
 
     fn tracker() -> Tracker {
-        Tracker::new(settings())
+        Tracker::new(settings()).unwrap()
     }
 
     fn admission(revision: u64, edited_ms: i64) -> Admission {
@@ -2902,7 +2907,7 @@ mod tests {
     fn disabled_config_stores_nothing() {
         let mut settings = settings();
         settings.enabled = false;
-        let tracker = Tracker::new(settings);
+        let tracker = Tracker::new(settings).unwrap();
         let now = Instant::now();
         tracker.stage(
             sight(4, 10, 100, now),
