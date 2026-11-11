@@ -120,6 +120,44 @@ async fn existing_registration_reads_stamped_identity_without_creating() {
 }
 
 #[tokio::test]
+async fn existing_registration_does_not_relabel_unreadable_identity_as_schema_mismatch() {
+    let f = Fixture::new();
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded("CREATE TABLE sentinel(value TEXT)", 64 * 1024 * 1024)
+            .unwrap();
+    }
+    let unmarked = format!(
+        "{:#}",
+        GuildDataStore::existing_registration(f.options()).unwrap_err()
+    );
+    assert!(
+        unmarked.contains("unsupported guild-store schema")
+            && unmarked.contains("no store identity marker")
+            && unmarked.contains("user_version 0"),
+        "{unmarked}"
+    );
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_batch_bounded(
+            "CREATE TABLE store_identity(singleton INTEGER)",
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+    }
+    // The marker table exists but its read fails, as a remote read error would.
+    let unreadable = format!(
+        "{:#}",
+        GuildDataStore::existing_registration(f.options()).unwrap_err()
+    );
+    assert!(
+        !unreadable.contains("unsupported guild-store schema")
+            && unreadable.contains("no such column"),
+        "a failed identity read must surface its own cause: {unreadable}"
+    );
+}
+
+#[tokio::test]
 async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
@@ -158,8 +196,25 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
             .with_conn(move |c| c.pragma_update(None, "user_version", version))
             .await
             .unwrap();
-        assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
-        assert!(GuildDataStore::initialize(f.options(), reg.clone()).is_err());
+        let refusals = [
+            GuildDataStore::open(f.options(), reg.clone()).err(),
+            GuildDataStore::initialize(f.options(), reg.clone()).err(),
+        ];
+        for refusal in refusals {
+            let text = format!("{:#}", refusal.expect("mismatched version must be refused"));
+            assert!(
+                text.contains(reg.id().as_str())
+                    && text.contains("shared")
+                    && text.contains(&format!("version {version}"))
+                    && text.contains(&format!("expects {VERSION}")),
+                "refusal must name the store and both versions: {text}"
+            );
+            assert_eq!(
+                text.contains("newer release"),
+                version > VERSION,
+                "only a newer store gets the newer-release action: {text}"
+            );
+        }
     }
     store
         .db
