@@ -651,12 +651,12 @@ async fn remote_bunny_journal_recovers_commits() {
     )
     .await
     .unwrap();
-    assert!(
-        !f.db
-            .bunny_transfer(t.scope.clone(), t.case_id.clone(), t.evidence_id.clone())
+    assert_eq!(
+        f.db.bunny_transfer(t.scope.clone(), t.case_id.clone(), t.evidence_id.clone())
             .await
             .unwrap()
-            .accepted
+            .acceptance,
+        BunnyAcceptance::Unresolved
     );
     let mut request = f
         .backend

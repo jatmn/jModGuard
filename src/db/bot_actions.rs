@@ -3,6 +3,60 @@ use super::*;
 use crate::bot_actions::{Action, Limits};
 use serde::Deserialize;
 
+// Stored and wire strings remain adapters; unknown values remain readable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionState<'a> {
+    Pending,
+    Claimed,
+    Running,
+    Succeeded,
+    Failed,
+    Uncertain,
+    Cancelled,
+    Expired,
+    Other(&'a str),
+}
+
+impl<'a> ActionState<'a> {
+    fn from_saved(value: &'a str) -> Self {
+        match value {
+            "pending" => Self::Pending,
+            "claimed" => Self::Claimed,
+            "running" => Self::Running,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "uncertain" => Self::Uncertain,
+            "cancelled" => Self::Cancelled,
+            "expired" => Self::Expired,
+            value => Self::Other(value),
+        }
+    }
+
+    fn as_str(self) -> &'a str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Other(value) => value,
+        }
+    }
+
+    fn is_completion(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Uncertain)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionPolicy {
+    Trusted,
+    Dispatched,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotAction {
     pub id: String,
@@ -33,7 +87,7 @@ pub struct BotAction {
 impl BotAction {
     /// Claim identity stays private to the data layer and is never serialized.
     pub fn is_claimed(&self) -> bool {
-        self.state == "claimed" && self.claim.is_some()
+        ActionState::from_saved(&self.state) == ActionState::Claimed && self.claim.is_some()
     }
 }
 
@@ -368,7 +422,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
             params![claim.as_str(), now, job.id.as_str()],
         )?;
         job.claim = Some(claim);
-        job.state = "claimed".into();
+        job.state = ActionState::Claimed.as_str().into();
         tx.commit()?;
         Ok(Some(job))
     })
@@ -405,7 +459,7 @@ pub async fn finish_bot_action(
     state: &str,
     outcome: &str,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, false).await
+    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Trusted).await
 }
 
 /// Worker completion: a local log-setting effect must still be within its deadline
@@ -416,7 +470,7 @@ pub async fn finish_dispatched_bot_action(
     state: &str,
     outcome: &str,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, true).await
+    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Dispatched).await
 }
 
 async fn finish_bot_action_inner(
@@ -424,34 +478,35 @@ async fn finish_bot_action_inner(
     job: &BotAction,
     state: &str,
     outcome: &str,
-    enforce_local_deadline: bool,
+    policy: CompletionPolicy,
 ) -> Result<bool> {
     anyhow::ensure!(
-        matches!(state, "succeeded" | "failed" | "uncertain"),
+        ActionState::from_saved(state).is_completion(),
         "invalid action outcome"
     );
     let (job, state, outcome) = (job.clone(), state.to_owned(), outcome.to_owned());
     db.with_conn(move |conn| {
+        let state = ActionState::from_saved(&state);
         let tx = conn.transaction_immediate()?;
         if !claimed_identity_matches(&tx, &job, None)? {
             tx.finish_read()?;
             return Ok(false);
         }
-        let (state, outcome) = if enforce_local_deadline
-            && state == "succeeded"
+        let (state, outcome) = if policy == CompletionPolicy::Dispatched
+            && state == ActionState::Succeeded
             && matches!(job.action, Action::SetLogChannel { .. })
             && chrono::Utc::now().timestamp() >= job.expires_at
         {
-            ("failed".to_owned(), "expired_before_execution".to_owned())
+            (ActionState::Failed, "expired_before_execution".to_owned())
         } else {
             (state, outcome)
         };
-        let write_fenced = enforce_local_deadline
-            && state == "succeeded"
+        let write_fenced = policy == CompletionPolicy::Dispatched
+            && state == ActionState::Succeeded
             && super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
         let (state, outcome) = if write_fenced && matches!(job.action, Action::SetLogChannel { .. })
         {
-            ("failed".to_owned(), "guild_move_fenced".to_owned())
+            (ActionState::Failed, "guild_move_fenced".to_owned())
         } else {
             (state, outcome)
         };
@@ -471,7 +526,7 @@ async fn finish_bot_action_inner(
             tx.finish_read()?;
             return Ok(false);
         }
-        if state == "succeeded" {
+        if state == ActionState::Succeeded {
             match &job.action {
                 Action::Unban { user_id, reason } if !write_fenced => {
                     tx.execute_matching(
@@ -625,7 +680,7 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
 fn claimed_identity_matches(
     conn: &impl SqlExecutor,
     job: &BotAction,
-    expected_state: Option<&str>,
+    expected_state: Option<ActionState<'_>>,
 ) -> Result<bool> {
     let stored = conn
         .query_row(
@@ -635,7 +690,7 @@ fn claimed_identity_matches(
         )
         .optional()?;
     Ok(stored.is_some_and(|stored| {
-        expected_state.is_none_or(|state| stored.state == state)
+        expected_state.is_none_or(|state| ActionState::from_saved(&stored.state) == state)
             && stored.guild_id == job.guild_id
             && stored.actor_id == job.actor_id
             && stored.enrollment_id == job.enrollment_id
@@ -650,7 +705,7 @@ pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDi
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_write()?;
-        let status = if !claimed_identity_matches(&tx, &job, Some("running"))? {
+        let status = if !claimed_identity_matches(&tx, &job, Some(ActionState::Running))? {
             BotActionDispatch::EnrollmentEnded
         } else if super::guild_stores::guild_write_fenced(&tx, job.guild_id)? {
             BotActionDispatch::GuildMoveFenced

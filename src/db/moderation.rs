@@ -589,6 +589,26 @@ pub struct CommandBanRecord {
     pub expiry_ban: Option<i64>,
 }
 
+/// Whether the primary row still authorizes the previously captured deadline binding.
+#[derive(Clone, Copy)]
+enum BanCaptureMatch {
+    Unknown,
+    Current(Option<i64>),
+    Changed,
+}
+
+impl BanCaptureMatch {
+    fn bind(self, published: Option<i64>) -> CommandBanRecord {
+        CommandBanRecord {
+            published,
+            expiry_ban: match self {
+                Self::Current(captured) => published.or(captured),
+                Self::Unknown | Self::Changed => None,
+            },
+        }
+    }
+}
+
 /// [`record_enrolled_ban_if_absent`] that also decides, in the same
 /// transaction, whether the command's deadline may bind to the result.
 /// `captured` is the active ban row (`Some(None)`: none) read before the
@@ -626,17 +646,12 @@ pub async fn record_ban_if_absent_binding(
         let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-        let keeps_capture = match captured {
-            Some(captured) => active_ban_id(&tx, guild_id, user_id)? == captured,
-            None => false,
-        };
-        let bind = |row: Option<i64>| CommandBanRecord {
-            published: row,
-            expiry_ban: if keeps_capture {
-                row.or(captured.flatten())
-            } else {
-                None
-            },
+        let capture = match captured {
+            Some(captured) if active_ban_id(&tx, guild_id, user_id)? == captured => {
+                BanCaptureMatch::Current(captured)
+            }
+            Some(_) => BanCaptureMatch::Changed,
+            None => BanCaptureMatch::Unknown,
         };
         let same_dispatch: Option<i64> = tx
             .query_row(
@@ -650,7 +665,7 @@ pub async fn record_ban_if_absent_binding(
             .optional()?;
         if kind == BanRecord::Retry && same_dispatch.is_some() {
             tx.finish_read()?;
-            return Ok(bind(None));
+            return Ok(capture.bind(None));
         }
         let same_attempt: Option<i64> = match operation_id.as_deref() {
             Some(operation_id) => tx
@@ -688,7 +703,7 @@ pub async fn record_ban_if_absent_binding(
             )?;
             anyhow::ensure!(updated == 1, "gateway ban echo was no longer this attempt");
             tx.commit()?;
-            return Ok(bind(Some(row_id)));
+            return Ok(capture.bind(Some(row_id)));
         }
         tx.execute_matching(
             "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
@@ -702,7 +717,7 @@ pub async fn record_ban_if_absent_binding(
         )?;
         let row_id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(bind(Some(row_id)))
+        Ok(capture.bind(Some(row_id)))
     })
     .await
 }
@@ -879,13 +894,67 @@ pub async fn record_gateway_ban_with_audit(
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorReasonState {
+    GatewayPlaceholder,
+    /// Includes absent text and literal placeholder text supplied by a moderator.
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorDisposition {
+    Keep,
+    Replace,
+}
+
+impl MirrorDisposition {
+    fn from_keep(keep: bool) -> Self {
+        if keep { Self::Keep } else { Self::Replace }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BanObservationOrder {
+    Current,
+    Historical,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayObservationMatch {
+    Original,
+    Retained(usize),
+}
+
+impl GatewayObservationMatch {
+    fn unique(original_matches: bool, retained: &[usize]) -> Option<Self> {
+        match (original_matches, retained) {
+            (true, []) => Some(Self::Original),
+            (false, [index]) => Some(Self::Retained(*index)),
+            _ => None,
+        }
+    }
+}
+
+/// An audit split becomes active only by replacing an older row of the same origin.
+#[derive(Clone, Copy)]
+enum SplitBanState {
+    Historical,
+    ReplacingActive(i64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorMutation {
+    Unchanged,
+    Changed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveBanMirror {
     id: i64,
     reason: Option<String>,
     /// Gateway placeholder text in storage with no moderator yet; distinct from a
     /// moderator who literally chose the same display string.
-    gateway_reason_unset: bool,
+    reason_state: MirrorReasonState,
     moderator_id: Option<i64>,
     operation_id: Option<String>,
     created_at: String,
@@ -904,12 +973,16 @@ fn load_active_ban_mirror(
             let reason: Option<String> = row.get(1)?;
             let moderator_id: Option<i64> = row.get(2)?;
             let operation_id: Option<String> = row.get(3)?;
-            let gateway_reason_unset =
-                reason.as_deref() == Some(GATEWAY_BAN_REASON) && moderator_id.is_none();
+            let reason_state =
+                if reason.as_deref() == Some(GATEWAY_BAN_REASON) && moderator_id.is_none() {
+                    MirrorReasonState::GatewayPlaceholder
+                } else {
+                    MirrorReasonState::Other
+                };
             Ok(ActiveBanMirror {
                 id: row.get(0)?,
                 reason,
-                gateway_reason_unset,
+                reason_state,
                 moderator_id,
                 operation_id,
                 created_at: row.get(4)?,
@@ -954,7 +1027,7 @@ fn manual_member_ban_event_exists_for_mirror(
 }
 
 fn gateway_placeholder_mirror(mirror: &ActiveBanMirror) -> bool {
-    mirror.gateway_reason_unset && mirror.operation_id.is_none()
+    mirror.reason_state == MirrorReasonState::GatewayPlaceholder && mirror.operation_id.is_none()
 }
 
 fn bot_owned_mirror_without_manual_event(
@@ -965,7 +1038,7 @@ fn bot_owned_mirror_without_manual_event(
 ) -> Result<bool> {
     if mirror.operation_id.is_none()
         || mirror.moderator_id.is_some()
-        || !mirror.gateway_reason_unset
+        || mirror.reason_state != MirrorReasonState::GatewayPlaceholder
     {
         return Ok(false);
     }
@@ -974,37 +1047,41 @@ fn bot_owned_mirror_without_manual_event(
     )?)
 }
 
-fn bot_echo_matches_mirror(
+fn bot_echo_disposition(
     conn: &impl SqlExecutor,
     guild_id: i64,
     user_id: i64,
     mirror: &ActiveBanMirror,
     operation_id: &Option<String>,
     observed_at: &str,
-) -> Result<bool> {
+) -> Result<MirrorDisposition> {
     match operation_id {
         Some(operation_id) if mirror.operation_id.as_deref() == Some(operation_id.as_str()) => {
-            Ok(true)
+            Ok(MirrorDisposition::Keep)
         }
         Some(_) => {
             if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
-                return Ok(true);
+                return Ok(MirrorDisposition::Keep);
             }
             if completed_bot_gateway_mirror(mirror) {
-                return Ok(true);
+                return Ok(MirrorDisposition::Keep);
             }
             if mirror.operation_id.is_some() && mirror.created_at.as_str() > observed_at {
-                return Ok(true);
+                return Ok(MirrorDisposition::Keep);
             }
             if mirror.created_at.as_str() >= observed_at {
-                return Ok(true);
+                return Ok(MirrorDisposition::Keep);
             }
-            Ok(mirror.operation_id.is_none()
-                && mirror.moderator_id.is_some()
-                && !mirror.gateway_reason_unset)
+            Ok(MirrorDisposition::from_keep(
+                mirror.operation_id.is_none()
+                    && mirror.moderator_id.is_some()
+                    && mirror.reason_state != MirrorReasonState::GatewayPlaceholder,
+            ))
         }
-        None if gateway_placeholder_mirror(mirror) => Ok(true),
-        None => Ok(mirror.operation_id.is_some() && mirror.moderator_id.is_some()),
+        None if gateway_placeholder_mirror(mirror) => Ok(MirrorDisposition::Keep),
+        None => Ok(MirrorDisposition::from_keep(
+            mirror.operation_id.is_some() && mirror.moderator_id.is_some(),
+        )),
     }
 }
 
@@ -1155,7 +1232,7 @@ fn same_gateway_delivery_as_mirror(
     )
 }
 
-fn replace_manual_gateway_mirror(
+fn manual_mirror_disposition(
     conn: &impl SqlExecutor,
     mirror: &ActiveBanMirror,
     guild_id: i64,
@@ -1163,16 +1240,16 @@ fn replace_manual_gateway_mirror(
     member_was_banned: bool,
     incoming_at: &str,
     incoming_audit_entry_id: Option<i64>,
-) -> Result<bool> {
+) -> Result<MirrorDisposition> {
     if bot_owned_mirror_without_manual_event(conn, guild_id, user_id, mirror)? {
         if mirror.created_at.as_str() > incoming_at {
-            return Ok(false);
+            return Ok(MirrorDisposition::Keep);
         }
-        return Ok(true);
+        return Ok(MirrorDisposition::Replace);
     }
     if gateway_placeholder_mirror(mirror) {
         if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
-            return Ok(true);
+            return Ok(MirrorDisposition::Replace);
         }
         if manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)? {
             if gateway_deliveries_are_same(
@@ -1183,17 +1260,17 @@ fn replace_manual_gateway_mirror(
                 incoming_at,
                 incoming_audit_entry_id,
             )? {
-                return Ok(false);
+                return Ok(MirrorDisposition::Keep);
             }
-            return Ok(true);
+            return Ok(MirrorDisposition::Replace);
         }
         if !member_was_banned {
-            return Ok(true);
+            return Ok(MirrorDisposition::Replace);
         }
-        return Ok(false);
+        return Ok(MirrorDisposition::Keep);
     }
     if unban_observed_after_mirror(conn, guild_id, user_id, &mirror.created_at)? {
-        return Ok(true);
+        return Ok(MirrorDisposition::Replace);
     }
     if same_gateway_delivery_as_mirror(
         conn,
@@ -1203,7 +1280,7 @@ fn replace_manual_gateway_mirror(
         incoming_at,
         incoming_audit_entry_id,
     )? {
-        return Ok(false);
+        return Ok(MirrorDisposition::Keep);
     }
     let manual = manual_member_ban_event_exists_for_mirror(conn, guild_id, user_id, mirror.id)?;
     if manual
@@ -1213,12 +1290,16 @@ fn replace_manual_gateway_mirror(
         )
         && incoming != stored
     {
-        return Ok(true);
+        return Ok(MirrorDisposition::Replace);
     }
     if manual && member_was_banned {
-        return Ok(true);
+        return Ok(MirrorDisposition::Replace);
     }
-    Ok(!member_was_banned)
+    Ok(if member_was_banned {
+        MirrorDisposition::Keep
+    } else {
+        MirrorDisposition::Replace
+    })
 }
 
 fn member_ban_event_json_lacks_audit_entry_id(data: &str) -> bool {
@@ -1405,13 +1486,14 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
         })
         .map(|(index, _)| index)
         .collect();
-    if usize::from(original_matches) + matching.len() != 1 {
+    let Some(selected) = GatewayObservationMatch::unique(original_matches, &matching) else {
         tx.finish_read()?;
         return Ok(false);
-    }
-    let candidate = matching
-        .first()
-        .map_or(&event, |index| &observations[*index]);
+    };
+    let candidate = match selected {
+        GatewayObservationMatch::Original => &event,
+        GatewayObservationMatch::Retained(index) => &observations[index],
+    };
     if candidate["audit_after_ms"]
         .as_i64()
         .is_some_and(|after| audit_at_ms <= after)
@@ -1419,8 +1501,8 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
         tx.finish_read()?;
         return Ok(false);
     }
-    if let Some(index) = matching.first() {
-        let at_ms = observations.remove(*index)["at_ms"]
+    if let GatewayObservationMatch::Retained(index) = selected {
+        let at_ms = observations.remove(index)["at_ms"]
             .as_i64()
             .ok_or_else(|| anyhow::anyhow!("invalid ban observation"))?;
         let at = chrono::DateTime::from_timestamp_millis(at_ms)
@@ -1448,17 +1530,17 @@ pub fn reconcile_gateway_manual_ban_audit_entry_conn(
                 |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)),
             )
             .optional()?;
-        let replace = match active_row {
+        let split = match active_row {
             Some((id, created))
                 if chrono::DateTime::parse_from_rfc3339(&created)?.timestamp_millis() < at_ms =>
             {
-                Some(id)
+                SplitBanState::ReplacingActive(id)
             }
-            _ => None,
+            _ => SplitBanState::Historical,
         };
-        let active = replace.is_some();
+        let active = matches!(split, SplitBanState::ReplacingActive(_));
         tx.ensure_mutation_receipt()?;
-        if let Some(id) = replace {
+        if let SplitBanState::ReplacingActive(id) = split {
             tx.execute_matching("UPDATE bans SET active=0 WHERE id=?1", params![id])?;
         }
         tx.execute_rows(
@@ -1636,9 +1718,9 @@ pub(super) fn record_gateway_ban_conn(
             "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3 ORDER BY id LIMIT 1",
             params![guild_id, user_id, operation], |row| Ok(row.get::<i64>(0)?),
         ).optional()? {
-        return finish_gateway_ban_write(tx, delivery_id, GatewayBanWrite::Existing { row_id }, false);
+        return finish_gateway_ban_write(tx, delivery_id, GatewayBanWrite::Existing { row_id }, MirrorMutation::Unchanged);
     }
-    let historical = if delivery_id.is_some() {
+    let observation_order = if delivery_id.is_some() {
         let at = chrono::DateTime::parse_from_rfc3339(&now)?.timestamp_millis();
         tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries
@@ -1648,10 +1730,10 @@ pub(super) fn record_gateway_ban_conn(
               OR EXISTS(SELECT 1 FROM events WHERE guild_id=?1 AND user_id=?2
                  AND event_type='member_unban' AND julianday(created_at)>=julianday(?4))",
             params![guild_id, user_id, at, now.clone(), enrollment.id.clone()],
-            |row| Ok(row.get::<bool>(0)?),
+            |row| Ok(if row.get::<bool>(0)? { BanObservationOrder::Historical } else { BanObservationOrder::Current }),
         )?
     } else {
-        false
+        BanObservationOrder::Current
     };
 
     if !owned_by_bot
@@ -1669,17 +1751,19 @@ pub(super) fn record_gateway_ban_conn(
             tx,
             delivery_id,
             GatewayBanWrite::Existing { row_id },
-            false,
+            MirrorMutation::Unchanged,
         );
     }
-    if !historical && let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)? {
-        let keep = if owned_by_bot {
-            bot_echo_matches_mirror(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
+    if observation_order == BanObservationOrder::Current
+        && let Some(mirror) = load_active_ban_mirror(&tx, guild_id, user_id)?
+    {
+        let disposition = if owned_by_bot {
+            bot_echo_disposition(&tx, guild_id, user_id, &mirror, &operation_id, &now)?
         } else {
             // A new audit action after the saved observation defeats the
             // id-less redelivery fallback, even if the older ban never got its
             // audit. Do not attach this pending ID until after the row exists.
-            let mut newer_audit = false;
+            let mut disposition = MirrorDisposition::Keep;
             if !pending_audit_entries.is_empty() {
                 let mirror_at =
                     chrono::DateTime::parse_from_rfc3339(&mirror.created_at)?.timestamp_millis();
@@ -1691,13 +1775,13 @@ pub(super) fn record_gateway_ban_conn(
                         && (0..=5000).contains(&(observed_at - audit_at))
                         && !gateway_audit_entry_id_known_for_user(&tx, guild_id, user_id, *entry)?
                     {
-                        newer_audit = true;
+                        disposition = MirrorDisposition::Replace;
                         break;
                     }
                 }
             }
-            !newer_audit
-                && !replace_manual_gateway_mirror(
+            if disposition == MirrorDisposition::Keep {
+                manual_mirror_disposition(
                     &tx,
                     &mirror,
                     guild_id,
@@ -1706,8 +1790,11 @@ pub(super) fn record_gateway_ban_conn(
                     &now,
                     gateway_audit_entry_id,
                 )?
+            } else {
+                disposition
+            }
         };
-        if keep {
+        if disposition == MirrorDisposition::Keep {
             // Existing is a redelivery guess, not an action identity. Retain a
             // bounded observation on the existing event for a later audit.
             if !owned_by_bot && gateway_audit_entry_id.is_none() {
@@ -1729,9 +1816,15 @@ pub(super) fn record_gateway_ban_conn(
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
-                    if at != original
-                        && !observations.iter().any(|o| o["at_ms"].as_i64() == Some(at))
-                    {
+                    let selected = if at == original {
+                        Some(GatewayObservationMatch::Original)
+                    } else {
+                        observations
+                            .iter()
+                            .position(|o| o["at_ms"].as_i64() == Some(at))
+                            .map(GatewayObservationMatch::Retained)
+                    };
+                    let Some(selected) = selected else {
                         observations.push(
                             serde_json::json!({"at_ms": at, "audit_after_ms": audit_after_ms}),
                         );
@@ -1748,17 +1841,14 @@ pub(super) fn record_gateway_ban_conn(
                             tx,
                             delivery_id,
                             GatewayBanWrite::Existing { row_id: mirror.id },
-                            true,
+                            MirrorMutation::Changed,
                         );
-                    }
-                    let candidate = if at == original {
-                        &mut event
-                    } else {
-                        let index = observations
-                            .iter()
-                            .position(|o| o["at_ms"].as_i64() == Some(at))
-                            .expect("existing observation");
-                        &mut event["gateway_observations"][index]
+                    };
+                    let candidate = match selected {
+                        GatewayObservationMatch::Original => &mut event,
+                        GatewayObservationMatch::Retained(index) => {
+                            &mut event["gateway_observations"][index]
+                        }
                     };
                     if audit_after_ms > candidate["audit_after_ms"].as_i64().unwrap_or(0) {
                         candidate["audit_after_ms"] = serde_json::json!(audit_after_ms);
@@ -1774,7 +1864,7 @@ pub(super) fn record_gateway_ban_conn(
                             tx,
                             delivery_id,
                             GatewayBanWrite::Existing { row_id: mirror.id },
-                            true,
+                            MirrorMutation::Changed,
                         );
                     }
                 }
@@ -1783,7 +1873,7 @@ pub(super) fn record_gateway_ban_conn(
                 tx,
                 delivery_id,
                 GatewayBanWrite::Existing { row_id: mirror.id },
-                false,
+                MirrorMutation::Unchanged,
             );
         }
         tx.ensure_mutation_receipt()?;
@@ -1805,7 +1895,7 @@ pub(super) fn record_gateway_ban_conn(
             user_name,
             user_display_name,
             operation_id,
-            !historical
+            observation_order == BanObservationOrder::Current
         ],
         1,
     ) {
@@ -1822,7 +1912,7 @@ pub(super) fn record_gateway_ban_conn(
             tx,
             delivery_id,
             GatewayBanWrite::OwnedByBot { row_id },
-            true,
+            MirrorMutation::Changed,
         );
     }
     let mut event = serde_json::json!({
@@ -1842,14 +1932,19 @@ pub(super) fn record_gateway_ban_conn(
         params![guild_id, user_id, data, now],
         |row| Ok(row.get::<i64>(0)?),
     )?;
-    finish_gateway_ban_write(tx, delivery_id, GatewayBanWrite::Recorded { row_id }, true)
+    finish_gateway_ban_write(
+        tx,
+        delivery_id,
+        GatewayBanWrite::Recorded { row_id },
+        MirrorMutation::Changed,
+    )
 }
 
 fn finish_gateway_ban_write(
     mut tx: crate::db_compat::Transaction,
     delivery: Option<&str>,
     result: GatewayBanWrite,
-    mutated: bool,
+    mutation: MirrorMutation,
 ) -> Result<GatewayBanWrite> {
     if let Some(id) = delivery {
         tx.ensure_mutation_receipt()?;
@@ -1858,7 +1953,7 @@ fn finish_gateway_ban_write(
             params![serde_json::to_string(&result)?, id],
         )?;
     }
-    if mutated || delivery.is_some() {
+    if mutation == MirrorMutation::Changed || delivery.is_some() {
         tx.commit()?;
     } else {
         tx.finish_read()?;
@@ -2103,6 +2198,23 @@ const RETRY_EXPIRY_SQL: &str = "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_a
              AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=b.guild_id)
              ORDER BY l.key,b.expires_at,b.id LIMIT 1";
 
+enum ExpiryRetrySelection {
+    None,
+    AfterPrimary { deferred: String, guilds: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpiryDeadlineMatch {
+    Current,
+    Stale,
+}
+
+impl From<bool> for ExpiryDeadlineMatch {
+    fn from(current: bool) -> Self {
+        if current { Self::Current } else { Self::Stale }
+    }
+}
+
 /// Find the oldest due expiry under an active, unfenced membership without
 /// consuming it, so the caller can verify live membership first. `skip_bans`
 /// and `skip_guilds` hold ban and guild IDs already deferred in this pass.
@@ -2118,13 +2230,16 @@ pub async fn next_expired_ban(
     last_guilds: Vec<i64>,
 ) -> Result<Option<ExpiredBan>> {
     let skip_bans = serde_json::to_string(&skip_bans)?;
-    let retries = (!last_guilds.is_empty())
-        .then(|| {
-            let deferred = serde_json::to_string(&skip_guilds)?;
-            skip_guilds.extend_from_slice(&last_guilds);
-            Ok::<_, anyhow::Error>((deferred, serde_json::to_string(&last_guilds)?))
-        })
-        .transpose()?;
+    let retries = if last_guilds.is_empty() {
+        ExpiryRetrySelection::None
+    } else {
+        let deferred = serde_json::to_string(&skip_guilds)?;
+        skip_guilds.extend_from_slice(&last_guilds);
+        ExpiryRetrySelection::AfterPrimary {
+            deferred,
+            guilds: serde_json::to_string(&last_guilds)?,
+        }
+    };
     let skip_guilds = serde_json::to_string(&skip_guilds)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_write()?;
@@ -2136,7 +2251,10 @@ pub async fn next_expired_ban(
             )
             .optional()?;
         if due.is_none()
-            && let Some((deferred, last_guilds)) = retries
+            && let ExpiryRetrySelection::AfterPrimary {
+                deferred,
+                guilds: last_guilds,
+            } = retries
         {
             due = tx
                 .query_row(
@@ -2188,9 +2306,9 @@ pub async fn claim_expired_ban(db: &Db, due: &ExpiredBan) -> Result<bool> {
                 due.enrollment.id,
                 due.enrollment.joined_at_ns,
             ],
-            |row| Ok(row.get::<bool>(0)?),
+            |row| Ok(ExpiryDeadlineMatch::from(row.get::<bool>(0)?)),
         )?;
-        if !current {
+        if current == ExpiryDeadlineMatch::Stale {
             tx.finish_read()?;
             return Ok(false);
         }

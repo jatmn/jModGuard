@@ -5,26 +5,28 @@ import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 const h = React.createElement;
+// Access, snapshot freshness and mutation activity are independent dimensions.
+/** @typedef {"checking" | "allowed" | "denied"} OwnerAccess */
+/** @typedef {"fresh" | "stale"} SnapshotFreshness */
 const ui = createState({
   activeView: "updates",
   snapshot: null,
   usageSnapshot: null,
-  usageStale: false,
+  usageFreshness: "fresh",
   usageRevision: 0,
   usageMessage: "Waiting to load usage…",
   status: { message: "Checking your access and release state…", tone: "neutral" },
-  busy: false,
-  stale: true,
-  authorized: false,
-  accessDenied: false,
-  needsSignIn: false,
+  activity: "idle",
+  freshness: "stale",
+  access: "checking",
+  signIn: "optional",
   actionMessage: "",
   policyRevision: 0
 });
 const root = createRoot(document.getElementById("content"));
 
-let refreshing = null;
-let usageRefreshPromise = null;
+let refreshFlight = { kind: "idle" };
+let usageFlight = { kind: "idle" };
 const detailRequests = new Map();
 
 let rateLimitUntil = 0;
@@ -50,7 +52,7 @@ function nextRefreshDelay(normal) {
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  if (ui.getSnapshot().accessDenied || document.visibilityState === "hidden") return;
+  if ((ui.getSnapshot().access === "denied") || document.visibilityState === "hidden") return;
   if (ui.getSnapshot().activeView === "usage") {
     refreshTimer = setTimeout(() => refreshUsage(), nextRefreshDelay(60000));
     return;
@@ -84,14 +86,14 @@ async function request(path, body) {
   }
   if (response.status === 401 || (path === "/api/me" && response.status === 400) ||
       (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
-    ui.set({ authorized: false, accessDenied: true, stale: true });
+    ui.set({ access: "denied", freshness: "stale" });
     clearTimeout(refreshTimer);
-    ui.set({ needsSignIn: true });
+    ui.set({ signIn: "required" });
 
     throw new Error("Sign in again to manage updates.");
   }
   if (response.status === 403) {
-    ui.set({ authorized: false, accessDenied: true, stale: true });
+    ui.set({ access: "denied", freshness: "stale" });
     clearTimeout(refreshTimer);
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
@@ -125,19 +127,19 @@ function line(items, label, value) {
 }
 
 async function mutate(record, label, callback) {
-  if (ui.getSnapshot().busy || ui.getSnapshot().stale || !ui.getSnapshot().authorized) return;
-  ui.set({ busy: true });
+  if ((ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale") || ui.getSnapshot().access !== "allowed") return;
+  ui.set({ activity: "busy" });
   clearTimeout(refreshTimer);
   // Finish any older read before submitting; it must never overwrite the result.
-  if (refreshing) await refreshing;
-  if (!ui.getSnapshot().authorized || ui.getSnapshot().stale) { ui.set({ busy: false }); restorePolicySelections(); scheduleRefresh(); return; }
+  if (refreshFlight.kind === "running") await refreshFlight.promise;
+  if (ui.getSnapshot().access !== "allowed" || (ui.getSnapshot().freshness === "stale")) { ui.set({ activity: "idle" }); restorePolicySelections(); scheduleRefresh(); return; }
   ui.set({ actionMessage: `${record.component.toUpperCase()}: ${label}…` });
   notice(ui.getSnapshot().actionMessage);
 
   try {
     const result = await callback();
     if (result.components) {
-      ui.set({ snapshot: result, stale: false });
+      ui.set({ snapshot: result, freshness: "fresh" });
     } else {
       await refresh();
     }
@@ -150,15 +152,15 @@ async function mutate(record, label, callback) {
         ? `${name}: update request accepted. Waiting for the component to report its result.`
         : `${name}: update request accepted.`
       : `${name}: ${label} completed.` });
-    if (!ui.getSnapshot().stale) notice(ui.getSnapshot().actionMessage, "good");
+    if (ui.getSnapshot().freshness !== "stale") notice(ui.getSnapshot().actionMessage, "good");
   } catch (error) {
     const message = `${record.component.toUpperCase()}: ${error.message}`;
     // A failed check may have persisted an error; show that state too.
-    if (ui.getSnapshot().authorized) await refresh();
+    if ((ui.getSnapshot().access === "allowed")) await refresh();
     ui.set({ actionMessage: message });
     notice(message, "bad");
   } finally {
-    ui.set({ busy: false });
+    ui.set({ activity: "idle" });
     restorePolicySelections();
 
     scheduleRefresh();
@@ -238,9 +240,9 @@ function ComponentCard({ record, revision }) {
   const inProgress = pending(record);
   const purgePending = record.component === "webui" && ui.getSnapshot().snapshot.webui_purge_pending;
   const problem = record.check_error || record.last_error || purgePending || record.state === "failed" || record.state === "drift";
-  heading.push(badge(ui.getSnapshot().stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
-    ui.getSnapshot().stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
-    ui.getSnapshot().stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
+  heading.push(badge((ui.getSnapshot().freshness === "stale") ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
+    (ui.getSnapshot().freshness === "stale") || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
+    (ui.getSnapshot().freshness === "stale") || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
   line(content, "Availability", availability);
   if (record.desired_launcher && record.desired_launcher.digest !== record.installed_launcher?.digest) {
     line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
@@ -265,17 +267,17 @@ function ComponentCard({ record, revision }) {
       h("details", { className: "administration-technical" }, h("summary", null, "Version & technical details"), h("div", null, details)),
       h("p", { className: "muted administration-help", hidden: !help }, help),
       h("div", { className: "card-actions administration-actions" },
-        action("Check now", record.component, item => request("/api/updates/check", { component: item.component }), { disabled: ui.getSnapshot().busy || ui.getSnapshot().stale }),
+        action("Check now", record.component, item => request("/api/updates/check", { component: item.component }), { disabled: (ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale") }),
         action(record.component === "webui" ? "Update WebUI" : "Update", record.component,
           item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }),
-          { hidden: !record.candidate, disabled: ui.getSnapshot().busy || ui.getSnapshot().stale || !canApply || applicationCurrent || candidatePending }),
+          { hidden: !record.candidate, disabled: (ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale") || !canApply || applicationCurrent || candidatePending }),
         record.component !== "webui" && h("details", { className: "administration-technical" },
           h("summary", null, "Advanced launcher controls"),
           h("p", null, "The launcher starts and recovers this service. Normal Update includes any required launcher update first. Use this control only for an optional launcher update. It restarts the service."),
           action("Update launcher", record.component,
             item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }),
-            { hidden: !record.candidate, disabled: ui.getSnapshot().busy || ui.getSnapshot().stale || pairActive || !ui.getSnapshot().snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
-      h("fieldset", { className: "fieldset administration-policy", disabled: ui.getSnapshot().busy || ui.getSnapshot().stale },
+            { hidden: !record.candidate, disabled: (ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale") || pairActive || !ui.getSnapshot().snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
+      h("fieldset", { className: "fieldset administration-policy", disabled: (ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale") },
         h("legend", { className: "fieldset-legend" }, "Release policy"),
         h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Release channel"),
           h("select", { className: "select select-sm", "aria-label": `${record.component} release channel`, value: channel,
@@ -302,7 +304,7 @@ function AlertChannelCard({ revision }) {
   const saved = ui.getSnapshot().snapshot?.alert_channel || "";
   const [value, setValue] = useState(saved);
   useEffect(() => { setValue(saved); }, [saved, revision]);
-  const blocked = ui.getSnapshot().busy || ui.getSnapshot().stale;
+  const blocked = (ui.getSnapshot().activity === "busy") || (ui.getSnapshot().freshness === "stale");
   return h("section", { id: "alert-channel", className: "card bg-base-100 administration-card" },
     h("div", { className: "card-body" },
       h("h2", { className: "card-title" }, "Boot repair alerts"),
@@ -319,27 +321,27 @@ function AlertChannelCard({ revision }) {
 
 function refresh() {
   if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
-  if (refreshing) return refreshing;
+  if (refreshFlight.kind === "running") return refreshFlight.promise;
   clearTimeout(refreshTimer);
 
-  refreshing = (async () => {
+  refreshFlight = { kind: "running", promise: (async () => {
     try {
       ui.set({ snapshot: await request("/api/updates", {}) });
       if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
-      ui.set({ authorized: true, accessDenied: false });
-      if (!ui.getSnapshot().busy) ui.set({ actionMessage: "" });
-      ui.set({ stale: false, needsSignIn: false });
+      ui.set({ access: "allowed" });
+      if (ui.getSnapshot().activity !== "busy") ui.set({ actionMessage: "" });
+      ui.set({ freshness: "fresh", signIn: "optional" });
       notice(ui.getSnapshot().actionMessage || "Status refreshed. Release availability reflects the last successful release check.");
     } catch (error) {
-      ui.set({ stale: true });
+      ui.set({ freshness: "stale" });
       notice(`Status could not be refreshed: ${error.message}`, "bad");
     } finally {
-      refreshing = null;
+      refreshFlight = { kind: "idle" };
 
-      if (!ui.getSnapshot().busy) scheduleRefresh();
+      if (ui.getSnapshot().activity !== "busy") scheduleRefresh();
     }
-  })();
-  return refreshing;
+  })() };
+  return refreshFlight.promise;
 }
 
 function decimalMB(value) {
@@ -444,9 +446,9 @@ function UsageCard({ database: initial, stale, revision }) {
             pending.finally(() => detailRequests.delete(database.id)).catch(() => {});
           }
           const updated = await pending;
-          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && ui.getSnapshot().authorized) setDetail({ database: updated, revision, source: initial });
+          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && (ui.getSnapshot().access === "allowed")) setDetail({ database: updated, revision, source: initial });
         } catch (error) {
-          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && ui.getSnapshot().authorized) { ui.set({ usageMessage: error.message }); }
+          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && (ui.getSnapshot().access === "allowed")) { ui.set({ usageMessage: error.message }); }
         }
         finally { setLoading(false); }
       } }, "Show current breakdown")));
@@ -457,16 +459,16 @@ async function doRefreshUsage() {
   try {
     const next = await request("/api/database-usage", {});
     if (ui.getSnapshot().activeView !== "usage" || document.visibilityState === "hidden") return;
-    ui.set({ needsSignIn: false, authorized: true, accessDenied: false, usageSnapshot: next, usageStale: false, usageMessage: `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.` });
-  } catch (error) { ui.set({ usageMessage: error.message }); ui.set({ usageStale: true }); }
+    ui.set({ signIn: "optional", access: "allowed", usageSnapshot: next, usageFreshness: "fresh", usageMessage: `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.` });
+  } catch (error) { ui.set({ usageMessage: error.message }); ui.set({ usageFreshness: "stale" }); }
   finally { ui.set({ usageRevision: ui.getSnapshot().usageRevision + 1 }); scheduleRefresh(); }
 }
 
 function refreshUsage() {
-  if (!usageRefreshPromise) {
-    usageRefreshPromise = doRefreshUsage().finally(() => { usageRefreshPromise = null; });
+  if (usageFlight.kind === "idle") {
+    usageFlight = { kind: "running", promise: doRefreshUsage().finally(() => { usageFlight = { kind: "idle" }; }) };
   }
-  return usageRefreshPromise;
+  return usageFlight.promise;
 }
 
 function selectView(view) {
@@ -495,27 +497,27 @@ function Administration() {
   return h(React.Fragment, null,
     h("header", { className: "administration-header" },
       h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : "Updates")),
-      h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: display.busy,
-        onClick: () => { if (!ui.getSnapshot().busy) { ui.set({ actionMessage: "" }); return refresh(); } } }, "↻ Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
+      h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
+        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, "↻ Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
-    h("div", { id: "sign-in", className: display.needsSignIn ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
+    h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
       h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
       h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage")),
-    h("div", { id: "updates", className: display.authorized && !display.accessDenied && display.activeView === "updates" ? "" : "hidden" },
+    h("div", { id: "updates", className: display.access === "allowed" && display.activeView === "updates" ? "" : "hidden" },
       h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
       h("p", { id: "automatic-state", className: "muted" }, display.snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
       h("div", { id: "browser-version", className: "administration-browser" }, display.snapshot && h(React.Fragment, null,
         h("details", null, h("summary", null, "Browser version"), h("div", null, details)),
         differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"),
-        differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: display.busy, onClick: () => window.location.reload() }, "Reload page"))),
+        differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: (display.activity === "busy"), onClick: () => window.location.reload() }, "Reload page"))),
       h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision }))),
       display.snapshot && h(AlertChannelCard, { revision: ui.getSnapshot().policyRevision })),
-    h("section", { id: "database-usage", className: display.authorized && !display.accessDenied && display.activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
+    h("section", { id: "database-usage", className: display.access === "allowed" && display.activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
       h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
-      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${display.usageStale ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),
+      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${(display.usageFreshness === "stale") ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),
       h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
-      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: ui.getSnapshot().usageStale, revision: ui.getSnapshot().usageRevision })))));
+      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: (ui.getSnapshot().usageFreshness === "stale"), revision: ui.getSnapshot().usageRevision })))));
 }
 
 root.render(h(Administration));

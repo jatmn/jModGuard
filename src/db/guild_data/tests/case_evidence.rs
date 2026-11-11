@@ -159,7 +159,7 @@ async fn removed_inflight_upload_must_settle_before_delete_and_parent_purge() {
         .unwrap()
         .pop()
         .unwrap();
-    assert!(job.cancelled);
+    assert_eq!(job.cancellation, EvidenceCancellation::Cancelled);
     assert!(
         store
             .evidence_jobs(a.clone(), EvidenceWork::Delete, None, 1, limits())
@@ -546,12 +546,13 @@ async fn sql_guards_and_failed_cancellation_preserve_parent_and_metadata() {
             .unwrap()
             .is_some()
     );
-    assert!(
-        !store
+    assert_eq!(
+        store
             .evidence_jobs(a.clone(), EvidenceWork::Capture, None, 1, limits())
             .await
             .unwrap()[0]
-            .cancelled
+            .cancellation,
+        EvidenceCancellation::NotCancelled
     );
     store
         .db

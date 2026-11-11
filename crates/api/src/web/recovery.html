@@ -16,21 +16,21 @@
 <p id="error" role="alert"></p><pre id="status" aria-live="polite"></pre>
 <script>
 const $=id=>document.getElementById(id);
-let snapshot=null, selection=null, busy=false;
+let snapshot=null, selection={kind:"unchecked"}, activity="idle";
 async function request(path,body){const response=await fetch(path,{method:body?'POST':'GET',credentials:'same-origin',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}); const data=await response.json();if(!response.ok)throw Error(data.error||'Request failed');return data;}
 function render(){const op=snapshot?.operation, active=op&&!['complete','aborted'].includes(op.phase), stopped=op?.bot.stopped&&op?.api.stopped;
 $('status').textContent=op?`Upgrade ${op.id}\nPhase: ${op.phase}\n${op.error||''}\nBot: ${op.bot.release.source_sha}\nAPI: ${op.api.release.source_sha}`:'No coordinated upgrade is running.';
 for(const mismatch of Object.values(snapshot?.boot_mismatches||{}))$('status').textContent+=`\nBoot mismatch (${mismatch.component}): ${mismatch.reason}\nExpected release: ${mismatch.expected.release_id} · ${mismatch.expected.source_sha}\nStartup executable: ${mismatch.running||'Application stopped'}`;
-$('apply').disabled=busy||!snapshot?.apply_enabled||!selection||(active&&!(op.error&&stopped));
-$('retry').disabled=busy||!snapshot?.apply_enabled||!active||!op.error||!stopped;
-$('cancel').disabled=busy||!active||op.irreversible;
-$('check').disabled=busy;
+$('apply').disabled=activity==="busy"||!snapshot?.apply_enabled||selection.kind!=="checked"||(active&&!(op.error&&stopped));
+$('retry').disabled=activity==="busy"||!snapshot?.apply_enabled||!active||!op.error||!stopped;
+$('cancel').disabled=activity==="busy"||!active||op.irreversible;
+$('check').disabled=activity==="busy";
 }
 async function refresh(){snapshot=await request('/api/service-upgrade');render();}
-async function act(work){busy=true;render();$('error').textContent='';try{await work();await refresh();}catch(e){$('error').textContent=e.message;}finally{busy=false;render();}}
-$('check').onclick=()=>act(async()=>{selection=null;const data=await request('/api/service-upgrade/check',{channel:$('channel').value});const bot=data.components.find(x=>x.component==='bot').candidate,api=data.components.find(x=>x.component==='api').candidate;if(!bot||!api||bot.source_sha!==api.source_sha)throw Error('Matching pair changed; check again.');selection={bot_digest:bot.digest,api_digest:api.digest};$('candidate').textContent=`Source: ${bot.source_sha}\nCore schema: ${data.core_schema} → ${bot.result_schema}\nGuild schema target: ${bot.upgrade?.guild_schema??'unsupported'}\nBot launcher: ${data.launchers?.bot?.reason??'Requirement unknown'}\nAPI launcher: ${data.launchers?.api?.reason??'Requirement unknown'}\nBot digest: ${bot.digest}\nAPI digest: ${api.digest}`;});
-$('apply').onclick=()=>{if(confirm('Update BOTH bot and API to the displayed pair? Required launchers will update first. Services will stop briefly. Once migration starts, only forward recovery is allowed.'))act(()=>request('/api/service-upgrade',{...selection,confirmed:true,recover:true}));};
+async function act(work){activity="busy";render();$('error').textContent='';try{await work();await refresh();}catch(e){$('error').textContent=e.message;}finally{activity="idle";render();}}
+$('check').onclick=()=>act(async()=>{selection={kind:"unchecked"};const data=await request('/api/service-upgrade/check',{channel:$('channel').value});const bot=data.components.find(x=>x.component==='bot').candidate,api=data.components.find(x=>x.component==='api').candidate;if(!bot||!api||bot.source_sha!==api.source_sha)throw Error('Matching pair changed; check again.');selection={kind:"checked",pair:{bot_digest:bot.digest,api_digest:api.digest}};$('candidate').textContent=`Source: ${bot.source_sha}\nCore schema: ${data.core_schema} → ${bot.result_schema}\nGuild schema target: ${bot.upgrade?.guild_schema??'unsupported'}\nBot launcher: ${data.launchers?.bot?.reason??'Requirement unknown'}\nAPI launcher: ${data.launchers?.api?.reason??'Requirement unknown'}\nBot digest: ${bot.digest}\nAPI digest: ${api.digest}`;});
+$('apply').onclick=()=>{if(confirm('Update BOTH bot and API to the displayed pair? Required launchers will update first. Services will stop briefly. Once migration starts, only forward recovery is allowed.'))act(()=>request('/api/service-upgrade',{...selection.pair,confirmed:true,recover:true}));};
 $('retry').onclick=()=>{const op=snapshot.operation;if(confirm('Retry the selected bot/API pair?'))act(()=>request('/api/service-upgrade',{bot_digest:op.bot.release.digest,api_digest:op.api.release.digest,confirmed:true,recover:true}));};
 $('cancel').onclick=()=>act(()=>request('/api/service-upgrade/cancel',{id:snapshot.operation.id}));
-refresh().catch(e=>$('error').textContent=e.message);setInterval(()=>{if(!busy)refresh().catch(e=>$('error').textContent=e.message);},5000);
+refresh().catch(e=>$('error').textContent=e.message);setInterval(()=>{if(activity!=="busy")refresh().catch(e=>$('error').textContent=e.message);},5000);
 </script></html>

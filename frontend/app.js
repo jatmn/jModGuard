@@ -13,16 +13,19 @@ import {
 } from "../tools/webui/components.js";
 
 const h = React.createElement;
+// Activity and edits are independent: an in-flight save may retain other drafts.
+/** @typedef {"idle" | "busy"} EditorActivity */
+/** @typedef {"clean" | "dirty"} EditorEdits */
 const BusyContext = createContext(false);
 const ui = createState({
   view: "startup-view",
   startupStatus: "Waiting for the API to finish starting…",
-  previewUnavailable: false,
+  previewAvailability: "unchecked",
   contentRevision: 0,
   editor: null,
   notification: null,
-  busy: false,
-  dirty: false,
+  activity: "idle",
+  edits: "clean",
   copySource: null,
   drafts: {},
   pendingDrafts: null
@@ -60,7 +63,7 @@ function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
       const next = { ...ui.getSnapshot().drafts };
       if (value === baseline) delete next[draftKey];
       else next[draftKey] = { value, group };
-      ui.set({ drafts: next, dirty: Object.keys(next).length > 0 });
+      ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" });
       onChange?.(event);
     },
   };
@@ -128,7 +131,7 @@ function App() {
 
   useEffect(() => {
     const beforeUnload = (event) => {
-      if (ui.getSnapshot().dirty || ui.getSnapshot().busy) {
+      if ((ui.getSnapshot().edits === "dirty") || (ui.getSnapshot().activity === "busy")) {
         event.preventDefault();
         event.returnValue = "";
       }
@@ -154,7 +157,7 @@ function App() {
   ];
   return h(
     BusyContext.Provider,
-    { value: display.busy },
+    { value: (display.activity === "busy") },
     isPreview() &&
       h(
         "div",
@@ -191,7 +194,7 @@ function App() {
                     pendingCase = null;
                     state.guildId = event.target.value;
                     state.config = null;
-                    ui.set({ dirty: false });
+                    ui.set({ edits: "clean" });
                     persistWorkspace();
                     if (await loadConfig()) renderTab();
                   },
@@ -270,9 +273,9 @@ function App() {
                 { id: "workspace-status" },
                 isPreview()
                   ? "Preview — changes disabled"
-                  : display.busy
+                  : (display.activity === "busy")
                     ? "Working…"
-                    : display.dirty
+                    : (display.edits === "dirty")
                       ? "Unsaved changes"
                       : "Changes saved with each action",
               ),
@@ -331,7 +334,7 @@ function App() {
                     null,
                     h("h1", null, "Getting things ready."),
                     h("p", { id: "startup-status", role: "status" }, display.startupStatus),
-                    display.previewUnavailable &&
+                    display.previewAvailability === "unavailable" &&
                       h(
                         "a",
                         {
@@ -411,9 +414,9 @@ function Content() {
     );
   if (!state.config)
     return emptyPanel(
-      state.loading ? "Loading your workspace…" : "Configuration unavailable",
-      state.error || "Fetching saved settings for this server.",
-      !state.loading &&
+      (state.configRead.activity === "loading") ? "Loading your workspace…" : "Configuration unavailable",
+      state.configRead.error || "Fetching saved settings for this server.",
+      state.configRead.activity !== "loading" &&
         h(
           ActionButton,
           {
@@ -436,13 +439,13 @@ function renderTab() {
   ui.set({
     contentRevision: ui.getSnapshot().contentRevision + 1,
     drafts,
-    dirty: Object.keys(drafts).length > 0,
+    edits: Object.keys(drafts).length > 0 ? "dirty" : "clean",
     pendingDrafts: matching && !state.config ? pending : null,
   });
 }
 
 function setBusy(value) {
-  ui.set({ busy: value });
+  ui.set({ activity: value ? "busy" : "idle" });
 }
 function showView(id) {
   ui.set({ view: id });
@@ -451,7 +454,7 @@ function setStartupStatus(text) {
   ui.set({ startupStatus: text });
 }
 function showPreviewUnavailable() {
-  ui.set({ view: "startup-view", previewUnavailable: true, startupStatus: "This preview is no longer signed in. Return to the owner dashboard and launch a new preview." });
+  ui.set({ view: "startup-view", previewAvailability: "unavailable", startupStatus: "This preview is no longer signed in. Return to the owner dashboard and launch a new preview." });
 }
 function toast(message, kind = "info") {
   ui.set({ notification: { message, kind } });
@@ -464,7 +467,7 @@ function toast(message, kind = "info") {
   );
 }
 function closeOverlay() {
-  ui.set({ editor: null, dirty: false });
+  ui.set({ editor: null, edits: "clean" });
 }
 function editRule(record) {
   if (isCustomRuleId(record.rule_id)) {
@@ -493,7 +496,7 @@ async function init() {
 }
 async function logout() {
   if (!canLeave()) return;
-  ui.set({ dirty: false });
+  ui.set({ edits: "clean" });
   stopPrivateWatchers();
   state.guildId = null;
   if (isPreview()) {
@@ -520,11 +523,15 @@ let state = {
   guildId: null,
   config: null,
   tab: "dashboard",
-  loading: false,
-  error: null,
+  configRead: { activity: "idle", error: null },
 };
 
+// Request generation fences publication; retained configuration is independent
+// of read activity and the most recent read error.
 let configRequest = 0;
+function ownsConfigRead(request, guildId) {
+  return request === configRequest && guildId === state.guildId;
+}
 
 const pendingLogChannelActions = new Map();
 const logChannelPolls = new Map();
@@ -575,11 +582,11 @@ function persistWorkspace() {
 }
 
 function canLeave() {
-  return !ui.getSnapshot().busy && (!ui.getSnapshot().dirty || confirm("Discard unsaved changes?"));
+  return ui.getSnapshot().activity !== "busy" && (ui.getSnapshot().edits !== "dirty" || confirm("Discard unsaved changes?"));
 }
 
 function markDirty() {
-  ui.set({ dirty: true });
+  ui.set({ edits: "dirty" });
 }
 
 function currentDrafts() {
@@ -594,12 +601,12 @@ function captureDrafts(savedFields, group) {
 function retainDrafts(guildId, tab, drafts, enrollmentId) {
   if (guildId !== state.guildId || tab !== state.tab) return;
   if (state.config && enrollmentId !== state.config.enrollment_id) return;
-  ui.set({ drafts, dirty: Object.keys(drafts).length > 0,
+  ui.set({ drafts, edits: Object.keys(drafts).length > 0 ? "dirty" : "clean",
     pendingDrafts: state.config ? null : { guildId, tab, drafts, enrollmentId } });
 }
 
 async function handleEvent(handler, event, savedFields, group) {
-  if (ui.getSnapshot().busy) return;
+  if ((ui.getSnapshot().activity === "busy")) return;
   const guildId = state.guildId, tab = state.tab, enrollmentId = state.config?.enrollment_id ?? ui.getSnapshot().pendingDrafts?.enrollmentId;
   const revision = ui.getSnapshot().contentRevision;
   const drafts = captureDrafts(savedFields, group);
@@ -613,7 +620,7 @@ async function handleEvent(handler, event, savedFields, group) {
   } catch (e) {
     reportApiError(e);
   } finally {
-    if (ui.getSnapshot().busy) setBusy(false);
+    if ((ui.getSnapshot().activity === "busy")) setBusy(false);
   }
 }
 
@@ -630,7 +637,11 @@ function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
 }
 
-let previewTokenFallback = null;
+let previewCapability = { kind: "absent" };
+
+function capturedPreviewToken() {
+  return previewCapability.kind === "captured" ? previewCapability.token : null;
+}
 
 function capturePreviewToken() {
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -638,7 +649,7 @@ function capturePreviewToken() {
   if (!token) return;
   // Keep an in-memory source of truth before touching browser storage. A
   // blocked sessionStorage must never silently restore the owner's write access.
-  previewTokenFallback = token;
+  previewCapability = { kind: "captured", token };
   try {
     window.sessionStorage.setItem("jmodguard_preview", token);
   } catch (_) {
@@ -650,14 +661,14 @@ function capturePreviewToken() {
 
 function currentPreviewToken() {
   try {
-    return window.sessionStorage.getItem("jmodguard_preview") || previewTokenFallback;
+    return window.sessionStorage.getItem("jmodguard_preview") || capturedPreviewToken();
   } catch (_) {
-    return previewTokenFallback;
+    return capturedPreviewToken();
   }
 }
 
 function clearPreviewToken() {
-  previewTokenFallback = null;
+  previewCapability = { kind: "absent" };
   try {
     window.sessionStorage.removeItem("jmodguard_preview");
   } catch (_) {}
@@ -855,6 +866,15 @@ function canonicalSaveBody(value) {
   return value;
 }
 
+// Failed/pending requests retain identity; only the existing explicit
+// expiry or reviewed-unknown paths may discard it.
+function saveFailureState(error) {
+  if (error.code === "save_expired") return "expired";
+  if (error.code === "save_unknown") return "unknown";
+  if (error.code === "save_pending") return "pending";
+  return "unresolved";
+}
+
 async function submitSave(path, method, body, signal, reconcileRecovered) {
   // A remount reads the current role revision while retaining an unresolved
   // role draft. Match that intent by its roles, then look up the captured revision.
@@ -862,16 +882,18 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
   const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
-  let raw, saved, lookup;
+  let raw, saved;
+  /** @type {"submit" | "lookup"} */
+  let saveMode;
   try {
     raw = window.sessionStorage.getItem(key);
-    lookup = raw !== null;
+    saveMode = raw !== null ? "lookup" : "submit";
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely save changes.");
   }
   // Only a new save needs the initial read. An unresolved save already owns
   // its original revision and must remain lookup-only while that read is pending.
-  if (roleSave && !lookup && !body.revision) {
+  if (roleSave && saveMode === "submit" && !body.revision) {
     throw new Error("Case-removal roles have not loaded yet. Wait for them to load before saving.");
   }
   try {
@@ -895,21 +917,21 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
     const capturedBody = roleSave ? { ...body, revision: saved.revision } : body;
     let result = await apiRequest(path, method, capturedBody, signal, {
       "x-jmodguard-save": saved.id,
-      "x-jmodguard-save-lookup": lookup ? "1" : "0",
+      "x-jmodguard-save-lookup": saveMode === "lookup" ? "1" : "0",
     });
     // Specialized editors also consume fields outside config_patch. Keep the
     // identity until their current-state read succeeds, so a failed read retries
     // the acknowledgement without submitting another mutation.
-    if (lookup && reconcileRecovered) result = await reconcileRecovered();
+    if (saveMode === "lookup" && reconcileRecovered) result = await reconcileRecovered();
     try { window.sessionStorage.removeItem(key); } catch (_) { /* A retained ID only queries its result. */ }
     // The page may already include this commit, or a newer edit. Reconcile
     // current configuration instead of applying a historical patch again.
-    return lookup ? { ...result, config_patch: null } : result;
+    return saveMode === "lookup" ? { ...result, config_patch: null } : result;
   } catch (error) {
-    if (error.code === "save_expired") {
+    if (saveFailureState(error) === "expired") {
       try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
     }
-    if (error.code === "save_unknown" && confirm("The earlier save may already have completed, but its result is unavailable. Have you checked the current configuration and want to clear this saved request? This will not submit another save.")) {
+    if (saveFailureState(error) === "unknown" && confirm("The earlier save may already have completed, but its result is unavailable. Have you checked the current configuration and want to clear this saved request? This will not submit another save.")) {
       window.sessionStorage.removeItem(key);
       throw new Error("Saved request cleared. Review the current configuration before saving again.");
     }
@@ -976,6 +998,14 @@ async function downloadPrivate(path, filename) {
   URL.revokeObjectURL(url);
 }
 
+// Receipt progress is distinct from reconciliation of the saved mapping.
+function botActionPhase(job) {
+  if (["pending", "claimed", "running"].includes(job.state)) return "active";
+  if (job.state === "succeeded") return "succeeded";
+  if (["failed", "uncertain", "cancelled", "expired"].includes(job.state)) return "terminal";
+  return "invalid";
+}
+
 async function submitBotAction(path, method, body) {
   const canonicalBody = Object.fromEntries(
     Object.keys(body)
@@ -1038,9 +1068,7 @@ async function submitBotAction(path, method, body) {
     job.guild_id !== guildId ||
     job.actor_id !== state.me.user.id ||
     job.enrollment_id !== enrollmentId ||
-    !["pending", "claimed", "running", "succeeded", "failed", "uncertain", "cancelled", "expired"].includes(
-      job.state,
-    )
+    botActionPhase(job) === "invalid"
   ) {
     throw new Error(
       "Action acknowledgment was invalid. Check Bot actions; retrying here will reuse the same request ID.",
@@ -1052,7 +1080,7 @@ async function submitBotAction(path, method, body) {
     /* Retaining the same ID is safe. */
   }
   const completed = job.state === "succeeded";
-  const waiting = ["pending", "claimed", "running"].includes(job.state);
+  const waiting = botActionPhase(job) === "active";
   toast(
     completed
       ? "Bot action completed. See Bot actions for details."
@@ -1116,8 +1144,8 @@ function applyQueuedLogChannel(job) {
     return false;
   const row = logChannelRow(job.action.event);
   if (!row) return false;
-  const active = ["pending", "claimed", "running"].includes(job.state);
-  const terminal = ["succeeded", "failed", "uncertain", "cancelled", "expired"].includes(job.state);
+  const active = botActionPhase(job) === "active";
+  const terminal = ["succeeded", "terminal"].includes(botActionPhase(job));
   if (!active && !terminal) return false;
   const key = logChannelActionKey(job);
   const existing = pendingLogChannelActions.get(key);
@@ -1125,7 +1153,7 @@ function applyQueuedLogChannel(job) {
     existing &&
     existing.job.id !== job.id &&
     terminal &&
-    ["pending", "claimed", "running"].includes(existing.job.state)
+    botActionPhase(existing.job) === "active"
   ) {
     // A retained request key can replay an older terminal receipt after a
     // newer request has become this row's active owner. Keep watching newer.
@@ -1160,8 +1188,8 @@ function applyQueuedLogChannel(job) {
   // A snapshot started before this acknowledged request must not replace its
   // queued representation after the button has already returned success.
   ++configRequest;
-  state.loading = false;
-  state.error = null;
+  state.configRead.activity = "idle";
+  state.configRead.error = null;
   return true;
 }
 
@@ -1190,10 +1218,10 @@ function scheduleLogChannelReconcile(job) {
   const key = logChannelPollKey(job);
   let poll = logChannelPolls.get(key);
   if (!poll) {
-    poll = { timer: null, dueAt: Date.now() + actionReconcileDelays[0], retryUntil: 0, attempt: 0, inFlight: null, generation: 0, admission: 0 };
+    poll = { timer: null, dueAt: Date.now() + actionReconcileDelays[0], retryUntil: 0, attempt: 0, flight: { kind: "idle" }, generation: 0, admission: 0 };
     logChannelPolls.set(key, poll);
   }
-  if (poll.timer !== null || poll.inFlight || !logChannelPollVisible(job) ||
+  if (poll.timer !== null || poll.flight.kind === "running" || !logChannelPollVisible(job) ||
     poll.attempt >= actionReconcileDelays.length) return;
   poll.timer = setTimeout(() => {
     poll.timer = null;
@@ -1211,18 +1239,18 @@ async function reconcileQueuedLogChannel(original) {
   const key = logChannelPollKey(original);
   scheduleLogChannelReconcile(original);
   const poll = logChannelPolls.get(key);
-  if (poll.inFlight) return poll.inFlight;
+  if (poll.flight.kind === "running") return poll.flight.promise;
   if (Date.now() < poll.retryUntil || ((poll.attempt > 0 || poll.admission > 0) && Date.now() < poll.dueAt)) return;
   clearTimeout(poll.timer);
   poll.timer = null;
   const generation = poll.generation;
   const admission = poll.admission;
   const current = () => logChannelPolls.get(key) === poll && poll.generation === generation;
-  poll.inFlight = (async () => {
+  poll.flight = { kind: "running", promise: (async () => {
     let retryUntil = 0;
     try {
       const entries = [...pendingLogChannelActions.values()].filter(item => logChannelPollKey(item.job) === key);
-      const jobs = entries.some(item => ["pending", "claimed", "running"].includes(item.job.state))
+      const jobs = entries.some(item => botActionPhase(item.job) === "active")
         ? await apiRead(`/api/guilds/${original.guild_id}/actions`) : [];
       for (const item of entries) {
         if (!current() || document.visibilityState !== "visible") break;
@@ -1238,7 +1266,7 @@ async function reconcileQueuedLogChannel(original) {
       if (isUnauthenticated(error)) return;
       retryUntil = Math.max(retryUntil, Date.now() + (error.retryAfterMs || 0));
     } finally {
-      poll.inFlight = null;
+      poll.flight = { kind: "idle" };
       if (logChannelPolls.get(key) === poll) {
         if (poll.admission === admission) ++poll.attempt;
         poll.retryUntil = retryUntil;
@@ -1248,8 +1276,8 @@ async function reconcileQueuedLogChannel(original) {
         else scheduleLogChannelReconcile(original);
       }
     }
-  })();
-  return poll.inFlight;
+  })() };
+  return poll.flight.promise;
 }
 
 async function reconcileLogChannelEntry(original, jobs, current) {
@@ -1266,9 +1294,7 @@ async function reconcileLogChannelEntry(original, jobs, current) {
     original.enrollment_id !== state.config?.enrollment_id
   )
     return;
-  const originalTerminal = ["succeeded", "failed", "uncertain", "cancelled", "expired"].includes(
-    original.state,
-  );
+  const originalTerminal = ["succeeded", "terminal"].includes(botActionPhase(original));
   let job = original;
   if (!originalTerminal) {
     job = jobs.find((candidate) => candidate.id === original.id);
@@ -1285,7 +1311,7 @@ async function reconcileLogChannelEntry(original, jobs, current) {
     )
       return;
   }
-  if (!job || ["pending", "claimed", "running"].includes(job.state)) {
+  if (!job || botActionPhase(job) === "active") {
     if (job) {
       entry.job = job;
       row.pending_action.state = job.state;
@@ -1336,10 +1362,10 @@ async function reconcileLogChannelEntry(original, jobs, current) {
 }
 
 async function waitForApiMe() {
-  let warmupStarted = null;
-  let reachabilityStarted = null;
+  let warmup = { kind: "unused" };
+  let reachability = { kind: "unused" };
   let delay = 500;
-  let sawStartup = false;
+  let startupDisplay = "unshown";
   while (true) {
     const attemptStarted = Date.now();
     const controller = new AbortController();
@@ -1351,19 +1377,19 @@ async function waitForApiMe() {
       if (!isOriginStarting(e)) throw e;
       const now = Date.now();
       if (isApiWarmup(e)) {
-        reachabilityStarted = null;
-        if (warmupStarted === null) warmupStarted = attemptStarted;
-        if (now - warmupStarted >= API_WARMUP_BUDGET_MS) {
+        reachability = { kind: "unused" };
+        if (warmup.kind === "unused") warmup = { kind: "running", startedAt: attemptStarted };
+        if (now - warmup.startedAt >= API_WARMUP_BUDGET_MS) {
           throw apiError(originGaveUpMessage(e), e.status || 0, 0);
         }
       } else {
-        if (reachabilityStarted === null) reachabilityStarted = attemptStarted;
-        if (now - reachabilityStarted >= ORIGIN_REACHABILITY_BUDGET_MS) {
+        if (reachability.kind === "unused") reachability = { kind: "running", startedAt: attemptStarted };
+        if (now - reachability.startedAt >= ORIGIN_REACHABILITY_BUDGET_MS) {
           throw apiError(originGaveUpMessage(e), e.status || 0, 0);
         }
       }
-      if (!sawStartup) {
-        sawStartup = true;
+      if (startupDisplay === "unshown") {
+        startupDisplay = "shown";
         showView("startup-view");
         setStartupStatus("Waiting for the API to finish starting…");
       }
@@ -1382,14 +1408,14 @@ async function loadConfig() {
     renderTab();
     return;
   }
-  state.loading = true;
-  state.error = null;
+  state.configRead.activity = "loading";
+  state.configRead.error = null;
   if (!state.config) renderTab();
   try {
     const config = await apiRead(`/api/guilds/${guildId}/config`);
-    if (request !== configRequest || guildId !== state.guildId) return;
+    if (!ownsConfigRead(request, guildId)) return;
     if (state.config && state.config.enrollment_id !== config.enrollment_id) {
-      ui.set({ pendingDrafts: null, drafts: {}, copySource: null, dirty: false });
+      ui.set({ pendingDrafts: null, drafts: {}, copySource: null, edits: "clean" });
       for (const [key, entry] of pendingLogChannelActions) {
         if (entry.job.guild_id === guildId && entry.job.enrollment_id !== config.enrollment_id) {
           clearPendingLogChannelEntry(key);
@@ -1401,16 +1427,16 @@ async function loadConfig() {
     for (const { entry } of overlayPendingLogChannels(config, guildId)) scheduleLogChannelReconcile(entry.job);
     return true;
   } catch (e) {
-    if (request !== configRequest || guildId !== state.guildId) return;
+    if (!ownsConfigRead(request, guildId)) return;
     if (isUnauthenticated(e)) return;
     state.config = null;
     ui.set({ editor: null });
-    state.error = e.message || String(e);
-    toast("Could not refresh configuration: " + state.error, "error");
+    state.configRead.error = e.message || String(e);
+    toast("Could not refresh configuration: " + state.configRead.error, "error");
   } finally {
     if (request === configRequest) {
-      state.loading = false;
-      if (state.error) renderTab();
+      state.configRead.activity = "idle";
+      if (state.configRead.error) renderTab();
     }
   }
 }
@@ -1425,8 +1451,8 @@ function applyConfigPatch(res) {
   if (!patch || !config) return false;
   // Any snapshot requested before this acknowledged commit is now stale.
   ++configRequest;
-  state.loading = false;
-  state.error = null;
+  state.configRead.activity = "idle";
+  state.configRead.error = null;
   if (patch.kind === "rule") {
     const custom = isCustomRuleId(patch.id);
     if (custom && patch.value == null) {
@@ -3583,23 +3609,30 @@ function tabMembers() {
     let timer = null,
       countdownTimer = null,
       debounce = null,
-      disposed = false,
+      lifecycle = "active",
       after = "",
       nextAfter = null;
     let latestStatus = null,
       latestStatusRevision = -1,
-      statusRetryNeeded = false,
+      statusRead = "current",
       lastStatusError = null;
     let latestStatusReceivedAt = 0;
     let pollAttempt = 0, pollDueAt = 0;
-    let pendingSyncAction = null,
-      syncActionOutcome = null;
+    let syncControl = { kind: "idle" };
+    let syncActionOutcome = null;
+    const controlPending = () => syncControl.kind !== "idle";
+    const observeControl = (job, operation) => {
+      syncControl = {
+        kind: job.state === "succeeded" ? "awaiting-status" : "awaiting-receipt",
+        job: { id: job.id, operation, state: job.state },
+      };
+    };
     let emptyMembersCell = null;
     const emptyMembersText = () =>
       latestStatus?.status === "complete"
         ? "No members match these filters."
         : "No saved members match yet. Import may still be incomplete.";
-    const aliveHere = () => !disposed && alive();
+    const aliveHere = () => lifecycle === "active" && alive();
     const clearTimer = () => {
       if (timer !== null) clearTimeout(timer);
       timer = null;
@@ -3618,8 +3651,8 @@ function tabMembers() {
       clearTimer();
       if (!aliveHere()) return;
       const active =
-        statusRetryNeeded ||
-        pendingSyncAction ||
+        statusRead === "retry-needed" ||
+        controlPending() ||
         (latestStatus &&
           (["queued", "running", "waiting"].includes(latestStatus.status) ||
             ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
@@ -3637,7 +3670,7 @@ function tabMembers() {
         if (["queued", "running", "waiting"].includes(latestStatus?.audit_recovery_status))
           attempts.push(Number(latestStatus.audit_recovery_next_attempt_at) || 0);
         // A queued control can change the schedule before the worker's next page.
-        if (attempts.length && !pendingSyncAction)
+        if (attempts.length && !controlPending())
           delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);
         delay = Math.max(delay, lastStatusError?.retryAfterMs || 0);
         pollDueAt = Date.now() + delay;
@@ -3837,7 +3870,7 @@ function tabMembers() {
             seconds &&
             aliveHere() &&
             document.visibilityState === "visible" &&
-            !statusRetryNeeded &&
+            statusRead !== "retry-needed" &&
             latestStatus === sync
           ) {
             countdownTimer = setTimeout(() => {
@@ -3931,12 +3964,12 @@ function tabMembers() {
       parts.push(h("p", { className: "muted" }, `Last committed progress: ${asDate(sync.last_progress_at)}`));
       if (sync.as_of_ms || sync.as_of)
         parts.push(h("p", { className: "muted" }, `Status read at ${asDate(sync.as_of_ms ?? sync.as_of)}`));
-      if (pendingSyncAction)
+      if (controlPending())
         parts.push(
           h(
             "p",
             { role: "status" },
-            `${pendingSyncAction.operation[0].toUpperCase()}${pendingSyncAction.operation.slice(1)} requested · bot action ${pendingSyncAction.state}. Waiting for the import status to reflect it.`,
+            `${syncControl.job.operation[0].toUpperCase()}${syncControl.job.operation.slice(1)} requested · bot action ${syncControl.job.state}. Waiting for the import status to reflect it.`,
           ),
         );
       if (syncActionOutcome) parts.push(h("p", { className: "err", role: "status" }, syncActionOutcome));
@@ -3950,7 +3983,7 @@ function tabMembers() {
         ]) {
           const disabled =
             !sync.run_id ||
-            !!pendingSyncAction ||
+            controlPending() ||
             (operation === "pause" && !["queued", "running", "waiting"].includes(sync.status)) ||
             (operation === "resume" && sync.status !== "paused") ||
             (operation === "retry" && !memberSyncRetryEnabled(sync)) ||
@@ -3990,7 +4023,7 @@ function tabMembers() {
                   if (!aliveHere()) return;
                   syncActionOutcome = null;
                   if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
-                    pendingSyncAction = { id: job.id, operation, state: job.state };
+                    observeControl(job, operation);
                   } else {
                     syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
                   }
@@ -4013,7 +4046,7 @@ function tabMembers() {
       pollDueAt = 0;
       // A succeeded receipt is durable before this primary status read starts.
       // Its effect (or a later state) must therefore be visible in the result.
-      const succeededId = pendingSyncAction?.state === "succeeded" ? pendingSyncAction.id : null;
+      const succeededId = syncControl.kind === "awaiting-status" ? syncControl.job.id : null;
       const request = ++statusRequest;
       statusAbort?.abort();
       statusAbort = new AbortController();
@@ -4021,18 +4054,18 @@ function tabMembers() {
         const sync = await apiRead(`/api/guilds/${guildId}/member-sync`, statusAbort.signal);
         if (!aliveHere() || request !== statusRequest) return;
         const revision = Number(sync.progress_revision ?? 0);
-        if (latestStatus && revision < latestStatusRevision && pendingSyncAction) {
+        if (latestStatus && revision < latestStatusRevision && controlPending()) {
           syncActionOutcome =
             "Import status changed after a restore. Check Bot actions before repeating the requested control.";
-          pendingSyncAction = null;
+          syncControl = { kind: "idle" };
         }
         if (latestStatus && (revision !== latestStatusRevision ||
           sync.status !== latestStatus.status ||
           sync.audit_recovery_status !== latestStatus.audit_recovery_status ||
           sync.audit_recovery_processed !== latestStatus.audit_recovery_processed)) pollAttempt = 0;
-        statusRetryNeeded = false;
+        statusRead = "current";
         lastStatusError = null;
-        if (succeededId && pendingSyncAction?.id === succeededId) pendingSyncAction = null;
+        if (succeededId && syncControl.job?.id === succeededId) syncControl = { kind: "idle" };
         latestStatus = sync;
         latestStatusRevision = revision;
         latestStatusReceivedAt = Date.now();
@@ -4040,17 +4073,17 @@ function tabMembers() {
           setMemberRows([h("tr", null, h("td", { colSpan: 5, className: "muted" }, emptyMembersText()))]);
         renderStatus(sync);
         schedulePoll();
-        if (pendingSyncAction) {
-          const pendingId = pendingSyncAction.id;
+        if (controlPending()) {
+          const pendingId = syncControl.job.id;
           try {
             const jobs = await apiRead(`/api/guilds/${guildId}/actions`, statusAbort.signal);
-            if (!aliveHere() || request !== statusRequest || pendingSyncAction?.id !== pendingId) return;
+            if (!aliveHere() || request !== statusRequest || syncControl.job?.id !== pendingId) return;
             const job = jobs.find((item) => item.id === pendingId);
             if (job && ["failed", "uncertain", "cancelled", "expired"].includes(job.state)) {
-              syncActionOutcome = `${pendingSyncAction.operation} action ${job.state}. Check Bot actions for details.`;
-              pendingSyncAction = null;
+              syncActionOutcome = `${syncControl.job.operation} action ${job.state}. Check Bot actions for details.`;
+              syncControl = { kind: "idle" };
             } else if (job) {
-              pendingSyncAction.state = job.state;
+              observeControl(job, syncControl.job.operation);
               if (job.state === "succeeded") {
                 // This status was read before the receipt. Read again in causal order.
                 loadStatus();
@@ -4065,7 +4098,7 @@ function tabMembers() {
         }
       } catch (error) {
         if (!aliveHere() || request !== statusRequest) return;
-        statusRetryNeeded = true;
+        statusRead = "retry-needed";
         lastStatusError = error;
         if (latestStatus) renderStatus(latestStatus);
         else setSyncParts([]);
@@ -4332,7 +4365,7 @@ function tabMembers() {
     document.addEventListener("visibilitychange", visibility);
     const dispose = () => {
       authLossCleanups.delete(dispose);
-      disposed = true;
+      lifecycle = "disposed";
       clearTimer();
       clearCountdown();
       clearTimeout(debounce);
@@ -4393,6 +4426,10 @@ function tabMembers() {
   );
 }
 
+function caseCleanupState(cleanupPending) {
+  return cleanupPending ? "pending" : "complete";
+}
+
 function tabCases() {
   const guildId = state.guildId;
   const handlers = useRef({});
@@ -4408,12 +4445,12 @@ function tabCases() {
     return next;
   });
   useEffect(() => {
-    let disposed = false;
+    let lifecycle = "active";
     let request = 0;
     let listController;
     let detailRequest = 0;
     let after = "";
-    let removed = false;
+    let listMode = "live";
     let nextAfter = "";
     const pageSize = 50;
     const openCase = async (id) => {
@@ -4432,10 +4469,10 @@ function tabCases() {
           sequence = entries[entries.length - 1].sequence;
         }
         const evidence = await apiRead(`/api/guilds/${guildId}/cases/${id}/evidence`);
-        if (disposed || currentDetail !== detailRequest || state.guildId !== guildId) return;
+        if (lifecycle === "disposed" || currentDetail !== detailRequest || state.guildId !== guildId) return;
         const c = payload.case || {};
-        let noteIntent = null;
-        let notePending = false;
+        let noteIntent = { kind: "empty" };
+        let noteActivity = "idle";
         const noteRef = React.createRef();
         const note = h(Textarea, {
           key: `${id}:${currentDetail}`,
@@ -4462,7 +4499,7 @@ function tabCases() {
                     if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
                     const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
                     toast(
-                      result?.cleanup_pending
+                      caseCleanupState(result?.cleanup_pending) === "pending"
                         ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
                         : "Case record removed",
                       "success",
@@ -4486,20 +4523,20 @@ function tabCases() {
                 className: "btn btn-sm",
                 type: "button",
                 onClick: async () => {
-                  if (notePending) return;
+                  if (noteActivity === "submitting") return;
                   const text = noteRef.current.value.trim();
-                  if (!noteIntent || noteIntent.text !== text) {
-                    noteIntent = { entry_id: crypto.randomUUID().replaceAll("-", ""), text };
+                  if (noteIntent.kind === "empty" || noteIntent.body.text !== text) {
+                    noteIntent = { kind: "retained", body: { entry_id: crypto.randomUUID().replaceAll("-", ""), text } };
                   }
-                  notePending = true;
+                  noteActivity = "submitting";
                   try {
-                    await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent);
-                    noteIntent = null;
+                    await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent.body);
+                    noteIntent = { kind: "empty" };
                     toast("Note added", "success");
                     await openCase(id);
-                    ui.set({ dirty: false });
+                    ui.set({ edits: "clean" });
                   } finally {
-                    notePending = false;
+                    noteActivity = "idle";
                   }
                 },
               },
@@ -4538,7 +4575,7 @@ function tabCases() {
           ),
         ]);
       } catch (e) {
-        if (disposed || currentDetail !== detailRequest || state.guildId !== guildId) return;
+        if (lifecycle === "disposed" || currentDetail !== detailRequest || state.guildId !== guildId) return;
         setDetailParts([h("p", { className: "err" }, e.message || String(e))]);
       }
     };
@@ -4555,10 +4592,10 @@ function tabCases() {
       setPagination((value) => ({ ...value, next: true }));
       setRows([]);
       try {
-        const query = new URLSearchParams({ limit: String(pageSize), removed: String(removed) });
+        const query = new URLSearchParams({ limit: String(pageSize), removed: String(listMode === "removed") });
         if (after) query.set("after", after);
         const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
-        if (disposed || current !== request || state.guildId !== guildId) return;
+        if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
         const ids = payload.cases || [];
         nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
@@ -4571,7 +4608,7 @@ function tabCases() {
               h(
                 "td",
                 { colSpan: 5, className: "muted" },
-                removed ? "No more removed records." : "No selected cases on this page.",
+                listMode === "removed" ? "No more removed records." : "No selected cases on this page.",
               ),
             ),
           ]);
@@ -4579,7 +4616,7 @@ function tabCases() {
         }
         const rows = [];
         for (const id of ids) {
-          if (removed) {
+          if (listMode === "removed") {
             rows.push(
               h(
                 "tr",
@@ -4595,7 +4632,7 @@ function tabCases() {
                       onClick: async () => {
                         const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
                         toast(
-                          result.cleanup_pending
+                          caseCleanupState(result.cleanup_pending) === "pending"
                             ? "Cleanup is pending. Retry when storage is available."
                             : "Live record cleanup complete. This does not delete backup copies.",
                           "success",
@@ -4632,7 +4669,7 @@ function tabCases() {
         }
         setRows(rows);
       } catch (e) {
-        if (disposed || current !== request || state.guildId !== guildId) return;
+        if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setRows([
           h(
             "tr",
@@ -4648,7 +4685,7 @@ function tabCases() {
         ]);
       } finally {
         clearTimeout(timeout);
-        if (!disposed && current === request && state.guildId === guildId) setLoading(false);
+        if (lifecycle === "active" && current === request && state.guildId === guildId) setLoading(false);
       }
     };
     handlers.current = {
@@ -4664,8 +4701,8 @@ function tabCases() {
         }
       },
       recovery: () => {
-        removed = !removed;
-        setRemovedView(removed);
+        listMode = listMode === "removed" ? "live" : "removed";
+        setRemovedView(listMode === "removed");
         after = "";
         run();
       },
@@ -4673,7 +4710,7 @@ function tabCases() {
     run();
     if (handoff?.guildId === guildId) openCase(handoff.caseId);
     return () => {
-      disposed = true;
+      lifecycle = "disposed";
       listController?.abort();
       ++request;
       ++detailRequest;
@@ -4989,7 +5026,7 @@ function tabSettings() {
                 setRoleBaseline(saved.roles ? saved.roles.join(", ") : roleInputRef.current.value);
                 const drafts = { ...currentDrafts() };
                 delete drafts["settings:roles"];
-                ui.set({ drafts, dirty: Object.keys(drafts).length > 0 });
+                ui.set({ drafts, edits: Object.keys(drafts).length > 0 ? "dirty" : "clean" });
 
                 toast("Case-removal roles saved", "success");
               },
@@ -5295,21 +5332,20 @@ function CommandStep({ step, placeholder, onChange, remove }) {
 
 function useApiRead(path) {
   const [revision, setRevision] = useState(0);
-  const [result, setResult] = useState({ loading: true, data: null, error: null });
+  const [result, setResult] = useState({ kind: "loading" });
   useEffect(() => {
     const controller = new AbortController();
-    let current = true;
+    let publication = "current";
     const timeout = setTimeout(() => controller.abort(), 30000);
-    setResult({ loading: true, data: null, error: null });
+    setResult({ kind: "loading" });
     apiRead(path, controller.signal)
       .then((data) => {
-        if (current) setResult({ loading: false, data, error: null });
+        if (publication === "current") setResult({ kind: "loaded", data });
       })
       .catch((error) => {
-        if (current)
+        if (publication === "current")
           setResult({
-            loading: false,
-            data: null,
+            kind: "failed",
             error: controller.signal.aborted
               ? apiError("Request timed out. Refresh to verify saved state before trying again.")
               : error,
@@ -5317,12 +5353,17 @@ function useApiRead(path) {
       })
       .finally(() => clearTimeout(timeout));
     return () => {
-      current = false;
+      publication = "disposed";
       clearTimeout(timeout);
       controller.abort();
     };
   }, [path, revision]);
-  return { ...result, refresh: () => setRevision((value) => value + 1) };
+  return {
+    loading: result.kind === "loading",
+    data: result.kind === "loaded" ? result.data : null,
+    error: result.kind === "failed" ? result.error : null,
+    refresh: () => setRevision((value) => value + 1),
+  };
 }
 function DataTable({ headings, children, className = "table table-zebra" }) {
   return h(

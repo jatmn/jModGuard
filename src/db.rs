@@ -458,7 +458,7 @@ pub struct Db {
     /// Renewal `block_on` does not share the pool workers or the 75s startup
     /// deadline. The CAS still uses the caller authority window.
     lease_runtime: DbRuntime,
-    startup_deferred: bool,
+    bootstrap_work: BootstrapWork,
     connections: Arc<ConnectionPool>,
     /// Renewal never waits for a core pool permit. Errors discard this stream.
     lease_connection: Arc<Mutex<Option<Connection>>>,
@@ -527,10 +527,10 @@ impl Db {
         let growth_paused = self.runtime.growth_paused();
         CapacityRuntimeStatus {
             growth_paused,
-            startup_deferred: self.startup_deferred,
+            startup_deferred: self.bootstrap_work == BootstrapWork::DeferredAtCapacity,
             reason: if growth_paused {
                 Some("write_bound_exceeded")
-            } else if self.startup_deferred {
+            } else if self.bootstrap_work == BootstrapWork::DeferredAtCapacity {
                 Some("startup_deferred")
             } else {
                 None
@@ -692,10 +692,15 @@ struct ConnectionPool {
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
 }
 
+enum LeasedConnection {
+    Reusable(Connection),
+    Retiring(Connection),
+    Returned,
+}
+
 struct ConnectionLease {
-    connection: Option<Connection>,
+    connection: LeasedConnection,
     pool: Arc<ConnectionPool>,
-    reusable: bool,
 }
 
 impl ConnectionLease {
@@ -760,14 +765,19 @@ impl ConnectionLease {
             .clone();
         connection.set_commit_lease_probe(probe);
         Ok(Self {
-            connection: Some(connection),
+            connection: LeasedConnection::Reusable(connection),
             pool,
-            reusable: true,
         })
     }
 
     fn discard(&mut self) {
-        self.reusable = false;
+        self.connection = match std::mem::replace(&mut self.connection, LeasedConnection::Returned)
+        {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                LeasedConnection::Retiring(connection)
+            }
+            LeasedConnection::Returned => LeasedConnection::Returned,
+        };
     }
 }
 
@@ -775,29 +785,36 @@ impl Deref for ConnectionLease {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_ref()
-            .expect("connection lease already returned")
+        match &self.connection {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                connection
+            }
+            LeasedConnection::Returned => panic!("connection lease already returned"),
+        }
     }
 }
 
 impl DerefMut for ConnectionLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.connection
-            .as_mut()
-            .expect("connection lease already returned")
+        match &mut self.connection {
+            LeasedConnection::Reusable(connection) | LeasedConnection::Retiring(connection) => {
+                connection
+            }
+            LeasedConnection::Returned => panic!("connection lease already returned"),
+        }
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        let Some(connection) = self.connection.take() else {
-            return;
+        let connection = match std::mem::replace(&mut self.connection, LeasedConnection::Returned) {
+            LeasedConnection::Reusable(connection) => connection,
+            LeasedConnection::Retiring(connection) => {
+                drop_connection_without_runtime(connection);
+                return;
+            }
+            LeasedConnection::Returned => return,
         };
-        if !self.reusable {
-            drop_connection_without_runtime(connection);
-            return;
-        }
         match self.pool.idle.lock() {
             Ok(mut idle) => idle.push(connection),
             Err(_) => {
@@ -848,7 +865,7 @@ impl Db {
         if !opts.read_only {
             note_writable_open();
         }
-        let startup_deferred = std::cell::Cell::new(false);
+        let bootstrap_work = std::cell::Cell::new(BootstrapWork::Required);
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
             bot_name: GuildSettings::default().bot_name,
@@ -863,14 +880,14 @@ impl Db {
                     // terminal defaults remain authoritative until a later restart
                     // can safely finish ordinary seed/heal work.
                     if bootstrap_at_capacity(bootstrap)? {
-                        startup_deferred.set(true);
+                        bootstrap_work.set(BootstrapWork::DeferredAtCapacity);
                         return Ok(());
                     }
                     // Hide readiness only when this open will actually rebuild
                     // schema/defaults. Clearing on every reconnect made a
                     // retryable pool failure look like an incomplete first boot
                     // and blocked the API for the whole remote retry window.
-                    if migrate_open_needs_api_fence(bootstrap)? {
+                    if migrate_open_fence(bootstrap)? == ApiBootstrapFence::Required {
                         clear_bootstrap_complete(bootstrap)?;
                     }
                     migrate_conn(bootstrap).context("migrate")?;
@@ -897,10 +914,11 @@ impl Db {
                     // token fails on the first real WebUI write instead of here.
                     let _ = read_bootstrap_defaults_primary(bootstrap)?;
                 }
+                bootstrap_work.set(BootstrapWork::Complete);
                 Ok(())
             },
             |bootstrap| {
-                if opts.migrate && !startup_deferred.get() {
+                if opts.migrate && bootstrap_work.get() == BootstrapWork::Complete {
                     write_meta_string_conn(
                         bootstrap,
                         META_BOOTSTRAP_COMPLETE,
@@ -910,7 +928,7 @@ impl Db {
                 Ok(())
             },
         )?;
-        db.startup_deferred = startup_deferred.get();
+        db.bootstrap_work = bootstrap_work.get();
         Ok(db)
     }
 
@@ -1051,7 +1069,7 @@ impl Db {
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
                 lease_runtime,
-                startup_deferred: false,
+                bootstrap_work: BootstrapWork::Complete,
                 connections: Arc::new(ConnectionPool {
                     idle: Mutex::new(connections),
                     database,

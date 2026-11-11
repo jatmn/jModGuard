@@ -17,6 +17,38 @@ pub struct GuildEnrollment {
     pub joined_at_ns: i64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MembershipPresence {
+    Present,
+    Departed,
+}
+
+struct StoredEnrollment {
+    id: String,
+    joined_at_ns: i64,
+    presence: MembershipPresence,
+}
+
+enum EnrollmentTransition<'a> {
+    Ignore,
+    Confirm(&'a StoredEnrollment),
+    Replace,
+}
+
+impl StoredEnrollment {
+    fn observe(&self, joined_at_ns: i64, presence: MembershipPresence) -> EnrollmentTransition<'_> {
+        if self.joined_at_ns > joined_at_ns
+            || (self.joined_at_ns == joined_at_ns && self.presence == MembershipPresence::Departed)
+        {
+            EnrollmentTransition::Ignore
+        } else if self.joined_at_ns == joined_at_ns && presence == MembershipPresence::Present {
+            EnrollmentTransition::Confirm(self)
+        } else {
+            EnrollmentTransition::Replace
+        }
+    }
+}
+
 pub async fn guild_enrollment(db: &Db, guild: i64) -> Result<Option<GuildEnrollment>> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
@@ -75,13 +107,13 @@ pub async fn enroll_guild_with_change(
     guild: i64,
     joined_at_ns: i64,
 ) -> Result<(Option<GuildEnrollment>, bool)> {
-    observe_membership(db, guild, joined_at_ns, true).await
+    observe_membership(db, guild, joined_at_ns, MembershipPresence::Present).await
 }
 
 /// Only use a confirmed departure with that membership's join timestamp.
 /// A missing guild/member response or gateway outage is not departure evidence.
 pub async fn retire_guild_enrollment(db: &Db, guild: i64, joined_at_ns: i64) -> Result<()> {
-    observe_membership(db, guild, joined_at_ns, false).await?;
+    observe_membership(db, guild, joined_at_ns, MembershipPresence::Departed).await?;
     Ok(())
 }
 
@@ -89,7 +121,7 @@ async fn observe_membership(
     db: &Db,
     guild: i64,
     joined_at_ns: i64,
-    present: bool,
+    presence: MembershipPresence,
 ) -> Result<(Option<GuildEnrollment>, bool)> {
     anyhow::ensure!(
         guild > 0 && joined_at_ns > 0,
@@ -101,15 +133,27 @@ async fn observe_membership(
             .query_row(
                 "SELECT id,joined_at_ns,active FROM guild_enrollments WHERE guild_id=?1",
                 params![guild],
-                |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?, r.get::<bool>(2)?)),
+                |r| Ok(StoredEnrollment {
+                    id: r.get(0)?,
+                    joined_at_ns: r.get(1)?,
+                    presence: if r.get::<bool>(2)? {
+                        MembershipPresence::Present
+                    } else {
+                        MembershipPresence::Departed
+                    },
+                }),
             )
             .optional()?;
-        if let Some((id, joined, active)) = &current {
-            if *joined > joined_at_ns || (*joined == joined_at_ns && !active) {
+        let transition = current.as_ref().map_or(EnrollmentTransition::Replace, |stored| {
+            stored.observe(joined_at_ns, presence)
+        });
+        match transition {
+            EnrollmentTransition::Ignore => {
                 tx.finish_read()?;
                 return Ok((None, false));
             }
-            if *joined == joined_at_ns && present {
+            EnrollmentTransition::Confirm(stored) => {
+                let id = &stored.id;
                 // Healthy observations are write-free; only a dormant request bound
                 // to this exact membership may be resumed after positive confirmation.
                 let dormant: bool = tx.query_row(
@@ -140,6 +184,7 @@ async fn observe_membership(
                     joined_at_ns,
                 }), false));
             }
+            EnrollmentTransition::Replace => {}
         }
         // The primary snapshot already holds the write lock: enabling recovery
         // here preserves the comparison/write atomicity without no-op receipts.
@@ -151,8 +196,11 @@ async fn observe_membership(
         // Retirement replaces the active identity, so it must not precede admission.
         // A newer departure can follow a missed join; clean the known old identity
         // as well. The earlier timestamp guard already rejected stale departures.
-        if let Some((id, joined, true)) = &current
+        if let Some(stored) = &current
+            && stored.presence == MembershipPresence::Present
         {
+            let id = &stored.id;
+            let joined = &stored.joined_at_ns;
             tx.execute_rows(
                 "INSERT INTO guild_erasure_jobs(guild_id,enrollment_id,joined_at_ns,store_id,placement_revision,created_at)
                  SELECT guild_id,?2,?3,store_id,revision,unixepoch() FROM guild_store_placements
@@ -175,6 +223,7 @@ async fn observe_membership(
              WHERE guild_id=?1 AND state!='dormant'", params![guild], 1,
         )?;
         let id = format!("{:032x}", rand::random::<u128>());
+        let present = presence == MembershipPresence::Present;
         tx.execute_rows(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,?3,?4)
              ON CONFLICT(guild_id) DO UPDATE SET id=excluded.id,

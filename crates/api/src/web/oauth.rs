@@ -24,7 +24,7 @@ pub struct OAuthClient {
     pub me_endpoint: Option<String>,
 }
 
-type GuildFlightSender = tokio::sync::watch::Sender<Option<std::sync::Arc<SharedGuildOutcome>>>;
+type GuildFlightSender = tokio::sync::watch::Sender<GuildFlightUpdate>;
 
 pub(crate) struct GuildListGate {
     /// Route key → earliest instant another request for that route may start.
@@ -44,12 +44,32 @@ pub(crate) enum Cooldown {
     AwaitingBody,
 }
 
+struct RetryDeadlineSnapshot {
+    generation: u64,
+    deadlines: std::collections::BTreeMap<String, i64>,
+}
+
+enum DeadlinePersistence {
+    Recorded,
+    WaitingForWriter,
+}
+
 impl GuildListGate {
     pub(crate) fn new() -> Self {
         Self {
             cooldowns: HashMap::new(),
             deadlines_ms: HashMap::new(),
             generation: 0,
+        }
+    }
+
+    fn await_body(&mut self, user_key: &str) {
+        if !matches!(
+            self.cooldowns.get(user_key),
+            Some(Cooldown::RestOfProcess | Cooldown::Until(_))
+        ) {
+            self.cooldowns
+                .insert(user_key.to_owned(), Cooldown::AwaitingBody);
         }
     }
 
@@ -90,7 +110,7 @@ impl GuildListGate {
         }
     }
 
-    fn durable_snapshot(&mut self) -> (u64, std::collections::BTreeMap<String, i64>) {
+    fn durable_snapshot(&mut self) -> RetryDeadlineSnapshot {
         let now = chrono::Utc::now().timestamp_millis();
         self.deadlines_ms
             .retain(|key, millis| *millis > now && super::discord_retry::durable_key(key));
@@ -105,13 +125,14 @@ impl GuildListGate {
             };
             self.deadlines_ms.remove(&soonest);
         }
-        (
-            self.generation,
-            self.deadlines_ms
+        RetryDeadlineSnapshot {
+            generation: self.generation,
+            deadlines: self
+                .deadlines_ms
                 .iter()
                 .map(|(key, millis)| (key.clone(), *millis))
                 .collect(),
-        )
+        }
     }
 }
 
@@ -640,13 +661,7 @@ impl OAuthClient {
             .guild_list
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !matches!(
-            gate.cooldowns.get(user_key),
-            Some(Cooldown::RestOfProcess | Cooldown::Until(_))
-        ) {
-            gate.cooldowns
-                .insert(user_key.to_owned(), Cooldown::AwaitingBody);
-        }
+        gate.await_body(user_key);
     }
 
     fn begin_flight(&self, user_key: &str) -> FlightJoin {
@@ -657,22 +672,22 @@ impl OAuthClient {
         if let Some(sender) = flights.get(user_key) {
             return FlightJoin::Follow(sender.subscribe());
         }
-        let (sender, _) = tokio::sync::watch::channel(None);
+        let (sender, _) = tokio::sync::watch::channel(GuildFlightUpdate::Pending);
         flights.insert(user_key.to_owned(), sender.clone());
         FlightJoin::Lead(FlightGuard {
             key: user_key.to_owned(),
             sender,
             flights: std::sync::Arc::clone(&self.guild_flights),
-            done: false,
+            progress: FlightProgress::Running,
         })
     }
 
     async fn wait_for_flight(
         &self,
-        mut receiver: tokio::sync::watch::Receiver<Option<std::sync::Arc<SharedGuildOutcome>>>,
+        mut receiver: tokio::sync::watch::Receiver<GuildFlightUpdate>,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
         loop {
-            if let Some(outcome) = receiver.borrow().clone() {
+            if let GuildFlightUpdate::Settled(outcome) = receiver.borrow().clone() {
                 return outcome_to_result(&outcome);
             }
             if receiver.changed().await.is_err() {
@@ -795,12 +810,12 @@ impl OAuthClient {
         // bounds the write, so a locked database fails the record inside the
         // interactive deadline instead of the bot's. The request continues.
         for _ in 0..4 {
-            let (generation, deadlines) = self
+            let snapshot = self
                 .guild_list
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .durable_snapshot();
-            let Ok(json) = serde_json::to_string(&deadlines) else {
+            let Ok(json) = serde_json::to_string(&snapshot.deadlines) else {
                 return;
             };
             if json.len() > 8192 {
@@ -820,67 +835,87 @@ impl OAuthClient {
                 link.submit(crate::db::ControlOp::StoreRetryDeadlines { json }, 0)
                     .await
                     .map(|reply| {
-                        matches!(
+                        if matches!(
                             reply,
                             crate::db::ControlReply::Saved { .. }
                                 | crate::db::ControlReply::Unchanged { .. }
-                        )
+                        ) {
+                            DeadlinePersistence::Recorded
+                        } else {
+                            DeadlinePersistence::WaitingForWriter
+                        }
                     })
             } else {
                 super::discord_retry::store_deadlines(&db, json)
                     .await
-                    .map(|_| true)
+                    .map(|_| DeadlinePersistence::Recorded)
             };
             match stored {
                 Err(error) => {
                     tracing::warn!("failed to persist discord retry deadline: {error:#}");
                     return;
                 }
-                Ok(false) => {
+                Ok(DeadlinePersistence::WaitingForWriter) => {
                     tracing::warn!("discord retry deadline is waiting for the bot writer");
                     return;
                 }
-                Ok(true) => {}
+                Ok(DeadlinePersistence::Recorded) => {}
             }
             let current = self
                 .guild_list
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .generation;
-            if current == generation {
+            if current == snapshot.generation {
                 return;
             }
         }
     }
 }
 
+#[derive(Clone)]
+enum GuildFlightUpdate {
+    Pending,
+    Settled(std::sync::Arc<SharedGuildOutcome>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlightProgress {
+    Running,
+    Finished,
+}
+
 enum FlightJoin {
     Lead(FlightGuard),
-    Follow(tokio::sync::watch::Receiver<Option<std::sync::Arc<SharedGuildOutcome>>>),
+    Follow(tokio::sync::watch::Receiver<GuildFlightUpdate>),
 }
 
 struct FlightGuard {
     key: String,
     sender: GuildFlightSender,
     flights: std::sync::Arc<std::sync::Mutex<HashMap<String, GuildFlightSender>>>,
-    done: bool,
+    progress: FlightProgress,
 }
 
 impl FlightGuard {
     fn finish(&mut self, outcome: &SharedGuildOutcome) {
-        let _ = self.sender.send(Some(std::sync::Arc::new(outcome.clone())));
-        self.done = true;
+        let _ = self
+            .sender
+            .send(GuildFlightUpdate::Settled(std::sync::Arc::new(
+                outcome.clone(),
+            )));
+        self.progress = FlightProgress::Finished;
     }
 }
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        if !self.done {
+        if self.progress == FlightProgress::Running {
             let _ = self
                 .sender
-                .send(Some(std::sync::Arc::new(SharedGuildOutcome::Failed(
-                    "guild list lookup ended before a result".into(),
-                ))));
+                .send(GuildFlightUpdate::Settled(std::sync::Arc::new(
+                    SharedGuildOutcome::Failed("guild list lookup ended before a result".into()),
+                )));
         }
         let mut flights = self
             .flights

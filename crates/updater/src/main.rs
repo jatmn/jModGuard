@@ -38,6 +38,41 @@ const SCHEMA_MISMATCH_BOOT_MISMATCH: &str =
     "registry unreachable; built-in application schema does not match the database";
 const GUILD_SCHEMA_MISMATCH_BOOT_MISMATCH: &str = "registry unreachable; built-in application guild schema does not match the recorded guild schema";
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AuthAdmission {
+    #[default]
+    Allowed,
+    Held,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum RestartIntent {
+    #[default]
+    Stopped,
+    Retry,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ExitAccounting {
+    #[default]
+    Unaccounted,
+    Accounted,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ReadinessReceipt {
+    #[default]
+    Pending,
+    Recorded,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum RejectionLookup {
+    #[default]
+    Unread,
+    Loaded,
+}
+
 /// Process-local only: container restart is the explicit reset for a bad token.
 ///
 /// The hold clock is not persisted. The rejected candidate itself is durable, so
@@ -51,7 +86,7 @@ const GUILD_SCHEMA_MISMATCH_BOOT_MISMATCH: &str = "registry unreachable; built-i
 /// by up to 60 s. Revisit both together if hold or backoff policy changes.
 #[derive(Default)]
 struct RestartPolicy {
-    held: bool,
+    auth_admission: AuthAdmission,
     failures: u32,
     not_before: Option<Instant>,
     auth_failures: u32,
@@ -65,12 +100,12 @@ impl RestartPolicy {
             self.recovered();
         }
         if bot && code == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
-            if !self.held {
+            if self.auth_admission == AuthAdmission::Allowed {
                 tracing::error!(
                     "discord token rejected; bot held, fix token and restart container"
                 );
             }
-            self.held = true;
+            self.auth_admission = AuthAdmission::Held;
             let delay = Duration::from_secs(30 * 60)
                 .saturating_mul(1_u32 << self.auth_failures.min(4))
                 .min(Duration::from_secs(6 * 3600));
@@ -89,8 +124,10 @@ impl RestartPolicy {
     }
 
     fn retry_auth(&mut self, now: Instant) -> bool {
-        if self.held && self.auth_retry_at.is_some_and(|at| now >= at) {
-            self.held = false;
+        if self.auth_admission == AuthAdmission::Held
+            && self.auth_retry_at.is_some_and(|at| now >= at)
+        {
+            self.auth_admission = AuthAdmission::Allowed;
             self.auth_retry_at = None;
             self.not_before = None;
             tracing::warn!("retrying bot after discord token rejection hold");
@@ -132,7 +169,7 @@ impl RestartPolicy {
     }
 
     fn not_ready_reason(&self) -> &'static str {
-        if self.held {
+        if self.auth_admission == AuthAdmission::Held {
             "discord token rejected"
         } else {
             "not ready"
@@ -140,7 +177,7 @@ impl RestartPolicy {
     }
 
     fn waiting(&self, now: Instant) -> bool {
-        self.held || self.not_before.is_some_and(|at| now < at)
+        self.auth_admission == AuthAdmission::Held || self.not_before.is_some_and(|at| now < at)
     }
 }
 
@@ -156,12 +193,50 @@ struct Running {
 }
 
 /// Last binary this supervisor started. A crash can relaunch it without a
-/// control read; an intentional stop leaves `exited_for_restart` clear.
-#[derive(Clone)]
+/// control read; an intentional stop leaves `restart_intent` at `Stopped`.
+#[derive(Debug, Clone)]
 struct RestartTarget {
     path: PathBuf,
     source_sha: String,
     release: Option<ComponentRelease>,
+}
+
+struct PreparedApplication {
+    upgrade_id: String,
+    path: PathBuf,
+}
+
+#[derive(Clone)]
+struct PendingRollback {
+    failed: ComponentRelease,
+    error: String,
+}
+
+#[derive(Default)]
+enum ReceiptSchedule {
+    #[default]
+    Ready,
+    After(Instant),
+}
+
+#[derive(Default)]
+struct ReceiptBackoff {
+    attempt: u32,
+    schedule: ReceiptSchedule,
+}
+
+impl ReceiptBackoff {
+    fn defer(&mut self) {
+        let delay = Duration::from_secs(1_u64 << self.attempt.min(6)).min(Duration::from_secs(60));
+        self.attempt = self.attempt.saturating_add(1);
+        self.schedule = ReceiptSchedule::After(Instant::now() + delay);
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn waiting(&self) -> bool {
+        matches!(self.schedule, ReceiptSchedule::After(at) if Instant::now() < at)
+    }
 }
 
 #[derive(Debug)]
@@ -762,10 +837,10 @@ struct Supervisor {
     running: Option<Running>,
     restart: RestartPolicy,
     restart_target: Option<RestartTarget>,
-    exited_for_restart: bool,
+    restart_intent: RestartIntent,
     /// `report_ready` already applied restart policy for the child still recorded
     /// in `running`. Settling that same exit must not count it again.
-    exit_accounted: bool,
+    exit_accounting: ExitAccounting,
     maintenance: Option<Running>,
     health: Option<tokio::task::JoinHandle<Result<()>>>,
     health_bind: Option<String>,
@@ -791,31 +866,29 @@ struct Supervisor {
         tokio::sync::oneshot::Receiver<()>,
     )>,
     staging: PathBuf,
-    prepared: Option<(String, PathBuf)>,
-    standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
+    prepared: Option<PreparedApplication>,
+    standby: Option<RestartTarget>,
     // Independent replacement rejected before its activation receipt.
     // `persisted_candidate_digest` is the digest last saved for that candidate.
     // A later rejection of a different release must be saved again.
     rejected_candidate: Option<ComponentRelease>,
     persisted_candidate_digest: Option<String>,
-    rejected_loaded: bool,
+    rejection_lookup: RejectionLookup,
     #[cfg(test)]
     fail_rejected_lookups: u32,
     #[cfg(test)]
     fail_rejected_candidate_write: bool,
     // Failed independent selection awaiting verified prior-service readiness.
-    rollback: Option<(ComponentRelease, String)>,
+    rollback: Option<PendingRollback>,
     pending_failure: Option<PendingFailure>,
     pending_boot_mismatch: VecDeque<PendingBootMismatch>,
     // Diagnostic retries must not postpone supported readiness/activation receipts.
-    boot_receipt_attempt: u32,
-    boot_receipt_not_before: Option<Instant>,
+    boot_receipts: ReceiptBackoff,
     /// Installed release retained while the built-in executable is covering a registry outage.
     baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
-    receipt_attempt: u32,
-    receipt_not_before: Option<Instant>,
-    reported: bool,
+    activation_receipts: ReceiptBackoff,
+    readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
 }
 
@@ -825,7 +898,7 @@ impl Supervisor {
         // the candidate when this process no longer has a standby path.
         let saved_digest = self.persisted_candidate_digest.clone();
         let have_standby = self.standby.is_some();
-        let reported = self.reported;
+        let reported = self.readiness_receipt == ReadinessReceipt::Recorded;
         let rolling_back = self.rollback.is_some();
         let mut rejected_now = None;
         let mut stop_child = false;
@@ -843,7 +916,7 @@ impl Supervisor {
             }
             // A failed health bind retains this child for the next attempt.
             // Count its rejection only when first establishing the hold.
-            if !self.restart.held {
+            if self.restart.auth_admission == AuthAdmission::Allowed {
                 let code = status.code();
                 let elapsed = child.started.elapsed();
                 self.restart.exited(true, code, elapsed, Instant::now());
@@ -866,10 +939,10 @@ impl Supervisor {
         }
         // A failed write is retried on the next call, including later polls.
         self.persist_rejected_candidate().await;
-        if self.restart.held {
+        if self.restart.auth_admission == AuthAdmission::Held {
             self.idle().await?;
         }
-        Ok(self.restart.held)
+        Ok(self.restart.auth_admission == AuthAdmission::Held)
     }
 
     async fn persist_rejected_candidate(&mut self) {
@@ -917,7 +990,7 @@ impl Supervisor {
     /// A fresh process has no standby path. Load a marker that still matches
     /// the selection; drop one whose selection changed while this process was down.
     async fn adopt_rejected_candidate(&mut self, state: &db::ComponentUpdate) -> Result<()> {
-        if self.role != "bot" || self.rejected_loaded {
+        if self.role != "bot" || self.rejection_lookup == RejectionLookup::Loaded {
             return Ok(());
         }
         #[cfg(test)]
@@ -927,7 +1000,7 @@ impl Supervisor {
         }
         let digest = self.control.rejected_candidate_digest(&self.role).await?;
         // An absent marker is a successful read. A failed read must retry.
-        self.rejected_loaded = true;
+        self.rejection_lookup = RejectionLookup::Loaded;
         let Some(digest) = digest else {
             return Ok(());
         };
@@ -944,10 +1017,7 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn installed_fallback(
-        &mut self,
-        state: &db::ComponentUpdate,
-    ) -> Result<(PathBuf, String, Option<ComponentRelease>)> {
+    async fn installed_fallback(&mut self, state: &db::ComponentUpdate) -> Result<RestartTarget> {
         if let Some(release) = state.installed.clone() {
             let path = match stage(
                 &self.registry,
@@ -972,9 +1042,17 @@ impl Supervisor {
                 Err(error) => return Err(error),
             };
             let sha = release.source_sha.clone();
-            Ok((path, sha, Some(release)))
+            Ok(RestartTarget {
+                path,
+                source_sha: sha,
+                release: Some(release),
+            })
         } else {
-            Ok((self.baked.clone(), self.base_sha.clone(), None))
+            Ok(RestartTarget {
+                path: self.baked.clone(),
+                source_sha: self.base_sha.clone(),
+                release: None,
+            })
         }
     }
 
@@ -983,20 +1061,15 @@ impl Supervisor {
     }
 
     fn note_receipt_delay(&mut self) {
-        let delay =
-            Duration::from_secs(1_u64 << self.receipt_attempt.min(6)).min(Duration::from_secs(60));
-        self.receipt_attempt = self.receipt_attempt.saturating_add(1);
-        self.receipt_not_before = Some(Instant::now() + delay);
+        self.activation_receipts.defer();
     }
 
     fn reset_receipt_backoff(&mut self) {
-        self.receipt_attempt = 0;
-        self.receipt_not_before = None;
+        self.activation_receipts.reset();
     }
 
     fn receipt_wait_elapsed(&self) -> bool {
-        self.receipt_not_before
-            .is_none_or(|at| Instant::now() >= at)
+        !self.activation_receipts.waiting()
     }
 
     fn remember_pending(&mut self, pending: PendingFailure) {
@@ -1065,15 +1138,11 @@ impl Supervisor {
     }
 
     fn note_boot_receipt_delay(&mut self) {
-        let delay = Duration::from_secs(1_u64 << self.boot_receipt_attempt.min(6))
-            .min(Duration::from_secs(60));
-        self.boot_receipt_attempt = self.boot_receipt_attempt.saturating_add(1);
-        self.boot_receipt_not_before = Some(Instant::now() + delay);
+        self.boot_receipts.defer();
     }
 
     fn reset_boot_receipt_backoff(&mut self) {
-        self.boot_receipt_attempt = 0;
-        self.boot_receipt_not_before = None;
+        self.boot_receipts.reset();
     }
 
     fn baked_child_running(&self) -> bool {
@@ -1188,11 +1257,7 @@ impl Supervisor {
     }
 
     async fn flush_pending_boot_mismatch(&mut self) -> Result<()> {
-        if self.pending_boot_mismatch.is_empty()
-            || self
-                .boot_receipt_not_before
-                .is_some_and(|at| Instant::now() < at)
-        {
+        if self.pending_boot_mismatch.is_empty() || self.boot_receipts.waiting() {
             return Ok(());
         }
         self.keep_record_ahead_of_clear();
@@ -1342,7 +1407,7 @@ impl Supervisor {
         if let Some(child) = self.running.as_mut()
             && (self.role == "api"
                 || child.child.try_wait()?.is_none_or(|status| {
-                    !self.restart.held
+                    self.restart.auth_admission == AuthAdmission::Allowed
                         && status.code()
                             == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE)
                 }))
@@ -1458,8 +1523,12 @@ impl Supervisor {
             stop(child).await?;
         }
         self.running = None;
-        self.reported = false;
-        self.exited_for_restart = restart_after_exit;
+        self.readiness_receipt = ReadinessReceipt::Pending;
+        self.restart_intent = if restart_after_exit {
+            RestartIntent::Retry
+        } else {
+            RestartIntent::Stopped
+        };
         self.idle().await
     }
 
@@ -1499,24 +1568,24 @@ impl Supervisor {
             return Ok(());
         }
         self.restart_target.get_or_insert(target);
-        if !self.exit_accounted {
+        if self.exit_accounting == ExitAccounting::Unaccounted {
             self.restart.exited(true, code, uptime, Instant::now());
-            self.exit_accounted = true;
+            self.exit_accounting = ExitAccounting::Accounted;
         }
-        self.exited_for_restart = true;
+        self.restart_intent = RestartIntent::Retry;
         Ok(())
     }
 
     /// Relaunch the last local child before any receipt or control await.
     async fn restart_exited_child(&mut self) -> Result<()> {
-        if !self.exited_for_restart
+        if self.restart_intent == RestartIntent::Stopped
             || self.running.is_some()
             || self.restart.waiting(Instant::now())
         {
             return Ok(());
         }
         let Some(target) = self.restart_target.clone() else {
-            self.exited_for_restart = false;
+            self.restart_intent = RestartIntent::Stopped;
             return Ok(());
         };
         tracing::info!("restarting child before the failure receipt is saved");
@@ -1529,32 +1598,32 @@ impl Supervisor {
     /// is left in place so a later successful read can roll it back.
     async fn settle_exited_child(&mut self) -> Result<()> {
         if self.role != "bot" {
-            self.exit_accounted = false;
+            self.exit_accounting = ExitAccounting::Unaccounted;
             return Ok(());
         }
         let (code, uptime) = {
             let Some(child) = self.running.as_mut() else {
-                self.exit_accounted = false;
+                self.exit_accounting = ExitAccounting::Unaccounted;
                 return Ok(());
             };
             let Some(status) = child.child.try_wait()? else {
-                self.exit_accounted = false;
+                self.exit_accounting = ExitAccounting::Unaccounted;
                 return Ok(());
             };
             (status.code(), child.started.elapsed())
         };
         if code == Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE) {
-            self.exit_accounted = false;
+            self.exit_accounting = ExitAccounting::Unaccounted;
             self.hold_rejected_token().await?;
             return Ok(());
         }
         if self.standby.is_some() || self.rollback.is_some() {
             return Ok(());
         }
-        if !self.exit_accounted {
+        if self.exit_accounting == ExitAccounting::Unaccounted {
             self.restart.exited(true, code, uptime, Instant::now());
         }
-        self.exit_accounted = false;
+        self.exit_accounting = ExitAccounting::Unaccounted;
         self.stop_child(true).await
     }
 
@@ -1605,7 +1674,7 @@ impl Supervisor {
         baked_restore: bool,
     ) -> Result<()> {
         ensure!(
-            !self.restart.held,
+            self.restart.auth_admission == AuthAdmission::Allowed,
             "bot held after Discord token rejection; restart container"
         );
         if self.running.is_some() {
@@ -1665,11 +1734,11 @@ impl Supervisor {
             source_sha: child.source_sha.clone(),
             release: child.release.clone(),
         });
-        self.exited_for_restart = false;
-        self.exit_accounted = false;
+        self.restart_intent = RestartIntent::Stopped;
+        self.exit_accounting = ExitAccounting::Unaccounted;
         self.running = Some(child);
         self.rejected_candidate = None;
-        self.reported = false;
+        self.readiness_receipt = ReadinessReceipt::Pending;
         self.last_observed = None;
         self.arm_child_health_watch();
         if baked_fallback {
@@ -1704,14 +1773,14 @@ impl Supervisor {
                     return Ok(false);
                 }
                 // The pre-control recover path may already have counted this exit.
-                if !self.exit_accounted {
+                if self.exit_accounting == ExitAccounting::Unaccounted {
                     self.restart.exited(
                         self.role == "bot",
                         status.code(),
                         child.started.elapsed(),
                         Instant::now(),
                     );
-                    self.exit_accounted = true;
+                    self.exit_accounting = ExitAccounting::Accounted;
                 }
                 bail!("application exited: {status}");
             }
@@ -1740,7 +1809,7 @@ impl Supervisor {
             )
         };
         self.restart.recovered();
-        if self.reported {
+        if self.readiness_receipt == ReadinessReceipt::Recorded {
             if self
                 .last_observed
                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
@@ -1758,7 +1827,7 @@ impl Supervisor {
         if !self.receipt_wait_elapsed() {
             return Ok(false);
         }
-        if let Some((failed, error)) = self.rollback.clone() {
+        if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
             let previous = self.durable_baked_selection(running_from_baked, &release);
             match self
                 .control
@@ -1768,7 +1837,7 @@ impl Supervisor {
                 Ok(()) => {
                     self.rollback = None;
                     self.standby = None;
-                    self.reported = true;
+                    self.readiness_receipt = ReadinessReceipt::Recorded;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
                     self.clear_rejected_marker().await;
@@ -1803,7 +1872,7 @@ impl Supervisor {
                         self.baked_fallback_installed = None;
                     }
                     self.standby = None;
-                    self.reported = true;
+                    self.readiness_receipt = ReadinessReceipt::Recorded;
                     self.last_observed = Some(Instant::now());
                     self.reset_receipt_backoff();
                     self.clear_rejected_marker().await;
@@ -1850,7 +1919,7 @@ impl Supervisor {
             .await?;
         if op.error.is_some() {
             self.stop_application().await?;
-            if !op.service(&self.role)?.stopped {
+            if op.service(&self.role)?.stopped == db::UpgradeProof::Missing {
                 self.control
                     .acknowledge(id, &self.role, &self.instance, Ack::Stopped)
                     .await?;
@@ -1874,7 +1943,7 @@ impl Supervisor {
         if self
             .prepared
             .as_ref()
-            .is_none_or(|(prepared_id, _)| prepared_id != id)
+            .is_none_or(|prepared| prepared.upgrade_id != id)
         {
             let path = stage(
                 &self.registry,
@@ -1884,9 +1953,12 @@ impl Supervisor {
                 StageTrust::NewInstall,
             )
             .await?;
-            self.prepared = Some((id.into(), path));
+            self.prepared = Some(PreparedApplication {
+                upgrade_id: id.into(),
+                path,
+            });
         }
-        if !op.service(&self.role)?.prepared {
+        if op.service(&self.role)?.prepared == db::UpgradeProof::Missing {
             self.control
                 .acknowledge(id, &self.role, &self.instance, Ack::Prepared)
                 .await?;
@@ -1910,9 +1982,11 @@ impl Supervisor {
         }
         let may_start = (self.role == "bot"
             && op.phase == Phase::StartingBot
-            && op.api.stopped
-            && op.api.prepared)
-            || (self.role == "api" && op.phase == Phase::StartingApi && op.bot.ready);
+            && op.api.stopped == db::UpgradeProof::Confirmed
+            && op.api.prepared == db::UpgradeProof::Confirmed)
+            || (self.role == "api"
+                && op.phase == Phase::StartingApi
+                && op.bot.ready == db::UpgradeProof::Confirmed);
         if may_start && self.running.is_none() {
             // Atomic reservation persists the irreversible fence BEFORE spawn.
             // A recovery request cannot replace this operation until we reap.
@@ -1923,7 +1997,7 @@ impl Supervisor {
                 .prepared
                 .as_ref()
                 .context("release was not prepared")?
-                .1
+                .path
                 .clone();
             self.start(&path, &target.source_sha, Some(target.clone()))
                 .await?;
@@ -2023,7 +2097,7 @@ impl Supervisor {
         state: &db::ComponentUpdate,
         schema: i64,
         release: &ComponentRelease,
-    ) -> Result<(PathBuf, String, Option<ComponentRelease>)> {
+    ) -> Result<RestartTarget> {
         ensure!(
             self.baked_core_fits(schema),
             "baked application cannot open database; use owner recovery"
@@ -2033,7 +2107,11 @@ impl Supervisor {
             db::APP_ONLY_SCHEMA_CHANGE_REFUSED
         );
         self.baked_fallback_installed = Some(release.clone());
-        Ok((self.baked.clone(), self.base_sha.clone(), None))
+        Ok(RestartTarget {
+            path: self.baked.clone(),
+            source_sha: self.base_sha.clone(),
+            release: None,
+        })
     }
 
     async fn start_baked_after_registry_outage(
@@ -2042,7 +2120,11 @@ impl Supervisor {
         schema: i64,
         release: &ComponentRelease,
     ) -> Result<()> {
-        let (path, sha, _) = match self.baked_registry_fallback(state, schema, release).await {
+        let RestartTarget {
+            path,
+            source_sha: sha,
+            ..
+        } = match self.baked_registry_fallback(state, schema, release).await {
             Ok(fallback) => fallback,
             Err(error) => {
                 // The owner alert names this cause; the refusal itself is unchanged.
@@ -2101,7 +2183,7 @@ impl Supervisor {
     }
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
-        if let Some((failed, error)) = self.rollback.clone() {
+        if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
         }
         let schema = self.control.schema_version().await?;
@@ -2473,7 +2555,7 @@ impl Supervisor {
             // report_ready reaps before this read. Bind health first so a stall
             // here cannot leave /health down after the watcher sees Reaped.
             self.bind_health_after_observed_exit().await?;
-            if self.restart.held {
+            if self.restart.auth_admission == AuthAdmission::Held {
                 return Ok(false);
             }
             #[cfg(test)]
@@ -2500,7 +2582,11 @@ impl Supervisor {
                 return Ok(false);
             }
             if self.rollback.is_none()
-                && let Some((path, sha, previous)) = self.standby.clone()
+                && let Some(RestartTarget {
+                    path,
+                    source_sha: sha,
+                    release: previous,
+                }) = self.standby.clone()
             {
                 // Independent switches passed the same core AND guild schema
                 // gate. Recheck the current schema before using that fallback.
@@ -2529,7 +2615,10 @@ impl Supervisor {
                 let message = format!("{error:#}");
                 // Stop, spawn, and post-spawn receipts can fail. Retain both
                 // identities until settlement so the failed selection stays held.
-                self.rollback = Some((failed.clone(), message.clone()));
+                self.rollback = Some(PendingRollback {
+                    failed: failed.clone(),
+                    error: message.clone(),
+                });
                 self.stop_application().await?;
                 Box::pin(self.start_checked(&path, &sha, previous, false)).await?;
                 let child = self.running.as_ref().context("rollback did not start")?;
@@ -2587,7 +2676,9 @@ impl Supervisor {
         if restoring_previous || self.rollback.is_some() {
             return Ok(false);
         }
-        if (!self.reported && !retrying_rejected) || !self.enabled {
+        if (self.readiness_receipt == ReadinessReceipt::Pending && !retrying_rejected)
+            || !self.enabled
+        {
             return Ok(false);
         }
         let Some(candidate) = state.desired.clone() else {
@@ -2699,11 +2790,11 @@ impl Supervisor {
                 .running
                 .as_ref()
                 .context("current application missing")?;
-            self.standby = Some((
-                child.path.clone(),
-                child.source_sha.clone(),
-                child.release.clone(),
-            ));
+            self.standby = Some(RestartTarget {
+                path: child.path.clone(),
+                source_sha: child.source_sha.clone(),
+                release: child.release.clone(),
+            });
         }
         self.stop_application().await?;
         if let Err(error) = self
@@ -2729,7 +2820,11 @@ impl Supervisor {
         failed: ComponentRelease,
         error: String,
     ) -> Result<()> {
-        let (path, sha, previous) = self
+        let RestartTarget {
+            path,
+            source_sha: sha,
+            release: previous,
+        } = self
             .standby
             .as_ref()
             .cloned()
@@ -2751,7 +2846,7 @@ impl Supervisor {
         // report_ready records the receipt; running() must not overwrite it.
         // The rejected-candidate marker must not outlive this rollback.
         self.clear_rejected_marker().await;
-        self.rollback = Some((failed, error));
+        self.rollback = Some(PendingRollback { failed, error });
         self.stop_application().await?;
         Box::pin(self.start_checked(&path, &sha, previous, false)).await
     }
@@ -3281,8 +3376,8 @@ async fn main() -> Result<()> {
         running: initial,
         restart,
         restart_target: None,
-        exited_for_restart: false,
-        exit_accounted: false,
+        restart_intent: RestartIntent::Stopped,
+        exit_accounting: ExitAccounting::Unaccounted,
         maintenance,
         health: boot_health,
         health_bind,
@@ -3301,7 +3396,7 @@ async fn main() -> Result<()> {
         standby: None,
         rejected_candidate: None,
         persisted_candidate_digest: None,
-        rejected_loaded: false,
+        rejection_lookup: RejectionLookup::Unread,
         #[cfg(test)]
         fail_rejected_lookups: 0,
         #[cfg(test)]
@@ -3309,13 +3404,11 @@ async fn main() -> Result<()> {
         rollback: None,
         pending_failure: None,
         pending_boot_mismatch: VecDeque::new(),
-        boot_receipt_attempt: 0,
-        boot_receipt_not_before: None,
+        boot_receipts: ReceiptBackoff::default(),
         baked_fallback_installed: None,
         pending_startup,
-        receipt_attempt: 0,
-        receipt_not_before: None,
-        reported: false,
+        activation_receipts: ReceiptBackoff::default(),
+        readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
     };
     supervisor.load_boot_mismatch_handoff().await?;
@@ -3669,7 +3762,7 @@ mod tests {
         }
         policy.exited(true, Some(1), Duration::from_secs(300), now);
         assert_eq!(policy.not_before, Some(now + POLL));
-        assert!(!policy.held);
+        assert!(policy.auth_admission == AuthAdmission::Allowed);
     }
 
     #[test]
@@ -3724,7 +3817,7 @@ mod tests {
         for code in [Some(1), Some(2), None] {
             let mut policy = RestartPolicy::default();
             policy.exited(true, code, Duration::ZERO, now);
-            assert!(!policy.held);
+            assert!(policy.auth_admission == AuthAdmission::Allowed);
             assert!(!policy.waiting(now + POLL));
         }
         let code = Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE);
@@ -3733,7 +3826,7 @@ mod tests {
         assert!(bot.waiting(now + Duration::from_secs(3600)));
         let mut api = RestartPolicy::default();
         api.exited(false, code, Duration::ZERO, now);
-        assert!(!api.held);
+        assert!(api.auth_admission == AuthAdmission::Allowed);
         assert!(!api.waiting(now + POLL));
         let mut clean = RestartPolicy::default();
         clean.exited(true, Some(0), Duration::ZERO, now);

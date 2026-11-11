@@ -24,10 +24,18 @@ use crate::types::{CommandDef, GuildSettings, RuleDef};
 /// while still refusing to commit the observed version until nothing remains.
 struct SlashSyncProgress {
     target: u64,
-    /// `None` = first pass (sync every cached guild). `Some` = retry set.
-    remaining: Option<HashSet<u64>>,
-    /// Config cache already invalidated once for this target.
-    invalidated: bool,
+    pass: SlashSyncPass,
+    cache: SlashCacheState,
+}
+
+enum SlashSyncPass {
+    FirstPass,
+    RetryFailed(HashSet<u64>),
+}
+
+enum SlashCacheState {
+    NeedsInvalidation,
+    Invalidated,
 }
 
 struct SlashRetry {
@@ -52,10 +60,34 @@ const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 const GATEWAY_MANUAL_BAN_AUDIT_TTL: Duration = Duration::from_secs(120);
 const MAX_GATEWAY_MANUAL_BAN_AUDIT_QUEUE: usize = 8;
 const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuppressionState {
+    Active,
+    Released,
+}
+
+/// Shared by a dispatch token and every echo captured from that exact dispatch.
+#[derive(Debug, Default)]
+struct SuppressionRelease(AtomicBool);
+
+impl SuppressionRelease {
+    fn state(&self) -> SuppressionState {
+        if self.0.load(Ordering::Acquire) {
+            SuppressionState::Released
+        } else {
+            SuppressionState::Active
+        }
+    }
+
+    fn release(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayCaseSuppression {
     id: u128,
-    released: Arc<AtomicBool>,
+    released: Arc<SuppressionRelease>,
 }
 
 /// One decision shared by the mirror, case routing and attribution.
@@ -65,10 +97,38 @@ pub(crate) struct GatewayBanEcho {
     pub(crate) operation_id: Option<String>,
 }
 
+enum BanEchoState {
+    Unowned,
+    First(Option<String>),
+    Repeated(Option<String>),
+}
+
+impl BanEchoState {
+    fn into_echo(self) -> GatewayBanEcho {
+        match self {
+            Self::Unowned => GatewayBanEcho {
+                suppress_case: false,
+                owned_by_bot: false,
+                operation_id: None,
+            },
+            Self::First(operation_id) => GatewayBanEcho {
+                suppress_case: true,
+                owned_by_bot: true,
+                operation_id,
+            },
+            Self::Repeated(operation_id) => GatewayBanEcho {
+                suppress_case: false,
+                owned_by_bot: true,
+                operation_id,
+            },
+        }
+    }
+}
+
 /// Identity captured before awaits, still revocable by its own failed dispatch.
 pub(crate) struct GatewayBanEchoCapture {
-    echo: GatewayBanEcho,
-    released: Option<Arc<AtomicBool>>,
+    echo: BanEchoState,
+    released: Option<Arc<SuppressionRelease>>,
 }
 
 impl GatewayBanEchoCapture {
@@ -76,15 +136,11 @@ impl GatewayBanEchoCapture {
     pub(crate) fn resolve(self) -> GatewayBanEcho {
         if self
             .released
-            .is_some_and(|released| released.load(Ordering::Acquire))
+            .is_some_and(|released| released.state() == SuppressionState::Released)
         {
-            GatewayBanEcho {
-                suppress_case: false,
-                owned_by_bot: false,
-                operation_id: None,
-            }
+            BanEchoState::Unowned.into_echo()
         } else {
-            self.echo
+            self.echo.into_echo()
         }
     }
 }
@@ -95,13 +151,13 @@ struct GatewayCaseEntry {
     user: u64,
     operation_id: Option<String>,
     expires: Instant,
-    released: Arc<AtomicBool>,
+    released: Arc<SuppressionRelease>,
 }
 
 struct GatewayBanEchoEntry {
     expires: Instant,
     operation_id: Option<String>,
-    released: Arc<AtomicBool>,
+    released: Arc<SuppressionRelease>,
 }
 
 /// Lock stripes stay fixed; registrations and durable peer identities are scoped
@@ -117,13 +173,19 @@ struct GatewayBanSubject {
     active_ids: Vec<db::GatewayBanPeer>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservationRegistration {
+    Registered,
+    Released,
+}
+
 pub(crate) struct GatewayBanObservation {
     pub(crate) delivery_id: db::guild_data::CaseId,
     flight: Arc<Mutex<GatewayBanFlight>>,
     guild: u64,
     user: u64,
     pub(crate) observed: chrono::DateTime<chrono::Utc>,
-    released: bool,
+    registration: ObservationRegistration,
     app: std::sync::Weak<BotState>,
     runtime: tokio::runtime::Handle,
     pub(crate) enrollment: Option<db::GuildEnrollment>,
@@ -168,7 +230,7 @@ impl GatewayBanObservation {
     }
 
     fn release(&mut self) {
-        if self.released {
+        if self.registration == ObservationRegistration::Released {
             return;
         }
         let mut flight = self.flight.lock();
@@ -181,7 +243,7 @@ impl GatewayBanObservation {
                 flight.subjects.remove(&(self.guild, self.user));
             }
         }
-        self.released = true;
+        self.registration = ObservationRegistration::Released;
     }
 
     fn retry(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -202,7 +264,7 @@ impl GatewayBanObservation {
 
 impl Drop for GatewayBanObservation {
     fn drop(&mut self) {
-        if !self.released {
+        if self.registration == ObservationRegistration::Registered {
             // The flight lock protects only in-memory bookkeeping. No SQL or
             // async wait can hold it, so release never needs a cleanup thread.
             self.release();
@@ -230,26 +292,79 @@ struct GatewayManualBanAuditQueue {
     entries: HashMap<(u64, u64), VecDeque<PendingGatewayBanAudit>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditValidityState {
+    Live,
+    Invalidated,
+}
+
+struct AuditValidity(AtomicBool);
+
+impl AuditValidity {
+    fn new() -> Self {
+        Self(AtomicBool::new(true))
+    }
+
+    fn state(&self) -> AuditValidityState {
+        if self.0.load(Ordering::Acquire) {
+            AuditValidityState::Live
+        } else {
+            AuditValidityState::Invalidated
+        }
+    }
+
+    fn invalidate(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct AuditRetrySlot(AtomicBool);
+
+impl AuditRetrySlot {
+    fn try_claim(self: &Arc<Self>) -> Option<GatewayBanAuditRetry> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(GatewayBanAuditRetry {
+            slot: Arc::clone(self),
+        })
+    }
+}
+
+enum AuditPass {
+    Initial,
+    Retrying { _owner: GatewayBanAuditRetry },
+}
+
+impl AuditPass {
+    fn is_initial(&self) -> bool {
+        matches!(self, Self::Initial)
+    }
+}
+
 struct PendingGatewayBanAudit {
     entry_id: i64,
     expires: Instant,
     attribution: Option<db::GatewayBanAuditAttribution>,
-    valid: Arc<AtomicBool>,
-    retrying: Arc<AtomicBool>,
+    valid: Arc<AuditValidity>,
+    retrying: Arc<AuditRetrySlot>,
 }
 
-struct GatewayBanAuditRetry(Arc<AtomicBool>);
+struct GatewayBanAuditRetry {
+    slot: Arc<AuditRetrySlot>,
+}
 
 impl Drop for GatewayBanAuditRetry {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.slot.0.store(false, Ordering::Release);
     }
 }
 
 impl Drop for PendingGatewayBanAudit {
     fn drop(&mut self) {
         // Clear, expiry, eviction and acknowledgment also revoke sleeping passes.
-        self.valid.store(false, Ordering::Release);
+        self.valid.invalidate();
     }
 }
 
@@ -292,8 +407,8 @@ impl GatewayManualBanAuditQueue {
             entry_id,
             expires: now + GATEWAY_MANUAL_BAN_AUDIT_TTL,
             attribution,
-            valid: Arc::new(AtomicBool::new(true)),
-            retrying: Arc::new(AtomicBool::new(false)),
+            valid: Arc::new(AuditValidity::new()),
+            retrying: Arc::new(AuditRetrySlot::default()),
         });
     }
 
@@ -344,7 +459,7 @@ struct GatewayCaseSuppressions {
 pub(crate) struct PendingMemberGap {
     pub(crate) guild_id: u64,
     pub(crate) enrollment_id: Option<String>,
-    pub(crate) users: Vec<(i64, bool)>,
+    pub(crate) users: Vec<(i64, db::guild_data::MemberVerifyKind)>,
     pub(crate) reason: String,
     generation: u64,
 }
@@ -378,11 +493,16 @@ impl PendingMemberGaps {
             });
         gap.generation = self.generation;
         gap.reason = reason.to_owned();
+        let kind = if reason.contains("ban") {
+            db::guild_data::MemberVerifyKind::Ban
+        } else {
+            db::guild_data::MemberVerifyKind::Member
+        };
         if let Some(user_id) = user_id.filter(|id| *id > 0)
-            && !gap.users.contains(&(user_id, reason.contains("ban")))
+            && !gap.users.contains(&(user_id, kind))
             && gap.users.len() < MAX_AFFECTED_USERS
         {
-            gap.users.push((user_id, reason.contains("ban")));
+            gap.users.push((user_id, kind));
         }
     }
 
@@ -409,8 +529,9 @@ impl PendingMemberGaps {
 impl GatewayCaseSuppressions {
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, entry| entry.expires > now);
-        self.recent_ban_echo
-            .retain(|_, entry| entry.expires > now && !entry.released.load(Ordering::Acquire));
+        self.recent_ban_echo.retain(|_, entry| {
+            entry.expires > now && entry.released.state() == SuppressionState::Active
+        });
     }
 
     fn insert(
@@ -434,7 +555,7 @@ impl GatewayCaseSuppressions {
         self.next_token += 1;
         let token = GatewayCaseSuppression {
             id: self.next_token,
-            released: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(SuppressionRelease::default()),
         };
         self.entries.insert(
             token.id,
@@ -453,7 +574,7 @@ impl GatewayCaseSuppressions {
     fn release(&mut self, token: GatewayCaseSuppression) {
         // Consumption must not detach the captured echo from a definitive
         // failure. This flag belongs only to this dispatch, even after unban.
-        token.released.store(true, Ordering::Release);
+        token.released.release();
         self.prune(Instant::now());
         self.entries.remove(&token.id);
     }
@@ -520,13 +641,24 @@ struct PendingDiscordAudit {
     entry_id: i64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PendingAuditOrigin {
+    Audit(u128),
+    Application(u128),
+}
+
 /// Application and audit halves matched in-memory but not yet durably linked.
 #[derive(Clone)]
 pub(crate) struct PendingAuditReady {
     pub(crate) link: PendingAuditLink,
     pub(crate) entry_id: i64,
-    pub(crate) audit_token: Option<u128>,
-    pub(crate) application_token: Option<u128>,
+    pub(crate) origin: PendingAuditOrigin,
+}
+
+/// A matched pair quarantined from live matching until it links or expires.
+struct DeferredAuditLink {
+    ready: PendingAuditReady,
+    expires: Instant,
 }
 
 #[derive(Default)]
@@ -534,22 +666,24 @@ struct PendingAuditLinks {
     next_token: u128,
     applications: HashMap<u128, (PendingAuditLink, Instant)>,
     audits: HashMap<u128, (PendingDiscordAudit, Instant)>,
-    deferred_links: Vec<(PendingAuditReady, Instant)>,
+    deferred_links: Vec<DeferredAuditLink>,
 }
 
 impl PendingAuditLinks {
     fn prune(&mut self, now: Instant) {
         self.applications.retain(|_, (_, expires)| *expires > now);
         self.audits.retain(|_, (_, expires)| *expires > now);
-        self.deferred_links.retain(|(_, expires)| *expires > now);
+        self.deferred_links
+            .retain(|deferred| deferred.expires > now);
     }
 
     fn defer_link(&mut self, ready: PendingAuditReady) {
         let now = Instant::now();
         self.prune(now);
-        self.finalize_link(ready.audit_token, ready.application_token);
-        if self.deferred_links.iter().any(|(existing, _)| {
-            existing.entry_id == ready.entry_id && existing.link.case_id == ready.link.case_id
+        self.finalize_link(ready.origin);
+        if self.deferred_links.iter().any(|deferred| {
+            deferred.ready.entry_id == ready.entry_id
+                && deferred.ready.link.case_id == ready.link.case_id
         }) {
             return;
         }
@@ -558,18 +692,21 @@ impl PendingAuditLinks {
                 .deferred_links
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (_, expires))| *expires)
+                .min_by_key(|(_, deferred)| deferred.expires)
                 .map(|(index, _)| index)
         {
             self.deferred_links.remove(oldest);
         }
-        self.deferred_links
-            .push((ready, now + GATEWAY_CASE_SUPPRESSION_TTL));
+        self.deferred_links.push(DeferredAuditLink {
+            ready,
+            expires: now + GATEWAY_CASE_SUPPRESSION_TTL,
+        });
     }
 
     fn clear_deferred_link(&mut self, case_id: &crate::db::guild_data::CaseId, entry_id: i64) {
-        self.deferred_links
-            .retain(|(ready, _)| ready.entry_id != entry_id || ready.link.case_id != *case_id);
+        self.deferred_links.retain(|deferred| {
+            deferred.ready.entry_id != entry_id || deferred.ready.link.case_id != *case_id
+        });
     }
 
     fn deferred_links_for_guild(&mut self, guild: Option<u64>) -> Vec<PendingAuditReady> {
@@ -577,8 +714,8 @@ impl PendingAuditLinks {
         self.prune(now);
         self.deferred_links
             .iter()
-            .filter(|(ready, _)| guild.is_none_or(|g| ready.link.guild == g))
-            .map(|(ready, _)| ready.clone())
+            .filter(|deferred| guild.is_none_or(|g| deferred.ready.link.guild == g))
+            .map(|deferred| deferred.ready.clone())
             .collect()
     }
 
@@ -605,13 +742,15 @@ impl PendingAuditLinks {
         entries.get(&token).map(|(value, _)| (token, value.clone()))
     }
 
-    fn finalize_link(&mut self, audit_token: Option<u128>, application_token: Option<u128>) {
+    fn finalize_link(&mut self, origin: PendingAuditOrigin) {
         self.prune(Instant::now());
-        if let Some(token) = audit_token {
-            self.audits.remove(&token);
-        }
-        if let Some(token) = application_token {
-            self.applications.remove(&token);
+        match origin {
+            PendingAuditOrigin::Audit(token) => {
+                self.audits.remove(&token);
+            }
+            PendingAuditOrigin::Application(token) => {
+                self.applications.remove(&token);
+            }
         }
     }
 
@@ -627,8 +766,7 @@ impl PendingAuditLinks {
             return Some(PendingAuditReady {
                 link,
                 entry_id: audit.entry_id,
-                audit_token: Some(audit_token),
-                application_token: None,
+                origin: PendingAuditOrigin::Audit(audit_token),
             });
         }
         Self::cap(&mut self.applications);
@@ -654,8 +792,7 @@ impl PendingAuditLinks {
             return Some(PendingAuditReady {
                 link,
                 entry_id,
-                audit_token: None,
-                application_token: Some(application_token),
+                origin: PendingAuditOrigin::Application(application_token),
             });
         }
         Self::cap(&mut self.audits);
@@ -698,6 +835,36 @@ pub(crate) enum ControlMemberFetch {
 type MemberLookup =
     dyn Fn(u64, u64) -> Pin<Box<dyn Future<Output = ControlMemberFetch> + Send>> + Send + Sync;
 
+#[derive(Default)]
+pub struct CommandCooldowns {
+    admitted: DashMap<(u64, u64, String), Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandAdmission {
+    Allowed,
+    CoolingDown,
+}
+
+impl CommandCooldowns {
+    pub(crate) fn admit(
+        &self,
+        key: (u64, u64, String),
+        now: Instant,
+        interval: Duration,
+    ) -> CommandAdmission {
+        if let Some(previous) = self.admitted.get(&key)
+            && now.duration_since(*previous.value()) < interval
+        {
+            return CommandAdmission::CoolingDown;
+        }
+        // Admission precedes execution; command failure does not release it.
+        // Preserve the existing map read/insert boundaries.
+        self.admitted.insert(key, now);
+        CommandAdmission::Allowed
+    }
+}
+
 enum GuildActorCache {
     Known(db::CachedGuildActor),
     MemberMissing,
@@ -729,7 +896,7 @@ pub struct BotState {
     pub member_joins: crate::logging::MemberJoinContext,
     pub rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries,
     pub member_audits: crate::logging::MemberAuditClaims,
-    pub cooldowns: DashMap<(u64, u64, String), Instant>,
+    pub cooldowns: CommandCooldowns,
     pub log_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) log_delivery_waiters: std::sync::Arc<tokio::sync::Semaphore>,
     pub log_delivery_failures: AtomicU64,
@@ -783,7 +950,7 @@ pub struct BotState {
     /// Timed-ban expiry: per-guild retry time after a failed membership check.
     pub(crate) expiry_check_retries: crate::action_worker::ExpiryCheckRetries,
     /// Shards that have already delivered READY in this process.
-    ready_shards: Mutex<HashSet<u32>>,
+    ready_shards: Mutex<ShardSessions>,
     /// Test seam. Production reads [`Self::discord_cache`] instead.
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
@@ -849,7 +1016,7 @@ impl BotState {
             member_joins: crate::logging::MemberJoinContext::default(),
             rejoin_note_deliveries: crate::logging::RejoinNoteDeliveries::default(),
             member_audits: crate::logging::MemberAuditClaims::default(),
-            cooldowns: DashMap::new(),
+            cooldowns: CommandCooldowns::default(),
             log_delivery_slots,
             log_delivery_waiters: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
             log_delivery_failures: AtomicU64::new(0),
@@ -896,7 +1063,7 @@ impl BotState {
             rate_limit_wait_logged_at: parking_lot::Mutex::new(HashMap::new()),
             ban_observations: Mutex::new(HashMap::new()),
             expiry_check_retries: Default::default(),
-            ready_shards: Mutex::new(HashSet::new()),
+            ready_shards: Mutex::new(ShardSessions::default()),
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
@@ -1373,12 +1540,16 @@ impl BotState {
         let mut suppressions = self.gateway_case_suppressions.lock();
         let suppress_case = suppressions.remove(GatewayCaseAction::Ban, guild, user);
         let remembered = suppressions.recent_ban_echo.get(&(guild, user));
+        let operation_id = remembered.and_then(|entry| entry.operation_id.clone());
+        let echo = if suppress_case {
+            BanEchoState::First(operation_id)
+        } else if remembered.is_some() {
+            BanEchoState::Repeated(operation_id)
+        } else {
+            BanEchoState::Unowned
+        };
         GatewayBanEchoCapture {
-            echo: GatewayBanEcho {
-                suppress_case,
-                owned_by_bot: suppress_case || remembered.is_some(),
-                operation_id: remembered.and_then(|entry| entry.operation_id.clone()),
-            },
+            echo,
             released: remembered.map(|entry| Arc::clone(&entry.released)),
         }
     }
@@ -1455,7 +1626,7 @@ impl BotState {
             guild,
             user,
             observed,
-            released: false,
+            registration: ObservationRegistration::Registered,
             app: Arc::downgrade(self),
             runtime: tokio::runtime::Handle::current(),
             enrollment: None,
@@ -1494,17 +1665,17 @@ impl BotState {
             return Ok(false);
         };
         let audit_at = (entry_id >> 22) + 1_420_070_400_000;
-        let mut retry = None;
+        let mut retry = AuditPass::Initial;
         let mut backoff = Duration::from_secs(1);
         loop {
-            if !valid.load(Ordering::Acquire) || expires <= Instant::now() {
+            if valid.state() == AuditValidityState::Invalidated || expires <= Instant::now() {
                 return Ok(false);
             }
             let blocked = gateway_ban_audit_blocked(&flight.lock(), guild, user);
             // The callback's pre-write pass cannot wait for its own observation.
             // An established error-retry owner stays alive through temporary
             // activity, so another completion cannot lose its only retry.
-            if blocked && retry.is_none() {
+            if blocked && retry.is_initial() {
                 return Ok(false);
             }
             let remaining_ms = audit_at + 5_001 - chrono::Utc::now().timestamp_millis();
@@ -1527,7 +1698,7 @@ impl BotState {
                         move |conn| {
                             {
                                 let state = flight.lock();
-                                if !valid.load(Ordering::Acquire)
+                                if valid.state() == AuditValidityState::Invalidated
                                     || expires <= Instant::now()
                                     || gateway_ban_audit_blocked(&state, guild, user)
                                     || chrono::Utc::now().timestamp_millis() <= audit_at + 5_000
@@ -1550,7 +1721,7 @@ impl BotState {
                     .await;
                 match result {
                     Ok(true) => return Ok(true),
-                    Ok(false) if retry.is_none() => return Ok(false),
+                    Ok(false) if retry.is_initial() => return Ok(false),
                     Ok(false) => {}
                     Err(error) => {
                         let transient = matches!(
@@ -1565,14 +1736,11 @@ impl BotState {
                         if !transient {
                             return Err(error);
                         }
-                        if retry.is_none() {
-                            if retrying
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_err()
-                            {
+                        if retry.is_initial() {
+                            let Some(owner) = retrying.try_claim() else {
                                 return Err(error);
-                            }
-                            retry = Some(GatewayBanAuditRetry(Arc::clone(&retrying)));
+                            };
+                            retry = AuditPass::Retrying { _owner: owner };
                         }
                         tracing::warn!("gateway manual ban audit will retry: {error:#}");
                     }
@@ -1692,7 +1860,7 @@ impl BotState {
     /// A shard's first READY is startup. A later READY from that same shard is
     /// a replaced session and advances the coverage-gap generation.
     pub(crate) fn note_shard_ready(&self, shard_id: u32) {
-        if !self.ready_shards.lock().insert(shard_id) {
+        if self.ready_shards.lock().observe_ready(shard_id) == ShardReady::Replaced {
             self.gateway_ready_generation
                 .fetch_add(1, Ordering::Relaxed);
             self.invalidate_member_sync_scope();
@@ -1730,14 +1898,8 @@ impl BotState {
             .remember_audit(action, guild, subject, entry_id)
     }
 
-    pub(crate) fn finalize_pending_audit_link(
-        &self,
-        audit_token: Option<u128>,
-        application_token: Option<u128>,
-    ) {
-        self.pending_audit_links
-            .lock()
-            .finalize_link(audit_token, application_token);
+    pub(crate) fn finalize_pending_audit_link(&self, origin: PendingAuditOrigin) {
+        self.pending_audit_links.lock().finalize_link(origin);
     }
 
     pub(crate) fn defer_pending_audit_link(&self, ready: PendingAuditReady) {
@@ -1982,7 +2144,7 @@ impl BotState {
             revision: revision.to_owned(),
             retry: Default::default(),
         });
-        if class == RetryClass::Permanent && !retry.retry.stopped {
+        if class == RetryClass::Permanent && !retry.retry.is_stopped() {
             tracing::warn!(
                 guild_id = guild,
                 status = response.map(|(status, _)| status),
@@ -2025,17 +2187,17 @@ impl BotState {
         if guard.as_ref().map(|p| p.target) != Some(remote) {
             *guard = Some(SlashSyncProgress {
                 target: remote,
-                remaining: None,
-                invalidated: false,
+                pass: SlashSyncPass::FirstPass,
+                cache: SlashCacheState::NeedsInvalidation,
             });
         }
         if cached.is_empty() {
             return SlashResyncPlan::Defer;
         }
         let progress = guard.as_mut().expect("progress set above");
-        let guilds = match &progress.remaining {
-            None => cached.to_vec(),
-            Some(rem) => {
+        let guilds = match &progress.pass {
+            SlashSyncPass::FirstPass => cached.to_vec(),
+            SlashSyncPass::RetryFailed(rem) => {
                 let pending: Vec<u64> =
                     cached.iter().copied().filter(|g| rem.contains(g)).collect();
                 if pending.len() != rem.len() {
@@ -2047,9 +2209,9 @@ impl BotState {
                 pending
             }
         };
-        let invalidate = !progress.invalidated;
+        let invalidate = matches!(progress.cache, SlashCacheState::NeedsInvalidation);
         if invalidate {
-            progress.invalidated = true;
+            progress.cache = SlashCacheState::Invalidated;
         }
         SlashResyncPlan::Sync { guilds, invalidate }
     }
@@ -2076,7 +2238,7 @@ impl BotState {
                 .store(false, Ordering::SeqCst);
             true
         } else {
-            progress.remaining = Some(failed);
+            progress.pass = SlashSyncPass::RetryFailed(failed);
             false
         }
     }
@@ -2179,6 +2341,33 @@ impl CachedGuildConfig {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShardReady {
+    First,
+    Replaced,
+}
+
+#[derive(Default)]
+struct ShardSessions {
+    ready: HashSet<u32>,
+}
+
+impl ShardSessions {
+    fn observe_ready(&mut self, shard_id: u32) -> ShardReady {
+        if self.ready.insert(shard_id) {
+            ShardReady::First
+        } else {
+            ShardReady::Replaced
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigReadRoute {
+    Replica,
+    Primary,
+}
+
 #[derive(Clone)]
 pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
@@ -2254,12 +2443,12 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
-        let mut primary = false;
+        let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
         let mut last_required = required;
         for _ in 0..3 {
             let version = self.version.load(Ordering::Relaxed);
-            let (durable_version, revision, parts) = if primary {
+            let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
                 db::load_config_parts_with_version_primary(db, guild_id as i64).await?
             } else {
                 db::load_config_parts_with_version(db, guild_id as i64).await?
@@ -2272,7 +2461,7 @@ impl ConfigCache {
             last_required = required_after;
             let accepted_revision = self.accepted_revision.lock().clone();
 
-            if primary && revision != accepted_revision {
+            if route == ConfigReadRoute::Primary && revision != accepted_revision {
                 self.require_primary_revision(durable_version, revision);
                 continue;
             }
@@ -2280,7 +2469,7 @@ impl ConfigCache {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
-                primary = true;
+                route = ConfigReadRoute::Primary;
                 continue;
             }
             let cfg = Arc::new(CachedGuildConfig::from_parts(
@@ -2302,7 +2491,7 @@ impl ConfigCache {
                     || durable_version < required_now
                     || revision != accepted_revision
                 {
-                    primary = true;
+                    route = ConfigReadRoute::Primary;
                     continue;
                 }
                 self.map.insert(guild_id as i64, Arc::clone(&cfg));
@@ -3204,7 +3393,13 @@ mod tests {
         );
         gaps.acknowledge(&first);
         let current = gaps.snapshot(42).pop().expect("newer failure retained");
-        assert_eq!(current.users, vec![(7, false), (8, false)]);
+        assert_eq!(
+            current.users,
+            vec![
+                (7, db::guild_data::MemberVerifyKind::Member),
+                (8, db::guild_data::MemberVerifyKind::Member)
+            ]
+        );
         gaps.acknowledge(&current);
         assert!(gaps.snapshot(42).is_empty());
     }
@@ -3225,7 +3420,7 @@ mod tests {
                 user: 40,
                 operation_id: None,
                 expires: Instant::now() - Duration::from_secs(1),
-                released: Arc::new(AtomicBool::new(false)),
+                released: Arc::new(SuppressionRelease::default()),
             },
         );
         suppressions.insert(GatewayCaseAction::Unban, 30, 40, None);
@@ -3340,7 +3535,7 @@ mod tests {
             .unwrap();
         assert_eq!(ready.link.case_id, first_id);
         assert_eq!(ready.entry_id, 123);
-        pending.finalize_link(ready.audit_token, ready.application_token);
+        pending.finalize_link(ready.origin);
         assert!(
             pending
                 .remember_audit(crate::db::guild_data::CaseAction::Unban, 10, 20, 124)
@@ -3361,7 +3556,7 @@ mod tests {
         kick.action = crate::db::guild_data::CaseAction::Kick;
         let ready = pending.remember_application(kick).unwrap();
         assert_eq!(ready.entry_id, 55);
-        pending.finalize_link(ready.audit_token, ready.application_token);
+        pending.finalize_link(ready.origin);
         assert!(pending.remember_application(dummy_link(20)).is_none());
     }
 

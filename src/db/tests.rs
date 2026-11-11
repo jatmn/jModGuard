@@ -991,7 +991,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     let tmp = tmp_db_path("migrate_fence");
     let empty = Connection::open(&tmp).unwrap();
     assert!(
-        migrate_open_needs_api_fence(&empty).unwrap(),
+        migrate_open_fence(&empty).unwrap() == ApiBootstrapFence::Required,
         "an empty database must fence the API until the bot finishes bootstrap"
     );
     drop(empty);
@@ -1009,7 +1009,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     .expect("bot migrate-open");
     bot.with_conn_sync(|conn| {
         assert!(
-            !migrate_open_needs_api_fence(conn)?,
+            migrate_open_fence(conn)? == ApiBootstrapFence::PreserveReady,
             "a finished bootstrap must not hide readiness on reconnect"
         );
         Ok(())
@@ -1031,7 +1031,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     bot.with_conn_sync(|conn| {
         clear_bootstrap_complete(conn)?;
         assert!(
-            migrate_open_needs_api_fence(conn)?,
+            migrate_open_fence(conn)? == ApiBootstrapFence::Required,
             "a missing marker must fence the API during a real bootstrap"
         );
         Ok(())
@@ -3376,7 +3376,7 @@ fn nickname_outbox_migration_does_not_adopt_unbound_guild_nicknames() {
             .unwrap()
             .unwrap()
             .state,
-        "dormant"
+        NicknameReconcileState::Dormant
     );
     cleanup_db(&tmp);
 }
@@ -3412,7 +3412,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
     tokio_test_block_on(finish_nickname_reconcile(
         &db,
         &job,
-        "terminal",
+        NicknameReconcileStop::Terminal,
         "discord_50013",
         "missing permissions",
         10_000,
@@ -3430,7 +3430,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .unwrap()
             .unwrap()
             .state,
-        "terminal",
+        NicknameReconcileState::Terminal,
         "a gateway reconnect must preserve an operator-actionable terminal failure"
     );
 
@@ -3475,7 +3475,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
     tokio_test_block_on(finish_nickname_reconcile(
         &db,
         &in_flight,
-        "terminal",
+        NicknameReconcileStop::Terminal,
         "late_error",
         "late Discord response",
         20_001,
@@ -3487,7 +3487,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .unwrap()
             .unwrap()
             .state,
-        "dormant",
+        NicknameReconcileState::Dormant,
         "late completion of an invalidated generation must not erase departure state"
     );
 
@@ -3501,7 +3501,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
     tokio_test_block_on(finish_nickname_reconcile(
         &db,
         &terminal,
-        "terminal",
+        NicknameReconcileStop::Terminal,
         "discord_50013",
         "missing permissions",
         20_000,
@@ -3523,7 +3523,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .unwrap()
             .unwrap()
             .state,
-        "terminal",
+        NicknameReconcileState::Terminal,
         "a rejected settings request must not reset terminal nickname work"
     );
     cleanup_db(&tmp);

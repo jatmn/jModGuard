@@ -277,29 +277,76 @@ fn load(
     .optional()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldSupply {
+    Inherited,
+    Supplied,
+}
+
+impl FieldSupply {
+    fn from_flag(supplied: bool) -> Self {
+        if supplied {
+            Self::Supplied
+        } else {
+            Self::Inherited
+        }
+    }
+
+    fn is_supplied(self) -> bool {
+        self == Self::Supplied
+    }
+
+    fn accept(&mut self, present: bool) -> bool {
+        if present && *self == Self::Inherited {
+            *self = Self::Supplied;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotContinuity {
+    Continuous,
+    Gap,
+}
+
+impl MessageSnapshot {
+    fn continuity_at(&self, epoch: u64) -> SnapshotContinuity {
+        if self.continuous && self.coverage_epoch == epoch {
+            SnapshotContinuity::Continuous
+        } else {
+            SnapshotContinuity::Gap
+        }
+    }
+
+    fn reconcile_coverage(&mut self, epoch: u64) {
+        self.continuous = self.continuity_at(epoch) == SnapshotContinuity::Continuous;
+    }
+}
+
 fn merged(
     old: &SnapshotFields,
     incoming: SnapshotFields,
-    mut content_supplied: bool,
-    mut attachments_supplied: bool,
+    mut content_supplied: FieldSupply,
+    mut attachments_supplied: FieldSupply,
     equal_version: bool,
-) -> (SnapshotFields, bool, bool) {
+) -> (SnapshotFields, FieldSupply, FieldSupply) {
     let mut fields = old.clone();
     if !equal_version {
-        content_supplied = false;
-        attachments_supplied = false;
+        content_supplied = FieldSupply::Inherited;
+        attachments_supplied = FieldSupply::Inherited;
     }
-    if incoming.content.is_some() && !content_supplied {
+    if content_supplied.accept(incoming.content.is_some()) {
         fields.content = incoming.content;
         fields.content_truncated = incoming.content_truncated;
         fields.content_original_bytes = incoming.content_original_bytes;
-        content_supplied = true;
     }
-    if incoming.attachments.is_some() && !attachments_supplied {
+    if attachments_supplied.accept(incoming.attachments.is_some()) {
         fields.attachments = incoming.attachments;
         fields.attachments_truncated = incoming.attachments_truncated;
         fields.attachments_omitted = incoming.attachments_omitted;
-        attachments_supplied = true;
     }
     if incoming.author_id.is_some() && fields.author_id.is_none() {
         fields.author_id = incoming.author_id;
@@ -652,10 +699,10 @@ impl GuildDataStore {
                 if prior.edit_at_ms.is_some_and(|at| edit < at) { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Stale, before: None, after: Some(prior.clone()) }); }
             }
             let equal = old.as_ref().is_some_and(|prior| prior.edit_at_ms == Some(edit));
-            let inserted_content = observation.fields.content.is_some();
-            let inserted_attachments = observation.fields.attachments.is_some();
+            let inserted_content = FieldSupply::from_flag(observation.fields.content.is_some());
+            let inserted_attachments = FieldSupply::from_flag(observation.fields.attachments.is_some());
             let (fields, content_supplied, attachments_supplied) = match &old {
-                Some(prior) => merged(&prior.fields, observation.fields, prior.content_supplied, prior.attachments_supplied, equal),
+                Some(prior) => merged(&prior.fields, observation.fields, FieldSupply::from_flag(prior.content_supplied), FieldSupply::from_flag(prior.attachments_supplied), equal),
                 None => (observation.fields, inserted_content, inserted_attachments),
             };
             let mut bounded = fields;
@@ -670,8 +717,8 @@ impl GuildDataStore {
                 return Ok(SnapshotTransition { outcome: SnapshotOutcome::CapacityRefused, before: None, after: old });
             }
             tx.ensure_mutation_receipt()?;
-            let before = if equal { None } else { old.clone().map(|mut row| { row.continuous &= row.coverage_epoch == observation.coverage_epoch; row }) };
-            let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuous && r.coverage_epoch == observation.coverage_epoch), content_supplied, attachments_supplied };
+            let before = if equal { None } else { old.clone().map(|mut row| { row.reconcile_coverage(observation.coverage_epoch); row }) };
+            let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuity_at(observation.coverage_epoch) == SnapshotContinuity::Continuous), content_supplied: content_supplied.is_supplied(), attachments_supplied: attachments_supplied.is_supplied() };
             if old.is_some() { update(&tx, &scope, &row, bytes)?; } else { insert(&tx, &scope, &row, incoming_bytes)?; }
             tx.commit()?;
             Ok(SnapshotTransition { outcome: if equal { SnapshotOutcome::Duplicate } else { SnapshotOutcome::Stored }, before, after: Some(row) })
@@ -760,7 +807,7 @@ impl GuildDataStore {
             let out = ids.into_iter().map(|id| {
                 if !consumed.insert(id) { return None; }
                 found.get(&id).cloned().filter(|row| row.expires_at_ms > effective_now).map(|mut row| {
-                    row.continuous &= row.coverage_epoch == current_epoch;
+                    row.reconcile_coverage(current_epoch);
                     row
                 })
             }).collect();

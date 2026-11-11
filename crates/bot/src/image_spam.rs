@@ -58,12 +58,16 @@ pub(crate) struct OwnDelete {
     post: Post,
     proof_lifetime: Weak<()>,
     echoed: Arc<AtomicBool>,
-    succeeded: bool,
+    result: DeleteResult,
 }
 
 impl OwnDelete {
     pub(crate) fn finish(&mut self, succeeded: bool) {
-        self.succeeded = succeeded;
+        self.result = if succeeded {
+            DeleteResult::Succeeded
+        } else {
+            DeleteResult::Unconfirmed
+        };
     }
 }
 #[derive(Debug, PartialEq)]
@@ -72,6 +76,26 @@ struct ImageMatch {
     proving: Vec<Hash>,
     known_bad: bool,
 }
+/// Reservation kind and deadline remain independent. An expired Match slot
+/// does not establish a verified match; only CompleteOutcome supplies proof.
+#[derive(Clone, Copy)]
+enum WindowOwner {
+    Match,
+    IncompleteNotice,
+}
+
+impl WindowOwner {
+    fn is_incomplete(self) -> bool {
+        matches!(self, Self::IncompleteNotice)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeleteResult {
+    Unconfirmed,
+    Succeeded,
+}
+
 struct Bucket {
     retired_before: u64,
     window: Duration,
@@ -82,8 +106,8 @@ struct Bucket {
     posts: Vec<Post>,
     budget: Budget,
     reported_until: Instant,
-    /// `reported_until` was reserved because analysis was blocked, not because a hit was logged.
-    blocked_notice: bool,
+    /// Kind of the reservation bounded by `reported_until`.
+    notice: WindowOwner,
 }
 /// Replay/rate tombstone after posts are gone; does not occupy live author slots.
 struct Watermark {
@@ -93,7 +117,7 @@ struct Watermark {
     token: (u64, u64),
     budget: Budget,
     reported_until: Instant,
-    blocked_notice: bool,
+    notice: WindowOwner,
 }
 struct Guild {
     bytes: usize,
@@ -238,7 +262,7 @@ fn park_author(g: &mut Guild, authors: &mut usize, author: u64, max_watermarks: 
             token: b.token,
             budget: b.budget,
             reported_until: b.reported_until,
-            blocked_notice: b.blocked_notice,
+            notice: b.notice,
         },
     );
     while g.watermarks.len() > max_watermarks {
@@ -598,7 +622,7 @@ impl Detector {
                             && deleted
                                 .proof_lifetime
                                 .ptr_eq(&Arc::downgrade(proof_lifetime))
-                            && deleted.succeeded
+                            && deleted.result == DeleteResult::Succeeded
                             && deleted.echoed.load(Ordering::Acquire)
                     })
                     .map(|deleted| &deleted.post)
@@ -658,7 +682,7 @@ impl Detector {
             post: post.clone(),
             proof_lifetime: Arc::downgrade(&bucket.proof_lifetime),
             echoed: Arc::new(AtomicBool::new(false)),
-            succeeded: false,
+            result: DeleteResult::Unconfirmed,
         };
         post.own_delete = Arc::downgrade(&deleted.echoed);
         Some(deleted)
@@ -868,14 +892,14 @@ impl Detector {
                 .map(|w| w.budget.clone())
                 .unwrap_or_else(|| Budget::new(now)),
             reported_until: watermark.as_ref().map(|w| w.reported_until).unwrap_or(now),
-            blocked_notice: watermark
+            notice: watermark
                 .as_ref()
-                .map(|w| w.blocked_notice)
-                .unwrap_or(false),
+                .map(|w| w.notice)
+                .unwrap_or(WindowOwner::Match),
         });
         if b.token != token {
-            if b.blocked_notice {
-                b.blocked_notice = false;
+            if b.notice.is_incomplete() {
+                b.notice = WindowOwner::Match;
                 b.reported_until = now;
             }
             b.proof_lifetime = Arc::new(());
@@ -996,7 +1020,7 @@ impl Detector {
         }
         // A verified hit owns the window. A blocked-analysis notice does not, so an
         // in-flight job that later proves the same posts can still report the match.
-        if now < b.reported_until && !b.blocked_notice {
+        if now < b.reported_until && !b.notice.is_incomplete() {
             return CompleteOutcome::Dropped;
         }
         // Every participating observation must still be the same live post.
@@ -1031,15 +1055,15 @@ impl Detector {
         };
         match &report {
             Report::Verified(_) => {
-                b.blocked_notice = false;
+                b.notice = WindowOwner::Match;
                 b.reported_until = now + Duration::from_secs(policy.window_secs);
                 CompleteOutcome::Report(report)
             }
             Report::Unverified(gate) => {
-                if b.blocked_notice && now < b.reported_until {
+                if b.notice.is_incomplete() && now < b.reported_until {
                     return CompleteOutcome::Suppressed(gate.clone());
                 }
-                b.blocked_notice = true;
+                b.notice = WindowOwner::IncompleteNotice;
                 b.reported_until = now + Duration::from_secs(policy.window_secs);
                 CompleteOutcome::Report(report)
             }
@@ -1080,7 +1104,11 @@ impl Detector {
             token == reservation.token && blocked && until == reservation.until
         };
         if let Some(bucket) = guild_state.authors.get(&author) {
-            return same(bucket.token, bucket.blocked_notice, bucket.reported_until);
+            return same(
+                bucket.token,
+                bucket.notice.is_incomplete(),
+                bucket.reported_until,
+            );
         }
         guild_state
             .watermarks
@@ -1088,14 +1116,14 @@ impl Detector {
             .is_some_and(|watermark| {
                 same(
                     watermark.token,
-                    watermark.blocked_notice,
+                    watermark.notice.is_incomplete(),
                     watermark.reported_until,
                 )
             })
     }
 
     /// Give back an incomplete-notice reservation when delivery did not succeed.
-    /// A verified window does not carry `blocked_notice`, so it is left alone.
+    /// A match window has a different owner, so it is left alone.
     fn release_incomplete_notice(
         &self,
         guild: u64,
@@ -1111,8 +1139,12 @@ impl Detector {
             token == reservation.token && blocked && until == reservation.until
         };
         if let Some(bucket) = guild_state.authors.get_mut(&author) {
-            if same_reservation(bucket.token, bucket.blocked_notice, bucket.reported_until) {
-                bucket.blocked_notice = false;
+            if same_reservation(
+                bucket.token,
+                bucket.notice.is_incomplete(),
+                bucket.reported_until,
+            ) {
+                bucket.notice = WindowOwner::Match;
                 bucket.reported_until = now;
             }
             return;
@@ -1120,11 +1152,11 @@ impl Detector {
         if let Some(watermark) = guild_state.watermarks.get_mut(&author)
             && same_reservation(
                 watermark.token,
-                watermark.blocked_notice,
+                watermark.notice.is_incomplete(),
                 watermark.reported_until,
             )
         {
-            watermark.blocked_notice = false;
+            watermark.notice = WindowOwner::Match;
             watermark.reported_until = now;
         }
     }
@@ -1177,7 +1209,7 @@ fn candidate_job(
     policy: &Policy,
     now: Instant,
 ) -> Option<Job> {
-    if now < bucket.reported_until && !bucket.blocked_notice {
+    if now < bucket.reported_until && !bucket.notice.is_incomplete() {
         return None;
     }
     let posts: Vec<_> = bucket
@@ -1262,8 +1294,8 @@ fn replace_existing(
     g.bytes += old.cost;
     state.bytes += old.cost;
     // The edited post is a different observation. Drop only the incomplete reservation.
-    if b.blocked_notice {
-        b.blocked_notice = false;
+    if b.notice.is_incomplete() {
+        b.notice = WindowOwner::Match;
         b.reported_until = now;
     }
     b.token = token;
@@ -3175,7 +3207,7 @@ mod tests {
             d.complete(pending, &p, true, transport_gate(), now),
             CompleteOutcome::Report(Report::Unverified(_))
         ));
-        assert!(d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         let mut next = post(20, 120, now, &[1, 2]);
         next.revision = d.revision();
         assert!(matches!(
@@ -3185,7 +3217,7 @@ mod tests {
         {
             let state = d.state.lock();
             let bucket = &state.guilds[&1].authors[&2];
-            assert!(!bucket.blocked_notice);
+            assert!(!bucket.notice.is_incomplete());
             assert!(bucket.reported_until <= now);
         }
 
@@ -3200,7 +3232,11 @@ mod tests {
             CompleteOutcome::Report(Report::Unverified(_))
         ));
         parked.invalidate_author(1, 2);
-        assert!(parked.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            parked.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         let mut restore = post(21, 121, now, &[1, 2]);
         restore.revision = parked.revision();
         assert!(matches!(
@@ -3210,7 +3246,7 @@ mod tests {
         {
             let state = parked.state.lock();
             let parked_bucket = &state.guilds[&1].authors[&2];
-            assert!(!parked_bucket.blocked_notice);
+            assert!(!parked_bucket.notice.is_incomplete());
             assert!(parked_bucket.reported_until <= now);
         }
 
@@ -3259,7 +3295,7 @@ mod tests {
         {
             let state = d.state.lock();
             let bucket = &state.guilds[&1].authors[&2];
-            assert!(!bucket.blocked_notice);
+            assert!(!bucket.notice.is_incomplete());
             assert_eq!(bucket.reported_until, reported_until);
             assert!(now < reported_until);
         }
@@ -5102,7 +5138,7 @@ mod tests {
             d.complete(store, &policy(), false, transport_gate(), now),
             CompleteOutcome::Dropped
         );
-        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         let failed_job = Job {
             burst_ids: Vec::new(),
             guild: 1,
@@ -5131,7 +5167,7 @@ mod tests {
             (
                 bucket.posts[0].hashes.clone(),
                 bucket.posts[1].hashes.clone(),
-                bucket.blocked_notice,
+                bucket.notice.is_incomplete(),
             )
         };
         assert_eq!(first_hashes.as_ref(), Some(&stored));
@@ -5362,14 +5398,18 @@ mod tests {
             CompleteOutcome::Report(Report::Unverified(_))
         ));
         d.invalidate_author(1, 2);
-        assert!(d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            d.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         let mut p = post(20, 120, now, &[1, 2]);
         p.revision = d.revision();
         assert!(matches!(
             d.admit(1, 2, p, (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted | AdmitOutcome::Matched(_)
         ));
-        assert!(d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
     }
 
     struct LoopbackFixture {
@@ -7031,7 +7071,11 @@ mod tests {
         ));
         let until = d.state.lock().guilds[&1].authors[&2].reported_until;
         d.invalidate_author(1, 2);
-        assert!(d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            d.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         assert_eq!(
             d.state.lock().guilds[&1].watermarks[&2].reported_until,
             until
@@ -7092,14 +7136,18 @@ mod tests {
         let d = Detector::new(Limits::default()).unwrap();
         let window = complete_verified_window(&d, now);
         d.invalidate_author(1, 2);
-        assert!(!d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            !d.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         let mut p = post(20, 120, now, &[1, 2]);
         p.revision = d.revision();
         assert!(matches!(
             d.admit(1, 2, p, (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted
         ));
-        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         assert!(admit(&d, 21, 121, now).is_none());
         finish_verified_report_window(
             &d,
@@ -7320,7 +7368,7 @@ mod tests {
             d.complete(stale, &policy, true, transport_gate(), now),
             CompleteOutcome::NoMatch
         );
-        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         assert_eq!(
             d.state.lock().guilds[&1].authors[&2]
                 .posts
@@ -7391,7 +7439,7 @@ mod tests {
             CompleteOutcome::Report(Report::Unverified(_))
         ));
         let bucket = &d.state.lock().guilds[&1].authors[&2];
-        assert!(bucket.blocked_notice);
+        assert!(bucket.notice.is_incomplete());
         assert_eq!(bucket.posts[0].hashes, kept);
         assert!(bucket.posts[2].hashes.is_none());
     }
@@ -7404,7 +7452,7 @@ mod tests {
         let until = d.state.lock().guilds[&1].authors[&2].reported_until;
         d.release_incomplete_notice(1, 2, window, now + Duration::from_secs(1));
         assert_eq!(d.state.lock().guilds[&1].authors[&2].reported_until, until);
-        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
     }
 
     #[test]
@@ -7430,11 +7478,19 @@ mod tests {
             until: until + Duration::from_secs(1),
         };
         d.release_incomplete_notice(1, 2, wrong, now);
-        assert!(d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         d.invalidate_author(1, 2);
-        assert!(d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            d.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         d.release_incomplete_notice(1, 2, reservation, now + Duration::from_secs(1));
-        assert!(!d.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            !d.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
         let mut restored = post(20, 120, now, &[1, 2]);
         restored.revision = d.revision();
         let _ = d.admit(
@@ -7446,7 +7502,7 @@ mod tests {
             now + Duration::from_secs(1),
             false,
         );
-        assert!(!d.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
     }
 
     fn budget_miss_limits() -> Limits {
@@ -7476,7 +7532,9 @@ mod tests {
         let permit = app.image_spam.try_acquire_job_slot();
         run_job(&app, &ctx, first, policy.clone(), 102, permit).await;
         assert!(
-            !app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice,
+            !app.image_spam.state.lock().guilds[&1].authors[&2]
+                .notice
+                .is_incomplete(),
             "a notice that was not sent must not suppress the window"
         );
         let mut second =
@@ -7495,7 +7553,11 @@ mod tests {
         let notices = capture.lock().unwrap().clone();
         assert_eq!(notices.len(), 1, "the later incomplete check must emit");
         assert_incomplete_automod(&notices[0], "Stopped at the author request budget");
-        assert!(app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(
+            app.image_spam.state.lock().guilds[&1].authors[&2]
+                .notice
+                .is_incomplete()
+        );
         let mut third =
             admit_channel_with_token(&app.image_spam, 14, 104, Instant::now(), token, &policy)
                 .expect("delivered window still starts a job");
@@ -7548,7 +7610,11 @@ mod tests {
             missed.lock().unwrap().is_empty(),
             "an unconfigured automod channel must not count as sent"
         );
-        assert!(!app.image_spam.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(
+            !app.image_spam.state.lock().guilds[&1].authors[&2]
+                .notice
+                .is_incomplete()
+        );
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
@@ -7754,13 +7820,15 @@ mod tests {
         pause.release();
         incomplete_handle.await.unwrap();
         assert!(
-            app.image_spam.state.lock().guilds[&1].authors[&3].blocked_notice,
+            app.image_spam.state.lock().guilds[&1].authors[&3]
+                .notice
+                .is_incomplete(),
             "another author's incomplete reservation must stay reserved"
         );
         {
             let state = app.image_spam.state.lock();
             let bucket = &state.guilds[&1].authors[&2];
-            assert!(!bucket.blocked_notice);
+            assert!(!bucket.notice.is_incomplete());
             assert!(now < bucket.reported_until);
         }
         let notices = capture.lock().unwrap().clone();
@@ -7801,7 +7869,7 @@ mod tests {
         seed_incomplete_notice(&app.image_spam, 2, token, now);
         let reservation = {
             let bucket = &app.image_spam.state.lock().guilds[&1].authors[&2];
-            assert!(bucket.blocked_notice);
+            assert!(bucket.notice.is_incomplete());
             ReportWindow {
                 token: bucket.token,
                 until: bucket.reported_until,
@@ -7818,7 +7886,7 @@ mod tests {
         ));
         {
             let bucket = &app.image_spam.state.lock().guilds[&1].authors[&2];
-            assert!(!bucket.blocked_notice);
+            assert!(!bucket.notice.is_incomplete());
             assert!(bucket.reported_until <= now);
         }
         assert!(!app.image_spam.incomplete_notice_current(1, 2, reservation));
@@ -7840,7 +7908,11 @@ mod tests {
         let verified = Detector::new(Limits::default()).unwrap();
         let window = complete_verified_window(&verified, now);
         let until = verified.state.lock().guilds[&1].authors[&2].reported_until;
-        assert!(!verified.state.lock().guilds[&1].authors[&2].blocked_notice);
+        assert!(
+            !verified.state.lock().guilds[&1].authors[&2]
+                .notice
+                .is_incomplete()
+        );
         assert_eq!(until, window.until);
         let mut replacement = post(10, 100, now, &[9]);
         replacement.revision = verified.revision();
@@ -7850,7 +7922,7 @@ mod tests {
             AdmitOutcome::Admitted
         ));
         let bucket = &verified.state.lock().guilds[&1].authors[&2];
-        assert!(!bucket.blocked_notice);
+        assert!(!bucket.notice.is_incomplete());
         assert_eq!(bucket.reported_until, until);
     }
 
@@ -7872,7 +7944,7 @@ mod tests {
             let state = app.image_spam.state.lock();
             assert!(!state.guilds[&1].authors.contains_key(&2));
             let watermark = &state.guilds[&1].watermarks[&2];
-            assert!(watermark.blocked_notice);
+            assert!(watermark.notice.is_incomplete());
             assert_eq!(watermark.token, reservation.token);
             assert_eq!(watermark.reported_until, reservation.until);
         }
@@ -7891,7 +7963,11 @@ mod tests {
             crate::logging::Delivery::Sent
         );
         assert_eq!(sink.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(app.image_spam.state.lock().guilds[&1].watermarks[&2].blocked_notice);
+        assert!(
+            app.image_spam.state.lock().guilds[&1].watermarks[&2]
+                .notice
+                .is_incomplete()
+        );
     }
     #[tokio::test]
     async fn late_create_after_delete_is_not_admitted() {

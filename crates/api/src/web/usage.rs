@@ -41,8 +41,38 @@ impl Default for UsageCache {
 
 #[derive(Default)]
 pub struct CacheState {
-    overview: Option<(Instant, Value)>,
-    detail: HashMap<String, (Instant, Value)>,
+    overview: Option<UsageSnapshot>,
+    detail: HashMap<String, UsageSnapshot>,
+}
+
+struct UsageSnapshot {
+    cached_at: Instant,
+    value: Value,
+}
+
+enum CachedUsage<'a> {
+    Missing,
+    Fresh(&'a Value),
+    Expired,
+}
+
+impl UsageSnapshot {
+    fn new(value: Value) -> Self {
+        Self {
+            cached_at: Instant::now(),
+            value,
+        }
+    }
+
+    // Cache age is separate from measurement quality: a newly cached fallback
+    // still contains stale/unavailable measurements and never grants capacity.
+    fn lookup(sample: Option<&Self>, ttl: Duration) -> CachedUsage<'_> {
+        match sample {
+            None => CachedUsage::Missing,
+            Some(sample) if sample.cached_at.elapsed() < ttl => CachedUsage::Fresh(&sample.value),
+            Some(_) => CachedUsage::Expired,
+        }
+    }
 }
 
 fn error(status: StatusCode, message: &'static str) -> (StatusCode, Json<Value>) {
@@ -440,8 +470,8 @@ pub async fn overview(
     authorize(&app, &session, &headers).await?;
     {
         let cache = app.usage_cache.state.lock().await;
-        if let Some((at, value)) = &cache.overview
-            && at.elapsed() < OVERVIEW_TTL
+        if let CachedUsage::Fresh(value) =
+            UsageSnapshot::lookup(cache.overview.as_ref(), OVERVIEW_TTL)
         {
             return Ok(Json(value.clone()));
         }
@@ -454,8 +484,8 @@ pub async fn overview(
     .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "database overview busy"))?;
     {
         let cache = app.usage_cache.state.lock().await;
-        if let Some((at, value)) = &cache.overview
-            && at.elapsed() < OVERVIEW_TTL
+        if let CachedUsage::Fresh(value) =
+            UsageSnapshot::lookup(cache.overview.as_ref(), OVERVIEW_TTL)
         {
             return Ok(Json(value.clone()));
         }
@@ -464,8 +494,8 @@ pub async fn overview(
         Ok(rows) => rows,
         Err(()) => {
             let mut cache = app.usage_cache.state.lock().await;
-            let fallback = cache.overview.as_ref().map(|(_, value)| {
-                let mut value = value.clone();
+            let fallback = cache.overview.as_ref().map(|sample| {
+                let mut value = sample.value.clone();
                 if let Some(rows) = value["databases"].as_array_mut() {
                     for row in rows {
                         *row = stale(row.clone());
@@ -475,7 +505,7 @@ pub async fn overview(
                 value
             });
             if let Some(value) = fallback {
-                cache.overview = Some((Instant::now(), value.clone()));
+                cache.overview = Some(UsageSnapshot::new(value.clone()));
                 return Ok(Json(value));
             }
             drop(cache);
@@ -487,12 +517,12 @@ pub async fn overview(
         }
     };
     let mut cache = app.usage_cache.state.lock().await;
-    if let Some((_, previous)) = &cache.overview {
-        preserve_failed_samples(&mut databases, previous);
+    if let Some(previous) = &cache.overview {
+        preserve_failed_samples(&mut databases, &previous.value);
     }
     let response = json!({"databases":databases,"catalog_status":"available",
         "generated_at":chrono::Utc::now().timestamp()});
-    cache.overview = Some((Instant::now(), response.clone()));
+    cache.overview = Some(UsageSnapshot::new(response.clone()));
     Ok(Json(response))
 }
 
@@ -513,8 +543,7 @@ pub async fn detail(
     }
     {
         let cache = app.usage_cache.state.lock().await;
-        if let Some((at, value)) = cache.detail.get(&id)
-            && at.elapsed() < DETAIL_TTL
+        if let CachedUsage::Fresh(value) = UsageSnapshot::lookup(cache.detail.get(&id), DETAIL_TTL)
         {
             return Ok(Json(value.clone()));
         }
@@ -535,8 +564,7 @@ pub async fn detail(
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "database detail busy"))?;
     {
         let cache = app.usage_cache.state.lock().await;
-        if let Some((at, value)) = cache.detail.get(&id)
-            && at.elapsed() < DETAIL_TTL
+        if let CachedUsage::Fresh(value) = UsageSnapshot::lookup(cache.detail.get(&id), DETAIL_TTL)
         {
             return Ok(Json(value.clone()));
         }
@@ -545,9 +573,9 @@ pub async fn detail(
         Ok(rows) => rows,
         Err(()) => {
             let mut cache = app.usage_cache.state.lock().await;
-            if let Some((_, previous)) = cache.detail.get(&id) {
-                let value = stale(previous.clone());
-                cache.detail.insert(id, (Instant::now(), value.clone()));
+            if let Some(previous) = cache.detail.get(&id) {
+                let value = stale(previous.value.clone());
+                cache.detail.insert(id, UsageSnapshot::new(value.clone()));
                 return Ok(Json(value));
             }
             return Err(error(
@@ -564,7 +592,7 @@ pub async fn detail(
         cache
             .detail
             .get(&id)
-            .map(|(_, value)| stale(value.clone()))
+            .map(|sample| stale(sample.value.clone()))
             .unwrap_or(response)
     } else {
         response
@@ -572,7 +600,9 @@ pub async fn detail(
     if cache.detail.len() >= 128 {
         cache.detail.clear();
     }
-    cache.detail.insert(id, (Instant::now(), response.clone()));
+    cache
+        .detail
+        .insert(id, UsageSnapshot::new(response.clone()));
     Ok(Json(response))
 }
 
@@ -684,7 +714,7 @@ mod tests {
     async fn authorization_runs_before_cached_owner_data() {
         let (app, path) = fixture();
         app.usage_cache.state.lock().await.overview =
-            Some((Instant::now(), json!({"secret":"owner-data"})));
+            Some(UsageSnapshot::new(json!({"secret":"owner-data"})));
         let session = signed_in(&app, 42).await;
         let mut headers = HeaderMap::new();
         let origin = reqwest::Url::parse(&app.cfg.web.base_url)
@@ -781,7 +811,7 @@ mod tests {
             .await
             .unwrap();
         app.usage_cache.state.lock().await.overview =
-            Some((Instant::now(), json!({"databases":[{"id":"core"}]})));
+            Some(UsageSnapshot::new(json!({"databases":[{"id":"core"}]})));
         let session = signed_in(&app, 99).await;
         let mut headers = HeaderMap::new();
         let origin = reqwest::Url::parse(&app.cfg.web.base_url)

@@ -82,8 +82,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
         return;
     }
     let link = ready.link.clone();
-    let audit_token = ready.audit_token;
-    let application_token = ready.application_token;
+    let origin = ready.origin;
     let entry_id = ready.entry_id;
     match app
         .tenant
@@ -98,7 +97,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
         .await
     {
         Ok(Some(_)) => {
-            app.finalize_pending_audit_link(audit_token, application_token);
+            app.finalize_pending_audit_link(origin);
             app.clear_deferred_audit_link(&link.case_id, entry_id);
         }
         Ok(None) => {
@@ -118,7 +117,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
                 "selected discord audit not linked: {error:#}"
             );
             if durable_audit_link_conflict(&error) {
-                app.finalize_pending_audit_link(audit_token, application_token);
+                app.finalize_pending_audit_link(origin);
                 app.clear_deferred_audit_link(&link.case_id, entry_id);
             } else {
                 tracing::warn!(
@@ -241,10 +240,16 @@ pub async fn record_application(
     Some(case_id)
 }
 
+#[derive(Clone)]
+enum AttemptRecord {
+    Unconfirmed,
+    Confirmed(db::guild_data::CaseId),
+}
+
 /// One dispatch, shared with the ban marker. The payload is fixed here so a
 /// late insert and the post-ban record compare as the same source key.
 pub(crate) struct ApplicationAttempt {
-    pub case_id: Option<db::guild_data::CaseId>,
+    record: AttemptRecord,
     data: CaseData,
     enrollment: db::GuildEnrollment,
 }
@@ -262,9 +267,11 @@ impl ApplicationAttempt {
         if !app.activation.may_record() {
             return None;
         }
-        let id = match self.case_id.clone() {
-            Some(id) => id,
-            None => record_data(&app.tenant, self.enrollment.clone(), self.data.clone()).await?,
+        let id = match self.record {
+            AttemptRecord::Confirmed(id) => id,
+            AttemptRecord::Unconfirmed => {
+                record_data(&app.tenant, self.enrollment.clone(), self.data.clone()).await?
+            }
         };
         if settle_application_attempt(
             app,
@@ -329,7 +336,7 @@ pub(crate) async fn begin_application_attempt(
         }
     };
     Some(ApplicationAttempt {
-        case_id,
+        record: case_id.map_or(AttemptRecord::Unconfirmed, AttemptRecord::Confirmed),
         data,
         enrollment,
     })
@@ -1176,8 +1183,10 @@ mod tests {
         )
         .await
         .unwrap()
-        .case_id
-        .unwrap();
+        .record;
+        let super::AttemptRecord::Confirmed(case_id) = case_id else {
+            panic!("attempt was not recorded")
+        };
         let settled = settle_application_attempt(
             &app,
             Some(enrollment.clone()),
@@ -1217,8 +1226,10 @@ mod tests {
         )
         .await
         .unwrap()
-        .case_id
-        .unwrap();
+        .record;
+        let super::AttemptRecord::Confirmed(case_id) = case_id else {
+            panic!("attempt was not recorded")
+        };
         let settled = settle_application_attempt(
             &app,
             Some(enrollment.clone()),
@@ -1265,7 +1276,9 @@ mod tests {
         .await
         .unwrap();
         let discord_reason = super::ban_dispatch_reason("raid", Some(&attempt));
-        let case_id = attempt.case_id.unwrap();
+        let super::AttemptRecord::Confirmed(case_id) = attempt.record else {
+            panic!("attempt was not recorded")
+        };
         claim(
             &successor,
             jmodguard::control::now_ms().saturating_add(21_000),
@@ -1340,7 +1353,9 @@ mod tests {
         .await
         .unwrap();
         let discord_reason = super::ban_dispatch_reason("spam wave", Some(&attempt));
-        let case_id = attempt.case_id.unwrap();
+        let super::AttemptRecord::Confirmed(case_id) = attempt.record else {
+            panic!("attempt was not recorded")
+        };
         claim(
             &successor,
             jmodguard::control::now_ms().saturating_add(21_000),
@@ -1599,7 +1614,7 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(1_400),
             "the ban deadline must not wait for the stalled case insert"
         );
-        assert!(attempt.case_id.is_none());
+        assert!(matches!(attempt.record, super::AttemptRecord::Unconfirmed));
         db::guild_data::set_case_record_stall(None);
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         attempt.finish(&app, CaseOutcome::Succeeded).await.unwrap();

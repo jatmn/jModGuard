@@ -33,8 +33,64 @@ pub struct AutomodEngine {
 struct RuleState {
     events: VecDeque<WindowEvent>,
     strikes: u32,
-    fired: HashSet<u32>,
+    fired: ThresholdReservations,
     last_event: Option<Instant>,
+}
+
+/// Reservation is independent of whether the selected Discord action runs.
+#[derive(Default)]
+struct ThresholdReservations(HashSet<u32>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThresholdState {
+    Available,
+    Reserved,
+}
+
+impl ThresholdReservations {
+    fn state(&self, threshold: u32) -> ThresholdState {
+        if self.0.contains(&threshold) {
+            ThresholdState::Reserved
+        } else {
+            ThresholdState::Available
+        }
+    }
+
+    fn reserve(&mut self, threshold: u32) {
+        self.0.insert(threshold);
+    }
+
+    fn release(&mut self, threshold: u32) {
+        self.0.remove(&threshold);
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum RuleRetention {
+    Retained,
+    Expired,
+}
+
+impl RuleState {
+    fn observe(&mut self, now: Instant) -> u32 {
+        self.strikes += 1;
+        self.last_event = Some(now);
+        self.events.push_back(WindowEvent { at: now });
+        self.strikes
+    }
+
+    fn prune(&mut self, now: Instant, keep: Duration) -> RuleRetention {
+        self.events.retain(|e| now.duration_since(e.at) < keep);
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < keep)
+            || !self.events.is_empty()
+        {
+            RuleRetention::Retained
+        } else {
+            RuleRetention::Expired
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -117,7 +173,7 @@ impl AutomodEngine {
             return;
         };
         if let Some(state) = bucket.get_mut(rule_id) {
-            state.fired.remove(&at);
+            state.fired.release(at);
         }
     }
 
@@ -126,13 +182,7 @@ impl AutomodEngine {
         let now = Instant::now();
         let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
         self.state.retain(|_, rules| {
-            rules.retain(|_, s| {
-                s.events.retain(|e| now.duration_since(e.at) < keep);
-                s.last_event
-                    .map(|t| now.duration_since(t) < keep)
-                    .unwrap_or(false)
-                    || !s.events.is_empty()
-            });
+            rules.retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
             !rules.is_empty()
         });
         self.member_joins
@@ -226,16 +276,12 @@ impl AutomodEngine {
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
             let state = bucket.entry(rule_id).or_default();
-            state.strikes += 1;
-            state.last_event = Some(now);
-            state.events.push_back(WindowEvent { at: now });
-
-            let strikes = state.strikes;
+            let strikes = state.observe(now);
             let fire = rule
                 .action_for_strike(strikes)
-                .filter(|a| !state.fired.contains(&a.at));
+                .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
             let Some(action) = fire else { continue };
-            state.fired.insert(action.at);
+            state.fired.reserve(action.at);
 
             let pending = PendingAction {
                 rule_id: rule_id.to_string(),

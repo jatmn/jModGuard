@@ -90,6 +90,46 @@ pub enum CaseOutcome {
     Uncertain,
 }
 
+/// Payload removal is terminal even while source replay identities remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CasePayloadState {
+    Live,
+    Removed,
+}
+
+impl CasePayloadState {
+    pub(super) fn from_deleted(deleted: bool) -> Self {
+        if deleted { Self::Removed } else { Self::Live }
+    }
+}
+
+/// Only these outcomes can cross the Attempted -> final settlement boundary.
+#[derive(Clone, Copy)]
+enum FinalCaseOutcome {
+    Succeeded,
+    Failed,
+    Uncertain,
+}
+
+impl FinalCaseOutcome {
+    fn from_outcome(outcome: &CaseOutcome) -> Result<Self> {
+        match outcome {
+            CaseOutcome::Succeeded => Ok(Self::Succeeded),
+            CaseOutcome::Failed => Ok(Self::Failed),
+            CaseOutcome::Uncertain => Ok(Self::Uncertain),
+            CaseOutcome::Attempted => Err(CaseError::Invalid.into()),
+        }
+    }
+
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
 /// Selected excerpt, not a chat archive. Guild/membership ownership comes from the case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -293,9 +333,12 @@ impl GuildDataStore {
                 let (found, key, deleted, equal) = row?;
                 anyhow::ensure!(existing.is_none() && matched.as_ref().is_some_and(|m| m.id.as_str()==found), CaseError::Conflict);
                 let found = CaseId::try_from(found)?;
-                existing = Some(if deleted { RecordCase::Removed(found) } else {
-                    anyhow::ensure!(key==source && equal==Some(true), CaseError::Conflict);
-                    RecordCase::Existing(found)
+                existing = Some(match CasePayloadState::from_deleted(deleted) {
+                    CasePayloadState::Removed => RecordCase::Removed(found),
+                    CasePayloadState::Live => {
+                        anyhow::ensure!(key==source && equal==Some(true), CaseError::Conflict);
+                        RecordCase::Existing(found)
+                    }
                 });
             }
             drop(stmt);
@@ -535,8 +578,11 @@ impl GuildDataStore {
                 return Err(error);
             }
             verify_scope(&tx, &expected, &scope, true)?;
-            let present = tx.query_row("SELECT deleted=0 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(r.get::<bool>(0)?)).optional()?.unwrap_or(false);
-            if !present { tx.finish_read()?; return Ok(false); }
+            let state = tx.query_row("SELECT deleted=0 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(CasePayloadState::from_deleted(!r.get::<bool>(0)?))).optional()?;
+            match state {
+                Some(CasePayloadState::Live) => {},
+                None | Some(CasePayloadState::Removed) => { tx.finish_read()?; return Ok(false); }
+            }
             tx.ensure_mutation_receipt()?;
             tx.execute_rows("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], 1)?;
             tx.commit()?;
@@ -579,7 +625,7 @@ impl GuildDataStore {
     ) -> Result<Option<CaseData>> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
-        let outcome_sql = outcome_sql(&outcome)?;
+        let final_outcome = FinalCaseOutcome::from_outcome(&outcome)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_write()?;
@@ -594,16 +640,19 @@ impl GuildDataStore {
                 return Ok(None);
             };
             let current: CaseData = serde_json::from_str(&payload)?;
-            if current.outcome != CaseOutcome::Attempted {
-                tx.finish_read()?;
-                return Ok(None);
+            match current.outcome {
+                CaseOutcome::Attempted => {},
+                CaseOutcome::Succeeded | CaseOutcome::Failed | CaseOutcome::Uncertain => {
+                    tx.finish_read()?;
+                    return Ok(None);
+                }
             }
             tx.ensure_mutation_receipt()?;
             tx.execute_rows(
                 "UPDATE guild_cases SET payload=json_set(payload, '$.outcome', ?4)
                  WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0
                    AND json_extract(payload, '$.outcome')='attempted'",
-                params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str(), outcome_sql],
+                params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str(), final_outcome.as_sql()],
                 1,
             )?;
             let updated: Option<String> = tx.query_row(
@@ -670,15 +719,15 @@ impl GuildDataStore {
                         .collect::<Result<Vec<_>>>()?;
                     drop(stmt);
                     tx.finish_read()?;
-                    if ids.len() == 1 {
-                        Ok(Some(CaseId::try_from(ids[0].clone())?))
-                    } else {
-                        Ok(None)
-                    }
+                    Ok(match ids.as_slice() {
+                        [] => TaggedBanMatch::Missing,
+                        [id] => TaggedBanMatch::Unique(CaseId::try_from(id.clone())?),
+                        _ => TaggedBanMatch::Ambiguous,
+                    })
                 }
             })
             .await?;
-        let Some(id) = chosen else {
+        let TaggedBanMatch::Unique(id) = chosen else {
             return Ok(Vec::new());
         };
         let mut settled = Vec::new();
@@ -690,6 +739,12 @@ impl GuildDataStore {
         }
         Ok(settled)
     }
+}
+
+enum TaggedBanMatch {
+    Missing,
+    Unique(CaseId),
+    Ambiguous,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -711,13 +766,4 @@ fn stall_case_source(source: &str) -> bool {
         .ok()
         .and_then(|guard| guard.clone())
         .is_some_and(|stalled| stalled == source)
-}
-
-fn outcome_sql(outcome: &CaseOutcome) -> Result<&'static str> {
-    match outcome {
-        CaseOutcome::Succeeded => Ok("succeeded"),
-        CaseOutcome::Failed => Ok("failed"),
-        CaseOutcome::Uncertain => Ok("uncertain"),
-        CaseOutcome::Attempted => Err(CaseError::Invalid.into()),
-    }
 }

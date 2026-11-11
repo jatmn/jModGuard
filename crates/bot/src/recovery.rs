@@ -90,6 +90,59 @@ pub async fn pending(db: &Db) -> Result<Vec<String>> {
     Ok(split_pending(raw.as_deref()))
 }
 
+enum PendingRecovery {
+    Complete,
+    Queued(Vec<String>),
+}
+
+impl PendingRecovery {
+    fn from_storage(raw: Option<&str>) -> Self {
+        let steps = split_pending(raw);
+        if steps.is_empty() {
+            Self::Complete
+        } else {
+            Self::Queued(steps)
+        }
+    }
+
+    fn acknowledge(&mut self, step: &str) -> bool {
+        let Self::Queued(steps) = self else {
+            return false;
+        };
+        if steps.first().is_none_or(|next| next != step) {
+            return false;
+        }
+        steps.remove(0);
+        if steps.is_empty() {
+            *self = Self::Complete;
+        }
+        true
+    }
+
+    fn storage_value(&self) -> String {
+        match self {
+            Self::Complete => String::new(),
+            Self::Queued(steps) => steps.join("\n"),
+        }
+    }
+}
+
+enum RecoveryRetry {
+    Ready,
+    Retrying(u32),
+}
+
+impl RecoveryRetry {
+    fn failed(&mut self) -> Duration {
+        let attempt = match self {
+            Self::Ready => 1,
+            Self::Retrying(attempt) => attempt.saturating_add(1),
+        };
+        *self = Self::Retrying(attempt);
+        backoff(attempt)
+    }
+}
+
 struct RecoveryFlagGuard<'a>(&'a Activation);
 
 impl Drop for RecoveryFlagGuard<'_> {
@@ -107,7 +160,7 @@ pub async fn run(db: &Db, activation: &Arc<Activation>) -> Result<()> {
         return Ok(());
     }
     activation.set_recovery_in_progress(true);
-    let mut attempt = 0_u32;
+    let mut retry = RecoveryRetry::Ready;
     loop {
         if !activation.may_record() {
             return Ok(());
@@ -115,9 +168,9 @@ pub async fn run(db: &Db, activation: &Arc<Activation>) -> Result<()> {
         let steps = match pending(db).await {
             Ok(steps) => steps,
             Err(error) => {
-                attempt = attempt.saturating_add(1);
+                let wait = retry.failed();
                 tracing::error!("maintenance recovery failed; retrying: {error:#}");
-                tokio::time::sleep(backoff(attempt)).await;
+                tokio::time::sleep(wait).await;
                 continue;
             }
         };
@@ -125,15 +178,15 @@ pub async fn run(db: &Db, activation: &Arc<Activation>) -> Result<()> {
             return Ok(());
         };
         match apply_step(db, &step).await {
-            Ok(()) => attempt = 0,
+            Ok(()) => retry = RecoveryRetry::Ready,
             Err(error) if lease_lost(&error) => {
                 tracing::error!("maintenance recovery lost the writer lease: {error:#}");
                 return Ok(());
             }
             Err(error) => {
-                attempt = attempt.saturating_add(1);
+                let wait = retry.failed();
                 tracing::error!("maintenance recovery failed; retrying: {error:#}");
-                tokio::time::sleep(backoff(attempt)).await;
+                tokio::time::sleep(wait).await;
             }
         }
     }
@@ -149,12 +202,11 @@ pub async fn apply_step(db: &Db, step: &str) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         let current = db::meta_string_conn(&tx, PENDING_KEY)?;
-        let mut steps = split_pending(current.as_deref());
-        if steps.first().is_some_and(|next| next == &step) {
-            steps.remove(0);
+        let mut pending = PendingRecovery::from_storage(current.as_deref());
+        if pending.acknowledge(&step) {
             let done_key = format!("maintenance_recovery_done_{step}");
             db::write_meta_string_conn(&tx, &done_key, "1")?;
-            db::write_meta_string_conn(&tx, PENDING_KEY, &steps.join("\n"))?;
+            db::write_meta_string_conn(&tx, PENDING_KEY, &pending.storage_value())?;
         }
         #[cfg(test)]
         if let Some(hook) = BEFORE_COMMIT

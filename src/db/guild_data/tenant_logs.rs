@@ -68,27 +68,68 @@ fn new_revision() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
-fn membership(conn: &impl SqlExecutor, guild: i64) -> Result<Option<(String, i64, bool, String)>> {
-    conn.query_row("SELECT enrollment_id,joined_at_ns,active,config_revision FROM guild_memberships WHERE guild_id=?1", params![guild], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MembershipState {
+    Active,
+    Closed,
 }
 
+pub(super) struct StoredMembership {
+    id: String,
+    joined_at_ns: i64,
+    pub(super) state: MembershipState,
+    revision: String,
+}
+
+pub(super) enum ScopeRequirement {
+    Active,
+    IncludingClosed,
+}
+
+fn membership(conn: &impl SqlExecutor, guild: i64) -> Result<Option<StoredMembership>> {
+    conn.query_row("SELECT enrollment_id,joined_at_ns,active,config_revision FROM guild_memberships WHERE guild_id=?1", params![guild], |r| Ok(StoredMembership {
+        id: r.get(0)?,
+        joined_at_ns: r.get(1)?,
+        state: if r.get::<bool>(2)? { MembershipState::Active } else { MembershipState::Closed },
+        revision: r.get(3)?,
+    })).optional()
+}
+
+pub(super) fn verify_membership(
+    conn: &impl SqlExecutor,
+    expected: &StoreRegistration,
+    scope: &GuildDataScope,
+    requirement: ScopeRequirement,
+) -> Result<StoredMembership> {
+    verify_bound_placement(conn, expected, &scope.placement)?;
+    let stored = membership(conn, scope.guild_id())?.ok_or(TenantDataError::Membership)?;
+    anyhow::ensure!(
+        stored.id == scope.enrollment.id
+            && stored.joined_at_ns == scope.enrollment.joined_at_ns
+            && match requirement {
+                ScopeRequirement::Active => stored.state == MembershipState::Active,
+                ScopeRequirement::IncludingClosed => true,
+            },
+        TenantDataError::Membership
+    );
+    anyhow::ensure!(valid_token(&stored.revision), TenantDataError::Revision);
+    Ok(stored)
+}
+
+// Compatibility adapter for data operations that require the existing tuple contract.
 pub(super) fn verify_scope(
     conn: &impl SqlExecutor,
     expected: &StoreRegistration,
     scope: &GuildDataScope,
     require_active: bool,
 ) -> Result<(bool, String)> {
-    verify_bound_placement(conn, expected, &scope.placement)?;
-    let (id, joined, active, revision) =
-        membership(conn, scope.guild_id())?.ok_or(TenantDataError::Membership)?;
-    anyhow::ensure!(
-        id == scope.enrollment.id
-            && joined == scope.enrollment.joined_at_ns
-            && (!require_active || active),
-        TenantDataError::Membership
-    );
-    anyhow::ensure!(valid_token(&revision), TenantDataError::Revision);
-    Ok((active, revision))
+    let requirement = if require_active {
+        ScopeRequirement::Active
+    } else {
+        ScopeRequirement::IncludingClosed
+    };
+    let stored = verify_membership(conn, expected, scope, requirement)?;
+    Ok((stored.state == MembershipState::Active, stored.revision))
 }
 
 impl GuildDataStore {
@@ -102,7 +143,7 @@ impl GuildDataStore {
             let mut tx = conn.transaction_primary_write()?;
             verify_bound_placement(&tx, &expected, &scope.placement)?;
             if membership(&tx, scope.guild_id())?.is_some() {
-                verify_scope(&tx, &expected, &scope, true)?;
+                verify_membership(&tx, &expected, &scope, ScopeRequirement::Active)?;
                 return tx.finish_read();
             }
             tx.ensure_mutation_receipt()?;
@@ -124,14 +165,14 @@ impl GuildDataStore {
                 verify_bound_placement(&tx, &expected, &placement)?;
                 let row = membership(&tx, placement.guild_id())?;
                 tx.finish_read()?;
-                Ok(row.map(|(id, joined_at_ns, active, _)| {
+                Ok(row.map(|stored| {
                     (
                         GuildEnrollment {
                             guild_id: placement.guild_id(),
-                            id,
-                            joined_at_ns,
+                            id: stored.id,
+                            joined_at_ns: stored.joined_at_ns,
                         },
-                        active,
+                        stored.state == MembershipState::Active,
                     )
                 }))
             })
@@ -148,8 +189,9 @@ impl GuildDataStore {
         self.db
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_write()?;
-                let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
-                if !active {
+                let stored =
+                    verify_membership(&tx, &expected, &scope, ScopeRequirement::IncludingClosed)?;
+                if stored.state == MembershipState::Closed {
                     return tx.finish_read();
                 }
                 tx.prepare_reclaim()?;
@@ -175,7 +217,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_primary_snapshot()?;
-            let (_, revision) = verify_scope(&tx, &expected, &scope, true)?;
+            let revision = verify_membership(&tx, &expected, &scope, ScopeRequirement::Active)?.revision;
             let mut stmt = tx.prepare("SELECT event_type,channel_id FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 ORDER BY event_type")?;
             let rows = stmt.query_map(params![scope.guild_id(), scope.enrollment.id.as_str()], |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?)))?;
             let mut channels = Vec::new();
@@ -208,7 +250,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_write()?;
-            let (_, current_revision) = verify_scope(&tx, &expected, &scope, true)?;
+            let current_revision = verify_membership(&tx, &expected, &scope, ScopeRequirement::Active)?.revision;
             anyhow::ensure!(revision == current_revision, TenantDataError::Revision);
             let current = tx.query_row("SELECT channel_id FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 AND event_type=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str()], |r| Ok(r.get::<i64>(0)?)).optional()?;
             if current == channel {

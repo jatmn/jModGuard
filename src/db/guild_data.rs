@@ -41,6 +41,7 @@ pub use case_history::*;
 mod cases;
 pub use cases::*;
 mod erasure;
+pub(crate) use erasure::ErasureProgress;
 mod snapshots;
 pub use snapshots::*;
 mod member_directory;
@@ -331,6 +332,33 @@ fn verify_identity_version(
     full
 }
 
+// Layout alone does not prove family or ownership; every path still verifies identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuildSchemaLayout {
+    Empty,
+    Older(i64),
+    Current,
+    Unsupported,
+}
+
+impl GuildSchemaLayout {
+    fn observed(version: i64, objects: i64) -> Self {
+        if version == 0 && objects == 0 {
+            Self::Empty
+        } else if (1..VERSION).contains(&version) {
+            Self::Older(version)
+        } else if version == VERSION {
+            Self::Current
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    fn needs_write(self, create: bool) -> bool {
+        create && matches!(self, Self::Empty | Self::Older(_))
+    }
+}
+
 fn initialize_store(
     conn: &mut Connection,
     expected: &StoreRegistration,
@@ -344,10 +372,9 @@ fn initialize_store(
             (),
             |r| Ok(r.get(0)?),
         )?;
-        let needs_write =
-            create && ((1..VERSION).contains(&version) || (version == 0 && objects == 0));
-        if !needs_write {
-            if !create && (1..VERSION).contains(&version) {
+        let layout = GuildSchemaLayout::observed(version, objects);
+        if !layout.needs_write(create) {
+            if !create && let GuildSchemaLayout::Older(version) = layout {
                 verify_identity_version(&tx, expected, version)?;
                 tx.finish_read()?;
                 return Err(SchemaNotReady(format!(
@@ -368,7 +395,8 @@ fn initialize_store(
         (),
         |r| Ok(r.get(0)?),
     )?;
-    if create && (1..VERSION).contains(&version) {
+    let layout = GuildSchemaLayout::observed(version, objects);
+    if create && let GuildSchemaLayout::Older(version) = layout {
         // Verify the old family and expected identity before extending it. No core migration.
         verify_identity_version(&tx, expected, version)?;
         tx.ensure_mutation_receipt()?;
@@ -425,7 +453,7 @@ fn initialize_store(
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
-    if !create || version != 0 || objects != 0 {
+    if !create || layout != GuildSchemaLayout::Empty {
         verify_identity(&tx, expected)?;
         tx.finish_read()?;
         return Ok(());

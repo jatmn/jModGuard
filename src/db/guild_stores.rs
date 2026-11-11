@@ -114,22 +114,42 @@ pub enum CatalogConflict {
 #[error("this server has an unresolved database write fence")]
 pub struct GuildWriteFenced;
 
-pub(super) fn guild_write_fenced(conn: &impl SqlExecutor, guild: i64) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuildWriteFence {
+    Clear,
+    Held,
+}
+
+impl GuildWriteFence {
+    pub(crate) fn from_presence(present: bool) -> Self {
+        if present { Self::Held } else { Self::Clear }
+    }
+
+    pub(crate) fn refuse_write(self) -> Result<()> {
+        match self {
+            Self::Clear => Ok(()),
+            Self::Held => Err(GuildWriteFenced.into()),
+        }
+    }
+}
+
+fn read_guild_write_fence(conn: &impl SqlExecutor, guild: i64) -> Result<GuildWriteFence> {
     if guild <= 0 {
-        return Ok(false);
+        return Ok(GuildWriteFence::Clear);
     }
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM guild_write_fences WHERE guild_id=?1)",
         params![guild],
-        |r| Ok(r.get::<i64>(0)? == 1),
+        |r| Ok(GuildWriteFence::from_presence(r.get::<i64>(0)? == 1)),
     )
 }
 
+pub(super) fn guild_write_fenced(conn: &impl SqlExecutor, guild: i64) -> Result<bool> {
+    Ok(read_guild_write_fence(conn, guild)? == GuildWriteFence::Held)
+}
+
 pub(super) fn refuse_fenced_write(conn: &impl SqlExecutor, guild: i64) -> Result<()> {
-    if guild_write_fenced(conn, guild)? {
-        return Err(GuildWriteFenced.into());
-    }
-    Ok(())
+    read_guild_write_fence(conn, guild)?.refuse_write()
 }
 
 pub async fn guild_is_write_fenced(db: &Db, guild: i64) -> Result<bool> {
@@ -281,6 +301,12 @@ pub async fn assign_initial_placement(
     .await
 }
 
+enum PlacementAdmission {
+    Current,
+    StaleEnrollment,
+    ErasurePending,
+}
+
 /// Runtime admission: retirement either precedes this check or observes the
 /// placement in its own primary transaction and admits the cleanup obligation.
 pub(crate) async fn admit_tenant_placement(
@@ -297,11 +323,22 @@ pub(crate) async fn admit_tenant_placement(
             params![enrollment.guild_id],
             |r| Ok(r.get(0)?),
         )?;
-        if current.as_ref() != Some(&enrollment) || queued {
-            tx.finish_read()?;
-            return Ok(None);
+        let admission = if current.as_ref() != Some(&enrollment) {
+            PlacementAdmission::StaleEnrollment
+        } else if queued {
+            PlacementAdmission::ErasurePending
+        } else {
+            PlacementAdmission::Current
+        };
+        match admission {
+            PlacementAdmission::Current => {
+                assign_initial_placement_transaction(tx, enrollment.guild_id, store_id).map(Some)
+            }
+            PlacementAdmission::StaleEnrollment | PlacementAdmission::ErasurePending => {
+                tx.finish_read()?;
+                Ok(None)
+            }
         }
-        assign_initial_placement_transaction(tx, enrollment.guild_id, store_id).map(Some)
     })
     .await
 }

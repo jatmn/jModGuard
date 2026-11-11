@@ -31,6 +31,43 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn nickname_status_keeps_its_wire_shape_in_both_read_paths() {
+    let f = Fixture::new();
+    enroll_guild(&f.db, 10, 100).await.unwrap();
+    let job = f.request(10, "desired").await;
+    mark_nickname_outcome_unknown(&f.db, &job, 1000)
+        .await
+        .unwrap();
+    for stored in ["pending", "dormant", "terminal", "unrecognized"] {
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE nickname_reconcile SET state=?1 WHERE guild_id=10",
+                params![stored],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let single = nickname_reconcile_status(&f.db, 10).await.unwrap().unwrap();
+        let bundled = load_web_config_snapshot(&f.db, 10)
+            .await
+            .unwrap()
+            .nickname_reconcile
+            .unwrap();
+        assert_eq!(single, bundled);
+        assert_eq!(single.confirmation(), NicknameConfirmation::Required);
+        let wire = serde_json::to_value(single).unwrap();
+        assert_eq!(wire["state"], stored);
+        assert_eq!(wire["last_error_code"], "outcome_unknown");
+        assert!(
+            wire.get("confirmation").is_none(),
+            "the internal confirmation state adds no wire field"
+        );
+    }
+}
+
+#[tokio::test]
 async fn new_join_never_adopts_old_work_and_late_receipts_cannot_touch_new_work() {
     for observed_departure in [false, true] {
         let f = Fixture::new();
@@ -53,9 +90,16 @@ async fn new_join_never_adopts_old_work_and_late_receipts_cannot_touch_new_work(
         schedule_nickname_reconcile_retry(&f.db, &old, 1000, "late", "late")
             .await
             .unwrap();
-        finish_nickname_reconcile(&f.db, &old, "terminal", "late", "late", 1000)
-            .await
-            .unwrap();
+        finish_nickname_reconcile(
+            &f.db,
+            &old,
+            NicknameReconcileStop::Terminal,
+            "late",
+            "late",
+            1000,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             pending_nickname_reconciles(&f.db, 0, 10).await.unwrap(),
             vec![new]
@@ -110,9 +154,16 @@ async fn modified_job_fields_and_stale_attempt_receipts_are_rejected() {
         schedule_nickname_reconcile_retry(&f.db, &forged, 1000, "forged", "forged")
             .await
             .unwrap();
-        finish_nickname_reconcile(&f.db, &forged, "terminal", "forged", "forged", 1000)
-            .await
-            .unwrap();
+        finish_nickname_reconcile(
+            &f.db,
+            &forged,
+            NicknameReconcileStop::Terminal,
+            "forged",
+            "forged",
+            1000,
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(
         pending_nickname_reconciles(&f.db, 0, 10).await.unwrap(),
@@ -179,9 +230,16 @@ async fn reconnect_resumes_same_enrollment_dormancy_without_resurrecting_old_att
     let f = Fixture::new();
     enroll_guild(&f.db, 10, 100).await.unwrap();
     let job = f.request(10, "name").await;
-    finish_nickname_reconcile(&f.db, &job, "dormant", "unknown_guild", "unavailable", 1000)
-        .await
-        .unwrap();
+    finish_nickname_reconcile(
+        &f.db,
+        &job,
+        NicknameReconcileStop::Dormant,
+        "unknown_guild",
+        "unavailable",
+        1000,
+    )
+    .await
+    .unwrap();
     enroll_guild(&f.db, 10, 100).await.unwrap();
     let resumed = pending_nickname_reconciles(&f.db, 0, 1)
         .await
@@ -227,9 +285,16 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
     })
     .await
     .unwrap();
-    finish_nickname_reconcile(&f.db, &job, "dormant", "unknown_guild", "unknown", 1)
-        .await
-        .unwrap();
+    finish_nickname_reconcile(
+        &f.db,
+        &job,
+        NicknameReconcileStop::Dormant,
+        "unknown_guild",
+        "unknown",
+        1,
+    )
+    .await
+    .unwrap();
     f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_nickname_write BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected write failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(enroll_guild(&f.db, 10, 100).await.is_err());
     assert_eq!(guild_enrollment(&f.db, 10).await.unwrap(), identity);
@@ -239,7 +304,7 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
             .unwrap()
             .unwrap()
             .state,
-        "dormant"
+        NicknameReconcileState::Dormant
     );
     f.db.with_conn(|conn| {
         conn.execute_batch_bounded("DROP TRIGGER reject_nickname_write", 64 * 1024 * 1024)
@@ -284,7 +349,7 @@ async fn version_eight_upgrade_does_not_bind_existing_nickname_to_active_members
                 .unwrap()
                 .unwrap()
                 .state,
-            "dormant"
+            NicknameReconcileState::Dormant
         );
     }
     assert!(

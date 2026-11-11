@@ -124,7 +124,7 @@ for event in guild_ban_addition guild_ban_removal; do
   [[ "$function" == *"gateway_ban_persistence::$receiver("* ]] \
     || fail "Gateway $event must delegate to its retained persistence owner"
   owner="$(extract_persistence "$receiver")"
-  for required in 'tokio::spawn(async move' "$case_guard" 'gateway_case(' 'save(&app.db, delivery).await?'; do
+  for required in 'tokio::spawn(async move' "$case_guard" 'gateway_case(' 'RetainedDelivery(delivery).save(&app.db).await?'; do
     [[ "$owner" == *"$required"* ]] \
       || fail "Gateway $event retained owner must suppress echoes and durably retain external cases: $required"
   done
@@ -151,7 +151,7 @@ extract_persistence receive_ban | awk '
   /let echo = echo\.resolve\(\);/ { resolved = NR }
   /let delivery = db::GatewayBanDelivery/ { payload = NR }
   /case:.*record_unresolved_gateway_observation/ { external_case = NR }
-  /let delivery = save\(/ { saved = NR }
+  /let delivery = RetainedDelivery\(delivery\)\.save\(/ { saved = NR }
   /\.await/ && !resolved { last_initial_await = NR }
   /\.await/ && resolved && !saved { intervening_await = 1 }
   END { exit !(last_initial_await && resolved && payload && external_case && saved && last_initial_await < resolved && resolved < payload && payload < external_case && external_case < saved && !intervening_await) }

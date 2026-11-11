@@ -4069,7 +4069,7 @@ async fn assert_refresh_session_kept(f: &Fixture) {
     );
     let state = refresh_state(f).await;
     let state = state.lock().await;
-    assert!(!state.dead);
+    assert!(!state.lifecycle.is_retired());
     assert_eq!(state.token.as_deref(), Some("fixture-token"));
     assert_eq!(state.refresh.as_deref(), Some("fixture-refresh"));
 }
@@ -4092,11 +4092,13 @@ fn clear_oauth_budget(f: &Fixture) {
 async fn expire_refresh_hold(f: &Fixture) {
     let state = refresh_state(f).await;
     let mut state = state.lock().await;
-    let (_, limited) = state.refresh_hold.unwrap();
-    state.refresh_hold = Some((
-        oauth::Cooldown::Until(std::time::Instant::now() - std::time::Duration::from_secs(1)),
-        limited,
-    ));
+    let hold = state.refresh_hold.unwrap();
+    state.refresh_hold = Some(RefreshHold {
+        deadline: oauth::Cooldown::Until(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ),
+        ..hold
+    });
 }
 
 #[tokio::test]
@@ -4296,7 +4298,7 @@ async fn refresh_invalid_grant_drops_session_and_next_request_calls_no_discord()
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), me_calls);
     let state = refresh_state(&f).await;
     let state = state.lock().await;
-    assert!(state.dead && state.token.is_none() && state.refresh.is_none());
+    assert!(state.lifecycle.is_retired() && state.token.is_none() && state.refresh.is_none());
     let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
     let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
     assert!(session.get::<u64>(SESSION_USER).await.unwrap().is_none());
@@ -4387,7 +4389,7 @@ fn allow_coordinator_sweep(app: &ApiState) {
 
 async fn assert_coordinator_payload_released(entry: &tokio::sync::Mutex<SessionAuth>) {
     let auth = entry.lock().await;
-    assert!(auth.dead);
+    assert!(auth.lifecycle.is_retired());
     assert!(auth.token.is_none());
     assert!(auth.refresh.is_none());
     assert!(auth.guilds.is_none());
@@ -4543,11 +4545,11 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     );
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), calls);
     let entry = refresh_state(&f).await;
-    entry.lock().await.dead_since = Some(
-        std::time::Instant::now()
+    entry.lock().await.lifecycle = SessionLifecycle::Retired {
+        since: std::time::Instant::now()
             .checked_sub(AUTH_SESSION_DEAD_TTL)
             .unwrap(),
-    );
+    };
     drop(entry);
     allow_coordinator_sweep(&f.app);
     f.app.sweep_auth_sessions(std::time::Instant::now());
@@ -4609,7 +4611,7 @@ async fn refresh_server_waits_are_capped_without_overflow() {
         assert_refresh_wait(&f, REFRESH_RETRY_MAX).await;
         let state = refresh_state(&f).await;
         assert!(matches!(
-            state.lock().await.refresh_hold.unwrap().0,
+            state.lock().await.refresh_hold.unwrap().deadline,
             oauth::Cooldown::Until(_)
         ));
         // Shared cooldowns outlive the session hold without retrying rejected
@@ -4816,11 +4818,11 @@ async fn retired_delayed_response_save_cannot_restore_authority() {
                 StatusCode::UNAUTHORIZED
             );
             let entry = refresh_state(&f).await;
-            entry.lock().await.dead_since = Some(
-                std::time::Instant::now()
+            entry.lock().await.lifecycle = SessionLifecycle::Retired {
+                since: std::time::Instant::now()
                     .checked_sub(AUTH_SESSION_DEAD_TTL)
                     .unwrap(),
-            );
+            };
             drop(entry);
             allow_coordinator_sweep(&f.app);
             f.app.sweep_auth_sessions(std::time::Instant::now());
@@ -5005,11 +5007,11 @@ async fn recovery_rejects_late_save(definitive_refusal: bool) {
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             assert_eq!(body["code"], "auth_lost");
             let entry = refresh_state(&f).await;
-            entry.lock().await.dead_since = Some(
-                std::time::Instant::now()
+            entry.lock().await.lifecycle = SessionLifecycle::Retired {
+                since: std::time::Instant::now()
                     .checked_sub(AUTH_SESSION_DEAD_TTL)
                     .unwrap(),
-            );
+            };
             drop(entry);
             allow_coordinator_sweep(&f.app);
             f.app.sweep_auth_sessions(std::time::Instant::now());

@@ -114,8 +114,13 @@ struct Observation {
 }
 
 #[derive(Default)]
-struct CpuRate {
-    previous: Option<(Duration, Instant)>,
+enum CpuRate {
+    #[default]
+    AwaitingBaseline,
+    Tracking {
+        usage: Duration,
+        at: Instant,
+    },
 }
 
 enum CpuStep {
@@ -126,24 +131,27 @@ enum CpuStep {
 
 impl CpuRate {
     fn reset(&mut self) {
-        self.previous = None;
+        *self = Self::AwaitingBaseline;
     }
 
     fn observe(&mut self, usage: Duration, at: Instant) -> CpuStep {
-        let Some((previous_usage, previous_at)) = self.previous else {
-            self.previous = Some((usage, at));
-            return CpuStep::Pending;
+        let (previous_usage, previous_at) = match *self {
+            Self::AwaitingBaseline => {
+                *self = Self::Tracking { usage, at };
+                return CpuStep::Pending;
+            }
+            Self::Tracking { usage, at } => (usage, at),
         };
         let wall = at.saturating_duration_since(previous_at);
         if wall.is_zero() {
             return CpuStep::Unchanged;
         }
         if usage < previous_usage {
-            self.previous = Some((usage, at));
+            *self = Self::Tracking { usage, at };
             return CpuStep::Pending;
         }
         let tenths = usage_tenths(usage.saturating_sub(previous_usage), wall);
-        self.previous = Some((usage, at));
+        *self = Self::Tracking { usage, at };
         CpuStep::Percent(tenths)
     }
 }

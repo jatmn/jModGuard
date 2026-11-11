@@ -292,8 +292,69 @@ pub async fn record_update_check(
     }).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseCheckFreshness {
+    Unchecked,
+    Fresh,
+    Stale,
+}
+
+impl ReleaseCheckFreshness {
+    fn at(checked_at: Option<i64>, now: i64) -> Self {
+        match checked_at {
+            None => Self::Unchecked,
+            Some(checked) if checked > now || now.saturating_sub(checked) >= 7200 => Self::Stale,
+            Some(_) => Self::Fresh,
+        }
+    }
+}
+
+/// Selection is independent of the display state: a failed request may still
+/// own a desired digest, and an observed baked process does not settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallSelection {
+    Unselected,
+    Pending,
+    Installed,
+}
+
+impl InstallSelection {
+    fn from_releases(
+        desired: Option<&ComponentRelease>,
+        installed: Option<&ComponentRelease>,
+    ) -> Self {
+        match desired {
+            None => Self::Unselected,
+            Some(selected)
+                if installed.is_some_and(|current| current.digest == selected.digest) =>
+            {
+                Self::Installed
+            }
+            Some(_) => Self::Pending,
+        }
+    }
+}
+
+/// A claim/renewal result, not authority retained beyond the checked operation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "bool", into = "bool")]
+pub enum UpdateLeaseStatus {
+    Held,
+    Unavailable,
+}
+impl From<bool> for UpdateLeaseStatus {
+    fn from(held: bool) -> Self {
+        if held { Self::Held } else { Self::Unavailable }
+    }
+}
+impl From<UpdateLeaseStatus> for bool {
+    fn from(status: UpdateLeaseStatus) -> Self {
+        status == UpdateLeaseStatus::Held
+    }
+}
+
 pub fn release_check_is_stale(checked_at: Option<i64>, now: i64) -> bool {
-    checked_at.is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+    ReleaseCheckFreshness::at(checked_at, now) != ReleaseCheckFreshness::Fresh
 }
 
 pub(super) fn checked_install_candidate(
@@ -890,7 +951,7 @@ pub async fn request_due_automatic_install(
         let desired=parse_release(state.desired)?;
         // A selected service digest remains queued across baked restarts. Only
         // a settled request may be replaced by a later automatic candidate.
-        if component != "webui" && desired.as_ref().is_some_and(|selected| installed.as_ref().is_none_or(|current| current.digest != selected.digest)) {
+        if component != "webui" && InstallSelection::from_releases(desired.as_ref(), installed.as_ref()) == InstallSelection::Pending {
             tx.commit()?; return Ok(None);
         }
         if release.channel!=state.channel || release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || installed.as_ref().is_some_and(|current| current.digest==release.digest) {
@@ -910,19 +971,37 @@ pub async fn request_due_automatic_install(
     }).await
 }
 
+enum AutomaticCadence {
+    Off,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl AutomaticCadence {
+    fn from_stored(cadence: &str) -> Self {
+        match cadence {
+            "daily" => Self::Daily,
+            "weekly" => Self::Weekly,
+            "monthly" => Self::Monthly,
+            _ => Self::Off,
+        }
+    }
+}
+
 fn automatic_window(cadence: &str, now: i64) -> Option<String> {
     use chrono::{TimeZone, Utc};
     let date = Utc.timestamp_opt(now, 0).single()?.date_naive();
-    match cadence {
-        "daily" => Some(date.format("%Y-%m-%d").to_string()),
-        "weekly" => Some(
+    match AutomaticCadence::from_stored(cadence) {
+        AutomaticCadence::Daily => Some(date.format("%Y-%m-%d").to_string()),
+        AutomaticCadence::Weekly => Some(
             date.week(chrono::Weekday::Mon)
                 .first_day()
                 .format("%Y-%m-%d")
                 .to_string(),
         ),
-        "monthly" => Some(date.format("%Y-%m").to_string()),
-        _ => None,
+        AutomaticCadence::Monthly => Some(date.format("%Y-%m").to_string()),
+        AutomaticCadence::Off => None,
     }
 }
 
@@ -1104,11 +1183,33 @@ pub async fn update_alert_channel(db: &Db) -> Result<Option<u64>> {
     .await
 }
 
+/// Records consumption before delivery, not proof that Discord accepted a message.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "bool", into = "bool")]
+enum AlertDisposition {
+    LoggedOnly,
+    ChannelClaimed,
+}
+impl From<bool> for AlertDisposition {
+    fn from(posted: bool) -> Self {
+        if posted {
+            Self::ChannelClaimed
+        } else {
+            Self::LoggedOnly
+        }
+    }
+}
+impl From<AlertDisposition> for bool {
+    fn from(state: AlertDisposition) -> Self {
+        state == AlertDisposition::ChannelClaimed
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct AlertedBootMismatch {
     record: BootMismatchRecord,
     /// False when only the no-channel warning was logged; a later channel posts.
-    posted: bool,
+    posted: AlertDisposition,
 }
 
 type Alerted = std::collections::BTreeMap<String, AlertedBootMismatch>;
@@ -1154,13 +1255,17 @@ pub async fn take_boot_mismatch_alerts(db: &Db) -> Result<BootMismatchAlerts> {
         let mut next = Alerted::new();
         let mut due = Vec::new();
         for (component, record) in current {
-            let seen = alerted
-                .get(&component)
-                .filter(|seen| seen.record == record && (seen.posted || channel.is_none()));
+            let seen = alerted.get(&component).filter(|seen| {
+                seen.record == record
+                    && (seen.posted == AlertDisposition::ChannelClaimed || channel.is_none())
+            });
             if seen.is_none() {
                 due.push(record.clone());
             }
-            let posted = seen.is_some_and(|seen| seen.posted) || channel.is_some();
+            let posted = AlertDisposition::from(
+                seen.is_some_and(|seen| seen.posted == AlertDisposition::ChannelClaimed)
+                    || channel.is_some(),
+            );
             next.insert(component, AlertedBootMismatch { record, posted });
         }
         Ok((next != alerted).then_some(((channel, due), next)))

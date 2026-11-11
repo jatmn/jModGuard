@@ -13,21 +13,35 @@ pub fn mark_child_ready() -> std::io::Result<()> {
     Ok(())
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::watch;
 
-static PROCESS_READY: AtomicBool = AtomicBool::new(false);
+/// Application readiness is independent of liveness and the shutdown latch.
+/// A live process may be unavailable while bootstrapping or draining.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Readiness {
+    Unavailable,
+    Ready,
+}
+
+static PROCESS_READY: AtomicU8 = AtomicU8::new(Readiness::Unavailable as u8);
 
 /// In-memory readiness. Liveness does not read this, and readiness does not
 /// touch a database.
 pub fn set_process_ready(ready: bool) {
-    PROCESS_READY.store(ready, Ordering::Release);
+    let state = if ready {
+        Readiness::Ready
+    } else {
+        Readiness::Unavailable
+    };
+    PROCESS_READY.store(state as u8, Ordering::Release);
 }
 
 pub fn process_ready() -> bool {
-    PROCESS_READY.load(Ordering::Acquire)
+    PROCESS_READY.load(Ordering::Acquire) == Readiness::Ready as u8
 }
 
 static SHUTDOWN_CONTEXT: Mutex<&'static str> = Mutex::new("process");
@@ -60,25 +74,55 @@ pub fn log_shutdown_finished(work: &str) {
 /// Process-wide shutdown latch. One OS signal unblocks every waiter
 /// (database retry, health, axum, Discord shards) instead of being
 /// consumed by the first `shutdown_signal()` call.
-fn shutdown_tx() -> &'static watch::Sender<bool> {
-    static TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, _rx) = watch::channel(false);
-        tx
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownState {
+    Running,
+    Requested,
+}
+
+struct ShutdownLatch(watch::Sender<ShutdownState>);
+
+impl ShutdownLatch {
+    fn new() -> Self {
+        let (tx, _) = watch::channel(ShutdownState::Running);
+        Self(tx)
+    }
+
+    fn request(&self) {
+        // A latch must retain the signal even between subscribers. `send`
+        // rejects that transition when all earlier waiters have been dropped.
+        self.0.send_replace(ShutdownState::Requested);
+    }
+
+    async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        loop {
+            if *rx.borrow() == ShutdownState::Requested {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn shutdown_latch() -> &'static ShutdownLatch {
+    static LATCH: OnceLock<ShutdownLatch> = OnceLock::new();
+    LATCH.get_or_init(ShutdownLatch::new)
 }
 
 fn arm_shutdown_listener() {
     static ARMED: std::sync::Once = std::sync::Once::new();
     ARMED.call_once(|| {
-        let tx = shutdown_tx().clone();
+        let latch = shutdown_latch();
         tokio::spawn(async move {
             wait_for_os_shutdown().await;
             tracing::info!("stop signal arrived ({})", shutdown_context());
             if let Ok(mut slot) = SIGNAL_AT.lock() {
                 *slot = Some(Instant::now());
             }
-            let _ = tx.send(true);
+            latch.request();
         });
     });
 }
@@ -123,13 +167,41 @@ async fn wait_for_os_shutdown() {
 /// listener after that work unwinds.
 pub async fn shutdown_signal() {
     arm_shutdown_listener();
-    let mut rx = shutdown_tx().subscribe();
-    loop {
-        if *rx.borrow() {
-            return;
+    shutdown_latch().wait().await;
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::ShutdownLatch;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_request_survives_a_gap_without_waiters() {
+        let latch = ShutdownLatch::new();
+        latch.request();
+        tokio::time::timeout(Duration::from_millis(100), latch.wait())
+            .await
+            .expect("a later waiter must observe an already requested shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_every_waiter_and_remains_latched() {
+        let latch = ShutdownLatch::new();
+        let first = latch.wait();
+        let second = latch.wait();
+        tokio::pin!(first, second);
+        tokio::select! {
+            _ = &mut first => panic!("shutdown has not been requested"),
+            _ = &mut second => panic!("shutdown has not been requested"),
+            _ = tokio::task::yield_now() => {}
         }
-        if rx.changed().await.is_err() {
-            return;
-        }
+        latch.request();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            first.await;
+            second.await;
+            latch.wait().await;
+        })
+        .await
+        .expect("all current and future waiters must finish");
     }
 }

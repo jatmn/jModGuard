@@ -91,7 +91,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -1022,7 +1022,7 @@ test('out-of-order server responses never overwrite the active server', async ()
   pending[0].resolve(response({ sentinel: 'first' }));
   await first;
   assert.equal(app.state.config.sentinel, 'second');
-  assert.equal(app.state.loading, false);
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('an older same-server refresh cannot roll back a newer saved snapshot', async () => {
@@ -1054,7 +1054,7 @@ test('an older refresh cannot roll back an acknowledged mutation representation'
   }));
   await old;
   assert.equal(app.state.config.rules[0].effective.enabled, false);
-  assert.equal(app.state.loading, false);
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('default-backed rule and template resets fall back instead of applying null', () => {
@@ -1107,8 +1107,8 @@ test('failed refresh clears stale settings and exposes a retryable error', async
   app.state.config = { settings: { prefix: 'stale' } };
   assert.equal(await app.loadConfig(), undefined);
   assert.equal(app.state.config, null);
-  assert.equal(app.state.error, 'offline');
-  assert.equal(app.state.loading, false);
+  assert.equal(app.state.configRead.error, 'offline');
+  assert.equal((app.state.configRead.activity === "loading"), false);
 });
 
 test('async actions block duplicate submissions and release after errors', async () => {

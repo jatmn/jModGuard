@@ -424,7 +424,7 @@ impl HranaFixture {
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
             lease_runtime: lease_runtime.clone(),
-            startup_deferred: false,
+            bootstrap_work: crate::db::BootstrapWork::Complete,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
                 database: Arc::clone(&database),

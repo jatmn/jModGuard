@@ -147,6 +147,12 @@ pub async fn mark_user_gap(app: &BotState, guild_id: u64, user_id: i64, reason: 
     mark_gap(app, &store, scope, Some(user_id), reason).await;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GapDelivery {
+    Complete,
+    Retry,
+}
+
 pub async fn flush_pending_gaps(
     app: &BotState,
     store: &db::guild_data::GuildDataStore,
@@ -173,15 +179,10 @@ pub async fn flush_pending_gaps(
             );
             continue;
         }
-        let mut queued = true;
-        for (user_id, is_ban) in &gap.users {
-            let kind = if *is_ban {
-                MemberVerifyKind::Ban
-            } else {
-                MemberVerifyKind::Member
-            };
+        let mut delivery = GapDelivery::Complete;
+        for (user_id, kind) in &gap.users {
             if let Err(error) = store
-                .queue_member_target_check(scope.clone(), *user_id, kind, &gap.reason, now_ms)
+                .queue_member_target_check(scope.clone(), *user_id, *kind, &gap.reason, now_ms)
                 .await
             {
                 tracing::warn!(
@@ -189,11 +190,11 @@ pub async fn flush_pending_gaps(
                     user_id,
                     "member target check retry failed: {error:#}"
                 );
-                queued = false;
+                delivery = GapDelivery::Retry;
                 break;
             }
         }
-        if queued {
+        if delivery == GapDelivery::Complete {
             app.acknowledge_member_gap(&gap);
         }
     }
@@ -364,17 +365,33 @@ fn commit_may_still_land(error: &anyhow::Error) -> bool {
     db::is_database_commit_indeterminate(error) || db::is_database_operation_timeout(error)
 }
 
-fn directory_repair_needed(outcome: &CaseOutcome) -> bool {
-    matches!(
-        outcome,
-        CaseOutcome::Succeeded | CaseOutcome::Uncertain | CaseOutcome::Attempted
-    )
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BanRepair {
+    NotRequired,
+    Required,
+}
+
+impl BanRepair {
+    fn after_outcome(outcome: &CaseOutcome) -> Self {
+        match outcome {
+            CaseOutcome::Failed => Self::NotRequired,
+            CaseOutcome::Succeeded | CaseOutcome::Uncertain | CaseOutcome::Attempted => {
+                Self::Required
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordedBan {
+    Confirmed,
+    Unconfirmed,
 }
 
 impl PendingBan {
     pub async fn finish(self, app: &BotState, outcome: CaseOutcome) {
         let Some((store, scope)) = self.located else {
-            if directory_repair_needed(&outcome) {
+            if BanRepair::after_outcome(&outcome) == BanRepair::Required {
                 app.remember_member_gap(
                     self.guild_id,
                     None,
@@ -411,10 +428,12 @@ impl PendingBan {
             return;
         }
         // A confirmed save keeps today's settlement and does not queue a second repair.
-        if self.save == MarkerSave::Saved || !directory_repair_needed(&outcome) {
+        if self.save == MarkerSave::Saved
+            || BanRepair::after_outcome(&outcome) == BanRepair::NotRequired
+        {
             return;
         }
-        if member_records_ban(&store, &scope, self.user_id).await {
+        if member_records_ban(&store, &scope, self.user_id).await == RecordedBan::Confirmed {
             return;
         }
         // A row that is already visible is the pending-ban verification's job.
@@ -445,13 +464,18 @@ async fn member_records_ban(
     store: &db::guild_data::GuildDataStore,
     scope: &db::guild_data::GuildDataScope,
     user_id: i64,
-) -> bool {
-    store
+) -> RecordedBan {
+    let confirmed = store
         .get_member(scope.clone(), user_id)
         .await
         .ok()
         .flatten()
-        .is_some_and(|member| member.is_banned)
+        .is_some_and(|member| member.is_banned);
+    if confirmed {
+        RecordedBan::Confirmed
+    } else {
+        RecordedBan::Unconfirmed
+    }
 }
 
 pub async fn current_member_stay_id(app: &BotState, guild_id: u64, user_id: u64) -> Option<String> {
@@ -1303,8 +1327,11 @@ mod tests {
         assert_eq!(discord_bans, 1);
         let gaps = app.pending_member_gaps(GUILD as u64);
         assert!(
-            gaps.iter()
-                .any(|gap| gap.users.iter().any(|(user, ban)| *user == USER && *ban)),
+            gaps.iter().any(|gap| gap
+                .users
+                .iter()
+                .any(|(user, ban)| *user == USER
+                    && *ban == crate::db::guild_data::MemberVerifyKind::Ban)),
             "refused marker save must keep an in-memory repair"
         );
         let _ = enrollment;

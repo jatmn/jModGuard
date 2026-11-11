@@ -490,9 +490,16 @@ async fn exercise_nickname_membership(bot: &Db, api: &Db) {
         .await
         .unwrap()
         .remove(0);
-    finish_nickname_reconcile(bot, &old, "dormant", "unknown_guild", "unknown", 1)
-        .await
-        .unwrap();
+    finish_nickname_reconcile(
+        bot,
+        &old,
+        jmodguard::db::NicknameReconcileStop::Dormant,
+        "unknown_guild",
+        "unknown",
+        1,
+    )
+    .await
+    .unwrap();
     test_drop_next_commit_response();
     enroll_guild(bot, 600, 100).await.unwrap();
     let resumed = pending_nickname_reconciles(bot, 0, 1)

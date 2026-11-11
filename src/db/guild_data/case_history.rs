@@ -121,8 +121,24 @@ fn validate(data: &CaseHistoryData, limits: CaseHistoryLimits) -> Result<()> {
     Ok(())
 }
 
-fn live_parent(conn: &impl SqlExecutor, scope: &GuildDataScope, case: &CaseId) -> Result<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0)", params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str()], |r| Ok(r.get(0)?))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryParent {
+    Live,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryReplayIdentity {
+    ExactPayload,
+    NoteIntent,
+}
+
+fn history_parent(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    case: &CaseId,
+) -> Result<HistoryParent> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0)", params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str()], |r| Ok(if r.get::<bool>(0)? { HistoryParent::Live } else { HistoryParent::Unavailable }))
 }
 
 impl GuildDataStore {
@@ -136,8 +152,15 @@ impl GuildDataStore {
         data: CaseHistoryData,
         limits: CaseHistoryLimits,
     ) -> Result<AppendCaseHistory> {
-        self.append_history(scope, case, id, data, limits, false)
-            .await
+        self.append_history(
+            scope,
+            case,
+            id,
+            data,
+            limits,
+            HistoryReplayIdentity::ExactPayload,
+        )
+        .await
     }
 
     /// One authenticated note intent. Its first committed timestamp is retained
@@ -156,8 +179,15 @@ impl GuildDataStore {
             recorded_at_ms: chrono::Utc::now().timestamp_millis().max(1),
             body: CaseHistoryBody::Note { text },
         };
-        self.append_history(scope, case, id, data, limits, true)
-            .await
+        self.append_history(
+            scope,
+            case,
+            id,
+            data,
+            limits,
+            HistoryReplayIdentity::NoteIntent,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,7 +198,7 @@ impl GuildDataStore {
         id: CaseId,
         data: CaseHistoryData,
         limits: CaseHistoryLimits,
-        note_intent: bool,
+        replay_identity: HistoryReplayIdentity,
     ) -> Result<AppendCaseHistory> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
@@ -187,8 +217,8 @@ impl GuildDataStore {
                 return Err(error);
             }
             verify_scope(&tx,&expected,&scope,true)?;
-            anyhow::ensure!(live_parent(&tx,&scope,&case)?, CaseError::Conflict);
-            if note_intent {
+            anyhow::ensure!(history_parent(&tx,&scope,&case)? == HistoryParent::Live, CaseError::Conflict);
+            if replay_identity == HistoryReplayIdentity::NoteIntent {
                 let existing = tx.query_row(
                     "SELECT sequence,CASE WHEN length(CAST(payload AS BLOB))<=?5 THEN payload ELSE NULL END
                      FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",
@@ -231,7 +261,7 @@ impl GuildDataStore {
         self.db.with_conn(move |conn| {
             let tx=conn.transaction_primary_snapshot()?;
             verify_scope(&tx,&expected,&scope,true)?;
-            if !live_parent(&tx,&scope,&case)? { tx.finish_read()?; return Ok(None); }
+            if history_parent(&tx,&scope,&case)? == HistoryParent::Unavailable { tx.finish_read()?; return Ok(None); }
             let row=tx.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?5 THEN payload ELSE NULL END FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),i64::from(limits.entry.max_record_bytes)],|r|Ok(r.get::<Option<String>>(0)?)).optional()?;
             let result=match row {
                 None=>None,
@@ -261,7 +291,7 @@ impl GuildDataStore {
         self.db.with_conn(move |conn| {
             let tx=conn.transaction_primary_snapshot()?;
             verify_scope(&tx,&expected,&scope,true)?;
-            if !live_parent(&tx,&scope,&case)? { tx.finish_read()?; return Ok(Vec::new()); }
+            if history_parent(&tx,&scope,&case)? == HistoryParent::Unavailable { tx.finish_read()?; return Ok(Vec::new()); }
             let mut stmt=tx.prepare("SELECT entry_id,sequence FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND sequence>?4 ORDER BY sequence LIMIT ?5")?;
             let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),after_sequence,i64::from(count)],|r|Ok((r.get::<String>(0)?,r.get::<i64>(1)?)))?;
             let mut refs=Vec::new();

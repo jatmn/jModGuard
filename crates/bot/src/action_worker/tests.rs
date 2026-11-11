@@ -2006,7 +2006,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
         );
         let discord = MockDiscord::default();
         let limits = WorkerLimits::default();
-        dispatch_expired_ban(&f.db, None, &discord, claimed, &limits)
+        dispatch_expired_ban(&f.db, None, &discord, ConsumedExpiry(claimed), &limits)
             .await
             .unwrap();
         assert_eq!(discord.calls.load(Ordering::SeqCst), 0, "{change}");
@@ -2575,7 +2575,10 @@ async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
             assert!(gaps.is_empty(), "{code}");
         } else {
             assert_eq!(gaps.len(), 1);
-            assert_eq!(gaps[0].users, vec![(20, true)]);
+            assert_eq!(
+                gaps[0].users,
+                vec![(20, crate::db::guild_data::MemberVerifyKind::Ban)]
+            );
             assert_eq!(gaps[0].reason, "confirmed unban persistence unavailable");
         }
     }

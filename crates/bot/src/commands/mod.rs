@@ -1106,12 +1106,14 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     let guild_id = slash.guild_id;
 
     // Defer so slow behaviors (purge, bans) don't hit the 3s window.
-    let deferred = serenity::builder::CreateInteractionResponse::Defer(
-        serenity::builder::CreateInteractionResponseMessage::new(),
-    )
-    .execute(&ctx.http, (slash.id, slash.token.as_str()))
-    .await
-    .is_ok();
+    let deferred = SlashResponseState::after_defer(
+        serenity::builder::CreateInteractionResponse::Defer(
+            serenity::builder::CreateInteractionResponseMessage::new(),
+        )
+        .execute(&ctx.http, (slash.id, slash.token.as_str()))
+        .await
+        .is_ok(),
+    );
 
     let cfg = match app.configs.get(&app.db, guild_id.get()).await {
         Ok(c) => c,
@@ -1306,15 +1308,31 @@ pub(crate) fn options_to_args_with_dm(
     (out, dm)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlashResponseState {
+    Initial,
+    DeferredPublic,
+}
+
+impl SlashResponseState {
+    fn after_defer(accepted: bool) -> Self {
+        if accepted {
+            Self::DeferredPublic
+        } else {
+            Self::Initial
+        }
+    }
+}
+
 async fn respond(
     activation: &crate::activation::Activation,
     slash: &SlashCtx,
     ctx: &Context,
-    deferred: bool,
+    deferred: SlashResponseState,
     text: &str,
     suppress_mentions: bool,
 ) {
-    let delivered = if deferred {
+    let delivered = if deferred == SlashResponseState::DeferredPublic {
         raced_slash_edit(
             activation,
             &ctx.http,
@@ -1491,7 +1509,7 @@ async fn deliver_slash_success(
     activation: &crate::activation::Activation,
     http: &serenity::http::Http,
     slash: &SlashCtx,
-    deferred: bool,
+    deferred: SlashResponseState,
     cmd: &CommandDef,
     outcome: &BehaviorOutcome,
 ) -> RacedWrite {
@@ -1500,7 +1518,7 @@ async fn deliver_slash_success(
     let suppress_mentions = suppress_untrusted_mentions(&cmd.behavior);
     match answer {
         SlashAnswer::Withdraw => {
-            if deferred {
+            if deferred == SlashResponseState::DeferredPublic {
                 withdraw_deferred_slash_answer(activation, http, slash.token.as_str(), &cmd.name)
                     .await
             } else {
@@ -1517,7 +1535,7 @@ async fn deliver_slash_success(
             }
         }
         SlashAnswer::Public | SlashAnswer::Ephemeral => {
-            if deferred {
+            if deferred == SlashResponseState::DeferredPublic {
                 raced_slash_edit(
                     activation,
                     http,
@@ -1623,12 +1641,28 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     rendered
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    Needed,
+    EffectAlreadyVisible,
+}
+
+impl BehaviorOutcome {
+    fn confirmation(&self) -> Confirmation {
+        if self.suppress_response {
+            Confirmation::EffectAlreadyVisible
+        } else {
+            Confirmation::Needed
+        }
+    }
+}
+
 /// Text to post in the invocation channel after a prefix command, or None
 /// when there is nothing to post. A behavior whose visible effect already
 /// landed in the invocation channel (`suppress_response`, e.g. `!say`
 /// posting there) gets no confirmation reply — it would be redundant.
 fn prefix_response_text(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<String> {
-    if outcome.suppress_response {
+    if outcome.confirmation() == Confirmation::EffectAlreadyVisible {
         return None;
     }
     let text = render_outcome(cmd, outcome);
@@ -1653,7 +1687,7 @@ enum SlashAnswer {
 }
 
 fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
-    if outcome.suppress_response {
+    if outcome.confirmation() == Confirmation::EffectAlreadyVisible {
         SlashAnswer::Withdraw
     } else if outcome.response.is_none() && cmd.response.is_empty() {
         SlashAnswer::Ephemeral
@@ -1819,13 +1853,9 @@ fn cooldown_check(
     }
     let key = (guild_id.get(), user.get(), cmd.name.clone());
     let now = Instant::now();
-    if let Some(entry) = app.cooldowns.get(&key)
-        && now.duration_since(*entry.value()) < Duration::from_secs(cmd.cooldown_secs)
-    {
-        return false;
-    }
-    app.cooldowns.insert(key, now);
-    true
+    app.cooldowns
+        .admit(key, now, Duration::from_secs(cmd.cooldown_secs))
+        == crate::state::CommandAdmission::Allowed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3920,9 +3950,15 @@ mod tests {
             options: Vec::new(),
         };
         let outcome = outcome(None, false);
-        let write =
-            deliver_slash_success(&app.activation, http.as_ref(), &slash, true, &cmd, &outcome)
-                .await;
+        let write = deliver_slash_success(
+            &app.activation,
+            http.as_ref(),
+            &slash,
+            SlashResponseState::DeferredPublic,
+            &cmd,
+            &outcome,
+        )
+        .await;
         assert_ne!(write, RacedWrite::Cutoff);
         if write != RacedWrite::Cutoff {
             log_outcome(

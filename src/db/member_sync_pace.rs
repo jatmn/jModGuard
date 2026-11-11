@@ -10,6 +10,47 @@ pub struct MemberSyncRequestClaim {
     pub generation: i64,
 }
 
+enum RequestLease {
+    Released,
+    ReservedUntil(i64),
+}
+
+struct RequestSlot {
+    request_after_ms: i64,
+    lease: RequestLease,
+    generation: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestAdmission {
+    Ready,
+    Paced,
+    Leased,
+}
+
+impl RequestSlot {
+    fn from_saved(after: i64, owner: Option<String>, until: Option<i64>, generation: i64) -> Self {
+        Self {
+            request_after_ms: after,
+            lease: match (owner, until) {
+                (Some(_), Some(until)) => RequestLease::ReservedUntil(until),
+                _ => RequestLease::Released,
+            },
+            generation,
+        }
+    }
+
+    fn admission(&self, now_ms: i64) -> RequestAdmission {
+        if self.request_after_ms > now_ms {
+            RequestAdmission::Paced
+        } else if matches!(self.lease, RequestLease::ReservedUntil(until) if until > now_ms) {
+            RequestAdmission::Leased
+        } else {
+            RequestAdmission::Ready
+        }
+    }
+}
+
 /// Reserve a request before calling Discord. An unknown commit outcome leaves
 /// the conservative deadline and lease in place until a later claim can prove
 /// that the slot is free; callers must not retry the HTTP request immediately.
@@ -38,12 +79,13 @@ pub async fn claim_member_sync_request(
             |r| Ok((r.get::<i64>(0)?, r.get::<Option<String>>(1)?, r.get::<Option<i64>>(2)?, r.get::<i64>(3)?)),
         ).optional()?;
         let (after, owner, until, generation) = row.unwrap_or((0, None, None, 0));
-        if after > now_ms || owner.is_some() && until.is_some_and(|v| v > now_ms) {
+        let slot = RequestSlot::from_saved(after, owner, until, generation);
+        if slot.admission(now_ms) != RequestAdmission::Ready {
             tx.finish_read()?;
             return Ok(None);
         }
         tx.ensure_mutation_receipt()?;
-        let next_generation = generation.checked_add(1).context("member sync pacing generation exhausted")?;
+        let next_generation = slot.generation.checked_add(1).context("member sync pacing generation exhausted")?;
         tx.execute_rows(
             "INSERT INTO member_sync_pacing(bot_id,request_after_ms,lease_owner,lease_until_ms,generation)
              VALUES(?1,?2,?3,?4,?5)

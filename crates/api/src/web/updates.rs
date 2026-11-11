@@ -112,7 +112,7 @@ async fn claim_any(
     owner: &str,
     now: i64,
     ttl: i64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<db::UpdateLeaseStatus> {
     if db.is_read_only() {
         commit_typed(
             app.context("waiting")?,
@@ -125,7 +125,9 @@ async fn claim_any(
         )
         .await
     } else {
-        db::claim_update_lease(db, component, owner, now, ttl).await
+        db::claim_update_lease(db, component, owner, now, ttl)
+            .await
+            .map(Into::into)
     }
 }
 
@@ -136,7 +138,7 @@ async fn renew_any(
     owner: &str,
     now: i64,
     ttl: i64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<db::UpdateLeaseStatus> {
     if db.is_read_only() {
         commit_typed(
             app.context("waiting")?,
@@ -149,7 +151,9 @@ async fn renew_any(
         )
         .await
     } else {
-        db::renew_update_lease(db, component, owner, now, ttl).await
+        db::renew_update_lease(db, component, owner, now, ttl)
+            .await
+            .map(Into::into)
     }
 }
 
@@ -411,6 +415,12 @@ async fn purge_and_record(
 const PURGE_PENDING_DURING_INSTALL: &str =
     "WebUI Storage publication started before a Pull Zone purge was accepted";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationPurgeMarker {
+    Unchanged,
+    Created,
+}
+
 /// Managed WebUI install order: purge configuration is checked and, when
 /// configured, the pending-purge marker is made durable before `publish` runs,
 /// so a restart or failed purge after the Storage cutover stays retryable. The
@@ -425,17 +435,19 @@ async fn publish_then_purge<T>(
     retry_delay: Duration,
 ) -> anyhow::Result<T> {
     let purge = PullZonePurge::from_lookup(lookup)?;
-    let mut provisional = false;
+    let mut marker = PublicationPurgeMarker::Unchanged;
     if purge.is_some() && db::webui_purge_pending(&app.db).await?.is_none() {
         set_purge_pending(app, Some(PURGE_PENDING_DURING_INSTALL.to_owned()))
             .await
             .context("WebUI pending purge could not be recorded before publication")?;
-        provisional = true;
+        marker = PublicationPurgeMarker::Created;
     }
     let published = match publish().await {
         Ok(published) => published,
         Err(error) => {
-            if provisional && let Err(clear_error) = set_purge_pending(app, None).await {
+            if marker == PublicationPurgeMarker::Created
+                && let Err(clear_error) = set_purge_pending(app, None).await
+            {
                 tracing::warn!("WebUI pending purge marker was not cleared: {clear_error:#}");
             }
             return Err(error);
@@ -489,7 +501,9 @@ pub async fn check_one(
 ) -> anyhow::Result<db::ComponentUpdate> {
     let lease = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp();
-    if !claim_any(Some(app), &app.db, component, &lease, now, 240).await? {
+    if claim_any(Some(app), &app.db, component, &lease, now, 240).await?
+        == db::UpdateLeaseStatus::Unavailable
+    {
         anyhow::bail!("another update operation is running");
     }
     with_update_lease(Some(app), &app.db, component, &lease, 240, async {
@@ -593,7 +607,8 @@ where
             chrono::Utc::now().timestamp(),
             ttl
         )
-        .await?,
+        .await?
+            == db::UpdateLeaseStatus::Held,
         "update lease expired before work began"
     );
     let watchdog = async {
@@ -601,7 +616,8 @@ where
             tokio::time::sleep(Duration::from_secs((ttl / 4).max(1) as u64)).await;
             let now = chrono::Utc::now().timestamp();
             anyhow::ensure!(
-                renew_any(app, db, component, lease, now, ttl).await?,
+                renew_any(app, db, component, lease, now, ttl).await?
+                    == db::UpdateLeaseStatus::Held,
                 "update lease expired or changed"
             );
         }
@@ -616,7 +632,10 @@ where
     let now = chrono::Utc::now().timestamp();
     let owned = renew_any(app, db, component, lease, now, ttl).await?;
     release_any(app, db, component, lease).await?;
-    anyhow::ensure!(owned, "update lease expired or changed");
+    anyhow::ensure!(
+        owned == db::UpdateLeaseStatus::Held,
+        "update lease expired or changed"
+    );
     result
 }
 
@@ -637,8 +656,10 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 .any(|part| part == prefix.as_bytes())
         }) {
             let registry = Registry::ghcr()?;
-            if let Some((root_hash, admin_hash)) =
-                storage.verify_release(&registry, release).await?
+            if let jmodguard_updater::storage::ReleaseVerification::Verified {
+                root_hash,
+                admin_hash,
+            } = storage.verify_release(&registry, release).await?
             {
                 record_running(
                     app,
@@ -669,7 +690,11 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
     }
     if let Some(installed) = state.installed.as_ref() {
         let registry = Registry::ghcr()?;
-        if let Some((root_hash, admin_hash)) = storage.verify_release(&registry, installed).await? {
+        if let jmodguard_updater::storage::ReleaseVerification::Verified {
+            root_hash,
+            admin_hash,
+        } = storage.verify_release(&registry, installed).await?
+        {
             let now = chrono::Utc::now().timestamp();
             record_verified(
                 app,
@@ -825,7 +850,7 @@ where
                 continue;
             }
         };
-        if !claimed {
+        if claimed == db::UpdateLeaseStatus::Unavailable {
             tracing::debug!(component, "release check skipped: update lease held");
             lease_held.insert(component);
             continue;
@@ -1143,7 +1168,9 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
     jmodguard_updater::compatible(&app.db, &candidate, now).await?;
     let lease = if component == "webui" {
         let lease = format!("{:032x}", rand::random::<u128>());
-        if !claim_any(Some(app), &app.db, component, &lease, now, 600).await? {
+        if claim_any(Some(app), &app.db, component, &lease, now, 600).await?
+            == db::UpdateLeaseStatus::Unavailable
+        {
             return Ok(());
         }
         Some(lease)
@@ -1280,7 +1307,7 @@ async fn queue_webui_install(
 ) -> anyhow::Result<(ComponentRelease, String)> {
     let lease = format!("{:032x}", rand::random::<u128>());
     anyhow::ensure!(
-        claim_any(app, db, "webui", &lease, now, 600).await?,
+        claim_any(app, db, "webui", &lease, now, 600).await? == db::UpdateLeaseStatus::Held,
         "another WebUI operation is running"
     );
     let requested = if db.is_read_only() {
