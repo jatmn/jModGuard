@@ -2445,7 +2445,7 @@ mod tests {
         // Test-only loopback WebSocket URL for a local accept() fixture, not production traffic.
         let addr = listener.local_addr().unwrap();
         let url = Arc::new(tokio::sync::Mutex::new(format!(
-            "ws://127.0.0.1:{}",
+            "ws://127.0.0.1:{}", // nosemgrep: javascript.lang.security.detect-insecure-websocket
             addr.port()
         )));
         let accept = tokio::spawn(async move {
