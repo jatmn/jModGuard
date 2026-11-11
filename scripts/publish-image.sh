@@ -260,7 +260,7 @@ changed_since_publication() {
   )
   if [[ "$component" == "webui" ]]; then
     inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore LICENSE.md
-      frontend tools/webui scripts/package-webui.mjs scripts/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
+      frontend tools/webui scripts/package-webui.mjs scripts/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.txt)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0
@@ -379,7 +379,7 @@ JS
         args+=(--label "io.jmodguard.launcher-revision=${launcher_revision}"
           --label "io.jmodguard.min-launcher-revision=${min_launcher_revision}")
       fi
-      guild_schema="$(cat "$context/migrations/guild/current_version.rs")"
+      guild_schema="$(cat "$context/migrations/guild/current_version.txt")"
       [[ "$guild_schema" =~ ^[1-9][0-9]*$ ]] || publish_fail 'invalid selected guild schema'
       args+=(
         --label "io.jmodguard.update-control=${control_protocol}"

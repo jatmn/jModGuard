@@ -247,7 +247,7 @@ done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
-cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
+cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
 sed -e 's/^pub const LAUNCHER_REVISION: u32 = 41;$/pub const LAUNCHER_REVISION: u32 = 42;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")

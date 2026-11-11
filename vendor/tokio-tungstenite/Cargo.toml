@@ -12,6 +12,10 @@ publish = false
 # tokio-tungstenite 0.21.0 pin. The sources are 0.24.0 (rustls 0.23) to drop
 # rustls-webpki 0.102.8 (GHSA-82j2-j2ch-gfr8).
 
+# Own workspace root so the path-patched crate loads standalone (CodeQL,
+# rust-analyzer) instead of failing with "believes it's in a workspace".
+[workspace]
+
 [features]
 default = ["connect", "handshake", "url"]
 connect = ["stream", "tokio/net", "handshake"]
