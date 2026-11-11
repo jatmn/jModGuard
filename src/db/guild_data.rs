@@ -127,9 +127,10 @@ fn read_existing_registration(conn: &impl SqlExecutor) -> Result<Option<StoreReg
         return Ok(None);
     }
     // Only an absent marker table means "not a guild store". A failed read of an
-    // existing marker (a remote timeout, for example) must surface as itself.
+    // existing marker (a remote timeout, for example) must surface as itself. SQLite resolves
+    // table names case-insensitively, so the presence probe does too.
     let marked: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='store_identity'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='store_identity' COLLATE NOCASE",
         (),
         |r| Ok(r.get(0)?),
     )?;

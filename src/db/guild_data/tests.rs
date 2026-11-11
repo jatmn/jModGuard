@@ -137,27 +137,33 @@ async fn existing_registration_does_not_relabel_unreadable_identity_as_schema_mi
             && unmarked.contains("user_version 0"),
         "{unmarked}"
     );
-    {
+    // SQLite resolves table names case-insensitively, so a differently cased marker is present.
+    for name in ["store_identity", "STORE_IDENTITY"] {
+        {
+            let raw = Connection::open(&f.store_path).unwrap();
+            raw.execute_batch_bounded(
+                &format!("CREATE TABLE {name}(singleton INTEGER, schema_family TEXT, store_id TEXT, dedicated_guild_id INTEGER)"),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        }
+        // A present but empty marker is a missing row, not an absent marker.
+        let empty = format!(
+            "{:#}",
+            GuildDataStore::existing_registration(f.options()).unwrap_err()
+        );
+        assert!(
+            empty.contains("no identity row") && !empty.contains("not a jModGuard guild store"),
+            "{name}: {empty}"
+        );
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch_bounded(
-            "CREATE TABLE store_identity(singleton INTEGER, schema_family TEXT, store_id TEXT, dedicated_guild_id INTEGER)",
-            64 * 1024 * 1024,
-        )
-        .unwrap();
+        raw.execute_batch_bounded(&format!("DROP TABLE {name}"), 64 * 1024 * 1024)
+            .unwrap();
     }
-    // A present but empty marker is a missing row, not an absent marker.
-    let empty = format!(
-        "{:#}",
-        GuildDataStore::existing_registration(f.options()).unwrap_err()
-    );
-    assert!(
-        empty.contains("no identity row") && !empty.contains("not a jModGuard guild store"),
-        "{empty}"
-    );
     {
         let raw = Connection::open(&f.store_path).unwrap();
         raw.execute_batch_bounded(
-            "DROP TABLE store_identity; CREATE TABLE store_identity(singleton INTEGER)",
+            "CREATE TABLE store_identity(singleton INTEGER)",
             64 * 1024 * 1024,
         )
         .unwrap();
