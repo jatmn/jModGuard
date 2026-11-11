@@ -193,10 +193,10 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new(settings: Settings) -> Self {
-        Self {
+    pub fn new(settings: Settings) -> anyhow::Result<Self> {
+        Ok(Self {
             settings,
-            process_nonce: fresh_nonce(),
+            process_nonce: fresh_nonce()?,
             state: Mutex::new(State {
                 guilds: HashMap::new(),
                 authors: 0,
@@ -212,7 +212,7 @@ impl Tracker {
             hits: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
             timeout_locks: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn prune(&self) {
@@ -1102,24 +1102,18 @@ impl State {
     }
 }
 
-fn fresh_nonce() -> u64 {
-    let mut bytes = [0u8; 8];
-    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| {
-        use std::io::Read as _;
-        file.read_exact(&mut bytes)
-    });
-    if read.is_ok() {
-        let value = u64::from_ne_bytes(bytes);
+/// Draws the per-process review-button nonce straight from the OS RNG so an
+/// entropy failure is a startup error rather than a `ThreadRng` panic.
+fn fresh_nonce() -> anyhow::Result<u64> {
+    use rand::TryRng as _;
+    loop {
+        let value = rand::rngs::SysRng.try_next_u64().map_err(|err| {
+            anyhow::anyhow!("OS random source unavailable for review nonce: {err}")
+        })?;
         if value != 0 {
-            return value;
+            return Ok(value);
         }
     }
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(1);
-    let mixed = tick ^ u64::from(std::process::id()).rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5;
-    if mixed == 0 { 1 } else { mixed }
 }
 
 fn bound_chars(value: &str, max: usize) -> String {
@@ -2766,7 +2760,7 @@ mod tests {
     }
 
     fn tracker() -> Tracker {
-        Tracker::new(settings())
+        Tracker::new(settings()).unwrap()
     }
 
     fn admission(revision: u64, edited_ms: i64) -> Admission {
@@ -2913,7 +2907,7 @@ mod tests {
     fn disabled_config_stores_nothing() {
         let mut settings = settings();
         settings.enabled = false;
-        let tracker = Tracker::new(settings);
+        let tracker = Tracker::new(settings).unwrap();
         let now = Instant::now();
         tracker.stage(
             sight(4, 10, 100, now),

@@ -596,11 +596,11 @@ mod tests {
     #[test]
     fn replayed_nonce_is_rejected() {
         let mut window = NonceWindow::new();
-        let nonce = "0123456789abcdef0123456789abcdef";
-        assert!(window.accept(nonce, 1_000_060_000, 1_000_000_000));
-        assert!(!window.accept(nonce, 1_000_060_000, 1_000_000_000));
-        assert!(!window.accept("short", 1_000_060_000, 1_000_000_000));
-        assert!(!window.accept(nonce, 1, 1_000_000_000));
+        let nonce = format!("{:032x}", rand::random::<u128>());
+        assert!(window.accept(&nonce, 1_000_060_000, 1_000_000_000));
+        assert!(!window.accept(&nonce, 1_000_060_000, 1_000_000_000));
+        assert!(!window.accept(&nonce[..5], 1_000_060_000, 1_000_000_000));
+        assert!(!window.accept(&nonce, 1, 1_000_000_000));
     }
 
     #[test]

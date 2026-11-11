@@ -329,7 +329,7 @@ for (const code of ['member_sync_missing_job', 'member_sync_invalid_operation'])
   await flushMembers();
   await fire(findNode(panel, n => n.textContent === 'Pause'), 'click', {});
   await flushMembers();
-  assert.match(textOf(panel), new RegExp(message.replace(/\./g, '\\.')));
+  assert.ok(textOf(panel).includes(message), `expected panel text to include: ${message}`);
   assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
   assert.equal(calls.filter(c => c.url.endsWith('/member-sync')).length, 2);
   assert.equal(calls.filter(c => c.url.endsWith('/member-sync/actions')).length, 1);

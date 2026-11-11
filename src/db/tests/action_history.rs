@@ -14,12 +14,12 @@ impl Fixture {
         }
         Self { db, path }
     }
-    async fn enqueue(&self, nonce: &str, now: i64) -> BotAction {
+    async fn enqueue(&self, label: &str, now: i64) -> BotAction {
         enqueue_bot_action(
             &self.db,
             10,
             42,
-            &format!("{now}_{nonce}"),
+            &format!("{now}_{label}"),
             action(),
             now,
             Limits::default(),
