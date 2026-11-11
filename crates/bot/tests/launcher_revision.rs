@@ -332,13 +332,14 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
             .await
             .unwrap();
     });
+    let ready_file = root.join("ready");
     let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string();
     let mut running = spawn(
         &[
             ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
             ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
             ("JMODGUARD_HEALTH_BIND", bind.as_str()),
-            ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
+            ("JMODGUARD_READY_FILE", ready_file.to_str().unwrap()),
             ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
             ("JMODGUARD_LAUNCHER_REVISION", "7"),
         ],
@@ -359,6 +360,10 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
     assert!(
         running.child.try_wait().unwrap().is_none(),
         "a refused store must hold the child, not exit for a launcher restart"
+    );
+    assert!(
+        !ready_file.exists(),
+        "the launcher reads this file as readiness; a held child must not write it"
     );
     assert!(
         !read_lease(&db_path).expect("the lease row must be readable to prove it is absent"),
