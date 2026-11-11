@@ -1745,7 +1745,9 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     let control = UpdateControl::open(&opts).unwrap().unwrap();
     assert!(!control.writes_locally());
     let script = root.join("sleep-child");
-    tokio::fs::write(&script, "#!/bin/sh\nsleep 60\n")
+    // `exec` keeps the launched child a single process: killing and reaping it
+    // below leaves no grandchild holding the test's inherited output pipes.
+    tokio::fs::write(&script, "#!/bin/sh\nexec sleep 60\n")
         .await
         .unwrap();
     tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
@@ -1777,6 +1779,12 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     );
     assert!(!service.tick().await.unwrap());
     assert!(service.pending_failure.is_some());
+    // Kill and reap the running child before dropping the supervisor: the
+    // tokio child's kill_on_drop would stop the shell, but nextest flags the
+    // test LEAK if any descendant still holds its stdout/stderr pipes.
+    if let Some(mut running) = service.running.take() {
+        stop(&mut running).await.unwrap();
+    }
     drop(service);
 
     let mut objects = HashMap::new();
@@ -6300,6 +6308,12 @@ fn reservation_lock_times_out_while_another_process_holds_it() {
             .arg(&lock_path)
             .arg("sleep")
             .arg("30")
+            // The holder's output is never asserted: null stdio keeps the
+            // orphaned `sleep` grandchild (surviving the flock kill in Drop)
+            // from holding the test's stdout/stderr pipes open past exit.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap(),
     ]);
