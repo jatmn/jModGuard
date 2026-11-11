@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
         // Hold with health up and no lease, as for an unsupported launcher.
         Err(error) if jmodguard::db::guild_data::StoreCheckError::is_schema_refusal(&error) => {
             tracing::error!(
-                "{error:#}; bot held without the writer lease. Fix the store or run a matching release, then restart the container"
+                "{error:#}; bot held without the writer lease. Run a release that matches the store, then restart the container"
             );
             idle_until_shutdown().await;
             return Ok(());
