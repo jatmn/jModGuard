@@ -1103,23 +1103,12 @@ impl State {
 }
 
 fn fresh_nonce() -> u64 {
-    let mut bytes = [0u8; 8];
-    let read = std::fs::File::open("/dev/urandom").and_then(|mut file| {
-        use std::io::Read as _;
-        file.read_exact(&mut bytes)
-    });
-    if read.is_ok() {
-        let value = u64::from_ne_bytes(bytes);
+    loop {
+        let value = rand::random::<u64>();
         if value != 0 {
             return value;
         }
     }
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(1);
-    let mixed = tick ^ u64::from(std::process::id()).rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5;
-    if mixed == 0 { 1 } else { mixed }
 }
 
 fn bound_chars(value: &str, max: usize) -> String {
