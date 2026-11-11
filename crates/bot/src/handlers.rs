@@ -503,8 +503,31 @@ pub(crate) struct UpdateObservation {
 static LAST_EMPTY_WARN: parking_lot::Mutex<Option<std::time::Instant>> =
     parking_lot::Mutex::new(None);
 
-fn warn_empty_content_once() {
-    let mut last = LAST_EMPTY_WARN.lock();
+/// Without the Message Content intent, Discord blanks the content, embeds,
+/// attachments, components and poll of other users' guild messages.
+/// Attachment-, sticker- or embed-only posts, system messages and bot or
+/// webhook messages can have empty content even with the intent, so only an
+/// ordinary user message with nothing at all points to a missing intent.
+fn content_intent_looks_missing(msg: &Message) -> bool {
+    use serenity::model::channel::MessageType;
+    matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
+        && !msg.author.bot
+        && msg.webhook_id.is_none()
+        && msg.content.is_empty()
+        && msg.attachments.is_empty()
+        && msg.embeds.is_empty()
+        && msg.sticker_items.is_empty()
+        && msg.components.is_empty()
+        && msg.poll.is_none()
+        && msg.message_snapshots.is_empty()
+        && msg.activity.is_none()
+}
+
+fn warn_empty_content_once(msg: &Message, last_warn: &parking_lot::Mutex<Option<Instant>>) {
+    if !content_intent_looks_missing(msg) {
+        return;
+    }
+    let mut last = last_warn.lock();
     let now = std::time::Instant::now();
     if last
         .map(|t| now.duration_since(t) > std::time::Duration::from_secs(120))
@@ -1178,9 +1201,7 @@ impl EventHandler for Handler {
             msg.webhook_id.is_some(),
         );
 
-        if msg.content.is_empty() {
-            warn_empty_content_once();
-        }
+        warn_empty_content_once(&msg, &LAST_EMPTY_WARN);
         log_message_diagnostic(&msg, guild_id);
 
         app.automod.maybe_prune();
@@ -1904,6 +1925,87 @@ mod tests {
     use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
     use serenity::model::id::{ChannelId, GuildId, MessageId};
+
+    #[test]
+    fn empty_content_warning_skips_legitimately_empty_messages() {
+        use crate::logging::persistence_log_tests::CapturedLog;
+        use serenity::model::channel::MessageType;
+
+        const HINT: &str = "received messages with empty content";
+        let user_message = || {
+            let mut msg = Message::default();
+            msg.guild_id = Some(GuildId::new(444444444444444444));
+            msg
+        };
+        let attachment_only = {
+            let mut msg = user_message();
+            msg.attachments.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "1", "filename": "a.png", "size": 1,
+                    "url": "https://cdn.example/a.png",
+                    "proxy_url": "https://cdn.example/a.png"
+                }))
+                .unwrap(),
+            );
+            msg
+        };
+        let sticker_only = {
+            let mut msg = user_message();
+            msg.sticker_items.push(
+                serde_json::from_value(
+                    serde_json::json!({"id": "2", "name": "wave", "format_type": 1}),
+                )
+                .unwrap(),
+            );
+            msg
+        };
+        let embed_only = {
+            let mut msg = user_message();
+            msg.embeds.push(Default::default());
+            msg
+        };
+        let system = {
+            let mut msg = user_message();
+            msg.kind = MessageType::MemberJoin;
+            msg
+        };
+        let bot = {
+            let mut msg = user_message();
+            msg.author.bot = true;
+            msg
+        };
+        let webhook = {
+            let mut msg = user_message();
+            msg.webhook_id = Some(serenity::model::id::WebhookId::new(3));
+            msg
+        };
+
+        let log = CapturedLog::default();
+        let last_warn = parking_lot::Mutex::new(None);
+        tracing::dispatcher::with_default(&log.dispatch(), || {
+            for msg in [
+                &attachment_only,
+                &sticker_only,
+                &embed_only,
+                &system,
+                &bot,
+                &webhook,
+            ] {
+                super::warn_empty_content_once(msg, &last_warn);
+            }
+        });
+        assert_eq!(log.text().matches(HINT).count(), 0, "{}", log.text());
+
+        // A normal user message with every content field blanked is what a
+        // missing Message Content intent delivers; it still warns, once.
+        tracing::dispatcher::with_default(&log.dispatch(), || {
+            super::warn_empty_content_once(&user_message(), &last_warn);
+            super::warn_empty_content_once(&user_message(), &last_warn);
+        });
+        let text = log.text();
+        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+        assert!(text.contains("Message Content intents"), "{text}");
+    }
 
     #[test]
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
