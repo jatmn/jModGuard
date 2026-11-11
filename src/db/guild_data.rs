@@ -92,14 +92,19 @@ fn store_label(id: &str, dedicated: Option<i64>) -> String {
     }
 }
 
+/// Runs before the stamped identity row is read, so it names the configured store and
+/// advises conditionally. The advice mirrors `GuildSchemaLayout::observed`: only versions
+/// `1..wanted` are migratable; a nonempty store at version 0 or below is never adopted.
 fn version_mismatch(id: &str, dedicated: Option<i64>, found: i64, wanted: i64) -> StoreCheckError {
     let action = if found > wanted {
-        "the store was migrated by a newer release; run that release or a later one (a store is never downgraded)"
+        "if a newer jModGuard release migrated the store, run that release or a later one (a store is never downgraded)"
+    } else if found >= 1 {
+        "if the store is older, start the bot so it migrates the store; otherwise restore the original store"
     } else {
-        "if the store is older, start the bot so it migrates the store; otherwise restore the original store (a store with no recognized version is never adopted)"
+        "a store with no recognized schema version is never adopted; restore the original store"
     };
     StoreCheckError::Schema(format!(
-        "store {} is at schema version {found}, but this build expects {wanted}; {action}",
+        "the database configured as store {} is at schema version {found}, but this build expects {wanted}; {action}",
         store_label(id, dedicated)
     ))
 }
@@ -128,27 +133,30 @@ fn read_existing_registration(conn: &impl SqlExecutor) -> Result<Option<StoreReg
         (),
         |r| Ok(r.get(0)?),
     )?;
-    let identity = if marked == 0 {
-        None
-    } else {
-        conn.query_row(
+    anyhow::ensure!(
+        marked > 0,
+        StoreCheckError::Schema(format!(
+            "no store identity marker (user_version {version}, {objects} objects); this is not a jModGuard guild store"
+        ))
+    );
+    let identity = conn
+        .query_row(
             "SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1",
             (),
             |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?)),
         )
-        .optional()?
-    };
+        .optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema(format!(
-            "no store identity marker (user_version {version}, {objects} objects); this is not a jModGuard guild store"
+            "the store identity marker has no identity row (user_version {version}, {objects} objects)"
         ))
         .into());
     };
+    // The stored id is not parsed until the family matches, so it is untrusted text here.
     anyhow::ensure!(
         family == FAMILY,
         StoreCheckError::Schema(format!(
-            "store {} has schema family {family:?}, expected {FAMILY:?}",
-            store_label(&id, dedicated)
+            "store {id:?} has schema family {family:?}, expected {FAMILY:?}"
         ))
     );
     let policy = match dedicated {
