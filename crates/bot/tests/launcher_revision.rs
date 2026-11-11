@@ -1,5 +1,6 @@
 //! Children of unsupported launchers idle with health up and never
 //! take the writer lease. Revision 7 and a standalone start are not gated.
+//! A guild store whose schema this build refuses is held the same way, not exited.
 use jmodguard::db::SqlExecutor;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -284,6 +285,97 @@ fn standalone_bot_without_launcher_markers_is_not_gated() {
             "standalone bot did not claim the writer lease\n{log}"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart() {
+    use jmodguard::db::guild_data::{GuildDataStore, GuildStoreOptions};
+    use jmodguard::db::guild_stores::{StoreId, StorePolicy, StoreRegistration};
+
+    let root = temp_root("store-ahead");
+    let db_path = root.join("core.db");
+    let store_path = root.join("core.db.guild.db");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The core database is created by the bot; only the store is pre-built, then
+        // stamped with a version newer than this build, as a newer release would leave it.
+        let options = GuildStoreOptions {
+            read_only: false,
+            path: store_path.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+        };
+        let id = StoreId::new();
+        drop(
+            GuildDataStore::initialize(
+                options,
+                StoreRegistration::for_test(id, StorePolicy::Shared),
+            )
+            .unwrap(),
+        );
+        let conn = libsql::Builder::new_local(&store_path)
+            .build()
+            .await
+            .unwrap()
+            .connect()
+            .unwrap();
+        conn.execute_batch("PRAGMA user_version = 99")
+            .await
+            .unwrap();
+    });
+    let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string();
+    let mut running = spawn(
+        &[
+            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+            ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
+            ("JMODGUARD_HEALTH_BIND", bind.as_str()),
+            ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
+            ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
+            ("JMODGUARD_LAUNCHER_REVISION", "7"),
+        ],
+        &[],
+    );
+    let log = wait_log(&running, "bot held without the writer lease");
+    assert!(
+        log.contains("unsupported guild-store schema")
+            && log.contains("schema version 99")
+            && log.contains("expects 17"),
+        "{log}"
+    );
+    let addr = health_addr(&wait_log(&running, "health listener"));
+    assert!(get(&addr, "/health").starts_with("HTTP/1.1 200"));
+    assert!(get(&addr, "/ready").starts_with("HTTP/1.1 503"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        running.child.try_wait().unwrap().is_none(),
+        "a refused store must hold the child, not exit for a launcher restart"
+    );
+    assert!(
+        !lease_present(&db_path),
+        "the held bot must not claim the lease"
+    );
+    assert!(
+        Command::new("kill")
+            .arg("-TERM")
+            .arg(running.child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = running.child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(0));
+            break;
+        }
+        assert!(Instant::now() < deadline, "held child did not stop");
+        std::thread::sleep(Duration::from_millis(10));
     }
     let _ = std::fs::remove_dir_all(&root);
 }
