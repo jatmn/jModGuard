@@ -662,11 +662,14 @@ async fn exercise_invite_description_copy(bot: &Db, api: &Db) {
         "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
     async fn stored_invite(db: &Db, guild: i64) -> serde_json::Value {
         db.with_conn(move |conn| {
-            let json: String = conn.query_row(
+            // The copy and lost-COMMIT reconciliation do not fence replica reads.
+            let tx = conn.transaction_primary_snapshot()?;
+            let json: String = tx.query_row(
                 "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
                 params![guild],
                 |row| Ok(row.get(0)?),
             )?;
+            tx.finish_read()?;
             Ok(serde_json::from_str(&json)?)
         })
         .await
