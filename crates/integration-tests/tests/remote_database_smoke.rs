@@ -156,6 +156,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_dispatch_completion(&bot).await;
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
+    exercise_invite_description_copy(&bot, &api).await;
     exercise_moderation_scopes(&bot, &api).await;
     exercise_received_gateway_ban_delivery(&bot).await;
     exercise_configuration_reads(&bot, &api).await;
@@ -649,6 +650,75 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
     assert_eq!(
         get_settings_primary(api, 501).await.unwrap().prefix,
         "source"
+    );
+}
+
+// Copied stale invite text reaches the save guard on the remote transport.
+async fn exercise_invite_description_copy(bot: &Db, api: &Db) {
+    use jmodguard::db::*;
+    // The crate-private obsolete shipped wording. If it drifts, the missing-target
+    // case copies this text unchanged and fails below.
+    const OLD: &str =
+        "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+    async fn stored_invite(db: &Db, guild: i64) -> serde_json::Value {
+        db.with_conn(move |conn| {
+            // The copy and lost-COMMIT reconciliation do not fence replica reads.
+            let tx = conn.transaction_primary_snapshot()?;
+            let json: String = tx.query_row(
+                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'invite'",
+                params![guild],
+                |row| Ok(row.get(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .await
+        .unwrap()
+    }
+    let source = ConfigurationScope::Guild(enroll_guild(bot, 520, 100).await.unwrap().unwrap());
+    let custom = ConfigurationScope::Guild(enroll_guild(bot, 521, 100).await.unwrap().unwrap());
+    let missing = ConfigurationScope::Guild(enroll_guild(bot, 522, 100).await.unwrap().unwrap());
+    let shipped = get_rule(api, 0, "invite").await.unwrap().unwrap();
+    assert_ne!(shipped.description, OLD);
+    let mut stale = shipped.clone();
+    stale.description = OLD.into();
+    stale.enabled = false;
+    stale.params = serde_json::json!({"allowlist_codes": ["remote-code"]});
+    let stale_json = serde_json::to_string(&stale).unwrap();
+    // A save would apply the guard; store the stale row as an old editor left it.
+    bot.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO rules(guild_id, rule_id, data) VALUES (520, 'invite', ?1)",
+            params![stale_json],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let mut target = shipped.clone();
+    target.description = "Remote target guidance".into();
+    upsert_rule(bot, 521, "invite", &target).await.unwrap();
+    for (destination, expected) in [
+        (custom, target.description.as_str()),
+        (missing, shipped.description.as_str()),
+    ] {
+        test_drop_next_commit_response();
+        copy_enrolled_guild_config(
+            api,
+            source.clone(),
+            destination.clone(),
+            vec!["rules".into()],
+        )
+        .await
+        .unwrap();
+        let mut want = serde_json::to_value(&stale).unwrap();
+        want["description"] = serde_json::json!(expected);
+        assert_eq!(stored_invite(api, destination.guild_id()).await, want);
+    }
+    assert_eq!(
+        stored_invite(api, 520).await,
+        serde_json::to_value(&stale).unwrap()
     );
 }
 
