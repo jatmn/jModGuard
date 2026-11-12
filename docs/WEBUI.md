@@ -114,12 +114,15 @@ Both themes share one desktop admin-console density, set by tokens in
 buttons, square icon buttons and info-tooltip triggers, at least 24px
 (WCAG 2.2 target size), and all controls share one visible focus ring.
 Narrow (720px or less) and touch screens scale fields back up to 40px.
-Pages open with a single header line instead of hero cards. The Dashboard
+Workspace tabs open with a single header line instead of hero cards; status
+panels for loading, server discovery and configuration errors keep a compact
+hero. The Dashboard
 hides Getting started once the loaded configuration has at least one enabled
 automod rule, one enabled command and one routed log channel (one per setup
 step); missing collections count as incomplete. Its stat explainer is an info
 tooltip: a focusable button described by the tooltip text, shown on hover or
-focus and dismissed with Escape. `scripts/frontend-contrast-test.mjs` guards
+focus, kept open while the pointer moves onto its text, and dismissed
+with Escape wherever focus is. `scripts/frontend-contrast-test.mjs` guards
 the scale, focus ring, target sizes and colors; the browser check in
 `scripts/frontend-state-test.mjs` measures the Dashboard at 1280×800.
 
