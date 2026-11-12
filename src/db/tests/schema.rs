@@ -203,6 +203,37 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
 }
 
 #[test]
+fn migrating_one_version_takes_only_baseline_and_migration_writer_locks() {
+    let path = tmp_db_path("migrate_skips_applied");
+    let prior = MIGRATIONS.len() - 1;
+    let conn = Connection::open(&path).unwrap();
+    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
+        let tx = conn.transaction_primary_write().unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    drop(conn);
+    let probe = Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let mut conn = Connection::open(&path).unwrap();
+    migrate_conn(&mut conn).unwrap();
+    assert_eq!(
+        probe.immediate(),
+        2,
+        "baseline read plus the one pending migration"
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
+            .unwrap(),
+        MIGRATIONS.len() as i64
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
+
+#[test]
 fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     let path = tmp_db_path("queue_upgrade");
     let conn = Connection::open(&path).unwrap();
