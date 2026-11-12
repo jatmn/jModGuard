@@ -829,13 +829,14 @@ test('Members keeps completed phases done while local case history finishes and 
     ['Current bans', 'Done', '3'],
     ['Candidate checks', 'Done', '1'],
     ['Available audit history', 'Done', '2'],
-    ['Local case history', 'Waiting', 'Unknown'],
+    ['Local case history', 'Waiting', 'Not counted'],
     ['Total', '24 records committed in this run · 20 members counted'],
   ]);
   assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'WaitingStage: Local case historyfinishing local case history');
   assert.doesNotMatch(copy, /100% complete/);
   const bar = findNode(panel, n => n.localName === 'progress');
   assert.equal(bar.getAttribute("value"), null);
+  assert.equal(bar.getAttribute('aria-valuetext'), 'Local case history stage; records not counted');
 });
 
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
@@ -851,6 +852,8 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   assert.match(copy, /80 members counted/);
   const bans = [...panel.querySelectorAll('tbody tr')].find(row => textOf(row.cells[0]) === 'Current bans');
   assert.deepEqual([...bans.cells].map(cell => textOf(cell)), ['Current bans', 'Queued', 'Unknown']);
+  assert.equal(findNode(panel, n => n.localName === 'progress').getAttribute('aria-valuetext'),
+    'Unknown number of records committed in current phase; total unknown');
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);
@@ -968,7 +971,7 @@ test('Members lays out a finished import with one status, phase rows, a fixed du
     ['Current bans', 'Done', '192'],
     ['Candidate checks', 'Done', '0'],
     ['Available audit history', 'Done', '18'],
-    ['Local case history', 'Done', 'Unknown'],
+    ['Local case history', 'Done', 'Not counted'],
     ['Total', '10,749 records committed in this run · 10,539 members counted · 100% complete'],
   ]);
   assert.match(copy, /Took 120 minutes/);
