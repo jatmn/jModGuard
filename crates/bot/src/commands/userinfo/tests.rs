@@ -808,7 +808,7 @@ async fn rest_lookup_failure_still_renders_warns_and_cases() {
     let outcome = super::run(&env, Some(enrollment), &mut vars).await.unwrap();
     let body = outcome.response.unwrap();
     assert!(body.contains(MISSING));
-    assert!(body.contains("**Warnings:** 1"));
+    assert!(body.contains("**⚠️ Warnings:** 1"));
     assert!(body.contains("`warning`"));
     assert!(!body.contains("Discord API error"));
     let requested = requested.lock().unwrap().clone();
@@ -1062,7 +1062,19 @@ async fn integration_warn_and_case_rows() {
     let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
     let outcome = super::run(&env, Some(enrollment), &mut vars).await.unwrap();
     let body = outcome.response.unwrap();
-    assert!(body.contains("**Warnings:** 1"));
+    assert!(body.contains("**⚠️ Warnings:** 1"));
+    // Shipped !userinfo: one map emoji on the title and on each label, values untouched.
+    assert!(body.starts_with("**👤 User info**\n"), "{body}");
+    for line in jmodguard::defaults::USER_INFO_TEMPLATE.lines().skip(1) {
+        if let Some(name) = jmodguard::emoji::line_label(line) {
+            let emoji = jmodguard::emoji::label(name).unwrap();
+            assert_eq!(
+                body.matches(&format!("**{emoji} {name}:**")).count(),
+                1,
+                "{name}: {body}"
+            );
+        }
+    }
     assert!(body.contains("`ban`"));
     assert!(body.contains("`91`"));
     assert!(
@@ -1497,10 +1509,10 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
         captured.lock().unwrap().clear();
         let report = requests
             .iter()
-            .find(|raw| raw.contains("**Voice:**"))
+            .find(|raw| raw.contains("**🔊 Voice:**"))
             .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
         assert!(
-            report.contains("**User info**"),
+            report.contains("**👤 User info**"),
             "{label} did not pass command authorization: {report}"
         );
         assert!(
@@ -1785,7 +1797,7 @@ async fn userinfo_prefix_and_slash_reject_invalid_mention_ids() {
         assert!(!cases.contains("<@0"), "{cases}");
         assert!(!cases.contains("<@&0"), "{cases}");
         assert!(!cases.contains(OVERFLOW), "{cases}");
-        assert!(content.contains("**User info**"), "{content}");
+        assert!(content.contains("**👤 User info**"), "{content}");
     }
 
     server.abort();
@@ -2138,7 +2150,7 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
 fn voice_line_from_content(content: &str) -> String {
     content
         .lines()
-        .find(|line| line.contains("**Voice:**"))
+        .find(|line| line.contains("**🔊 Voice:**"))
         .unwrap_or_else(|| panic!("no voice line in {content}"))
         .to_string()
 }
@@ -2148,7 +2160,7 @@ fn report_content(label: &str, captured: &Arc<std::sync::Mutex<Vec<String>>>) ->
     captured.lock().unwrap().clear();
     let report = requests
         .iter()
-        .find(|raw| raw.contains("**Voice:**"))
+        .find(|raw| raw.contains("**🔊 Voice:**"))
         .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
     let (_, body) = report
         .split_once("\r\n\r\n")
@@ -2179,7 +2191,7 @@ fn voice_line(report: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("no content in {payload}"))
         .lines()
-        .find(|line| line.contains("**Voice:**"))
+        .find(|line| line.contains("**🔊 Voice:**"))
         .unwrap_or_else(|| panic!("no voice line in {payload}"))
         .to_string()
 }

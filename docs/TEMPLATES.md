@@ -116,14 +116,16 @@ shows the layout with sample data, including unsaved edits.
 
 ## Emoji
 
-Discord reports from shipped default templates show one standard Unicode emoji
+Discord output from shipped default templates shows one standard Unicode emoji
 before the title and one before each field label, from one shared map in
 `src/emoji.rs`. Values, reasons and observed message text never gain emoji, and
 no custom server emotes are used. The emoji are added only when the bot builds
-the Discord embed: stored templates, the WebUI editor, its live preview and the
-template names stay plain text. Saved custom templates render exactly as before;
-add `{emoji}` to one to opt in. An event without a mapped emoji leaves `{emoji}`
-visible, like any other unknown variable.
+the Discord message: stored templates, the WebUI editor and its labels and the
+template names stay plain text. The Templates live preview shows the Discord
+message, so it applies the same emoji, which the API serves from that map with
+each template row. Saved custom templates render exactly as before; add
+`{emoji}` to one to opt in, and the preview shows it too. An event without a
+mapped emoji leaves `{emoji}` visible, like any other unknown variable.
 
 | Emoji | Report type |
 | --- | --- |
@@ -150,6 +152,19 @@ missing · ❔ Storage unknown · 🧹 Filtered · ✂️ Transcript omitted · 
 ⚡ Action · ⌨️ Command · ➕ Added · ➖ Removed · 🏷️ Role · 🔤 Name/Username ·
 🪪 Display name · 🧵 Thread · 🗄️ Archived · 🔒 Locked · ⏲️ Auto-archive ·
 ✉️ Invitable. The map also reserves 📊 for status reports.
+
+Other shipped text templates use the same map. Built-in command replies start
+with their command's emoji (for example `🔨 Banned {target} | {reason}`, 📛
+`!setname`, ⚙️ `!prefix`); a custom reply is unchanged unless it uses
+`{emoji}`, which gives the emoji of the built-in command with the same behavior
+(⌨️ otherwise). Kick/ban reason DMs start with 🔨 or 👢 and label ⚡ Action and
+📝 Reason; the follow-up after a failed removal starts with ⚠️. `!userinfo`
+starts with 👤 and labels 🆔 ID · 🔤 Username · 🪪 Global name · 📛 Nick ·
+📅 Account · ⏰ Joined · 🏷️ Roles · 🔊 Voice · ⚠️ Warnings · 📋 Cases. `!voice`
+replies start with 🔊. Attachment-burst review buttons answer with ⛔ (not
+allowed), ℹ️ (already handled) or ⚠️ (failed); a shipped review keeps 🛡️ and
+gains 🧑‍⚖️ Review after a decision. Error replies (`error: …`), `!status`/`!stats`,
+and lists built by commands such as `!help`, `!warns` and `!banlist` stay plain.
 
 Limits count UTF-16 units: title 256, description 4096, at most 25 fields, field
 names 256 and values 1024, total 6000. No author or footer is emitted (their Discord

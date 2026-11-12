@@ -1696,19 +1696,19 @@ pub(crate) async fn handle_component(
         &press.roles,
     ) != ModeratorStatus::Moderator
     {
-        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
+        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED, "denied").await;
         return;
     }
     let Some(review) =
         app.attachment_burst
             .claim_review(press.review_id, press.guild_id.get(), press.nonce)
     else {
-        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_HANDLED).await;
+        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_HANDLED, "handled").await;
         return;
     };
     if press.user_id.get() == review.data.user {
         app.attachment_burst.restore_review(review);
-        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED).await;
+        let _ = ephemeral(ctx, &press, ATTACHMENT_BURST_DENIED, "denied").await;
         return;
     }
     let acked = CreateInteractionResponse::Acknowledge
@@ -1758,6 +1758,24 @@ fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionRes
         ("decision".to_string(), label.to_string()),
         ("actor".to_string(), format!("user {actor}")),
     ]);
+    // A shipped review body starts with the decorated heading; promote it and
+    // decorate the shipped decision line too. Custom bodies keep the plain path.
+    let shipped_title = jmodguard::emoji::decorate(
+        jmodguard::emoji::title("automod", &vars),
+        &jmodguard::log_embeds::style("automod").title,
+    );
+    let heading = format!("{shipped_title}\n\n");
+    if let Some(body) = vars
+        .get("body")
+        .and_then(|body| body.strip_prefix(&heading))
+    {
+        let decision = jmodguard::emoji::decorate_template(None, ATTACHMENT_BURST_DECISION);
+        let mut vars = vars.clone();
+        vars.insert("body".into(), body.to_string());
+        let mut embed = jmodguard::log_embeds::render("automod", &decision, &vars);
+        embed.title = shipped_title;
+        return decision_response(embed);
+    }
     let mut embed = jmodguard::log_embeds::render("automod", ATTACHMENT_BURST_DECISION, &vars);
     // Promote only the exact shipped heading. Other saved previews may carry
     // legacy or custom headings, so keep their body intact without adding a title.
@@ -1767,6 +1785,10 @@ fn decision_edit(body: String, label: &str, actor: UserId) -> EditInteractionRes
     } else {
         embed.title.clear();
     }
+    decision_response(embed)
+}
+
+fn decision_response(embed: jmodguard::log_embeds::LogEmbed) -> EditInteractionResponse {
     EditInteractionResponse::new()
         .content("")
         .embed(crate::logging::discord_embed(embed))
@@ -1990,10 +2012,21 @@ async fn ban_then_record(
     }
 }
 
-async fn ephemeral(ctx: &Context, press: &ButtonPress, text: &str) -> serenity::Result<()> {
+/// A shipped notice template with its map emoji for `kind`.
+fn notice(text: &str, kind: &str) -> String {
+    let text = jmodguard::emoji::decorate_template(jmodguard::emoji::reply(kind), text);
+    templates::render(&text, &BTreeMap::new())
+}
+
+async fn ephemeral(
+    ctx: &Context,
+    press: &ButtonPress,
+    text: &str,
+    kind: &str,
+) -> serenity::Result<()> {
     CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
-            .content(templates::render(text, &BTreeMap::new()))
+            .content(notice(text, kind))
             .ephemeral(true),
     )
     .execute(&ctx.http, (press.id, press.token.as_str()))
@@ -2003,7 +2036,7 @@ async fn ephemeral(ctx: &Context, press: &ButtonPress, text: &str) -> serenity::
 
 async fn review_read_failed(ctx: &Context, press: &ButtonPress) -> serenity::Result<()> {
     CreateInteractionResponseFollowup::new()
-        .content(templates::render(ATTACHMENT_BURST_FAILED, &BTreeMap::new()))
+        .content(notice(ATTACHMENT_BURST_FAILED, "failed"))
         .ephemeral(true)
         .execute(&ctx.http, (None, press.token.as_str()))
         .await
@@ -4711,8 +4744,9 @@ mod tests {
                 }
             }
             assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
-            assert_eq!(payload["embeds"][0]["title"], "Automod");
-            assert!(visible.contains(&format!("**Review:** {label} by user 7")));
+            // The shipped review keeps its map emoji after a decision.
+            assert_eq!(payload["embeds"][0]["title"], "🛡️ Automod");
+            assert!(visible.contains(&format!("**🧑‍⚖️ Review:** {label} by user 7")));
             assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
             assert_eq!(payload["components"], serde_json::json!([]));
         }
@@ -4739,6 +4773,35 @@ mod tests {
     #[tokio::test]
     async fn attachment_burst_decision_title_once_preview() {
         attachment_burst_decision_title_once(None).await;
+    }
+
+    #[test]
+    fn review_notices_get_one_map_emoji() {
+        assert_eq!(
+            notice(ATTACHMENT_BURST_DENIED, "denied"),
+            format!("⛔ {ATTACHMENT_BURST_DENIED}")
+        );
+        assert_eq!(
+            notice(ATTACHMENT_BURST_HANDLED, "handled"),
+            format!("ℹ️ {ATTACHMENT_BURST_HANDLED}")
+        );
+        assert_eq!(
+            notice(ATTACHMENT_BURST_FAILED, "failed"),
+            format!("⚠️ {ATTACHMENT_BURST_FAILED}")
+        );
+        // The same constants used as decision values stay plain.
+        let edit = serde_json::to_value(decision_edit(
+            "custom body".into(),
+            ATTACHMENT_BURST_FAILED,
+            UserId::new(7),
+        ))
+        .unwrap();
+        assert!(
+            edit["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("**Review:** {ATTACHMENT_BURST_FAILED} by user 7"))
+        );
     }
 
     fn assert_attachment_burst_decision_body_title_once(body: &str) {
@@ -4966,7 +5029,7 @@ mod tests {
             }
             assert_eq!(visible.matches("Automod").count(), 1, "{payload}");
             assert!(visible.contains("Attachment burst"));
-            assert!(visible.contains(&format!("**Review:** {label} by user 7")));
+            assert!(visible.contains(&format!("**🧑‍⚖️ Review:** {label} by user 7")));
             assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
             assert_eq!(payload["components"], serde_json::json!([]));
         }

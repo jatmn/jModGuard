@@ -108,7 +108,9 @@ Example: a `!welcome` plan: `reply "Hi {user}, welcome to {guild}!"` →
 Each command's `response` field is a template rendered after success, e.g.
 `Banned {target} | {reason}`. Variables: `{user} {actor} {actor_id} {guild}
 {channel} {target} {target_id} {reason} {minutes} {count} {name} {prefix}
-{seconds} {duration} {response}`. Leave it empty and the behavior's built-in reply (if
+{seconds} {duration} {response} {emoji}`. Built-in replies start with their
+command's map emoji; `{emoji}` lets a custom reply opt in (see
+[Templates](TEMPLATES.md#emoji)). Leave it empty and the behavior's built-in reply (if
 any) is used. When `!say` posts into the invoking channel the reply is
 suppressed as redundant — the posted text is already visible there — so a
 prefix invocation sends nothing and the deferred slash answer is withdrawn.

@@ -3621,16 +3621,24 @@ function tabTemplates() {
   );
 }
 
-// Same UTF-16 budget and substitution order as the shared log renderer.
+// Joiners, presentation selectors and modifiers that continue an emoji sequence.
+function continuesEmojiSequence(ch) {
+  const cp = ch.codePointAt(0);
+  return cp === 0x200d || cp === 0xfe0e || cp === 0xfe0f || cp === 0x20e3
+    || (cp >= 0x1f3fb && cp <= 0x1f3ff) || (cp >= 0xe0020 && cp <= 0xe007f);
+}
+
+// Same UTF-16 budget and substitution order as the shared log renderer. Like
+// the bot, a cut never splits an emoji sequence.
 function clipEmbedText(text, limit) {
   if (text.length <= limit) return text;
   if (!limit) return "";
-  let out = "";
-  for (const ch of text) {
-    if (out.length + ch.length > limit - 1) break;
-    out += ch;
-  }
-  return out + "…";
+  const chars = Array.from(text);
+  let end = 0;
+  let units = 0;
+  while (units + chars[end].length < limit) units += chars[end++].length;
+  while (end > 0 && (continuesEmojiSequence(chars[end]) || chars[end - 1] === "\u200d")) end--;
+  return chars.slice(0, end).join("") + "…";
 }
 
 function renderEmbedText(template, vars, limit) {
@@ -3654,27 +3662,35 @@ function renderEmbedText(template, vars, limit) {
   return out;
 }
 
+// Discord preview: the bot's map emoji arrive from the API in record.preview_emoji.
 function templateEmbedPreview(record, template, vars) {
   const style = record.embed_style || { title: "Log event", color: 0xffb347 };
+  const emoji = record.preview_emoji || {};
   const action = (vars.action || "").trim().toLowerCase();
   const color = style.removal_color && vars.removed && vars.removed !== "none"
     ? style.removal_color : style.action_colors?.[action] ?? style.color;
-  const title = clipEmbedText(style.title, 256);
+  const titleEmoji = (Object.hasOwn(emoji.actions || {}, action) ? emoji.actions[action] : null) || emoji.title;
+  const shipped = template === record.shipped;
+  const title = clipEmbedText(shipped && titleEmoji ? `${titleEmoji} ${style.title}` : style.title, 256);
   let left = 6000 - title.length;
   const fields = [];
   let description = "";
-  if (template === record.shipped) {
+  if (shipped) {
     for (const line of template.split("\n").slice(1)) {
       const match = line.match(/^\*\*(.*?):\*\* (.*)$/);
       if (!match || fields.length === 25 || left < 2) continue;
-      const name = clipEmbedText(match[1], Math.min(256, left - 1));
+      const labelEmoji = Object.hasOwn(emoji.labels || {}, match[1]) ? emoji.labels[match[1]] : null;
+      const name = clipEmbedText(labelEmoji ? `${labelEmoji} ${match[1]}` : match[1], Math.min(256, left - 1));
       left -= name.length;
       const value = clipEmbedText(renderEmbedText(match[2], vars, 1024) || "—", Math.min(1024, left));
       left -= value.length;
       fields.push({ name, value });
     }
   } else {
-    description = renderEmbedText(template, vars, Math.min(4096, left));
+    // Custom wording opts in with {emoji}; values supplied by the caller win.
+    const opted = template.includes("{emoji}") && titleEmoji && !Object.hasOwn(vars, "emoji")
+      ? { ...vars, emoji: titleEmoji } : vars;
+    description = renderEmbedText(template, opted, Math.min(4096, left));
   }
   return { title, color, description, fields };
 }

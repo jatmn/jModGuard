@@ -1447,6 +1447,14 @@ pub(crate) async fn preview_automod(
     let mut owned = jmodguard::emoji::with_var("automod", vars).unwrap_or_else(|| vars.clone());
     templates::format_log_timestamps(&mut owned);
     let rendered = render_log_template("automod", &template, &mut owned);
+    if template == default_template("automod") {
+        // The shipped body carries the embed's map emoji; vars are already bounded.
+        let decorated = jmodguard::emoji::decorate_template(
+            jmodguard::emoji::title("automod", &owned),
+            &template,
+        );
+        return templates::render_bounded(&decorated, &owned, 2000);
+    }
     // Fresh reviews use the shipped heading spelling that decision_edit promotes.
     // Canonicalize only its separator; preserve custom headings and all body bytes.
     let title = jmodguard::log_embeds::style("automod").title;

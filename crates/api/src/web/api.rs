@@ -54,7 +54,8 @@ fn settings_wire(settings: &impl serde::Serialize) -> serde_json::Value {
     value
 }
 
-/// One Templates-page row. Stays emoji-free: the bot adds map emoji only to Discord embeds.
+/// One Templates-page row. Editor text and labels stay emoji-free; `preview_emoji`
+/// carries the shared map entries the Discord preview applies like the bot does.
 fn template_wire(
     event: &str,
     def: &str,
@@ -68,6 +69,7 @@ fn template_wire(
         "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
         "guild_override": guild_row,
         "global": global_row.unwrap_or_else(|| def.to_string()),
+        "preview_emoji": jmodguard::emoji::preview(event, def),
     })
 }
 
@@ -1504,17 +1506,32 @@ mod tests {
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
     }
 
-    /// The Discord emoji map must never reach WebUI chrome, sources or template defaults.
+    /// WebUI chrome (sources, template names, editor text) never contains the
+    /// Discord emoji map; only the preview data does, and that is checked positively.
     #[test]
     fn webui_template_rows_and_sources_have_no_discord_emoji() {
         let find = |text: &str| jmodguard::emoji::all().find(|emoji| text.contains(emoji));
         let mut events = 0;
         for (event, def) in crate::defaults::rendered_log_templates() {
-            // JSON text keeps non-ASCII unescaped: shipped, effective, global and embed_style.
-            let row = super::template_wire(event, def, None, None).to_string();
-            assert!(row.contains(def.lines().next().unwrap()), "{row}");
-            assert_eq!(find(&row), None, "{event}: {row}");
-            assert!(jmodguard::emoji::title(event, &Default::default()).is_some());
+            let mut row = super::template_wire(event, def, None, None);
+            let preview = row
+                .as_object_mut()
+                .unwrap()
+                .remove("preview_emoji")
+                .unwrap();
+            // JSON text keeps non-ASCII unescaped: event, shipped, effective, global, embed_style.
+            let chrome = row.to_string();
+            assert!(chrome.contains(def.lines().next().unwrap()), "{chrome}");
+            assert_eq!(find(&chrome), None, "{event}: {chrome}");
+            let title = jmodguard::emoji::title(event, &Default::default()).unwrap();
+            assert_eq!(preview["title"], title, "{event}");
+            for line in def.lines().skip(1).filter(|line| line.starts_with("**")) {
+                let name = jmodguard::emoji::line_label(line).unwrap();
+                assert_eq!(
+                    preview["labels"][name],
+                    jmodguard::emoji::label(name).unwrap()
+                );
+            }
             events += 1;
         }
         assert_eq!(
@@ -1538,6 +1555,130 @@ mod tests {
             }
         }
         assert!(scanned >= 10, "scanned {scanned} WebUI sources");
+    }
+
+    /// Golden cases the Node preview test replays: the expected embed is the
+    /// bot's own Discord render. Regenerate with JMODGUARD_BLESS_TEMPLATE_PREVIEW=1.
+    #[test]
+    fn template_preview_cases_match_the_bot_renderer() {
+        let base: std::collections::BTreeMap<String, String> = [
+            "user",
+            "user_id",
+            "mention",
+            "channel",
+            "actor",
+            "reason",
+            "rule",
+            "rule_id",
+            "content",
+            "count",
+            "removed",
+            "added",
+            "before",
+            "after",
+            "attachments",
+            "coverage",
+            "message_url",
+            "time",
+            "account_created",
+            "account_age",
+            "duration",
+            "joined",
+            "cases",
+            "notice",
+            "retained",
+            "unavailable",
+            "unknown",
+            "filtered",
+            "omitted",
+            "details",
+            "command",
+            "role",
+            "role_id",
+            "role_name",
+            "detail",
+            "before_global",
+            "after_global",
+            "thread",
+            "thread_id",
+            "thread_name",
+            "archived",
+            "locked",
+            "auto_archive",
+            "invitable",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), format!("v-{key} {{emoji}}")))
+        .collect();
+        let templates = crate::defaults::rendered_log_templates();
+        let shipped = |event: &str| templates.iter().find(|(e, _)| *e == event).unwrap().1;
+        let mut cases: Vec<(String, &str, String, &str)> = templates
+            .iter()
+            .map(|(event, def)| (format!("{event} default"), *event, def.to_string(), "ban"))
+            .collect();
+        for action in ["warn", "kick", "custom"] {
+            let name = format!("mod_action default ({action})");
+            cases.push((name, "mod_action", shipped("mod_action").into(), action));
+        }
+        for (event, action) in [
+            ("member_ban", "ban"),
+            ("mod_action", "kick"),
+            ("system", "ban"),
+        ] {
+            let name = format!("{event} custom with emoji");
+            cases.push((name, event, "{emoji} {user}: {reason}".into(), action));
+        }
+        let plain = "Plain {user} 🔨 own wording".to_string();
+        cases.push((
+            "member_ban custom without emoji".into(),
+            "member_ban",
+            plain,
+            "ban",
+        ));
+        let mut lines = Vec::new();
+        for (name, event, template, action) in cases {
+            let mut vars = base.clone();
+            vars.insert("action".into(), action.into());
+            let embed = jmodguard::log_embeds::render(event, &template, &vars);
+            // Only the served row fields the preview reads.
+            let row = super::template_wire(event, shipped(event), None, None);
+            let case = serde_json::json!({
+                "name": name,
+                "record": {
+                    "shipped": row["shipped"],
+                    "embed_style": row["embed_style"],
+                    "preview_emoji": row["preview_emoji"],
+                },
+                "template": template,
+                "action": action,
+                "discord": {
+                    "title": embed.title,
+                    "color": embed.color,
+                    "description": embed.description,
+                    "fields": embed.fields.iter().map(|f| serde_json::json!({
+                        "name": f.name,
+                        "value": f.value,
+                    })).collect::<Vec<_>>(),
+                },
+            });
+            lines.push(format!("  {case}"));
+        }
+        let text = format!(
+            "{{\"vars\": {},\n\"cases\": [\n{}\n]}}\n",
+            serde_json::to_string(&base).unwrap(),
+            lines.join(",\n")
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/web/template_preview_cases.json");
+        if std::env::var_os("JMODGUARD_BLESS_TEMPLATE_PREVIEW").is_some() {
+            std::fs::write(&path, &text).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            text,
+            "regenerate {} with JMODGUARD_BLESS_TEMPLATE_PREVIEW=1",
+            path.display()
+        );
     }
 }
 

@@ -18,6 +18,12 @@ pub const CHANNEL_UNAVAILABLE_TEMPLATE: &str =
 
 const CHANNEL_NAME_CLIP: usize = 100;
 
+/// Render one shipped `!voice` reply with its map emoji.
+pub fn render_reply(template: &str, vars: &std::collections::BTreeMap<String, String>) -> String {
+    let template = jmodguard::emoji::decorate_template(jmodguard::emoji::reply("voice"), template);
+    crate::templates::render(&template, vars)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceLookupSnapshot {
     InChannel {
@@ -118,6 +124,28 @@ fn clip_channel_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_shipped_voice_reply_gets_one_map_emoji_and_plain_values() {
+        let vars = std::collections::BTreeMap::from([
+            ("target".to_string(), "**alice** 🔨 {emoji}".to_string()),
+            ("channel".to_string(), "General".to_string()),
+            ("channel_id".to_string(), "1".to_string()),
+        ]);
+        for template in [
+            IN_CHANNEL_TEMPLATE,
+            NOT_IN_CHANNEL_TEMPLATE,
+            GUILD_NOT_CACHED_TEMPLATE,
+            CHANNEL_UNAVAILABLE_TEMPLATE,
+        ] {
+            let text = render_reply(template, &vars);
+            assert_eq!(
+                text,
+                format!("🔊 {}", crate::templates::render(template, &vars))
+            );
+            assert_eq!(jmodguard::emoji::decorate_template(Some("🔊"), &text), text);
+        }
+    }
+
     use super::*;
     use serenity::model::channel::ChannelType;
     use serenity::model::channel::GuildChannel;
@@ -734,7 +762,8 @@ mod tests {
             GUILD_NOT_CACHED_TEMPLATE,
             &std::collections::BTreeMap::from([("target".into(), token.into())]),
         );
-        assert_eq!(text, expected);
+        // The shipped reply gains only the voice emoji in front.
+        assert_eq!(text, format!("🔊 {expected}"));
         assert!(text.contains("not cached"), "{text}");
         assert!(!text.contains("could not resolve"), "{text}");
         assert_eq!(

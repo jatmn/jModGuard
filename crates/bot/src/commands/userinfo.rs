@@ -689,7 +689,10 @@ pub(crate) async fn run(
         };
 
     let cases = load_case_lines(env, enrollment, target).await;
-    let template = jmodguard::defaults::USER_INFO_TEMPLATE;
+    let template = &jmodguard::emoji::decorate_template(
+        jmodguard::emoji::reply("userinfo"),
+        jmodguard::defaults::USER_INFO_TEMPLATE,
+    );
     let response = match cases {
         CasesField::Unavailable => render_userinfo_with_cases(
             template,
